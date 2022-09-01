@@ -1,0 +1,536 @@
+file;cat1;cat2;cat3;id;caption;frames
+animations\mimics\child_mimic_layers.w2anims;child;layers;;confident_anim_combined_face;confident anim combined face;610
+animations\mimics\child_mimic_layers.w2anims;child;layers;;head_left02_head_accent_face;head left02 head accent face;63
+animations\mimics\child_mimic_layers.w2anims;child;layers;;head_left03_head_accent_face;head left03 head accent face;63
+animations\mimics\child_mimic_layers.w2anims;child;layers;;head_right01_head_accent_face;head right01 head accent face;50
+animations\mimics\child_mimic_layers.w2anims;child;layers;;head_right02_head_accent_face;head right02 head accent face;54
+animations\mimics\child_mimic_layers.w2anims;child;layers;;head_right03_head_accent_face;head right03 head accent face;29
+animations\mimics\child_mimic_layers.w2anims;child;layers;;nervous_eyes_face;nervous eyes face;610
+animations\mimics\child_mimic_layers.w2anims;child;layers;;nervous_eyes_soft_face;nervous eyes soft face;610
+animations\mimics\child_mimic_animation.w2anims;child;;;geralt_happiness_gesture_smile_face;geralt happiness gesture smile face;67
+animations\mimics\child_mimic_animation.w2anims;child;;;geralt_lick_lips_face;geralt lick lips face;31
+animations\mimics\child_mimic_animation.w2anims;child;;;geralt_neutral_gesture_death_longer_face;geralt neutral gesture death longer face;245
+animations\mimics\child_mimic_animation.w2anims;child;;;geralt_neutral_gesture_eating_face;geralt neutral gesture eating face;259
+animations\mimics\child_mimic_animation.w2anims;child;;;geralt_neutral_gesture_into_bursting_anger_face;geralt neutral gesture into bursting anger face;75
+animations\mimics\child_mimic_animation.w2anims;child;;;geralt_neutral_question_what_did_ya_say_face;geralt neutral question what did ya say face;60
+animations\mimics\child_mimic_animation.w2anims;child;;;geralt_reaction_irritation_face;geralt reaction irritation face;243
+animations\mimics\child_mimic_animation.w2anims;child;;;nboy1_q602_01108351_zwrotka1_lipsync;nboy1 q602 01108351 zwrotka1 lipsync;358
+animations\mimics\child_mimic_animation.w2anims;child;;;nboy2_q602_01108355_zwrotka3_lipsync;nboy2 q602 01108355 zwrotka3 lipsync;359
+animations\mimics\child_mimic_animation.w2anims;child;;;ngrl1_q602_01108353_zwrotka2_lipsync;ngrl1 q602 01108353 zwrotka2 lipsync;350
+animations\mimics\child_mimic_animation.w2anims;child;;;ngrl2_q602_01108357_zwrotka4_lipsync;ngrl2 q602 01108357 zwrotka4 lipsync;354
+animations\mimics\geralt_mimic_layers.w2anims;man;geralt;layers;afraid_anim_combined_face;afraid anim combined face;700
+animations\mimics\geralt_mimic_layers.w2anims;man;geralt;layers;afraid_anim_face;afraid anim face;700
+animations\mimics\geralt_mimic_layers.w2anims;man;geralt;layers;afraid_eyes_face;afraid eyes face;700
+animations\mimics\geralt_mimic_layers.w2anims;man;geralt;layers;afraid_eyes_soft_face;afraid eyes soft face;700
+animations\mimics\geralt_mimic_layers.w2anims;man;geralt;layers;seducing__eyes_face;seducing  eyes face;600
+animations\mimics\geralt_mimic_layers.w2anims;man;geralt;layers;test_anim_combined_face;test anim combined face;175
+animations\mimics\geralt_mimic_layers.w2anims;man;geralt;layers;test_anim_face;test anim face;175
+animations\mimics\geralt_mimic_layers.w2anims;man;geralt;layers;test_eyes_face;test eyes face;175
+animations\mimics\geralt_mimic_layers.w2anims;man;geralt;layers;test_pose_face;test pose face;10
+animations\mimics\geralt_mimic_layers.w2anims;man;geralt;layers;worried_pose_face;worried pose face;10
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;bob_ending_face;bob ending face;674
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;ep1_geralt_neutral_gesture_hearty_spit_face;ep1 geralt neutral gesture hearty spit face;250
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;ep1_slow_dance_outro_geralt_face;ep1 slow dance outro geralt face;1095
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;ep1_witold_take_bottle_drink_all__witold_face;ep1 witold take bottle drink all  witold face;663
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_bursting_anger_combined_face;gameplay bursting anger combined face;600
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_focused_anim_combined_face;gameplay focused anim combined face;820
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_geralt_pose_damage_01_face;gameplay geralt pose damage 01 face;30
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_geralt_pose_damage_02_face;gameplay geralt pose damage 02 face;30
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_geralt_pose_damage_03_face;gameplay geralt pose damage 03 face;30
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_geralt_pose_damage_04_face;gameplay geralt pose damage 04 face;30
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_geralt_pose_death_01_face;gameplay geralt pose death 01 face;30
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_geralt_pose_death_02_face;gameplay geralt pose death 02 face;30
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_geralt_pose_death_03_face;gameplay geralt pose death 03 face;30
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_geralt_pose_death_04_face;gameplay geralt pose death 04 face;30
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_geralt_pose_hit_01_face;gameplay geralt pose hit 01 face;30
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_geralt_pose_hit_02_face;gameplay geralt pose hit 02 face;30
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_neutral_anim_combined_face;gameplay neutral anim combined face;820
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;gameplay_underwater_anim_combined_face;gameplay underwater anim combined face;700
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_choice_face;geralt choice face;973
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_neutral_gesture_maybe_face;geralt neutral gesture maybe face;70
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_neutral_gesture_shake_it_off_face;geralt neutral gesture shake it off face;70
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_neutral_gesture_shout_no_way_face;geralt neutral gesture shout no way face;100
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_neutral_gesture_shout_out_of_my_sight_face;geralt neutral gesture shout out of my sight face;175
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_neutral_gesture_shout_outta_my_way_face;geralt neutral gesture shout outta my way face;90
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_neutral_gesture_shout_shut_up_face;geralt neutral gesture shout shut up face;90
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_neutral_gesture_shout_you_failed_face;geralt neutral gesture shout you failed face;90
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_neutral_gesture_yawn_no_head_anim_face;geralt neutral gesture yawn no head anim face;250
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_neutral_question_where_monsters_face;geralt neutral question where monsters face;105
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_pose_eye_darts_tired_sleepy_face;geralt pose eye darts tired sleepy face;200
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_reaction_anguish_face;geralt reaction anguish face;250
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_reaction_disgust_face;geralt reaction disgust face;160
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_reaction_embarrassment_face;geralt reaction embarrassment face;215
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_reaction_i_dont_agree_face;geralt reaction i dont agree face;160
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_reaction_i_dont_understand_face;geralt reaction i dont understand face;160
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_reaction_irritation_face;geralt reaction irritation face;260
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_reaction_mad_face;geralt reaction mad face;200
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_reaction_scepticism_face;geralt reaction scepticism face;200
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_reaction_searching_for_words_face;geralt reaction searching for words face;230
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geralt_reaction_tired_face;geralt reaction tired face;300
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;geraltstage_face;geraltstage face;286
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_crossbow_check1_face;inventory crossbow check1 face;166
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_crossbow_idle_face;inventory crossbow idle face;150
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_crossbow_to_noequipment_face;inventory crossbow to noequipment face;48
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_heavy_melee_check1_face;inventory heavy melee check1 face;168
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_noequipment_armor_face;inventory noequipment armor face;125
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_noequipment_armor_flex1_face;inventory noequipment armor flex1 face;190
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_noequipment_armor_flex2_face;inventory noequipment armor flex2 face;151
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_noequipment_boots_face;inventory noequipment boots face;147
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_noequipment_gloves_face;inventory noequipment gloves face;170
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_noequipment_idle_face;inventory noequipment idle face;150
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_noequipment_random1_face;inventory noequipment random1 face;146
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_sheathe_crossbow_face;inventory sheathe crossbow face;154
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_sheathe_silver_face;inventory sheathe silver face;63
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_sheathe_steel_face;inventory sheathe steel face;63
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_sword_check1_face;inventory sword check1 face;187
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_sword_check2_face;inventory sword check2 face;200
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_sword_idle_face;inventory sword idle face;140
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_unsheathe_crossbow_face;inventory unsheathe crossbow face;142
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_unsheathe_silver_face;inventory unsheathe silver face;45
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;inventory_unsheathe_steel_face;inventory unsheathe steel face;45
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;man_swimming_drown_face;man swimming drown face;300
+animations\mimics\gameplay_geralt_high_mimic_animation.w2anims;man;geralt;;man_swimming_emerge_face;man swimming emerge face;60
+animations\mimics\geralt_mimic_inventory.w2anims;man;geralt;;menu_idle_v1_face;menu idle v1 face;620
+animations\mimics\geralt_mimic_animation.w2anims;man;geralt;;q705_geralt_end_of_blood_and_wine_face;q705 geralt end of blood and wine face;622
+animations\mimics\man_mimic_layers.w2anims;man;layers;;bursting_anger_eyes_soft_face;bursting anger eyes soft face;600
+animations\mimics\man_mimic_layers.w2anims;man;layers;;confident_anim_face;confident anim face;610
+animations\mimics\man_mimic_layers.w2anims;man;layers;;confident_eyes_face;confident eyes face;610
+animations\mimics\man_mimic_layers.w2anims;man;layers;;confident_eyes_soft_face;confident eyes soft face;610
+animations\mimics\man_mimic_layers.w2anims;man;layers;;disgusted_anim_combined_face;disgusted anim combined face;715
+animations\mimics\man_mimic_layers.w2anims;man;layers;;disgusted_anim_face;disgusted anim face;715
+animations\mimics\man_mimic_layers.w2anims;man;layers;;disgusted_eyes_face;disgusted eyes face;715
+animations\mimics\man_mimic_layers.w2anims;man;layers;;disgusted_eyes_soft_face;disgusted eyes soft face;715
+animations\mimics\man_mimic_layers.w2anims;man;layers;;drunk_anim_face;drunk anim face;1050
+animations\mimics\man_mimic_layers.w2anims;man;layers;;drunk_combined_face;drunk combined face;1050
+animations\mimics\man_mimic_layers.w2anims;man;layers;;drunk_eyes_face;drunk eyes face;1050
+animations\mimics\man_mimic_layers.w2anims;man;layers;;drunk_pose_face;drunk pose face;10
+animations\mimics\man_mimic_layers.w2anims;man;layers;;focused_eyes_face;focused eyes face;350
+animations\mimics\man_mimic_layers.w2anims;man;layers;;sleeping_pose_face;sleeping pose face;10
+animations\mimics\man_mimic_layers.w2anims;man;layers;;TEST_ANGRYFACE_EYES_LAYER_face;TEST ANGRYFACE EYES LAYER face;600
+animations\mimics\man_mimic_layers.w2anims;man;layers;;TEST_ANGRYFACE_IDLE_LAYER_face;TEST ANGRYFACE IDLE LAYER face;600
+animations\mimics\man_mimic_layers.w2anims;man;layers;;TEST_ANGRYFACE_POSE_LAYER_face;TEST ANGRYFACE POSE LAYER face;10
+animations\mimics\man_mimic_animation.w2anims;man;;;ep2_sniff;ep2 sniff;150
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_happiness_gesture_smile_face;geralt happiness gesture smile face;66
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_look_left_impatient_face;geralt look left impatient face;101
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_breath_closed_face;geralt neutral gesture breath closed face;90
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_breath_face;geralt neutral gesture breath face;90
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_brows_down_face_lcl;geralt neutral gesture brows down face lcl;90
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_brows_down_face_nrml;geralt neutral gesture brows down face nrml;90
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_brows_up_face_lcl;geralt neutral gesture brows up face lcl;90
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_brows_up_face_nrml;geralt neutral gesture brows up face nrml;90
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_chewing_face;geralt neutral gesture chewing face;180
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_cry_face;geralt neutral gesture cry face;230
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_death_longer_face;geralt neutral gesture death longer face;300
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_death_shorter_face;geralt neutral gesture death shorter face;250
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_diasppointment_face;geralt neutral gesture diasppointment face;183
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_eating_apple_face;geralt neutral gesture eating apple face;200
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_grimace_face;geralt neutral gesture grimace face;170
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_interrupted_01_face;geralt neutral gesture interrupted 01 face;155
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_rapid_head_flick_up_face;geralt neutral gesture rapid head flick up face;40
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_sceptical_remark_face;geralt neutral gesture sceptical remark face;110
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_sniffle_face;geralt neutral gesture sniffle face;90
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_gesture_whistle_call_face;geralt neutral gesture whistle call face;73
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;geralt_neutral_idle;geralt neutral idle;600
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;geralt_neutral_idle_just_facial_animation;geralt neutral idle just facial animation;600
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_no_contempt_face;geralt neutral no contempt face;85
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_no_fast_face;geralt neutral no fast face;55
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_no_not_a_chance_face;geralt neutral no not a chance face;160
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_no_slow_face;geralt neutral no slow face;90
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_question_how_much_face;geralt neutral question how much face;90
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_question_king_slaughtered_face;geralt neutral question king slaughtered face;100
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_question_problem_face;geralt neutral question problem face;95
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_question_what_do_we_do_face;geralt neutral question what do we do face;100
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_question_what_face;geralt neutral question what face;100
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_question_where_face;geralt neutral question where face;160
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_question_why_face;geralt neutral question why face;120
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_yes_long_face;geralt neutral yes long face;90
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_yes_ok_face;geralt neutral yes ok face;60
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_neutral_yes_slow_face;geralt neutral yes slow face;50
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;geralt_pose_damage_01;geralt pose damage 01;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;geralt_pose_damage_02;geralt pose damage 02;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;geralt_pose_damage_03;geralt pose damage 03;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;geralt_pose_damage_04;geralt pose damage 04;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;geralt_pose_hit_01;geralt pose hit 01;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;geralt_pose_hit_02;geralt pose hit 02;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;geralt_pose_hit_03;geralt pose hit 03;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;geralt_pose_hit_04;geralt pose hit 04;30
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_pose_neutral_listening_face;geralt pose neutral listening face;600
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_quick_nodding_face;geralt quick nodding face;92
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_quick_nodding_withlook_face;geralt quick nodding withlook face;92
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_anguish_face;geralt reaction anguish face;230
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_disgust_face;geralt reaction disgust face;199
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_embarrassment_face;geralt reaction embarrassment face;200
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_I_dont_agree_face;geralt reaction I dont agree face;143
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_i_dont_agree_face;geralt reaction i dont agree face;143
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_i_dont_understand_face;geralt reaction i dont understand face;136
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_irritation_face;geralt reaction irritation face;200
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_listening_new_info_face;geralt reaction listening new info face;200
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_mad_face;geralt reaction mad face;136
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_pain_face;geralt reaction pain face;280
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_sad_face;geralt reaction sad face;225
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_scepticism_face;geralt reaction scepticism face;264
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_searching_for_words_face;geralt reaction searching for words face;193
+animations\mimics\man_mimic_animation.w2anims;man;;;geralt_reaction_tired_face;geralt reaction tired face;266
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_anger_idle;npc anger idle;640
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_anger_idle_just_facial_animation;npc anger idle just facial animation;640
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_fearful_idle;npc fearful idle;559
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_fearful_idle_just_facial_animation;npc fearful idle just facial animation;559
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_neutral_idle;npc neutral idle;549
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_neutral_idle_just_facial_animation;npc neutral idle just facial animation;549
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_damage_01;npc pose damage 01;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_damage_02;npc pose damage 02;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_damage_03;npc pose damage 03;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_damage_04;npc pose damage 04;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_death_01;npc pose death 01;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_death_02;npc pose death 02;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_death_03;npc pose death 03;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_death_04;npc pose death 04;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_hit_01;npc pose hit 01;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_hit_02;npc pose hit 02;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_hit_03;npc pose hit 03;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_hit_04;npc pose hit 04;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_sleep_01;npc pose sleep 01;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_pose_sleep_02;npc pose sleep 02;30
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_work_idle;npc work idle;578
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;npc_work_idle_just_mimics;npc work idle just mimics;578
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;nps_surprised_idle;nps surprised idle;640
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;nps_surprised_idle_just_facial_animation;nps surprised idle just facial animation;640
+animations\mimics\gameplay_man_mimic_animation.w2anims;man;;;test;test;474
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;blink_fast_offset_face;blink fast offset face;16
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;blink_long_offset_face;blink long offset face;30
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;blink_normal_face;blink normal face;20
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;blink_normal_offset_face;blink normal offset face;20
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;creepy_anim_combined_face;creepy anim combined face;600
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;creepy_anim_face;creepy anim face;600
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;creepy_eyes_face;creepy eyes face;600
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;creepy_pose_face;creepy pose face;10
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;foch_pose_face;foch pose face;10
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;geralt_neutral_gesture_mouth1_face;geralt neutral gesture mouth1 face;90
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;geralt_neutral_gesture_question_ver03_face;geralt neutral gesture question ver03 face;85
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;geralt_neutral_gesture_squint_face;geralt neutral gesture squint face;85
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;johny_and_bottle_02_whiskey_face;johny and bottle 02 whiskey face;1006
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;johny_and_bottle_03_did_i_ever_face;johny and bottle 03 did i ever face;530
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;johny_and_bottle_06_forgive_me_gran_face;johny and bottle 06 forgive me gran face;1280
+animations\mimics\godling_mimic_layers.w2anims;monster;godling;layers;q105_johny_regain_voice_forgive_face;q105 johny regain voice forgive face;1440
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;afraid_anim_combined_face;afraid anim combined face;550
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;afraid_anim_face;afraid anim face;557
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;afraid_eyes_face;afraid eyes face;557
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;geralt_neutral_gesture_dont_touch_me_face;geralt neutral gesture dont touch me face;165
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;happy_anim_combined_face;happy anim combined face;650
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;happy_anim_face;happy anim face;650
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;happy_eyes_face;happy eyes face;650
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;happy_eyes_soft_face;happy eyes soft face;650
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;neutral_anim_combined_face;neutral anim combined face;700
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;neutral_anim_face;neutral anim face;700
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;neutral_eyes_face;neutral eyes face;700
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;neutral_eyes_soft_face;neutral eyes soft face;700
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;pain_anim_combined_face;pain anim combined face;442
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;pain_anim_face;pain anim face;442
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;pain_eyes_face;pain eyes face;442
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;sleeping_pain_anim_combined_face;sleeping pain anim combined face;600
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;sleeping_pain_anim_face;sleeping pain anim face;600
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;sleeping_pain_eyes_face;sleeping pain eyes face;600
+animations\mimics\uma_mimic_layers.w2anims;monster;uma;layers;sleeping_pain_pose_face;sleeping pain pose face;10
+animations\mimics\weavess_mimic_animation.w2anims;monster;weavess;;evil_anim_face;evil anim face;637
+animations\mimics\weavess_mimic_animation.w2anims;monster;weavess;;evil_eyes_face;evil eyes face;637
+animations\mimics\weavess_mimic_animation.w2anims;monster;weavess;;evil_pose_face;evil pose face;10
+animations\mimics\weavess_mimic_animation.w2anims;monster;weavess;;geralt_meets_witches_sisters_dialogue_face;geralt meets witches sisters dialogue face;130
+animations\mimics\weavess_mimic_animation.w2anims;monster;weavess;;geralt_neutral_gesture_smile_mocking_face;geralt neutral gesture smile mocking face;86
+animations\mimics\weavess_mimic_animation.w2anims;monster;weavess;;test_face;test face;600
+animations\mimics\warewolf_mimic_animation.w2anims;monster;werewolf;layers;aggressive_pose_face;aggressive pose face;30
+animations\mimics\warewolf_mimic_animation.w2anims;monster;werewolf;layers;neutral_pose_face;neutral pose face;30
+animations\mimics\warewolf_mimic_animation.w2anims;monster;werewolf;layers;sad_pose_face;sad pose face;30
+animations\mimics\warewolf_mimic_animation.w2anims;monster;werewolf;layers;sceptic_pose_face;sceptic pose face;30
+animations\mimics\warewolf_mimic_animation.w2anims;monster;werewolf;layers;surprised_pose_face;surprised pose face;30
+animations\woman\dialog\anna_henrietta_mimic_layers.w2anims;woman;anna henrietta;layers;take 001_face;take 001 face;150
+animations\mimics\ciri_mimic_animation.w2anims;woman;ciri;;geralt_neutral_gesture_diasppointment_sad_face;geralt neutral gesture diasppointment sad face;160
+animations\mimics\ciri_mimic_animation.w2anims;woman;ciri;;geralt_neutral_gesture_eating_face;geralt neutral gesture eating face;184
+animations\mimics\ciri_mimic_animation.w2anims;woman;ciri;;geralt_neutral_gesture_smile03_face;geralt neutral gesture smile03 face;180
+animations\mimics\ciri_mimic_animation.w2anims;woman;ciri;;geralt_neutral_yes_long_face;geralt neutral yes long face;130
+animations\mimics\ciri_mimic_animation.w2anims;woman;ciri;;geralt_reaction_smile_genuine_face;geralt reaction smile genuine face;180
+animations\woman\dialog\ep2_syanna_mimic_layers.w2anims;woman;syanna;layers;bursting_anger_face;bursting anger face;600
+animations\woman\dialog\ep2_syanna_mimic_layers.w2anims;woman;syanna;layers;bursting_pose_face;bursting pose face;10
+animations\woman\dialog\ep2_syanna_mimic_layers.w2anims;woman;syanna;layers;harald_weareancraite_face;harald weareancraite face;80
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;afraid_anim_combined_face;afraid anim combined face;500
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;afraid_anim_face;afraid anim face;500
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;afraid_eyes_face;afraid eyes face;500
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;afraid_eyes_soft_face;afraid eyes soft face;500
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;afraid_pose_face;afraid pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;aggressive_anim_combined_face;aggressive anim combined face;650
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;aggressive_anim_face;aggressive anim face;650
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;aggressive_eyes_face;aggressive eyes face;650
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;aggressive_eyes_soft_face;aggressive eyes soft face;650
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;aggressive_pose_face;aggressive pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;blink_fast_face;blink fast face;16
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;blink_long_face;blink long face;30
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;blink_normal_face;blink normal face;16
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;brows_down_accent_face;brows down accent face;26
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;brows_up_accent_face;brows up accent face;26
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;bursting_anger_anim_face;bursting anger anim face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;bursting_anger_combined_face;bursting anger combined face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;bursting_anger_eyes_face;bursting anger eyes face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;bursting_anger_pose_face;bursting anger pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;confident_anim_combined_face;confident anim combined face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;confident_anim_face;confident anim face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;confident_eyes_face;confident eyes face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;confident_eyes_soft_face;confident eyes soft face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;confident_pose_face;confident pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;confident02_pose_face;confident02 pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;constant_brows_down_accent_face;constant brows down accent face;21
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;constant_brows_up_accent_face;constant brows up accent face;21
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;constant_closed_eyes_face;constant closed eyes face;21
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;constant_left_brow_up_accent_face;constant left brow up accent face;21
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;constant_right_brow_up_accent_face;constant right brow up accent face;21
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;contempt_pose_face;contempt pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;cry_anim_face;cry anim face;700
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;cry_combined_face;cry combined face;700
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;cry_eyes_face;cry eyes face;700
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;cry_pose_face;cry pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;debug_0_percent_face;debug 0 percent face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;debug_10_percent_face;debug 10 percent face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;debug_100_percent_face;debug 100 percent face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;debug_25_percent_face;debug 25 percent face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;debug_50_percent_face;debug 50 percent face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;debug_75_percent_face;debug 75 percent face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;determined_anim_face;determined anim face;840
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;determined_combined_face;determined combined face;840
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;determined_eyes_face;determined eyes face;840
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;determined_pose_face;determined pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;disgusted_anim_combined_face;disgusted anim combined face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;disgusted_anim_face;disgusted anim face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;disgusted_eyes_face;disgusted eyes face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;disgusted_eyes_soft_face;disgusted eyes soft face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;disgusted_pose_face;disgusted pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;fearful_anim_combined_face;fearful anim combined face;520
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;fearful_anim_face;fearful anim face;520
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;fearful_eyes_face;fearful eyes face;520
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;fearful_eyes_soft_face;fearful eyes soft face;520
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;fearful_pose_face;fearful pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;focused_anim_combined_face;focused anim combined face;889
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;focused_anim_face;focused anim face;889
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;focused_eyes_face;focused eyes face;889
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;focused_pose_face;focused pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;grin_anim_combined_face;grin anim combined face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;grin_anim_face;grin anim face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;grin_eyes_face;grin eyes face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;grin_eyes_soft_face;grin eyes soft face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;grin_pose_face;grin pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;happy_anim_combined_face;happy anim combined face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;happy_anim_face;happy anim face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;happy_eyes_face;happy eyes face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;happy_eyes_soft_face;happy eyes soft face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;happy_pose_face;happy pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;head_down_head_accent_face;head down head accent face;22
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;head_left01_head_accent_face;head left01 head accent face;55
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;head_right01_head_accent_face;head right01 head accent face;57
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;head_up_head_accent_face;head up head accent face;37
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;left_brow_up_accent_face;left brow up accent face;28
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;nervous_anim_combined_face;nervous anim combined face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;nervous_anim_face;nervous anim face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;nervous_eyes_face;nervous eyes face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;nervous_eyes_soft_face;nervous eyes soft face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;nervous_pose_face;nervous pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;neutral_anim_combined_face;neutral anim combined face;610
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;neutral_anim_face;neutral anim face;610
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;neutral_eyes_face;neutral eyes face;610
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;neutral_eyes_soft_face;neutral eyes soft face;610
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;neutral_pose_face;neutral pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;no_head_accent_face;no head accent face;60
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;nod_head_accent_face;nod head accent face;55
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;normal_blend_test_face;normal blend test face;500
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;pain_pose_face;pain pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;proud_pose_face;proud pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;quicknod_head_accent_face;quicknod head accent face;46
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;right_brow_up_accent_face;right brow up accent face;28
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sad_anim_combined_face;sad anim combined face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sad_anim_face;sad anim face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sad_eyes_face;sad eyes face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sad_eyes_soft_face;sad eyes soft face;540
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sad_pose_face;sad pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sceptic_pose_face;sceptic pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;seducing_anim_combined_face;seducing anim combined face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;seducing_anim_face;seducing anim face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;seducing_eyes_face;seducing eyes face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;seducing_eyes_soft_face;seducing eyes soft face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;seducing_pose_face;seducing pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sleeping_anim_combined_face;sleeping anim combined face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sleeping_anim_face;sleeping anim face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sleeping_eyes_face;sleeping eyes face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sleeping_pose_face;sleeping pose face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sleepy_eyes_face;sleepy eyes face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;sleepy_eyes_soft_face;sleepy eyes soft face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;suprised_shocked_pose_face;suprised shocked pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;surprised_anim_combined_face;surprised anim combined face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;surprised_anim_face;surprised anim face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;surprised_eyes_face;surprised eyes face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;surprised_eyes_soft_face;surprised eyes soft face;600
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;surprised_pose_face;surprised pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;white_eyes_pose_face;white eyes pose face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;yes_head_accent_face;yes head accent face;50
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;zero_all_face;zero all face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;zero_all_lookat_face;zero all lookat face;10
+animations\woman\dialog\yennefer_mimic_layers.w2anims;woman;yennefer;layers;zero_all_pose_face;zero all pose face;10
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;anabelleall_face;anabelleall face;850
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;anabelleallshort_face;anabelleallshort face;400
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;anabelletest_face;anabelletest face;850
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;ep1_slow_dance_outro_shani_face;ep1 slow dance outro shani face;1095
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;ep2_q704_diva_breathing_face;ep2 q704 diva breathing face;140
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;ep2_syanna_lip_bite_face;ep2 syanna lip bite face;100
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_agreement_face;geralt neutral gesture agreement face;110
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_approval_face;geralt neutral gesture approval face;125
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_axii_face;geralt neutral gesture axii face;100
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_closing_eyes_face;geralt neutral gesture closing eyes face;170
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_diasppointment_face;geralt neutral gesture diasppointment face;160
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_diasppointment_neutral_face;geralt neutral gesture diasppointment neutral face;160
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_disapproval_face;geralt neutral gesture disapproval face;80
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_dont_know_face;geralt neutral gesture dont know face;90
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_drinking_face;geralt neutral gesture drinking face;250
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_eyeroll_face;geralt neutral gesture eyeroll face;100
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_grimace_face;geralt neutral gesture grimace face;130
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_gulp_face;geralt neutral gesture gulp face;35
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_gulp_with_eye_blink_face;geralt neutral gesture gulp with eye blink face;35
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_head_point_left_back_face;geralt neutral gesture head point left back face;65
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_head_point_left_front_face;geralt neutral gesture head point left front face;60
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_head_point_left_side_face;geralt neutral gesture head point left side face;60
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_head_point_right_back_face;geralt neutral gesture head point right back face;65
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_head_point_right_front_face;geralt neutral gesture head point right front face;60
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_head_point_right_side_face;geralt neutral gesture head point right side face;60
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_impatience_face;geralt neutral gesture impatience face;170
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_impressed01_face;geralt neutral gesture impressed01 face;160
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_impressed02_face;geralt neutral gesture impressed02 face;160
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_interrupted_01_face;geralt neutral gesture interrupted 01 face;150
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_kiss_short_face;geralt neutral gesture kiss short face;90
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_laugh_snort_face;geralt neutral gesture laugh snort face;60
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_laughter_face;geralt neutral gesture laughter face;135
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_licklips_face;geralt neutral gesture licklips face;75
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_listen_to_me_face;geralt neutral gesture listen to me face;170
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_look_around_slow_face;geralt neutral gesture look around slow face;310
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_maybe_face;geralt neutral gesture maybe face;85
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_no_face;geralt neutral gesture no face;60
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_no_long_face;geralt neutral gesture no long face;215
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_no_noface_face;geralt neutral gesture no noface face;60
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_no_short_face;geralt neutral gesture no short face;55
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_nod_face;geralt neutral gesture nod face;55
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_question_direct_face;geralt neutral gesture question direct face;37
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_question_ver01_not_bad_face;geralt neutral gesture question ver01 not bad face;80
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_question_ver01_not_bad_with_blink_face;geralt neutral gesture question ver01 not bad with blink face;80
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_question_ver02_happy_face;geralt neutral gesture question ver02 happy face;80
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_question_ver03_face;geralt neutral gesture question ver03 face;80
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_question_ver04_face;geralt neutral gesture question ver04 face;85
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_question_ver05_face;geralt neutral gesture question ver05 face;70
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_quicknod_face;geralt neutral gesture quicknod face;31
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_rapid_head_flick_up_face;geralt neutral gesture rapid head flick up face;35
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_reaction_01_face;geralt neutral gesture reaction 01 face;100
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_reaction_02_face;geralt neutral gesture reaction 02 face;150
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_really_face;geralt neutral gesture really face;85
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_resentful_face;geralt neutral gesture resentful face;120
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_sceptical_remark_face;geralt neutral gesture sceptical remark face;101
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_shake_it_off_face;geralt neutral gesture shake it off face;80
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_shout_no_way_face;geralt neutral gesture shout no way face;87
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_shout_out_of_my_sight_face;geralt neutral gesture shout out of my sight face;171
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_shout_outta_my_way_face;geralt neutral gesture shout outta my way face;65
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_shout_youre_wrong_face;geralt neutral gesture shout youre wrong face;75
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_shut_up_face;geralt neutral gesture shut up face;60
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_smile_face;geralt neutral gesture smile face;67
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_smile_syanna_face;geralt neutral gesture smile syanna face;67
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_smile02_face;geralt neutral gesture smile02 face;120
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_smile02_syanna_face;geralt neutral gesture smile02 syanna face;120
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_smile03_syanna_face;geralt neutral gesture smile03 syanna face;180
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_sour_face;geralt neutral gesture sour face;180
+animations\mimics\yennefer_mimic_animation_new_skin.w2anims;woman;yennefer;;geralt_neutral_gesture_squint old_face;geralt neutral gesture squint old face;75
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_squint_face;geralt neutral gesture squint face;73
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_supreme_meaning_face;geralt neutral gesture supreme meaning face;140
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_suprised_worried_face;geralt neutral gesture suprised worried face;95
+animations\mimics\yennefer_mimic_animation_new_skin.w2anims;woman;yennefer;;geralt_neutral_gesture_sure_sure_face;geralt neutral gesture sure sure face;132
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_sure_sure_face;geralt neutral gesture sure sure face;125
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_vodka_face;geralt neutral gesture vodka face;200
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_warning_face;geralt neutral gesture warning face;100
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_warning_you_taking_to_me_face;geralt neutral gesture warning you taking to me face;100
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_what_did_you_say_face;geralt neutral gesture what did you say face;135
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_what_face;geralt neutral gesture what face;115
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_what_ver02_face;geralt neutral gesture what ver02 face;100
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_whew_face;geralt neutral gesture whew face;130
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_white_eyes_face;geralt neutral gesture white eyes face;185
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_wink_face;geralt neutral gesture wink face;30
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_wondering_face;geralt neutral gesture wondering face;156
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_yawn_face;geralt neutral gesture yawn face;250
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_yes_face;geralt neutral gesture yes face;71
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_yes_noface_face;geralt neutral gesture yes noface face;71
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_yes_slow_face;geralt neutral gesture yes slow face;98
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_gesture_you_kiddin_face;geralt neutral gesture you kiddin face;140
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_no_contempt_face;geralt neutral no contempt face;135
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_no_fast_face;geralt neutral no fast face;80
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_no_not_a_chance_face;geralt neutral no not a chance face;43
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_no_slow_face;geralt neutral no slow face;132
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_question_can_we_beat_them_face;geralt neutral question can we beat them face;75
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_question_king_slaughtered_face;geralt neutral question king slaughtered face;79
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_question_problem_face;geralt neutral question problem face;100
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_question_what_did_ya_say_face;geralt neutral question what did ya say face;70
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_question_where_face;geralt neutral question where face;95
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_question_where_monsters_face;geralt neutral question where monsters face;102
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_question_why_face;geralt neutral question why face;51
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_question_you_sure_face;geralt neutral question you sure face;90
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_shout_cheers_face;geralt neutral shout cheers face;75
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_shout_hurray_face;geralt neutral shout hurray face;72
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_shout_we_won_face;geralt neutral shout we won face;96
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_shout_you_falied_face;geralt neutral shout you falied face;81
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_yes_long_face;geralt neutral yes long face;116
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_yes_ok_face;geralt neutral yes ok face;40
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_neutral_yes_slow_face;geralt neutral yes slow face;135
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_passionate_kiss_front_01_face;geralt passionate kiss front 01 face;576
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_pose_eye_darts_nervous_face;geralt pose eye darts nervous face;550
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_pose_eye_darts_normal_face;geralt pose eye darts normal face;500
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_pose_eye_darts_tired_sleepy_face;geralt pose eye darts tired sleepy face;600
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_pose_subtle_gestures_face;geralt pose subtle gestures face;500
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_admiration_face;geralt reaction admiration face;381
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_anger_restrain_face;geralt reaction anger restrain face;220
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_anguish_face;geralt reaction anguish face;280
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_annoyed_face;geralt reaction annoyed face;100
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_bored_face;geralt reaction bored face;240
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_confidence_face;geralt reaction confidence face;210
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_consternation_face;geralt reaction consternation face;210
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_disgust_face;geralt reaction disgust face;230
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_embarrassment_face;geralt reaction embarrassment face;260
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_eye_smile_face;geralt reaction eye smile face;240
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_eye_smile_syanna_face;geralt reaction eye smile syanna face;240
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_grief_face;geralt reaction grief face;230
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_horrified_face;geralt reaction horrified face;187
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_humiliation_face;geralt reaction humiliation face;468
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_i_dont_agree_face;geralt reaction i dont agree face;170
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_i_dont_understand_face;geralt reaction i dont understand face;100
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_irritation_face;geralt reaction irritation face;280
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_listening_new_info_face;geralt reaction listening new info face;270
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_mad_face;geralt reaction mad face;60
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_rage_face;geralt reaction rage face;225
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_relief_face;geralt reaction relief face;180
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_sad_face;geralt reaction sad face;180
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_scepticism_face;geralt reaction scepticism face;330
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_searching_for_words_face;geralt reaction searching for words face;160
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_smile_face;geralt reaction smile face;270
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_thankful_face;geralt reaction thankful face;140
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reaction_uncertain_face;geralt reaction uncertain face;205
+animations\mimics\yennefer_mimic_animation.w2anims;woman;yennefer;;geralt_reacton_tired_face;geralt reacton tired face;180
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_neutral_gesture_disapproval_face;geralt neutral gesture disapproval face;72
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_neutral_gesture_mouth2_face;geralt neutral gesture mouth2 face;70
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_neutral_gesture_mouth3_face;geralt neutral gesture mouth3 face;75
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_neutral_gesture_reaction_01_face;geralt neutral gesture reaction 01 face;180
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_neutral_gesture_shout_youre_wrong_face;geralt neutral gesture shout youre wrong face;80
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_neutral_no_not_a_chance_face;geralt neutral no not a chance face;40
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_neutral_yes_ok_face;geralt neutral yes ok face;35
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_anger_face;geralt pose anger face;600
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_bursting_anger_listening_face;geralt pose bursting anger listening face;500
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_contempt_face;geralt pose contempt face;10
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_disgust_face;geralt pose disgust face;10
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_fear_face;geralt pose fear face;10
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_focused_face;geralt pose focused face;10
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_happiness_face;geralt pose happiness face;10
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_listening_face;geralt pose listening face;127
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_neutral_face;geralt pose neutral face;600
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_pride_face;geralt pose pride face;10
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_sadness_face;geralt pose sadness face;300
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_sceptic_face;geralt pose sceptic face;10
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_surprise_face;geralt pose surprise face;10
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_pose_surprised_face;geralt pose surprised face;100
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_reaction_disgust_face;geralt reaction disgust face;220
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_reaction_I_dont_agree_face;geralt reaction I dont agree face;170
+animations\mimics\woman_mimic_animation.w2anims;woman;;;geralt_reaction_mad_face;geralt reaction mad face;76

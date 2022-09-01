@@ -1,0 +1,10 @@
+*.pyc
+.vscode/*
+
+# Local History for Visual Studio Code
+.history/
+qt/*
+TEMP/
+io_import_w2l/export_anims.py
+io_import_w2l/test.py
+io_import_w2l/.vscode/
