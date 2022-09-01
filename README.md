@@ -17,7 +17,11 @@ Blender addon for working with Witcher 3 files. Very much a work in progress. Ma
 
 
 ## Requirements
+- Blender ~3.2.1
+
 - [FBX Import plugin for blender](https://www.nexusmods.com/witcher3/mods/6118) - Won't work without this.
+
+- [yaml for python](https://mega.nz/file/PJJARA5S#jDFjV18W6JCB-NAs_NPm8iVAseMmGkL7IH7t5fw_HTU) - Put this yaml folder in your blender addons folder if you're getting a yaml error. [yaml on git](https://github.com/yaml/pyyaml/tree/master/lib/yaml)
 
 - [ArdCarraigh Blender_APX_Addon](https://github.com/ArdCarraigh/Blender_APX_Addon) - The APX addon is needed to load any redcloth items. You will have to export all apx form the game and add the Redcloth repo in addon settings
 
