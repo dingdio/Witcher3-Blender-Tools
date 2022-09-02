@@ -107,8 +107,8 @@ def importCloth(filename, mat_filename, ns="cake", name=":"):
     minimal_armature=True #!change
     rm_ph_me=True
 
-    #io_scene_apx.read_apx(context, filepath, rm_db, use_mat, rotate_180, scale_down, minimal_armature, rm_ph_me)
-    read_clothing(context, filepath, rm_db, use_mat, rotate_180, minimal_armature, rm_ph_me)
+    #io_scene_apx.read_apx(context, filepath, rm_db, use_mat, rotate_180, scale_down, rm_ph_me)
+    read_clothing(context, filepath, rm_db, use_mat, rotate_180, rm_ph_me)
     # objs = bpy.context.objects[:]
     # for obj in objs:
     #     print (obj.name)

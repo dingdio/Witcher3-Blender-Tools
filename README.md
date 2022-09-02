@@ -23,7 +23,7 @@ Blender addon for working with Witcher 3 files. Very much a work in progress. Ma
 
 - [yaml for python](https://mega.nz/file/PJJARA5S#jDFjV18W6JCB-NAs_NPm8iVAseMmGkL7IH7t5fw_HTU) - Put this yaml folder in your blender addons folder if you're getting a yaml error. [yaml on git](https://github.com/yaml/pyyaml/tree/master/lib/yaml)
 
-- [ArdCarraigh Blender_APX_Addon](https://github.com/ArdCarraigh/Blender_APX_Addon) - The APX addon is needed to load any redcloth items. You will have to export all apx form the game and add the Redcloth repo in addon settings
+- [ArdCarraigh Blender_APX_Addon](https://github.com/ArdCarraigh/Blender_APX_Addon) - The APX addon is needed to load any redcloth items. You will have to export all apx from the game and add the Redcloth repo in addon settings
 
 - [Prolog World Terrain Setup](https://mega.nz/file/WNZzCQQR#KICtWteq_OxwU_YKj4LU09kdJlBMqzzwIJd8DVGil4Q) - Not really required but has an example of how I set up basic terrain for the prolog world. It won't match how it looks in game but good enough to place game objects in blender. video - https://www.youtube.com/watch?v=qlRfUGMCyvQ
 
