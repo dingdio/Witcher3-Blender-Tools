@@ -37,5 +37,6 @@ in the addon settings add your own paths to:
 - tex_uncook_path = repo folder with ALL exported .tga from the game
 
 All these folders can be the same repo
+Since wcclite.exe has trouble exporting many fbx from the Witcher 3 game I have uploaded my collection of .fbx files along with Redcloth items in .apx format. Find them in this folder: [Folder Link](https://mega.nz/folder/GIR3AZBY#I4EEwkl4tjgnIv07f10n0A)
 
 
