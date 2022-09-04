@@ -384,7 +384,8 @@ def import_single_component(component, parent_obj):
         bpy.ops.object.light_add(type='POINT', radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
         light_obj = bpy.context.selected_objects[:][0]
         light_obj.parent = parent_obj
-        light_obj.data.energy = component.GetVariableByName('brightness').Value * 10
+        if component.GetVariableByName('brightness'):
+            light_obj.data.energy = component.GetVariableByName('brightness').Value * 10
 
         if component.GetVariableByName('color'):
             for color in component.GetVariableByName('color').More:
@@ -394,7 +395,8 @@ def import_single_component(component, parent_obj):
                     light_obj.data.color[1] = color.Value/255
                 if color.theName == "Blue":
                     light_obj.data.color[2] = color.Value/255
-        light_obj.data.shadow_soft_size = component.GetVariableByName('radius').Value
+        if component.GetVariableByName('radius'):
+            light_obj.data.shadow_soft_size = component.GetVariableByName('radius').Value
         if component.GetVariableByName('transform'):
             set_blender_object_transform(light_obj, component.GetVariableByName('transform').EngineTransform)
     return

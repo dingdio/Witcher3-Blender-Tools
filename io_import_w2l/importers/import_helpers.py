@@ -309,5 +309,7 @@ def checkLevel(levelData):
         return True
     else:
         print("Missing", len(errors) ,"/", len(levelData.Entities))
+        for error in errors:
+            print(error)
         return False
 
