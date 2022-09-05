@@ -1,4 +1,5 @@
 from io_import_w2l import get_texture_path
+from io_import_w2l import get_keep_lod_meshes
 
 from typing import List, Tuple, Dict
 from bpy.types import Operator, Object
@@ -173,7 +174,8 @@ def deduplicate_images():
             img.user_remap(filepaths[img.filepath])
 
 def importFbx(filepath, ns="cake", name=":", uncook_path=False, keep_lod_meshes = False):
-    #keep_lod_meshes = True
+    context = bpy.context
+    keep_lod_meshes = get_keep_lod_meshes(context)
     if not os.path.exists(filepath):
         print("Can't find FBX file", filepath)
         #cmds.confirmDialog( title='Error', button='OK', message='Can\'t find "{0}". Check it exists in the FBX depo.'.format( filepath ))
@@ -183,7 +185,6 @@ def importFbx(filepath, ns="cake", name=":", uncook_path=False, keep_lod_meshes 
     #     "name":filepath}],
     #     directory=filepath+"\\",
     #     force_update_mats=False)
-    context = bpy.context
     uncook_path = get_texture_path(context)+"\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
     tex_table = load_texture_table()
 
