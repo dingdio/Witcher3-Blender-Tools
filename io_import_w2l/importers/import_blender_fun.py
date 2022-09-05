@@ -15,6 +15,7 @@ from io_import_w2l import fbx_util
 from io_import_w2l import get_uncook_path
 from io_import_w2l import get_W3_FOLIAGE_PATH
 from io_import_w2l import get_fbx_uncook_path
+from io_import_w2l import get_keep_lod_meshes
 
 def set_blender_object_transform(obj, EngineTransform):
     """Sets blender object to RED Engine Transform
@@ -208,6 +209,36 @@ def loadLevel(levelData):
 
 from bpy.types import Object, Mesh
 
+def check_if_empty_already_in_scene(repo_path):
+    start_time1 = time.time()
+    for o in bpy.context.scene.objects:
+        if o.type != 'EMPTY':
+            continue
+        if o.name[-4] != "." and 'repo_path' in o and o['repo_path'] == repo_path:
+            logging.critical('Check Mesh found in %f seconds.', time.time() - start_time1)
+            start_time2 = time.time()
+            #log.info("COPYING", o['repo_path'])
+            new_obj = o.copy()
+            for ch_obj in o.children:
+                new_ch_obj = ch_obj.copy()
+                new_ch_obj.parent = new_obj
+                bpy.context.collection.objects.link(new_ch_obj)
+            bpy.context.collection.objects.link(new_obj)
+            x, y, z = (radians(0), radians(0), radians(0))
+            mat = Euler((x, y, z)).to_matrix().to_4x4()
+            new_obj.matrix_world = mat
+
+            new_obj.location[0] = 0
+            new_obj.location[1] = 0
+            new_obj.location[2] = 0
+            new_obj.scale[0] = 1
+            new_obj.scale[1] = 1
+            new_obj.scale[2] = 1
+            new_obj.parent = None
+            logging.critical('Check Mesh Finished importing in %f seconds.', time.time() - start_time2)
+            return new_obj
+    return False
+
 def check_if_mesh_already_in_scene(repo_path):
 
     start_time1 = time.time()
@@ -224,7 +255,7 @@ def check_if_mesh_already_in_scene(repo_path):
     for o in bpy.context.scene.objects:
         if o.type != 'MESH':
             continue
-        if 'repo_path' in o and o['repo_path'] == repo_path:
+        if o.name[-4] != "." and 'repo_path' in o and o['repo_path'] == repo_path:
             logging.critical('Check Mesh found in %f seconds.', time.time() - start_time1)
             start_time2 = time.time()
             #log.info("COPYING", o['repo_path'])
@@ -256,15 +287,22 @@ def import_single_mesh(mesh, errors, parent_transform = False):
     # log.info("             ")
     # log.info(str(mesh.exists())+" "+ mesh.fbxPath())
     # log.info("             ")
+    keep_lod_meshes = get_keep_lod_meshes(bpy.context)
 
-    obj = check_if_mesh_already_in_scene(mesh.meshName)
-
+    if keep_lod_meshes:
+        obj = check_if_empty_already_in_scene(mesh.meshName)
+    else:
+        obj = check_if_mesh_already_in_scene(mesh.meshName)
+    #obj = False
     if not obj:
+        if keep_lod_meshes:
+            bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
+            obj = bpy.context.object
         try:
             if mesh.type == "mesh_foliage":
                 bpy.ops.import_scene.fbx(filepath=mesh.fbxPath())
             else:
-                fbx_util.importFbx(mesh.fbxPath(),mesh.fileName(),mesh.fileName())
+                fbx_util.importFbx(mesh.fbxPath(),mesh.fileName(),mesh.fileName(), keep_lod_meshes=keep_lod_meshes)
                 # bpy.ops.import_scene.witcher3_fbx_batch(filepath=mesh.fbxPath(),
                 #     files=[{"name":mesh.fileName(),
                 #     "name":mesh.fileName()}],
@@ -273,15 +311,22 @@ def import_single_mesh(mesh, errors, parent_transform = False):
         except:
             log.error("#1 Problem with FBX importer "+mesh.fbxPath())
         try:
-            obj = bpy.context.selected_objects[:][0]
-            obj['repo_path'] = mesh.meshName
+            
+            objs = bpy.context.selected_objects[:]
+            if keep_lod_meshes:
+                obj.name = Path(mesh.meshName).stem
+                obj['repo_path'] = mesh.meshName
+                for subobj in objs:
+                    subobj.parent = obj
+            else:
+                obj = objs[0]
+                obj['repo_path'] = mesh.meshName
             #apply scale
             bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
         except:
             #usually tried to do something with materials and failed
             log.error("#2 Problem with FBX importer "+mesh.fbxPath())
             return
-
     if parent_transform:
         obj.parent = parent_transform
 

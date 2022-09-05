@@ -59,6 +59,11 @@ def get_W3_REDCLOTH_PATH(context) -> str:
     return W3_REDCLOTH_PATH
 
 
+def get_keep_lod_meshes(context) -> str:
+    addon_prefs = context.preferences.addons[__package__].preferences
+    keep_lod_meshes = addon_prefs.keep_lod_meshes
+    return keep_lod_meshes
+
 
 #logging
 #from io_import_w2l.setup_logging_bl import *
@@ -175,10 +180,14 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         default='F:\\voice_synth\\witcher\\speech\\ogg',
         description="Path with ogg files"
     )
+    
+    keep_lod_meshes: bpy.props.BoolProperty(name="Keep lod meshes", default = True)
 
     #importFacePoses
     def draw(self, context):
         layout = self.layout
+        layout.label(text="Witcher 3 Mesh settings:")
+        layout.prop(self, "keep_lod_meshes")
         layout.label(text="Witcher 3 Tools settings:")
         layout.prop(self, "uncook_path")
         layout.prop(self, "fbx_uncook_path")

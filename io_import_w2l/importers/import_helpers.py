@@ -1,6 +1,7 @@
 import os
 try:
     import bpy
+    from io_import_w2l import get_fbx_uncook_path
 except Exception as e:
     pass
 from pathlib import Path
@@ -10,7 +11,6 @@ from CR2W.CR2W_helpers import Enums
 #from io_import_w2l.setup_logging_bl import *
 from CR2W.setup_logging import *
 log = logging.getLogger(__name__)
-from io_import_w2l import get_fbx_uncook_path
 
 def get_w3_level_data(level, fbx_uncook_path = False):
     if fbx_uncook_path == False:

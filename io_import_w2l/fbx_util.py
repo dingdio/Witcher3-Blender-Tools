@@ -146,12 +146,15 @@ def import_w3_fbx(context
     bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
     enable_print(True)
 
-    for o in reversed(meshes):
-        if "lod1" in o.name or \
-            "lod2" in o.name or \
-            "lod3" in o.name or \
-            "lod4" in o.name:
-            o.hide_viewport = True
+    # for o in reversed(meshes):
+    #     if "lod1" in o.name or \
+    #         "lod2" in o.name or \
+    #         "lod3" in o.name or \
+    #         "lod4" in o.name:
+    #         o.hide_viewport = True
+    # for o in reversed(meshes):
+    #     if "_proxy" in o.name:
+    #         o.hide_viewport = False
     return (meshes, armatures)
 
 def set_render_settings(context):
@@ -170,7 +173,7 @@ def deduplicate_images():
             img.user_remap(filepaths[img.filepath])
 
 def importFbx(filepath, ns="cake", name=":", uncook_path=False, keep_lod_meshes = False):
-    keep_lod_meshes = True
+    #keep_lod_meshes = True
     if not os.path.exists(filepath):
         print("Can't find FBX file", filepath)
         #cmds.confirmDialog( title='Error', button='OK', message='Can\'t find "{0}". Check it exists in the FBX depo.'.format( filepath ))
