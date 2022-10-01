@@ -3,6 +3,9 @@ import functools
 import os
 from pathlib import Path
 import time
+from CR2W.Types.CMesh import CMesh
+
+from CR2W.Types.VariousTypes import CNAME, NAME, CBufferVLQInt32, CColor
 
 from .bStream import *
 from .setup_logging import *
@@ -485,6 +488,25 @@ class SBlockDataCollisionObject:
         elif (read > size):
             log.error("ERROR READING SBlockDataMeshObject")
 
+class SBlockDataDimmer(object):
+    """docstring for SBlockDataDimmer."""
+    def __init__(self, f, size, packedObjectType):
+        startp = f.tell()
+        #self.meshIndex = readUShort(f) #CUInt16
+
+        self.ambienLevel = readFloat(f)
+        self.marginFactor = readFloat(f)
+        self.dimmerType = readUByte(f)
+        self.paddin1 = readUByte(f)
+        self.paddin2 = readUShort(f)
+
+        endp = f.tell()
+        read = endp - startp
+        if (read < size):
+            f.seek(size - read, 1)#unk1.Read(file, size - (uint)read);
+        elif (read > size):
+            log.error("ERROR READING SBlockDataDimmer")
+
 class SBlockDataMeshObject:
     def __init__(self, f, size, packedObjectType):
         startp = f.tell();
@@ -504,20 +526,6 @@ class SBlockDataMeshObject:
             f.seek(size - read, 1)#unk1.Read(file, size - (uint)read);
         elif (read > size):
             log.error("ERROR READING SBlockDataMeshObject")
-
-class CColor:
-    def __init__(self):
-        self.Red = False
-        self.Green = False
-        self.Blue = False
-        self.Alpha = False
-
-    def Read(self, f):
-        self.Red = f.readUInt8()
-        self.Green = f.readUInt8()
-        self.Blue = f.readUInt8()
-        self.Alpha = f.readUInt8()
-        return self
 
 class SBlockDataRigidBody:
     def __init__(self, f, size, packedObjectType):
@@ -601,6 +609,9 @@ class SBlockData:
         elif packedObjectType == Enums.BlockDataObjectType.Collision: # actuall rigid bodies?
             self.packedObject = SBlockDataCollisionObject(f, size - 56, packedObjectType)
             self.resourceIndex = self.packedObject.meshIndex
+        elif packedObjectType == Enums.BlockDataObjectType.Dimmer:
+            self.packedObject = SBlockDataDimmer(f, size - 56, packedObjectType)
+            #self.resourceIndex = self.packedObject.meshIndex
         # elif packedObjectType == Enums.BlockDataObjectType.Invalid:
         #     self.packedObject = SBlockDataMeshObject(f, size - 56, packedObjectType)
         #     self.resourceIndex = self.packedObject.meshIndex
@@ -1350,18 +1361,6 @@ class SFoliageResourceData():
         
         #CBufferVLQInt32<SFoliageInstanceData> TreeCollection { get; set; }
 
-class CBufferVLQInt32():
-    def __init__(self, CR2WFILE, buffer_type):
-        self.buffer_type = buffer_type;
-        self.CR2WFILE = CR2WFILE
-        self.elements = []
-    def Read(self, f, size):
-        elementcount = ReadVLQInt32(f)
-        for _ in range(0, elementcount):
-            element = self.buffer_type(self.CR2WFILE)
-            element.Read(f, 0)
-            self.elements.append(element)
-
 class CVariantSizeNameType():
     def __init__(self, CR2WFILE):
         self.CR2WFILE = CR2WFILE
@@ -1473,7 +1472,17 @@ class CLASS:
         # if self.name == "CHardAttachment":
         #     log.debug("CHardAttachment")
         tempClass  = parent.currentClass; # local string
-        if currentClass == "CLayerGroup":
+        if currentClass == "CMesh":
+            while True:
+                prop = PROPERTY(f, CR2WFILE, self)
+                if prop.Type == None:
+                    break
+                self.PROPS.append(prop)
+            #ReadAllRedVariables
+            #REDBuffers
+            self.CMesh = CMesh(CR2WFILE)
+            self.CMesh.Read(f, 0)
+        elif currentClass == "CLayerGroup":
             while True:
                 prop = PROPERTY(f, CR2WFILE, self)
                 if prop.Type == None:
@@ -1801,26 +1810,6 @@ class CR2WImport:
 #     }
 #     return (uint32)(0xFFFFFFFF & fnvhash);
 # }
-
-class CNAME:
-    def __init__(self,f):
-        self.value = getString(f)
-    def WriteCNAME():
-        #GenerateHash
-        pass
-
-class NAME:
-    def __init__(self,f, CR2WFILE):
-        self.stringOffset = readU32(f)
-        hashStartOffset = f.tell()
-        self.hash = readU32(f)
-        f.seek(CR2WFILE.CR2WTable[0].offset + self.stringOffset + CR2WFILE.start)
-        # CNAME name;
-        self.name = CNAME(f)
-        # local string hName <hidden=true> = (string)name;
-
-        f.seek(hashStartOffset + 4)
-        # FSeek(startof(hash)+4);
 
 def getCR2WTABLEName(index, version):
     if index == 0: return "Strings"

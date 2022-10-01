@@ -28,6 +28,11 @@ class Enums:
                     "Particles"]
             return arr[num]
 
+    class EDimmerType(Enum):
+        DIMMERTYPE_Default = 0
+        DIMMERTYPE_InsideArea = 1
+        DIMMERTYPE_OutsideArea = 2
+
     class ESkeletalAnimationType(Enum):
         """Docstring for ESkeletalAnimationType."""
         SAT_Normal = 0

@@ -1,3 +1,5 @@
+from .Types.BlenderMesh import CommonData
+from .Types.SBufferInfos import SBufferInfos, SVertexBufferInfos
 from .setup_logging import *
 log = logging.getLogger(__name__)
 
@@ -8,8 +10,19 @@ def load_bin_mesh(filename):
     log.info('FileLoading: '+ filename)
 
     with open(filename,"rb") as f:
-        theFile = getCR2W(f)
+        meshFile = getCR2W(f)
         f.close()
 
-    meshData = False
+    CData:CommonData = CommonData()
+    bufferInfos:SBufferInfos = SBufferInfos()
+    for chunk in meshFile.CHUNKS.CHUNKS:
+        if chunk.Type == "CMesh":
+            vertexBufferInfos = SVertexBufferInfos()
+            cookedDatas = chunk.GetVariableByName("cookedData")
+            ckae = 123
+        if chunk.Type == "CMaterialInstance":
+            CData.materialInstances.append(chunk)
+            pass
+
+    meshData = meshFile
     return meshData

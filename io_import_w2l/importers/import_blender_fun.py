@@ -54,9 +54,7 @@ def get_CSectorData(level):
         for idx, block in enumerate(level.CSectorData.BlockData):
             #TESTING
             this_type = Enums.BlockDataObjectType.getEnum(block.packedObjectType)
-            if this_type != "mesh" and block.resourceIndex < 12:
-                pass#print("cake")
-            if block.resourceIndex < 12:
+            if hasattr(block, 'resourceIndex') and block.resourceIndex < 12:
                 this_resource = level.CSectorData.Resources[block.resourceIndex].pathHash
                 print(block.resourceIndex, this_resource)
 
@@ -107,7 +105,7 @@ def loadLevel(levelData):
     levelFile = levelData.layerNode
     errors = ['======Errors======= '+ levelFile]
 
-    ready_to_import = checkLevel(levelData)
+    ready_to_import = True#checkLevel(levelData)
 
     #create collection lfor this level
     if ready_to_import:
@@ -214,7 +212,7 @@ def check_if_empty_already_in_scene(repo_path):
     for o in bpy.context.scene.objects:
         if o.type != 'EMPTY':
             continue
-        if o.name[-4] != "." and 'repo_path' in o and o['repo_path'] == repo_path:
+        if len(o.name) > 4 and o.name[-4] != "." and 'repo_path' in o and o['repo_path'] == repo_path:
             logging.critical('Check Mesh found in %f seconds.', time.time() - start_time1)
             start_time2 = time.time()
             #log.info("COPYING", o['repo_path'])
@@ -302,12 +300,19 @@ def import_single_mesh(mesh, errors, parent_transform = False):
             if mesh.type == "mesh_foliage":
                 bpy.ops.import_scene.fbx(filepath=mesh.fbxPath())
             else:
-                fbx_util.importFbx(mesh.fbxPath(),mesh.fileName(),mesh.fileName(), keep_lod_meshes=keep_lod_meshes)
-                # bpy.ops.import_scene.witcher3_fbx_batch(filepath=mesh.fbxPath(),
-                #     files=[{"name":mesh.fileName(),
-                #     "name":mesh.fileName()}],
-                #     directory=mesh.filePath()+"\\",
-                #     force_update_mats=False)
+                if os.path.exists(mesh.fbxPath()):
+                    fbx_util.importFbx(mesh.fbxPath(),mesh.fileName(),mesh.fileName(), keep_lod_meshes=keep_lod_meshes)
+                else:
+                    print("Can't find FBX file", mesh.fbxPath())
+                    bpy.ops.mesh.primitive_cube_add()
+                    objs = bpy.context.selected_objects[:]
+                    objs[0].color = (0,0,1,1)
+                    objs[0].name = "ERROR_CUBE"
+                    err_mat = bpy.data.materials.new("ERROR_CUBE_MAT")
+                    err_mat.use_nodes = True
+                    principled = err_mat.node_tree.nodes['Principled BSDF']
+                    principled.inputs['Base Color'].default_value = (0,0,1,1)
+                    objs[0].data.materials.append(err_mat)
         except:
             log.error("#1 Problem with FBX importer "+mesh.fbxPath())
         try:
