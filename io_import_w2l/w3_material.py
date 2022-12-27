@@ -1,11 +1,13 @@
 # Modified w3_material.py from Mets3D orignal
 # https://github.com/Mets3D/batch_import_witcher3_fbx
 
-import logging
-## for file logging
-logging.basicConfig(level=logging.CRITICAL,
-        format='%(asctime)s %(levelname)s %(threadName)-10s %(message)s',)
+# import logging
+# ## for file logging
+# logging.basicConfig(level=logging.CRITICAL,
+#         format='%(asctime)s %(levelname)s %(threadName)-10s %(message)s',)
 
+from io_import_w2l.setup_logging_bl import *
+log = logging.getLogger(__name__)
 
 from pathlib import Path
 from . import CR2W
@@ -19,10 +21,12 @@ Element = ElementTree.Element
 
 from .w3_material_constants import *
 
-from io_import_w2l import get_modded_texture_path
+from io_import_w2l import get_modded_texture_path, get_uncook_path
+
+TEXTURE_EXT = '.tga'
 
 def repo_file(filepath: str):
-    if filepath.endswith('.tga'):
+    if filepath.endswith(TEXTURE_EXT):
         return os.path.join(get_modded_texture_path(bpy.context), filepath)
 
 def load_texture_table() -> Dict[str, List[str]]:
@@ -44,7 +48,7 @@ def make_texture_table(uncook_path) -> Dict[str, List[str]]:
 
     for subdir, dirs, files in os.walk(uncook_path):
         for f in files:
-            if not f.endswith(".tga"):
+            if not f.endswith(TEXTURE_EXT):
                 continue
             full_path = os.path.join(subdir, f)
             rel_path = full_path.replace(uncook_path, "")
@@ -99,7 +103,8 @@ def ensure_node_group(ng_name):
 
     return ng
 
-def load_w3_materials(
+
+def load_w3_materials_XML(
         obj: Object
         ,uncook_path: str
         ,tex_table: Dict[str, List[str]]
@@ -117,7 +122,7 @@ def load_w3_materials(
             for xml_data in root_element:
                 xml_mat_name = xml_data.get('name')
                 if xml_mat_name == "":
-                    logging.info("No material name? " + obj.name)
+                    log.info("No material name? " + obj.name)
                     continue
                 # Find corresponding blender material.
                 target_mat = None
@@ -171,6 +176,7 @@ def setup_w3_material(
         ,xml_data: Element
         ,xml_path: str
         ,force_update = False	# Set to True when re-importing stuff to test changes with the latest material set-up code.
+        ,is_instance_file = False
         ):
     # Checks for duplicate materials
     # Saves XML data in custom properties
@@ -180,7 +186,7 @@ def setup_w3_material(
     mat_base = xml_data.get('base')		# Path to the .w2mg or .w2mi file.
     if not mat_base:
         # Never seen this happen, but just in case.
-        logging.info("No material base, skipping: " + material.name)
+        log.info("No material base, skipping: " + material.name)
         return
 
     params = {}
@@ -212,62 +218,117 @@ def setup_w3_material(
     material['witcher3_mat_base'] = mat_base
     material['witcher3_mat_params'] = params
 
-    if mat_base.endswith(".w2mi"):
-        #remove w2mi_params the main material instance already provided
-        for name, attrs in params.items():
-            w2mi_params.pop(name, None)
+    #TODO Create the material instance NodeGroup
+    #TODO instances contained within w2mesh files will be imported as materials.
+    if is_instance_file and False:
+        nodegroup_node = init_instance_nodes(material, shader_type)
+        nodegroup_node.name = material.name
+        #nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
+        
+        ngt = nodegroup_node.node_tree
+        
+        # create group inputs
+        group_inputs = ngt.nodes.new('NodeGroupInput')
+        group_inputs.location = (-550,0)
+        # create group outputs
+        group_outputs = ngt.nodes.new('NodeGroupOutput')
+        group_outputs.location = (300,0)
+                
+        # Order parameters so input nodes get created in a specified order, from top to bottom relative to the inputs of the nodegroup.
+        # Purely for neatness of the node noodles.
+        ordered_params = order_elements_by_attribute(xml_data, PARAM_ORDER, 'name')
+        for p in ordered_params:
+            par_name = p.get('name')
+            par_type = p.get('type')
+            par_value = p.get('value')
+            if par_type == "Color":
+                ngt.inputs.new('NodeSocketColor', par_name)
+                ngt.outputs.new('NodeSocketColor',par_name)
+                values = [float(f) for f in par_value.split("; ")]
+                ngt.inputs[par_name].default_value = (
+                    values[0] / 255
+                    ,values[1] / 255
+                    ,values[2] / 255
+                    ,values[3] / 255
+                )
+            elif par_type == "Float":
+                ngt.inputs.new('NodeSocketFloat', par_name)
+                ngt.outputs.new('NodeSocketFloat',par_name)
+                ngt.inputs[par_name].default_value = float(par_value)
+                
+                ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
+            elif par_type == "handle:ITexture":
+                ngt.inputs.new('NodeSocketColor', par_name)
+                ngt.outputs.new('NodeSocketColor',par_name)
+                ngt.inputs.new('NodeSocketFloat', par_name+"_active")
+                #ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
+            else:
+                ngt.inputs.new('NodeSocketFloat', par_name)
+                ngt.outputs.new('NodeSocketFloat',par_name)
+                ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
+                
+        # mat_load_params_into_nodes(material, tex_table, ordered_params, nodegroup_node, uncook_path)
+        # hide_unused_sockets(nodegroup_node)
 
-        for name, attrs in w2mi_params.items():
-            create_param(
-                xml_data = xml_data
-                ,name = name 
-                ,type = attrs[0]
-                ,value = attrs[1]
-            )
-        # for tex_path, tex_type in w2mi_tex_params.items():
-        #     create_texture_param(
-        #         xml_data = xml_data
-        #         ,name = tex_type
-        #         ,tex_filepath = tex_path
-        #     )
+    else:
+        if mat_base.endswith(".w2mi"):
+            #remove w2mi_params the main material instance already provided
+            for name, attrs in params.items():
+                w2mi_params.pop(name, None)
+
+            for name, attrs in w2mi_params.items():
+                create_param(
+                    xml_data = xml_data
+                    ,name = name 
+                    ,type = attrs[0]
+                    ,value = attrs[1]
+                )
+            # for tex_path, tex_type in w2mi_tex_params.items():
+            #     create_texture_param(
+            #         xml_data = xml_data
+            #         ,name = tex_type
+            #         ,tex_filepath = tex_path
+            #     )
 
 
-    only_basic_maps = True
-    # if only_basic_maps:
-    #     new_xml = ElementTree.Element(xml_data.tag, xml_data.attrib)
-    #     for value in list(xml_data.iter()):
-    #         if 'Diffuse' == value.attrib['name'] or 'Normal' == value.attrib['name']:
-    #             new_xml.append(value)
-    #     xml_data = new_xml
+        only_basic_maps = True
+        # if only_basic_maps:
+        #     new_xml = ElementTree.Element(xml_data.tag, xml_data.attrib)
+        #     for value in list(xml_data.iter()):
+        #         if 'Diffuse' == value.attrib['name'] or 'Normal' == value.attrib['name']:
+        #             new_xml.append(value)
+        #     xml_data = new_xml
 
-    #logging.warning(ElementTree.tostring(xml_data, encoding='utf8', method='xml'))
-    all_children2 = list(xml_data.iter())
-    # Clean existing nodes and create core nodegroup.
-    nodegroup_node = init_material_nodes(material, shader_type)
-    nodegroup_node.name = mat_base[-60:]
-    nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
+        #log.warning(ElementTree.tostring(xml_data, encoding='utf8', method='xml'))
+        all_children2 = list(xml_data.iter())
+        # Clean existing nodes and create core nodegroup.
+        nodegroup_node = init_material_nodes(material, shader_type)
+        nodegroup_node.name = mat_base[-60:]
+        nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
 
-    # Order parameters so input nodes get created in a specified order, from top to bottom relative to the inputs of the nodegroup.
-    # Purely for neatness of the node noodles.
-    ordered_params = order_elements_by_attribute(xml_data, PARAM_ORDER, 'name')
+        # Order parameters so input nodes get created in a specified order, from top to bottom relative to the inputs of the nodegroup.
+        # Purely for neatness of the node noodles.
+        ordered_params = order_elements_by_attribute(xml_data, PARAM_ORDER, 'name')
 
-    mat_load_params_into_nodes(material, tex_table, ordered_params, nodegroup_node, uncook_path)
-    hide_unused_sockets(nodegroup_node)
+        mat_load_params_into_nodes(material, tex_table, ordered_params, nodegroup_node, uncook_path)
+        hide_unused_sockets(nodegroup_node)
 
-    if existing_mat and force_update:
-        existing_mat.user_remap(material)
+        if existing_mat and force_update:
+            existing_mat.user_remap(material)
 
-    mat_set_name_by_diffuse(material, nodegroup_node, nodes)
-    mat_ensure_dummy_transparent_img_node(material, nodegroup_node, shader_type, nodes)
-    mat_apply_settings(material, shader_type)
+        #if the material is a .w2mi file use the filename, otherwise use diffues name for materal
+        if not is_instance_file:
+            mat_set_name_by_diffuse(material, nodegroup_node, nodes)
+        mat_ensure_dummy_transparent_img_node(material, nodegroup_node, shader_type, nodes)
+        mat_apply_settings(material, shader_type)
 
 
-    #\w3_uncook\FBXs\characters\models\main_npc\cerys\model\i_02_wa__cerys.fbx
-    DetailTile_node = nodes.get("DetailTile")
-    Pattern_Array_mapping_node = nodes.get("Pattern_Array_Mapping")
-    if DetailTile_node and Pattern_Array_mapping_node:
-        Pattern_Array_mapping_node.inputs[3].default_value[0] = DetailTile_node.inputs[3].default_value[0]
-        Pattern_Array_mapping_node.inputs[3].default_value[1] = DetailTile_node.inputs[3].default_value[1]
+        #\w3_uncook\FBXs\characters\models\main_npc\cerys\model\i_02_wa__cerys.fbx
+        DetailTile_node = nodes.get("DetailTile")
+        Pattern_Array_mapping_node = nodes.get("Pattern_Array_Mapping")
+        if DetailTile_node and Pattern_Array_mapping_node:
+            Pattern_Array_mapping_node.inputs[3].default_value[0] = DetailTile_node.inputs[3].default_value[0]
+            Pattern_Array_mapping_node.inputs[3].default_value[1] = DetailTile_node.inputs[3].default_value[1]
 
     return material
 
@@ -317,7 +378,7 @@ def read_2wmi_params2(
                 # ,value = param[2]
             if PROP.Handles[0].DepotPath:
                 file_path = PROP.Handles[0].DepotPath
-                file_path = file_path.replace(".xbm", ".tga")
+                file_path = file_path.replace(".xbm", TEXTURE_EXT)
                 #texture_paths.append(file_path)
                 final_params[PROP.theName] = (PROP.theType, file_path)
     return final_params
@@ -336,11 +397,12 @@ def read_2wmi_params(
 
     # Check if the .w2mi file references any textures or texarrays, and do the same there.
     # Load the .w2mi file.
-    logging.info("READING W2MI: " + w2mi_path) # FIX PATHS WITH SPACES bob_broken_woods_longpile
+    log.info("READING W2MI: " + w2mi_path) # FIX PATHS WITH SPACES bob_broken_woods_longpile
 
     extra = []
     #texture_paths = []
-    full_path = os.path.join(uncook_path, w2mi_path)
+    uncook_path_mats = get_uncook_path(bpy.context)
+    full_path = os.path.join(uncook_path_mats, w2mi_path)
     material = CR2W.CR2W_reader.load_material(full_path)[0]
 
     return read_2wmi_params2(mat,uncook_path,material,shader_type)
@@ -363,11 +425,11 @@ def read_2wmi_params(
                         more_tex_params = read_2wmi_params(mat, uncook_path, file_path, shader_type)
                         texture_params.update(more_tex_params)
                     else:
-                        file_path = file_path.replace(".xbm", ".tga")
+                        file_path = file_path.replace(".xbm", TEXTURE_EXT)
                         texture_paths.append(file_path)
-                    logging.info(file_path)
+                    log.info(file_path)
 
-            # texture_paths = [p.replace("\\\\", "\\").replace(".xbm", ".tga") for p in parts if p.endswith(".xbm") or p.endswith(".texarray")]
+            # texture_paths = [p.replace("\\\\", "\\").replace(".xbm", TEXTURE_EXT) for p in parts if p.endswith(".xbm") or p.endswith(".texarray")]
 
             normal = ""
             for tex_filepath in texture_paths[:]:
@@ -414,7 +476,7 @@ def guess_texture_type_by_link(mat: Material, img_node):
         if socket_name == 'Color':	# Normal maps are connected to a Normal Map node's "Color" input.
             return 'Normal'
         else:
-            logging.info(f"Image {img_node.image.name} on material {mat.name} attaches to {socket_name}, yo!")
+            log.info(f"Image {img_node.image.name} on material {mat.name} attaches to {socket_name}, yo!")
             return
 
 def create_param(
@@ -510,7 +572,7 @@ def init_material_nodes(material: Material, shader_type: str):
     """Wipe all nodes, then create a node group node and return it."""
     ng_name = SHADER_MAPPING.get(shader_type)
     if not ng_name:
-        logging.warning(f"Unknown shader type: {shader_type} (Fell back to default)")
+        log.warning(f"Unknown shader type: {shader_type} (Fell back to default)")
         ng_name = 'Witcher3_Main'
     ng = ensure_node_group(ng_name)			# Nodegroup node tree  (bpy.types.ShaderNodeTree)
     node_ng = None							# Nodegroup group node (bpy.types.ShaderNodeGroup)
@@ -524,6 +586,23 @@ def init_material_nodes(material: Material, shader_type: str):
     node_ng = nodes.new(type='ShaderNodeGroup')
     node_ng.node_tree = ng
     node_ng.label = shader_type
+
+    node_ng.location = (500, 200)
+    node_ng.width = 350
+
+    return node_ng
+
+def init_instance_nodes(material: Material, shader_type: str):
+    """Wipe all nodes, then create a node group node and return it."""
+    ng_name = material.name #SHADER_MAPPING.get(shader_type)
+    ng = bpy.data.node_groups.new(ng_name, 'ShaderNodeTree')
+    nodes = material.node_tree.nodes
+    nodes.clear()
+
+    # Create main node group node
+    node_ng = nodes.new(type='ShaderNodeGroup')
+    node_ng.node_tree = ng
+    node_ng.label = ng_name
 
     node_ng.location = (500, 200)
     node_ng.width = 350
@@ -641,7 +720,7 @@ def create_node_for_param(
     elif par_type == 'Vector':
         node = create_node_vector(mat, param, node_ng)
     else:
-        logging.warning("Unknown material parameter type: "+par_type)
+        log.warning("Unknown material parameter type: "+par_type)
         node = create_node_attribute(mat, param, node_ng)
         node_label = "Unknown type: " + par_type
 
@@ -719,10 +798,10 @@ def create_node_texture(
     
     
     if par_value.endswith('.texarray'):
-        par_value = par_value+".texture_%s.tga" % texarray_index
+        par_value = par_value+".texture_%s%s" % texarray_index, TEXTURE_EXT
     # We use os.path.abspath() to make sure the filepath has consistent slashes and backslashes,
     # so that we can compare image file paths to each other for duplicate checking.
-    final_tga_path = par_value.replace(".xbm", ".tga")
+    final_tga_path = par_value.replace(".xbm", TEXTURE_EXT)
     try:
         final_texture = repo_file(final_tga_path) # TODO fix loading texarray
         if not Path(final_texture).exists():
@@ -755,7 +834,7 @@ def load_texture(
             break
     # Check if the file exists
     if not img and not os.path.isfile(tex_path):
-        logging.info("Image not found: " + tex_path + " (Usually unimportant)")
+        log.info("Image not found: " + tex_path + " (Usually unimportant)")
         return
     elif not img:
         img = bpy.data.images.load(tex_path,check_existing=True)
@@ -822,11 +901,11 @@ def create_node_vector(mat, param, node_ng):
                 mapping_node.inputs[3].default_value[0] = values[0]
                 mapping_node.inputs[3].default_value[1] = values[1]
             else:
-                logging.warning(f"Expected a mapping node for {par_name}, got {mapping_node.type} instead!")
+                log.warning(f"Expected a mapping node for {par_name}, got {mapping_node.type} instead!")
                 return
             mapping_node.label = mapping_node.name = par_name
         else:
-            logging.warning(f"Warning: Node {target_node.name} in material {mat.name} was expected to have a Mapping node plugged into it!")
+            log.warning(f"Warning: Node {target_node.name} in material {mat.name} was expected to have a Mapping node plugged into it!")
 
     # Handling UV scale/tile nodes params
     if 'Tile' in par_name:
@@ -839,7 +918,7 @@ def create_node_vector(mat, param, node_ng):
         return
     # if values[3] != 1 and values[3] != 0:
     # 	The 4th value on vectors is probably always useless.
-    # 	logging.warning("Warning: Discarded vector 4th value: " + str(values) + " in parameter: " + par_name)
+    # 	log.warning("Warning: Discarded vector 4th value: " + str(values) + " in parameter: " + par_name)
 
     node = nodes.new(type='ShaderNodeCombineXYZ')
     node.inputs[0].default_value = values[0]
