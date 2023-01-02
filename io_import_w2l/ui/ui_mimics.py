@@ -239,14 +239,11 @@ class MYMIMICLISTITEM_UL_basic(bpy.types.UIList):
             col = layout.column()
             col.label(text=item.name)
             
-
-class SCENE_PT_mymimiclist(bpy.types.Panel):
-
+from io_import_w2l.ui.ui_utils import WITCH_PT_Base
+class SCENE_PT_mymimiclist(WITCH_PT_Base, bpy.types.Panel):
+    bl_parent_id = "WITCH_PT_Quick"
     bl_label = "Quick Mimic List"
     bl_idname = "SCENE_PT_mymimiclist"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Witcher 3"
 
     def draw(self, context):
 
@@ -267,9 +264,9 @@ class SCENE_PT_mymimiclist(bpy.types.Panel):
         grid = layout.grid_flow( columns = 2 )
         
         grid.operator("object.mymimiclist_debug", text="Reset").action = "reset3"
-        grid.operator("object.mymimiclist_debug", text="Clear").action = "clear"
+        #grid.operator("object.mymimiclist_debug", text="Clear").action = "clear"
         grid.operator("object.mymimiclist_debug", text="Load").action = "load"
-
+        
 
 classes = (
         MyMimicListNode,

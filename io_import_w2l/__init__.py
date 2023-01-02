@@ -1,22 +1,8 @@
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTIBILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <http://www.gnu.org/licenses/>.
-
 import os
 from pathlib import Path
-import time
-from typing import Tuple
 
-
+from io_import_w2l.setup_logging_bl import *
+log = logging.getLogger(__name__)
 
 def get_uncook_path(context) -> str:
     addon_prefs = context.preferences.addons[__package__].preferences
@@ -58,60 +44,70 @@ def get_W3_REDCLOTH_PATH(context) -> str:
     W3_REDCLOTH_PATH = addon_prefs.W3_REDCLOTH_PATH
     return W3_REDCLOTH_PATH
 
-
-def get_keep_lod_meshes(context) -> str:
+def get_use_fbx_repo(context) -> str:
     addon_prefs = context.preferences.addons[__package__].preferences
-    keep_lod_meshes = addon_prefs.keep_lod_meshes
-    return keep_lod_meshes
-
-
-#logging
-#from io_import_w2l.setup_logging_bl import *
-from io_import_w2l.CR2W.setup_logging import *
+    use_fbx_repo = addon_prefs.use_fbx_repo
+    return use_fbx_repo
 
 from io_import_w2l import CR2W
 from io_import_w2l.CR2W.w3_types import CSkeletalAnimationSetEntry
 from io_import_w2l.CR2W.dc_anims import load_lipsync_file
-from io_import_w2l.importers import import_anims
-from io_import_w2l.importers import import_rig
-from io_import_w2l.importers import import_w2l
-#from io_import_w2l import export_anims
+#from io_import_w2l.importers import *
+from io_import_w2l.importers import (
+                                    import_anims,
+                                    import_rig,
+                                    import_w2l,
+                                    import_mesh,
+                                    import_w2w,
+                                    import_texarray
+                                    )
+from io_import_w2l.exporters import (
+                                    export_anims
+                                    )
 from io_import_w2l import constrain_util
 from io_import_w2l import file_helpers
+from io_import_w2l.cloth_util import setup_w3_material_CR2W
+
 
 #ui
+from io_import_w2l.ui import ui_map
+from io_import_w2l.ui.ui_map import (WITCH_OT_w2L,
+                                     WITCH_OT_w2w,
+                                     WITCH_OT_load_layer,
+                                     WITCH_OT_load_layer_group,
+                                     WITCH_OT_radish_w2L)
 from io_import_w2l.ui import ui_anims
 from io_import_w2l.ui import ui_entity
 from io_import_w2l.ui import ui_morphs
+from io_import_w2l.ui.ui_morphs import (WITCH_OT_morphs)
+
 from io_import_w2l.ui import ui_voice
 from io_import_w2l.ui import ui_mimics
 from io_import_w2l.ui import ui_anims_list
-#from io_import_w2l import filter_list
+from io_import_w2l.ui import ui_import_menu
+from io_import_w2l.ui.ui_mesh import WITCH_OT_w2mesh, WITCH_OT_apx
+from io_import_w2l.ui.ui_utils import WITCH_PT_Base
+from io_import_w2l.ui.ui_entity import WITCH_OT_ENTITY_lod_toggle
+#from io_import_w2l.ui.ui_entity import WITCH_OT_w2ent_chara
 
+import bpy
+from bpy.types import (Panel, Operator)
+from bpy.props import StringProperty, BoolProperty
+from mathutils import Vector
+from bpy_extras.io_utils import ImportHelper, ExportHelper
+import addon_utils
 
 bl_info = {
     "name": "Witcher 3 Tools",
     "author": "Dingdio",
-    "version": (1, 0),
-    "blender": (3, 00, 0),
-    "location": "View3D > Witcher 3 Tools",
+    "version": (0, 5),
+    "blender": (3, 3, 0),
+    "location": "File > Import-Export > Witcher 3 Assets",
     "description": "Tools for Witcher 3",
     "warning": "",
-    "doc_url": "",
-    "category": "",
+    "doc_url": "https://github.com/dingdio/Witcher3_Blender_Tools",
+    "category": "Import-Export"
 }
-
-import bpy
-from bpy.types import (Panel, Operator)
-from bpy.app.handlers import persistent
-
-from io_import_w2l.importers import import_w2w
-from io_import_w2l.importers import import_texarray
-from bpy.props import StringProperty
-
-from bpy_extras.io_utils import (
-        ImportHelper
-        )
 
 class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     # this must match the addon name, use '__package__'
@@ -121,7 +117,7 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     uncook_path: StringProperty(
         name="Uncook Path",
         subtype='DIR_PATH',
-        default='E:\\w3.modding\\modkit\\r4data',
+        default="E:\\w3.modding\\modkit_new\\r4data",#'E:\\w3.modding\\modkit\\r4data',
         description="Path where you uncooked the game files."
     )
 
@@ -131,63 +127,66 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         default='E:\\w3_uncook\\FBXs',
         description="Path where you exported the FBX files."
     )
-    
+
     tex_uncook_path: StringProperty(
         name="Uncook Path TEXTURES (.tga)",
         subtype='DIR_PATH',
-        default='E:\\w3_uncook',
+        default='E:\\w3_uncook',#"E:\\w3_uncook_new",#
         description="Path where you exported the tga files."
     )
-    
+
     tex_mod_uncook_path: StringProperty(
         name="(optional) Uncook Path modded TEXTURES (.tga)",
         subtype='DIR_PATH',
         default='E:\\w3.modding\\modkit\\modZOldWitcherArmour',
         description="(optional) Path where you exported the tga files from a mod."
     )
-    
+
     W3_FOLIAGE_PATH: StringProperty(
         name="Uncook Path FOLIAGE (.fbx)",
         subtype='DIR_PATH',
         default='E:\\w3_uncook\\FBXs\\FOLIAGE',
         description="Path where you exported the fbx files."
     )
-    
+
     W3_REDCLOTH_PATH: StringProperty(
         name="Uncook Path REDCLOTH (.apx)",
         subtype='DIR_PATH',
         default='E:\\w3_uncook\\FBXs\\REDCLOTH',
         description="Path where you exported the apx files."
     )
-    
+
     W3_REDFUR_PATH: StringProperty(
         name="Uncook Path REDFUR (.apx)",
         subtype='DIR_PATH',
         default='E:\\w3_uncook\\FBXs\\REDFUR',
         description="Path where you exported the apx files."
     )
-    
+
     W3_VOICE_PATH: StringProperty(
         name="Extracted lipsync (.cr2w)",
         subtype='DIR_PATH',
         default='E:\\w3.modding\\radish-tools\\docs.speech\\enpc.w3speech-extracted_GOOD\\enpc.w3speech-extracted',
         description="Path where you extracted w3speech"
     )
-    
+
     W3_OGG_PATH: StringProperty(
         name="Converted .wem files (.ogg)",
         subtype='DIR_PATH',
         default='F:\\voice_synth\\witcher\\speech\\ogg',
         description="Path with ogg files"
     )
-    
-    keep_lod_meshes: bpy.props.BoolProperty(name="Keep lod meshes", default = True)
+
+    #keep_lod_meshes: bpy.props.BoolProperty(name="Keep lod meshes", default = False)
+    use_fbx_repo: bpy.props.BoolProperty(name="Use FBX repo",
+                                        default=False,
+                                        description="Enable this to load from the fbx repo when importing meshes, maps etc.")
 
     #importFacePoses
     def draw(self, context):
         layout = self.layout
         layout.label(text="Witcher 3 Mesh settings:")
-        layout.prop(self, "keep_lod_meshes")
+        layout.prop(self, "use_fbx_repo")
         layout.label(text="Witcher 3 Tools settings:")
         layout.prop(self, "uncook_path")
         layout.prop(self, "fbx_uncook_path")
@@ -198,349 +197,94 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         layout.prop(self, "W3_VOICE_PATH")
         layout.prop(self, "W3_OGG_PATH")
 
-# class ButtonOperator(bpy.types.Operator):
-#     """Tooltip"""
-#     bl_idname = "object.import_scn_btn"
-#     bl_label = "Import .scn"
+class WITCH_OT_w2mi(bpy.types.Operator, ImportHelper):
+    """Load Witcher 3 Material Instance"""
+    bl_idname = "witcher.import_w2mi"
+    bl_label = "Import .w2mi"
+    filename_ext = ".w2mi"
+    filter_glob: StringProperty(default='*.w2mi', options={'HIDDEN'})
+    do_update_mats: BoolProperty(
+        name="Material Update",
+        default=True,
+        description="If enabled, it will replace the material with same name instead of creating a new one"
+    )
+    def execute(self, context):
+        print("importing material instance now!")
+        fdir = self.filepath
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        ext = file_helpers.getFilenameType(fdir)
+        if ext == ".w2mi":
+            bpy.ops.mesh.primitive_plane_add()
+            obj = bpy.context.selected_objects[:][0]
+            instance_filename = Path(fdir).stem
+            materials = []
+            material_file_chunks = CR2W.CR2W_reader.load_material(fdir)
+            for idx, mat in enumerate(material_file_chunks):
+                # if idx > 0:
+                #     raise Exception('wut')
+                target_mat = False
+                if self.do_update_mats:
+                    if instance_filename in obj.data.materials:
+                        target_mat = obj.data.materials[instance_filename] #None
+                    if instance_filename in bpy.data.materials:
+                        target_mat = bpy.data.materials[instance_filename] #None
+                if not target_mat:
+                    target_mat = bpy.data.materials.new(name=instance_filename)
 
-#     def execute(self, context):
-#         print("importing now!")
-#         #import_scn.btn_import_SCN()
-#         return {'FINISHED'}
+                finished_mat = setup_w3_material_CR2W(get_texture_path(context), target_mat, mat, force_update=True, mat_filename=instance_filename, is_instance_file = False)
 
-
-def import_group(coll, uncook_path):
-    for child in coll.children:
-        if child.group_type and child.group_type == "LayerInfo":
-            print("LOADING LEVEL "+child.name)
-            if child.level_path:
-                fdir =  os.path.join(uncook_path, child.level_path)
-                if Path(fdir).exists():
-                    levelFile = CR2W.CR2W_reader.load_w2l(fdir)
-                    import_w2l.btn_import_W2L(levelFile)
+                if instance_filename in obj.data.materials and not self.do_update_mats:
+                    obj.material_slots[target_mat.name].material = finished_mat
                 else:
-                    print("Can't find level "+fdir)
-    for child in coll.children:
-        if child.group_type and child.group_type == "LayerGroup":
-            print("LAYER_GROUP "+child.name)
-            import_group(child, uncook_path)
-
-
-class LOAD_LAYER_GROUP_ButtonOperator(bpy.types.Operator):
-    """IMPORT_LAYER_ButtonOperator"""
-    bl_idname = "object.load_this_layer"
-    bl_label = "Load This LayerGroup"
-
-    def execute(self, context):
-        coll = context.collection
-        if coll:
-            #loop all child colls
-            #if LayerInfo load level
-            #if LayerGroup load group
-
-            uncook_path = get_uncook_path(context)
-            
-            start_time = time.time()
-            import_group(coll, uncook_path)
-            logging.info(' Finished importing LayerGroup in %f seconds.', time.time() - start_time)
-            #CLayerInfo
-            #coll.level_path
-            #coll.layerBuildTag
-        return {'FINISHED'}
-
-class LOAD_LEVEL_ButtonOperator(bpy.types.Operator):
-    """IMPORT_LEVEL_ButtonOperator"""
-    bl_idname = "object.load_this_level"
-    bl_label = "Load This Level"
-
-    # @classmethod
-    # def poll(cls, context):
-    #     return context.layer_collection is not None
-
-    def execute(self, context):
-        coll = context.collection
-        if coll:
-            #CLayerInfo
-            #coll.level_path
-            #coll.layerBuildTag
-            uncook_path = get_uncook_path(context)
-            fdir =  os.path.join(uncook_path, coll.level_path) 
-            levelFile = CR2W.CR2W_reader.load_w2l(fdir)
-            import_w2l.btn_import_W2L(levelFile)
-        return {'FINISHED'}
-
-
-def create_morph_and_driver(self, obj, mesh_bl_o, this_POSE):
-    bpy.context.view_layer.objects.active =  mesh_bl_o
-    apply_ret = bpy.ops.object.modifier_apply_as_shapekey(keep_modifier=True, modifier="Armature")
-
-    if 'FINISHED' not in apply_ret:
-        self.report({'ERROR'}, "Error on pplying modifier, Object: {0}, ShapeKey: {1}, apply modifier: {2}".format(mesh_bl_o.name, this_POSE.name, apply_ret))
-        ret = False
-    else:
-        new_morph = mesh_bl_o.data.shape_keys.key_blocks[-1]
-        new_morph.name = this_POSE.name # rename
-        driver_curve = new_morph.driver_add("value")
-        driver = driver_curve.driver
-        channel = this_POSE.name
-        driver.expression = channel
-        var = driver.variables.get(channel)
-        if var is None:
-            var = driver.variables.new()
-        var.type = "SINGLE_PROP"
-        var.name = channel
-        target = var.targets[0]
-        target.id_type = "OBJECT"
-        target.data_path = 'pose.bones["w3_face_poses"]["%s"]' % channel #'["%s"]' % channel
-        target.id = obj # 
-
-#! ------------------------------------------------------------------------
-#!    Debug
-#! ------------------------------------------------------------------------
-
-def witcherui_add_redmorph(collection, item):
-    for el in collection:
-        if el.name == item[0] and el.path == item[1] and el.type == item[2]:
-            return
-
-    add_item = collection.add()
-    add_item.name = item[0]
-    add_item.path = item[1]
-    add_item.type = item[2]
-    return
-
-def get_face_meshs(mimicFace: str) -> Tuple:
-    face_arms = []
-    face_meshes = []
-    #face_rig =bpy.context.scene.objects[mimicFace]
-    all_objs = bpy.data.objects
-    for arm_obj in all_objs:
-        if arm_obj.type != 'ARMATURE':
-            continue
-        for bone in arm_obj.pose.bones:
-            for constraint in bone.constraints:
-                if constraint.target.name == mimicFace and arm_obj.name not in face_arms:
-                    face_arms.append(arm_obj.name)
-
-    for mesh_obj in all_objs:
-        if mesh_obj.type != 'MESH':
-            continue
-        for modifier in mesh_obj.modifiers:
-            if modifier.type != 'ARMATURE':
-                continue
-            if modifier.object.name in face_arms and mesh_obj.name not in face_meshes:
-                face_meshes.append(mesh_obj.name)
-    return (face_meshes, face_arms)
-
-
-from mathutils import Vector
-class ButtonActiveDebug(bpy.types.Operator):
-    """Select the CMovingPhysicalAgentComponent and press this button. 
-    It will take a while but should create all the face morphs and add a bone to control them."""
-    bl_idname = "object.active_debug"
-    bl_label = "Active Debug"
-
-    def execute(self, context):
-        main_obj = bpy.context.active_object
-        
-        bpy.ops.object.mode_set(mode='EDIT')
-        arm_obj = main_obj
-        bl_ctrl_bone = arm_obj.data.edit_bones.get("w3_face_poses")
-        if bl_ctrl_bone == None:
-            bl_ctrl_bone = arm_obj.data.edit_bones.new("w3_face_poses")
-            bl_ctrl_bone.parent = None
-            bl_ctrl_bone.use_deform = False
-            bl_ctrl_bone.head = Vector([-0.5, 0, 1.5])
-            bl_ctrl_bone.tail = Vector([0, 0, 0.2]) + bl_ctrl_bone.head
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-        # for c in obj.constraints:
-        #     print(f"{c.name}: {c.type}")
-
-        #cake = bpy.data.objects["shani:CMimicComponent12_ARM"].pose.bones["torso3"].constraints["Child Of"]
-        #cake = bpy.data.objects["shani:CMimicComponent12_ARM"].pose.bones["torso3"].constraints["torso3 to torso3"]
-        #dawd = "23"
-        # for o in bpy.data.objects:
-        #     for c in o.constraints:
-        #         print(f"{c.name}: {c.type}")
-        #! LIPSYNC
-        # anim = load_lipsync_file(r"E:\w3.modding\radish-tools\docs.speech\enpc.w3speech-extracted_GOOD\enpc.w3speech-extracted\0000498215.cr2w")
-        # set_entry = CSkeletalAnimationSetEntry()
-        # set_entry.animation = anim
-        # import_anims.import_anim(context, "cake", set_entry)
-        
-        #! FACE POSES
-        #fileName = os.path.join(get_uncook_path(context), "characters\\models\\main_npc\\triss\\h_01_wa__triss\\h_01_wa__triss.w3fac")
-        #fileName = r'E:\\w3.modding\\modkit\\r4data\\dlc\\ep1\\data\\characters\\models\\secondary_npc\\shani\\h_01_wa__shani\\h_01_wa__shani.w3fac'
-        #fileName = r"D:\Witcher_uncooked_clean\raw_ent_TEST\dlc\ep1\data\characters\models\secondary_npc\shani\h_01_wa__shani\h_01_wa__shani.w3fac.json"
-        #fileName = r"E:\w3.modding\modkit\r4data\characters\models\geralt\head\model\h_01_mg__geralt.w3fac"
-        fileName = main_obj['mimicFaceFile']
-        
-        faceData = import_rig.loadFaceFile(fileName)
-        # for pose in faceData.mimicPoses:
-        #     for bone in pose.animBuffer.bones:
-        #         for rot in bone.rotationFramesQuat:
-        #             rot.W = rot.W
-        #             rot.X = rot.X
-        #             rot.Y = rot.Y
-        #             rot.Z = rot.Z
-        #main_arm_obj = bpy.context.scene.objects["shani:_ARM"]
-        
-        rig_settings = main_obj.data.witcherui_RigSettings
-        rig_settings.model_armature_object = main_obj
-        
-        for pose in faceData.mimicPoses:
-            # if pose.name != "default":
-            #     continue
-            bl_ctrl_bone_pose = main_obj.pose.bones['w3_face_poses']
-            bl_ctrl_bone_pose[pose.name] = 0.0
-            property_manager = bl_ctrl_bone_pose.id_properties_ui(pose.name)
-            property_manager.update(min = 0., max = 1)
-            witcherui_add_redmorph(rig_settings.witcher_morphs_list, [pose.name, pose.name, 4])
-            
-            #this_POSE = faceData.mimicPoses[2]
-            this_POSE = pose
-
-            face_rig = bpy.context.scene.objects[main_obj['mimicFace']]
-            bpy.context.view_layer.objects.active = face_rig
-            (face_meshes, face_arms ) = get_face_meshs(main_obj['mimicFace']) #get_face_meshs(obj.name) #get_face_meshs(obj['mimicFace'])
-            #return {'FINISHED'}
-            this_POSE.SkeletalAnimationType = "SAT_Additive"
-            set_entry = CSkeletalAnimationSetEntry()
-            set_entry.animation = this_POSE
-            for pb in face_rig.pose.bones:
-                pb.matrix_basis.identity()
-            #bpy.ops.object.mode_set(mode='POSE', toggle=False)
-            #bpy.ops.pose.transforms_clear()
-            import_anims.import_anim(context, "cake", set_entry, facePose=True, override_select=[face_rig])
-            
-            
-            context.scene.frame_current = 0
-            
-            #!GET MESH OBJECTS FOR THIS AND APPLY SHAPE KEYS
-            # eyes_mouth_obj =bpy.context.scene.objects["he_01_wa__shani_Mesh_lod0"] 
-            # mesh_bl_o = bpy.context.scene.objects["h_01_wa__shani_Mesh_lod0"]
-            
-            for face_mesh in face_meshes:
-                the_mesh = bpy.context.scene.objects[face_mesh]
-                create_morph_and_driver(self, main_obj, the_mesh, this_POSE)
-                # create_morph_and_driver(self, obj, mesh_bl_o, faceData)
-                # create_morph_and_driver(self, obj, eyes_mouth_obj, faceData)
-
-            #! RETURN ACTIVE OBJECT
-            bpy.context.view_layer.objects.active = face_rig
-            for pb in face_rig.pose.bones:
-                pb.matrix_basis.identity()
-            face_rig.animation_data.action = None
-            
-        #! RETURN MAIN OBJECT
-        bpy.context.view_layer.objects.active = main_obj
-
-        bpy.ops.object.mode_set(mode='POSE')
-        for face_mesh in face_meshes:
-            the_mesh = bpy.context.scene.objects[face_mesh]
-            if the_mesh.data.shape_keys.animation_data is not None:
-                for oDrv in the_mesh.data.shape_keys.animation_data.drivers:
-                    driver = oDrv.driver
-                    driver.expression += " "
-                    driver.expression = driver.expression[:-1]
-        return {'FINISHED'}
-
-    def __del__(self):
-        pass
-        #bpy.ops.object.modifier_apply_as_shapekey(keep_modifier=True, modifier="Armature")
-        #print("End")
-
-class ButtonOperatorW2L(bpy.types.Operator, ImportHelper):
-    """Load Witcher 3 Level"""
-    bl_idname = "object.import_w2l_btn"
-    bl_label = "Import .w2l"
-    filename_ext = ".w2l"
-
-    # @classmethod
-    # def poll(cls, context):
-    #     # Always can import
-    #     return True
-
-    def execute(self, context):
-        print("importing now!")
-        fdir = self.filepath
-
-        start_time = time.time()
-        if fdir.endswith(".w2l"):
-            levelFile = CR2W.CR2W_reader.load_w2l(fdir)
-            import_w2l.btn_import_W2L(levelFile)
+                    obj.data.materials.append(finished_mat)
         else:
-            fdir = os.path.join(get_uncook_path(context),"levels\\prolog_village\\surroundings\\architecture.w2l")
-            levelFile = CR2W.CR2W_reader.load_w2l(fdir)
-        logging.info(' Finished importing level in %f seconds.', time.time() - start_time)
-
-        # if status == '{NONE}':
-        #     # self.report({'DEBUG'}, "DEBUG File Format unrecognized")
-        #     # self.report({'INFO'}, "INFO File Format unrecognized")
-        #     # self.report({'OPERATOR'}, "OPERATOR File Format unrecognized")
-        #     # self.report({'WARNING'}, "WARNING File Format unrecognized")
-        #     # self.report({'ERROR'}, "ERROR File Format unrecognized")
-        #     self.report({'ERROR'}, "ERROR File Format unrecognized")
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
-class ButtonOperatorW2W(bpy.types.Operator, ImportHelper):
-    """Load Witcher 3 Level"""
-    bl_idname = "object.import_w2w_btn"
-    bl_label = "Import .w2w"
-    filename_ext = ".w2w"
-
-    # @classmethod
-    # def poll(cls, context):
-    #     # Always can import
-    #     return True
-
-    def execute(self, context):
-        print("importing now!")
-        fdir = self.filepath
-        #fdir = r"E:\w3.modding\modkit\r4data\dlc\bob\data\levels\bob\bob.w2w"
-        #fdir = r"E:\w3.modding\modkit\r4data_unbundled\levels\prolog_village\prolog_village.w2w"
-        #fdir = r"E:\w3.modding\modkit\r4data\levels\kaer_morhen\kaer_morhen.w2w"
-        #fdir = r"E:\w3.modding\modkit\r4data\levels\novigrad\novigrad.w2w"
-        worldFile = CR2W.CR2W_reader.load_w2w(fdir)
-        # print(worldFile)
-
-        import_w2w.btn_import_w2w(worldFile)
-        #import_w2w.SetupNodeDataWorld(worldFile)
-        #import_w2w.SetupListFromNodeData()
-        return {'FINISHED'}
-
-class ButtonOperatorw2ent(bpy.types.Operator, ImportHelper):
-    """Load Witcher 3 Level"""
-    bl_idname = "object.import_w2ent_btn"
+class WITCH_OT_w2ent(bpy.types.Operator, ImportHelper):
+    """Load Witcher 3 Entity File"""
+    bl_idname = "witcher.import_w2ent"
     bl_label = "Import .w2ent"
     filename_ext = ".w2ent, flyr"
     def execute(self, context):
-        print("importing now!")
+        print("importing entity now!")
         fdir = self.filepath
-        #fdir = r"E:\w3.modding\modkit\r4data\items\weapons\swords\witcher_steel_scabbards\witcher_steel_bear_scabbard.w2ent"
-        #fdir = r"E:\w3.modding\modkit\r4data\items\weapons\swords\witcher_silver_scabbards\witcher_silver_bear_scabbard.w2ent"
-        #fdir = r"E:\w3.modding\modkit\r4data\dlc\bob\data\items\weapons\swords\witcher_steel_swords\witcher_steel_viper_ep2_sword_lvl4.w2ent"
-        #fdir = r"E:\w3.modding\modkit\r4data\items\weapons\swords\silver_swords\silver_sword_lvl1.w2ent"
-        #fdir = r"E:\w3.modding\modkit\r4data\characters\models\main_npc\ciri\l_01_wa__lingerie_ciri.w2ent"
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
         ext = file_helpers.getFilenameType(fdir)
         if ext == ".flyr":
             foliage = CR2W.CR2W_reader.load_foliage(fdir)
             import_w2l.btn_import_w2ent(foliage)
         elif ext == ".w2ent":
-            #entity = CR2W.CR2W_reader.load_entity(r"E:\w3.modding\modkit\r4data\environment\decorations\light_sources\hanging_lamp\hanging_lantern_red.w2ent")
-            #entity = CR2W.CR2W_reader.load_entity(r"E:\w3.modding\modkit\r4data\environment\decorations\light_sources\complex\candelabra_standing_complex.w2ent")
-            #entity = CR2W.CR2W_reader.load_entity(r"E:\w3.modding\modkit\r4data\gameplay\containers\_container_definitions\_unique_containers\_chest_fisherman.w2ent")
- 
             entity = CR2W.CR2W_reader.load_entity(fdir)
             import_w2l.btn_import_w2ent(entity)
         else:
-            return {'ERROR'}
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
-class ButtonOperatorAddConstraints(bpy.types.Operator):
+class WITCH_OT_ViewportNormals(bpy.types.Operator):
+    bl_description = "Switch normal map nodes to a faster custom node. Get https://github.com/theoldben/BlenderNormalGroups addon to enable button"
+    bl_idname = 'witcher.normal_map_group'
+    bl_label = "Normal Map nodes to Custom"
+    bl_options = {'UNDO'}
+
+    @classmethod
+    def poll(self, context):
+        (exist, enabled) = addon_utils.check("normal_map_to_group")
+        return enabled
+
+    def execute(self, context):
+        bpy.ops.node.normal_map_group()
+        return {'FINISHED'}
+
+class WITCH_OT_AddConstraints(bpy.types.Operator):
     """Add Constraints"""
-    bl_idname = "object.add_constraints"
+    bl_idname = "witcher.add_constraints"
     bl_label = "Add Constraints"
     bl_description = "Object Mode. Create bone constraints based on same bone names or r_weapon/l_weapon bones. Select Armature then Ctrl+Select Armature you want to attach to it"
     action: StringProperty(default="default")
@@ -548,61 +292,91 @@ class ButtonOperatorAddConstraints(bpy.types.Operator):
         scene = context.scene
         action = self.action
         if action == "add_const":
-            constrain_util.do_it()
+            constrain_util.do_it(1)
+        if action == "add_const_ik":
+            constrain_util.do_it(2)
         elif action == "attach_r_weapon":
             constrain_util.attach_weapon("r_weapon")
         elif action == "attach_l_weapon":
             constrain_util.attach_weapon("l_weapon")
         return {'FINISHED'}
 
-class ButtonOperatorImportW2RigJson(bpy.types.Operator):
-    """Import W2 rig Json"""
-    bl_idname = "object.import_w2_rig_json"
-    bl_label = "W2 rig Json"
+class WITCH_OT_ImportW2Rig(bpy.types.Operator, ImportHelper):
+    """Load Witcher 3 .w2rig file or .w2rig.json"""
+    bl_idname = "witcher.import_w2_rig"
+    bl_label = "Import .w2rig"
+    filename_ext = ".w2rig, .w2rig.json; w3dyny"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filter_glob: StringProperty(default='*.w2rig;*.w2rig.json;*.w3dyng;*.w3dyng.json', options={'HIDDEN'})
+
+    do_fix_tail: BoolProperty(
+        name="Connect bones",
+        default=False,
+        description="If enabled, an attempt will be made to connect tail bones. Currently this will mess up rotation of the bones and prevent applying w2anims but useful for creating IK rigs in Blender"
+    )
     def execute(self, context):
-        import_rig.start_rig_import(context)
+        print("importing rig now!")
+        fdir = self.filepath
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        ext = file_helpers.getFilenameType(fdir)
+        if ext == ".w2rig" or ext == ".json":
+            import_rig.start_rig_import(fdir, "default", self.do_fix_tail, context=context)
+        elif ext ==".w3fac":
+            faceData = import_rig.loadFaceFile(fdir)
+            root_bone = import_rig.create_armature(faceData.mimicSkeleton, "yes", context=context)
         return {'FINISHED'}
 
-class ButtonOperatorExportW2RigJson(bpy.types.Operator):
+class WITCH_OT_ExportW2RigJson(bpy.types.Operator, ExportHelper):
     """export W2 rig Json"""
-    bl_idname = "object.export_w2_rig_json"
-    bl_label = "W2 rig Json"
+    bl_idname = "witcher.export_w2_rig"
+    bl_label = "Export"
+    filename_ext = ".json"
+    filename = ".w2rig"
     def execute(self, context):
-        import_rig.export_w3_rig(context, r"F:\RE3R_MODS\Blender_Scripts\io_import_w2l\woman_base.w2rig.json")
+        obj = context.object
+        fdir = self.filepath
+        ext = file_helpers.getFilenameType(fdir)
+        import_rig.export_w3_rig(context, fdir)
         return {'FINISHED'}
-    
-class ButtonOperatorExportW2AnimJson(bpy.types.Operator):
-    """export W2 rig Json"""
-    bl_idname = "object.export_w2_anim_json"
-    bl_label = "W2 rig Json"
+
+class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
+    """export W2 Anim Json"""
+    bl_idname = "witcher.export_w2_anim"
+    bl_label = "Export"
+    filename_ext = ".json"
     def execute(self, context):
-        #export_anims.export_w3_anim(context, r"F:\RE3R_MODS\Blender_Scripts\io_import_w2l\test.w2anim.json")
+        obj = context.object
+        fdir = self.filepath
+        ext = file_helpers.getFilenameType(fdir)
+        export_anims.export_w3_anim(context, fdir)
         return {'FINISHED'}
-#----------------------------------------------------------
-#   Panels
-#----------------------------------------------------------
 
-class WITCH_PT_Base:
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Witcher'
-    bl_context = ''#{'objectmode', 'posemode'}
-    #bl_options = {'DEFAULT_CLOSED'}
+class WITCH_OT_load_texarray(bpy.types.Operator, ImportHelper):
+    """WITCH_OT_load_texarray"""
+    bl_idname = "witcher.load_texarray"
+    bl_label = "Load texarray json"
+    filename_ext = ".json"
+    bl_options = {'REGISTER', 'UNDO'}
 
-
-class _XpsPanels():
-    """All XPS panel inherit from this."""
-
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Witcher'
-    bl_context = ''#'objectmode'
+    filter_glob: StringProperty(default='*.json', options={'HIDDEN'})
+    def execute(self, context):
+        fdir = self.filepath
+        print("Importing Material")
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        else:
+            import_texarray.start_import(fdir)
+        return {'FINISHED'}
 
 #----------------------------------------------------------
 #   Utilities panel
 #----------------------------------------------------------
 
-class WITCH_PT_Utils(_XpsPanels, bpy.types.Panel):
+class WITCH_PT_Utils(WITCH_PT_Base, bpy.types.Panel):
     bl_label = "Utilities"
 
     def draw(self, context):
@@ -632,157 +406,141 @@ class WITCH_PT_Utils(_XpsPanels, bpy.types.Panel):
                 box.prop(coll, "layerBuildTag")
             if coll.level_path:
                 row = layout.row()
-                row.operator(LOAD_LEVEL_ButtonOperator.bl_idname, text="Load This Level", icon='CUBE')
+                row.operator(WITCH_OT_load_layer.bl_idname, text="Load This Level", icon='CUBE')
 
             #CLayerGroup
             if coll.group_type and coll.group_type == "LayerGroup":
                 row = layout.row()
-                row.operator(LOAD_LAYER_GROUP_ButtonOperator.bl_idname, text="Load This LayerGroup", icon='CUBE')
+                row.operator(WITCH_OT_load_layer_group.bl_idname, text="Load This LayerGroup", icon='CUBE')
         else:
             box.label(text = "No active collection")
-            
 
-
-
-class CustomPanel(_XpsPanels, bpy.types.Panel):
-    bl_idname = "OBJECT_PT_w2l"
+class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
+    bl_idname = "WITCH_PT_Main"
     bl_label = "Witcher 3 Tools"
 
     def draw(self, context):
-        layout = self.layout
-
-        obj = context.object
-        row = layout.row()
-        row.operator(ButtonActiveDebug.bl_idname, text="(load face morphs) Active Debug", icon='SPHERE')
-        self.layout.label(text = "Map")
-        row = layout.row()
-        
-        op = row.operator(ButtonOperatorW2L.bl_idname, text="Import .w2l", icon='SPHERE')
+        layout:bpy.types.UILayout = self.layout # UILayout
+        #Map
+        row = layout.row().box()
+        row = row.column(align=True)
+        row.label(text='Map Import')
+        op = row.operator(WITCH_OT_w2L.bl_idname, text="Layer (.w2l)", icon='SPHERE')
         op.filepath = os.path.join(get_uncook_path(context),"levels\\")
-
-        row = layout.row()
-        op = row.operator(ButtonOperatorW2W.bl_idname, text="Import .w2w", icon='SPHERE')
+        op = row.operator(WITCH_OT_w2w.bl_idname, text="World (.w2w)", icon='WORLD_DATA')
         op.filepath = get_uncook_path(context)+"\\levels\\"
+        row.operator(WITCH_OT_load_texarray.bl_idname, text="Texarray (.json)", icon='TEXTURE_DATA')
+        row = layout.row().box()
+        row = row.column(align=True)
         
-        row = layout.row()
-        row.operator(LOAD_TEXARRAY_ButtonOperator.bl_idname, text="Import texarray", icon='SPHERE')
+        row.label(text='Radish yml Export')
+        op = row.operator(WITCH_OT_radish_w2L.bl_idname, text="Layer (.yml)", icon='SPHERE')
+        row = layout.row().box()
+        row = row.column(align=True)
 
-        self.layout.label(text = "Entity")
-        row = layout.row()
-        op = row.operator(ButtonOperatorw2ent.bl_idname, text="Import .w2ent", icon='SPHERE')
+        #Mesh
+        row.label(text='Mesh Import')
+        op = row.operator(WITCH_OT_w2mesh.bl_idname, text="Mesh (.w2mesh)", icon='MESH_DATA')
         op.filepath = get_uncook_path(context)
-        #materials
+        op = row.operator(WITCH_OT_apx.bl_idname, text="Redcloth (.redcloth)", icon='MESH_DATA')
+        op.filepath = get_uncook_path(context)
 
-        self.layout.label(text = "Animation")
-        #anims
-        row = layout.row()
-        row.operator(ButtonOperatorAddConstraints.bl_idname, text="Add Constraints", icon='SPHERE').action = "add_const"
-        
-        row = layout.row()
-        row.operator(ButtonOperatorAddConstraints.bl_idname, text="Attach to r_weapon", icon='SPHERE').action = "attach_r_weapon"
-        row = layout.row()
-        row.operator(ButtonOperatorAddConstraints.bl_idname, text="Attach to l_weapon", icon='SPHERE').action = "attach_l_weapon"
-        
-        row = layout.row()
-        row.operator(ButtonOperatorImportW2RigJson.bl_idname, text="Import .w2rig.json", icon='SPHERE')
-        
-        row = layout.row()
-        row.operator(ButtonOperatorExportW2RigJson.bl_idname, text="Export .w2rig.json", icon='SPHERE')
-        
-        
-        #row = layout.prop(context.scene, "anim_export_name")
-        row = layout.row()
-        row.operator(ButtonOperatorExportW2AnimJson.bl_idname, text="Export .w2anims.json", icon='SPHERE')
+        #Mesh
+        row = layout.row().box()
+        row = row.column(align=True)
+        row.label(text='Material Import')
+        op = row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
+        op.filepath = get_uncook_path(context)+"\\"
+
+        #Entity
+        row = layout.row().box()
+        row = row.column(align=True)
+        row.label(text='Entity Import')
+        op = row.operator(WITCH_OT_w2ent.bl_idname, text="Items (.w2ent)", icon='SPHERE')
+        op.filepath = os.path.join(get_uncook_path(context),"items\\")
+        # op = row.operator(WITCH_OT_w2ent_chara.bl_idname, text="Import .w2ent (Characters)", icon='SPHERE')
+        # op.filepath = os.path.join(get_uncook_path(context),"characters\\")
+
+        #Animation
+        row = layout.row().box()
+        row = row.column(align=True)
+        row.label(text='Animation Tools')
+        row.operator(WITCH_OT_AddConstraints.bl_idname, text="Add Constraints", icon='CONSTRAINT').action = "add_const"
+        row.operator(WITCH_OT_AddConstraints.bl_idname, text="Add Constraints IK", icon='CONSTRAINT').action = "add_const_ik"
+        row.operator(WITCH_OT_AddConstraints.bl_idname, text="Attach to r_weapon", icon='CONSTRAINT').action = "attach_r_weapon"
+        row.operator(WITCH_OT_AddConstraints.bl_idname, text="Attach to l_weapon", icon='CONSTRAINT').action = "attach_l_weapon"
+        row.operator(WITCH_OT_ViewportNormals.bl_idname, text="Faster Viewport Normals", icon='MESH_DATA')
+
+        row = layout.row().box()
+        row = row.column(align=True)
+        row.label(text='Animation Import')
+        op = row.operator(WITCH_OT_ImportW2Rig.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
+        op.filepath = os.path.join(get_uncook_path(context),"characters\\base_entities\\")
+
+        row = layout.row().box()
+        row = row.column(align=True)
+        row.label(text='Animation Export')
+        row.operator(WITCH_OT_ExportW2RigJson.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
+        row.operator(WITCH_OT_ExportW2AnimJson.bl_idname, text="Anim (.w2anims)", icon='MESH_DATA')
+        # row.operator(WITCH_OT_ExportW2RigJson.bl_idname, text="Rig Json (.w2rig.json)", icon='ARMATURE_DATA')
+        # row.operator(WITCH_OT_ExportW2AnimJson.bl_idname, text="Anim Json (.w2anims.json)", icon='MESH_DATA')
 
 
-        #self.layout.separator()
-        # scn = context.scene
-        # layout = self.layout
-        
-        # row = layout.row()
-        # row.template_list(
-        #     "MYLISTTREEITEM_UL_basic",
-        #     "",
-        #     scn,
-        #     "myListTree",
-        #     scn,
-        #     "myListTree_index",
-        #     sort_lock = True
-        #     )
-            
-        #grid = layout.grid_flow( columns = 2 )
-        
-        # grid.operator("object.mylisttree_debug", text="Reset").action = "reset3"
-        # grid.operator("object.mylisttree_debug", text="Clear").action = "clear"
-        # grid.operator("object.mylisttree_debug", text="Print").action = "print"
-        #grid.operator("object.mylisttree_debug", text="Load Group").action = "group"
-        #grid.operator("object.mylisttree_debug", text="Load w2l").action = "level"
-    # def draw(self, context):
-    #     layout = self.layout
-        
-    #     obj = context.object
-    #     col = layout.column()
+        #Morphs
+        row = layout.row().box()
+        row = row.column(align=True)
+        row.label(text='Morphs')
+        row.operator(WITCH_OT_morphs.bl_idname, text="Load Face Morphs", icon='SHAPEKEY_DATA')
 
-    #     col.label(text='Import:')
-    #     # c = col.column()
-    #     r = col.row(align=True)
-    #     r1c1 = r.column(align=True)
-    #     r1c1.operator(ButtonOperator.bl_idname, text="Import", icon='None')
-    #     col = layout.column()
+        #General Settings
+        row = layout.row().box()
+        column = row.column(align=True)
+        column.label(text='General Settings')
+        # addon_prefs = context.preferences.addons[__package__].preferences
+        # row.prop(addon_prefs, 'keep_lod_meshes')
+        addon_prefs = context.preferences.addons[__package__].preferences
+        column.prop(addon_prefs, 'use_fbx_repo')
+        column = row.column(align=True)
+        row_lod = column.row()
+        row_lod.operator(WITCH_OT_ENTITY_lod_toggle.bl_idname, text="lod0").action = "_lod0"
+        row_lod.operator(WITCH_OT_ENTITY_lod_toggle.bl_idname, text="lod1").action = "_lod1"
+        row_lod.operator(WITCH_OT_ENTITY_lod_toggle.bl_idname, text="lod2").action = "_lod2"
+        column = row.column(align=True)
+        row = column.row()
+        row.operator(WITCH_OT_ENTITY_lod_toggle.bl_idname, text="Hide Collision Mesh").action = "_collisionHide"
+        row.operator(WITCH_OT_ENTITY_lod_toggle.bl_idname, text="Show Collision Mesh").action = "_collisionShow"
 
-class LOAD_TEXARRAY_ButtonOperator(bpy.types.Operator):
-    """LOAD_TEXARRAY_ButtonOperator"""
-    bl_idname = "object.load_this_texarray"
-    bl_label = "LOAD_TEXARRAY"
+class WITCH_PT_Quick(WITCH_PT_Base, bpy.types.Panel):
+    bl_label = "QUICK ANIMATION IMPORT"
+    bl_options = {'DEFAULT_CLOSED'}
 
-    def execute(self, context):
-        print("Importing Material")
-        fileName = r"E:\w3.modding\w3terrain-extract-v2020-03-30\terrain.json"
-        import_texarray.start_import(fileName)
-        return {'FINISHED'}
-
-# class TexArrayPanel(_XpsPanels, bpy.types.Panel):
-#     bl_idname = "OBJECT_PT_W3_TEXARRAY"
-#     bl_label = "TEXARRAY"
-
-#     def draw(self, context):
-#         layout = self.layout
-
-#         obj = context.object
-
-#         row = layout.row()
-#         row.operator(LOAD_TEXARRAY_ButtonOperator.bl_idname, text="Import texarray", icon='SPHERE')
-
+    def draw(self, context):
+        pass
 
 from bpy.utils import (register_class, unregister_class)
 
 _classes = [
     #ent_import
-    ButtonActiveDebug,
-    ButtonOperatorW2L,
-    ButtonOperatorW2W,
-    ButtonOperatorw2ent,
+    WITCH_OT_morphs,
+    WITCH_OT_w2L,
+    WITCH_OT_w2w,
+    WITCH_OT_w2mi,
+    WITCH_OT_w2ent,
+    WITCH_OT_radish_w2L,
     #anims
-    ButtonOperatorAddConstraints,
-    ButtonOperatorImportW2RigJson,
-    ButtonOperatorExportW2RigJson,
-    ButtonOperatorExportW2AnimJson,
-    #panel
-    CustomPanel,
+    WITCH_OT_AddConstraints,
+    WITCH_OT_ImportW2Rig,
+    WITCH_OT_ExportW2RigJson,
+    WITCH_OT_ExportW2AnimJson,
+    WITCH_OT_ViewportNormals,
+    WITCH_OT_load_layer,
+    WITCH_OT_load_layer_group,
+    WITCH_OT_load_texarray,
 
-    WITCH_PT_Utils,
-    LOAD_LEVEL_ButtonOperator,
-    LOAD_LAYER_GROUP_ButtonOperator,
-
-    LOAD_TEXARRAY_ButtonOperator
-    # TexArrayPanel
+    #panels
+    WITCH_PT_Main,
+    #WITCH_PT_Utils,
 ]
-
-
-# @persistent
-# def load_fonts(scene):
-#     import_w2w.SetupNodeData()
-#     import_w2w.SetupListFromNodeData()
 
 def register():
     bpy.utils.register_class(Witcher3AddonPrefs)
@@ -804,24 +562,22 @@ def register():
     bpy.types.Collection.group_type = StringProperty(
         name = "group_type"
     )
-    ui_anims.register()
+    for cls in _classes:
+        register_class(cls)
     ui_entity.register()
     ui_morphs.register()
+    ui_import_menu.register()
+    #ui_map.register()
+    ui_anims.register()
+    register_class(WITCH_PT_Utils)
+    register_class(WITCH_PT_Quick)
     ui_voice.register()
     ui_mimics.register()
     ui_anims_list.register()
-    # filter_list.register()
-    for cls in _classes:
-        register_class(cls)
-    # bpy.types.Scene.temp = StringProperty(
-    #     name = "temp"
-    # )
-    #import_w2w.register()
-    #bpy.app.handlers.load_post.append(load_fonts)
-    #import_w2w.SetupNodeData()
-    #import_w2w.SetupListFromNodeData()
 
 def unregister():
+    unregister_class(WITCH_PT_Quick)
+    unregister_class(WITCH_PT_Utils)
     bpy.utils.unregister_class(Witcher3AddonPrefs)
     del bpy.types.Object.template
     del bpy.types.Object.entity_type
@@ -830,15 +586,13 @@ def unregister():
     del bpy.types.Collection.layerBuildTag
     del bpy.types.Collection.world_path
     del bpy.types.Collection.group_type
+    for cls in _classes:
+        unregister_class(cls)
+    ui_import_menu.unregister()
+    #ui_map.unregister()
     ui_anims.unregister()
     ui_entity.unregister()
     ui_morphs.unregister()
     ui_voice.unregister()
     ui_mimics.unregister()
     ui_anims_list.unregister()
-    #filter_list.unregister()
-    for cls in _classes:
-        unregister_class(cls)
-    #import_w2w.unregister()
-    #bpy.app.handlers.load_post.remove(load_fonts)
-

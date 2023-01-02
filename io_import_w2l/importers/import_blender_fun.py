@@ -11,11 +11,26 @@ import time
 from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
+from io_import_w2l import cloth_util
 from io_import_w2l import fbx_util
 from io_import_w2l import get_uncook_path
 from io_import_w2l import get_W3_FOLIAGE_PATH
 from io_import_w2l import get_fbx_uncook_path
-from io_import_w2l import get_keep_lod_meshes
+from io_import_w2l import get_use_fbx_repo
+from io_import_w2l.importers import import_mesh
+
+from bpy_extras.wm_utils.progress_report import (
+    ProgressReport,
+    ProgressReportSubstep,
+)
+
+def repo_file(filepath: str):
+    if filepath.endswith('.fbx'):
+        return os.path.join(bpy.context.preferences.addons['io_import_w2l'].preferences.fbx_uncook_path, filepath)
+    else:
+        return os.path.join(bpy.context.preferences.addons['io_import_w2l'].preferences.uncook_path, filepath)
+
+from io_import_w2l import get_W3_REDCLOTH_PATH
 
 def set_blender_object_transform(obj, EngineTransform):
     """Sets blender object to RED Engine Transform
@@ -24,25 +39,60 @@ def set_blender_object_transform(obj, EngineTransform):
         obj (Blender Object): A Blender Object
         EngineTransform (RED Engine Transform): A RED Engine Transform
     """    
-    x, y, z = (radians(EngineTransform.Pitch), radians(EngineTransform.Yaw), radians(EngineTransform.Roll))
+    if EngineTransform.Yaw == 0.0 and EngineTransform.Pitch == 0.0 and EngineTransform.Roll == 0.0:
+        pass
+    else:
+        #THIS WORKS?
+        x, y,  z = (radians(EngineTransform.Yaw),
+                    radians(EngineTransform.Pitch),
+                    radians(EngineTransform.Roll))
+        orders =  ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']
+        mat = Euler((x, y, z), orders[2]).to_matrix().to_4x4()
 
-    mat = Euler((x, y, z)).to_matrix().to_4x4()
+        mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
+        mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
+        mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
 
-    mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
-    mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
-    mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
-
-
-    obj.matrix_world = obj.matrix_world @ mat
+        obj.matrix_world @= mat
     # obj.rotation_euler[0] = EngineTransform.Pitch
     # obj.rotation_euler[1] = EngineTransform.Yaw
     # obj.rotation_euler[2] = EngineTransform.Roll
     obj.location[0] = EngineTransform.X
     obj.location[1] = EngineTransform.Y
     obj.location[2] = EngineTransform.Z
-    obj.scale[0] =EngineTransform.Scale_x
-    obj.scale[1] =EngineTransform.Scale_y
-    obj.scale[2] =EngineTransform.Scale_z
+
+    #foliage transforms don't have scale
+    if hasattr(EngineTransform, "Scale_x"):
+        obj.scale[0] =EngineTransform.Scale_x
+        obj.scale[1] =EngineTransform.Scale_y
+        obj.scale[2] =EngineTransform.Scale_z
+        # else:
+        #     obj.scale[0] =0.01
+        #     obj.scale[1] =0.01
+        #     obj.scale[2] =0.01
+        
+        
+    #! OLD
+    # x, y, z = (radians(EngineTransform.Pitch), radians(EngineTransform.Yaw), radians(EngineTransform.Roll))
+
+    # mat = Euler((x, y, z)).to_matrix().to_4x4()
+
+    # # mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
+    # # mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
+    # # mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
+
+
+
+    # obj.matrix_world @= mat
+    # # obj.rotation_euler[0] = EngineTransform.Pitch
+    # # obj.rotation_euler[1] = EngineTransform.Yaw
+    # # obj.rotation_euler[2] = EngineTransform.Roll
+    # obj.location[0] = EngineTransform.X
+    # obj.location[1] = EngineTransform.Y
+    # obj.location[2] = EngineTransform.Z
+    # obj.scale[0] =EngineTransform.Scale_x
+    # obj.scale[1] =EngineTransform.Scale_y
+    # obj.scale[2] =EngineTransform.Scale_z
 
 def get_CSectorData(level):
     if level.CSectorData:
@@ -56,7 +106,7 @@ def get_CSectorData(level):
             this_type = Enums.BlockDataObjectType.getEnum(block.packedObjectType)
             if hasattr(block, 'resourceIndex') and block.resourceIndex < 12:
                 this_resource = level.CSectorData.Resources[block.resourceIndex].pathHash
-                print(block.resourceIndex, this_resource)
+                log.debug(str(block.resourceIndex)+' '+this_resource)
 
             if block.packedObjectType == Enums.BlockDataObjectType.Mesh:# or block.packedObjectType == Enums.BlockDataObjectType.Invalid:
                 mesh_path = level.CSectorData.Resources[block.packedObject.meshIndex].pathHash
@@ -73,7 +123,7 @@ def get_CSectorData(level):
             if block.packedObjectType == Enums.BlockDataObjectType.PointLight:
                 log.info("found point light in CSectorData")
             if block.packedObjectType == Enums.BlockDataObjectType.SpotLight:
-                light_path = level.CSectorData.Resources[block.resourceIndex].pathHash
+                #light_path = level.CSectorData.Resources[block.resourceIndex].pathHash
                 log.info("found spot light in CSectorData")
             if block.packedObjectType == Enums.BlockDataObjectType.Invalid:
                 log.info("found point Invalid in CSectorData")
@@ -101,7 +151,22 @@ def recurLayerCollection(layerColl, collName):
         if found:
             return found
 
-def loadLevel(levelData):
+from collections import defaultdict
+
+
+#global repo_lookup_list
+
+def loadLevel(levelData, context = None, keep_lod_meshes = False):
+    if context == None:
+        context = bpy.context
+    # global repo_lookup_list
+    # repo_lookup_list = defaultdict(list)
+    # scene = bpy.context.scene
+    # for o in scene.objects:
+    #     if o.type != 'EMPTY':
+    #         continue
+    #     if len(o.name) > 4 and o.name[-4] != "." and 'repo_path' in o:
+    #         repo_lookup_list[o['repo_path']].append(o)
     levelFile = levelData.layerNode
     errors = ['======Errors======= '+ levelFile]
 
@@ -140,7 +205,7 @@ def loadLevel(levelData):
                     tree_mesh.meshName = treeFilePath
                     tree_mesh.transform = treeTransform
                     tree_mesh.type = "mesh_foliage"
-                    import_single_mesh(tree_mesh, errors)
+                    import_single_mesh(tree_mesh, errors, keep_lod_meshes = keep_lod_meshes)
             for treeCollection in levelData.Foliage.Grasses.elements:
                 treeFilePath = treeCollection.TreeType.DepotPath
                 for treeTransform in treeCollection.TreeCollection.elements:
@@ -148,7 +213,7 @@ def loadLevel(levelData):
                     tree_mesh.meshName = treeFilePath
                     tree_mesh.transform = treeTransform
                     tree_mesh.type = "mesh_foliage"
-                    import_single_mesh(tree_mesh, errors)
+                    import_single_mesh(tree_mesh, errors, keep_lod_meshes = keep_lod_meshes)
 
         mesh_list = get_CSectorData(levelData)
         if mesh_list:
@@ -169,25 +234,29 @@ def loadLevel(levelData):
             Mesh_transform.name = "Mesh"
             Mesh_transform.parent = empty_transform
 
-            for mesh in mesh_list:
+            #wm = context.window_manager
+            #wm.progress_begin(0, len(mesh_list))
+            for idx, mesh in enumerate(mesh_list):
+                #wm.progress_update(idx)
                 if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh:
-                    import_single_mesh(mesh, errors, Mesh_transform)
+                    import_single_mesh(mesh, errors, Mesh_transform, keep_lod_meshes = keep_lod_meshes)
                     continue
                 if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision:
-                    import_single_mesh(mesh, errors, Collision_transform)
+                    import_single_mesh(mesh, errors, Collision_transform, keep_lod_meshes = keep_lod_meshes)
                     continue
                 if mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody:
-                    import_single_mesh(mesh, errors, Rigid_transform)
+                    import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes)
                     continue
+            #wm.progress_end()
 
         for INCLUDE_OBJECT in levelData.includes:
             for ENTITY_OBJECT in INCLUDE_OBJECT.Entities:
                 if ENTITY_OBJECT.type in Entity_Type_List:
-                    import_gameplay_entity(ENTITY_OBJECT, errors)
+                    import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes)
             
         for ENTITY_OBJECT in levelData.Entities:
             if ENTITY_OBJECT.type in Entity_Type_List:
-                import_gameplay_entity(ENTITY_OBJECT, errors)
+                import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes)
         # for idx, ENTITY_OBJECT in enumerate(levelData.meshes):
         #     if ENTITY_OBJECT.type == "Mesh": #A SINGLE MESH WITH NO COMPONENTS
         #         import_single_mesh(ENTITY_OBJECT, errors)
@@ -204,8 +273,15 @@ def loadLevel(levelData):
 
     for error in errors:
         log.error(error)
+    return {'FINISHED'}
 
 from bpy.types import Object, Mesh
+
+def repo_in_scene(dct, path):
+    if path in dct.keys():
+        return True
+    else:
+        return False
 
 def check_if_empty_already_in_scene(repo_path):
     start_time1 = time.time()
@@ -213,7 +289,9 @@ def check_if_empty_already_in_scene(repo_path):
         if o.type != 'EMPTY':
             continue
         if len(o.name) > 4 and o.name[-4] != "." and 'repo_path' in o and o['repo_path'] == repo_path:
-            logging.critical('Check Mesh found in %f seconds.', time.time() - start_time1)
+    #if repo_path in repo_lookup_list.keys(): repo_in_scene(repo_lookup_list, repo_path):
+        #o = repo_lookup_list[repo_path][0]
+            log.info('Check Mesh found in %f seconds.', time.time() - start_time1)
             start_time2 = time.time()
             #log.info("COPYING", o['repo_path'])
             new_obj = o.copy()
@@ -225,6 +303,8 @@ def check_if_empty_already_in_scene(repo_path):
             x, y, z = (radians(0), radians(0), radians(0))
             mat = Euler((x, y, z)).to_matrix().to_4x4()
             new_obj.matrix_world = mat
+            new_obj.matrix_local = mat
+            new_obj.matrix_basis = mat
 
             new_obj.location[0] = 0
             new_obj.location[1] = 0
@@ -233,7 +313,7 @@ def check_if_empty_already_in_scene(repo_path):
             new_obj.scale[1] = 1
             new_obj.scale[2] = 1
             new_obj.parent = None
-            logging.critical('Check Mesh Finished importing in %f seconds.', time.time() - start_time2)
+            log.info('Check Mesh Finished importing in %f seconds.', time.time() - start_time2)
             return new_obj
     return False
 
@@ -254,7 +334,7 @@ def check_if_mesh_already_in_scene(repo_path):
         if o.type != 'MESH':
             continue
         if o.name[-4] != "." and 'repo_path' in o and o['repo_path'] == repo_path:
-            logging.critical('Check Mesh found in %f seconds.', time.time() - start_time1)
+            log.info('Check Mesh found in %f seconds.', time.time() - start_time1)
             start_time2 = time.time()
             #log.info("COPYING", o['repo_path'])
             new_obj = o.copy()
@@ -269,6 +349,8 @@ def check_if_mesh_already_in_scene(repo_path):
             x, y, z = (radians(0), radians(0), radians(0))
             mat = Euler((x, y, z)).to_matrix().to_4x4()
             new_obj.matrix_world = mat
+            new_obj.matrix_local = mat
+            new_obj.matrix_basis = mat
 
             new_obj.location[0] = 0
             new_obj.location[1] = 0
@@ -277,31 +359,33 @@ def check_if_mesh_already_in_scene(repo_path):
             new_obj.scale[1] = 1
             new_obj.scale[2] = 1
             new_obj.parent = None
-            logging.critical('Check Mesh Finished importing in %f seconds.', time.time() - start_time2)
+            log.info('Check Mesh Finished importing in %f seconds.', time.time() - start_time2)
             return new_obj
     return False
 
-def import_single_mesh(mesh, errors, parent_transform = False):
-    # log.info("             ")
-    # log.info(str(mesh.exists())+" "+ mesh.fbxPath())
-    # log.info("             ")
-    keep_lod_meshes = get_keep_lod_meshes(bpy.context)
+def import_single_mesh(mesh, errors, parent_transform = False, keep_lod_meshes = False):
+    use_fbx = get_use_fbx_repo(bpy.context)
 
-    if keep_lod_meshes:
-        obj = check_if_empty_already_in_scene(mesh.meshName)
-    else:
-        obj = check_if_mesh_already_in_scene(mesh.meshName)
+    obj = check_if_empty_already_in_scene(mesh.meshName)
+    # if keep_lod_meshes:
+    #     obj = check_if_empty_already_in_scene(mesh.meshName)
+    # else:
+    #     obj = check_if_mesh_already_in_scene(mesh.meshName)
     #obj = False
     if not obj:
-        if keep_lod_meshes:
-            bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-            obj = bpy.context.object
+        # if keep_lod_meshes:
+        #     bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
+        #     obj = bpy.context.object
+        bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
+        obj = bpy.context.object
         try:
             if mesh.type == "mesh_foliage":
                 bpy.ops.import_scene.fbx(filepath=mesh.fbxPath())
             else:
-                if os.path.exists(mesh.fbxPath()):
+                if use_fbx and os.path.exists(mesh.fbxPath()):
                     fbx_util.importFbx(mesh.fbxPath(),mesh.fileName(),mesh.fileName(), keep_lod_meshes=keep_lod_meshes)
+                elif not use_fbx:
+                    import_mesh.import_mesh(mesh.uncookedPath(), keep_lod_meshes = keep_lod_meshes)
                 else:
                     print("Can't find FBX file", mesh.fbxPath())
                     bpy.ops.mesh.primitive_cube_add()
@@ -313,19 +397,21 @@ def import_single_mesh(mesh, errors, parent_transform = False):
                     principled = err_mat.node_tree.nodes['Principled BSDF']
                     principled.inputs['Base Color'].default_value = (0,0,1,1)
                     objs[0].data.materials.append(err_mat)
-        except:
+
+        except Exception as e:
             log.error("#1 Problem with FBX importer "+mesh.fbxPath())
+            raise e
         try:
             
             objs = bpy.context.selected_objects[:]
-            if keep_lod_meshes:
-                obj.name = Path(mesh.meshName).stem
-                obj['repo_path'] = mesh.meshName
-                for subobj in objs:
-                    subobj.parent = obj
-            else:
-                obj = objs[0]
-                obj['repo_path'] = mesh.meshName
+            #if keep_lod_meshes:
+            obj.name = Path(mesh.meshName).stem
+            obj['repo_path'] = mesh.meshName
+            for subobj in objs:
+                subobj.parent = obj
+            # else:
+            #     obj = objs[0]
+            #     obj['repo_path'] = mesh.meshName
             #apply scale
             bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
         except:
@@ -337,15 +423,18 @@ def import_single_mesh(mesh, errors, parent_transform = False):
 
     if mesh.transform:
         obj.rotation_euler = (0,0,0)
-        x, y, z = (radians(mesh.transform.Pitch), radians(mesh.transform.Yaw), radians(mesh.transform.Roll))
-
-        mat = Euler((x, y, z)).to_matrix().to_4x4()
+        #THIS WORKS?
+        x, y,  z = (radians(mesh.transform.Yaw),
+                    radians(mesh.transform.Pitch),
+                    radians(mesh.transform.Roll))
+        orders =  ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']
+        mat = Euler((x, y, z), orders[2]).to_matrix().to_4x4()
 
         mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
         mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
         mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
 
-        obj.matrix_world = obj.matrix_world @ mat
+        obj.matrix_world @= mat
         # obj.rotation_euler[0] = mesh.transform.Pitch
         # obj.rotation_euler[1] = mesh.transform.Yaw
         # obj.rotation_euler[2] = mesh.transform.Roll
@@ -382,19 +471,6 @@ def import_single_mesh(mesh, errors, parent_transform = False):
         obj.location[0] = mesh.translation.x
         obj.location[1] = mesh.translation.y
         obj.location[2] = mesh.translation.z
-        # bpy.ops.transform.translate(value=(mesh.translation.x, mesh.translation.y, mesh.translation.z),
-        #     orient_axis_ortho='X',
-        #     orient_type='GLOBAL',
-        #     orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)),
-        #     orient_matrix_type='GLOBAL',
-        #     constraint_axis=(True, False, False),
-        #     mirror=False,
-        #     use_proportional_edit=False,
-        #     proportional_edit_falloff='SMOOTH',
-        #     proportional_size=1,
-        #     use_proportional_connected=False,
-        #     use_proportional_projected=False,
-        #     release_confirm=True)
 
 MeshComponent_Type_List = ['CStaticMeshComponent',
                             'CMeshComponent',
@@ -413,23 +489,25 @@ MeshComponent_Type_List = ['CStaticMeshComponent',
                             "CScriptedDestroyableComponent",
                             "CWindowComponent"]
 
-
 def getDataBufferMesh(entity):
     mesh_list = []
+    cloth_list = []
     if hasattr(entity, "streamingDataBuffer") and entity.streamingDataBuffer:
         for chunk in entity.streamingDataBuffer.CHUNKS.CHUNKS:
             if chunk.name in Entity_Type_List:
                 log.info("Found an entity in data buffer??")
             if chunk.name in MeshComponent_Type_List:
                 mesh_list.append(meshPath(fbx_uncook_path = get_fbx_uncook_path(bpy.context)).static_from_chunk(chunk))
-        return mesh_list
-    else:
-        return False
+            
+            if chunk.name in "CClothComponent":
+                cloth_list.append(chunk)
 
-def import_single_component(component, parent_obj):
+    return (mesh_list, cloth_list)
+
+def import_single_component(component, parent_obj, keep_lod_meshes = False):
     if component.name == "CMeshComponent":
         mesh = meshPath(fbx_uncook_path = get_fbx_uncook_path(bpy.context)).static_from_chunk(component)
-        import_single_mesh(mesh, [], parent_obj)
+        import_single_mesh(mesh, [], parent_obj, keep_lod_meshes = keep_lod_meshes)
     elif component.name == "CPointLightComponent":
         bpy.ops.object.light_add(type='POINT', radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
         light_obj = bpy.context.selected_objects[:][0]
@@ -475,7 +553,7 @@ def import_single_component(component, parent_obj):
         light_obj.data.spot_size = component.GetVariableByName('outerAngle').Value
         #light_obj.data.spot_size = component.GetVariableByName('softness').Value
 
-def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False):
+def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_meshes = False):
     #TRANSFORM FOR THIS ENTITY
     bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
     empty_transform = bpy.context.object
@@ -486,15 +564,24 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False):
     else:
         empty_transform.name = ENTITY_OBJECT.name
 
-    if empty_transform.name == "W3AnimatedContainer_SUB.012":
-        print("W3AnimatedContainer_SUB.012")
-        
-    mesh_list = getDataBufferMesh(ENTITY_OBJECT)
+    try:
+        (mesh_list, cloth_list) = getDataBufferMesh(ENTITY_OBJECT)
+    except Exception as e:
+        raise e
     if mesh_list:
         for mesh in mesh_list:
-            import_single_mesh(mesh, errors, empty_transform)
+            import_single_mesh(mesh, errors, empty_transform, keep_lod_meshes = keep_lod_meshes)
+    if cloth_list:
+        for chunk in cloth_list:
+            cloth_name = chunk.GetVariableByName('name').String.String
+            resource = chunk.GetVariableByName('resource').Handles[0].DepotPath
+            resource_apx = get_W3_REDCLOTH_PATH(bpy.context)+"\\"+resource.replace(".redcloth", ".apx")
+            resource = repo_file(resource)
+            cloth_arma = cloth_util.importCloth(False, resource_apx, True, True, True, resource, "CClothComponent", cloth_name)
+            cloth_arma.parent = empty_transform
+    
     for component in ENTITY_OBJECT.Components:
-        import_single_component(component, empty_transform)
+        import_single_component(component, empty_transform, keep_lod_meshes = keep_lod_meshes)
     #MESH THIS ENTITY HAS
     # for mesh in ENTITY_OBJECT.static_mesh_list:
     #     import_single_mesh(mesh, errors, empty_transform)
@@ -510,9 +597,9 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False):
             for INCLUDE_OBJECT in ENTITY_OBJECT.template.includes:
                 for inc_entity in INCLUDE_OBJECT.Entities:
                     if inc_entity.type in Entity_Type_List:
-                        import_gameplay_entity(inc_entity, errors, include_transform)
+                        import_gameplay_entity(inc_entity, errors, include_transform, keep_lod_meshes = keep_lod_meshes)
         for entity in ENTITY_OBJECT.template.Entities:
-            import_gameplay_entity(entity, errors, empty_transform)
+            import_gameplay_entity(entity, errors, empty_transform, keep_lod_meshes = keep_lod_meshes)
             # mesh_list = getDataBufferMesh(entity)
             # for mesh in mesh_list:
             #     import_single_mesh(mesh, errors, empty_transform)

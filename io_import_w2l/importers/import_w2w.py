@@ -1,7 +1,7 @@
 import os
 
-import yaml
 import bpy
+from io_import_w2l.CR2W.CR2W_file import WORLD
 from io_import_w2l import CR2W
 from io_import_w2l.importers import import_w2l
 
@@ -427,14 +427,23 @@ def AddCLayerGroup(groups, parent_collection):
 
 
 
-def btn_import_w2w(worldFile):
+def btn_import_w2w(worldFile: WORLD):
     # collection = bpy.data.collections.new(worldFile.worldName)
     # collection['world_path'] = worldFile.worldName
     collection = AddCLayerGroup(worldFile.groups, False)
     bpy.context.scene.collection.children.link(collection)
     layer_collection = bpy.context.view_layer.layer_collection.children[collection.name]
     bpy.context.view_layer.active_layer_collection = layer_collection
-
+    
+    
+    # bpy.ops.mesh.primitive_plane_add(size=worldFile.terrainSize, enter_editmode=False, align='WORLD', location=(0, 0, worldFile.lowestElevation), scale=(1, 1, 1))
+    # obj: bpy.types.Object = bpy.context.selected_objects[:][0]
+    # #obj.location = [0,0]
+    # for a in bpy.context.screen.areas:
+    #     if a.type == 'VIEW_3D':
+    #         for s in a.spaces:
+    #             if s.type == 'VIEW_3D':
+    #                 s.clip_end = 9999 
 
 classes = (
         MyListTreeNode,

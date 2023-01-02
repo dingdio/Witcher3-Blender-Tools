@@ -83,7 +83,7 @@ def readU32(inFile):
 
 def readU32Check(f, pos):
     orignal_pos = f.tell()
-    f.seek(pos,0);
+    f.seek(pos,0)
     the_uint = struct.unpack('I', f.read(4))[0]
     f.seek(orignal_pos, 0)
     return the_uint
@@ -120,7 +120,6 @@ def ReadBit6(file):
     shift = 0;
     b = 0; # byte
     i = 1;
-
 
     while True:
         b = readUByte(file) #stream.ReadByte();
@@ -174,7 +173,7 @@ def ReadFloat16(file):
 
 def readUShortCheck(f, pos):
     orignal_pos = f.tell()
-    f.seek(pos,0);
+    f.seek(pos,0)
     the_uint = struct.unpack(TypeFormat.UInt16, f.read(2))[0]
     f.seek(orignal_pos, 0)
     return the_uint
@@ -190,7 +189,7 @@ def readUChar(file):
 
 def readUByteCheck(f, pos):
     orignal_pos = f.tell()
-    f.seek(pos,0);
+    f.seek(pos,0)
     the_uint = struct.unpack(TypeFormat.Byte, f.read(1))[0]
     f.seek(orignal_pos, 0)
     return the_uint
@@ -209,7 +208,7 @@ def readFloat(inFile):
 
 def readFloatCheck(f, pos):
     orignal_pos = f.tell()
-    f.seek(pos,0);
+    f.seek(pos,0)
     the_uint = struct.unpack('f', f.read(4))[0]
     f.seek(orignal_pos, 0)
     return the_uint
@@ -229,7 +228,7 @@ def skipToNextLine(f):
 
 def skipPadding(f):
     while (readUByteCheck(f, f.tell()) == 0 and f.tell() + 1 < FileSize(f)):
-        f.seek(1,1);
+        f.seek(1,1)
 
 def wRot(frame):
     RotationX = frame.RotationX
@@ -240,5 +239,5 @@ def wRot(frame):
     if (RotationW > 0.0):
         RotationW = math.sqrt(RotationW) #(float)Sqrt(RotationW);
     else:
-        RotationW = 0.0;
-    return RotationW;
+        RotationW = 0.0
+    return RotationW

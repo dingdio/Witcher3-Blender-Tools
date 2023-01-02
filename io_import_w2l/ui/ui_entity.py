@@ -1,12 +1,16 @@
+
+import os
+import time
+import bpy
+
 from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
-import os
-import bpy
 from io_import_w2l.importers import import_entity
 from io_import_w2l.importers import import_anims
+from io_import_w2l.ui.ui_utils import WITCH_PT_Base
 from bpy.types import Panel, Operator, UIList, PropertyGroup
-from bpy.props import IntProperty, StringProperty, CollectionProperty
+from bpy.props import IntProperty, StringProperty, CollectionProperty, BoolProperty
 
 from io_import_w2l import get_uncook_path
 
@@ -14,22 +18,9 @@ from bpy_extras.io_utils import (
         ImportHelper
         )
 
-class ListItemApp(PropertyGroup):
-    """Group of properties representing an item in the list."""
-
-    name: StringProperty(
-           name="Name",
-           description="Name of the animation",
-           default="Untitled")
-
-    jsonData: StringProperty(
-           name="Animation in Json",
-           description="",
-           default="")
-
-class APP_TOOL_UL_List(UIList):
+class WITCH_UL_ENTITY_List(UIList):
     """Demo UIList."""
-    bl_idname = "APP_TOOL_UL_List"
+    bl_idname = "WITCH_UL_ENTITY_List"
     layout_type = "DEFAULT" # could be "COMPACT" or "GRID"
 
     def draw_item(self, context,
@@ -50,27 +41,136 @@ class APP_TOOL_UL_List(UIList):
             layout.alignment = 'CENTER'
             layout.label(text="")
 
-class ButtonOperatorw2entChara(bpy.types.Operator, ImportHelper):
-    """Load Witcher 3 Character"""
+class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
+    """Load a Witcher 3 character (.w2ent) file"""
     bl_idname = "object.import_w2ent_chara_btn"
-    bl_label = "Import Character Json"
+    bl_label = "Import Character"
     filename_ext = ".w2ent"
-    def execute(self, context):
-        print("importing now!")
-        fdir = self.filepath
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    filter_glob: StringProperty(default='*.w2ent;*.w2ent.json', options={'HIDDEN'})
+    do_import_mats: BoolProperty(
+        name="Apply Materials",
+        default=True,
+        description="If enabled, materials will be imported. You must have the game unbundled and tga textures uncooked. With the path to them set in the addon settings"
+    )
+    do_import_armature: BoolProperty(
+        name="Import Armature",
+        default=True,
+        description="If enabled, the armature will be imported"
+    )
+    keep_lod_meshes: BoolProperty(
+        name="Keep LODs",
+        default=False,
+        description="If enabled, it will keep low quality meshes and materials"
+    )
+    do_merge_normals: BoolProperty(
+        name="Merge Normals",
+        default=False,
+        description="If enabled, normals will be merged. Can cause blender to hang."
+    )
+    rotate_180: BoolProperty(
+        name="Rotate 180°",
+        description="Rotate both the mesh and the armature on the Z-axis by 180°",
+        default=True
+    )
+    
+    def draw(self, context):
+        layout = self.layout
+        sections = ["Settings"]
+        section_options = {
+            "Settings" : ["do_import_mats",
+                        "do_import_armature",
+                        "keep_lod_meshes",
+                        "do_merge_normals",
+                        "rotate_180"]
+        }
+        for section in sections:
+            row = layout.row()
+            box = row.box()
+            box.label(text=section)
+            for prop in section_options[section]:
+                box.prop(self, prop)
 
+    def execute(self, context):
+        print("importing character now!")
+        fdir = self.filepath
+        s = time.time()
         if fdir.endswith(".w2ent") or fdir.endswith(".json"):
-            import_entity.import_ent_template(fdir, False)
+            import_entity.import_ent_template(fdir, False,
+                                    self.do_import_mats,
+                                    self.do_import_armature,
+                                    self.keep_lod_meshes,
+                                    self.do_merge_normals,
+                                    self.rotate_180)
         else:
-            fdir = os.path.join(get_uncook_path(context),"characters\\npc_entities\\main_npc\\lambert.w2ent")
-            root_bone = import_entity.import_ent_template(fdir, False)
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        message = f'Read character file in {time.time() - s} seconds.'
+        log.info(message)
+        self.report({'INFO'}, message)
         return {'FINISHED'}
 
-class APP_TOOL_OT_list_loadapp(Operator):
+class WITCH_OT_ENTITY_list_loadapp(Operator):
     """ Add an Item to the UIList"""
     bl_idname = "tool.list_loadapp"
     bl_label = "Load"
-    bl_description = "load a new item to the list."
+    bl_description = "Load the selected apperance for this character"
+
+    action: StringProperty(default="default")
+    @classmethod
+    def poll(cls, context):
+        return context.scene
+
+    def execute(self, context):
+        ob = context.object
+        if ob and ob.type == "ARMATURE" and "CMovingPhysicalAgentComponent" in ob.name:
+            main_arm_obj:bpy.types.Object = ob
+            
+            #main_arm_obj = bpy.context.active_object
+            rig_settings = main_arm_obj.data.witcherui_RigSettings
+            scene = context.scene
+            action = self.action
+
+            if "w2anims" == action:
+                print("=== load w2anims ====")
+                print(rig_settings.main_entity_skeleton)
+                
+                if rig_settings.animset_list_index >= 0 and rig_settings.animset_list:
+                    repoPath = rig_settings.animset_list[rig_settings.animset_list_index]
+                    fdir = os.path.join(get_uncook_path(context),repoPath.path)
+                    print(fdir)
+                    loadFromJson = True
+                    if loadFromJson:
+                        if (os.path.exists(fdir+'.json')):
+                            fdir = fdir + '.json'
+                    if "_mimic_" in fdir:
+                        import_anims.start_import(context, fdir, rigPath=rig_settings.main_face_skeleton)
+                    else:
+                        import_anims.start_import(context, fdir, rigPath=rig_settings.main_entity_skeleton)
+
+            if "load" == action:
+                print("=== load apperance ====")
+                if rig_settings.app_list_index >= 0 and rig_settings.app_list:
+                    item = rig_settings.app_list[rig_settings.app_list_index]
+
+                    import_entity.import_from_list_item(context, item, rig_settings.do_import_redcloth)
+                    bpy.ops.object.select_all(action='DESELECT')
+                    main_arm_obj.select_set(True)
+                    bpy.context.view_layer.objects.active = main_arm_obj
+                # context.rig_settings.app_list.add()
+            elif "clear" == action:
+                print("=== Debug Clear ====")
+                bpy.context.rig_settings.app_list.clear()
+
+        return {'FINISHED'}
+
+
+class WITCH_OT_ENTITY_lod_toggle(Operator):
+    """ Add an Item to the UIList"""
+    bl_idname = "witcher.lod_toggle"
+    bl_label = "Toggle"
+    bl_description = "Change lod level for all meshes."
 
     action: StringProperty(default="default")
     @classmethod
@@ -80,91 +180,80 @@ class APP_TOOL_OT_list_loadapp(Operator):
     def execute(self, context):
         scene = context.scene
         action = self.action
-
+        ob = context.object
         lods = ['_lod0','_lod1','_lod2']
+        if '_collision' in action:
+            meshes = set(o for o in scene.objects if o.type == 'MESH')
+            hidden_bool = True
+            if 'Show' in action:
+                hidden_bool = False
 
-        if "w2anims" == action:
-            print("=== load w2anims ====")
-            print(scene.main_entity_skeleton)
+            for o in meshes:
+                if "_proxy" in o.name:
+                    print("hiding _proxy"+o.name)
+                    o.hide_set(hidden_bool)
+                if "_shadowmesh" in o.name:
+                    print("hiding _shadowmesh"+o.name)
+                    o.hide_set(hidden_bool)
+                if "_volume" in o.name:
+                    print("hiding _volume"+o.name)
+                    o.hide_set(hidden_bool)
+                if "blockout_box" in o.name:
+                    print("hiding blockout_box"+o.name)
+                    o.hide_set(hidden_bool)
+                if o.name.startswith("capsule_"):
+                    print("hiding capsule_"+o.name)
+                    o.hide_set(hidden_bool)
+                if o.name.startswith("box_"):
+                    print("hiding box_"+o.name)
+                    o.hide_set(hidden_bool)
             
-            if scene.animset_list_index >= 0 and scene.animset_list:
-                repoPath = scene.animset_list[scene.animset_list_index]
-                fdir = os.path.join(get_uncook_path(context),repoPath.path)
-                print(fdir)
-                loadFromJson = True
-                if loadFromJson:
-                    if (os.path.exists(fdir+'.json')):
-                        fdir = fdir + '.json'
-                if "_mimic_" in fdir:
-                    import_anims.start_import(context, fdir, rigPath=scene.main_face_skeleton)
-                else:
-                    import_anims.start_import(context, fdir, rigPath=scene.main_entity_skeleton)
-
-        if "load" == action:
-            print("=== load apperance ====")
-            if scene.app_list_index >= 0 and scene.app_list:
-                item = scene.app_list[scene.app_list_index]
-
-                import_entity.import_from_list_item(context, item)
-            # context.scene.app_list.add()
-        elif "clear" == action:
-            print("=== Debug Clear ====")
-            bpy.context.scene.app_list.clear()
         elif action in lods:
-            lod_idx = int(action[-1:])
+            lod_idx = int(action[-1:])+1
             lod_meshes = []
             for mesh in scene.objects:
                 # only for meshes
                 if mesh.type == 'MESH':
-                    if mesh.name[-5:-1] == "_lod":
-                        mesh.hide_viewport = True
-                        mesh.hide_render = True
-                        if mesh.name[:-5] not in lod_meshes:
-                            lod_meshes.append(mesh.name[:-5])
-            for lod_mesh in lod_meshes:
-                mesh_bl = scene.objects.get(lod_mesh+action)
-                if mesh_bl:
-                    mesh_bl.hide_viewport = False
-                    mesh_bl.hide_render = False
-                else:
-                    mesh_bl = scene.objects.get(lod_mesh+"_lod"+str(lod_idx-1))
-                    if mesh_bl:
-                        mesh_bl.hide_viewport = False
-                        mesh_bl.hide_render = False
-                    else:
-                        mesh_bl = scene.objects.get(lod_mesh+"_lod"+str(lod_idx-1))
-                        if mesh_bl:
-                            mesh_bl.hide_viewport = False
-                            mesh_bl.hide_render = False
+                    if 'witcher_lod_level' in mesh:
+                        if mesh['witcher_lod_level'] == lod_idx:
+                            mesh.hide_set(False)
                         else:
-                            log.debug("LOD ERROR")
+                            mesh.hide_set(True)
+            #         if mesh.name[-5:-1] == "_lod":
+            #             mesh.hide_viewport = True
+            #             mesh.hide_render = True
+            #             if mesh.name[:-5] not in lod_meshes:
+            #                 lod_meshes.append(mesh.name[:-5])
+            # for lod_mesh in lod_meshes:
+            #     mesh_bl = scene.objects.get(lod_mesh+action)
+            #     if mesh_bl:
+            #         mesh_bl.hide_viewport = False
+            #         mesh_bl.hide_render = False
+            #     else:
+            #         mesh_bl = scene.objects.get(lod_mesh+"_lod"+str(lod_idx-1))
+            #         if mesh_bl:
+            #             mesh_bl.hide_viewport = False
+            #             mesh_bl.hide_render = False
+            #         else:
+            #             mesh_bl = scene.objects.get(lod_mesh+"_lod"+str(lod_idx-1))
+            #             if mesh_bl:
+            #                 mesh_bl.hide_viewport = False
+            #                 mesh_bl.hide_render = False
+            #             else:
+            #                 log.debug("LOD ERROR")
 
             # if mesh.name[-5:] == action:
             #     mesh.hide_viewport = False
             #     mesh.hide_render = False
-
         return {'FINISHED'}
-
-
 
 ##############################
 #       Animset List         #
 ##############################
-class ListItemAnimset(PropertyGroup):
-    """."""
-    path: StringProperty(
-           name="Path",
-           description="Path to Animset",
-           default="Untitled")
 
-    name: StringProperty(
-           name="Name",
-           description="",
-           default="")
-
-class ANIMSET_UL_List(UIList):
+class WITCH_PT_ENTITY_ANIMSET_UL_List(UIList):
     """List for the Animsets"""
-    bl_idname = "ANIMSET_UL_List"
+    bl_idname = "WITCH_PT_ENTITY_ANIMSET_UL_List"
     layout_type = "DEFAULT" # could be "COMPACT" or "GRID"
 
     def draw_item(self, context,
@@ -185,84 +274,91 @@ class ANIMSET_UL_List(UIList):
             layout.alignment = 'CENTER'
             layout.label(text="")
 
-class _CAKE_Base:
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Witcher'
-    bl_context = ''#'objectmode'
-    #bl_options = {'DEFAULT_CLOSED'}
-class APP_TOOL_PT_Panel(_CAKE_Base, Panel):
-    bl_idname = "APP_TOOL_PT_Panel"
+class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
+    bl_idname = "WITCH_PT_ENTITY_Panel"
     bl_label = "Character Appearances"
     bl_description = "Demonstration of UIList Features"
     #bl_options = {'HEADER_LAYOUT_EXPAND'}
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
-        """ Draw a UI List and its controls using the same format used by
-            various UI Lists in the user interface, such as Vertex Groups
-            or Shape Keys in the Object Properties Tab of the Properties
-            Editor.
-        """
-
-        object = context.scene
-        if object == None:
-            return
-
-        self.layout.label(text = "Character")
-        row = self.layout.row()
-        op = row.operator(ButtonOperatorw2entChara.bl_idname, text="Import Character", icon='SPHERE')
+        layout = self.layout
+        row = layout.row().box()
+        row = row.column(align=True)
+        row.label(text='Character')
+        op = row.operator(WITCH_OT_ENTITY_w2ent_chara.bl_idname, text="Import Character", icon='SPHERE')
         op.filepath = os.path.join(get_uncook_path(context),"characters\\")
 
-        row = self.layout.row()
-        row.alignment = "CENTER"
+        
+        ob = context.object
+        character_rig_selected = ob and ob.type == "ARMATURE" and "CMovingPhysicalAgentComponent" in ob.name
+        if character_rig_selected:
+            main_arm_obj = ob
+            
+            #main_arm_obj = bpy.context.active_object
+            rig_settings = main_arm_obj.data.witcherui_RigSettings
+            object = rig_settings #context.scene
+            if object == None:
+                return
+            
+            col = row.column(align=True)
+            col.template_list("WITCH_UL_ENTITY_List", "The_List", object,
+                                "app_list", object, "app_list_index")
 
+            grid = row.grid_flow( columns = 2 )
+            grid.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Load").action = "load"
+            #grid.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Clear List").action = "clear"
+            sections = ["Import Settings"]
+            section_options = {
+                "Import Settings" :["do_import_redcloth",
+                                    "do_import_lods"]
+            }
+            for section in sections:
+                row = layout.row()
+                box = row.box()
+                box.label(text=section)
+                for prop in section_options[section]:
+                    box.prop(rig_settings, prop)
 
-        col = row.column(align=True)
-        col.template_list("APP_TOOL_UL_List", "The_List", object,
-                            "app_list", object, "app_list_index")
+            self.layout.label(text = "Character Info:")
+            if object.app_list_index >= 0 and object.app_list:
+                item = object.app_list[object.app_list_index]
 
-
-        grid = self.layout.grid_flow( columns = 2 )
-
-        grid.operator("tool.list_loadapp", text="Load").action = "load"
-        grid.operator("tool.list_loadapp", text="Clear List").action = "clear"
-
-        row = self.layout.row()
-        row.operator("tool.list_loadapp", text="Set lod0").action = "_lod0"
-        row.operator("tool.list_loadapp", text="Set lod1").action = "_lod1"
-        row.operator("tool.list_loadapp", text="Set lod2").action = "_lod2"
-        if object.app_list_index >= 0 and object.app_list:
-            item = object.app_list[object.app_list_index]
-
+                row = self.layout.row()
+                row.prop(item, "name")
+                
             row = self.layout.row()
-            row.prop(item, "name")
-        row = self.layout.row()
-        row.prop(context.scene, "main_entity_skeleton")
-        row = self.layout.row()
-        row.prop(context.scene, "main_face_skeleton")
+            row.prop(rig_settings, "main_entity_skeleton")
+            row = self.layout.row()
+            row.prop(rig_settings, "main_face_skeleton")
 
 
-        row = self.layout.row()
-        col = row.column(align=True)
-        col.template_list("ANIMSET_UL_List", "The_List_2", object,
-                            "animset_list", object, "animset_list_index")
-        row = self.layout.row()
-        row.operator("tool.list_loadapp", text="Load .w2anims").action = "w2anims"
+            row = layout.row().box()
+            row = row.column(align=True)
+            row.label(text='Animation')
+            col = row.column(align=True)
+            col.template_list("WITCH_PT_ENTITY_ANIMSET_UL_List", "The_List_2", object,
+                                "animset_list", object, "animset_list_index")
+            row.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Load .w2anims").action = "w2anims"
 
 
 classes = [
-    ListItemApp,
-    ButtonOperatorw2entChara,
-    APP_TOOL_UL_List,
-    APP_TOOL_PT_Panel,
-    APP_TOOL_OT_list_loadapp,
-
-    #animset
-    ListItemAnimset,
-    ANIMSET_UL_List,
+    #properties
+    #ListItemApp,
+    #ListItemAnimset,
+    
+    #operators
+    WITCH_OT_ENTITY_w2ent_chara,
+    WITCH_OT_ENTITY_list_loadapp,
+    WITCH_OT_ENTITY_lod_toggle,
+    
+    #lists
+    WITCH_UL_ENTITY_List,
+    
+    #panels
+    WITCH_PT_ENTITY_Panel,
+    WITCH_PT_ENTITY_ANIMSET_UL_List,
 ]
-
 
 
 def register():
@@ -270,37 +366,18 @@ def register():
         bpy.utils.register_class(c)
 
 
-    #apperance list
-    bpy.types.Scene.app_list = CollectionProperty(type = ListItemApp)
-    bpy.types.Scene.app_list_index = IntProperty(name = "Index for app_list",
-                                             default = 0)
-
-    #TODO The follow stuff should be attached to armature object?
-    bpy.types.Scene.main_entity_skeleton = StringProperty(
-                                            name="Main Rig",
-                                            description="Name of the rig",
-                                            default="")
-
-    bpy.types.Scene.main_face_skeleton = StringProperty(
-                                            name="Main Face Rig",
-                                            description="Name of the rig",
-                                            default="")
-
-    #animset list
-    bpy.types.Scene.animset_list = CollectionProperty(type = ListItemAnimset)
-    bpy.types.Scene.animset_list_index = IntProperty(name = "Index for Animset list",
-                                             default = 0)
+    
 
 
 def unregister():
-    del bpy.types.Scene.app_list
-    del bpy.types.Scene.app_list_index
+    # del bpy.types.rig_settings.app_list
+    # del bpy.types.rig_settings.app_list_index
 
-    del bpy.types.Scene.main_entity_skeleton
-    del bpy.types.Scene.main_face_skeleton
+    # del bpy.types.rig_settings.main_entity_skeleton
+    # del bpy.types.rig_settings.main_face_skeleton
 
-    del bpy.types.Scene.animset_list
-    del bpy.types.Scene.animset_list_index
+    # del bpy.types.rig_settings.animset_list
+    # del bpy.types.rig_settings.animset_list_index
     for c in classes:
         bpy.utils.unregister_class(c)
 

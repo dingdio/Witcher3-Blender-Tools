@@ -2,8 +2,8 @@ from pathlib import Path
 from io_import_w2l import import_anims
 #from io_import_w2l.filter_list import memory
 from io_import_w2l.setup_logging_bl import *
-from io_import_w2l.CR2W.dc_anims import load_bin_anims_single
 log = logging.getLogger(__name__)
+from io_import_w2l.CR2W.dc_anims import load_bin_anims_single
 
 import csv
 import os
@@ -95,36 +95,42 @@ def createCat(cat_name, dict):
 from io_import_w2l.filtered_list.animations_manager import CModStoryBoardAnimationListsManager
 from io_import_w2l.filtered_list.storyboardasset import CModStoryBoardActor
 def SetupNodeData(context):
-    animListsManager: CModStoryBoardAnimationListsManager = CModStoryBoardAnimationListsManager()
+    ob = context.object
+    if ob and ob.type == "ARMATURE" and "CMovingPhysicalAgentComponent" in ob.name:
+        main_arm_obj = ob
+        
+        #main_arm_obj = bpy.context.active_object
+        rig_settings = main_arm_obj.data.witcherui_RigSettings
+        animListsManager: CModStoryBoardAnimationListsManager = CModStoryBoardAnimationListsManager()
 
-    actor = CModStoryBoardActor()
-    
-    animset_list = context.scene.animset_list
-    actor._animPaths = []
-    for set in animset_list:
-        if ":" not in set.path:
-            actor._animPaths.append(set.path)
-    
-    animListsManager.lazyLoad()
+        actor = CModStoryBoardActor()
+        
+        animset_list = rig_settings.animset_list
+        actor._animPaths = []
+        for set in animset_list:
+            if ":" not in set.path:
+                actor._animPaths.append(set.path)
+        
+        animListsManager.lazyLoad()
 
-    #TODO list should be filtered by the list of w2anims passed into it from the entity object
-    list = animListsManager.getAnimationListFor(actor)
-    #list.setWildcardFilter("")
-    filteredList = list.getFilteredList()
-    print(list.getMatchingItemCount(),"/",list.getTotalCount())
-    myAnims = bpy.context.scene.myAnimList
-    myAnims.clear()
-    for (i, item) in enumerate(filteredList):
-        anim = myAnims.add()
-        anim.id = str(item.id)
-        anim.prefix = item.prefix
-        anim.suffix = item.suffix
-        anim.caption = item.caption
-        anim.child_count = str(item.child_count)
-        anim.isSelected = item.isSelected
-        anim.name = "{}{}{}".format(item.prefix, item.caption, item.suffix)
-        anim.selfIndex = len(myAnims)-1
-        anim.animLineId = str(i)
+        #TODO list should be filtered by the list of w2anims passed into it from the entity object
+        list = animListsManager.getAnimationListFor(actor)
+        #list.setWildcardFilter("")
+        filteredList = list.getFilteredList()
+        print(list.getMatchingItemCount(),"/",list.getTotalCount())
+        myAnims = bpy.context.scene.myAnimList
+        myAnims.clear()
+        for (i, item) in enumerate(filteredList):
+            anim = myAnims.add()
+            anim.id = str(item.id)
+            anim.prefix = item.prefix
+            anim.suffix = item.suffix
+            anim.caption = item.caption
+            anim.child_count = str(item.child_count)
+            anim.isSelected = item.isSelected
+            anim.name = "{}{}{}".format(item.prefix, item.caption, item.suffix)
+            anim.selfIndex = len(myAnims)-1
+            anim.animLineId = str(i)
 
 def FilterData(context):
     list = CModStoryBoardAnimationListsManager.active_list
@@ -147,7 +153,7 @@ def FilterData(context):
             anim.animLineId = str(i)
 
 class MyAnimListItem_Debug(bpy.types.Operator):
-    bl_idname = "object.myanimlist_debug"
+    bl_idname = "witcher.myanimlist_debug"
     bl_label = "Debug"
     
     action: StringProperty(default="default")
@@ -158,7 +164,12 @@ class MyAnimListItem_Debug(bpy.types.Operator):
         scene = context.scene
         action = self.action
         if "load" == action:
-            
+            ob = context.object
+            if ob and ob.type == "ARMATURE" and "CMovingPhysicalAgentComponent" in ob.name:
+                main_arm_obj = ob
+                
+                #main_arm_obj = bpy.context.active_object
+                rig_settings = main_arm_obj.data.witcherui_RigSettings
             if scene.myAnimList_index >= 0 and scene.myAnimList:
                 manager = CModStoryBoardAnimationListsManager.active
                 item = scene.myAnimList[scene.myAnimList_index]
@@ -167,9 +178,9 @@ class MyAnimListItem_Debug(bpy.types.Operator):
                 fdir = os.path.join(uncook_path, fdir)
                 
                 if "_mimic_" in fdir:
-                    result = load_bin_anims_single(fdir, anim_name, rigPath=scene.main_face_skeleton)
+                    result = load_bin_anims_single(fdir, anim_name, rigPath=rig_settings.main_face_skeleton)
                 else:
-                    result = load_bin_anims_single(fdir, anim_name, rigPath=scene.main_entity_skeleton)
+                    result = load_bin_anims_single(fdir, anim_name, rigPath=rig_settings.main_entity_skeleton)
                 animation = result.animations[0]
                 import_anims.import_anim(context, fdir, animation, use_NLA= True)
                 print(fdir)
@@ -178,7 +189,6 @@ class MyAnimListItem_Debug(bpy.types.Operator):
             print("=== Debug Reset ====")
             context.scene.anim_search_str = ""
             SetupNodeData(context)
-            cake = 123
             #memory.changed()
         elif "search" == action:
             FilterData(context)
@@ -273,13 +283,12 @@ class MYANIMLISTITEM_UL_basic(bpy.types.UIList):
         return ([],[])
             
 
-class SCENE_PT_myanimlist(bpy.types.Panel):
+from io_import_w2l.ui.ui_utils import WITCH_PT_Base
+class SCENE_PT_myanimlist(WITCH_PT_Base, bpy.types.Panel):
+    bl_parent_id = "WITCH_PT_Quick"
 
     bl_label = "Quick Anim List"
     bl_idname = "SCENE_PT_myanimlist"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Witcher 3"
 
     def draw(self, context):
         scn = context.scene
@@ -290,7 +299,7 @@ class SCENE_PT_myanimlist(bpy.types.Panel):
         
         row = self.layout.row()
         row.prop(context.scene, "anim_search_str")
-        row.operator("object.myanimlist_debug", text="Search").action = "search"
+        row.operator(MyAnimListItem_Debug.bl_idname, text="Search").action = "search"
         row = layout.row()
         row.template_list(
             listtype_name='MYANIMLISTITEM_UL_basic',#'MYANIMLISTITEM_UL_basic',
@@ -302,9 +311,9 @@ class SCENE_PT_myanimlist(bpy.types.Panel):
             rows=8)
         grid = layout.grid_flow( columns = 2 )
         
-        grid.operator("object.myanimlist_debug", text="Reset").action = "reset3"
-        grid.operator("object.myanimlist_debug", text="Clear").action = "clear"
-        grid.operator("object.myanimlist_debug", text="Load").action = "load"
+        grid.operator(MyAnimListItem_Debug.bl_idname, text="Reset").action = "reset3"
+        #grid.operator(MyAnimListItem_Debug.bl_idname, text="Clear").action = "clear"
+        grid.operator(MyAnimListItem_Debug.bl_idname, text="Load").action = "load"
 
 
 classes = (
@@ -326,8 +335,8 @@ def register():
     # bpy.types.Scene.myAnimList_pointer = PointerProperty(type=bpy.types.UIList
     #                                                      ,name = "Main Anim List")
     bpy.types.Scene.anim_search_str = StringProperty(
-                                            name="Search Anims",
-                                            description="Search Anims",
+                                            name="",
+                                            description="Search Animations",
                                             default="",
                                             update=update_filter)
 

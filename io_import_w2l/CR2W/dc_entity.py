@@ -306,6 +306,8 @@ def create_CEntity(file):
             coloringEntries = chunk.GetVariableByName("coloringEntries")
             if coloringEntries:
                 for coloringEntry in coloringEntries.More:
+                    if coloringEntries.Count == 1:
+                        coloringEntry = coloringEntries
                     colorShift1 = coloringEntry.GetVariableByName('colorShift1')
                     if colorShift1:
                         colorShift1 = w3_types.CColorShift(colorShift1.GetVariableByName('hue').Value if colorShift1.GetVariableByName('hue') else 0,

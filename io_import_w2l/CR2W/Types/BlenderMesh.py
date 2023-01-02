@@ -1,17 +1,17 @@
 from typing import List
 
-from CR2W.Types.SBufferInfos import SMeshInfos
-
+from CR2W.Types.SBufferInfos import SMeshInfos, BoneData, W3_DataCache
+import math
 
 class CommonData(object):
-    def __init__(self):
-        #public string modelPath = "";
-        # public StaticMesh staticMesh = StaticMesh.Create();
-        self.materialInstances: List = []# public List<CMaterialInstance> materialInstances = new List<CMaterialInstance>();
-        self.meshInfos: List[SMeshInfos] = []# public List<SMeshInfos> meshInfos = new List<SMeshInfos>();
-        # public BoneData boneData = new BoneData();
-        # public W3_DataCache w3_DataCache = new W3_DataCache();
+    PI_OVER_180 = math.pi / 180.0
 
-        # public const float PI_OVER_180 = (float)Math.PI / 180.0f;
+    def __init__(self):
+        self.modelPath = ""
+        self.staticMesh = None
+        self.materialInstances: List = []
+        self.meshInfos: List[SMeshInfos] = []
+        self.boneData = BoneData()
+        self.w3_DataCache = W3_DataCache()
 
 

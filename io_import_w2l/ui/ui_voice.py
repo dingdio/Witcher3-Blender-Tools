@@ -230,7 +230,6 @@ class MyVoiceListItem_Debug(bpy.types.Operator):
                 cr2wPath = cr2w_directory_to_check+filename+".cr2w"
                 if os.path.isfile(cr2wPath):
                     log.info('Importing Lipsync')
-                    #cr2wPath = r"E:\w3.mods\w3.modCakeTest\speech\speech.en.wem\2113445002.lipsyncanim.cr2w"
                     import_anims.import_lipsync(context, cr2wPath, use_NLA=True, NLA_track="voice_import")
                 if os.path.isfile(soundPath):
                     log.info('Importing Sound')
@@ -284,14 +283,13 @@ class MYVOICELISTITEM_UL_basic(bpy.types.UIList):
             col = layout.column()
             col.label(text=item.name)
             
+from io_import_w2l.ui.ui_utils import WITCH_PT_Base
 
-class SCENE_PT_myvoicelist(bpy.types.Panel):
+class SCENE_PT_myvoicelist(WITCH_PT_Base, bpy.types.Panel):
+    bl_parent_id = "WITCH_PT_Quick"
 
     bl_label = "Quick Voice List"
     bl_idname = "SCENE_PT_myvoicelist"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Witcher 3"
 
     def draw(self, context):
 
@@ -312,7 +310,7 @@ class SCENE_PT_myvoicelist(bpy.types.Panel):
         grid = layout.grid_flow( columns = 2 )
         
         grid.operator("object.myvoicelist_debug", text="Reset").action = "reset3"
-        grid.operator("object.myvoicelist_debug", text="Clear").action = "clear"
+        #grid.operator("object.myvoicelist_debug", text="Clear").action = "clear"
         grid.operator("object.myvoicelist_debug", text="Load").action = "load"
 
 

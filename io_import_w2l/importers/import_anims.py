@@ -41,77 +41,6 @@ class animFile:
 class HasAnimationData:
     animation_data: bpy.types.AnimData
 
-class _InterpolationHelper:
-    def __init__(self, mat):
-        self.__indices = indices = [0, 1, 2]
-        l = sorted((-abs(mat[i][j]), i, j) for i in range(3) for j in range(3))
-        _, i, j = l[0]
-        if i != j:
-            indices[i], indices[j] = indices[j], indices[i]
-        _, i, j = next(k for k in l if k[1] != i and k[2] != j)
-        if indices[i] != j:
-            idx = indices.index(j)
-            indices[i], indices[idx] = indices[idx], indices[i]
-
-    def convert(self, interpolation_xyz):
-        return (interpolation_xyz[i] for i in self.__indices)
-
-class BoneConverter:
-    def __init__(self, pose_bone, scale, invert=False):
-        mat = pose_bone.bone.matrix_local.to_3x3()
-        mat[1], mat[2] = mat[2].copy(), mat[1].copy()
-        self.__mat = mat.transposed()
-        self.__scale = scale
-        if invert:
-            self.__mat.invert()
-        self.convert_interpolation = _InterpolationHelper(self.__mat).convert
-
-    def convert_location(self, location):
-        return matmul(self.__mat, Vector(location)) * self.__scale
-
-    def convert_rotation(self, rotation_xyzw):
-        rot = Quaternion()
-        rot.x, rot.y, rot.z, rot.w = rotation_xyzw
-        return Quaternion(matmul(self.__mat, rot.axis) * -1, rot.angle).normalized()
-
-class BoneConverterPoseMode:
-    def __init__(self, pose_bone, scale, invert=False):
-        mat = pose_bone.matrix.to_3x3()
-        mat[1], mat[2] = mat[2].copy(), mat[1].copy()
-        self.__mat = mat.transposed()
-        self.__scale = scale
-        self.__mat_rot = pose_bone.matrix_basis.to_3x3()
-        self.__mat_loc = matmul(self.__mat_rot, self.__mat)
-        self.__offset = pose_bone.location.copy()
-        self.convert_location = self._convert_location
-        self.convert_rotation = self._convert_rotation
-        if invert:
-            self.__mat.invert()
-            self.__mat_rot.invert()
-            self.__mat_loc.invert()
-            self.convert_location = self._convert_location_inverted
-            self.convert_rotation = self._convert_rotation_inverted
-        self.convert_interpolation = _InterpolationHelper(self.__mat_loc).convert
-
-    def _convert_location(self, location):
-        return self.__offset + matmul(self.__mat_loc, Vector(location)) * self.__scale
-
-    def _convert_rotation(self, rotation_xyzw):
-        rot = Quaternion()
-        rot.x, rot.y, rot.z, rot.w = rotation_xyzw
-        rot = Quaternion(matmul(self.__mat, rot.axis) * -1, rot.angle)
-        return matmul(self.__mat_rot, rot.to_matrix()).to_quaternion()
-
-    def _convert_location_inverted(self, location):
-        return matmul(self.__mat_loc, Vector(location) - self.__offset) * self.__scale
-
-    def _convert_rotation_inverted(self, rotation_xyzw):
-        rot = Quaternion()
-        rot.x, rot.y, rot.z, rot.w = rotation_xyzw
-        rot = matmul(self.__mat_rot, rot.to_matrix()).to_quaternion()
-        return Quaternion(matmul(self.__mat, rot.axis) * -1, rot.angle).normalized()
-
-
 class AnimImporter:
     def __init__(self, filepath, SetEntry, scale=1.0, use_pose_mode=False, use_NLA=False, facePose=False, NLA_track = 'anim_import'):
         self.__animFile = animFile()
@@ -121,95 +50,8 @@ class AnimImporter:
         self.__SetEntry = SetEntry
         self.__use_NLA = use_NLA
         self.__NLA_track = NLA_track
-        self.__bone_util_cls = BoneConverterPoseMode if use_pose_mode else BoneConverter
         self.__frame_margin = 0
         self.facePose = facePose
-
-    @staticmethod
-    def __swap_components(vec, mp):
-        __pat = 'XYZ'
-        return [vec[__pat.index(k)] for k in mp]
-
-    @staticmethod
-    def __minRotationDiff(prev_q, curr_q):
-        t1 = (prev_q.w - curr_q.w)**2 + (prev_q.x - curr_q.x)**2 + (prev_q.y - curr_q.y)**2 + (prev_q.z - curr_q.z)**2
-        t2 = (prev_q.w + curr_q.w)**2 + (prev_q.x + curr_q.x)**2 + (prev_q.y + curr_q.y)**2 + (prev_q.z + curr_q.z)**2
-        #t1 = prev_q.rotation_difference(curr_q).angle
-        #t2 = prev_q.rotation_difference(-curr_q).angle
-        return -curr_q if t2 < t1 else curr_q
-
-    @staticmethod
-    def __setInterpolation(bezier, kp0, kp1):
-        if bezier[0] == bezier[1] and bezier[2] == bezier[3]:
-            kp0.interpolation = 'LINEAR'
-        else:
-            kp0.interpolation = 'BEZIER'
-        kp0.handle_right_type = 'FREE'
-        kp1.handle_left_type = 'FREE'
-        d = (kp1.co - kp0.co) / 127.0
-        kp0.handle_right = kp0.co + Vector((d.x * bezier[0], d.y * bezier[1]))
-        kp1.handle_left = kp0.co + Vector((d.x * bezier[2], d.y * bezier[3]))
-
-    @staticmethod
-    def __fixFcurveHandles(fcurve):
-        kp0 = fcurve.keyframe_points[0]
-        kp0.handle_left_type = 'FREE'
-        kp0.handle_left = kp0.co + Vector((-1, 0))
-        kp = fcurve.keyframe_points[-1]
-        kp.handle_right_type = 'FREE'
-        kp.handle_right = kp.co + Vector((1, 0))
-
-    @staticmethod
-    def __keyframe_insert_inner(fcurves: bpy.types.ActionFCurves, path: str, index: int, frame: float, value: float):
-        fcurve = fcurves.find(path, index=index)
-        if fcurve is None:
-            fcurve = fcurves.new(path, index=index)
-        fcurve.keyframe_points.insert(frame, value, options={'FAST'})
-
-    @staticmethod
-    def __keyframe_insert(fcurves: bpy.types.ActionFCurves, path: str, frame: float, value: Union[int, float, Vector]):
-        if isinstance(value, (int, float)):
-            AnimImporter.__keyframe_insert_inner(fcurves, path, 0, frame, value)
-
-        elif isinstance(value, Vector):
-            AnimImporter.__keyframe_insert_inner(fcurves, path, 0, frame, value[0])
-            AnimImporter.__keyframe_insert_inner(fcurves, path, 1, frame, value[1])
-            AnimImporter.__keyframe_insert_inner(fcurves, path, 2, frame, value[2])
-
-        else:
-            raise TypeError('Unsupported type: {0}'.format(type(value)))
-
-    def __getBoneConverter(self, bone):
-        converter = self.__bone_util_cls(bone, self.__scale)
-        mode = bone.rotation_mode
-        compatible_quaternion = self.__minRotationDiff
-        class _ConverterWrap:
-            convert_location = converter.convert_location
-            convert_interpolation = converter.convert_interpolation
-            if mode == 'QUATERNION':
-                convert_rotation = converter.convert_rotation
-                compatible_rotation = compatible_quaternion
-            elif mode == 'AXIS_ANGLE':
-                @staticmethod
-                def convert_rotation(rot):
-                    (x, y, z), angle = converter.convert_rotation(rot).to_axis_angle()
-                    return (angle, x, y, z)
-                @staticmethod
-                def compatible_rotation(prev, curr):
-                    angle, x, y, z = curr
-                    if prev[1]*x + prev[2]*y + prev[3]*z < 0:
-                        angle, x, y, z = -angle, -x, -y, -z
-                    angle_diff = prev[0] - angle
-                    if abs(angle_diff) > math.pi:
-                        pi_2 = math.pi * 2
-                        bias = -0.5 if angle_diff < 0 else 0.5
-                        angle += int(bias + angle_diff/pi_2) * pi_2
-                    return (angle, x, y, z)
-            else:
-                convert_rotation = lambda rot: converter.convert_rotation(rot).to_euler(mode)
-                compatible_rotation = lambda prev, curr: curr.make_compatible(prev) or curr
-        return _ConverterWrap
-
 
     def __assign_action(self, target: Union[bpy.types.ID, HasAnimationData], action: bpy.types.Action):
         if target.animation_data is None:
@@ -243,20 +85,6 @@ class AnimImporter:
                 return None
         SkeletalAnimationType = self.__SetEntry.animation.SkeletalAnimationType
         AdditiveType = self.__SetEntry.animation.AdditiveType
-
-        # class ESkeletalAnimationType(Enum):
-        #     """Docstring for ESkeletalAnimationType."""
-        #     SAT_Normal = 0
-        #     SAT_Additive = 1
-        #     SAT_MS = 2
-            
-        # class EAdditiveType(Enum):
-        #     """Docstring for EAdditiveType."""
-        #     AT_Local = 0
-        #     AT_Ref = 1
-        #     AT_TPose = 2
-        #     AT_Animation = 3
-
         armature_namespace = detect_maya_namespace(armObj.pose.bones[0].name)
         scale = 1.0
         extra_frame = 1 if self.__frame_margin > 1 else 0
@@ -412,6 +240,15 @@ class AnimImporter:
                             armObj.rotation_euler.x = math.radians(90)
                         elif degrees[0] > 88 and degrees[0] <92:
                             armObj.rotation_euler.x = math.radians(-90)
+                            if degrees[2] < -174 and degrees[2] > -181:
+                                armObj.rotation_euler.x = math.radians(90)
+                                armObj.rotation_euler.z = math.radians(0)
+                            elif degrees[0] > 88 and degrees[0] <92 and degrees[2] > 178 and degrees[2] < 181:
+                                armObj.rotation_euler.x = math.radians(90)
+                                if degrees[1] > 0:
+                                    armObj.rotation_euler.z = math.radians(0)
+                                else:
+                                    armObj.rotation_euler.z = math.radians(180)
                         if degrees[1] > 178 and degrees[1] < 181:
                             armObj.rotation_euler.z = math.radians(0)
                         if degrees[2] > 88 and degrees[2] < 120:
@@ -427,15 +264,6 @@ class AnimImporter:
                         rot_curves[i].keyframe_points[-1].interpolation = 'LINEAR'
         bpy.ops.object.mode_set(mode='OBJECT')
         log.critical(' Finished adding keyframes in %f seconds.', time.time() - start_time)
-        
-        # if len(armObj.keys()) > 1:
-        #     # First item is _RNA_UI
-        #     print("Object",armObj.name,"custom properties:")
-        #     for K in armObj.keys():
-        #         if K not in '_RNA_UI':
-        #             print( K , "-" , armObj[K] )
-        # if "jaw_open_a" in armObj.keys():
-        #     print( "jaw_open_a" , "-" , armObj["jaw_open_a"] )
         
         SkeletalAnimation = self.__SetEntry.animation
         SkeletalAnimationData = SkeletalAnimation.animBuffer
@@ -527,7 +355,6 @@ class AnimImporter:
 
         self.__assign_action(meshObj.data.shape_keys, action)
 
-
     def assign(self, obj, action_name=None):
         if obj is None:
             return
@@ -550,12 +377,7 @@ def NewListItem( treeList, node):
     item.SkeletalAnimationType = node.animation.SkeletalAnimationType
     if node.animation.AdditiveType:
         item.AdditiveType = node.animation.AdditiveType
-    
-    #item.jsonData = "cake" #node.toJSON()
-    #item.nodeIndex = node.selfIndex
-    #item.childCount = node.childCount
     return item
-
 
 def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=False, override_select = False, update_scene_settings = True, NLA_track = 'anim_import'):
     if not override_select:
@@ -568,9 +390,9 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
         importer.assign(i)
     log.info(' Finished importing motion in %f seconds.', time.time() - start_time)
 
-    #update_scene_settings = True # MAKE BLEND IMPORT PROP
+    update_scene_settings = True # MAKE BLEND IMPORT PROP
     if update_scene_settings:
-        auto_scene_setup.setupFrameRanges()
+        auto_scene_setup.setupFrameRanges(use_NLA)
         auto_scene_setup.setupFps()
     context.scene.frame_set(context.scene.frame_current)
     return {'FINISHED'}
@@ -578,7 +400,6 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
 global GLOBAL_ANIMSET
 
 def import_from_list_item(context, item):
-    #cake = w3_types.CSkeletalAnimationSetEntry.from_json(json.loads(item.jsonData))
     for anim_set_entry in GLOBAL_ANIMSET.animations:
         if anim_set_entry.animation.name == item.name:
             import_anim(context, "from_list", anim_set_entry)
@@ -609,21 +430,14 @@ def import_lipsync(context, fileName = False, load_from_data = False, use_NLA=Tr
     log.info('Lipsync loaded')
     return {'FINISHED'}
     
-def start_import(context, fileName = False, load_from_data = False, rigPath = r"E:\w3.modding\modkit\r4data\characters\base_entities\woman_base\woman_base.w2rig"):
-    if fileName.endswith('.w2anims') or fileName.endswith('.json'):
-        pass
-    else:
-        fileName = r"E:\w3.modding\modkit\r4data\animations\man\combat\man_geralt_gabriel.w2anims.json"
+def start_import(context, fileName = False, load_from_data = False, rigPath = None):
     if fileName:
         animSetTemplate = import_w3_animSet(fileName, rigPath)
     elif load_from_data:
         animSetTemplate = load_from_data
     else:
-        print("populate_animSet error")
+        log.critical("populate_animSet error")
         return
-    #!DELETE
-    # with open(r"F:\RE3R_MODS\Blender_Scripts\io_import_w2l\test_w2anims.json", "w") as file:
-    #     file.write(json.dumps(animSetTemplate,indent=2, default=vars, sort_keys=False))
 
     treeList = context.scene.demo_list
     treeList.clear()
@@ -631,7 +445,3 @@ def start_import(context, fileName = False, load_from_data = False, rigPath = r"
     GLOBAL_ANIMSET = animSetTemplate
     for node in animSetTemplate.animations:
         item = NewListItem(treeList, node)
-
-    #animSetTemplate.animations[0]
-    
-    

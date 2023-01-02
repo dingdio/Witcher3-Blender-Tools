@@ -206,7 +206,7 @@ class CModStoryBoardAnimationListsManager(object):
         CModStoryBoardAnimationListsManager.active = self
 
     def init(self):
-        cake =123
+        pass
     # ------------------------------------------------------------------------
     def lazyLoad(self):
         self._animMeta = CStoryBoardAnimationMetaInfo()

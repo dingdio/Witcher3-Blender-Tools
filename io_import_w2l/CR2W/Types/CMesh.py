@@ -1,4 +1,12 @@
-from CR2W.Types.VariousTypes import CNAME, CNAME_INDEX, NAME, CBufferVLQInt32, CFloat, CMatrix4x4, CPaddedBuffer, CUInt16, CUInt32
+from CR2W.Types.VariousTypes import (CNAME,
+                                     CNAME_INDEX,
+                                     NAME,
+                                     CBufferVLQInt32,
+                                     CFloat,
+                                     CMatrix4x4,
+                                     CPaddedBuffer,
+                                     CUInt16,
+                                     CUInt32)
 
 
 class CResource(object):
@@ -61,19 +69,14 @@ class CMesh(object):
         pass
 
     def Read(self, f, size):
-        #CBufferVLQInt32<CPaddedBuffer<CUInt16>> ChunkgroupIndeces
         self.chunkgroupIndeces = CBufferVLQInt32(self.CR2WFILE, CPaddedBuffer, CUInt16)
         self.chunkgroupIndeces.Read(f, 0)
-        #CBufferVLQInt32<CName> BoneNames
         self.boneNames = CBufferVLQInt32(self.CR2WFILE, CNAME_INDEX)
         self.boneNames.Read(f, 0)
-        #CBufferVLQInt32<CMatrix4x4> Bonematrices
         self.Bonematrices = CBufferVLQInt32(self.CR2WFILE, CMatrix4x4)
         self.Bonematrices.Read(f, 0)
-        #CBufferVLQInt32<CFloat> Block3
         self.Block3 = CBufferVLQInt32(self.CR2WFILE, CFloat)
         self.Block3.Read(f, 0)
-        #CBufferVLQInt32<CUInt32> BoneIndecesMappingBoneIndex
         self.BoneIndecesMappingBoneIndex = CBufferVLQInt32(self.CR2WFILE, CUInt32)
         self.BoneIndecesMappingBoneIndex.Read(f, 0)
 

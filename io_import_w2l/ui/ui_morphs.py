@@ -1,13 +1,16 @@
-
-from io_import_w2l.CR2W.CR2W_types import dotdict
 import bpy
+from typing import Tuple
+from bpy.props import StringProperty, BoolProperty
+from mathutils import Vector
 
-
-class WITCH_PT_Base:
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Witcher'
-    bl_context = ''#'objectmode'
+from io_import_w2l.ui.ui_utils import WITCH_PT_Base
+from io_import_w2l.CR2W.CR2W_types import dotdict
+from io_import_w2l.CR2W.w3_types import CSkeletalAnimationSetEntry
+from io_import_w2l.CR2W.dc_anims import load_lipsync_file
+from io_import_w2l.importers import import_anims
+from io_import_w2l.importers import import_rig
+from bpy.types import PropertyGroup
+from bpy.props import IntProperty, StringProperty, CollectionProperty, BoolProperty
 
 class witcherui_redmorph(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name = "Name")
@@ -16,8 +19,45 @@ class witcherui_redmorph(bpy.types.PropertyGroup):
 
 bpy.utils.register_class(witcherui_redmorph)
 
-class witcherui_RigSettings(bpy.types.PropertyGroup):
+class ListItemBone(PropertyGroup):
+    """."""
+    name: StringProperty(
+           name="Bone",
+           description="Name of bone",
+           default="")
+bpy.utils.register_class(ListItemBone)
 
+
+class ListItemAnimset(PropertyGroup):
+    """."""
+    path: StringProperty(
+           name="Path",
+           description="Path to Animset",
+           default="Untitled")
+
+    name: StringProperty(
+           name="Name",
+           description="",
+           default="")
+
+
+class ListItemApp(PropertyGroup):
+    """Group of properties representing an item in the list."""
+
+    name: StringProperty(
+           name="Name",
+           description="Name of the animation",
+           default="Untitled")
+
+    jsonData: StringProperty(
+           name="Animation in Json",
+           description="",
+           default="")
+
+bpy.utils.register_class(ListItemAnimset)
+bpy.utils.register_class(ListItemApp)
+
+class witcherui_RigSettings(bpy.types.PropertyGroup):
     model_name: bpy.props.StringProperty(default = "",
                         name = "Model name",
                         description = "Model name")
@@ -42,81 +82,240 @@ class witcherui_RigSettings(bpy.types.PropertyGroup):
 
     witcher_morphs_number: bpy.props.IntProperty(default = 0,
                         name = "")
-    witcher_body_morphs: bpy.props.BoolProperty(default = True,
-                        name = "Body Morphs Morphs",
+    witcher_face_morphs: bpy.props.BoolProperty(default = True,
+                        name = "Morphs from mimic poses",
                         description = "Search for witcher Body morphs")
     witcher_morphs_collapse: bpy.props.BoolProperty(default = True)
+
+    #apperance list
+    app_list : CollectionProperty(type = ListItemApp)
+    app_list_index : IntProperty(name = "Index for app_list",
+                                             default = 0)
+    
+    main_entity_skeleton : StringProperty(
+                                            name="Main Rig",
+                                            description="Name of the rig",
+                                            default="")
+
+    main_face_skeleton : StringProperty(
+                                            name="Main Face Rig",
+                                            description="Name of the rig",
+                                            default="")
+    
+    do_import_redcloth : BoolProperty(
+                                            name="Include redcloth",
+                                            description="Import redcloth with apperances",
+                                            default=1)
+    do_import_lods : BoolProperty(
+                                            name="Include LODs",
+                                            description="Include LODs",
+                                            default=0)
+
+    #animset list
+    animset_list : CollectionProperty(type = ListItemAnimset)
+    animset_list_index : IntProperty(name = "Index for Animset list",
+                                             default = 0)
+
+    jsonData: StringProperty(name="Json Data",
+                            description="Json Data of entire character",
+                            default="")
+
+    bone_order_list : CollectionProperty(type=ListItemBone)
+
+
 
 bpy.utils.register_class(witcherui_RigSettings)
 bpy.types.Armature.witcherui_RigSettings = bpy.props.PointerProperty(type = witcherui_RigSettings)
 
-
-class PANEL_PT_WitcherMorphs(WITCH_PT_Base, bpy.types.Panel):
-    bl_idname = "PANEL_PT_WitcherMorphs"
+class WITCH_PT_WitcherMorphs(WITCH_PT_Base, bpy.types.Panel):
+    bl_parent_id = "WITCH_PT_ENTITY_Panel"
+    bl_idname = "WITCH_PT_WitcherMorphs"
     bl_label = "Morphs"
-    #bl_options = {"DEFAULT_CLOSED"}
-
-    # def draw_header(self,context):
-    #     pass
     def draw(self, context):
-
-
-        return
         ob = context.object
         coll = context.collection
         scn = context.scene
-        layout = self.layout
+        layout:bpy.types.UILayout = self.layout
         box = layout.box()
-        if ob:
-            box.label(text = "Active Object: %s" % ob.entity_type)
-            box.prop(ob, "name")
-            if ob.template:
-                box.prop(ob, "template")
-            if ob.entity_type:
-                box.prop(ob, "entity_type")
-        else:
-            box.label(text = "No active object")
+        # if ob:
+        #     box.label(text = "Active Object: %s" % ob.entity_type)
+        #     box.prop(ob, "name")
+        #     if ob.template:
+        #         box.prop(ob, "template")
+        #     if ob.entity_type:
+        #         box.prop(ob, "entity_type")
+        # else:
+        #     box.label(text = "No active object")
+        box.operator(WITCH_OT_morphs.bl_idname, text="Load Face Morphs", icon='SHAPEKEY_DATA')
 
-        main_arm_obj = bpy.context.scene.objects["shani:CMimicComponent12_ARM"]
-        
-        main_arm_obj = bpy.context.active_object
-        rig_settings = main_arm_obj.data.witcherui_RigSettings
+        if ob and ob.type == "ARMATURE" and "CMovingPhysicalAgentComponent" in ob.name:
+            main_arm_obj = ob
 
-        #cake = settings.witcher_morphs_list.add()
+            main_arm_obj = bpy.context.active_object
+            rig_settings = main_arm_obj.data.witcherui_RigSettings
+            layout = self.layout
+            if rig_settings.witcher_face_morphs:
+                box = layout.box()
+                row = box.row(align=False)
+                row.prop(rig_settings, "witcher_morphs_collapse", icon="TRIA_DOWN" if not rig_settings.witcher_morphs_collapse else "TRIA_RIGHT", icon_only=True, emboss=False)
+                body_morphs = [x for x in rig_settings.witcher_morphs_list if x.type == 4] #and self.morph_filter(x, rig_settings)]
+                row.label(text="Face (" + str(len(body_morphs)) + ")")
+
+                if not rig_settings.witcher_morphs_collapse:
+                    the_data = rig_settings.model_armature_object.pose.bones["w3_face_poses"]
+
+                    for morph in body_morphs:
+                        if hasattr(the_data,'[\"' + morph.path + '\"]'):
+                            box.prop(the_data, '[\"' + morph.path + '\"]', text = morph.name)
+
+                        else:
+                            pass
 
 
-        layout = self.layout
+def create_morph_and_driver(self, obj, mesh_bl_o, this_POSE):
+    bpy.context.view_layer.objects.active =  mesh_bl_o
+    apply_ret = bpy.ops.object.modifier_apply_as_shapekey(keep_modifier=True, modifier="Armature")
 
-        box = layout.box()
-        # rig_settings = dotdict({'model_armature_object':main_arm_obj})
-        # body_morphs = [dotdict({'name':"jaw_open_o",'path':"jaw_open_o"})]
-        # settings = dotdict({'morphs_error':"morphs_error"})
-        row = box.row(align=False)
-        row.label(text = "Face Morphs")
+    if 'FINISHED' not in apply_ret:
+        self.report({'ERROR'}, "Error on pplying modifier, Object: {0}, ShapeKey: {1}, apply modifier: {2}".format(mesh_bl_o.name, this_POSE.name, apply_ret))
+        ret = False
+    else:
+        new_morph = mesh_bl_o.data.shape_keys.key_blocks[-1]
+        new_morph.name = this_POSE.name # rename
+        driver_curve = new_morph.driver_add("value")
+        driver = driver_curve.driver
+        channel = this_POSE.name
+        driver.expression = channel
+        var = driver.variables.get(channel)
+        if var is None:
+            var = driver.variables.new()
+        var.type = "SINGLE_PROP"
+        var.name = channel
+        target = var.targets[0]
+        target.id_type = "OBJECT"
+        target.data_path = 'pose.bones["w3_face_poses"]["%s"]' % channel #'["%s"]' % channel
+        target.id = obj
 
-        if rig_settings.witcher_body_morphs:
-            box = layout.box()
-            row = box.row(align=False)
-            row.prop(rig_settings, "witcher_morphs_collapse", icon="TRIA_DOWN" if not rig_settings.witcher_morphs_collapse else "TRIA_RIGHT", icon_only=True, emboss=False)
-            body_morphs = [x for x in rig_settings.witcher_morphs_list if x.type == 4] #and self.morph_filter(x, rig_settings)]
-            row.label(text="Body (" + str(len(body_morphs)) + ")")
+def witcherui_add_redmorph(collection, item):
+    for el in collection:
+        if el.name == item[0] and el.path == item[1] and el.type == item[2]:
+            return
 
-            if not rig_settings.witcher_morphs_collapse:
+    add_item = collection.add()
+    add_item.name = item[0]
+    add_item.path = item[1]
+    add_item.type = item[2]
+    return
 
-                for morph in body_morphs:
-                    if hasattr(rig_settings.model_armature_object,'[\"' + morph.path + '\"]'):
-                        box.prop(rig_settings.model_armature_object, '[\"' + morph.path + '\"]', text = morph.name)
-                    else:
-                        pass
-                        # row = box.row(align=False)
-                        # row.label(text = morph.name)
-                        # row.prop(settings, 'morphs_error', text = "", icon = "ERROR", emboss=False, icon_only = True)
+def get_face_meshs(mimicFace: str) -> Tuple:
+    face_arms = []
+    face_meshes = []
+    #face_rig =bpy.context.scene.objects[mimicFace]
+    all_objs = bpy.data.objects
+    for arm_obj in all_objs:
+        if arm_obj.type != 'ARMATURE':
+            continue
+        for bone in arm_obj.pose.bones:
+            for constraint in bone.constraints:
+                if constraint.target.name == mimicFace and arm_obj.name not in face_arms:
+                    face_arms.append(arm_obj.name)
 
+    for mesh_obj in all_objs:
+        if mesh_obj.type != 'MESH':
+            continue
+        for modifier in mesh_obj.modifiers:
+            if modifier.type != 'ARMATURE':
+                continue
+            if modifier.object.name in face_arms and mesh_obj.name not in face_meshes:
+                face_meshes.append(mesh_obj.name)
+    return (face_meshes, face_arms)
+
+class WITCH_OT_morphs(bpy.types.Operator):
+    """Must load a character in the Characher Appearances panel first. Select the CMovingPhysicalAgentComponent and press this button. It may take a while but should create all the face morphs and add a pose bone to control them"""
+    bl_idname = "witcher.load_face_morphs"
+    bl_label = "Active Debug"
+
+    def execute(self, context):
+        main_obj = bpy.context.active_object
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        arm_obj = main_obj
+        bl_ctrl_bone = arm_obj.data.edit_bones.get("w3_face_poses")
+        if bl_ctrl_bone == None:
+            bl_ctrl_bone = arm_obj.data.edit_bones.new("w3_face_poses")
+            bl_ctrl_bone.parent = None
+            bl_ctrl_bone.use_deform = False
+            bl_ctrl_bone.head = Vector([-0.5, 0, 1.5])
+            bl_ctrl_bone.tail = Vector([0, 0, 0.2]) + bl_ctrl_bone.head
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        fileName = main_obj['mimicFaceFile']
+
+        faceData = import_rig.loadFaceFile(fileName)
+
+        rig_settings = main_obj.data.witcherui_RigSettings
+        rig_settings.model_armature_object = main_obj
+
+        for pose in faceData.mimicPoses:
+            # if pose.name != "default":
+            #     continue
+            bl_ctrl_bone_pose = main_obj.pose.bones['w3_face_poses']
+            bl_ctrl_bone_pose[pose.name] = 0.0
+            property_manager = bl_ctrl_bone_pose.id_properties_ui(pose.name)
+            property_manager.update(min = 0., max = 1)
+            witcherui_add_redmorph(rig_settings.witcher_morphs_list, [pose.name, pose.name, 4])
+
+            #this_POSE = faceData.mimicPoses[2]
+            this_POSE = pose
+
+            face_rig = bpy.context.scene.objects[main_obj['mimicFace']]
+            bpy.context.view_layer.objects.active = face_rig
+            (face_meshes, face_arms ) = get_face_meshs(main_obj['mimicFace']) #get_face_meshs(obj.name) #get_face_meshs(obj['mimicFace'])
+            #return {'FINISHED'}
+            this_POSE.SkeletalAnimationType = "SAT_Additive"
+            set_entry = CSkeletalAnimationSetEntry()
+            set_entry.animation = this_POSE
+            for pb in face_rig.pose.bones:
+                pb.matrix_basis.identity()
+            #bpy.ops.object.mode_set(mode='POSE', toggle=False)
+            #bpy.ops.pose.transforms_clear()
+            import_anims.import_anim(context, "cake", set_entry, facePose=True, override_select=[face_rig])
+
+
+            context.scene.frame_current = 0
+            #!GET MESH OBJECTS FOR THIS AND APPLY SHAPE KEYS
+
+            for face_mesh in face_meshes:
+                the_mesh = bpy.context.scene.objects[face_mesh]
+                create_morph_and_driver(self, main_obj, the_mesh, this_POSE)
+
+            #! RETURN ACTIVE OBJECT
+            bpy.context.view_layer.objects.active = face_rig
+            for pb in face_rig.pose.bones:
+                pb.matrix_basis.identity()
+            face_rig.animation_data.action = None
+
+        #! RETURN MAIN OBJECT
+        bpy.context.view_layer.objects.active = main_obj
+
+        bpy.ops.object.mode_set(mode='POSE')
+        for face_mesh in face_meshes:
+            the_mesh = bpy.context.scene.objects[face_mesh]
+            if the_mesh.data.shape_keys.animation_data is not None:
+                for oDrv in the_mesh.data.shape_keys.animation_data.drivers:
+                    driver = oDrv.driver
+                    driver.expression += " "
+                    driver.expression = driver.expression[:-1]
+        return {'FINISHED'}
+
+    def __del__(self):
+        pass
+        #bpy.ops.object.modifier_apply_as_shapekey(keep_modifier=True, modifier="Armature")
 
 from bpy.utils import (register_class, unregister_class)
 
 _classes = [
-    PANEL_PT_WitcherMorphs,
+    WITCH_PT_WitcherMorphs,
 ]
 
 

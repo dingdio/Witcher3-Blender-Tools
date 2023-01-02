@@ -1,5 +1,6 @@
 from io_import_w2l import get_texture_path
-from io_import_w2l import get_keep_lod_meshes
+#from io_import_w2l import get_keep_lod_meshes
+from io_import_w2l.importers import import_mesh
 
 from typing import List, Tuple, Dict
 from bpy.types import Operator, Object
@@ -7,7 +8,7 @@ from bpy.types import Operator, Object
 import bpy, os, sys
 from math import pi
 
-from .w3_material import load_w3_materials, load_texture_table, make_texture_table
+from .w3_material import load_w3_materials_XML
 
 def enable_print(bool):
     """For suppressing prints from fbx importer and remove_doubles()."""
@@ -48,7 +49,6 @@ def is_object_useless(ob_blacklist: List[str], o: Object) -> str:
 def import_w3_fbx(context
         ,filepath: str
         ,uncook_path: str
-        ,tex_table: Dict[str, List[str]]	# Dictionary that maps texture filenames to their full paths (sometimes several paths)
         ,ob_blacklist: List[str] = []
         ,remove_doubles = True
         ,keep_lod_meshes = False
@@ -111,7 +111,7 @@ def import_w3_fbx(context
             xml_path = filepath.replace(".fbx", ".xml")
             xml_path = xml_path.replace("_CONVERT_","")
             try:
-                load_w3_materials(o, uncook_path, tex_table, xml_path, force_mat_update=force_mat_update)
+                load_w3_materials_XML(o, uncook_path, xml_path, force_mat_update=force_mat_update)
             except ValueError as err:
                 print("WARNING: Problem loading material in fbx importer", err.reason)
             if len(o.data.vertices) == 0:
@@ -174,29 +174,30 @@ def deduplicate_images():
             img.user_remap(filepaths[img.filepath])
 
 def importFbx(filepath, ns="cake", name=":", uncook_path=False, keep_lod_meshes = False):
-    context = bpy.context
-    keep_lod_meshes = get_keep_lod_meshes(context)
-    if not os.path.exists(filepath):
-        print("Can't find FBX file", filepath)
-        #cmds.confirmDialog( title='Error', button='OK', message='Can\'t find "{0}". Check it exists in the FBX depo.'.format( filepath ))
-    #bpy.ops.import_scene.fbx(filepath=filepath)
-    # bpy.ops.import_scene.witcher3_fbx_batch(filepath=filepath,
-    #     files=[{"name":filepath,
-    #     "name":filepath}],
-    #     directory=filepath+"\\",
-    #     force_update_mats=False)
-    uncook_path = get_texture_path(context)+"\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
-    tex_table = load_texture_table()
+    
+    if filepath.endswith(".w2mesh"):
+        (meshes, armatures) = import_mesh.import_mesh(filepath, do_merge_normals = True)
+    else:
+        context = bpy.context
+        if not os.path.exists(filepath):
+            print("Can't find FBX file", filepath)
+            #cmds.confirmDialog( title='Error', button='OK', message='Can\'t find "{0}". Check it exists in the FBX depo.'.format( filepath ))
+        #bpy.ops.import_scene.fbx(filepath=filepath)
+        # bpy.ops.import_scene.witcher3_fbx_batch(filepath=filepath,
+        #     files=[{"name":filepath,
+        #     "name":filepath}],
+        #     directory=filepath+"\\",
+        #     force_update_mats=False)
+        uncook_path = get_texture_path(context)+"\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
 
-    (meshes, armatures) = import_w3_fbx(context
-        ,filepath = filepath
-        ,uncook_path = uncook_path
-        ,tex_table = tex_table
-        ,remove_doubles = False #remove_doubles
-        ,keep_lod_meshes = keep_lod_meshes
-        ,quadrangulate = False #quadrangulate
-        ,fix_armature = True
-        ,force_mat_update = True#self.force_update_mats
-    )
+        (meshes, armatures) = import_w3_fbx(context
+            ,filepath = filepath
+            ,uncook_path = uncook_path
+            ,remove_doubles = False #remove_doubles
+            ,keep_lod_meshes = keep_lod_meshes
+            ,quadrangulate = False #quadrangulate
+            ,fix_armature = True
+            ,force_mat_update = True#self.force_update_mats
+        )
     return (meshes, armatures)
 

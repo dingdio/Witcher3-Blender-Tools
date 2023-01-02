@@ -9,9 +9,11 @@ from CR2W.Types.VariousTypes import CNAME, NAME, CBufferVLQInt32, CColor
 
 from .bStream import *
 from .setup_logging import *
+from .witcher_cache import bundle
 log = logging.getLogger(__name__)
 
 from CR2W.CR2W_helpers import Enums
+from CR2W.TypeList import get_vectors
 from .bin_helpers import (
                         ReadBit6,
                         ReadFloat16,
@@ -53,8 +55,6 @@ Entity_Type_List = ["CEntity",
                     "CNewNPC",
                     "W3PlayerWitcher",
                     "W3ReplacerCiri"]
-
-
 
 
 def detectedProp(f, CR2WFILE, offset ):
@@ -156,7 +156,7 @@ class DATA:
                 #     f.seek(self.classEnd)
                 #     return
             if time_taken > 0.3:
-                print("cake")
+                log.warn("Time taken more than 0.3")
             #log.debug(' Read Chunk in %f seconds.', time.time() - start_time)
         
 
@@ -175,13 +175,13 @@ class STRINGINDEX:
         # local int lvl <hidden=true> = level;
         try:
             if (self.Index > 0 and CR2WFILE.CNAMES[self.Index].name.value):
-                self.String = CR2WFILE.CNAMES[self.Index].name.value;
+                self.String = CR2WFILE.CNAMES[self.Index].name.value
         except IndexError:
             pass #couldn't find name index
 
         try:
             if (self.Index > 0 and not hasattr(parent, 'dataType') and hasattr(CR2WFILE, 'CR2WImport') and CR2WFILE.CR2WImport[self.Index-1].path):
-                self.Path = CR2WFILE.CR2WImport[self.Index-1].path;
+                self.Path = CR2WFILE.CR2WImport[self.Index-1].path
         except IndexError:
             pass #couldn't fix path index
     def ToString(self):
@@ -197,7 +197,7 @@ class FLOATVALUE:
 
 class Data_Bytes:
     def __init__(self, f, size):
-        f.seek(f.tell() + size - 4);
+        f.seek(f.tell() + size - 4)
 
 class PROPSTART_BLANK:
     def __init__(self):
@@ -215,27 +215,30 @@ class PROPSTART_NO_NAME:
 
 class PROPSTART:
     def __init__(self, f, CR2WFILE, parent):
-        self.strIdx = STRINGINDEX(f, CR2WFILE, self) #<name="String Index">;
-        if self.strIdx.Index > 0:
-            self.dataType = STRINGINDEX(f, CR2WFILE, self) #<name="Data Type">;
-            self.name = CR2WFILE.CNAMES[self.strIdx.Index].name.value; #string
-            self.type = CR2WFILE.CNAMES[self.dataType.Index].name.value; #string
+        try:
+            self.strIdx = STRINGINDEX(f, CR2WFILE, self) #<name="String Index">;
+            if self.strIdx.Index > 0:
+                self.dataType = STRINGINDEX(f, CR2WFILE, self) #<name="Data Type">;
+                self.name = CR2WFILE.CNAMES[self.strIdx.Index].name.value; #string
+                self.type = CR2WFILE.CNAMES[self.dataType.Index].name.value; #string
 
-            if ("rRef:" in self.type and (readU32Check(f.tell()-8) == 10)):
-                self.size = 2; #local int
-            elif (f.tell() + 4 < FileSize(f) and readU32Check(f, f.tell()) < FileSize(f) - f.tell() + 2):
-                self.size = readU32(f) #uint32
+                if ("rRef:" in self.type and (readU32Check(f.tell()-8) == 10)):
+                    self.size = 2; #local int
+                elif (f.tell() + 4 < FileSize(f) and readU32Check(f, f.tell()) < FileSize(f) - f.tell() + 2):
+                    self.size = readU32(f) #uint32
+                else:
+                    self.size = 4; # local ushort
+
+                if (self.size > 4):
+                    startofData_Bytes = f.tell()
+                    self.Data = Data_Bytes(f, self.size)
+                    f.seek(startofData_Bytes)
             else:
-                self.size = 4; # local ushort
-
-            if (self.size > 4):
-                startofData_Bytes = f.tell()
-                self.Data = Data_Bytes(f, self.size)
-                f.seek(startofData_Bytes);
-        else:
-            self.dataType = None
-            self.name = None
-            self.type = None
+                self.dataType = None
+                self.name = None
+                self.type = None
+        except Exception as e:
+            raise e
             
 
 def sizeof(sizeof): #TODO FIX
@@ -267,9 +270,9 @@ class STRINGANSI:
         len = readUChar(f)
         self.isUTF = False
         if (len >= 128):
-            len = len - 128;
-            self.isUTF = True;
-            len = len*2;
+            len = len - 128
+            self.isUTF = True
+            len = len*2
 
         if (self.isUTF):
             self.String = f.read(len).decode('utf-16')
@@ -360,7 +363,7 @@ class ELEMENT:
         firstProp  = "" #local string
         prevProp  = "" #local string
         Sub_Element_Count  = 0 #local uint
-        ElementIdx  = parent.ElementCounter; #local uint
+        self.ElementIdx  = parent.ElementCounter; #local uint
         skipNextTime  = False #local int
         sfp  = -1 #local int
         title  = "" #local string
@@ -375,48 +378,43 @@ class ELEMENT:
                 #     parseMesh();
 
                 #parse elements:
-                if (prevProp != "metalLevelsOut" and detectedProp(f, CR2WFILE, f.tell()) and CR2WFILE.gName != firstProp) : #multilayer_layers should end at metalLevelsOut
+                if (prevProp != "metalLevelsOut" and detectedProp(f, CR2WFILE, f.tell()) and CR2WFILE.gName != firstProp and CR2WFILE.gName) : #multilayer_layers should end at metalLevelsOut
                     Sub_Element_Count += 1
                     if (firstProp == ""):
-                        firstProp = CR2WFILE.gName;
-
-                    #setColor();
-                    if (CR2WFILE.gName == "v" and CR2WFILE.gType == "[3]Float") :
-                        More =PROPERTY(f,CR2WFILE, self)#struct PROPERTY More <open=true>;  FSkip(-1); BLANK blank;
-                    else:
-                        More =PROPERTY(f,CR2WFILE, self)#struct PROPERTY More;  #//sub property
+                        firstProp = CR2WFILE.gName
+                    More =PROPERTY(f,CR2WFILE, self)#struct PROPERTY More  #//sub property
                     self.MoreProps.append(More)
                     if (self.elementName == "" and exists(More, "Index") and (exists(More, "Type.type") and More.Type.type == "CName")):
                         try:
-                            self.elementName = More.Index.String#More.Index[0].String;
+                            self.elementName = More.Index.String#More.Index[0].String
                         except IndexError:
                             pass
                     if (CR2WFILE.gName == "material" and title == "" and exists(More , "Path.Path")):
-                        title = More.Path.Path;
+                        title = More.Path.Path
                     elif (exists(More, "Type") and title == "" and not doesExist(parent.Type.type, "layer")):
                         if (More.Type.name == "id" or endsWith(More.Type.name, "Id") or endsWith(More.Type.type, "Id")):
                             if (exists(More, "Value")):
-                                #SPrintf(title, "%s = %Ld", More.Type.name, More.Value);
+                                #SPrintf(title, "%s = %Ld", More.Type.name, More.Value)
                                 title = "%s = %Ld" % (More.Type.name, More.Value)
                             elif (exists(More, "More[0].Value")):
-                                #SPrintf(title, "%s = %Ld", More.Type.name, More.More[0].Value);
+                                #SPrintf(title, "%s = %Ld", More.Type.name, More.More[0].Value)
                                 title = "%s = %Ld" % (More.Type.name, More.More[0].Value)
                         elif (doesExist(More.Type.type, "Ref") and exists(More.Path)):
-                            title = More.Path.Path;
+                            title = More.Path.Path
                     if (not doesExist(CR2WFILE.gType, "loat") and not doesExist(CR2WFILE.gType, "Uint8")):
-                        pass #SetBackColor(cNone);
+                        pass #SetBackColor(cNone)
 
                     if (parent.theType == "meshLocalMaterialHeader" and CR2WFILE.gName == "size"):
-                        parent.ElementCounter+=1;
-                        break;
+                        parent.ElementCounter+=1
+                        break
                 else:
                     if (parent.lastProp == ""):
-                        parent.lastProp = prevProp;
+                        parent.lastProp = prevProp
 
-                    prevProp = CR2WFILE.gName;
+                    prevProp = CR2WFILE.gName
                     parent.ElementCounter+=1
-                    break;
-                prevProp = CR2WFILE.gName;
+                    break
+                prevProp = CR2WFILE.gName
             else:
                 f.seek(1,1)#FSkip(1);
 
@@ -425,7 +423,11 @@ class Cr2wResourceManager:
     def __init__(self):
         
         fileDir = os.path.dirname(os.path.realpath(__file__))
+        fileDir = os.path.join(fileDir, "witcher_cache")
         filename = os.path.join(fileDir, "pathhashes.csv")
+        if not os.path.exists(filename):
+            bundle.create_pathhashes(outputPath=filename)
+            log.info('Creating pathhashes.csv')
         self.pathashespath = filename
         #self.HashdumpDict = {}
         reader = csv.DictReader(open(self.pathashespath))
@@ -436,8 +438,8 @@ class Cr2wResourceManager:
     @staticmethod
     def Get():
         if (Cr2wResourceManager.resourceManager == None):
-            Cr2wResourceManager.resourceManager = Cr2wResourceManager();
-        return Cr2wResourceManager.resourceManager;
+            Cr2wResourceManager.resourceManager = Cr2wResourceManager()
+        return Cr2wResourceManager.resourceManager
 
 class CSectorDataResource:
     def __init__(self, f, CR2WFILE, parent):
@@ -447,7 +449,7 @@ class CSectorDataResource:
         self.box3 = readFloat(f)
         self.box4 = readFloat(f)
         self.box5 = readFloat(f)
-        self.hashint = readU64(f);
+        self.hashint = readU64(f)
         if self.hashint == 0:
             self.pathHash = 0
         else:
@@ -455,8 +457,8 @@ class CSectorDataResource:
             if str(self.hashint) in resoruce.HashdumpDict:
                 self.pathHash = resoruce.HashdumpDict[str(self.hashint)]
             else:
-                log.debug("panic")
-                self.pathHash = self.hashint;
+                log.critical("FOUND UNKNOWN PATH")
+                self.pathHash = self.hashint
         #public CString pathHash;
 class CSectorDataObject:
     def __init__(self, f, CR2WFILE, parent):
@@ -472,45 +474,23 @@ class CSectorDataObject:
             log.debug("found invalid")
             
 class SBlockDataCollisionObject:
-    def __init__(self, f, size, packedObjectType):
-        startp = f.tell();
-
-        #base.Read(file, size);
+    def __init__(self, f, size= None, packedObjectType= None):
         self.meshIndex = readUShort(f) #CUInt16
         self.padding = readUShort(f) #CUInt16
         self.collisionMask = readU64(f) #CUInt64
         self.collisionGroup = readU64(f) #CUInt64
 
-        endp = f.tell();
-        read = endp - startp;
-        if (read < size):
-            f.seek(size - read, 1)#unk1.Read(file, size - (uint)read);
-        elif (read > size):
-            log.error("ERROR READING SBlockDataMeshObject")
-
 class SBlockDataDimmer(object):
     """docstring for SBlockDataDimmer."""
-    def __init__(self, f, size, packedObjectType):
-        startp = f.tell()
-        #self.meshIndex = readUShort(f) #CUInt16
-
+    def __init__(self, f, size= None, packedObjectType= None):
         self.ambienLevel = readFloat(f)
         self.marginFactor = readFloat(f)
         self.dimmerType = readUByte(f)
         self.paddin1 = readUByte(f)
         self.paddin2 = readUShort(f)
 
-        endp = f.tell()
-        read = endp - startp
-        if (read < size):
-            f.seek(size - read, 1)#unk1.Read(file, size - (uint)read);
-        elif (read > size):
-            log.error("ERROR READING SBlockDataDimmer")
-
 class SBlockDataMeshObject:
-    def __init__(self, f, size, packedObjectType):
-        startp = f.tell();
-
+    def __init__(self, f, size = None, packedObjectType= None):
         #base.Read(file, size);
         self.meshIndex = readUShort(f) # CUInt16
         self.forceAutoHide = readUShort(f) # CUInt16
@@ -520,17 +500,9 @@ class SBlockDataMeshObject:
         self.renderingPlane = readUByte(f) # CUInt8
 
 
-        endp = f.tell();
-        read = endp - startp;
-        if (read < size):
-            f.seek(size - read, 1)#unk1.Read(file, size - (uint)read);
-        elif (read > size):
-            log.error("ERROR READING SBlockDataMeshObject")
 
 class SBlockDataRigidBody:
-    def __init__(self, f, size, packedObjectType):
-        startp = f.tell();
-
+    def __init__(self, f, size= None, packedObjectType= None):
         #base.Read(file, size);
         self.meshIndex = readUShort(f) # CUInt16
         self.forceAutoHide = readUShort(f) # CUInt16
@@ -549,81 +521,165 @@ class SBlockDataRigidBody:
         self.padd2 = readUByte(f) #CUInt8 
         self.padd3 = readUByte(f) #CUInt8 
 
+class SBlockDataPointLight(object):
+    """docstring for SBlockDataPointLight."""
+    def __init__(self):
+        self.color = None #CUInt32
+        self.radius = None #CFloat
+        self.brightness = None #CFloat
+        self.attenuation = None #CFloat
+        self.autoHideRange = None #CFloat
+        self.shadowFadeDistance = None #CFloat
+        self.shadowFadeRange = None #CFloat
+        self.shadowFadeBlendFactor = None #CFloat
+        self.lightFlickering = None #SVector3D
+        self.shadowCastingMode = None #CUInt8
+        self.dynamicShadowsFaceMask = None #CUInt8
+        self.envColorGroup = None #CUInt8
+        self.padding = None #CUInt8
+        self.lightUsageMask = None #CUInt32
+    
+    def Read(self, f):
+        self.color = CColor().Read(f) #readU32(f) #CUInt32
+        self.radius = readFloat(f) #CFloat
+        self.brightness = readFloat(f) #CFloat
+        self.attenuation = readFloat(f) #CFloat
+        self.autoHideRange = readFloat(f) #CFloat
+        self.shadowFadeDistance = readFloat(f) #CFloat
+        self.shadowFadeRange = readFloat(f) #CFloat
+        self.shadowFadeBlendFactor = readFloat(f) #CFloat
+        self.lightFlickering = CVector3D(f, 0) #SVector3D
+        self.shadowCastingMode = readUByte(f) #CUInt8
+        self.dynamicShadowsFaceMask = readUByte(f) #CUInt8
+        self.envColorGroup = readUByte(f) #CUInt8
+        self.padding = readUByte(f) #CUInt8
+        self.lightUsageMask = readU32(f) #CUInt32
+        return self
 
-        endp = f.tell();
-        read = endp - startp;
-        if (read < size):
-            f.seek(size - read, 1)#unk1.Read(file, size - (uint)read);
-        elif (read > size):
-            log.error("ERROR READING SBlockDataMeshObject")
 
 class SBlockDataSpotLight: #make CPointLightComponent
-    def __init__(self, f, size, packedObjectType):
-        #f = bStream()
-        startp = f.tell();
-        self.color = CColor().Read(f)  #f.readUInt32() #CUInt32 //TODO: Check why this works an CColor doesn't?
-        self.radius = f.readFloat() #CFloat
-        self.brightness = f.readFloat() #CFloat
-        self.attenuation = f.readFloat() #CFloat
-        self.autoHideRange = f.readFloat() #CFloat
-        self.shadowFadeDistance = f.readFloat() #CFloat
-        self.shadowFadeRange = f.readFloat() #CFloat
-        self.shadowFadeBlendFactor = f.readFloat() #CFloat
-        #self.lightFlickering = CVector3D(f, 0) #SVector3D
-        #self.shadowCastingMode = f.readUInt8() #CUInt8
-        #self.dynamicShadowsFaceMask = f.readUInt8() #CUInt8
-        #self.envColorGroup = f.readUInt8() #CUInt8
-        #self.padding = f.readUInt8() #CUInt8
-        # self.lightUsageMask = f.readUInt32() #CUInt32
-        # self.innerAngle = f.readFloat() #CFloat
-        # self.outerAngle = f.readFloat() #CFloat
-        # self.softness = f.readFloat() #CFloat
-        # self.projectionTextureAngle = f.readFloat() #CFloat
-        # self.projectionTexureUBias = f.readFloat() #CFloat
-        # self.projectionTexureVBias = f.readFloat() #CFloat
-        # self.projectionTexture = f.readUInt16() #CUInt16
-        # self.padding2 = f.readUInt16() #CUInt16
-        f.seek(6,1)
-        endp = f.tell();
-        read = endp - startp;
-        if (read < size):
-            f.seek(size - read, 1)#unk1.Read(file, size - (uint)read);
-        elif (read > size):
-            log.error("ERROR READING SBlockDataSpotLight")
+    def __init__(self):
+        self.color = None #CUInt32
+        self.radius = None #CFloat
+        self.brightness = None #CFloat
+        self.attenuation = None #CFloat
+        self.autoHideRange = None #CFloat
+        self.shadowFadeDistance = None #CFloat
+        self.shadowFadeRange = None #CFloat
+        self.shadowFadeBlendFactor = None #CFloat
+        self.lightFlickering = None # SVector3D
+        self.shadowCastingMode = None # CUInt8
+        self.dynamicShadowsFaceMask = None # CUInt8
+        self.envColorGroup = None # CUInt8
+        self.padding = None # CUInt8
+        self.lightUsageMask = None # CUInt32
+        self.innerAngle = None # CFloat
+        self.outerAngle = None # CFloat
+        self.softness = None # CFloat
+        self.projectionTextureAngle = None # CFloat
+        self.projectionTexureUBias = None # CFloat
+        self.projectionTexureVBias = None # CFloat
+        self.projectionTexture = None # CUInt16
+        self.padding2 = None # CUInt16
+
+    def Read(self, f):
+        self.color = CColor().Read(f) #CUInt32
+        self.radius = readFloat(f) #CFloat
+        self.brightness = readFloat(f) #CFloat
+        self.attenuation = readFloat(f) #CFloat
+        self.autoHideRange = readFloat(f) #CFloat
+        self.shadowFadeDistance = readFloat(f) #CFloat
+        self.shadowFadeRange = readFloat(f) #CFloat
+        self.shadowFadeBlendFactor = readFloat(f) #CFloat
+        self.lightFlickering = CVector3D(f,0) # SVector3D
+        self.shadowCastingMode = readUByte(f) # CUInt8
+        self.dynamicShadowsFaceMask = readUByte(f) # CUInt8
+        self.envColorGroup = readUByte(f) # CUInt8
+        self.padding = readUByte(f) # CUInt8
+        self.lightUsageMask = readU32(f) # CUInt32
+        self.innerAngle = readFloat(f) # CFloat
+        self.outerAngle = readFloat(f) # CFloat
+        self.softness = readFloat(f) # CFloat
+        self.projectionTextureAngle = readFloat(f) # CFloat
+        self.projectionTexureUBias = readFloat(f) # CFloat
+        self.projectionTexureVBias = readFloat(f) # CFloat
+        self.projectionTexture = readUShort(f) # CUInt16
+        self.padding2 = readUShort(f) # CUInt16
+        return self
+
+class SBlockDataParticles():
+    def __init__(self, f):
+        self.particleSystem = readUShort(f) # CUInt16
+        self.padding = readUShort(f) # CUInt16
+        self.lightChanels = readUByte(f) # CUInt8
+        self.renderingPlane = readUByte(f) # CUInt8
+        self.envAutoHideGroup = readUByte(f) # CUInt8
+        self.transparencySortGroup = readUByte(f) # CUInt8
+        self.globalEmissionScale = readFloat(f) # CFloat
+
+class SBlockDataDecal():
+    def __init__(self, f):
+        self.diffuseTexture = readUShort(f) # CUInt16
+        self.padding = readUShort(f) # CUInt16
+        self.specularColor = readU32(f) # CUInt32
+        self.normalTreshold = readFloat(f) # CFloat
+        self.specularity = readFloat(f) # CFloat
+        self.fadeTime = readFloat(f) # CFloat
 
 class SBlockData:
     def __init__(self, f, size, packedObjectType):
+        startp = f.tell()
         self.rotationMatrix = CMatrix3x3(f)
         self.position = CVector3D(f, 0) #CVector3D
         self.streamingRadius = readUShort(f) #CUInt16
         self.flags = readUShort(f) #CUInt16
         self.occlusionSystemID = readU32(f) #CUInt32
         self.packedObjectType = packedObjectType
+            
 
         if packedObjectType == Enums.BlockDataObjectType.Mesh:
-            self.packedObject = SBlockDataMeshObject(f, size - 56, packedObjectType)
-            self.resourceIndex = self.packedObject.meshIndex
-        elif packedObjectType == Enums.BlockDataObjectType.RigidBody: # actuall rigid bodies?
-            self.packedObject = SBlockDataRigidBody(f, size - 56, packedObjectType)
+            self.packedObject = SBlockDataMeshObject(f)
             self.resourceIndex = self.packedObject.meshIndex
         elif packedObjectType == Enums.BlockDataObjectType.Collision: # actuall rigid bodies?
-            self.packedObject = SBlockDataCollisionObject(f, size - 56, packedObjectType)
+            self.packedObject = SBlockDataCollisionObject(f)
             self.resourceIndex = self.packedObject.meshIndex
+        elif packedObjectType == Enums.BlockDataObjectType.Decal:
+            self.packedObject = SBlockDataDecal(f)
         elif packedObjectType == Enums.BlockDataObjectType.Dimmer:
-            self.packedObject = SBlockDataDimmer(f, size - 56, packedObjectType)
-            #self.resourceIndex = self.packedObject.meshIndex
-        # elif packedObjectType == Enums.BlockDataObjectType.Invalid:
-        #     self.packedObject = SBlockDataMeshObject(f, size - 56, packedObjectType)
-        #     self.resourceIndex = self.packedObject.meshIndex
-        #elif packedObjectType == Enums.BlockDataObjectType.SpotLight:
-            #self.resourceIndex = readUShort(f)
-            #self.packedObject = SBlockDataSpotLight(f, size - 58, packedObjectType)
-            #self.resourceIndex = self.packedObject.meshIndex
+            self.packedObject = SBlockDataDimmer(f)
+        elif packedObjectType == Enums.BlockDataObjectType.PointLight:
+            self.packedObject = SBlockDataPointLight().Read(f)
+        elif packedObjectType == Enums.BlockDataObjectType.SpotLight:
+            self.packedObject = SBlockDataSpotLight().Read(f)
+        elif packedObjectType == Enums.BlockDataObjectType.RigidBody: # actuall rigid bodies?
+            self.packedObject = SBlockDataRigidBody(f)
+            self.resourceIndex = self.packedObject.meshIndex
+        elif packedObjectType == Enums.BlockDataObjectType.Cloth:
+            f.seek(size - 56, 1)
+        elif packedObjectType == Enums.BlockDataObjectType.Destruction:
+            f.seek(size - 56, 1)
+        elif packedObjectType == Enums.BlockDataObjectType.Particles:
+            self.packedObject = SBlockDataParticles(f)
+        elif packedObjectType == Enums.BlockDataObjectType.Invalid:
+            f.seek(size - 56, 1)
         else:
-            self.resourceIndex = readUShort(f)
-            f.seek(size - 58, 1)
+            f.seek(size - 56, 1)
             #self.tail = #CBytes
             #f.seek(size - 56, 1)
+
+
+        endp = f.tell()
+        read = endp - startp
+        if (read < size):
+            pass
+        elif(read > size):
+            print("read too far")
+        # endp = f.tell()
+        # read = endp - startp
+        # if (read < size):
+        #     f.seek(size - read, 1)#unk1.Read(file, size - (uint)read);
+        # elif (read > size):
+        #     log.error("ERROR READING SBlockDataMeshObject")
 
 class CMatrix3x3:
     def __init__(self, f):
@@ -675,21 +731,21 @@ class HANDLE:
         val = self.val
 
         if (val >= 0):
-            self.ChunkHandle = True;
+            self.ChunkHandle = True
         if (self.ChunkHandle):
             if (val == 0):
-                self.Reference = None;
+                self.Reference = None
             else:
                 self.Reference = self.val - 1 #CR2WFILE
                 #Reference = cr2w.chunks[val - 1];
         else:
             try:
-                self.DepotPath = CR2WFILE.CR2WImport[-val - 1].path;
+                self.DepotPath = CR2WFILE.CR2WImport[-val - 1].path
 
-                filetype = CR2WFILE.CR2WImport[-val - 1].className;
-                self.ClassName = CR2WFILE.CNAMES[filetype].name.value;
+                filetype = CR2WFILE.CR2WImport[-val - 1].className
+                self.ClassName = CR2WFILE.CNAMES[filetype].name.value
 
-                self.Flags = CR2WFILE.CR2WImport[-val - 1].flags;
+                self.Flags = CR2WFILE.CR2WImport[-val - 1].flags
             except:
                 f.seek(-4,1)
                 self.Index = readU32(f)#uint ;
@@ -810,7 +866,31 @@ class SAnimationBufferBitwiseCompressedBoneTrack(object):
         f.seek(2,1)#zero2= readUByte(f)
         #zero3= readUByte(f)
         return self
-    
+
+class CEnum(object):
+    def __init__(self, CR2WFILE, IsFlag = False):
+        self.IsFlag = IsFlag
+        self.CR2WFILE = CR2WFILE
+        self.String = None
+        self.strings = []
+    def Read(self, f):
+        self.strings = []
+        if self.IsFlag:
+            while True:
+                idx = readUShort(f)
+                if (idx == 0):
+                    break
+                s = self.CR2WFILE.CNAMES[idx].name.value
+                self.strings.append(s)
+        else:
+            idx = readUShort(f)
+            s = self.CR2WFILE.CNAMES[idx].name.value
+            self.String = s
+            self.strings.append(s)
+    def ToString(self):
+        return ''.join(self.strings)
+
+
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
     __getattr__ = dict.get
@@ -826,7 +906,10 @@ class PROPERTY:
         elif ("handle:" in self.theType):
             return self.Handles[0].ToString()
         elif hasattr(self, 'Index'):
-            return self.Index.ToString()
+            try:
+                return self.Index.ToString()
+            except Exception as e:
+                raise e
         else:
             log.warning("Returned None PROP string")
             return None
@@ -869,8 +952,8 @@ class PROPERTY:
         self.dataEnd = dataEnd
         self.classEnd = parent.classEnd
 
-        if self.theName == "bones":
-            log.debug("bones hit")
+        # if self.theName == "bones":
+        #     log.debug("bones hit")
         # if self.theName == "data":
         #     log.debug("data hit")
         # if self.theName == "parentIndices":
@@ -891,12 +974,16 @@ class PROPERTY:
         #     log.debug("apexMaterialNames")
         # if self.theName == "Diffuse":
         #     log.debug("Diffuse")
-        if self.theName == "appearances":
-            log.debug("appearances")
-        if self.theName == "ParentSlotName":
-            log.debug("ParentSlotName")
-        if self.theName == "animations":
-            log.debug("animations")
+        # if self.theName == "appearances":
+        #     log.debug("appearances")
+        # if self.theName == "ParentSlotName":
+        #     log.debug("ParentSlotName")
+        # if self.theName == "animations":
+        #     log.debug("animations")
+        # if theType == "array:2,0,SMeshChunkPacked":
+        #     log.debug("SMeshChunkPacked Arr")
+        # if theType == "EMeshChunkRenderMask":
+        #     log.debug("EMeshChunkRenderMask")
 
         # if "aterial" in Type.type:
         #     log.debug("aterial")
@@ -904,8 +991,8 @@ class PROPERTY:
         # if self.classEnd == 13009453:
         #     log.debug("classend prob")
         
-        if "ESkeletalAnimationType" in Type.type:
-            log.debug("ESkeletalAnimationType")
+        # if "ESkeletalAnimationType" in Type.type:
+        #     log.debug("ESkeletalAnimationType")
         
             
         #detect array type:
@@ -918,6 +1005,21 @@ class PROPERTY:
             for _ in range(0, self.Count):
                 More.append(SAnimationBufferBitwiseCompressedBoneTrack(CR2WFILE).Read(f, 0, self.classEnd))
             self.More = More
+            return
+        elif (Type.type in Enums.Enum_Flags_Types):
+            the_enum = CEnum(CR2WFILE, True)
+            the_enum.Read(f)
+            self.IsFlag = the_enum.IsFlag
+            self.strings = the_enum.strings
+            return
+        elif (Type.type in Enums.Enum_Types):
+            the_enum = CEnum(CR2WFILE, False)
+            the_enum.Read(f)
+            self.Index = the_enum
+            return
+        elif (",SMeshChunkPacked" in Type.type):
+            self.chunks = CArray(CR2WFILE, SMeshChunkPacked)
+            self.chunks.Read(f, 0)
             return
         elif ("SAnimationBufferBitwiseCompressedData" == Type.type):
             #zero1 = readSByte(f)
@@ -953,7 +1055,6 @@ class PROPERTY:
             else:
                 delim = theType.find(']')
                 arrayDataType = theType[delim+1:len(theType)]#SubStr( theType, delim+1, len(theType) - delim);
-            #cake = len(theType) - delim 0 delim+1;
             arrayType = theType[delim+1:len(theType)]#SubStr( theType, delim+1, len(theType) - delim);
             theType = arrayType;
             if (f.tell()+2 < FileSize(f) and theType != "inkWidgetLibraryItem" and readU32Check(f, f.tell()) != 0 and (readU32Check(f, f.tell())) + f.tell() < dataEnd):
@@ -1092,6 +1193,7 @@ class PROPERTY:
                 self.value=[]
                 for _ in range(0,count):
                     self.value.append(readU32(f))
+            return
         elif ("Int32" in theType):
             if (count == 1 and "array" not in Type.type):
                 self.Value = readInt32(f)
@@ -1150,6 +1252,7 @@ class PROPERTY:
                 self.value = []
                 for _ in range(0,count):
                     self.value.append(readUByte(f)) # uint64
+            return
         elif("ptr:" in Type.type ):
             if (count == 1 and "array" not in Type.type):
                 self.Value = readU32(f)
@@ -1183,7 +1286,7 @@ class PROPERTY:
             else:
                 self.Value = readU32(f) #uint32 ;
         elif (dataEnd - f.tell() == 2):#
-            self.Index = STRINGINDEX(f,CR2WFILE, self);
+            self.Index = STRINGINDEX(f,CR2WFILE, self)
         elif (dataEnd - f.tell() == 1):#
             if (sizeof(Type.size) == 4):
                 self.Value = readUByte(f) #ubyte
@@ -1218,7 +1321,9 @@ class PROPERTY:
                 More.append(ELEMENT(f,CR2WFILE, self))
             self.More = More
             propCount+=1
-        while (f.tell() < parent.classEnd and f.tell() < dataEnd and f.tell() < FileSize(f)-4 and readU32Check(f, f.tell()) != 1462915651):
+        if parent.classEnd == None:
+            pass #print('WARNING: Attempting generic prop read without class size info')
+        while (parent.classEnd is not None and f.tell() < parent.classEnd and f.tell() < dataEnd and f.tell() < FileSize(f)-4 and readU32Check(f, f.tell()) != 1462915651):
             if (detectedProp(f,CR2WFILE, f.tell()) and count > 1 and not hasattr(self, "Value") and not hasattr(self, "Index")): #!exists(this.Value) && !exists(this.Index)) :
                 #setColor();
                 #self.More = ELEMENT(f) #ELEMENT More;
@@ -1229,7 +1334,7 @@ class PROPERTY:
                 if ( detectedProp(f, CR2WFILE, f.tell()) ):
                     if (CR2WFILE.CNAMES[readUShortCheck(f, f.tell()+2)].name == "SharedDataBuffer" ):
                         PackageHdr = PROPSTART(f, CR2WFILE, self); f.seek(4,1);#FSkip(4); #//start of new CR2W
-                        return;
+                        return
                     else:
                         if (f.tell() < dataEnd):
                             # if (doMesh == True and count == 1):
@@ -1241,9 +1346,9 @@ class PROPERTY:
                             # if (not doesExist(gType, "loat") && not doesExist(gType, "Uint8"))
                             #     SetBackColor(cNone);
                         else:
-                            break;
+                            break
                 else:
-                    f.seek(1,1);
+                    f.seek(1,1)
 
 
 
@@ -1262,9 +1367,9 @@ class CQuaternion:
 
 class SSkeletonRigData:
     def __init__(self, f):
-        self.position = CQuaternion(f);
-        self.rotation = CQuaternion(f);
-        self.scale = CQuaternion(f);
+        self.position = CQuaternion(f)
+        self.rotation = CQuaternion(f)
+        self.scale = CQuaternion(f)
 
 class CCompressedBuffer:
     def __init__(self, f, CR2WFILE, parent, Name = "rigData"):
@@ -1274,8 +1379,8 @@ class CCompressedBuffer:
         self.rigData = []
     def Read(self, f, size, count):
         m_count = count
-        cake = f.tell()
-        f.seek(2,1) # TODO CHECK why need this, count??
+        #tell = f.tell()
+        f.seek(2,1)
         for _ in range(0, m_count):
             self.rigData.append(SSkeletonRigData(f))
 
@@ -1327,10 +1432,10 @@ class CVariantSizeTypeName():
         nameId = readUShort(br)
 
         if (nameId == 0):
-            return;
+            return
 
-        typename = self.CR2WFILE.CNAMES[typeId].name.value;
-        varname = self.CR2WFILE.CNAMES[nameId].name.value;
+        typename = self.CR2WFILE.CNAMES[typeId].name.value
+        varname = self.CR2WFILE.CNAMES[nameId].name.value
         propstart = PROPSTART_BLANK()
         propstart.size = varsize
         propstart.name = varname
@@ -1339,7 +1444,7 @@ class CVariantSizeTypeName():
 
 class CBufferUInt32():
     def __init__(self, CR2WFILE, buffer_type):
-        self.buffer_type = buffer_type;
+        self.buffer_type = buffer_type
         self.CR2WFILE = CR2WFILE
         self.elements = []
     def Read(self, f, size):
@@ -1361,6 +1466,93 @@ class SFoliageResourceData():
         
         #CBufferVLQInt32<SFoliageInstanceData> TreeCollection { get; set; }
 
+#33369
+class CVariable:
+    """docstring for CVariable."""
+    def __init__(self, CR2WFILE):
+        super(CVariable, self).__init__()
+        self.CR2WFILE = CR2WFILE
+    def Read(self, f, size):
+        self.startpos = f.tell()
+        self.classEnd = None
+        zero = readSByte(f)
+        if zero != 0:
+            print("Error")
+
+        self.MoreProps = []
+        while True:
+            prop = PROPERTY(f, self.CR2WFILE, self)
+            if prop.Type == None:
+                break
+            self.MoreProps.append(prop)
+        self.endpos = f.tell()
+        bytesread = self.endpos - self.startpos
+        if (bytesread > size):
+            if (size != 0):
+                print("Read bytes not equal to expected bytes. Difference: {bytesread - size}")
+        elif (bytesread < size):
+            pass
+
+
+class SMeshChunkPacked():
+    def __init__(self, CR2WFILE):
+        self.CR2WFILE = CR2WFILE
+        self.PROP = False
+		# [Ordinal(1)] [RED("vertexType")] 		public CEnum<EMeshVertexType> VertexType { get; set;}
+		# [Ordinal(2)] [RED("materialID")] 		public CUInt32 MaterialID { get; set;}
+		# [Ordinal(3)] [RED("numBonesPerVertex")] 		public CUInt8 NumBonesPerVertex { get; set;}
+		# [Ordinal(4)] [RED("numVertices")] 		public CUInt32 NumVertices { get; set;}
+		# [Ordinal(5)] [RED("numIndices")] 		public CUInt32 NumIndices { get; set;}
+		# [Ordinal(6)] [RED("firstVertex")] 		public CUInt32 FirstVertex { get; set;}
+		# [Ordinal(7)] [RED("firstIndex")] 		public CUInt32 FirstIndex { get; set;}
+		# [Ordinal(8)] [RED("renderMask")] 		public CEnum<EMeshChunkRenderMask> RenderMask { get; set;}
+		# [Ordinal(9)] [RED("useForShadowmesh")] 		public CBool UseForShadowmesh { get; set;}
+    def Read(self, f, size):
+        self.startpos = f.tell()
+        self.classEnd = None
+        zero = readSByte(f)
+        if zero != 0:
+            print("Error")
+
+        self.MoreProps = []
+        while True:
+            prop = PROPERTY(f, self.CR2WFILE, self)
+            if prop.Type == None:
+                break
+            self.MoreProps.append(prop)
+            
+            # nameId = readUShort(f)
+            # typeId = readUShort(f)
+            # typename = self.CR2WFILE.CNAMES[typeId].name.value
+            # varname = self.CR2WFILE.CNAMES[nameId].name.value
+            # sizepos = f.tell()
+            # varsize = readU32(f)
+
+            # propstart = PROPSTART_BLANK()
+            # propstart.size = varsize
+            # propstart.name = varname
+            # propstart.type = typename
+            # self.PROP = PROPERTY(f, self.CR2WFILE, self, False, propstart)
+            
+            # afterVarPos = f.tell()
+            # bytesleft = varsize - (afterVarPos - sizepos)
+        self.endpos = f.tell()
+        bytesread = self.endpos - self.startpos
+        if (bytesread > size):
+            # parsed to far: possible file corruption
+            # BUT: this check is impossible for elements of an array.
+            # in this case, passed size is 0, so we can check for that
+            if (size != 0):
+                print("Read bytes not equal to expected bytes. Difference: {bytesread - size}")
+        elif (bytesread < size):
+            pass
+            # parsed too few bytes: add to unknown bytes later
+
+        # create a type manager for each value in SMeshChunkPacked
+        # create class for each type
+        # add all variable to the MoreProps Array so it functions normally
+        #self.PROP = PROPERTY(f, self.CR2WFILE, self)
+
 class CVariantSizeNameType():
     def __init__(self, CR2WFILE):
         self.CR2WFILE = CR2WFILE
@@ -1374,10 +1566,10 @@ class CVariantSizeNameType():
         typeId = readUShort(br)
 
         if (nameId == 0):
-            return;
+            return
 
-        typename = self.CR2WFILE.CNAMES[typeId].name.value;
-        varname = self.CR2WFILE.CNAMES[nameId].name.value;
+        typename = self.CR2WFILE.CNAMES[typeId].name.value
+        varname = self.CR2WFILE.CNAMES[nameId].name.value
         propstart = PROPSTART_BLANK()
         propstart.size = varsize
         propstart.name = varname
@@ -1572,10 +1764,6 @@ class CLASS:
                     # }
                     self.propCount+=1
                 else:
-                    # if self.name == "CHardAttachment":
-                    #     f.seek(1,1);
-                    #     cake = PROPERTY(f, CR2WFILE, self)
-                    #     pdwa = 432
                     if self.name in Entity_Type_List:
                         self.isCreatedFromTemplate = False
                         self.Template = self.GetVariableByName('template')
@@ -1585,8 +1773,8 @@ class CLASS:
                         self.Components = []
                         f.seek(10,1)
                         size = self.classEnd - startofthis
-                        endPos = f.tell();
-                        bytesleft = size - (endPos - startofthis);
+                        endPos = f.tell()
+                        bytesleft = size - (endPos - startofthis)
                         log.info(self.name)
                         if (not self.isCreatedFromTemplate):
                             if bytesleft > 0:
@@ -1595,8 +1783,8 @@ class CLASS:
                                     self.Components.append(readInt32(f))
 
 
-                        endPos = f.tell();
-                        bytesleft = size - (endPos - startofthis);
+                        endPos = f.tell()
+                        bytesleft = size - (endPos - startofthis)
                         self.BufferV1 = []
 
                         if (bytesleft > 0):
@@ -1613,13 +1801,13 @@ class CLASS:
                         else:
                             log.critical("unknown CEntity Fileformat.") #throw new EndOfStreamException("unknown CEntity Fileformat.");
 
-                        endPos = f.tell();
-                        bytesleft = size - (endPos - startofthis);
+                        endPos = f.tell()
+                        bytesleft = size - (endPos - startofthis)
                         self.BufferV2 = False
                         if (self.isCreatedFromTemplate):
                             self.BufferV2 = CBufferUInt32(CR2WFILE, SEntityBufferType2)
                             if (bytesleft > 0):
-                                self.BufferV2.Read(f, 0);
+                                self.BufferV2.Read(f, 0)
                                 self.BufferV2 = self.BufferV2.elements
                             else:
                                 log.warning("unknown CEntity Fileformat.")#throw new EndOfStreamException("unknown CEntity Fileformat.");
@@ -1643,17 +1831,16 @@ class CLASS:
                         #     # item.Read(file, elementsize);
                         #     # item.Type = typeName;
                         #     # item.Name = typeName;
-                        #     cake = f.tell()
                         #     self.entries.append(PROPERTY(f,CR2WFILE,self, True));
                         #     f.seek(-2,1);
                         f.seek(self.classEnd)
                     elif self.name == "CSkeleton":
                         for item in self.PROPS:
                             if item.theName == "bones":
-                                bonecount = len(item.More);
-                                break;
+                                bonecount = len(item.More)
+                                break
                         self.rigData = CCompressedBuffer(f, CR2WFILE, self, Name = "rigData")
-                        self.rigData.Read(f, bonecount * 48, bonecount);
+                        self.rigData.Read(f, bonecount * 48, bonecount)
                         #f.seek(self.classEnd)
                     elif self.name == "CFoliageResource":
                         self.Trees = CBufferVLQInt32(CR2WFILE, SFoliageResourceData)
@@ -1662,7 +1849,7 @@ class CLASS:
                         self.Grasses.Read(f, 0)
                     elif self.name == "CSectorData":
                         dict = Cr2wResourceManager().Get()
-                        f.seek(-1,1);
+                        f.seek(-1,1)
                         ukn1 = readU64(f) #46871095541760
 
                         #RESOURCE
@@ -1687,11 +1874,11 @@ class CLASS:
                             curoffset = curobj.offset
                             leng = 0 #ulong 
                             if (idx < len(self.Objects) - 1):
-                                nextobj = self.Objects[idx + 1];
+                                nextobj = self.Objects[idx + 1]
                                 nextoffset = nextobj.offset; #ulong
-                                leng = nextoffset - curoffset;
+                                leng = nextoffset - curoffset
                             else:
-                                leng = self.blocksize - curoffset;
+                                leng = self.blocksize - curoffset
                             self.BlockData.append(SBlockData(f, leng, curobj.type))
                             idx += 1
                         # for _ in range(0, count):
@@ -1699,7 +1886,7 @@ class CLASS:
 
                         f.seek(self.classEnd)
                     elif self.name == "CGameWorld":
-                        f.seek(2,1);
+                        f.seek(2,1)
                         self.Firstlayer = HANDLE(f, CR2WFILE, self)
                     elif self.name == "CLayerGroup":
                         #f.seek(2,1);
@@ -1718,9 +1905,9 @@ class CLASS:
 
                         f.seek(self.classEnd)
                     elif self.name == "CLayerInfo":
-                        f.seek(2,1);
-                        endpos = f.tell();
-                        bytesread = endpos - startofthis;
+                        f.seek(2,1)
+                        endpos = f.tell()
+                        bytesread = endpos - startofthis
                         self.ParentGroup = HANDLE(f, CR2WFILE, self)
                         f.seek(self.classEnd)
                     elif self.name == "CMaterialInstance":
@@ -1784,9 +1971,9 @@ class CR2WImport:
     def __init__(self,f, CR2WFILE):
         startofdepotPath = f.tell()
         self.depotPath = readU32(f)
-        f.seek(self.depotPath + CR2WFILE.CR2WTable[0].offset + CR2WFILE.start);
+        f.seek(self.depotPath + CR2WFILE.CR2WTable[0].offset + CR2WFILE.start)
         self.path = getString(f)#string path <open=suppress>;
-        f.seek(startofdepotPath+4);
+        f.seek(startofdepotPath+4)
         self.className = readUShort(f)
         self.flags = readUShort(f)
 
@@ -1796,20 +1983,6 @@ class CR2WImport:
     def WriteCR2WIMPORT():
         #void WriteCR2WIMPORT (CR2WIMPORT &f, string s ) { forceWriteString(startof(f.path), sizeof(f.path), s); }
         pass
-
-
-# uint64 GenerateHash(CNAME str) {
-#     local uint64 fnvhash = 0xCBF29CE484222325;
-
-#     if (sizeof(str) == 1 && str[0] == 0)
-#         return 0;
-
-#     for (j = 0; j < sizeof(str)-1; j++) {
-#         fnvhash ^= str[j];
-#         fnvhash *= 0x00000100000001B3;
-#     }
-#     return (uint32)(0xFFFFFFFF & fnvhash);
-# }
 
 def getCR2WTABLEName(index, version):
     if index == 0: return "Strings"
@@ -1831,34 +2004,121 @@ class CR2WTABLE:
             pass
         else:
             self.crc32 = readU32(f) #uint crc32;
+            
+
+from typing import List, Tuple, Dict
+import numpy as np
 
 class CR2W_header:
-    def __init__(self,f):
-        self.magic = readU32(f)
-        self.version = readU32(f) # witcher3 = 162
+    def __init__(self,f = None):
+        if f:
+            self.Read(f)
+        else:
+            self.Create()
+
+    def Read(self, f = None):
+        self.magic: np.uint = readU32(f)
+        self.version: np.uint = readU32(f) # witcher3 = 162
 
         if (self.version < 115):# witcher2
-            self.flags = readU32(f)
+            self.flags: np.uint = readU32(f)
             log.error("w2 header error")
         else:
-            self.flags = readU32(f)
-            self.timestamp = readU64(f)
-            self.buildVersion = readU32(f)
-            self.fileSize = readU32(f)
-            self.bufferSize = readU32(f)
-            self.CRC32 = readU32(f)
-            self.numChunks = readU32(f)
+            self.flags: np.uint = readU32(f)
+            self.timestamp: np.uint64 = readU64(f)
+            self.buildVersion: np.uint = readU32(f)
+            self.fileSize: np.uint = readU32(f)
+            self.bufferSize: np.uint = readU32(f)
+            self.CRC32: np.uint = readU32(f)
+            self.numChunks: np.uint = readU32(f)
+
+    def Create(self):
+        self.magic: np.uint = 0
+        self.version: np.uint = 0
+        self.flags: np.uint = 0
+        self.timestamp: np.uint64 = 0
+        self.buildVersion: np.uint = 0
+        self.fileSize:np.uint = 0
+        self.bufferSize:np.uint = 0
+        self.CRC32:np.uint = 0
+        self.numChunks:np.uint = 0
+
+
+from enum import Enum
+class EStringTableMod(Enum):
+    None_ = 0
+    SkipType = 1
+    SkipName = 2
+    SkipNameAndType = 3
+    TypeFirst = 4
 
 class CR2W:
-    def __init__(self, f, anim_name = None):
-        self.fileName = f.name
+    def __init__(self, f = None, anim_name = None):
         #global variables to use
-        self.gName = ""
-        self.gType = ""
-        start = f.tell()
-        self.start = start
-        self.HEADER = CR2W_header(f)
+        self.gName:np.string_ = ""
+        self.gType:np.string_ = ""
+        
+        if f:
+            self.Read(f, anim_name)
+        else:
+            self.Create()
+
+    def Create(self):
+        self.start:np.uint = 0
+        self.fileName:np.string_ = None
+        self.HEADER:CR2W_header = CR2W_header()
         table_range = 10
+
+    def GenerateStringtable(self):
+        newstringtable = {}
+        
+        
+        (nameslist, importslist) = self.GenerateStringtableInner()
+        stringlist:List[str] = nameslist
+        newstrings:bytearray = []
+        
+        return (newstringtable, newstrings, nameslist, importslist)
+
+    def GenerateStringtableInner(self):
+        dbg_trace:List[str]= []
+        newnameslist = {"":""}
+        newimportslist: List[CR2WImport] = []
+        newsoftlist: List[CR2WImport] = []
+        guidlist = []
+        chunkguidlist = []
+        c: CLASS = None
+        
+        def LoopWrapper(item1: EStringTableMod, item2: CLASS):
+            dbg_trace.append(f"{item2.name}[{item2.Type}] - {item1.name}")
+            self.AddStrings(item1, item2)
+
+        for c in self.CHUNKS.CHUNKS:
+            LoopWrapper(EStringTableMod.SkipName, c)
+            
+            
+        return (newnameslist, newimportslist)
+
+    def AddStrings(self, item1: EStringTableMod, item2: CLASS):
+        var = item2
+        pass
+
+    def Write(self, f):
+        nn: List[CNAME] = self.CNAMES.copy()
+        
+        StringDictionary = {}
+        
+        newstrings:List[np.byte]
+        nameslist:str = []
+        importslist:List[CR2WImport] = []
+
+        (StringDictionary, newstrings, nameslist, importslist) = self.GenerateStringtable()
+        
+    def Read(self, f = None, anim_name = None):
+        self.fileName:np.string_ = f.name
+        start:np.uint = f.tell()
+        self.start = start
+        self.HEADER:CR2W_header = CR2W_header(f)
+        table_range:np.uint = 10
         if self.HEADER.version == 112: table_range = 4
         
         

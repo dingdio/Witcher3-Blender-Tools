@@ -301,15 +301,15 @@ def readEntFile(filename):
 
 def Read_CSkeletalAnimationSet(json):
     print('Reading Skeletal AnimationSet')
-    data = w3_types.CSkeletalAnimationSet.from_json(json)
+    if 'animations' in json:
+        data = w3_types.CSkeletalAnimationSet.from_json(json)
+    else:
+        data =  w3_types.CSkeletalAnimationSet()
+        data.animations.append(w3_types.CSkeletalAnimationSetEntry.from_json(json))
+        
     return data
 
 def Read_CCutsceneTemplate(json):
     print('Reading Cutscene')
-    # animBuffer = readAnimBuffer(json['animBuffer'])
-    # name = json['name']
-    # duration = json['duration']
-    # data = w3_types.CCutsceneTemplate(  animations = [],
-    #                                     SCutsceneActorDefs = [])
     data = w3_types.CCutsceneTemplate.from_json(json)
     return data

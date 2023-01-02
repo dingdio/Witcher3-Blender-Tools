@@ -206,7 +206,7 @@ def create_armature2(mdl: w3_types.CSkeleton, nsp="", scale=1.0):
     armature = bpy.data.armatures.new(f"{model_name}_ARM_DATA")
     armature_obj = bpy.data.objects.new(f"{model_name}_ARM", armature)
     armature_obj.show_in_front = True
-    bpy.context.scene.collection.objects.link(armature_obj)
+    bpy.context.collection.objects.link(armature_obj)
 
     armature_obj.select_set(True)
     bpy.context.view_layer.objects.active = armature_obj
@@ -223,21 +223,23 @@ def create_armature2(mdl: w3_types.CSkeleton, nsp="", scale=1.0):
     bpy.ops.object.mode_set(mode='OBJECT')
 
     bpy.context.active_object.rotation_euler[2] = radians(180)
-    #bpy.context.scene.collection.objects.unlink(armature_obj)
+    #bpy.context.collection.objects.unlink(armature_obj)
     return armature_obj
 
 #!WORKING CREATE COMMETED OUT
-def create_armature(mdl: w3_types.CSkeleton, nsp="", scale=1.0):
+def create_armature(mdl: w3_types.CSkeleton, nsp="", scale=1.0, do_fix_tail = False, context = None):
+    if context == None:
+        context = bpy.context
     PREFIX = nsp
     PREFIX = ""
     model_name =nsp#nsp.split(":")[0] #Path(mdl.header.name).stem
     armature = bpy.data.armatures.new(f"{model_name}_ARM_DATA")
     armature_obj = bpy.data.objects.new(f"{model_name}_ARM", armature)
     armature_obj.show_in_front = True
-    bpy.context.scene.collection.objects.link(armature_obj)
+    context.collection.objects.link(armature_obj)
 
     armature_obj.select_set(True)
-    bpy.context.view_layer.objects.active = armature_obj
+    context.view_layer.objects.active = armature_obj
 
     bpy.ops.object.mode_set(mode='EDIT')
     bl_bones = []
@@ -264,21 +266,21 @@ def create_armature(mdl: w3_types.CSkeleton, nsp="", scale=1.0):
 
     bpy.ops.pose.armature_apply()
     
-    # bpy.ops.object.mode_set(mode='EDIT')
-    # fix_bone_tail_on_hierarchy(armature.edit_bones)
+    if do_fix_tail: #!
+        bpy.ops.object.mode_set(mode='EDIT')
+        fix_bone_tail_on_hierarchy(armature.edit_bones)
     
     bpy.ops.object.mode_set(mode='OBJECT')
 
-    bpy.context.active_object.rotation_euler[2] = radians(180)
-    #bpy.context.scene.collection.objects.unlink(armature_obj)
+    context.active_object.rotation_euler[2] = radians(180)
+    #context.collection.objects.unlink(armature_obj)
     return armature_obj
 
 
 
-def start_rig_import(context, fileName = False, ns = ""):
+def start_rig_import(fileName = False, ns = "", do_fix_tail = False, context = None):
     ns = ns+":"
-    if not fileName:
-        fileName = os.path.join(get_uncook_path(context),"characters\\base_entities\\woman_base\\woman_base.w2rig")
+    #if not fileName:
         #fileName = r":\w3.modding\modkit\r4data\characters\models\geralt\scabbards\model\scabbards_crossbow.w2rig"
     print("Importing file: ", fileName)
     if fileName.endswith('.w2rig') or fileName.endswith('.w3dyng'):
@@ -287,17 +289,21 @@ def start_rig_import(context, fileName = False, ns = ""):
         w3Data = load_json_skeleton(fileName)
     else:
         return {'ERROR'}
-    arm = create_armature(w3Data, ns)
-
+    arm = create_armature(w3Data, ns, 1.0, do_fix_tail, context)
+    arm.data.witcherui_RigSettings.main_entity_skeleton = fileName
+    for bonedata in w3Data.bones:
+        bone = arm.data.witcherui_RigSettings.bone_order_list.add()
+        bone.name = bonedata.name
+        
     # for bone in arm.pose.bones:
     #     print(bone.name)
     #     if bone.name == ns+"pelvis":
     #         adw = "ddaw"
     return arm
 
-def import_w3_rig(filename, ns=""):
+def import_w3_rig(filename, ns="", do_fix_tail = False, context = None):
     print("Importing file: ", filename)
-    arm = start_rig_import(bpy.context, filename, ns)
+    arm = start_rig_import(filename, ns, do_fix_tail, context)
     return arm
     w3Data = load_json_skeleton(filename)
     if not w3Data:

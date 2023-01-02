@@ -47,8 +47,8 @@ class SModUiFilteredListCatItem:
 
 
 def StrFindFirst(str, str2):
-    cake = str.find(str2)
-    return cake
+    str = str.find(str2)
+    return str
     if str2.lower() in str.lower():
         return True
     else:
@@ -127,9 +127,6 @@ class CModUiFilteredList(ABC):
             isMatch = isMatch or StrFindFirst(self._items[i].caption, self._wildcardFilter) >= 0
             self._items[i].isWildcardMiss = not isMatch
             
-            # if "geralt" in self._items[i].caption:
-            #     cake = 234
-
             # set selected categories from first match to open the categories
             if (not firstMatchFound and isMatch):
                 firstMatchFound = True

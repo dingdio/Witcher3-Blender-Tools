@@ -5,6 +5,9 @@
 .history/
 qt/*
 TEMP/
-io_import_w2l/export_anims.py
 io_import_w2l/test.py
 io_import_w2l/.vscode/
+io_import_w2l/TEMP_PATHS.py
+io_import_w2l/JSON_EXPORT_TEMP/
+LINKS/
+witcher_texture/

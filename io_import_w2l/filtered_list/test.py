@@ -13,4 +13,3 @@ list = animListsManager.getAnimationListFor(actor)
 list.setWildcardFilter("")
 filteredList = list.getFilteredList()
 print(list.getMatchingItemCount(),"/",list.getTotalCount())
-cake = 123

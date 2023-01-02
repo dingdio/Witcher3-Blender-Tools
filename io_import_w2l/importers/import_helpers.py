@@ -1,7 +1,7 @@
 import os
 try:
     import bpy
-    from io_import_w2l import get_fbx_uncook_path
+    from io_import_w2l import get_fbx_uncook_path, get_uncook_path
 except Exception as e:
     pass
 from pathlib import Path
@@ -202,7 +202,10 @@ class meshPath:
     def __init__(self, meshName = False, translation = False, matrix = False, fbx_uncook_path = False, transform = False, BlockDataObjectType = Enums.BlockDataObjectType.Mesh):
         if fbx_uncook_path == False:
             fbx_uncook_path = get_fbx_uncook_path(bpy.context)
+        self.uncook_path = get_uncook_path(bpy.context)
         self.name = "Mesh Item"
+        if type(meshName) == int:
+            raise Exception("wut")
         self.meshName = meshName
         self.translation = translation
         #self.rotation = rotation
@@ -213,14 +216,20 @@ class meshPath:
         self.type = "Mesh"
         self.BlockDataObjectType = BlockDataObjectType
     def fbxPath(self):
-        name = Path(os.path.join(self.fbx_uncook_path, self.meshName))
-        return str(name.with_suffix('.fbx'));
+        try:
+            name = Path(os.path.join(self.fbx_uncook_path, self.meshName))
+            return str(name.with_suffix('.fbx'));
+        except Exception as e:
+            raise e
     def exists(self):
         return  Path(self.fbxPath()).exists();
     def fileName(self):
         return  os.path.basename(self.fbxPath())
     def filePath(self):
         return  os.path.dirname(self.fbxPath())
+    def uncookedPath(self):
+        name = str(Path(os.path.join(self.uncook_path, self.meshName)))
+        return name
     def static_from_chunk(self, meshChunk):
         #DepotPath = meshChunk.GetVariableByName('mesh').Handles[0].DepotPath
         self.meshName = meshChunk.GetVariableByName('mesh').Handles[0].DepotPath

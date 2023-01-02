@@ -1,17 +1,9 @@
-import math
 import os
 import sys
-import yaml
-from pathlib import Path
-import math
-from math import radians
-
+from .third_party_libs import yaml
 from .common_blender import repo_file
-
 from .setup_logging import *
 log = logging.getLogger(__name__)
-
-#import import_w2l
 
 parent_path = os.path.abspath(os.path.join(os.path.abspath(__file__), os.pardir))
 sys.path.append(parent_path.replace("\CR2W", ""))
@@ -22,7 +14,7 @@ from .bin_helpers import (ReadUlong48, readUShort,
                         ReadFloat24,
                         ReadFloat16)
 
-from .CR2W_types import ( Entity_Type_List, getCR2W )
+from .CR2W_types import ( Entity_Type_List, getCR2W, CLASS )
 
 from .bStream import *
 
@@ -56,6 +48,11 @@ class CLayerInfo(object):
 class WORLD:
     def __init__(self):
         self.worldName = "WORLD_NAME"
+        self.terrainClipMap = None
+        self.tileRes:int = 256
+        self.terrainSize:float = 2000
+        self.lowestElevation:float = 0
+        self.highestElevation:float = 100
         self.groups = []
 
 def write_yml(world):
@@ -107,14 +104,21 @@ def getChildrenGroups(group, CHUNKS):
 
 def create_world(file):
 
-    world = WORLD();
+    world = WORLD()
     CHUNKS = file.CHUNKS.CHUNKS
     for chunk in CHUNKS:
         if chunk.name == "CGameWorld":
-            CGameWorld = chunk
+            CGameWorld:CLASS = chunk
     firstLayer = CHUNKS[CGameWorld.Firstlayer.Reference]
     
-
+    world.terrainClipMap = CHUNKS[CGameWorld.GetVariableByName('terrainClipMap').Value-1]
+    #world.clipSize:int = world.terrainClipMap.GetVariableByName('clipSize').Value
+    #world.clipmapSize:int = world.terrainClipMap.GetVariableByName('clipmapSize').Value
+    world.tileRes:int = world.terrainClipMap.GetVariableByName('tileRes').Value
+    world.terrainSize:float = world.terrainClipMap.GetVariableByName('terrainSize').Value
+    world.lowestElevation:float = world.terrainClipMap.GetVariableByName('lowestElevation').Value
+    world.highestElevation:float = world.terrainClipMap.GetVariableByName('highestElevation').Value
+    
     world.groups = getChildrenGroups(firstLayer, CHUNKS)
     world.worldName = world.groups.name
     # for ChildGroup in firstLayer.ChildrenGroups:

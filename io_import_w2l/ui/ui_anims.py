@@ -3,19 +3,14 @@ from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
 from io_import_w2l.importers import import_anims
+from io_import_w2l.importers import import_cutscene
 import bpy
 from bpy.types import Panel, Operator, UIList, PropertyGroup
 from bpy.props import IntProperty, StringProperty, CollectionProperty, FloatProperty
 from bpy_extras.io_utils import (
         ImportHelper
         )
-#-----------------------------------------------------------------------------
-#
-# An extremely simple class that is used as the list item in the UIList.
-# It is possible to use a builtin type instead but this allows customization.
-# The content is fairly arbitrary, execpt that the member should be
-# bpy.props (ToDo: Verify this.)
-# Since it contains bpy.props, it must be registered.
+
 class ListItem(PropertyGroup):
     """Group of properties representing an item in the list."""
 
@@ -49,21 +44,12 @@ class ListItem(PropertyGroup):
     #        description="",
     #        default="")
     
-#-----------------------------------------------------------------------------
-#
-# https://docs.blender.org/api/current/bpy.types.UIList.html#bpy.types.UIList
-# The actual UIList class
-# This class has a filter function that can be used to sort the properties
-# into ascending or descending order using their name property.
 class TOOL_UL_List(UIList):
     """Demo UIList."""
     bl_idname = "TOOL_UL_List"
     layout_type = "DEFAULT" # could be "COMPACT" or "GRID"
     # list_id ToDo
 
-    # Custom properties, used in the filter functions
-    # This property applies only if use_order_name is True.
-    # In that case it determines whether to reverse the order of the sort.
     use_name_reverse: bpy.props.BoolProperty(
         name="Reverse Name",
         default=False,
@@ -71,8 +57,6 @@ class TOOL_UL_List(UIList):
         description="Reverse name sort order",
     )
 
-    # This properties tells whether to sort the list according to
-    # the alphabetical order of the names.
     use_order_name: bpy.props.BoolProperty(
         name="Name",
         default=False,
@@ -80,14 +64,12 @@ class TOOL_UL_List(UIList):
         description="Sort groups by their name (case-insensitive)",
     )
 
-    # This property is the value for a simple name filter.
     filter_string: bpy.props.StringProperty(
         name="filter_string",
         default = "",
         description="Filter string for name"
     )
 
-    # This property tells whether to invert the simple name filter
     filter_invert: bpy.props.BoolProperty(
         name="Invert",
         default = False,
@@ -95,17 +77,6 @@ class TOOL_UL_List(UIList):
         description="Invert Filter"
     )
 
-    #-------------------------------------------------------------------------
-    # This function does two things, and as a result returns two arrays:
-    # flt_flags - this is the filtering array returned by the filter
-    #             part of the function. It has one element per item in the
-    #             list and is set or cleared based on whether the item
-    #             should be displayed.
-    # flt_neworder - this is the sorting array returned by the sorting
-    #             part of the function. It has one element per item
-    #             the item is the new position in order for the
-    #             item.
-    # The arrays must be the same length as the list of items or empty
     def filter_items(self, context,
                     data, # Data from which to take Collection property
                     property # Identifier of property in data, for the collection
@@ -174,15 +145,11 @@ class TOOL_UL_List(UIList):
             layout.alignment = 'CENTER'
             layout.label(text="")
 
-#-----------------------------------------------------------------------------
-#
-# An extremely simple list add operator
-# Replace context.scene.demo_list with the actual list
 class TOOL_OT_List_LoadAnim(Operator):
     """ Add an Item to the UIList"""
     bl_idname = "tool.list_loadanim"
     bl_label = "Load"
-    bl_description = "load a new item to the list."
+    bl_description = "Load the selected animation"
     
     action: StringProperty(default="default")
     @classmethod
@@ -204,10 +171,6 @@ class TOOL_OT_List_LoadAnim(Operator):
             bpy.context.scene.demo_list.clear()
         return {'FINISHED'}
 
-#-----------------------------------------------------------------------------
-#
-# An extremely simple list add operator
-# Replace context.scene.demo_list with the actual list
 class TOOL_OT_List_Add(Operator):
     """ Add an Item to the UIList"""
     bl_idname = "tool.list_add"
@@ -226,12 +189,6 @@ class TOOL_OT_List_Add(Operator):
         context.scene.demo_list.add()
         return {'FINISHED'}
 
-#-----------------------------------------------------------------------------
-#
-# An extremely simple list remove operator
-# Replace context.scene.demo_list with the actual list
-# It's only possible to remove the item that is indexed
-# The reorder routine keeps track of the index.
 class TOOL_OT_List_Remove(Operator):
     """ Add an Item to the UIList"""
     bl_idname = "tool.list_remove"
@@ -256,10 +213,6 @@ class TOOL_OT_List_Remove(Operator):
         context.scene.list_index = min(max(0, index - 1), len(alist) - 1)
         return {'FINISHED'}
 
-#-----------------------------------------------------------------------------
-#
-# An extremely simple list reordering operator
-# Replace context.object.demo_list with the actual list
 class TOOL_OT_List_Reorder(Operator):
     """ Add an Item to the UIList"""
     bl_idname = "tool.list_reorder"
@@ -295,8 +248,6 @@ class TOOL_OT_List_Reorder(Operator):
         self.move_index()
         return {'FINISHED'}
 
-#-----------------------------------------------------------------------------
-#
 
 class ButtonOperatorImportW2Anims(bpy.types.Operator, ImportHelper):
     """Import W2 Anims"""
@@ -314,17 +265,26 @@ class ButtonOperatorImportW2Anims(bpy.types.Operator, ImportHelper):
             import_anims.start_import(context, fdir)
         return {'FINISHED'}
 
+class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
+    """Import W2 Cutscee"""
+    bl_idname = "object.import_w2_cutscene"
+    bl_label = "W2 Cutscene"
+    filename_ext = ".w2cutscene"
+    def execute(self, context):
+        fdir = self.filepath
+        if (os.path.exists(fdir+'.json')):
+            fdir = fdir + '.json'
+        else:
+            #import_anims.start_import(context, fdir)
+            import_cutscene.import_w3_cutscene(fdir)
+        return {'FINISHED'}
 
 from io_import_w2l import get_W3_VOICE_PATH
+from io_import_w2l.ui.ui_utils import WITCH_PT_Base
 
-class WITCH_PT_Base:
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Witcher'
-    bl_context = ''#'objectmode'
-    #bl_options = {'DEFAULT_CLOSED'}
-class TOOL_PT_Panel(WITCH_PT_Base, Panel):
-    bl_idname = "TOOL_PT_Panel"
+class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
+    #bl_parent_id = "WITCH_PT_ENTITY_Panel"
+    bl_idname = "WITCHER_PT_animset_panel"
     bl_label = "Animation Set"
     bl_description = "Demonstration of UIList Features"
     #bl_options = {'HEADER_LAYOUT_EXPAND'}
@@ -342,20 +302,24 @@ class TOOL_PT_Panel(WITCH_PT_Base, Panel):
         op.filepath = get_W3_VOICE_PATH(bpy.context) #r"\w3.modding\radish-tools\docs.speech\enpc.w3speech-extracted_GOOD\enpc.w3speech-extracted"
         
         row = self.layout.row()
-        op = row.operator(ButtonOperatorImportW2Anims.bl_idname, text="Import .w2anims.json", icon='SPHERE')
+        op = row.operator(ButtonOperatorImportW2Anims.bl_idname, text="Import Set (.w2anims)", icon='SPHERE')
         op.filepath = os.path.join(get_uncook_path(context),"animations\\")
         
-        row = self.layout.row()
-        row.alignment = "CENTER"
+        # row = self.layout.row()
+        # op = row.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Import CS (.w2cutscene)", icon='SPHERE')
+        # op.filepath = os.path.join(get_uncook_path(context),"animations\\")
         
-
+        box = self.layout.box()
+        row = box.row()
+        #row.alignment = "CENTER"
+        
         col = row.column(align=True)
         col.template_list("TOOL_UL_List", "The_List", object,
                             "demo_list", object, "list_index")
         
-        col = row.column(align=True)
-        col.operator("tool.list_add", text="", icon="ADD")
-        col.operator("tool.list_remove", text="", icon="REMOVE")
+        col = row.column()
+        # col.operator("tool.list_add", text="", icon="ADD")
+        # col.operator("tool.list_remove", text="", icon="REMOVE")
 
         if len(object.demo_list) > 1:
             col.operator("tool.list_reorder", text="",
@@ -363,10 +327,10 @@ class TOOL_PT_Panel(WITCH_PT_Base, Panel):
             col.operator("tool.list_reorder", text="",
                 icon="TRIA_DOWN").direction = "DOWN"
 
-        grid = self.layout.grid_flow( columns = 2 )
-        
-        grid.operator("tool.list_loadanim", text="Load").action = "load"
-        grid.operator("tool.list_loadanim", text="Clear List").action = "clear"
+        #grid = box.layout.grid_flow( columns = 2 )
+        box.operator("tool.list_loadanim", text="Load").action = "load"
+
+        #grid.operator("tool.list_loadanim", text="Clear List").action = "clear"
         row = self.layout.row()
         if object.list_index >= 0 and object.demo_list:
             item = object.demo_list[object.list_index]
@@ -395,8 +359,8 @@ from bpy_extras.io_utils import (
         ImportHelper
         )
 
-class WM_OT_import_w3_fbx(Operator, ImportHelper):
-    """Select an entire character folder or single FBX file. If you select multiple characters, all their skeletons will be merged into one, not recommended."""
+class WITCH_OT_import_w3_fbx(Operator, ImportHelper):
+    """Same as normal FBX import but applies materials. Need seprate "FBX Import plugin for blender" enabled. Download from Nexus"""
     bl_idname = "import_scene.witcher3_fbx_ding"
     bl_label = "Import Witcher 3 FBX"
     bl_options = {'REGISTER', 'UNDO'}
@@ -469,7 +433,6 @@ class WM_OT_import_w3_fbx(Operator, ImportHelper):
         if uncook_path == 'E:\\Path_to_your_uncooked_folder\\Uncooked\\':
             raise Exception("Please browse your Uncooked folder in the Addon Preferences UI in Edit->Preferences->Addons->Witcher 3 FBX Import Tools.")
 
-        #tex_table = load_texture_table()
         #bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
 
         fbx_util.importFbx(filepath
@@ -482,28 +445,24 @@ class WM_OT_import_w3_fbx(Operator, ImportHelper):
         return {'FINISHED'}
 
 
-def menu_func_import(self, context):
-    self.layout.operator(WM_OT_import_w3_fbx.bl_idname, text="Witcher 3 FBX Ding")
-
-
 #-----------------------------------------------------------------------------
 #
 classes = [
     ButtonOperatorImportW2Anims,
-    WM_OT_import_w3_fbx,
+    ButtonOperatorImportW2cutscene,
     ListItem,
     TOOL_UL_List,
     TOOL_OT_List_Add,
     TOOL_OT_List_Remove,
     TOOL_OT_List_Reorder,
-    TOOL_PT_Panel,
+    WITCHER_PT_animset_panel,
     TOOL_OT_List_LoadAnim,
 ]
 
 
 
 def register():
-    bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    #bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     for c in classes:
         bpy.utils.register_class(c)
 
@@ -519,7 +478,7 @@ def register():
 def unregister():
     del bpy.types.Scene.demo_list
     del bpy.types.Scene.list_index
-    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    #bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     #del bpy.types.Scene.anim_export_name
     for c in classes:
         bpy.utils.unregister_class(c)

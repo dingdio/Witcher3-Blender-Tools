@@ -1,4 +1,4 @@
-import yaml
+from io_import_w2l.CR2W.third_party_libs import yaml
 import bpy
 import os
 import json

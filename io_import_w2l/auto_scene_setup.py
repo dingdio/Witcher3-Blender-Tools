@@ -2,19 +2,26 @@
 
 import bpy
 
-def setupFrameRanges():
+def setupFrameRanges(use_NLA = False):
     obj = bpy.context.object
     s, e = 1, 1
-    if obj.animation_data.action:
-        i = obj.animation_data.action
-        ts, te = i.frame_range
-        s = min(s, ts)
-        e = max(e, te)
+    if use_NLA:
+        if obj.animation_data.nla_tracks:
+            for track in obj.animation_data.nla_tracks:
+                for i in track.strips:
+                    s = min(s, i.action_frame_start)
+                    e = max(e, i.action_frame_end)
     else:
-        for i in bpy.data.actions:
+        if obj.animation_data.action:
+            i = obj.animation_data.action
             ts, te = i.frame_range
             s = min(s, ts)
             e = max(e, te)
+        else:
+            for i in bpy.data.actions:
+                ts, te = i.frame_range
+                s = min(s, ts)
+                e = max(e, te)
     bpy.context.scene.frame_start = int(s)
     bpy.context.scene.frame_end = int(e)
     if bpy.context.scene.rigidbody_world is not None:

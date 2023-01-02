@@ -74,11 +74,19 @@ def constrain_w3_rig(arm_parent, arm_child, mo=False):
     CreateConstraints(arm_parent, arm_child)   
 
 def CreateConstraints2(arm_parent, arm_child):
-    bpy.ops.object.mode_set(mode='POSE', toggle=False)
+    objs = bpy.context.selected_objects[:]
+    obj = objs[0]
+    # bpy.ops.object.select_all(action='DESELECT')
+    # arm_parent.select_set(True)
+    # arm_child.select_set(True)
+    try:
+        bpy.ops.object.mode_set(mode='POSE', toggle=False)
+    except Exception as e:
+        raise e
     for tgt_parent_bone in arm_parent.pose.bones:
         tgt_child_bone = False
         p_bone_name = file_helpers.rm_ns(tgt_parent_bone.name)
-        print(p_bone_name)
+        #print(p_bone_name)
 
         for cBone in arm_child.pose.bones:
             c_bone_name = file_helpers.rm_ns(cBone.name)
@@ -86,8 +94,15 @@ def CreateConstraints2(arm_parent, arm_child):
                 tgt_child_bone = cBone
         #some positions of the face rig of a character don't match
         CHILD_OF_list = ['ears', 'jaw', 'tongue1', 'tongue2', 'tongue_right_side', 'tongue_left_side','left_eye', 'right_eye'
-                         ,'right_chick1','left_chick1']
+                        ,'right_chick1','left_chick1']
         #if tgt_child_bone and "ears" not in tgt_child_bone.name and not "eye" == tgt_child_bone.name and not "jaw" == tgt_child_bone.name:
+
+        # if tgt_child_bone and tgt_child_bone.name == "head":
+        #     if tgt_child_bone.parent == None:
+        #         CHILD_OF_list.remove("head")
+        # if tgt_child_bone and not tgt_child_bone.parent:
+        #     CHILD_OF_list.append(tgt_child_bone.name)
+
         if tgt_child_bone and tgt_child_bone.name not in CHILD_OF_list:
             for cons in tgt_child_bone.constraints:
                 tgt_child_bone.constraints.remove(cons)
@@ -151,6 +166,49 @@ def CreateConstraints2(arm_parent, arm_child):
     bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
     return {'FINISHED'}
 
+
+def CreateConstraints_IK_rig(arm_parent, arm_child):
+    bpy.ops.object.mode_set(mode='POSE', toggle=False)
+    for tgt_parent_bone in arm_parent.pose.bones:
+        tgt_child_bone = False
+        p_bone_name = file_helpers.rm_ns(tgt_parent_bone.name)
+        print(p_bone_name)
+        for cBone in arm_child.pose.bones:
+            c_bone_name = file_helpers.rm_ns(cBone.name)
+            if c_bone_name == p_bone_name:
+                tgt_child_bone = cBone
+        CHILD_OF_list = []
+        if tgt_child_bone and tgt_child_bone.name not in CHILD_OF_list:
+            for cons in tgt_child_bone.constraints:
+                tgt_child_bone.constraints.remove(cons)
+            copyTransform = tgt_child_bone.constraints.new('COPY_TRANSFORMS')
+            copyTransform.name = tgt_parent_bone.name + " to " + tgt_child_bone.name
+            copyTransform.target = arm_parent
+            copyTransform.subtarget = tgt_parent_bone.name
+            
+            #! TEMP STUFF FOR ADDING IK
+            copyTransform.target_space = "WORLD"
+            copyTransform.owner_space = "WORLD"
+            copyTransform.target_space = "LOCAL_WITH_PARENT"
+            copyTransform.owner_space = "LOCAL_WITH_PARENT"
+            
+            copyRotation = tgt_child_bone.constraints.new('COPY_ROTATION')
+            copyRotation.name = tgt_parent_bone.name + " to " + tgt_child_bone.name
+            copyRotation.target = arm_parent
+            copyRotation.subtarget = tgt_parent_bone.name
+            copyRotation.mix_mode = "REPLACE"
+            copyRotation.target_space = "LOCAL_OWNER_ORIENT"
+            copyRotation.owner_space = "LOCAL"
+            
+            copyLocation = tgt_child_bone.constraints.new('COPY_LOCATION')
+            copyLocation.name = tgt_parent_bone.name + " to " + tgt_child_bone.name
+            copyLocation.target = arm_parent
+            copyLocation.subtarget = tgt_parent_bone.name
+            #! TEMP STUFF END
+    bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+    return {'FINISHED'}
+
+
 def attach_weapon(p_bone_name = "r_weapon"):
     #bpy.data.objects['CMeshComponent14:Armature']
     arm_parent = False
@@ -171,7 +229,7 @@ def attach_weapon(p_bone_name = "r_weapon"):
     copyTransform.target = arm_parent
     copyTransform.subtarget = p_bone_name
 
-def do_it():
+def do_it(type = 1):
     #bpy.data.objects['CMeshComponent14:Armature']
     arm_parent = False
     arm_child = bpy.context.active_object
@@ -185,7 +243,6 @@ def do_it():
             arm_parent = obj
             continue
 
-    print("CAKE")
     # arm_parent = bpy.context.object
     # objects = bpy.context.selected_objects
     # arm = arm_parent.data
@@ -194,6 +251,9 @@ def do_it():
     #     print("No Armature selected! Exiting script.")
     #     return {"ERROR"}
     print("Creating constraints...")
-    cake = CreateConstraints2(arm_parent, arm_child)   
+    if type == 1:
+        result = CreateConstraints2(arm_parent, arm_child)
+    elif type == 2:
+        CreateConstraints_IK_rig(arm_parent, arm_child)
     print("Script finished")
     return {'FINISHED'}

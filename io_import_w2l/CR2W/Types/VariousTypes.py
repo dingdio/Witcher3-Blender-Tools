@@ -4,7 +4,8 @@ from ..bin_helpers import (
                         getString,
                         readFloat,
                         readU32,
-                        readUShort,)
+                        readUShort,
+                        readUByte)
 
 class CColor:
     def __init__(self):
@@ -12,12 +13,19 @@ class CColor:
         self.Green = False
         self.Blue = False
         self.Alpha = False
+        
+    def Set(self,r,g,b,a):
+        self.Red = r
+        self.Green = g
+        self.Blue = b
+        self.Alpha = a
+        return self
 
     def Read(self, f):
-        self.Red = f.readUInt8()
-        self.Green = f.readUInt8()
-        self.Blue = f.readUInt8()
-        self.Alpha = f.readUInt8()
+        self.Red = readUByte(f)
+        self.Green = readUByte(f)
+        self.Blue = readUByte(f)
+        self.Alpha = readUByte(f)
         return self
 
 
@@ -62,6 +70,7 @@ class CMatrix4x4(object):
     """docstring for CMatrix4x4."""
     def __init__(self, CR2WFILE):
         super(CMatrix4x4, self).__init__()
+        self.fields = []
         self.ax = None
         self.ay = None
         self.az = None
@@ -95,6 +104,24 @@ class CMatrix4x4(object):
         self.dy = readFloat(f)
         self.dz = readFloat(f)
         self.dw = readFloat(f)
+        self.fields = [
+            self.ax,
+            self.ay,
+            self.az,
+            self.aw,
+            self.bx,
+            self.by,
+            self.bz,
+            self.bw,
+            self.cx,
+            self.cy,
+            self.cz,
+            self.cw,
+            self.dx,
+            self.dy,
+            self.dz,
+            self.dw,
+        ]
     def Write():
         pass
     

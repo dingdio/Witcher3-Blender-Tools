@@ -20,7 +20,7 @@ from .bin_helpers import (ReadUlong48, readUShort,
                         ReadFloat24,
                         ReadFloat16)
 
-from bStream import *
+from .bStream import *
 
 class CVector3D:
     def __init__(self, f, compression = 0):
@@ -373,4 +373,11 @@ def load_bin_anims(fileName, rigPath = False) -> w3_types.CSkeletalAnimationSet:
         theFile = getCR2W(f)
         f.close()
     anim_set = create_anim_set(theFile, rig)
+    return anim_set
+
+def load_bin_cutscene(fileName) -> w3_types.CCutsceneTemplate:
+    with open(fileName, "rb") as f:
+        theFile = getCR2W(f)
+        f.close()
+    anim_set = theFile
     return anim_set
