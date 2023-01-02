@@ -28,8 +28,9 @@ Blender addon for working with Witcher 3 files.
     The current best way to work with the exported animation json is to use this specific version of Wolvenkit 0.6.1 compiled by nikich340 until Wolvenkit-7 is updated. Also the utility tool for modifying the exported files.
 - [0.6.1-YML-W2ANIMS-APRIL04](https://github.com/nikich340/WolvenKit/releases/tag/0.6.1-YML-W2ANIMS-APRIL04)
 - [W3-Maya-AnimUtil](https://github.com/nikich340/W3-Maya-AnimUtil) 
+- [Some Wiki Notes](https://github.com/dingdio/Witcher3_Blender_Tools/wiki/Exporting-Animation-Notes)
 
-## Recommened 
+## Recommended 
 
 - [FBX Import plugin for blender](https://www.nexusmods.com/witcher3/mods/6118) - For working with any fbx files.
 
