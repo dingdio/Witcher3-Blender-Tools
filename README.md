@@ -5,7 +5,7 @@ Blender addon for working with Witcher 3 files.
 
 - Mesh importer (.w2mesh)
 - Rig import/export (.w2rig, .json)
-- Animation import/export (.w2rig, .json)
+- Animation import/export (.w2anims, .json)
 - Map importer (.w2l, .w2w)
 - Basic map layer definition export for [radish tools](https://www.nexusmods.com/witcher3/mods/3620) (.yml)
 - Characters/Entity definition (.w2ent) importer
@@ -40,18 +40,27 @@ Blender addon for working with Witcher 3 files.
 
 ## Installation
 Put "io_import_w2l" folder into your blender addons folder
-Launch Blender, active the addon in Blender Preferences
+Launch Blender and activate the addon in Blender Preferences
 
 in the addon settings add your own paths to:
 - uncook_path = main repo where you exported all the game bundles with wcclite.exe .w2mesh files, .w2mi files, .w2ent etc.
 - tex_uncook_path = repo folder with ALL exported .tga from the game
 - apx_uncook_path = repo folder with ALL exported .apx from the game
-- fbx_uncook_path = repo folder with ALL exported .fbx from the game
 
 All these folders can be the same repo.
 
-Since wcclite.exe has trouble exporting many fbx from the Witcher 3 game I have uploaded my collection of .fbx files along with Redcloth items in .apx format. Find them in this folder: [Folder Link](https://mega.nz/folder/GIR3AZBY#I4EEwkl4tjgnIv07f10n0A)
+## Optional Setup
 
+### Speech / Lipsync repo settings
+- Extracted Lipsync repo = folder with .cr2w files
+- Converted wem files = folder with (.ogg)s 
+- [Wiki about speech](https://github.com/dingdio/Witcher3_Blender_Tools/wiki/Speech-Notes)
+
+### FBX repo settings
+
+- fbx_uncook_path = repo folder with ALL exported .fbx from the game
+
+Since wcclite.exe has trouble exporting many fbx from the Witcher 3 game I have uploaded my collection of .fbx files along with Redcloth items in .apx format. Find them in this folder: [Folder Link](https://mega.nz/folder/GIR3AZBY#I4EEwkl4tjgnIv07f10n0A) These files are now optional for map/character loader since .w2mesh is now read directly. There is a toggle in settings to use fbx.
 
 ## Links
 - https://github.com/WolvenKit/WolvenKit-7

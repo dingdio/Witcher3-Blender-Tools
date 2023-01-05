@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class ListItem(PropertyGroup):
     #        name="Animation in Json",
     #        description="",
     #        default="")
-    
+
 class TOOL_UL_List(UIList):
     """Demo UIList."""
     bl_idname = "TOOL_UL_List"
@@ -93,7 +94,7 @@ class TOOL_UL_List(UIList):
             flt_flags = bpy.types.UI_UL_list.filter_items_by_name(
                     self.filter_string,
                     self.bitflag_filter_item,
-                    items, 
+                    items,
                     propname="name",
                     reverse=self.filter_invert)
         else:
@@ -106,10 +107,10 @@ class TOOL_UL_List(UIList):
             if self.use_name_reverse:
                 flt_neworder.reverse()
         else:
-            flt_neworder = []    
+            flt_neworder = []
 
 
-        return flt_flags, flt_neworder        
+        return flt_flags, flt_neworder
 
     def draw_filter(self, context,
                     layout # Layout to draw the item
@@ -150,12 +151,12 @@ class TOOL_OT_List_LoadAnim(Operator):
     bl_idname = "tool.list_loadanim"
     bl_label = "Load"
     bl_description = "Load the selected animation"
-    
+
     action: StringProperty(default="default")
     @classmethod
     def poll(cls, context):
         return context.scene
-    
+
     def execute(self, context):
         scene = context.scene
         action = self.action
@@ -163,7 +164,7 @@ class TOOL_OT_List_LoadAnim(Operator):
             print("=== load anim ====")
             if scene.list_index >= 0 and scene.demo_list:
                 item = scene.demo_list[scene.list_index]
-                
+
                 import_anims.import_from_list_item(context, item)
             # context.scene.demo_list.add()
         elif "clear" == action:
@@ -176,7 +177,7 @@ class TOOL_OT_List_Add(Operator):
     bl_idname = "tool.list_add"
     bl_label = "Add"
     bl_description = "add a new item to the list."
-    
+
     @classmethod
     def poll(cls, context):
         """ We can only add items to the list of an active object
@@ -184,7 +185,7 @@ class TOOL_OT_List_Add(Operator):
             just this function can only check if there is an active object
         """
         return context.scene
-    
+
     def execute(self, context):
         context.scene.demo_list.add()
         return {'FINISHED'}
@@ -194,7 +195,7 @@ class TOOL_OT_List_Remove(Operator):
     bl_idname = "tool.list_remove"
     bl_label = "Add"
     bl_description = "Remove an new item from the list."
-    
+
     @classmethod
     def poll(cls, context):
         """ We can only remove items from the list of an active object
@@ -202,10 +203,10 @@ class TOOL_OT_List_Remove(Operator):
             yet exist and there's no reason to remove an item from an empty
             list.
         """
-        return (context.scene 
+        return (context.scene
                 and context.scene.demo_list
                 and len(context.scene.demo_list))
-    
+
     def execute(self, context):
         alist = context.scene.demo_list
         index = context.scene.list_index
@@ -218,16 +219,16 @@ class TOOL_OT_List_Reorder(Operator):
     bl_idname = "tool.list_reorder"
     bl_label = "Add"
     bl_description = "add a new item to the list."
-    
+
     direction: bpy.props.EnumProperty(items=(('UP', 'Up', ""),
                                               ('DOWN', 'Down', ""),))
-    
+
     @classmethod
     def poll(cls, context):
         """ No reason to try to reorder a list with fewer than
             two items in it.
         """
-        return (context.scene 
+        return (context.scene
                 and context.scene.demo_list
                 and len(context.scene.demo_list) > 1)
 
@@ -248,6 +249,59 @@ class TOOL_OT_List_Reorder(Operator):
         self.move_index()
         return {'FINISHED'}
 
+class ButtonOperatorImportVoice(bpy.types.Operator, ImportHelper):
+    """Import W2 lipsync Animation"""
+    bl_idname = "object.import_w2_voice"
+    bl_label = "w2 lipsync"
+    filename_ext = ".cr2w"
+
+    use_NLA: bpy.props.BoolProperty(name="Use NLA",
+                                        default=True,
+                                        description="Animation will be imported into a track called \"voice_import\" instead of action")
+
+    def execute(self, context):
+        fdir = self.filepath
+        #fdir = r"E:\w3.mods\w3.modCakeTest\speech\speech.en.wem\2113445001.lipsyncanim.cr2w"
+        if (os.path.exists(fdir+'.json')):
+            fdir = fdir + '.json'
+        if fdir.endswith('.cr2w'):
+            log.info('Importing Lipsync')
+            #import_anims.import_lipsync(context, fdir)
+            cr2wPath = fdir
+            path = Path(cr2wPath)
+            filename = Path(cr2wPath).stem
+            import_anims.import_lipsync(context, cr2wPath, use_NLA=self.use_NLA, NLA_track="voice_import")
+            soundPath = cr2wPath.replace(".cr2w", ".wav")
+
+            if not os.path.isfile(soundPath):
+                folder = path.parent.name
+                if "speech." in folder and ".wem" in folder and "lipsyncanim" in filename:
+                    speechId = filename.split('.')[0]
+                    soundFolder = str(path.parent.parent)+"\\"+path.parent.name.replace('wem','wav')
+                    if os.path.isdir(soundFolder):
+                        files = Path(soundFolder).glob('*')
+                        for file in files:
+                            if file.suffix == ".wav" and speechId in file.stem:
+                                print(file.stem)
+                                soundPath = str(file)
+                                break
+
+
+            #search same directiory
+            #search defined voice dir
+            #search speech.en.wav
+
+            if os.path.isfile(soundPath):
+                log.info('Importing Sound')
+                scene = context.scene
+
+                bpy.ops.sequencer.delete()
+                if not scene.sequence_editor:
+                    scene.sequence_editor_create()
+
+                #Sequences.new_sound(name, filepath, channel, frame_start)
+                soundstrip = scene.sequence_editor.sequences.new_sound("voiceline", soundPath, 3, 0)
+        return {'FINISHED'}
 
 class ButtonOperatorImportW2Anims(bpy.types.Operator, ImportHelper):
     """Import W2 Anims"""
@@ -256,13 +310,7 @@ class ButtonOperatorImportW2Anims(bpy.types.Operator, ImportHelper):
     filename_ext = ".w2anims"
     def execute(self, context):
         fdir = self.filepath
-        if (os.path.exists(fdir+'.json')):
-            fdir = fdir + '.json'
-        if fdir.endswith('.cr2w'):
-            log.info('Importing Lipsync')
-            import_anims.import_lipsync(context, fdir)
-        else:
-            import_anims.start_import(context, fdir)
+        import_anims.start_import(context, fdir)
         return {'FINISHED'}
 
 class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
@@ -291,32 +339,32 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
-        """ 
+        """
         """
         object = context.scene
         if object == None:
             return
 
         row = self.layout.row()
-        op = row.operator(ButtonOperatorImportW2Anims.bl_idname, text="Import Voiceline", icon='SPHERE')
+        op = row.operator(ButtonOperatorImportVoice.bl_idname, text="Import Voiceline", icon='SPHERE')
         op.filepath = get_W3_VOICE_PATH(bpy.context) #r"\w3.modding\radish-tools\docs.speech\enpc.w3speech-extracted_GOOD\enpc.w3speech-extracted"
-        
+
         row = self.layout.row()
         op = row.operator(ButtonOperatorImportW2Anims.bl_idname, text="Import Set (.w2anims)", icon='SPHERE')
         op.filepath = os.path.join(get_uncook_path(context),"animations\\")
-        
+
         # row = self.layout.row()
         # op = row.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Import CS (.w2cutscene)", icon='SPHERE')
         # op.filepath = os.path.join(get_uncook_path(context),"animations\\")
-        
+
         box = self.layout.box()
         row = box.row()
         #row.alignment = "CENTER"
-        
+
         col = row.column(align=True)
         col.template_list("TOOL_UL_List", "The_List", object,
                             "demo_list", object, "list_index")
-        
+
         col = row.column()
         # col.operator("tool.list_add", text="", icon="ADD")
         # col.operator("tool.list_remove", text="", icon="REMOVE")
@@ -449,6 +497,7 @@ class WITCH_OT_import_w3_fbx(Operator, ImportHelper):
 #
 classes = [
     ButtonOperatorImportW2Anims,
+    ButtonOperatorImportVoice,
     ButtonOperatorImportW2cutscene,
     ListItem,
     TOOL_UL_List,
@@ -482,6 +531,6 @@ def unregister():
     #del bpy.types.Scene.anim_export_name
     for c in classes:
         bpy.utils.unregister_class(c)
-        
+
 if __name__ == '__main__':
     register()
