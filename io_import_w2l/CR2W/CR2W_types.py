@@ -1,19 +1,24 @@
 import csv
 import functools
 import os
-from pathlib import Path
+import base64
 import time
-from CR2W.Types.CMesh import CMesh
+import numpy as np
+from pathlib import Path
+from enum import Enum
+from typing import List
 
-from CR2W.Types.VariousTypes import CNAME, NAME, CBufferVLQInt32, CColor
-
+from .Types.CMesh import CMesh
+from .Types.VariousTypes import CPaddedBuffer, CNAME, CNAME_INDEX, CMatrix4x4, NAME, CBufferVLQInt32, CColor
+from .json_convert.CR2WJsonObject import CR2WJsonData, CR2WJsonChunkMap, CR2WJsonMap, CR2WJsonScalar, CR2WJsonArray
+from .W3Strings import LoadStringsManager
 from .bStream import *
 from .setup_logging import *
 from .witcher_cache import bundle
 log = logging.getLogger(__name__)
 
-from CR2W.CR2W_helpers import Enums
-from CR2W.TypeList import get_vectors
+from .CR2W_helpers import Enums
+from .TypeList import get_vectors
 from .bin_helpers import (
                         ReadBit6,
                         ReadFloat16,
@@ -54,7 +59,25 @@ Entity_Type_List = ["CEntity",
                     "CActor",
                     "CNewNPC",
                     "W3PlayerWitcher",
-                    "W3ReplacerCiri"]
+                    "W3ReplacerCiri",
+                    "CCamera"]
+
+v_types = [
+    'String',
+    'Float',
+    'Bool',
+    'Uint32',
+    'Uint16',
+    'Uint8'
+]
+IREDPrimitive = [
+    'CString',
+    'CFloat',
+    'CBool',
+    'CUInt32',
+    'CUInt16',
+    'CUInt8'
+]
 
 
 def detectedProp(f, CR2WFILE, offset ):
@@ -97,14 +120,26 @@ def getClass(f, CR2WFILE, self, idx):
             log.warning("WARANING: -128")
         else:
             log.warning("WARANING: Found not zero for class")
-    return CLASS(f, CR2WFILE, self, idx)
+    return W_CLASS(f, CR2WFILE, self, idx)
 
 class DATA:
-    def __init__(self, f, CR2WFILE, anim_name):
+    def __init__(self, f = None, CR2WFILE = None, anim_name = None, **kwargs):
         self.exports=[]
         self.sizes=[]
         self.CHUNKS=[]
         self.animCount = 0
+
+        if f:
+            self.Read(f, CR2WFILE, anim_name)
+        else:
+            self.Create(kwargs)
+    def Create(self, args):
+        pass
+
+    def Write(self):
+        raise NotImplementedError('')
+
+    def Read(self, f, CR2WFILE, anim_name):
         for i in range(0, CR2WFILE.CR2WTable[4].itemCount):
             # exports[idx] = CR2WFILE.CR2WExport[idx].dataOffset + 1 + start;
             # sizes[idx] = CR2WFILE.CR2WExport[idx].dataSize;
@@ -123,12 +158,12 @@ class DATA:
                     log.warning("WARANING: -128")
                 else:
                     log.warning("WARANING: Found not zero for class")
-            #self.Class = CLASS(f, CR2WFILE, self)
+            #self.Class = W_CLASS(f, CR2WFILE, self)
             start_time = time.time()
-            self.CHUNKS.append(CLASS(f, CR2WFILE, self, i))
+            self.CHUNKS.append(W_CLASS(f, CR2WFILE, self, i))
             time_taken = time.time() - start_time
             log.debug('%i Read Chunk %s in %f seconds.',i, self.CHUNKS[-1].name, time.time() - start_time)
-            
+
             if anim_name: #"w2anims" in CR2WFILE.fileName:
                 animations = self.CHUNKS[0].GetVariableByName('animations').value
                 for set_entry_idx in animations:
@@ -158,7 +193,7 @@ class DATA:
             if time_taken > 0.3:
                 log.warn("Time taken more than 0.3")
             #log.debug(' Read Chunk in %f seconds.', time.time() - start_time)
-        
+
 
 class STRINGINDEX:
     def __init__(self, f, CR2WFILE, parent):
@@ -222,6 +257,13 @@ class PROPSTART:
                 self.name = CR2WFILE.CNAMES[self.strIdx.Index].name.value; #string
                 self.type = CR2WFILE.CNAMES[self.dataType.Index].name.value; #string
 
+                if CR2WFILE.HEADER.version <= 115:
+                    unk = readInt16(f)
+                    if unk != -1:
+                        self.type = CR2WFILE.CNAMES[unk].name.value; #string #!
+                        #f.seek(-2, os.SEEK_CUR)
+                        #raise Exception("W2 PROPSTART")
+
                 if ("rRef:" in self.type and (readU32Check(f.tell()-8) == 10)):
                     self.size = 2; #local int
                 elif (f.tell() + 4 < FileSize(f) and readU32Check(f, f.tell()) < FileSize(f) - f.tell() + 2):
@@ -239,7 +281,7 @@ class PROPSTART:
                 self.type = None
         except Exception as e:
             raise e
-            
+
 
 def sizeof(sizeof): #TODO FIX
     return sizeof
@@ -261,9 +303,13 @@ def CDate2String(value):
     return dt;
 
 class CDATETIME:
-    def __init__(self, f):
-        self.Value = readU64(f) #uint64;
-        self.String = CDate2String(self.Value) #local string String = CDate2String(Value);
+    def __init__(self, f = None, **kwargs):
+        if f and not kwargs:
+            self.Value = readU64(f) #uint64;
+            self.String = CDate2String(self.Value) #local string String = CDate2String(Value);
+        else:
+            self.Value:np.uint64 = kwargs['Value']
+            self.String = kwargs['String']
 
 class STRINGANSI:
     def __init__(self, f):
@@ -276,7 +322,7 @@ class STRINGANSI:
 
         if (self.isUTF):
             self.String = f.read(len).decode('utf-16')
-            
+
         else:
             self.String = f.read(len).decode('utf-8')
             self.String = self.String.replace("\x00", "") #remove \x00
@@ -284,58 +330,54 @@ class STRINGANSI:
         return self.String
 
 
-
 class LocalizedString(object):
     """docstring for LocalizedString."""
     def __init__(self):
         self.val = 0
+        self.text = ''
     def Read(self, f, CR2WFILE):
         self.val = str(readU32(f)) #! temp
+        self._get_text()
         return self
+    def _get_text(self):
+        string_manager = LoadStringsManager()
+        self.text = string_manager.GetString(int(self.val))
+        return self.text
 
 class STRING:
-    def __init__(self, f):
+    def __init__(self, f = None, **kwargs):
+        if f and not kwargs:
+            self.Read(f)
+        else:
+            self.Create(kwargs)
+
+    def Create(self, args):
+        self.isUTF = False
+        self.String = ''
+        for arg in args.items():
+            setattr(self, arg[0], arg[1])
+
+    def Read(self, f):
         startofString = f.tell()
         strLen = readUChar(f) #uchar
         len = strLen
         actualLen = 0 #local uint
         flag = 0 #local uint
-        maxSize = 0; #local uint
-        #extraLength = readUChar(f) #uchar
+        maxSize = 0 #local uint
         self.isUTF = False
-        #f.seek(-1, 1) # FSkip(-1);
         if(strLen >= 128): #128??
             len = len - 128
             if (len >= 64):
                 len = len - 64
                 len = readUChar(f)*64 + len
-            self.String = f.read(len).decode('utf-8')#getStringOfLen(f, len)
-            #skipPadding(f)
-            # if (strLen >= 192):
-            #     f.seek(1,1); flag = 1;
-            #     actualLen = (strLen - 128) + 64 * (extraLength-1);
-            # else:
-            #     actualLen = strLen - 128;
-            # if(actualLen > 0):
-            #     self.String = getStringOfLen(f, actualLen)
-            #     # self.String = []
-            #     # for _ in range(0, actualLen):
-            #     #     self.String.append(readUChar(f)) #char String[actualLen]
-            #skipPadding(f)
-            # maxSize = f.tell() - startofString;
-            # f.seek(startofString + actualLen);
+            self.String = f.read(len).decode('utf-8')
         else:
-            self.isUTF = True;
-
+            self.isUTF = True
             if (len >= 64):
                 len = len - 64
                 len = readUChar(f)*64 + len
             len = len*2
             self.String = f.read(len).decode('utf-16')
-            
-            # self.String = getStringOfLen(f, strLen)
-            # self.String = self.String[0:-1] #remove \x00
-            #skipPadding(f)
             log.warning("Invalid length for string at %u\n", f.tell());
     def ToString(self):
         return self.String
@@ -421,7 +463,7 @@ class ELEMENT:
 class Cr2wResourceManager:
     resourceManager = None
     def __init__(self):
-        
+
         fileDir = os.path.dirname(os.path.realpath(__file__))
         fileDir = os.path.join(fileDir, "witcher_cache")
         filename = os.path.join(fileDir, "pathhashes.csv")
@@ -431,7 +473,7 @@ class Cr2wResourceManager:
         self.pathashespath = filename
         #self.HashdumpDict = {}
         reader = csv.DictReader(open(self.pathashespath))
-        
+
         self.HashdumpDict = {}
         for row in reader:
             self.HashdumpDict[row["HashInt"]] = row["Path"]
@@ -472,7 +514,7 @@ class CSectorDataObject:
         # self.positionZ = readFloat(f) #CFloat
         if self.type == 0:
             log.debug("found invalid")
-            
+
 class SBlockDataCollisionObject:
     def __init__(self, f, size= None, packedObjectType= None):
         self.meshIndex = readUShort(f) #CUInt16
@@ -511,15 +553,15 @@ class SBlockDataRigidBody:
         self.shadowBias = readUByte(f) # CUInt8
         self.renderingPlane = readUByte(f) # CUInt8
 
-        self.linearDamping = readFloat(f) #CFloat 
-        self.angularDamping = readFloat(f) #CFloat 
-        self.linearVelocityClamp = readFloat(f) #CFloat 
-        self.collisionMask = readU64(f) #CUInt64 
-        self.collisionGroup = readU64(f) #CUInt64 
-        self.motionType = readUByte(f) #CUInt8 
-        self.padd1 = readUByte(f) #CUInt8 
-        self.padd2 = readUByte(f) #CUInt8 
-        self.padd3 = readUByte(f) #CUInt8 
+        self.linearDamping = readFloat(f) #CFloat
+        self.angularDamping = readFloat(f) #CFloat
+        self.linearVelocityClamp = readFloat(f) #CFloat
+        self.collisionMask = readU64(f) #CUInt64
+        self.collisionGroup = readU64(f) #CUInt64
+        self.motionType = readUByte(f) #CUInt8
+        self.padd1 = readUByte(f) #CUInt8
+        self.padd2 = readUByte(f) #CUInt8
+        self.padd3 = readUByte(f) #CUInt8
 
 class SBlockDataPointLight(object):
     """docstring for SBlockDataPointLight."""
@@ -538,7 +580,7 @@ class SBlockDataPointLight(object):
         self.envColorGroup = None #CUInt8
         self.padding = None #CUInt8
         self.lightUsageMask = None #CUInt32
-    
+
     def Read(self, f):
         self.color = CColor().Read(f) #readU32(f) #CUInt32
         self.radius = readFloat(f) #CFloat
@@ -635,7 +677,7 @@ class SBlockData:
         self.flags = readUShort(f) #CUInt16
         self.occlusionSystemID = readU32(f) #CUInt32
         self.packedObjectType = packedObjectType
-            
+
 
         if packedObjectType == Enums.BlockDataObjectType.Mesh:
             self.packedObject = SBlockDataMeshObject(f)
@@ -719,15 +761,48 @@ class HANDLE:
             return self.DepotPath
         else:
             return self
+
     def GetRef(self, CHUNKS):
         return CHUNKS[self.Reference]
-    def __init__(self, f, CR2WFILE, parent):
+
+    def __init__(self, f = None, CR2WFILE = None, parent = None, **kwargs):
+        self.ChunkHandle = False
+        self.Reference = None
+        self.val = None # Int32
+        self.DepotPath = None
+        self.ClassName = None
+        self.Flags = None
+        self.theType = None
+        self.Index = None
+        if f and not kwargs:
+            self.Read(f, CR2WFILE, parent)
+        else:
+            self.__CR2WFILE = CR2WFILE
+            self.Create(kwargs)
+
+    def Create(self, args):
+        for arg in args.items():
+            setattr(self, arg[0], arg[1])
+        if self.ChunkHandle == True:
+            currentchun = len(self.__CR2WFILE.CHUNKS.CHUNKS)
+            if not hasattr(self.__CR2WFILE, 'childrendict'):
+                self.__CR2WFILE.childrendict = {}
+            if currentchun not in self.__CR2WFILE.childrendict:
+                self.__CR2WFILE.childrendict[currentchun] = []
+            self.__CR2WFILE.childrendict[currentchun].append(self.Reference)
+
+    def Read(self, f, CR2WFILE, parent):
         self.ChunkHandle = False
         self.Reference = None
         self.val = readInt32(f) # Int32
         self.DepotPath = None
         self.ClassName = None
         self.Flags = None
+        if hasattr(parent, 'theType'):
+            self.theType = 'handle:'+parent.theType.split(':')[-1]
+        else:
+            self.theType = 'handle:'+parent.Type
+        self.Index = None
         val = self.val
 
         if (val >= 0):
@@ -755,7 +830,7 @@ class CByteArray:
     def __init__(self, f):
         self.arraysize = readU32(f)
         self.Bytes = f.read(self.arraysize)
-        
+
 
 class CByteArray2(object):
     """docstring for CByteArray2."""
@@ -787,7 +862,7 @@ class SFoliageInstanceData:
         return self
 
 class EngineTransform:
-    def __init__(self, f):
+    def __init__(self, f = None, **kwargs):
         self.X = 0.0
         self.Y = 0.0
         self.Z = 0.0
@@ -797,7 +872,10 @@ class EngineTransform:
         self.Scale_x = 1.0
         self.Scale_y = 1.0
         self.Scale_z = 1.0
+        if f:
+            self.Read(f)
 
+    def Read(self, f):
         flags = readSByte(f)
 
         if ((flags & 1) == 1):
@@ -814,6 +892,12 @@ class EngineTransform:
             self.Scale_x = readFloat(f)
             self.Scale_y = readFloat(f)
             self.Scale_z = readFloat(f)
+    @classmethod
+    def from_json(cls, **kwargs):
+        t = cls()
+        for name, val in kwargs.items():
+            setattr(t, name, val)
+        return t
 
 class CEngineQsTransform:
     def __init__(self, f):
@@ -924,7 +1008,25 @@ class PROPERTY:
                 return item
         return None
 
-    def __init__(self, f, CR2WFILE, parent, no_name = False, custom_propstart=False):
+    def __init__(self, f = None, CR2WFILE = None, parent = None, no_name = False, custom_propstart=False, **kwargs):
+        self.Type = None #<CR2W.CR2W_types.PROPSTART>
+        self.theName = None #'importFile'
+        self.theType = None #'String'
+
+        if f and not kwargs:
+            self.Read(f, CR2WFILE, parent, no_name, custom_propstart)
+        else:
+            self.__CR2WFILE = CR2WFILE
+            self.Create(kwargs)
+
+    def Create(self, args):
+        for arg in args.items():
+            setattr(self, arg[0], arg[1])
+
+    def Write(self, f):
+        raise NotImplementedError('No Prop Writing')
+
+    def Read(self, f = None, CR2WFILE = None, parent = None, no_name = False, custom_propstart=False):
         if custom_propstart:
             Type = custom_propstart
         else:
@@ -936,7 +1038,7 @@ class PROPERTY:
             self.Type = None
             return None
         strartofthis = f.tell()
-        
+
         dataEnd = f.tell() + Type.size - 4 #local uint64
         count = 1 #local uint64
         theType = Type.type
@@ -952,51 +1054,9 @@ class PROPERTY:
         self.dataEnd = dataEnd
         self.classEnd = parent.classEnd
 
-        # if self.theName == "bones":
-        #     log.debug("bones hit")
-        # if self.theName == "data":
-        #     log.debug("data hit")
-        # if self.theName == "parentIndices":
-        #     log.debug("parentIndices")
-        # if self.theName == "mimicPoses":
-        #     log.debug("mimicPoses")
-        # if self.theName == "animations":
-        #     log.debug("animations")
-        # if self.theName == "cookedMipStackHeight":
-        #     log.debug("cookedMipStackHeight")
-        # if self.theName == "streamingDataBuffer":
-        #     log.debug("streamingDataBuffer")
-        # if self.theName == "tags":
-        #     log.debug("tags")
-        # if self.theName == "containers":
-        #     log.debug("containers")
-        # if self.theName == "apexMaterialNames":
-        #     log.debug("apexMaterialNames")
-        # if self.theName == "Diffuse":
-        #     log.debug("Diffuse")
-        # if self.theName == "appearances":
-        #     log.debug("appearances")
-        # if self.theName == "ParentSlotName":
-        #     log.debug("ParentSlotName")
-        # if self.theName == "animations":
-        #     log.debug("animations")
-        # if theType == "array:2,0,SMeshChunkPacked":
-        #     log.debug("SMeshChunkPacked Arr")
-        # if theType == "EMeshChunkRenderMask":
-        #     log.debug("EMeshChunkRenderMask")
+        if theType == "array:2,0,CGUID":
+            log.debug("array:2,0,CGUID")
 
-        # if "aterial" in Type.type:
-        #     log.debug("aterial")
-        # log.debug(Type.type, f.tell())
-        # if self.classEnd == 13009453:
-        #     log.debug("classend prob")
-        
-        # if "ESkeletalAnimationType" in Type.type:
-        #     log.debug("ESkeletalAnimationType")
-        
-            
-        #detect array type:
-        
         More = []
         #? to make the animation list load faster save reading the bones until needed
         #if ("array:129,0,SAnimationBufferBitwiseCompressedBoneTrack" == Type.type):
@@ -1046,7 +1106,14 @@ class PROPERTY:
             f.seek(2,1)
             #f.seek(dataEnd)
             return
+        elif (theType == "array:2,0,CGUID"):
+            self.Count = readU32(f)
+            for _ in range(0, self.Count):
+                More.append(CGUID().Read(f))
+            self.More = More
+            f.seek(dataEnd)
         elif (theType == "CGUID"):
+            self.GUID = CGUID().Read(f)
             f.seek(dataEnd)
         elif ("array" in theType or "static:" in theType or "curveData" in theType or "]" in theType):
             if (":" in theType):
@@ -1070,37 +1137,13 @@ class PROPERTY:
             pass
         elif ("handle" in Type.type): #//sub-class sorting
             if (doesExist(Type.type, "]")):
-                f.seek(8,1)#FSkip(8);
-                count = (int)((strartofthis + Type.size + 4 - f.tell()) / 4);
-            #iTemp, jTemp, zTemp, kTemp, val = i, j, z, k, 0; # local uint64 hidden
+                f.seek(8,1)
+                count = (int)((strartofthis + Type.size + 4 - f.tell()) / 4)
             self.Handles = []
             startofHandles = f.tell()
-            # struct {
-            #     HANDLE Handle[count];
-            # } Handles;
             for _ in range(0, count):
                 self.Handles.append(HANDLE(f,CR2WFILE, self))
             f.seek(startofHandles); # FSeek(startof(Handles));
-
-            # handleIdx = 0; #local uint
-            # for j in range(0, count): #for (j=0; j < count; j++) {
-            #     val = 0;
-            #     if (readU32Check(f,f.tell())-1 > -1 and exists(CR2WFILE, "CR2WExport[readU32Check(f,f.tell())-1].name)")):
-            #         val = readU32Check(f,f.tell())-1;
-            #     elif (readUShortCheck(f, f.tell())-1 > -1 and exists(CR2WFILE, "CR2WExport[readUShortCheck(f, f.tell())-1].name")):
-            #         val = readUShortCheck(f, f.tell())-1;
-            #     if (readU32Check(f,f.tell()) != 0 and sortByHandle and CR2WFILE.exports[val] != -1):
-            #         Handle = HANDLE(f,CR2WFILE, self);
-            #         f.seek(-4,1)#FSkip(-4);
-            #         if (Handle[handleIdx].Index > 0 and Handle[handleIdx].Index < CR2WFILE.CR2WTable[4].itemCount):
-            #             iTemp = i, jTemp = j, zTemp = z, kTemp = k, i = Handle[handleIdx].Index - 1;
-            #             Class = CLASS(f,CR2WFILE, self) #struct CLASS Class <size=SizeCLASS>;
-            #             CR2WFILE.exports2[Handle[handleIdx].Index - 1] = 0;
-            #             i = iTemp, j = jTemp, k = kTemp, z = zTemp;
-            #         handleIdx += 1;
-            #     else:
-            #         Handle = HANDLE(f,CR2WFILE, self);
-            #     f.seek(Handle[j].startof + 4)#FSeek(startof(Handle[j]) + 4);
         elif (Type.type == "array:String" or Type.type == "array:2,0,String"):
                 self.elements = []
                 for _ in range(0,count):
@@ -1112,6 +1155,7 @@ class PROPERTY:
         elif ("String" in Type.type or theType == "NodeRef"):
             if (theType == "LocalizedString"):
                 self.String = LocalizedString().Read(f,CR2WFILE)
+                CR2WFILE.LocalizedStrings.append(self.String)
                 #self.Hash=readU64(f); #uint64
             else:
                 self.String = STRING(f)
@@ -1349,9 +1393,6 @@ class PROPERTY:
                             break
                 else:
                     f.seek(1,1)
-
-
-
         #f.seek(dataEnd,1)
 
 class CQuaternion:
@@ -1384,13 +1425,32 @@ class CCompressedBuffer:
         for _ in range(0, m_count):
             self.rigData.append(SSkeletonRigData(f))
 
+import uuid
+
 class CGUID(object):
     """docstring for CGUID."""
     def __init__(self):
         super(CGUID, self).__init__()
-        self.guid = bytearray(16)
+        self._guid = bytearray(16)
+    @property
+    def GuidString(self):
+        return str(self)
+    @GuidString.setter
+    def GuidString(self, value):
+        try:
+            g = uuid.UUID(bytes_le=value)
+            self._guid = g.bytes
+        except ValueError:
+            pass
     def Read(self, f: bStream):
-        self.guid = f.read(16)
+        self._guid = f.read(16)
+        return self
+    def __str__(self):
+        if self._guid is not None and len(self._guid) > 0:
+            return str(uuid.UUID(bytes_le=self._guid))
+        else:
+            self._guid = uuid.uuid4().bytes
+            return str(self)
 
 class SEntityBufferType1():
     def __init__(self, CR2WFILE, BufferV1, idx):
@@ -1402,7 +1462,7 @@ class SEntityBufferType1():
         if self.ComponentName.Index != 0:
             return True
         return False
-            
+
     def Read(self, f, size = 0):
         if self.ComponentName.Index:
             self.Guid.Read(f)
@@ -1462,11 +1522,9 @@ class SFoliageResourceData():
         self.TreeType = HANDLE(f, self.CR2WFILE, self) # CSRTBaseTree Class
         self.TreeCollection = CBufferVLQInt32(self.CR2WFILE, SFoliageInstanceData)
         self.TreeCollection.Read(f, 0)
-        print("CAke")
-        
+
         #CBufferVLQInt32<SFoliageInstanceData> TreeCollection { get; set; }
 
-#33369
 class CVariable:
     """docstring for CVariable."""
     def __init__(self, CR2WFILE):
@@ -1493,20 +1551,19 @@ class CVariable:
         elif (bytesread < size):
             pass
 
-
 class SMeshChunkPacked():
     def __init__(self, CR2WFILE):
         self.CR2WFILE = CR2WFILE
         self.PROP = False
-		# [Ordinal(1)] [RED("vertexType")] 		public CEnum<EMeshVertexType> VertexType { get; set;}
-		# [Ordinal(2)] [RED("materialID")] 		public CUInt32 MaterialID { get; set;}
-		# [Ordinal(3)] [RED("numBonesPerVertex")] 		public CUInt8 NumBonesPerVertex { get; set;}
-		# [Ordinal(4)] [RED("numVertices")] 		public CUInt32 NumVertices { get; set;}
-		# [Ordinal(5)] [RED("numIndices")] 		public CUInt32 NumIndices { get; set;}
-		# [Ordinal(6)] [RED("firstVertex")] 		public CUInt32 FirstVertex { get; set;}
-		# [Ordinal(7)] [RED("firstIndex")] 		public CUInt32 FirstIndex { get; set;}
-		# [Ordinal(8)] [RED("renderMask")] 		public CEnum<EMeshChunkRenderMask> RenderMask { get; set;}
-		# [Ordinal(9)] [RED("useForShadowmesh")] 		public CBool UseForShadowmesh { get; set;}
+		# CEnum<EMeshVertexType> VertexType
+		# CUInt32 MaterialID
+		# CUInt8 NumBonesPerVertex
+		# CUInt32 NumVertices
+		# CUInt32 NumIndices
+		# CUInt32 FirstVertex
+		# CUInt32 FirstIndex
+		# CEnum<EMeshChunkRenderMask> RenderMask
+		# CBool UseForShadowmesh
     def Read(self, f, size):
         self.startpos = f.tell()
         self.classEnd = None
@@ -1520,33 +1577,13 @@ class SMeshChunkPacked():
             if prop.Type == None:
                 break
             self.MoreProps.append(prop)
-            
-            # nameId = readUShort(f)
-            # typeId = readUShort(f)
-            # typename = self.CR2WFILE.CNAMES[typeId].name.value
-            # varname = self.CR2WFILE.CNAMES[nameId].name.value
-            # sizepos = f.tell()
-            # varsize = readU32(f)
-
-            # propstart = PROPSTART_BLANK()
-            # propstart.size = varsize
-            # propstart.name = varname
-            # propstart.type = typename
-            # self.PROP = PROPERTY(f, self.CR2WFILE, self, False, propstart)
-            
-            # afterVarPos = f.tell()
-            # bytesleft = varsize - (afterVarPos - sizepos)
         self.endpos = f.tell()
         bytesread = self.endpos - self.startpos
         if (bytesread > size):
-            # parsed to far: possible file corruption
-            # BUT: this check is impossible for elements of an array.
-            # in this case, passed size is 0, so we can check for that
             if (size != 0):
                 print("Read bytes not equal to expected bytes. Difference: {bytesread - size}")
         elif (bytesread < size):
             pass
-            # parsed too few bytes: add to unknown bytes later
 
         # create a type manager for each value in SMeshChunkPacked
         # create class for each type
@@ -1554,9 +1591,9 @@ class SMeshChunkPacked():
         #self.PROP = PROPERTY(f, self.CR2WFILE, self)
 
 class CVariantSizeNameType():
-    def __init__(self, CR2WFILE):
-        self.CR2WFILE = CR2WFILE
-        self.PROP = False
+    def __init__(self, __CR2WFILE, PROP = None):
+        self.__CR2WFILE = __CR2WFILE
+        self.PROP = PROP
     def Read(self, f, size):
         varsize = readU32(f)#file.ReadUInt32();
         self.classEnd = varsize
@@ -1568,30 +1605,48 @@ class CVariantSizeNameType():
         if (nameId == 0):
             return
 
-        typename = self.CR2WFILE.CNAMES[typeId].name.value
-        varname = self.CR2WFILE.CNAMES[nameId].name.value
+        typename = self.__CR2WFILE.CNAMES[typeId].name.value
+        varname = self.__CR2WFILE.CNAMES[nameId].name.value
         propstart = PROPSTART_BLANK()
         propstart.size = varsize
         propstart.name = varname
         propstart.type = typename
-        self.PROP = PROPERTY(br, self.CR2WFILE, self, False, propstart)
+        self.PROP = PROPERTY(br, self.__CR2WFILE, self, False, propstart)
+
+class CVariantSizeType():
+    def __init__(self, __CR2WFILE):
+        self.__CR2WFILE = __CR2WFILE
+        self.PROP = False
+    def Read(self, f, size):
+        varsize = readU32(f)#file.ReadUInt32();
+        self.classEnd = varsize
+        buffer = f.read(varsize - 4)#file.ReadBytes((int)varsize - 4);
+        br = bStream(data = bytearray(buffer))
+        typeId = readUShort(br)
+
+
+        typename = self.__CR2WFILE.CNAMES[typeId].name.value
+        propstart = PROPSTART_BLANK()
+        propstart.size = varsize
+        propstart.type = typename
+        self.PROP = PROPERTY(br, self.__CR2WFILE, self, False, propstart)
 
 class CArray():
-    def __init__(self, CR2WFILE, array_type):
+    def __init__(self, __CR2WFILE, array_type):
         self.array_type = array_type
-        self.CR2WFILE = CR2WFILE
+        self.__CR2WFILE = __CR2WFILE
         self.elements = []
     def Read(self, f, size):
         elementcount = readU32(f)
         for _ in range(0, elementcount):
-            element = self.array_type(self.CR2WFILE)
+            element = self.array_type(self.__CR2WFILE)
             element.Read(f, 0)
             self.elements.append(element)
 
 class CMaterialInstance():
-    def __init__(self, CR2WFILE):
-        self.CR2WFILE = CR2WFILE
-        self.InstanceParameters = CArray(CR2WFILE, CVariantSizeNameType) #new CBufferUInt32<CVariantSizeTypeName>(cr2w, this, nameof(variables)) { IsSerialized = true };
+    def __init__(self, __CR2WFILE):
+        self.__CR2WFILE = __CR2WFILE
+        self.InstanceParameters = CArray(__CR2WFILE, CVariantSizeNameType) #new CBufferUInt32<CVariantSizeTypeName>(cr2w, this, nameof(variables)) { IsSerialized = true };
     def Read(self, f, size = 0):
         self.InstanceParameters.Read(f, size)
 
@@ -1633,14 +1688,29 @@ class CLayerGroup(object):
 
 
 
-class CLASS:
+class W_CLASS:
     def GetVariableByName(self, str):
         for item in self.PROPS:
             if item.theName == str:
                 return item
         return None
 
-    def __init__(self, f, CR2WFILE, parent, idx = False):
+    def __init__(self, f = None, CR2WFILE = None, parent = None, idx = False, **kwargs):
+        self.PROPS:list = [],
+        self.Type:str = '',
+        self.name:str = ''
+        self.ChunkIndex:int = idx
+        self.__CR2WFILE = CR2WFILE
+        if f and not kwargs:
+            self.Read(f, CR2WFILE, parent, idx)
+        else:
+            self.Create(kwargs)
+
+    def Create(self, args):
+        for arg in args.items():
+            setattr(self, arg[0], arg[1])
+
+    def Read(self, f, CR2WFILE, parent, idx = False):
         if hasattr(parent, 'Handle'):
             idx = readU32Check(f.tell()) -1 #idx = ReadUInt(FTell()) - 1;
             f.seek(parent.exports[idx])#FSeek(CR2WFile[level].exports[idx]);
@@ -1664,7 +1734,27 @@ class CLASS:
         # if self.name == "CHardAttachment":
         #     log.debug("CHardAttachment")
         tempClass  = parent.currentClass; # local string
-        if currentClass == "CMesh":
+
+        if CR2WFILE.HEADER.version <= 115: #? WITCHER 2
+            startofthis -=1
+            self.classEnd -=1
+            f.seek(-1, os.SEEK_CUR)
+            while True:
+                prop = PROPERTY(f, CR2WFILE, self)
+                if prop.Type == None:
+                    break
+                self.PROPS.append(prop)
+                # if prop.theName == 'importFileTimeStamp' and self.Type == 'CSkeletalAnimation':
+                #     ckae = f.tell()
+        elif currentClass == "CStorySceneSection":
+            while True:
+                prop = PROPERTY(f, CR2WFILE, self)
+                if prop.Type == None:
+                    break
+                self.PROPS.append(prop)
+            self.sceneEventElements = CArray(CR2WFILE, CVariantSizeType)
+            self.sceneEventElements.Read(f, 0)
+        elif currentClass == "CMesh":
             while True:
                 prop = PROPERTY(f, CR2WFILE, self)
                 if prop.Type == None:
@@ -1674,6 +1764,15 @@ class CLASS:
             #REDBuffers
             self.CMesh = CMesh(CR2WFILE)
             self.CMesh.Read(f, 0)
+        elif self.name == "CMaterialInstance":
+            while True:
+                prop = PROPERTY(f, CR2WFILE, self)
+                if prop.Type == None:
+                    break
+                self.PROPS.append(prop)
+            MyMaterialInstance = CMaterialInstance(CR2WFILE)
+            MyMaterialInstance.Read(f)
+            self.CMaterialInstance = MyMaterialInstance
         elif currentClass == "CLayerGroup":
             while True:
                 prop = PROPERTY(f, CR2WFILE, self)
@@ -1686,28 +1785,26 @@ class CLASS:
             self.worldHandle = HANDLE(f, CR2WFILE, self)
             self.layergrouphandle = HANDLE(f, CR2WFILE, self)
 
-
             # self.ChildrenGroups = CBufferVLQInt32(CR2WFILE, HANDLE)
             # self.ChildrenGroups.Read(f, 0)
             # self.ChildrenInfos = CBufferVLQInt32(CR2WFILE, HANDLE)
             # self.ChildrenInfos.Read(f, 0)
-            
+
             count = ReadVLQInt32(f)
             self.ChildrenGroups = []
             for _ in range(0, count):
                 self.ChildrenGroups.append(HANDLE(f, CR2WFILE, self))
                 if self.ChildrenGroups[-1].Reference > 100000:
-                    print("cake")
+                    pass
 
             count = ReadVLQInt32(f)
             self.ChildrenInfos = []
             for _ in range(0, count):
                 self.ChildrenInfos.append(HANDLE(f, CR2WFILE, self))
                 if self.ChildrenInfos[-1].Reference > 100000:
-                    cake1 = readInt32(f)
-                    cake2 = readInt32(f)
-                    cake3 = readInt32(f)
-                    print("cake")
+                    int1 = readInt32(f)
+                    int2 = readInt32(f)
+                    int3 = readInt32(f)
 
             #group = CLayerGroup()
             f.seek(self.classEnd)
@@ -1722,7 +1819,7 @@ class CLASS:
                 self.PROPS.append(prop)
             self.ParentGroup = HANDLE(f, CR2WFILE, self)
             if self.ParentGroup.Reference > 100000:
-                print("cake")
+                print("ParentGroup.Reference > 100000")
             f.seek(self.classEnd)
         elif (CR2WFILE.CR2WExport[idx].dataSize == 5 and readUShortCheck(f.tell()+2) < CR2WFILE.CR2WTable[1].itemCount):
             f.seek(startofthis + 2)#FSeek(startof(this) + 2);
@@ -1730,38 +1827,19 @@ class CLASS:
         elif (CR2WFILE.CR2WExport[idx].dataSize > 3):
             dataEnd = f.tell() + CR2WFILE.CR2WExport[idx].dataSize; #local uint64
             idxTotals = 0; #local int
-            cake = []
-            cakeEnd = []
             while (f.tell() < self.classEnd-1 and f.tell() + 4 < FileSize(f) and readU32Check(f, f.tell()) != 1462915651):
                 if (detectedProp(f, CR2WFILE, f.tell()) and f.tell()+4 < self.classEnd):
-                    cake.append(f.tell())
-                    if self.propCount == 1:
-                        cak6547e = "fwa"
                     start_time = time.time()
                     self.PROPS.append(PROPERTY(f, CR2WFILE, self))
                     time_taken = time.time() - start_time
                     log.debug(' Read PROP in %f seconds.', time.time() - start_time)
                     if time_taken > 0.3:
-                        log.critical("cake")
-                    cakeEnd.append(f.tell())
+                        log.warn("time_taken > 0.3")
                     if self.PROPS[-1].dataEnd != f.tell():
                         log.warning(r'dataEnd was not correct '+self.name)
                         f.seek(self.PROPS[-1].dataEnd) # TODO NEEDS MORE TESTING
-                    if len(self.PROPS) == 16 and currentClass == "CClipMap":
-                        log.critical("cake")
-                        
-                    # setColor();
-                    # PROPERTY Property;
-                    # if (exists(Property.Type) && title == "") {
-                    #     if (Property.Type.name == "id" || endsWith(Property.Type.name, "Id") || endsWith(Property.Type.type, "Id")) {
-                    #         if (exists(Property.Value))
-                    #             SPrintf(title, "%s = %Ld", Property.Type.name, Property.Value);
-                    #         else if (exists(Property.More[0].Value))
-                    #             SPrintf(title, "%s = %Ld", Property.Type.name, Property.More[0].Value);
-                    #     } else if (doesExist(Property.Type.type, "Ref") && exists(Property.Path)) {
-                    #         title = Property.Path.Path;
-                    #     }
-                    # }
+                    # if len(self.PROPS) == 16 and currentClass == "CClipMap":
+                    #     log.critical("CClipMap")
                     self.propCount+=1
                 else:
                     if self.name in Entity_Type_List:
@@ -1866,13 +1944,13 @@ class CLASS:
 
                         pos = f.tell()
                         self.blocksize = ReadVLQInt32(f)
-                        
+
                         # #BLOCKDATA
                         self.BlockData = []
                         idx = 0
                         for curobj in self.Objects:
                             curoffset = curobj.offset
-                            leng = 0 #ulong 
+                            leng = 0 #ulong
                             if (idx < len(self.Objects) - 1):
                                 nextobj = self.Objects[idx + 1]
                                 nextoffset = nextobj.offset; #ulong
@@ -1886,7 +1964,7 @@ class CLASS:
 
                         f.seek(self.classEnd)
                     elif self.name == "CGameWorld":
-                        f.seek(2,1)
+                        f.seek(2,1) # this reads zero "type" at the end of normal PROPS
                         self.Firstlayer = HANDLE(f, CR2WFILE, self)
                     elif self.name == "CLayerGroup":
                         #f.seek(2,1);
@@ -1910,11 +1988,6 @@ class CLASS:
                         bytesread = endpos - startofthis
                         self.ParentGroup = HANDLE(f, CR2WFILE, self)
                         f.seek(self.classEnd)
-                    elif self.name == "CMaterialInstance":
-                        f.seek(2,1); #TODO what is this skip?
-                        MyMaterialInstance = CMaterialInstance(CR2WFILE)
-                        MyMaterialInstance.Read(f)
-                        self.InstanceParameters = MyMaterialInstance.InstanceParameters
                     else:
                         f.seek(self.classEnd)
                         #f.seek(1,1);
@@ -1931,15 +2004,39 @@ class CLASS:
         self.ChunkIndex = idx
 
 class CR2WProperty:
-    def __init__(self,f):
+    def __init__(self, f = None, **kwargs):
+        if f and not kwargs:
+            self.Read(f)
+        else:
+            self.Create(kwargs)
+
+    def Read(self, f):
         self.className = readUShort(f)
         self.classFlags = readUShort(f)
         self.propertyName = readUShort(f)
         self.propertyFlags = readUShort(f)
         self.hash = readU64(f)
 
+    def Create(self, args):
+        self.className = 0
+        self.classFlags = 0
+        self.propertyName = 0
+        self.propertyFlags = 0
+        self.hash = 0
+        for arg in args.items():
+            setattr(self, arg[0], arg[1])
+
+    def Write(self, f):
+        raise NotImplementedError('')
+
 class CR2WBuffer:
-    def __init__(self,f):
+    def __init__(self,f = None, **kwargs):
+        if f and not kwargs:
+            self.Read(f)
+        else:
+            self.Create(kwargs)
+
+    def Read(self, f):
         self.flags = readU32(f)
         self.index = readU32(f)
         self.offset = readU32(f)
@@ -1947,9 +2044,74 @@ class CR2WBuffer:
         self.memSize = readU32(f)
         self.crc32 = readU32(f)
 
-class CR2WExport:
+    def Create(self, args):
+        self.flags = 0
+        self.index = 0
+        self.offset = 0
+        self.diskSize = 0
+        self.memSize = 0
+        self.crc32 = 0
+        for arg in args.items():
+            setattr(self, arg[0], arg[1])
+
+    def Write(self, f):
+        raise NotImplementedError('')
+
+class CR2WExport_Witcher2:
     def __init__(self,f, CR2WFILE):
-        self.className = STRINGINDEX(f, CR2WFILE, self)# STRINGINDEX className;
+        #self.typeNameIndex = readUShort(f)
+        self.className = STRINGINDEX(f, CR2WFILE, self)#CR2WFILE.STRINGS[self.typeNameIndex - 1]
+        #self.objectFlags = readUShort(f)# ushort objectFlags;
+        self.parentID = readU32(f) # uint parentID
+        self.dataSize = readU32(f) # uint dataSize
+        self.dataOffset = readU32(f) # uint dataOffset
+        self.objectFlags = readU32(f) # uint template
+
+        self.Unknown5 = readU32(f)
+        if CR2WFILE.HEADER.version < 102:
+            self.Link = None
+        else:
+            self.Link = STRING(f).String
+
+        self.name = CR2WFILE.CNAMES[self.className.Index].name.value # local string name <hidden=true> = CR2WFile[level].NAMES.Name[className.Index].name;
+
+        # f.seek(self.dataOffset + CR2WFILE.start) # FSeek(dataOffset + start);
+        # # struct { FSkip(dataSize); } Data;
+        # f.seek(self.dataSize, 1)
+
+
+
+class CR2WExport:
+    def __init__(self, f = None, CR2WFILE = None, **kwargs):
+        self.className = None
+        self.objectFlags = None
+        self.parentID = None
+        self.dataSize = None
+        self.dataOffset = None
+        self.template = None
+        self.crc32 =None
+        self.name = None
+        if f:
+            self._CR2WFILE = CR2WFILE
+            self.ReadCR2WExport(f)
+        else:
+            self.Create(kwargs)
+
+    def Create(self, args):
+        self.className = None
+        self.objectFlags = None
+        self.parentID = None
+        self.dataSize = None
+        self.dataOffset = None
+        self.template = None
+        self.crc32 =None
+        self.name = None
+        for arg in args.items():
+            setattr(self, arg[0], arg[1])
+
+    def ReadCR2WExport(self, f):
+        #string ReadCR2WEXPORT (CR2WEXPORT &input) { return input.name; }
+        self.className = STRINGINDEX(f, self._CR2WFILE, self)# STRINGINDEX className;
         self.objectFlags = readUShort(f)# ushort objectFlags;
         self.parentID = readU32(f) # uint parentID
         self.dataSize = readU32(f) # uint dataSize
@@ -1957,40 +2119,59 @@ class CR2WExport:
         self.template = readU32(f) # uint template
         startofcrc32 = f.tell()
         self.crc32 = readU32(f); # uint crc32;
-        self.name = CR2WFILE.CNAMES[self.className.Index].name.value # local string name <hidden=true> = CR2WFile[level].NAMES.Name[className.Index].name;
-        f.seek(self.dataOffset + CR2WFILE.start) # FSeek(dataOffset + start);
+        self.name = self._CR2WFILE.CNAMES[self.className.Index].name.value # local string name <hidden=true> = CR2WFile[level].NAMES.Name[className.Index].name;
+        f.seek(self.dataOffset + self._CR2WFILE.start) # FSeek(dataOffset + start);
         # struct { FSkip(dataSize); } Data;
         f.seek(self.dataSize, 1)
         f.seek(startofcrc32 + 4)# FSeek(startof(crc32)+4);
 
-    def ReadCR2WExport():
-        #string ReadCR2WEXPORT (CR2WEXPORT &input) { return input.name; }
-        pass
-
 class CR2WImport:
-    def __init__(self,f, CR2WFILE):
+    def __init__(self, f = None, CR2WFILE = None, **kwargs):
+        self.depotPath = None
+        self.path = None
+        self.className = None
+        self.flags = None
+        if f and not kwargs:
+            self._CR2WFILE = CR2WFILE
+            self.ReadCR2WIMPORT(f)
+        else:
+            self.Create(kwargs)
+
+    def ReadCR2WIMPORT(self, f):
         startofdepotPath = f.tell()
         self.depotPath = readU32(f)
-        f.seek(self.depotPath + CR2WFILE.CR2WTable[0].offset + CR2WFILE.start)
+        f.seek(self.depotPath +  self._CR2WFILE.CR2WTable[0].offset +  self._CR2WFILE.start)
         self.path = getString(f)#string path <open=suppress>;
         f.seek(startofdepotPath+4)
         self.className = readUShort(f)
         self.flags = readUShort(f)
-
-    def ReadCR2WIMPORT():
         #string ReadCR2WIMPORT (CR2WIMPORT &input) { return input.path; }
-        pass
+
     def WriteCR2WIMPORT():
         #void WriteCR2WIMPORT (CR2WIMPORT &f, string s ) { forceWriteString(startof(f.path), sizeof(f.path), s); }
         pass
 
+    def Create(self, args):
+        self.depotPath = None
+        self.path:str = None
+        self.className = None
+        self.flags = None
+        for arg in args.items():
+            setattr(self, arg[0], arg[1])
+
 def getCR2WTABLEName(index, version):
-    if index == 0: return "Strings"
-    if index == 1: return "Enums"
-    if index == 2: return "CR2WImport"
-    if index == 3: return "CR2WProperty"
-    if index == 4: return "CR2WExport"
-    if index == 5: return "CR2WBuffer"
+    if version <= 115:
+        if index == 0: return "name"
+        if index == 1: return "object"
+        if index == 2: return "link"
+        if index == 3: return "dependency"
+    else:
+        if index == 0: return "Strings"
+        if index == 1: return "Enums"
+        if index == 2: return "CR2WImport"
+        if index == 3: return "CR2WProperty"
+        if index == 4: return "CR2WExport"
+        if index == 5: return "CR2WBuffer"
     return "Unknown"
 
 class CR2WTABLE:
@@ -2000,27 +2181,23 @@ class CR2WTABLE:
         self.offset = readU32(f) #uint offset;
         self.itemCount = readU32(f) #uint itemCount;
 
-        if version == 112:
+        if version <= 115:
             pass
         else:
             self.crc32 = readU32(f) #uint crc32;
-            
-
-from typing import List, Tuple, Dict
-import numpy as np
 
 class CR2W_header:
-    def __init__(self,f = None):
-        if f:
+    def __init__(self,f = None, **kwargs):
+        if f and not kwargs:
             self.Read(f)
         else:
-            self.Create()
+            self.Create(kwargs)
 
     def Read(self, f = None):
         self.magic: np.uint = readU32(f)
         self.version: np.uint = readU32(f) # witcher3 = 162
 
-        if (self.version < 115):# witcher2
+        if (self.version <= 115):# witcher2
             self.flags: np.uint = readU32(f)
             log.error("w2 header error")
         else:
@@ -2032,7 +2209,7 @@ class CR2W_header:
             self.CRC32: np.uint = readU32(f)
             self.numChunks: np.uint = readU32(f)
 
-    def Create(self):
+    def Create(self, args):
         self.magic: np.uint = 0
         self.version: np.uint = 0
         self.flags: np.uint = 0
@@ -2042,9 +2219,9 @@ class CR2W_header:
         self.bufferSize:np.uint = 0
         self.CRC32:np.uint = 0
         self.numChunks:np.uint = 0
+        for arg in args.items():
+            setattr(self, arg[0], arg[1])
 
-
-from enum import Enum
 class EStringTableMod(Enum):
     None_ = 0
     SkipType = 1
@@ -2052,12 +2229,21 @@ class EStringTableMod(Enum):
     SkipNameAndType = 3
     TypeFirst = 4
 
+class W2CNAME:
+    def __init__(self,str):
+        self.value = str
+class W2NAME:
+    def __init__(self,str):
+        self.name = W2CNAME(str)
+
 class CR2W:
-    def __init__(self, f = None, anim_name = None):
+    def __init__(self, f = None, anim_name = None, do_read_chunks = True):
+        self.do_read_chunks = do_read_chunks
         #global variables to use
         self.gName:np.string_ = ""
         self.gType:np.string_ = ""
-        
+        self.childrendict = {}
+
         if f:
             self.Read(f, anim_name)
         else:
@@ -2071,12 +2257,12 @@ class CR2W:
 
     def GenerateStringtable(self):
         newstringtable = {}
-        
-        
+
+
         (nameslist, importslist) = self.GenerateStringtableInner()
         stringlist:List[str] = nameslist
         newstrings:bytearray = []
-        
+
         return (newstringtable, newstrings, nameslist, importslist)
 
     def GenerateStringtableInner(self):
@@ -2086,68 +2272,104 @@ class CR2W:
         newsoftlist: List[CR2WImport] = []
         guidlist = []
         chunkguidlist = []
-        c: CLASS = None
-        
-        def LoopWrapper(item1: EStringTableMod, item2: CLASS):
+        c: W_CLASS = None
+
+        def LoopWrapper(item1: EStringTableMod, item2: W_CLASS):
             dbg_trace.append(f"{item2.name}[{item2.Type}] - {item1.name}")
             self.AddStrings(item1, item2)
 
         for c in self.CHUNKS.CHUNKS:
             LoopWrapper(EStringTableMod.SkipName, c)
-            
-            
+
+
         return (newnameslist, newimportslist)
 
-    def AddStrings(self, item1: EStringTableMod, item2: CLASS):
+    def AddStrings(self, item1: EStringTableMod, item2: W_CLASS):
         var = item2
         pass
 
     def Write(self, f):
         nn: List[CNAME] = self.CNAMES.copy()
-        
+
         StringDictionary = {}
-        
+
         newstrings:List[np.byte]
         nameslist:str = []
         importslist:List[CR2WImport] = []
 
         (StringDictionary, newstrings, nameslist, importslist) = self.GenerateStringtable()
-        
+
     def Read(self, f = None, anim_name = None):
+        self.LocalizedStrings:List[LocalizedString] = []
         self.fileName:np.string_ = f.name
         start:np.uint = f.tell()
         self.start = start
         self.HEADER:CR2W_header = CR2W_header(f)
         table_range:np.uint = 10
         if self.HEADER.version == 112: table_range = 4
-        
-        
-        if (self.HEADER.version < 115): #witcher2
-            nameDataOffset:int = readU32(f)
-            nameCount:int = readU32(f)
-            objectDataOffset:int = readU32(f)
-            objectCount:int = readU32(f)
-            linkDataOffset:int = readU32(f)
-            linkCount:int = readU32(f)
-            dependencyDataOffset:int = 0
-            dependencyCount:int = 0
 
-            if (self.HEADER.version >= 46):
-                dependencyDataOffset:int = readU32(f)
-                dependencyCount:int = readU32(f)
-                
-            if (nameDataOffset > 0):
+
+        if (self.HEADER.version <= 115): #? WITCHER 2
+            self.CR2WTable = []
+            for i in range(0, table_range):
+                self.CR2WTable.append(CR2WTABLE(i, f, self.HEADER.version))
+
+            self.maxExport = 0
+            if (self.CR2WTable[4].itemCount > self.maxExport):
+                self.maxExport = self.CR2WTable[4].itemCount
+
+            if (self.CR2WTable[0].offset > 0):
                 self.STRINGS = []
-                f.seek(nameDataOffset + start)
-                for _ in range(0, nameCount): #uses enum table count??
-                    self.STRINGS.append(STRING(f).String)
-            log.debug("cake")
+                f.seek(self.CR2WTable[0].offset + start)
+                for _ in range(0, self.CR2WTable[0].itemCount):
+                    Str = STRING(f).String
+                    if "@*" in Str:
+                        Str = Str.replace("@*", "array:2,0,ptr:")
+                    elif "@" in Str:
+                        Str = Str.replace("@", "array:2,0,")
+                    elif "*" in Str:
+                        Str = Str.replace("*", "ptr:")
+                    self.STRINGS.append(Str)
+            self.CNAMES = []
+            self.CNAMES.append(W2NAME(""))
+            for _str in self.STRINGS:
+                self.CNAMES.append(W2NAME(_str))
 
-            if (dependencyDataOffset > 0 and dependencyCount >1):
-                self.Dependencies = []
-                f.seek(dependencyDataOffset + start)
-                for _ in range(0, dependencyCount): #uses enum table count??
-                    self.Dependencies.append(STRING(f).String)
+            if (self.CR2WTable[1].offset > 0) :
+                self.CR2WExport = []
+                f.seek(self.CR2WTable[1].offset + start)
+                for _ in range(0, self.CR2WTable[1].itemCount):
+                    self.CR2WExport.append(CR2WExport_Witcher2(f, self))
+
+            self.CR2WTable[4] = self.CR2WTable[1]
+
+            self.CHUNKS = DATA(f, self, anim_name)
+
+            # nameDataOffset:int = readU32(f)
+            # nameCount:int = readU32(f)
+            # objectDataOffset:int = readU32(f)
+            # objectCount:int = readU32(f)
+            # linkDataOffset:int = readU32(f)
+            # linkCount:int = readU32(f)
+            # dependencyDataOffset:int = 0
+            # dependencyCount:int = 0
+
+            # if (self.HEADER.version >= 46):
+            #     dependencyDataOffset:int = readU32(f)
+            #     dependencyCount:int = readU32(f)
+
+            # if (nameDataOffset > 0):
+            #     self.STRINGS = []
+            #     f.seek(nameDataOffset + start)
+            #     for _ in range(0, nameCount): #uses enum table count??
+            #         self.STRINGS.append(STRING(f).String)
+            # log.debug("str")
+
+            # if (dependencyDataOffset > 0 and dependencyCount >1):
+            #     self.Dependencies = []
+            #     f.seek(dependencyDataOffset + start)
+            #     for _ in range(0, dependencyCount): #uses enum table count??
+            #         self.Dependencies.append(STRING(f).String)
         else:
 
             self.CR2WTable = []
@@ -2158,11 +2380,10 @@ class CR2W:
             if (self.CR2WTable[4].itemCount > self.maxExport):
                 self.maxExport = self.CR2WTable[4].itemCount
 
-            #useless?
             if (self.CR2WTable[0].offset > 0):
                 self.STRINGS = []
                 f.seek(self.CR2WTable[0].offset + start)
-                for _ in range(0, self.CR2WTable[1].itemCount): #uses enum table count??
+                for _ in range(0, self.CR2WTable[1].itemCount):
                     self.STRINGS.append(getString(f))
 
             if (self.CR2WTable[1].offset > 0):
@@ -2175,32 +2396,235 @@ class CR2W:
             if (self.CR2WTable[2].offset > 0) :
                 self.CR2WImport = []
                 f.seek(self.CR2WTable[2].offset + start)
-                for _ in range(0, self.CR2WTable[2].itemCount): #uses enum table count??
+                for _ in range(0, self.CR2WTable[2].itemCount):
                     self.CR2WImport.append(CR2WImport(f, self))
 
             if (self.CR2WTable[3].offset > 0) :
                 self.CR2W_Property = []
                 f.seek(self.CR2WTable[3].offset + start)
-                for _ in range(0, self.CR2WTable[3].itemCount): #uses enum table count??
+                for _ in range(0, self.CR2WTable[3].itemCount):
                     self.CR2W_Property.append(CR2WProperty(f))
 
             if (self.CR2WTable[4].offset > 0) :
                 self.CR2WExport = []
                 f.seek(self.CR2WTable[4].offset + start)
-                for _ in range(0, self.CR2WTable[4].itemCount): #uses enum table count??
+                for _ in range(0, self.CR2WTable[4].itemCount):
                     self.CR2WExport.append(CR2WExport(f, self))
-
             if (self.CR2WTable[5].offset > 0) :
                 self.CR2WBuffer = []
+                self.BufferData = []
                 f.seek(self.CR2WTable[5].offset + start)
-                for _ in range(0, self.CR2WTable[5].itemCount): #uses enum table count??
+                for idx in range(0, self.CR2WTable[5].itemCount):
                     self.CR2WBuffer.append(CR2WBuffer(f))
+                    pos = f.tell()
+                    f.seek(self.CR2WBuffer[idx].offset + start, os.SEEK_SET)
+                    data = f.read(self.CR2WBuffer[idx].memSize)
+                    self.BufferData.append(data)
+                    f.seek(pos, os.SEEK_SET)
+            if self.do_read_chunks:
+                self.CHUNKS = DATA(f, self, anim_name)
 
+    ###################
 
+    #      JSON       #
 
-            self.CHUNKS = DATA(f, self, anim_name)
+    ###################
+    def _createJsonHandle(self, _propJson, the_handle):
+        _propJson._vars['_chunkHandle'] = CR2WJsonScalar(_type = 'bool', _value = the_handle.ChunkHandle)
+        if the_handle.ChunkHandle:
+            try:
+                _propJson._vars['_reference'] = CR2WJsonScalar(_type = 'string', _value = self.CR2WExport[the_handle.Reference].name+ ' #'+str(the_handle.Reference))
+            except:
+                _propJson._vars['_reference'] = None
+                log.critical('Problem Finding Chunk Reference')
+        else:
+            _propJson._vars['_className'] = CR2WJsonScalar(_type = 'string', _value = the_handle.ClassName)
+            _propJson._vars['_depotPath'] = CR2WJsonScalar(_type = 'string', _value = the_handle.DepotPath)
+            _propJson._vars['_flags'] = CR2WJsonScalar(_type = 'uint16', _value = the_handle.Flags)
+        return _propJson
 
-def getCR2W(f, anim_name = None):
-    return CR2W(f, anim_name)
+    def WalkNode(self, prop):
+        # if type(prop) == CMatrix4x4 or prop.__class__.__name__ == "CMatrix4x4":
+        #     pass
+        if prop.__class__.__name__ in IREDPrimitive:
+            return CR2WJsonScalar(_type = prop.type, _value = prop.val)
+        elif type(prop) == PROPERTY:
+            if prop.theName == 'chunksBuffer':
+                ckae =123
+            #TODO REMOVE
+            if hasattr(prop, "PROPS"):
+                prop.PROPS = prop.PROPS
+            elif hasattr(prop, "MoreProps"):
+                prop.PROPS = prop.MoreProps
+            elif hasattr(prop, "More"):
+                prop.PROPS = prop.More
+            #!TODO REMOVE
+            if prop.theType in v_types:
+                try:
+                    return CR2WJsonScalar(_type = prop.theType, _value = prop.Value)
+                except Exception as e:
+                    return CR2WJsonScalar(_type = prop.theType, _value = prop.String.String)
+            elif prop.theType in Enums.Enum_Types or prop.theType == "CName":
+                return CR2WJsonScalar(_type = prop.theType, _value = prop.Index.String)
+            elif prop.theType.startswith('ptr:'):
+                ptrMap = CR2WJsonMap(_type = prop.theType)
+                ref = self.CR2WExport[prop.Value-1].name+ ' #'+str(prop.Value-1)
+                ptrMap._vars['_reference'] = CR2WJsonScalar(_type = 'string', _value = ref)
+                return ptrMap
+            elif prop.theType.startswith('handle:'):
+                _propJson = CR2WJsonMap(_type = prop.theType)
+                the_handle = prop.Handles[0]
+                return self._createJsonHandle(_propJson, the_handle)
+            elif prop.theType.startswith('array:'):
+                array = CR2WJsonArray(_type = prop.theType)
+
+                ############################# ##TODO GET RID OF THIS
+                if hasattr(prop, 'chunks'):
+                    prop.elements = prop.chunks.elements
+                elif hasattr(prop, 'Handles'):
+                    prop.elements = prop.Handles
+                elif hasattr(prop, 'PROPS'):
+                    prop.elements = prop.PROPS
+                ###########################
+
+                if hasattr(prop, 'elements'):
+                    for element in prop.elements:
+                        _elJson = self.WalkNode(element)
+                        if _elJson._type == 'ELEMENT':
+                            _elJson._type = prop.theType.split(',')[-1]
+                        array._elements.append(_elJson)
+                return array
+            elif prop.theType == "DeferredDataBuffer":
+                dbuf = CR2WJsonMap(_type = prop.theType)
+                dbuf._vars['Bufferdata'] = CR2WJsonScalar(_type = "Int16", _value = prop.ValueA)
+                return dbuf
+            elif prop.theType == "CDateTime":
+                CR2WJsonScalar(_type = "CDateTime", _value = prop.DateTime.String.replace('/','-').replace(' ','T'))
+            else:
+                try:
+                    _propJson = CR2WJsonMap(_type = prop.theType)
+                    prop:PROPERTY
+                    for prop in prop.PROPS:
+                        _propJsonVar = self.WalkNode(prop)
+                        _propJson._vars[prop.theName] = _propJsonVar
+                    return _propJson
+                except Exception as e:
+                    log.critical('UNKNOWN PROP')
+                    return None
+
+        elif type(prop) == CPaddedBuffer: # primities
+            array = CR2WJsonArray(_type = prop.theType)
+            array._bufferPadding = prop.padding
+            for element in prop.elements:
+                _elJson = self.WalkNode(element)
+                array._elements.append(_elJson)
+            return array
+        elif hasattr(prop, 'elements'):
+            array = CR2WJsonArray(_type = prop.theType)
+
+            for element in prop.elements:
+                _elJson = self.WalkNode(element)
+                array._elements.append(_elJson)
+            return array
+        elif type(prop) == STRING: # primities
+            return CR2WJsonScalar(_type = 'String', _value = prop.String)
+        elif type(prop) == HANDLE: # primities
+            _propJson = CR2WJsonMap(_type = prop.theType)
+            the_handle = prop
+            return self._createJsonHandle(_propJson, the_handle)
+        elif type(prop) == CMatrix4x4 or prop.__class__.__name__ == "CMatrix4x4":
+            _propJson = CR2WJsonMap(_type = prop.__class__.__name__)
+            for idx, field in enumerate(prop.fields):
+                _propJson._vars[prop.fieldNames[idx]] = CR2WJsonScalar(_type = "Float", _value = float(field))
+            return _propJson
+        elif type(prop) == CNAME_INDEX: # primities
+            return CR2WJsonScalar(_type = "CName", _value = prop.value.name.value)
+        elif type(prop) == CVariantSizeNameType:
+            _propJson = CR2WJsonMap(_type = prop.__class__.__name__)
+            _propJsonVar = self.WalkNode(prop.PROP)
+            _propJson._vars["_variant"] = _propJsonVar
+            _propJson._vars["_name"] = CR2WJsonScalar(_type = "string", _value = prop.PROP.theName)
+            return _propJson
+        elif prop.__class__.__name__.startswith('CVariant'):
+            raise NotImplementedError('new variaint class')
+        else:
+            if hasattr(prop, "PROPS"):
+                PROPS = prop.PROPS
+            elif hasattr(prop, "MoreProps"):
+                PROPS = prop.MoreProps
+            elif hasattr(prop, "More"):
+                PROPS = prop.More
+            elif hasattr(prop, "PROP"):
+                PROPS = [prop.PROP]
+            _propJson = CR2WJsonMap(_type = prop.__class__.__name__)
+            prop:PROPERTY
+            for prop in PROPS:
+                _propJsonVar = self.WalkNode(prop)
+                _propJson._vars[prop.theName] = _propJsonVar
+            return _propJson
+        return None
+
+    def GetJson(self):
+        jsonCR2W = CR2WJsonData(create = True)
+        for _import in self.CR2WImport:
+            _dict = {
+                "_className": _import.className if type(_import.className) == str else self.CNAMES[_import.className].name.value,
+                "_depotPath": _import.path,
+                "_flags": _import.flags
+            }
+            jsonCR2W._imports.append(_dict)
+        for _properties in self.CR2W_Property:
+            jsonCR2W._properties.append({'Property':_properties})
+        for idx, _buffer in enumerate(self.CR2WBuffer):
+            jsonCR2W._buffers.append({'Buffer':_buffer, 'Data': base64.b64encode(self.BufferData[idx]).decode('utf-8')})
+
+        jsonCR2W._embedded = [] #!TODO
+        for chunk in self.CHUNKS.CHUNKS:
+            _export = self.CR2WExport[chunk.ChunkIndex]
+            _cmap = CR2WJsonChunkMap(_type = chunk.Type)
+            _cmap._flags = _export.objectFlags
+            _cmap._key = chunk.name+' #'+str(chunk.ChunkIndex)
+
+            def findParent(chunk, cr2w):
+                CHUNKS = cr2w.CHUNKS.CHUNKS
+                for key, value in cr2w.childrendict.items():
+                    if chunk.ChunkIndex in value:
+                        res = CHUNKS[int(key)].Type+" #"+str(key)
+                        return res
+                return ''
+
+            _cmap._parentKey = findParent(chunk, self)
+
+            if hasattr(chunk, 'CMesh'):
+                members = [attr for attr in dir(chunk.CMesh) if not callable(getattr(chunk.CMesh, attr)) and not attr.startswith("_")]
+                for attr in members:
+                    chunk.PROPS.append(getattr(chunk.CMesh, attr))
+            if hasattr(chunk, "PROPS"):
+                PROPS = chunk.PROPS
+            elif hasattr(chunk, "MoreProps"):
+                PROPS = chunk.MoreProps
+            elif hasattr(chunk, "More"):
+                PROPS = chunk.More
+            prop:PROPERTY
+            for prop in PROPS:
+                _propJson = self.WalkNode(prop)
+                _cmap._vars[prop.theName] = _propJson
+
+            ##! HACK FIX HOW THIS WORKS
+            if hasattr(chunk, 'CMaterialInstance'):
+                array = CR2WJsonArray(_type = "array:0,0,CVariantSizeNameType")
+
+                for element in chunk.CMaterialInstance.InstanceParameters.elements:
+                    _elJson = self.WalkNode(element)
+                    array._elements.append(_elJson)
+                _cmap._vars['InstanceParameters'] = array
+                # for prop_el in chunk.InstanceParameters.elements:
+                #     chunk.PROPS.append(prop_el)
+
+            jsonCR2W._chunks[_cmap._key] = _cmap
+        return jsonCR2W
+
+def getCR2W(f, anim_name = None, do_read_chunks = True):
+    return CR2W(f, anim_name, do_read_chunks)
 
 

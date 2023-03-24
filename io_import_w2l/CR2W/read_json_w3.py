@@ -93,30 +93,6 @@ def readBones(file):
         bones.append(w3Bone)
     return bones
 
-
-
-# def readBonesBin(file):
-#     bones = []
-#     # Bone Count
-#     boneCount = len(file.names)
-#     for boneId in range(boneCount):
-#         boneName = file.names[boneId]
-#         parentId = file.parentIdx[boneId]
-#         coords = readxyz(file.positions[boneId])
-#         scale = readxyz(file.scales[boneId])
-#         quat_read = readXYZW(file.rotations[boneId])
-#         quat = om.MQuaternion( quat_read[0],quat_read[1],quat_read[2],-quat_read[3] )
-#         quat.normalizeIt()
-#         #euler = quat.asEulerRotation()
-#         #e = euler.reorderIt(5)
-
-#         ro = False #readEulerXYZ(e)
-
-#         w3Bone = w3_types.W3Bone(boneId, boneName, coords, parentId, ro, quat, scale)
-#         bones.append(w3Bone)
-#     return bones
-
-
 def eularToQuat(file):
     rot_rad = deg_to_rad_XYZ(file)
     euler = om.MEulerRotation( rot_rad[0],rot_rad[1],rot_rad[2], 5 )
@@ -136,8 +112,9 @@ def readCSkeleton(filename):
     
 def readCSkeletonData(data):
     bones = readBones(data)
+    tracks = data.tracks
     hasBones = bool(bones)
-    w3ModelData = w3_types.CSkeleton(bones=bones)
+    w3ModelData = w3_types.CSkeleton(bones = bones, tracks = tracks)
     return w3ModelData
 
 def readTracks(file):

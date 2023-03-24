@@ -11,6 +11,7 @@ from io_import_w2l.importers import import_anims
 from io_import_w2l.ui.ui_utils import WITCH_PT_Base
 from bpy.types import Panel, Operator, UIList, PropertyGroup
 from bpy.props import IntProperty, StringProperty, CollectionProperty, BoolProperty
+from io_import_w2l.importers.import_entity import test_load_entity
 
 from io_import_w2l import get_uncook_path
 
@@ -49,60 +50,49 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
     bl_options = {'REGISTER', 'UNDO'}
     
     filter_glob: StringProperty(default='*.w2ent;*.w2ent.json', options={'HIDDEN'})
-    do_import_mats: BoolProperty(
-        name="Apply Materials",
-        default=True,
-        description="If enabled, materials will be imported. You must have the game unbundled and tga textures uncooked. With the path to them set in the addon settings"
+    import_apperance: IntProperty(
+        name="Select Apperance",
+        default=0,
+        description="Select index of apperance. 0 will only import character base"
     )
-    do_import_armature: BoolProperty(
-        name="Import Armature",
-        default=True,
-        description="If enabled, the armature will be imported"
-    )
-    keep_lod_meshes: BoolProperty(
-        name="Keep LODs",
-        default=False,
-        description="If enabled, it will keep low quality meshes and materials"
-    )
-    do_merge_normals: BoolProperty(
-        name="Merge Normals",
-        default=False,
-        description="If enabled, normals will be merged. Can cause blender to hang."
-    )
-    rotate_180: BoolProperty(
-        name="Rotate 180°",
-        description="Rotate both the mesh and the armature on the Z-axis by 180°",
-        default=True
-    )
-    
     def draw(self, context):
+        filepath = self.filepath
         layout = self.layout
-        sections = ["Settings"]
-        section_options = {
-            "Settings" : ["do_import_mats",
-                        "do_import_armature",
-                        "keep_lod_meshes",
-                        "do_merge_normals",
-                        "rotate_180"]
-        }
-        for section in sections:
-            row = layout.row()
-            box = row.box()
-            box.label(text=section)
-            for prop in section_options[section]:
-                box.prop(self, prop)
+        
+        # check if the file is a file and has the .w2ent extension
+        if os.path.isfile(self.filepath) and self.filepath.endswith('.w2ent'):
+            pass
+
+        else:
+            layout.label(text="Selected file is not a .w2ent file.")
+            
+        row = layout.row()
+        row.prop(self, "import_apperance")
+        if False:
+            pass
+            sections = ["Settings"]
+            section_options = {
+                "Settings" : [
+                            # "do_import_mats",
+                            # "do_import_armature",
+                            # "keep_lod_meshes",
+                            # "do_merge_normals",
+                            # "rotate_180"
+                            ]
+            }
+            for section in sections:
+                row = layout.row()
+                box = row.box()
+                box.label(text=section)
+                for prop in section_options[section]:
+                    box.prop(self, prop)
 
     def execute(self, context):
         print("importing character now!")
         fdir = self.filepath
         s = time.time()
         if fdir.endswith(".w2ent") or fdir.endswith(".json"):
-            import_entity.import_ent_template(fdir, False,
-                                    self.do_import_mats,
-                                    self.do_import_armature,
-                                    self.keep_lod_meshes,
-                                    self.do_merge_normals,
-                                    self.rotate_180)
+            import_entity.import_ent_template(fdir, False, self.import_apperance)
         else:
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
             return {'CANCELLED'}
@@ -214,8 +204,8 @@ class WITCH_OT_ENTITY_lod_toggle(Operator):
             for mesh in scene.objects:
                 # only for meshes
                 if mesh.type == 'MESH':
-                    if 'witcher_lod_level' in mesh:
-                        if mesh['witcher_lod_level'] == lod_idx:
+                    if 'lod_level' in mesh.witcherui_MeshSettings:
+                        if mesh.witcherui_MeshSettings['lod_level'] == lod_idx:
                             mesh.hide_set(False)
                         else:
                             mesh.hide_set(True)
@@ -277,7 +267,7 @@ class WITCH_PT_ENTITY_ANIMSET_UL_List(UIList):
 class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
     bl_idname = "WITCH_PT_ENTITY_Panel"
     bl_label = "Character Appearances"
-    bl_description = "Demonstration of UIList Features"
+    bl_description = ""
     #bl_options = {'HEADER_LAYOUT_EXPAND'}
     bl_options = {'DEFAULT_CLOSED'}
 
@@ -291,57 +281,76 @@ class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
 
         
         ob = context.object
-        character_rig_selected = ob and ob.type == "ARMATURE" and "CMovingPhysicalAgentComponent" in ob.name
-        if character_rig_selected:
-            main_arm_obj = ob
-            
-            #main_arm_obj = bpy.context.active_object
-            rig_settings = main_arm_obj.data.witcherui_RigSettings
-            object = rig_settings #context.scene
-            if object == None:
-                return
-            
-            col = row.column(align=True)
-            col.template_list("WITCH_UL_ENTITY_List", "The_List", object,
-                                "app_list", object, "app_list_index")
-
-            grid = row.grid_flow( columns = 2 )
-            grid.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Load").action = "load"
-            #grid.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Clear List").action = "clear"
-            sections = ["Import Settings"]
-            section_options = {
-                "Import Settings" :["do_import_redcloth",
-                                    "do_import_lods"]
-            }
-            for section in sections:
-                row = layout.row()
-                box = row.box()
-                box.label(text=section)
-                for prop in section_options[section]:
-                    box.prop(rig_settings, prop)
-
-            self.layout.label(text = "Character Info:")
-            if object.app_list_index >= 0 and object.app_list:
-                item = object.app_list[object.app_list_index]
-
-                row = self.layout.row()
-                row.prop(item, "name")
+        if ob != None:
+            if ob.type == "ARMATURE" and "CMovingPhysicalAgentComponent" in ob.name or "CAnimatedComponent" in ob.name:
+                main_arm_obj = ob
                 
-            row = self.layout.row()
-            row.prop(rig_settings, "main_entity_skeleton")
-            row = self.layout.row()
-            row.prop(rig_settings, "main_face_skeleton")
+                #main_arm_obj = bpy.context.active_object
+                rig_settings = main_arm_obj.data.witcherui_RigSettings
+                object = rig_settings #context.scene
+                if object == None:
+                    return
+                
+                col = row.column(align=True)
+                col.template_list("WITCH_UL_ENTITY_List", "The_List", object,
+                                    "app_list", object, "app_list_index")
+
+                grid = row.grid_flow( columns = 2 )
+                grid.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Load").action = "load"
+                #grid.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Clear List").action = "clear"
+                sections = ["Import Settings"]
+                section_options = {
+                    "Import Settings" :["do_import_redcloth",
+                                        "do_import_lods"]
+                }
+                for section in sections:
+                    row = layout.row()
+                    box = row.box()
+                    box.label(text=section)
+                    for prop in section_options[section]:
+                        box.prop(rig_settings, prop)
+
+                self.layout.label(text = "Character Info:")
+                if object.app_list_index >= 0 and object.app_list:
+                    item = object.app_list[object.app_list_index]
+
+                    row = self.layout.row()
+                    row.prop(item, "name")
+                    
+                row = self.layout.row()
+                row.prop(rig_settings, "main_entity_skeleton")
+                row = self.layout.row()
+                row.prop(rig_settings, "main_face_skeleton")
+                row = self.layout.row()
+                row.prop(rig_settings, "repo_path")
+                
+                row = layout.row().box()
+                row = row.column(align=True)
+                row.label(text='Animation')
+                col = row.column(align=True)
+                col.template_list("WITCH_PT_ENTITY_ANIMSET_UL_List", "The_List_2", object,
+                                    "animset_list", object, "animset_list_index")
+                row.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Load .w2anims").action = "w2anims"
 
 
-            row = layout.row().box()
-            row = row.column(align=True)
-            row.label(text='Animation')
-            col = row.column(align=True)
-            col.template_list("WITCH_PT_ENTITY_ANIMSET_UL_List", "The_List_2", object,
-                                "animset_list", object, "animset_list_index")
-            row.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Load .w2anims").action = "w2anims"
-
-
+                if rig_settings.witcher_tracks_list:
+                    box = layout.box()
+                    row = box.row(align=False)
+                    row.prop(rig_settings, "witcher_tracks_collapse", icon="TRIA_DOWN" if not rig_settings.witcher_tracks_collapse else "TRIA_RIGHT", icon_only=True, emboss=False)
+                    track_items = [x for x in rig_settings.witcher_tracks_list if x.type == 0]
+                    row.label(text="Tracks (" + str(len(track_items)) + ")")
+                    
+                    if not rig_settings.witcher_tracks_collapse:
+                        
+                        for track in track_items:
+                            if 'hctFOV' in track.name:
+                                the_data = main_arm_obj.pose.bones["Camera_Node"]
+                                #box.prop(bpy.data.cameras["Camera"], 'lens')#text = track.name)
+                                if hasattr(the_data,'[\"' + track.path + '\"]'):
+                                    box.prop(the_data, '[\"' + track.path + '\"]', text = track.name)
+                                else:
+                                    pass
+                    
 classes = [
     #properties
     #ListItemApp,

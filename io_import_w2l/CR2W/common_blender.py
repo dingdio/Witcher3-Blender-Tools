@@ -20,3 +20,9 @@ def repo_file(filepath: str):
             return os.path.join(fbx_uncook_path, filepath)
         else:
             return os.path.join(uncook_path, filepath)
+
+def get_game_path():
+    try:
+        return bpy.context.preferences.addons[addon_name].preferences.witcher_game_path
+    except Exception as e:
+        return r"E:\GOG Games\The Witcher 3 Wild Hunt GOTY"

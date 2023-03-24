@@ -1,6 +1,6 @@
 from typing import List
 
-from CR2W.Types.SBufferInfos import SMeshInfos, BoneData, W3_DataCache
+from .SBufferInfos import SMeshInfos, BoneData, W3_DataCache
 import math
 
 class CommonData(object):
@@ -13,5 +13,12 @@ class CommonData(object):
         self.meshInfos: List[SMeshInfos] = []
         self.boneData = BoneData()
         self.w3_DataCache = W3_DataCache()
+        
+        
+        self.autohideDistance:float = 100
+        self.isTwoSided:bool = False
+        self.useExtraStreams:bool = True
+        self.mergeInGlobalShadowMesh:bool = True
+        self.entityProxy:bool = False
 
 

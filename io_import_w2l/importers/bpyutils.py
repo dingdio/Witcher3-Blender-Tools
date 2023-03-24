@@ -50,7 +50,7 @@ class __SelectObjects:
             pass
 
         for i in bpy.context.selected_objects:
-            i.select = False
+            i.select_set(False)
 
         self.__active_object = active_object
         self.__selected_objects = tuple(set(selected_objects)|set([active_object]))
@@ -58,7 +58,7 @@ class __SelectObjects:
         self.__hides = []
         scene = SceneOp(bpy.context)
         for i in self.__selected_objects:
-            self.__hides.append(i.hide)
+            self.__hides.append(i.hide_get())
             scene.select_object(i)
         scene.active_object = active_object
 

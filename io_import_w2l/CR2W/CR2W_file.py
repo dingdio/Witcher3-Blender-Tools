@@ -4,9 +4,6 @@ from .third_party_libs import yaml
 from .common_blender import repo_file
 from .setup_logging import *
 log = logging.getLogger(__name__)
-
-parent_path = os.path.abspath(os.path.join(os.path.abspath(__file__), os.pardir))
-sys.path.append(parent_path.replace("\CR2W", ""))
 import io
 
 from .bin_helpers import (ReadUlong48, readUShort,
@@ -14,7 +11,7 @@ from .bin_helpers import (ReadUlong48, readUShort,
                         ReadFloat24,
                         ReadFloat16)
 
-from .CR2W_types import ( Entity_Type_List, getCR2W, CLASS )
+from .CR2W_types import ( Entity_Type_List, getCR2W, W_CLASS )
 
 from .bStream import *
 
@@ -108,7 +105,7 @@ def create_world(file):
     CHUNKS = file.CHUNKS.CHUNKS
     for chunk in CHUNKS:
         if chunk.name == "CGameWorld":
-            CGameWorld:CLASS = chunk
+            CGameWorld:W_CLASS = chunk
     firstLayer = CHUNKS[CGameWorld.Firstlayer.Reference]
     
     world.terrainClipMap = CHUNKS[CGameWorld.GetVariableByName('terrainClipMap').Value-1]
@@ -187,6 +184,33 @@ class CWitcherSword(CEntity):
     def show(self):
         super().show()
 
+#Actor Entities
+class CActor(CGameplayEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CActor"
+        self.type = "CActor"
+
+    def show(self):
+        super().show()
+        
+class CNewNPC(CActor):
+    def __init__(self):
+        super().__init__()
+        self.name = "CNewNPC"
+        self.type = "CNewNPC"
+
+    def show(self):
+        super().show()
+        
+class CPlayer(CActor):
+    def __init__(self):
+        super().__init__()
+        self.name = "CPlayer"
+        self.type = "CPlayer"
+
+    def show(self):
+        super().show()
 
 #Container Entities
 class W3LockableEntity(CGameplayEntity):
@@ -235,6 +259,8 @@ class W3NewDoor(W3LockableEntity):
     def show(self):
         super().show()
 
+from . import CR2W_file
+
 def create_level(file, filename):
     level = LEVEL();
     level.layerNode = filename
@@ -249,8 +275,6 @@ def create_level(file, filename):
     if level.type not in top_level_list:
         return file
         
-
-    module = __import__("CR2W")
     for chunk in CHUNKS:
         if chunk.name == "CFoliageResource":
             level.Foliage = chunk
@@ -269,7 +293,12 @@ def create_level(file, filename):
         if chunk.name == "CSectorData":
             CSectorData = chunk
         if chunk.name in Entity_Type_List:
-            class_ = getattr(module.CR2W_file, chunk.name)
+            try:
+                class_ = getattr(CR2W_file, chunk.name)
+            except Exception as e:
+                log.critical(f'Found undefined entity class "{chunk.name}", skipping')
+                #raise e
+                continue
             Entity = class_()
 
             if chunk.GetVariableByName('transform'):
@@ -303,9 +332,13 @@ def create_level(file, filename):
                         sub_chunk  = CHUNKS[chunk_id-1]
                         if sub_chunk.name == "CPointLightComponent":
                             Entity.Components.append(sub_chunk)
-                        if sub_chunk.name == "CSpotLightComponent":
+                        elif sub_chunk.name == "CSpotLightComponent":
                             Entity.Components.append(sub_chunk)
-                        if sub_chunk.name == "CMeshComponent":
+                        elif sub_chunk.name == "CMeshComponent":
+                            Entity.Components.append(sub_chunk)
+                        elif sub_chunk.name == "CAreaComponent":
+                            Entity.Components.append(sub_chunk)
+                        elif sub_chunk.name == "CWaterComponent":
                             Entity.Components.append(sub_chunk)
                 Entities.append(Entity)
     level.CSectorData = CSectorData

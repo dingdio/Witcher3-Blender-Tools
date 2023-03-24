@@ -11,3 +11,7 @@ io_import_w2l/TEMP_PATHS.py
 io_import_w2l/JSON_EXPORT_TEMP/
 LINKS/
 witcher_texture/
+Cache/
+io_import_w2l/blender_render.log
+io_import_w2l/CR2W/W3Strings/string_cache.json
+io_import_w2l/temp_json/

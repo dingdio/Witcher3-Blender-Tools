@@ -4,10 +4,25 @@ from pathlib import Path
 from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
+def get_game_path(context) -> str:
+    addon_prefs = context.preferences.addons[__package__].preferences
+    witcher_game_path = addon_prefs.witcher_game_path
+    return witcher_game_path
+
 def get_uncook_path(context) -> str:
     addon_prefs = context.preferences.addons[__package__].preferences
     uncook_path = addon_prefs.uncook_path
     return uncook_path
+
+def get_mod_directory(context) -> str:
+    addon_prefs = context.preferences.addons[__package__].preferences
+    mod_directory = addon_prefs.mod_directory
+    return mod_directory
+
+def get_wolvenkit(context) -> str:
+    addon_prefs = context.preferences.addons[__package__].preferences
+    wolvenkit = addon_prefs.wolvenkit
+    return wolvenkit
 
 def get_fbx_uncook_path(context) -> str:
     addon_prefs = context.preferences.addons[__package__].preferences
@@ -85,10 +100,14 @@ from io_import_w2l.ui import ui_voice
 from io_import_w2l.ui import ui_mimics
 from io_import_w2l.ui import ui_anims_list
 from io_import_w2l.ui import ui_import_menu
-from io_import_w2l.ui.ui_mesh import WITCH_OT_w2mesh, WITCH_OT_apx
+from io_import_w2l.ui import ui_scene
+from io_import_w2l.ui.ui_mesh import WITCH_OT_w2mesh, WITCH_OT_apx, WITCH_OT_w2mesh_export
 from io_import_w2l.ui.ui_utils import WITCH_PT_Base
 from io_import_w2l.ui.ui_entity import WITCH_OT_ENTITY_lod_toggle
 #from io_import_w2l.ui.ui_entity import WITCH_OT_w2ent_chara
+from io_import_w2l import w3_material_nodes
+from io_import_w2l import w3_material_blender
+from io_import_w2l import w3_material_nodes_custom
 
 import bpy
 from bpy.types import (Panel, Operator)
@@ -100,8 +119,8 @@ import addon_utils
 bl_info = {
     "name": "Witcher 3 Tools",
     "author": "Dingdio",
-    "version": (0, 5),
-    "blender": (3, 3, 0),
+    "version": (0, 6, 0),
+    "blender": (3, 4, 1),
     "location": "File > Import-Export > Witcher 3 Assets",
     "description": "Tools for Witcher 3",
     "warning": "",
@@ -114,13 +133,31 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     # when defining this in a submodule of a python package.
     bl_idname = __package__
 
+    witcher_game_path: StringProperty(
+        name="Witcher 3 Path",
+        subtype='DIR_PATH',
+        default="E:\\GOG Games\\The Witcher 3 Wild Hunt GOTY",
+        description="Path where The Witcher 3 is installed."
+    )
+    
     uncook_path: StringProperty(
         name="Uncook Path",
         subtype='DIR_PATH',
         default="E:\\w3.modding\\modkit_new\\r4data",#'E:\\w3.modding\\modkit\\r4data',
         description="Path where you uncooked the game files."
     )
-
+    wolvenkit: StringProperty(
+        name="Wolvenkit 7 CLI exe",
+        subtype='FILE_PATH',
+        default="G:\\sourcetree\\WolvenKit-7\\WolvenKit.CLI\\bin\\Release\\net481\\WolvenKit.CLI.exe",
+        description="Wolvenkit .exe."
+    )
+    mod_directory: StringProperty(
+        name="Wolvenkit Project Path",
+        subtype='DIR_PATH',
+        default="E:\\w3.mods\\wolvenProjects\\mesh_import_testing",
+        description="Path of the current Wolvenkit mod."
+    )
     fbx_uncook_path: StringProperty(
         name="Uncook Path FBX (.fbx)",
         subtype='DIR_PATH',
@@ -131,7 +168,7 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     tex_uncook_path: StringProperty(
         name="Uncook Path TEXTURES (.tga)",
         subtype='DIR_PATH',
-        default='E:\\w3_uncook',#"E:\\w3_uncook_new",#
+        default='E:\\w3_uncook_new',#"E:\\w3_uncook_new",#
         description="Path where you exported the tga files."
     )
 
@@ -166,7 +203,7 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     W3_VOICE_PATH: StringProperty(
         name="Extracted lipsync (.cr2w)",
         subtype='DIR_PATH',
-        default='E:\\w3.modding\\radish-tools\\docs.speech\\enpc.w3speech-extracted_GOOD\\enpc.w3speech-extracted',
+        default=r'E:\w3.modding\radish-tools_PREVIEW\docs.speech\enpc.w3speech-extracted_GOOD\enpc.w3speech-extracted',
         description="Path where you extracted w3speech"
     )
 
@@ -185,17 +222,50 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     #importFacePoses
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Witcher 3 Mesh settings:")
-        layout.prop(self, "use_fbx_repo")
         layout.label(text="Witcher 3 Tools settings:")
         layout.prop(self, "uncook_path")
-        layout.prop(self, "fbx_uncook_path")
         layout.prop(self, "tex_uncook_path")
+        layout.prop(self, "witcher_game_path")
+        
+        layout.label(text='MOD PATHS:')
+        layout.prop(self, "wolvenkit")
+        layout.prop(self, "mod_directory")
+        layout.prop(self, "tex_mod_uncook_path")
+        
+        layout.label(text='EXTRA SETTINGS:')
         layout.prop(self, "W3_FOLIAGE_PATH")
         layout.prop(self, "W3_REDCLOTH_PATH")
         layout.prop(self, "W3_REDFUR_PATH")
         layout.prop(self, "W3_VOICE_PATH")
         layout.prop(self, "W3_OGG_PATH")
+        layout.label(text="FBX:")
+        layout.prop(self, "use_fbx_repo")
+        layout.prop(self, "fbx_uncook_path")
+
+class WITCH_OT_w2mg(bpy.types.Operator, ImportHelper):
+    """Load Witcher 3 Material Shader"""
+    bl_idname = "witcher.import_w2mg"
+    bl_label = "Import .w2mg"
+    filename_ext = ".w2mg"
+    filter_glob: StringProperty(default='*.w2mg', options={'HIDDEN'})
+    do_update_mats: BoolProperty(
+        name="Material Update",
+        default=True,
+        description="If enabled, it will replace the material with same name instead of creating a new one"
+    )
+    def execute(self, context):
+        print("importing material now!")
+        fdir = self.filepath
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        ext = file_helpers.getFilenameType(fdir)
+        if ext == ".w2mg":
+            w3_material_blender.import_w2mg(fdir, self)
+        else:
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        return {'FINISHED'}
 
 class WITCH_OT_w2mi(bpy.types.Operator, ImportHelper):
     """Load Witcher 3 Material Instance"""
@@ -233,7 +303,7 @@ class WITCH_OT_w2mi(bpy.types.Operator, ImportHelper):
                 if not target_mat:
                     target_mat = bpy.data.materials.new(name=instance_filename)
 
-                finished_mat = setup_w3_material_CR2W(get_texture_path(context), target_mat, mat, force_update=True, mat_filename=instance_filename, is_instance_file = False)
+                finished_mat = setup_w3_material_CR2W(get_texture_path(context), target_mat, mat, force_update=True, mat_filename=instance_filename, is_instance_file = True)
 
                 if instance_filename in obj.data.materials and not self.do_update_mats:
                     obj.material_slots[target_mat.name].material = finished_mat
@@ -319,6 +389,7 @@ class WITCH_OT_ImportW2Rig(bpy.types.Operator, ImportHelper):
         print("importing rig now!")
         fdir = self.filepath
         if os.path.isdir(fdir):
+            #fdir = r"E:\w3.modding\modkit\r4data\gameplay\camera\model\camera.w2rig"
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
             return {'CANCELLED'}
         ext = file_helpers.getFilenameType(fdir)
@@ -392,6 +463,20 @@ class WITCH_PT_Utils(WITCH_PT_Base, bpy.types.Panel):
                 box.prop(ob, "template")
             if ob.entity_type:
                 box.prop(ob, "entity_type")
+                
+            if ob.type == "MESH":
+                mesh_settings = ob.witcherui_MeshSettings
+                box.prop(mesh_settings, "lod_level")
+                box.prop(mesh_settings, "distance")
+                box.prop(mesh_settings, "mat_id")
+                if mesh_settings.lod_level == 0:
+                    box.label(text = "Global Mesh Settings:")
+                    box.prop(mesh_settings, "autohideDistance")
+                    box.prop(mesh_settings, "isTwoSided")
+                    box.prop(mesh_settings, "useExtraStreams")
+                    box.prop(mesh_settings, "mergeInGlobalShadowMesh")
+                    box.prop(mesh_settings, "entityProxy")
+
         else:
             box.label(text = "No active object")
 
@@ -440,15 +525,53 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
 
         #Mesh
         row.label(text='Mesh Import')
-        op = row.operator(WITCH_OT_w2mesh.bl_idname, text="Mesh (.w2mesh)", icon='MESH_DATA')
-        op.filepath = get_uncook_path(context)
-        op = row.operator(WITCH_OT_apx.bl_idname, text="Redcloth (.redcloth)", icon='MESH_DATA')
-        op.filepath = get_uncook_path(context)
+        row.operator(WITCH_OT_w2mesh.bl_idname, text="Mesh (.w2mesh)", icon='MESH_DATA')
+        row.operator(WITCH_OT_apx.bl_idname, text="Redcloth (.redcloth)", icon='MESH_DATA')
 
+        #Mesh
+        row.label(text='Mesh Export')
+        row.operator(WITCH_OT_w2mesh_export.bl_idname, text="Mesh (.w2mesh)", icon='MESH_DATA')
+
+        ob = context.object
+        if context.selected_objects:
+            if ob and ob.type == "MESH" or ob and ob.type == "ARMATURE":
+                if ob.type == "ARMATURE":
+                    armature_meshes = [child for child in ob.children if child.type == 'MESH']
+                    if armature_meshes:
+                        ob = armature_meshes[0]
+
+                
+                box = layout.box()
+                row = box.row(align=False)
+                row.prop(ob.witcherui_MeshSettings, "witcher_meshexport_collapse", icon="TRIA_DOWN" if not ob.witcherui_MeshSettings.witcher_meshexport_collapse else "TRIA_RIGHT", icon_only=True, emboss=False)
+                row.label(text="Mesh Export Settings")
+
+                if not ob.witcherui_MeshSettings.witcher_meshexport_collapse:
+                    mesh_settings = ob.witcherui_MeshSettings
+                    box.prop(mesh_settings, "lod_level")
+                    box.prop(mesh_settings, "distance")
+                    box.prop(mesh_settings, "mat_id")
+                    if mesh_settings.lod_level == 0:
+                        box.label(text = "Global Mesh Settings:")
+                        box.prop(mesh_settings, "autohideDistance")
+                        box.prop(mesh_settings, "isTwoSided")
+                        box.prop(mesh_settings, "useExtraStreams")
+                        box.prop(mesh_settings, "mergeInGlobalShadowMesh")
+                        box.prop(mesh_settings, "entityProxy")
+                        box.prop(mesh_settings, "item_repo_path")
+                        box.prop(mesh_settings, "make_export_dir")
+                        box.prop(mesh_settings, "is_DLC")
+                        
+            
         #Mesh
         row = layout.row().box()
         row = row.column(align=True)
         row.label(text='Material Import')
+        op = row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
+        op.filepath = get_uncook_path(context)+"\\"
+        op = row.operator(WITCH_OT_w2mg.bl_idname, text="Shader (.w2mg)", icon='MESH_DATA')
+        op.filepath = get_uncook_path(context)+"\\"
+        row.label(text='Material Export')
         op = row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
         op.filepath = get_uncook_path(context)+"\\"
 
@@ -525,6 +648,7 @@ _classes = [
     WITCH_OT_w2L,
     WITCH_OT_w2w,
     WITCH_OT_w2mi,
+    WITCH_OT_w2mg,
     WITCH_OT_w2ent,
     WITCH_OT_radish_w2L,
     #anims
@@ -569,13 +693,17 @@ def register():
     ui_import_menu.register()
     #ui_map.register()
     ui_anims.register()
+    ui_scene.register()
     register_class(WITCH_PT_Utils)
     register_class(WITCH_PT_Quick)
     ui_voice.register()
     ui_mimics.register()
     ui_anims_list.register()
+    w3_material_nodes.register()
+    w3_material_nodes_custom.register()
 
 def unregister():
+    w3_material_nodes_custom.unregister()
     unregister_class(WITCH_PT_Quick)
     unregister_class(WITCH_PT_Utils)
     bpy.utils.unregister_class(Witcher3AddonPrefs)
@@ -590,9 +718,11 @@ def unregister():
         unregister_class(cls)
     ui_import_menu.unregister()
     #ui_map.unregister()
+    ui_scene.unregister()
     ui_anims.unregister()
     ui_entity.unregister()
     ui_morphs.unregister()
     ui_voice.unregister()
     ui_mimics.unregister()
     ui_anims_list.unregister()
+    w3_material_nodes.unregister()

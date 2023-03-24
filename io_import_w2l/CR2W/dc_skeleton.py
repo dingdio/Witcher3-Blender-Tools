@@ -32,7 +32,6 @@ class Bone(w3_types.base_w3):
         self.scale_numFrames = 0
         self.scaleFrames =[] #new List<Vector>()
 
-
 def read_skelly(skelly):
     this_skeleton = w3_types.w2rig(
                 nbBones=94,
@@ -62,7 +61,6 @@ def create_CMimicFace(file):
     mimicPoses = []
 
     mimic = file.CHUNKS.CHUNKS[0]
-
 
     chunkMimicFace = file.CHUNKS.CHUNKS[0]
     mimicSkeleton = read_skelly(file.CHUNKS.CHUNKS[1])
@@ -100,7 +98,6 @@ def create_CMimicFace(file):
             myBone.scaleFrames.append(Vector3D(bone.scale_x, bone.scale_y, bone.scale_z))
             pose.bones.append(myBone)
         final_poses.append(pose)
-    #mimicSkeleton = w3_types.CSkeleton(bones=readBones(loaded['mimicSkeleton']))
     CMimicFace = w3_types.CMimicFace(name = "name",
                                      mimicSkeleton = mimicSkeleton,
                                      floatTrackSkeleton = floatTrackSkeleton,
@@ -127,8 +124,6 @@ def load_bin_skeleton(fileName):
         theFile = getCR2W(f)
         f.close()
         rig = create_Skeleton(theFile)
-        # with open(r"F:\RE3R_MODS\Blender_Scripts\io_import_w2l\test_skelly.json", "w") as file:
-        #     file.write(json.dumps(rig,indent=2, default=vars, sort_keys=False))
     for i, rot in enumerate(rig.rotations):
         rig.rotations[i].w = -rot.w
     final = readCSkeletonData(rig)

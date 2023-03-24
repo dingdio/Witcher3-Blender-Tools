@@ -1,0 +1,457 @@
+{
+  "name": "player",
+  "MovingPhysicalAgentComponent": {
+    "skeleton": "characters\\base_entities\\man_base\\man_base.w2rig",
+    "name": "man_base"
+  },
+  "appearances": [
+    {
+      "name": "geralt_player",
+      "includedTemplates": [
+        {
+          "templateFilename": "items\\bodyparts\\geralt_items\\heads\\h_00_mg__geralt.w2ent",
+          "ns": "h_00_mg__geralt",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CMimicComponent",
+              "name": "head",
+              "mimicFace": "characters\\models\\geralt\\head\\model\\h_01_mg__geralt.w3fac"
+            },
+            {
+              "chunkIndex": 3,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 4
+            },
+            {
+              "chunkIndex": 4,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\head\\model\\h_00_mg__geralt.w2mesh",
+              "name": "h_00_mg__geralt"
+            },
+            {
+              "chunkIndex": 9,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 10
+            },
+            {
+              "chunkIndex": 10,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\head\\model\\he_01_mg__geralt.w2mesh",
+              "name": "he_01_mg__geralt"
+            }
+          ]
+        },
+        {
+          "templateFilename": "items\\bodyparts\\geralt_items\\coif\\c_01_mg__witcher.w2ent",
+          "ns": "c_01_mg__witcher",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CAnimDangleComponent",
+              "name": "c_02_mg__half_tail",
+              "constraint": 3
+            },
+            {
+              "chunkIndex": 3,
+              "type": "CAnimDangleConstraint_Dyng",
+              "dyng": "characters\\models\\geralt\\coif\\model\\c_02_mg__half_tail.w3dyng"
+            },
+            {
+              "chunkIndex": 4,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 5
+            },
+            {
+              "chunkIndex": 5,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\coif\\model\\c_02_mg__hair_tie.w2mesh",
+              "name": "c_02_mg__hair_tie"
+            },
+            {
+              "chunkIndex": 6,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 7
+            },
+            {
+              "chunkIndex": 7,
+              "type": "CFurComponent",
+              "mesh": "characters\\models\\geralt\\coif\\model\\c_02_mg__halftail_bangs.w2mesh",
+              "name": ""
+            },
+            {
+              "chunkIndex": 8,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 9
+            },
+            {
+              "chunkIndex": 9,
+              "type": "CFurComponent",
+              "mesh": "characters\\models\\geralt\\coif\\model\\c_02_mg__halftail_crown.w2mesh",
+              "name": ""
+            },
+            {
+              "chunkIndex": 10,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 11
+            },
+            {
+              "chunkIndex": 11,
+              "type": "CFurComponent",
+              "mesh": "characters\\models\\geralt\\coif\\model\\c_02_mg__halftail_long.w2mesh",
+              "name": ""
+            },
+            {
+              "chunkIndex": 12,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 13
+            },
+            {
+              "chunkIndex": 13,
+              "type": "CFurComponent",
+              "mesh": "characters\\models\\geralt\\coif\\model\\c_02_mg__halftail_pony.w2mesh",
+              "name": ""
+            },
+            {
+              "chunkIndex": 14,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 15
+            }
+          ]
+        },
+        {
+          "templateFilename": "characters\\models\\geralt\\armor\\armor__viper\\t_01_mg__viper_lvl3_meshes.w2ent",
+          "ns": "t_01_mg__viper_lvl3_meshes",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\t_01_mg__viper.w2mesh",
+              "name": "torso"
+            },
+            {
+              "chunkIndex": 3,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\i_01_mg__viper.w2mesh",
+              "name": "i_01_mg__viper"
+            },
+            {
+              "chunkIndex": 4,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\pendant_01_mg__viper.w2mesh",
+              "name": "pendant_01_mg__viper"
+            },
+            {
+              "chunkIndex": 5,
+              "type": "CAnimDangleComponent",
+              "name": "viper_armour_pendant",
+              "constraint": 7
+            },
+            {
+              "chunkIndex": 6,
+              "type": "CMeshSkinningAttachment",
+              "parent": 5,
+              "child": 4
+            },
+            {
+              "chunkIndex": 7,
+              "type": "CAnimDangleConstraint_Dyng",
+              "dyng": "characters\\models\\geralt\\armor\\armor__viper\\viper_armour_pendant.w3dyng"
+            },
+            {
+              "chunkIndex": 8,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\hook_01_mg__viper.w2mesh",
+              "name": "hook_01_mg__viper"
+            },
+            {
+              "chunkIndex": 9,
+              "type": "CClothComponent",
+              "resource": "characters\\models\\geralt\\armor\\armor__viper\\t_01_mg__viper_cloth_px.redcloth"
+            }
+          ]
+        },
+        {
+          "templateFilename": "characters\\models\\geralt\\armor\\armor__viper\\g_01_mg__viper_lvl3_meshes.w2ent",
+          "ns": "g_01_mg__viper_lvl3_meshes",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\g_01_mg__viper.w2mesh",
+              "name": "gloves"
+            },
+            {
+              "chunkIndex": 3,
+              "type": "CClothComponent",
+              "resource": "characters\\models\\geralt\\armor\\armor__viper\\t_01_mg__viper_cloth2_px.redcloth"
+            }
+          ]
+        },
+        {
+          "templateFilename": "characters\\models\\geralt\\armor\\armor__viper\\l_01_mg__viper_lvl3_meshes.w2ent",
+          "ns": "l_01_mg__viper_lvl3_meshes",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\l_01_mg__viper.w2mesh",
+              "name": "pants"
+            }
+          ]
+        },
+        {
+          "templateFilename": "characters\\models\\geralt\\armor\\armor__viper\\s_01_mg__viper_lvl3_meshes.w2ent",
+          "ns": "s_01_mg__viper_lvl3_meshes",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\s_01_mg__viper.w2mesh",
+              "name": "shoes"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "staticMeshes": {
+    "templateFilename": "staticMeshes",
+    "ns": "staticMeshes",
+    "chunks": [
+      {
+        "chunkIndex": 39,
+        "type": "CAnimatedComponent",
+        "name": "scabbards_skeleton",
+        "skeleton": "characters\\models\\geralt\\scabbards\\model\\scabbards_crossbow.w2rig"
+      },
+      {
+        "chunkIndex": 42,
+        "type": "CMeshComponent",
+        "mesh": "characters\\models\\geralt\\head\\model\\h_mg__neck_transition.w2mesh",
+        "name": ""
+      },
+      {
+        "skeleton": "characters\\base_entities\\man_base\\man_base.w2rig",
+        "name": "man_base",
+        "type": "CMovingPhysicalAgentComponent",
+        "chunkIndex": 13
+      },
+      {
+        "chunkIndex": 15,
+        "type": "CHardAttachment",
+        "parent": 13,
+        "child": 16,
+        "parentSlotName": "torso3",
+        "parentSlot": 17
+      },
+      {
+        "chunkIndex": 17,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 12
+      },
+      {
+        "chunkIndex": 20,
+        "type": "CHardAttachment",
+        "parent": 13,
+        "child": 21,
+        "parentSlotName": "l_shin",
+        "parentSlot": 22
+      },
+      {
+        "chunkIndex": 22,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 16
+      },
+      {
+        "chunkIndex": 23,
+        "type": "CHardAttachment",
+        "parent": 13,
+        "child": 24,
+        "parentSlotName": "r_shin",
+        "parentSlot": 25
+      },
+      {
+        "chunkIndex": 25,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 19
+      },
+      {
+        "chunkIndex": 26,
+        "type": "CHardAttachment",
+        "parent": 13,
+        "child": 27,
+        "parentSlotName": "torso",
+        "parentSlot": 28
+      },
+      {
+        "chunkIndex": 28,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 10
+      },
+      {
+        "chunkIndex": 29,
+        "type": "CHardAttachment",
+        "parent": 13,
+        "child": 30,
+        "parentSlotName": "r_forearm",
+        "parentSlot": 31
+      },
+      {
+        "chunkIndex": 31,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 29
+      },
+      {
+        "chunkIndex": 32,
+        "type": "CHardAttachment",
+        "parent": 13,
+        "child": 33,
+        "parentSlotName": "l_forearm",
+        "parentSlot": 34
+      },
+      {
+        "chunkIndex": 34,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 23
+      },
+      {
+        "chunkIndex": 38,
+        "type": "CHardAttachment",
+        "parent": 13,
+        "child": 39,
+        "parentSlotName": "torso3",
+        "parentSlot": 40
+      },
+      {
+        "chunkIndex": 40,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 12
+      },
+      {
+        "chunkIndex": 41,
+        "type": "CMeshSkinningAttachment",
+        "parent": 13,
+        "child": 42
+      },
+      {
+        "chunkIndex": 43,
+        "type": "CHardAttachment",
+        "parent": 13,
+        "child": 44,
+        "parentSlotName": "torso3",
+        "parentSlot": 45
+      },
+      {
+        "chunkIndex": 45,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 12
+      },
+      {
+        "chunkIndex": 46,
+        "type": "CHardAttachment",
+        "parent": 13,
+        "child": 47,
+        "parentSlotName": "torso3",
+        "parentSlot": 48
+      },
+      {
+        "chunkIndex": 48,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 12
+      }
+    ]
+  },
+  "CAnimAnimsetsParam": [
+    {
+      "name": "geralt",
+      "animationSets": [
+        "animations\\interaction\\boat\\boat_geralt_sailor.w2anims",
+        "animations\\man\\movement\\man_geralt_exploration.w2anims",
+        "animations\\man\\movement\\man_movement_prototype.w2anims",
+        "animations\\interaction\\horse_draft\\horse_draft_geralt_rider.w2anims",
+        "animations\\man\\combat\\man_geralt_sword.w2anims",
+        "animations\\man\\inventory\\geralt_inventory_gui_animation.w2anims",
+        null,
+        "animations\\interaction\\mini_games\\drinking_game\\drinking_game.w2anims",
+        "animations\\man\\movement\\man_geralt_swimming.w2anims",
+        "animations\\man\\movement\\man_geralt_movement.w2anims",
+        "animations\\interaction\\environment\\man_meditation.w2anims",
+        "animations\\interaction\\environment\\man_geralt_focus.w2anims",
+        "animations\\man\\combat\\man_geralt_sword_locomotion.w2anims",
+        "animations\\man\\combat\\man_fistfight.w2anims",
+        "animations\\man\\combat\\man_longsword.w2anims",
+        "animations\\man\\community\\man_work.w2anims",
+        "animations\\interaction\\environment\\man_geralt_carry_item.w2anims",
+        "animations\\man\\combat\\man_geralt_gabriel.w2anims",
+        "animations\\man\\combat\\man_geralt_petard.w2anims",
+        "animations\\interaction\\finishers\\geralt_finishers.w2anims",
+        "animations\\man\\combat\\man_geralt_horse_combat.w2anims",
+        "animations\\interaction\\horse_draft\\man_horse_sword.w2anims",
+        "animations\\man\\combat\\man_geralt_signs.w2anims",
+        "animations\\interaction\\environment\\man_geralt_switch.w2anims",
+        "animations\\man\\quest\\q602_geralt_salsa_dancing.w2anims",
+        "animations\\man\\quest\\q602_geralt_ghost.w2anims",
+        "animations\\man\\combat\\man_geralt_tornado.w2anims"
+      ]
+    },
+    {
+      "name": "scabbards",
+      "animationSets": [
+        "animations\\items\\weapon\\witcher_scabbards.w2anims"
+      ]
+    },
+    {
+      "name": "man_dialog",
+      "animationSets": [
+        "animations\\man\\dialogs\\man_dialog_sitting_table.w2anims",
+        "animations\\man\\dialogs\\man_dialog_standing.w2anims",
+        "animations\\man\\quest\\man_quest.w2anims",
+        "animations\\man\\dialogs\\man_dialog_standing_to_standing.w2anims",
+        "animations\\man\\dialogs\\man_dialog_standing_leaning.w2anims",
+        "animations\\man\\dialogs\\man_dialog_sitting.w2anims",
+        "animations\\man\\dialogs\\man_dialog_item_interaction.w2anims",
+        "animations\\man\\dialogs\\man_dialog_standing_leaning_back.w2anims",
+        "animations\\man\\dialogs\\man_dialog_gameplay_recompress.w2anims",
+        "animations\\man\\dialogs\\man_dialog_kneeling.w2anims",
+        "animations\\man\\dialogs\\man_dialog_additives.w2anims",
+        "animations\\man\\dialogs\\man_dialog_lookats.w2anims",
+        "animations\\man\\dialogs\\man_dialog_sitting_ground.w2anims",
+        "animations\\man\\dialogs\\man_dialog_lying.w2anims",
+        "animations\\man\\dialogs\\man_dialog_locomotion.w2anims",
+        "animations\\man\\dialogs\\ep1_man_dialog_animation.w2anims"
+      ]
+    }
+  ],
+  "CAnimMimicParam": [
+    [
+      {
+        "name": "MimicSets",
+        "animationSets": [
+          "animations\\mimics\\geralt_mimic_animation.w2anims",
+          "animations\\mimics\\geralt_mimic_layers.w2anims",
+          "animations\\mimics\\geralt_mimic_inventory.w2anims",
+          "animations\\mimics\\gameplay_geralt_high_mimic_animation.w2anims",
+          "animations\\mimics\\ep1_geralt_mimic_animation.w2anims"
+        ]
+      },
+      {
+        "name": "MimicSets",
+        "animationSets": [
+          "animations\\mimics\\man_mimic_animation.w2anims",
+          "animations\\mimics\\man_mimic_layers.w2anims",
+          "animations\\mimics\\gameplay_man_mimic_animation.w2anims"
+        ]
+      }
+    ]
+  ],
+  "coloringEntries": []
+}

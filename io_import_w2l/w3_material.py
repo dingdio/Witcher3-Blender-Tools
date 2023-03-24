@@ -5,7 +5,7 @@ from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
 from pathlib import Path
-from . import CR2W
+from .CR2W import CR2W_reader
 import bpy, os
 from typing import List, Dict
 from bpy.types import Image, Material, Object, Node
@@ -95,6 +95,13 @@ def load_w3_materials_XML(
                 finished_mat = setup_w3_material(uncook_path, target_mat, xml_data, xml_path, force_update=force_mat_update)
                 obj.material_slots[target_mat.name].material = finished_mat
 
+def find_mapping_nodes(node_tree):
+    mapping_nodes = []
+    for node in node_tree.nodes:
+        if node.bl_idname == 'ShaderNodeMapping':
+            mapping_nodes.append(node)
+    return mapping_nodes
+
 def readXML(xml_path) -> Element:
     """Read Witcher 3 material info read from an .xml file, and return the root Element."""
     try:
@@ -109,6 +116,152 @@ def readXML(xml_path) -> Element:
             data = myFile.read()
     return ElementTree.fromstring(data)
 
+def create_instance_group(  material,
+                            xml_data,
+                            xml_path,
+                            mat_base,
+                            shader_type,
+                            uncook_path,
+                            x_loc):
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    nodegroup_node = init_instance_nodes(material, shader_type, clear = False, x_loc = x_loc)
+    nodegroup_node.name = material.name
+    #nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
+    
+    ngt = nodegroup_node.node_tree
+    
+    # create group inputs
+    group_inputs = ngt.nodes.new('NodeGroupInput')
+    group_inputs.location = (-550,0)
+    # create group outputs
+    group_outputs = ngt.nodes.new('NodeGroupOutput')
+    group_outputs.location = (300,0)
+
+    # Order parameters so input nodes get created in a specified order, from top to bottom relative to the inputs of the nodegroup.
+    # Purely for neatness of the node noodles.
+    ordered_params = order_elements_by_attribute(xml_data, PARAM_ORDER, 'name')
+
+    
+    for idx, p in enumerate(ordered_params):
+        par_name = p.get('name')
+        par_type = p.get('type')
+        par_value = p.get('value')
+        if par_type == "Color":
+            ngt.inputs.new('NodeSocketColor', par_name)
+            ngt.outputs.new('NodeSocketColor',par_name)
+            values = [float(f) for f in par_value.split("; ")]
+            d_val = (
+                values[0] / 255
+                ,values[1] / 255
+                ,values[2] / 255
+                ,values[3] / 255
+            )
+            ngt.inputs[par_name].default_value = d_val
+            nodegroup_node.inputs[par_name].default_value = d_val
+        elif par_type == "Float":
+            ngt.inputs.new('NodeSocketFloat', par_name)
+            ngt.outputs.new('NodeSocketFloat',par_name)
+            ngt.inputs[par_name].default_value = float(par_value)
+            nodegroup_node.inputs[par_name].default_value = float(par_value)
+            
+            ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
+        elif par_type == "handle:ITexture":
+            ngt.inputs.new('NodeSocketColor', par_name)
+            ngt.outputs.new('NodeSocketColor',par_name)
+            active_node = ngt.inputs.new('NodeSocketFloat', par_name+"_active")
+            
+            # create three math nodes in a group
+            mix_node_1 = ngt.nodes.new('ShaderNodeMixRGB')
+            mix_node_1.blend_type = 'MIX'
+            mix_node_1.location = (0,0+(-500*idx))
+            ngt.links.new(group_inputs.outputs[par_name], mix_node_1.inputs["Color2"])
+            ngt.links.new(mix_node_1.outputs["Color"], group_outputs.inputs[par_name])
+            
+            math_node_1 = ngt.nodes.new('ShaderNodeMath')
+            math_node_1.location = (-320,200+(-500*idx))
+            math_node_1.operation = 'GREATER_THAN'
+            
+            
+            ngt.links.new(mix_node_1.inputs[0], math_node_1.outputs[0])
+            ngt.links.new(math_node_1.inputs[0], group_inputs.outputs[par_name+"_active"])
+            
+            #node = ngt.nodes.new(type="ShaderNodeTexImage")
+            #node.width = 300
+            node = create_node_texture(material, p, ngt, 0+(500*idx), uncook_path, 0, using_node_tree = True)
+
+            node.location = (-320,0+(-500*idx))
+            if node and node.image:
+                if par_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse']:
+                    node.image.colorspace_settings.name = 'sRGB'
+                else:
+                    node.image.colorspace_settings.name = 'Non-Color'
+                    
+            if node and node.image and len(node.outputs[0].links) > 0:
+                pin_name = node.outputs[0].links[0].to_socket.name
+                if pin_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse']:
+                    node.image.colorspace_settings.name = 'sRGB'
+                else:
+                    node.image.colorspace_settings.name = 'Non-Color'
+            ngt.links.new(node.outputs["Color"], mix_node_1.inputs["Color1"])
+            
+        elif par_type == 'Vector':
+            ngt.inputs.new('NodeSocketVector', par_name)
+            ngt.outputs.new('NodeSocketVector',par_name)
+            ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
+
+            values = [float(f) for f in par_value.split("; ")]
+            d_val = (
+                values[0]
+                ,values[1]
+                ,values[2]
+            )
+            ngt.inputs[par_name].default_value = d_val
+            nodegroup_node.inputs[par_name].default_value = d_val
+        else:
+            ngt.inputs.new('NodeSocketFloat', par_name)
+            ngt.outputs.new('NodeSocketFloat',par_name)
+            ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
+        
+    return (ordered_params, nodegroup_node)
+
+def xml_data_from_CR2W(mat_bin, name = None):
+    mat_base = mat_bin.GetVariableByName('baseMaterial').Handles[0].DepotPath
+    shader_type = mat_base.split("\\")[-1][:-5]	# The .w2mg or .w2mi file, minus the extension.
+    
+    if name == None:
+        filePath = mat_bin._CLASS__CR2WFILE.fileName
+    
+    new_xml = ElementTree.Element('material')
+    new_xml.set('name', name if name else Path(filePath).stem)
+    new_xml.set('local', "true")
+    new_xml.set('base', mat_base)
+
+    w2mi_params = {}
+    read_instance_params(mat_bin, w2mi_params)
+    for name, attrs in w2mi_params.items():
+        create_param(
+            xml_data = new_xml
+            ,name = name 
+            ,type = attrs[0]
+            ,value = attrs[1]
+        )
+    return new_xml
+
+def get_all_w2mi(w2mi_path, all_instances):
+    full_path = os.path.join(get_uncook_path(bpy.context), w2mi_path)
+    material_bin = CR2W_reader.load_material(full_path)[0]
+
+    xml_data = xml_data_from_CR2W(material_bin)
+    mat_base = xml_data.get('base')
+    all_instances.append(xml_data)
+
+    if mat_base.endswith(".w2mi"):
+        return get_all_w2mi(mat_base, all_instances)
+    else:
+        return mat_base
+
 def setup_w3_material(
         uncook_path: str
         ,material: Material
@@ -117,6 +270,10 @@ def setup_w3_material(
         ,force_update = False	# Set to True when re-importing stuff to test changes with the latest material set-up code.
         ,is_instance_file = False
         ):
+    #!REMOVE
+    force_update = False
+    is_instance_file = False
+    #!REMOVE
     # Checks for duplicate materials
     # Saves XML data in custom properties
     # Creates nodes
@@ -143,7 +300,8 @@ def setup_w3_material(
         shader_type = guess_shader_type(shader_type)
         w2mi_path = xml_data.get('base')
         #w2mi_tex_params = read_2wmi_params(material, uncook_path, w2mi_path, shader_type)
-        w2mi_params = read_2wmi_params(material, uncook_path, w2mi_path, shader_type)
+        w2mi_params = read_2wmi_params(w2mi_path)
+
 
     # Checking if this material was already imported by comparing some custom properties
     # that we create on imported materials.
@@ -159,105 +317,75 @@ def setup_w3_material(
 
     #TODO Create the material instance NodeGroup
     #TODO instances contained within w2mesh files will be imported as materials.
-    if is_instance_file:
-        nodegroup_node = init_instance_nodes(material, shader_type)
-        nodegroup_node.name = material.name
-        #nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
+    if is_instance_file: #! Cange name of this option to "instance_group_mode" or something.
         
-        ngt = nodegroup_node.node_tree
+        all_instances = [xml_data] # xml data for each instance
+
+        if mat_base.endswith(".w2mi"):
+            final_base_mat = get_all_w2mi(mat_base, all_instances)
+
+
+        #clear all nodes in the main material
+        nodes.clear()
+        # find each instance
+        # create group for each instance
+        #link them all up to the base material group at the end
+        all_instances_params = []
+        for i, instance_xml_data in enumerate(reversed(all_instances)):
+            (ordered_params, nodegroup_node) = create_instance_group(material,
+                                instance_xml_data,
+                                xml_path,
+                                mat_base,
+                                shader_type,
+                                uncook_path,
+                                x_loc = -350 + i*-500)
+            all_instances_params.append((ordered_params, nodegroup_node))
         
-        # create group inputs
-        group_inputs = ngt.nodes.new('NodeGroupInput')
-        group_inputs.location = (-550,0)
-        # create group outputs
-        group_outputs = ngt.nodes.new('NodeGroupOutput')
-        group_outputs.location = (300,0)
-                
-        #!REPEATED CODE
-        # Order parameters so input nodes get created in a specified order, from top to bottom relative to the inputs of the nodegroup.
-        # Purely for neatness of the node noodles.
-        ordered_params = order_elements_by_attribute(xml_data, PARAM_ORDER, 'name')
+        all_instances_params_rev = all_instances_params[::-1]
+
+        for idx in range(len(all_instances_params_rev)-1):
+            from_group = all_instances_params_rev[idx]
+            to_group = all_instances_params_rev[idx+1]
+            for p in from_group[0]:
+                par_name = p.get('name')
+                try:
+                    material.node_tree.links.new(from_group[1].outputs[par_name], to_group[1].inputs[par_name])
+                    active_node = to_group[1].inputs.get( par_name+"_active")
+                    if active_node:
+                        active_node.default_value = 1.0
+                    if par_name == 'DetailTile':
+                        mapping_nodes = find_mapping_nodes(to_group[1].node_tree)
+                        
+                        def get_group_input(node_tree):
+                            for node in node_tree.nodes:
+                                if node.type == 'GROUP_INPUT':
+                                    return node
+                            return None
+                        group_input = get_group_input(to_group[1].node_tree)
+                        DetailTile_input = group_input.outputs['DetailTile']
+                        if DetailTile_input and mapping_nodes:
+                            for mapping in mapping_nodes:
+                                to_group[1].node_tree.links.new(
+                                    DetailTile_input,
+                                    mapping.inputs[3])
+                                            
+
+                except Exception as e:
+                    print(e)
         
-        # Clean existing nodes and create core nodegroup.
+
         nodegroup_node_base_shader = init_material_nodes(material, shader_type, clear = False)
         nodegroup_node_base_shader.name = mat_base[-60:]
         nodes_create_outputs(material, nodes, links, nodegroup_node_base_shader, xml_data, xml_path)
-        #!REPEATED CODE
-        
-        for idx, p in enumerate(ordered_params):
-            par_name = p.get('name')
-            par_type = p.get('type')
-            par_value = p.get('value')
-            if par_type == "Color":
-                ngt.inputs.new('NodeSocketColor', par_name)
-                ngt.outputs.new('NodeSocketColor',par_name)
-                values = [float(f) for f in par_value.split("; ")]
-                ngt.inputs[par_name].default_value = (
-                    values[0] / 255
-                    ,values[1] / 255
-                    ,values[2] / 255
-                    ,values[3] / 255
-                )
-            elif par_type == "Float":
-                ngt.inputs.new('NodeSocketFloat', par_name)
-                ngt.outputs.new('NodeSocketFloat',par_name)
-                ngt.inputs[par_name].default_value = float(par_value)
-                
-                ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
-            elif par_type == "handle:ITexture":
-                ngt.inputs.new('NodeSocketColor', par_name)
-                ngt.outputs.new('NodeSocketColor',par_name)
-                active_node = ngt.inputs.new('NodeSocketFloat', par_name+"_active")
-                
-                # create three math nodes in a group
-                mix_node_1 = ngt.nodes.new('ShaderNodeMixRGB')
-                mix_node_1.blend_type = 'MIX'
-                mix_node_1.location = (0,0+(-500*idx))
-                ngt.links.new(group_inputs.outputs[par_name], mix_node_1.inputs["Color2"])
-                ngt.links.new(mix_node_1.outputs["Color"], group_outputs.inputs[par_name])
-                
-                math_node_1 = ngt.nodes.new('ShaderNodeMath')
-                math_node_1.location = (-320,200+(-500*idx))
-                math_node_1.operation = 'GREATER_THAN'
-                
-                
-                ngt.links.new(mix_node_1.inputs[0], math_node_1.outputs[0])
-                ngt.links.new(math_node_1.inputs[0], group_inputs.outputs[par_name+"_active"])
-                
-                #node = ngt.nodes.new(type="ShaderNodeTexImage")
-                #node.width = 300
-                node = create_node_texture(material, p, ngt, 0+(500*idx), uncook_path, 0, using_node_tree = True)
-
-                node.location = (-320,0+(-500*idx))
-                if node and node.image:
-                    if par_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse']:
-                        node.image.colorspace_settings.name = 'sRGB'
-                    else:
-                        node.image.colorspace_settings.name = 'Non-Color'
-                        
-                if node and node.image and len(node.outputs[0].links) > 0:
-                    pin_name = node.outputs[0].links[0].to_socket.name
-                    if pin_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse']:
-                        node.image.colorspace_settings.name = 'sRGB'
-                    else:
-                        node.image.colorspace_settings.name = 'Non-Color'
-                ngt.links.new(node.outputs["Color"], mix_node_1.inputs["Color1"])
-                
-            else:
-                ngt.inputs.new('NodeSocketFloat', par_name)
-                ngt.outputs.new('NodeSocketFloat',par_name)
-                ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
-
-        for idx, p in enumerate(ordered_params):
+        for idx, p in enumerate(all_instances_params[0][0]):
             par_name = p.get('name')
             par_type = p.get('type')
             par_value = p.get('value')
             try:
-                material.node_tree.links.new(nodegroup_node.outputs[par_name], nodegroup_node_base_shader.inputs[par_name])
+                material.node_tree.links.new(all_instances_params[0][1].outputs[par_name], nodegroup_node_base_shader.inputs[par_name])
             except Exception as e:
                 #raise e
                 print(e)
-           
     else:
         if mat_base.endswith(".w2mi"):
             #remove w2mi_params the main material instance already provided
@@ -288,7 +416,7 @@ def setup_w3_material(
         #     xml_data = new_xml
 
         #log.warning(ElementTree.tostring(xml_data, encoding='utf8', method='xml'))
-        all_children2 = list(xml_data.iter())
+        #all_children2 = list(xml_data.iter())
         # Clean existing nodes and create core nodegroup.
         nodegroup_node = init_material_nodes(material, shader_type)
         nodegroup_node.name = mat_base[-60:]
@@ -297,10 +425,18 @@ def setup_w3_material(
         # Order parameters so input nodes get created in a specified order, from top to bottom relative to the inputs of the nodegroup.
         # Purely for neatness of the node noodles.
         ordered_params = order_elements_by_attribute(xml_data, PARAM_ORDER, 'name')
+        
+        for name, attrs in params.items():
+            for param1 in ordered_params:
+                if param1.attrib['name'] == name:
+                    param1.set("witcher_include", True)
 
+        
+        #links nodes to created output
+        #! Missing params will be created by this function
         mat_load_params_into_nodes(material, ordered_params, nodegroup_node, uncook_path)
         hide_unused_sockets(nodegroup_node)
-
+    
         if existing_mat and force_update:
             existing_mat.user_remap(material)
 
@@ -310,8 +446,6 @@ def setup_w3_material(
         mat_ensure_dummy_transparent_img_node(material, nodegroup_node, shader_type, nodes)
         mat_apply_settings(material, shader_type)
 
-
-        #\w3_uncook\FBXs\characters\models\main_npc\cerys\model\i_02_wa__cerys.fbx
         DetailTile_node = nodes.get("DetailTile")
         Pattern_Array_mapping_node = nodes.get("Pattern_Array_Mapping")
         if DetailTile_node and Pattern_Array_mapping_node:
@@ -335,22 +469,22 @@ def find_material(mat_base, params):
             return m
 
 def read_2wmi_params2(
-        mat: Material
-        ,uncook_path: str
-        ,material_bin: str
-        ,shader_type: str
+        material_bin: str
         ) -> Dict[str, str]:
     final_params: Dict[str, str] = {}	# texture filepath : texture type
-    material = material_bin
-    baseMaterial = material.GetVariableByName('baseMaterial')
+    baseMaterial = material_bin.GetVariableByName('baseMaterial')
     if baseMaterial:
         handle = baseMaterial.Handles[0]
         if baseMaterial.theType == "handle:IMaterial" and handle.ClassName == "CMaterialInstance":
-            more_tex_params = read_2wmi_params(mat, uncook_path, handle.DepotPath, shader_type)
+            more_tex_params = read_2wmi_params(handle.DepotPath)
             #TODO THESE PARAMS SHOULD NOT OVERRIDE EXISTING PARAMS
             #TODO NEED TO COMPARE and replace PROPs
             final_params.update(more_tex_params)
-    for mat_param in material.InstanceParameters.elements:
+    read_instance_params(material_bin, final_params)
+    return final_params
+    
+def read_instance_params(material, final_params):
+    for mat_param in material.CMaterialInstance.InstanceParameters.elements:
         PROP = mat_param.PROP
         if PROP.theType == "Float":
             final_params[PROP.theName] = (PROP.theType, str(PROP.Value))
@@ -372,10 +506,7 @@ def read_2wmi_params2(
     return final_params
 
 def read_2wmi_params(
-        mat: Material
-        ,uncook_path: str
-        ,w2mi_path: str
-        ,shader_type: str
+        w2mi_path: str
         ) -> Dict[str, str]:
     # Check if the .w2mi file references any textures or texarrays, and do the same there.
     # Load the .w2mi file.
@@ -385,9 +516,9 @@ def read_2wmi_params(
     #texture_paths = []
     uncook_path_mats = get_uncook_path(bpy.context)
     full_path = os.path.join(uncook_path_mats, w2mi_path)
-    material = CR2W.CR2W_reader.load_material(full_path)[0]
+    material_bin = CR2W_reader.load_material(full_path)[0]
 
-    return read_2wmi_params2(mat,uncook_path,material,shader_type)
+    return read_2wmi_params2(material_bin)
 
 def guess_texture_type_by_link(mat: Material, img_node):
         socket_name = img_node.outputs[0].links[0].to_socket.name
@@ -571,6 +702,9 @@ def mat_load_params_into_nodes(
             y_loc -= 220
         else:
             y_loc -= 170
+        if param.get("witcher_include"):
+            node.witcher_include = True
+
 
 def create_node_for_param(
         mat: Material
@@ -615,7 +749,7 @@ def create_node_for_param(
     elif par_type == 'Color':
         node = create_node_color(mat, param, node_ng)
     elif par_type == 'Vector':
-        node = create_node_vector(mat, param, node_ng)
+        (node, node_w) = create_node_vector(mat, param, node_ng, do_vec_4 = True)
     else:
         log.warning("Unknown material parameter type: "+par_type)
         node = create_node_attribute(mat, param, node_ng)
@@ -633,12 +767,39 @@ def create_node_for_param(
         input_pin = node_ng.inputs.get(EQUIVALENT_PARAMS[par_name])
     else:
         input_pin = node_ng.inputs.get(par_name)
+    
+    input_pin_vec_W = None
+    if par_type == 'Vector':
+        #create the W float node and pins
+        input_pin_vec_W = node_ng.inputs.get(par_name+'_W')
+        if input_pin_vec_W == None:
+            node_ng.node_tree.inputs.new('NodeSocketFloat', par_name+'_W')
+            input_pin_vec_W = node_ng.inputs.get(par_name+'_W')
+        node_w.location = (-450, y_loc)
+        node_w.name = par_name+'_W'
+        node_w.label = node_label+'_W'
+
+    #this will create the input pin on the shader node gorup if it doesn't exist. Idealy all shader pins would be defined. But some w2mi have values that don't exist on their shader
+    #TODO check for same names but differnt types defined on instance vs shader.
+    if input_pin == None:
+        if par_type == "Color":
+            node_ng.node_tree.inputs.new('NodeSocketColor', par_name)
+        elif par_type == "Float":
+            node_ng.node_tree.inputs.new('NodeSocketFloat', par_name)
+        elif par_type == "handle:ITexture":
+            node_ng.node_tree.inputs.new('NodeSocketColor', par_name)
+        elif par_type == 'Vector':
+            node_ng.node_tree.inputs.new('NodeSocketVector', par_name)
+        input_pin = node_ng.inputs.get(par_name)
+
 
     if input_pin and len(input_pin.links) == 0:
         # Only connect the node if some other node isn't already connected.
         # This is because if there are two diffuse textures defined, we are better off prioritizing
         # the first one.
         links.new(node.outputs[0], input_pin)
+        if par_type == 'Vector':
+            links.new(node_w.outputs[0], input_pin_vec_W)
 
     return node
 
@@ -735,7 +896,11 @@ def load_texture(
     # Check if the file exists
     if not img and not os.path.isfile(tex_path):
         log.info("Image not found: " + tex_path + " (Usually unimportant)")
-        return
+
+        img = bpy.data.images.new(img_filename, width=1024, height=1024)
+        img.filepath = tex_path
+        img.source = 'FILE'
+        #return
     elif not img:
         img = bpy.data.images.load(tex_path,check_existing=True)
 
@@ -757,13 +922,13 @@ def create_node_float(mat, param, node_ng):
     par_name = param.get('name')
     par_value = param.get('value')
 
-    if 'Rotation' in par_name:
-        normal_node = nodes.get(par_name.replace('Rotation', 'Normal'))
-        if normal_node != None:
-            mapping_node = normal_node.inputs[0].links[0].from_node
-            # Set Z rotation
-            mapping_node.inputs[1].default_value[2] = float(par_value)
-            return
+    # if 'Rotation' in par_name:
+    #     normal_node = nodes.get(par_name.replace('Rotation', 'Normal'))
+    #     if normal_node != None:
+    #         mapping_node = normal_node.inputs[0].links[0].from_node
+    #         # Set Z rotation
+    #         mapping_node.inputs[1].default_value[2] = float(par_value)
+    #         return
     node = nodes.new(type='ShaderNodeValue')
     node.outputs[0].default_value = float(par_value)
 
@@ -784,7 +949,7 @@ def create_node_color(mat, param, node_ng):
 
     return node
 
-def create_node_vector(mat, param, node_ng):
+def create_node_vector(mat, param, node_ng, do_vec_4 = False):
     nodes = mat.node_tree.nodes
     par_name = param.get('name')
     par_value = param.get('value')
@@ -815,7 +980,7 @@ def create_node_vector(mat, param, node_ng):
     elif par_name == 'SpecularShiftUVScale':
         target_node = nodes.get('SpecularShiftTexture')
         assign_uv_scale_values(mat, target_node)
-        return
+        #return
     # if values[3] != 1 and values[3] != 0:
     # 	The 4th value on vectors is probably always useless.
     # 	log.warning("Warning: Discarded vector 4th value: " + str(values) + " in parameter: " + par_name)
@@ -825,7 +990,12 @@ def create_node_vector(mat, param, node_ng):
     node.inputs[1].default_value = values[1]
     node.inputs[2].default_value = values[2]
 
-    return node
+    if do_vec_4:
+        node_w = nodes.new(type='ShaderNodeValue')
+        node_w.outputs[0].default_value = float(values[3])
+        return node, node_w
+    else:
+        return node
 
 def create_node_attribute(mat, param, node_ng):
     nodes = mat.node_tree.nodes
@@ -886,8 +1056,8 @@ def mat_set_name_by_diffuse(mat, node_ng, nodes):
             named = True
             break
     if not named:
-        # These cases should be investigated and avoided.
-        mat.name = "!3 No Texture"
+        # mat.name = "!3 No Texture"
+        pass
 
 def mat_apply_settings(mat, shader_type: str):
     """Setting material viewport settings."""

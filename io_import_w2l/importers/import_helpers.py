@@ -6,10 +6,10 @@ except Exception as e:
     pass
 from pathlib import Path
 
-from CR2W.CR2W_helpers import Enums
+from ..CR2W.CR2W_helpers import Enums
 
 #from io_import_w2l.setup_logging_bl import *
-from CR2W.setup_logging import *
+from ..CR2W.setup_logging import *
 log = logging.getLogger(__name__)
 
 def get_w3_level_data(level, fbx_uncook_path = False):
@@ -30,8 +30,8 @@ def get_w3_level_data(level, fbx_uncook_path = False):
         for idx, block in enumerate(level.CSectorData.BlockData):
             #TESTING
             this_type = Enums.BlockDataObjectType.getEnum(block.packedObjectType)
-            if this_type != "mesh" and block.resourceIndex < 12:
-                pass#print("cake")
+            # if this_type != "mesh" and block.resourceIndex < 12:
+            #     pass
             if block.resourceIndex < 12:
                 this_resource = level.CSectorData.Resources[block.resourceIndex].pathHash
                 print(block.resourceIndex, this_resource)

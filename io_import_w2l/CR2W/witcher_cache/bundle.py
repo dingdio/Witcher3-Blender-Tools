@@ -1,10 +1,11 @@
 import struct
 import io
 import csv
-
 import os
+
+from ..common_blender import get_game_path
+
 blobs = [
-r"content\content0\bundles\caketown.bundle",
 r"content\content0\bundles\blob.bundle",
 r"content\content0\bundles\buffers.bundle",
 r"content\content0\bundles\movies.bundle",
@@ -130,6 +131,7 @@ def hash_bundle_paths(filename):
     return filenames
 
 def create_pathhashes(gamedir = r"E:\GOG Games\The Witcher 3 Wild Hunt GOTY", outputPath = None):
+    gamedir = get_game_path()
     with open(outputPath, 'w', newline='') as csvfile:
         fieldnames = ["Path", "HashInt"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)

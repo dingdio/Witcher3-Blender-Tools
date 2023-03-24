@@ -8,6 +8,7 @@ from io_import_w2l import get_W3_VOICE_PATH
 import csv
 import os
 import bpy
+import math
 
 from bpy.types import PropertyGroup
 
@@ -199,10 +200,77 @@ class MyVoiceListItem_Expand(bpy.types.Operator):
     
 
 
-#
-#   Several debug operations
-#   (bundled into a single operator with an "action" property)
-#
+#check in radish dirs if string, wav and cr2w exist. If they do add it to voice list and make it avaliaible.
+radish_dirs = [
+    r"E:\w3.mods\w3.modCakeTest"
+]
+global_sound = None
+def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame = 0):
+    unpadded_line_id = ''+voiceLineId
+    if context == None:
+        context = bpy.context
+    namelen = len(voiceLineId)
+    if namelen != 10:
+        zeros = "0000000000"
+        num_of_zeros = 10 - namelen
+        voiceLineId = zeros[:num_of_zeros] + voiceLineId
+    sound_directory_to_check: Path = Path(get_W3_OGG_PATH(context))
+    cr2w_directory_to_check: Path =  Path(get_W3_VOICE_PATH(context))
+    
+    soundPath: Path = sound_directory_to_check / f"{voiceLineId}.ogg"
+    cr2wPath: Path = cr2w_directory_to_check / f"{voiceLineId}.cr2w"
+    
+    
+    ##? RADISH CHECKING
+    if not cr2wPath.is_file():
+        for dir in radish_dirs:
+            dir = Path(dir) / "speech/speech.en.wem"
+            files = Path(dir).glob('*')
+            for file in files:
+                if file.suffix == ".cr2w" and unpadded_line_id in file.stem:
+                    print(file.stem)
+                    cr2wPath = file
+                    break
+        #check radish dirs
+    
+    if cr2wPath.is_file() and not soundPath.is_file():
+        path = cr2wPath
+        folder = path.parent.name
+        if "speech." in folder and ".wem" in folder and "lipsyncanim" in cr2wPath.stem:
+            speechId = cr2wPath.stem.split('.')[0]
+            soundFolder = str(path.parent.parent)+"\\"+path.parent.name.replace('wem','wav')
+            if os.path.isdir(soundFolder):
+                files = Path(soundFolder).glob('*')
+                for file in files:
+                    if file.suffix == ".wav" and speechId in file.stem:
+                        soundPath = file
+                        break
+    ##? RADISH CHECKING
+    
+    if cr2wPath.is_file():
+        log.info('Importing Lipsync')
+        import_anims.import_lipsync(context, str(cr2wPath), use_NLA=True, NLA_track="voice_import", override_select=actor, at_frame=at_frame)
+    if soundPath.is_file():
+        log.info('Importing Sound')
+        scene = context.scene 
+
+        #bpy.ops.sequencer.delete()
+        if not scene.sequence_editor:
+            scene.sequence_editor_create()
+
+        if at_frame == 0:
+            sound_strips = [strip for strip in scene.sequence_editor.sequences if strip.type == 'SOUND']
+            # Remove the sound strips
+            for strip in sound_strips:
+                scene.sequence_editor.sequences.remove(strip)
+
+        # try:
+        #     soundstrip = scene.sequence_editor.sequences.new_sound("voiceline", str(soundPath), 1, at_frame)
+        # except Exception as e:
+
+        soundstrip = scene.sequence_editor.sequences.new_sound(soundPath.stem, str(soundPath), channel=1, frame_start= math.ceil(at_frame)+1)
+        soundstrip.frame_start = at_frame
+
 class MyVoiceListItem_Debug(bpy.types.Operator):
     bl_idname = "object.myvoicelist_debug"
     bl_label = "Debug"
@@ -218,29 +286,8 @@ class MyVoiceListItem_Debug(bpy.types.Operator):
                 item = scene.myVoiceList[scene.myVoiceList_index]
 
                 filename = item.voiceLineId
-                namelen = len(filename)
-                if namelen != 10:
-                    zeros = "0000000000"
-                    num_of_zeros = 10 - namelen
-                    filename = zeros[:num_of_zeros] + filename
-                sound_directory_to_check = get_W3_OGG_PATH(context)+"//"
-                cr2w_directory_to_check =  get_W3_VOICE_PATH(context)+"//"
+                load_voice_and_lipsync(filename)
                 
-                soundPath = sound_directory_to_check+filename+".ogg"
-                cr2wPath = cr2w_directory_to_check+filename+".cr2w"
-                if os.path.isfile(cr2wPath):
-                    log.info('Importing Lipsync')
-                    import_anims.import_lipsync(context, cr2wPath, use_NLA=True, NLA_track="voice_import")
-                if os.path.isfile(soundPath):
-                    log.info('Importing Sound')
-                    scene = context.scene 
-
-                    bpy.ops.sequencer.delete()
-                    if not scene.sequence_editor:
-                        scene.sequence_editor_create()
-
-                    #Sequences.new_sound(name, filepath, channel, frame_start)    
-                    soundstrip = scene.sequence_editor.sequences.new_sound("voiceline", soundPath, 3, 0)
         elif "reset3" == action:
             print("=== Debug Reset ====")
             SetupNodeData()

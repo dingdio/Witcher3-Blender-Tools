@@ -9,8 +9,8 @@ def setupFrameRanges(use_NLA = False):
         if obj.animation_data.nla_tracks:
             for track in obj.animation_data.nla_tracks:
                 for i in track.strips:
-                    s = min(s, i.action_frame_start)
-                    e = max(e, i.action_frame_end)
+                    s = min(s, i.frame_start)
+                    e = max(e, i.frame_end)
     else:
         if obj.animation_data.action:
             i = obj.animation_data.action

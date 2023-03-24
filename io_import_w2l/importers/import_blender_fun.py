@@ -1,6 +1,6 @@
 from pathlib import Path
-from CR2W.CR2W_helpers import Enums
-from CR2W.CR2W_types import Entity_Type_List
+from ..CR2W.CR2W_helpers import Enums
+from ..CR2W.CR2W_types import Entity_Type_List
 import bpy
 import os
 from io_import_w2l.importers.import_helpers import MatrixToArray, checkLevel, meshPath
@@ -32,15 +32,58 @@ def repo_file(filepath: str):
 
 from io_import_w2l import get_W3_REDCLOTH_PATH
 
-def set_blender_object_transform(obj, EngineTransform):
+def set_blender_pose_bone_transform(obj, EngineTransform, rotate_180 = False):
+    if EngineTransform.Yaw == 0.0 and EngineTransform.Pitch == 0.0 and EngineTransform.Roll == 0.0:
+        pass
+    else:
+        x, y, z = ( radians(EngineTransform.Yaw),
+                    radians(EngineTransform.Pitch),
+                    radians(EngineTransform.Roll))
+        orders =  ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']
+        mat = Euler((x, y, z), orders[2]).to_matrix().to_4x4()
+
+        if rotate_180:
+            mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
+        else:
+            mat[0][0], mat[0][1], mat[0][2] = mat[0][0], mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = mat[1][0], mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = mat[2][0], mat[2][1], mat[2][2]
+            
+
+        obj.matrix = obj.parent.bone.matrix_local.inverted() @ mat
+    obj.location[0] = EngineTransform.X
+    obj.location[1] = EngineTransform.Y
+    obj.location[2] = EngineTransform.Z
+
+    if hasattr(EngineTransform, "Scale_x"):
+        obj.scale[0] =EngineTransform.Scale_x
+        obj.scale[1] =EngineTransform.Scale_y
+        obj.scale[2] =EngineTransform.Scale_z
+
+def set_blender_object_transform(obj, EngineTransform, rotate_180 = False, from_this_object= False, pose_bone = None):
     """Sets blender object to RED Engine Transform
 
     Args:
         obj (Blender Object): A Blender Object
         EngineTransform (RED Engine Transform): A RED Engine Transform
     """    
+    if from_this_object:
+        obj.matrix_world = from_this_object.matrix_world
+        obj.matrix_local = from_this_object.matrix_local
+        obj.matrix_basis = from_this_object.matrix_basis
+        obj.location = from_this_object.location
+        
+
+    # obj.rotation_euler[0] = EngineTransform.Pitch
+    # obj.rotation_euler[1] = EngineTransform.Yaw
+    # obj.rotation_euler[2] = EngineTransform.Roll
+    #obj.location[0] += EngineTransform.X
+    #obj.location[1] += EngineTransform.Y
+    #obj.location[2] += EngineTransform.Z
     if EngineTransform.Yaw == 0.0 and EngineTransform.Pitch == 0.0 and EngineTransform.Roll == 0.0:
-        pass
+        mat = obj.matrix_basis
     else:
         #THIS WORKS?
         x, y,  z = (radians(EngineTransform.Yaw),
@@ -49,23 +92,23 @@ def set_blender_object_transform(obj, EngineTransform):
         orders =  ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']
         mat = Euler((x, y, z), orders[2]).to_matrix().to_4x4()
 
-        mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
-        mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
-        mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
+        if rotate_180:
+            mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
+        else:
+            mat[0][0], mat[0][1], mat[0][2] = mat[0][0], mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = mat[1][0], mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = mat[2][0], mat[2][1], mat[2][2]
 
-        obj.matrix_world @= mat
-    # obj.rotation_euler[0] = EngineTransform.Pitch
-    # obj.rotation_euler[1] = EngineTransform.Yaw
-    # obj.rotation_euler[2] = EngineTransform.Roll
-    obj.location[0] = EngineTransform.X
-    obj.location[1] = EngineTransform.Y
-    obj.location[2] = EngineTransform.Z
+    mat.translation = [EngineTransform.X,EngineTransform.Y,EngineTransform.Z] #obj.location
+    obj.matrix_world @= mat
 
     #foliage transforms don't have scale
     if hasattr(EngineTransform, "Scale_x"):
-        obj.scale[0] =EngineTransform.Scale_x
-        obj.scale[1] =EngineTransform.Scale_y
-        obj.scale[2] =EngineTransform.Scale_z
+        obj.scale[0] = EngineTransform.Scale_x
+        obj.scale[1] = EngineTransform.Scale_y
+        obj.scale[2] = EngineTransform.Scale_z
         # else:
         #     obj.scale[0] =0.01
         #     obj.scale[1] =0.01
@@ -430,9 +473,15 @@ def import_single_mesh(mesh, errors, parent_transform = False, keep_lod_meshes =
         orders =  ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']
         mat = Euler((x, y, z), orders[2]).to_matrix().to_4x4()
 
-        mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
-        mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
-        mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
+        rotate_180 = False
+        if rotate_180:
+            mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
+        else:
+            mat[0][0], mat[0][1], mat[0][2] = mat[0][0], mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = mat[1][0], mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = mat[2][0], mat[2][1], mat[2][2]
 
         obj.matrix_world @= mat
         # obj.rotation_euler[0] = mesh.transform.Pitch
@@ -458,9 +507,15 @@ def import_single_mesh(mesh, errors, parent_transform = False, keep_lod_meshes =
             log.info(obj.name)
             mat = Matrix()
 
-            mat[0][0], mat[0][1], mat[0][2] = -mesh.matrix[0][0], -mesh.matrix[1][0], mesh.matrix[2][0]
-            mat[1][0], mat[1][1], mat[1][2] = -mesh.matrix[0][1], -mesh.matrix[1][1], mesh.matrix[2][1]
-            mat[2][0], mat[2][1], mat[2][2] = -mesh.matrix[0][2], -mesh.matrix[1][2], mesh.matrix[2][2]
+            rotate_180 = False
+            if rotate_180:
+                mat[0][0], mat[0][1], mat[0][2] = -mesh.matrix[0][0], -mesh.matrix[1][0], mesh.matrix[2][0]
+                mat[1][0], mat[1][1], mat[1][2] = -mesh.matrix[0][1], -mesh.matrix[1][1], mesh.matrix[2][1]
+                mat[2][0], mat[2][1], mat[2][2] = -mesh.matrix[0][2], -mesh.matrix[1][2], mesh.matrix[2][2]
+            else:
+                mat[0][0], mat[0][1], mat[0][2] = mesh.matrix[0][0], mesh.matrix[1][0], mesh.matrix[2][0]
+                mat[1][0], mat[1][1], mat[1][2] = mesh.matrix[0][1], mesh.matrix[1][1], mesh.matrix[2][1]
+                mat[2][0], mat[2][1], mat[2][2] = mesh.matrix[0][2], mesh.matrix[1][2], mesh.matrix[2][2]
             #log.info(mat)
             obj.matrix_world = obj.matrix_world @ mat
         except:
@@ -527,8 +582,8 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False):
             light_obj.data.shadow_soft_size = component.GetVariableByName('radius').Value
         if component.GetVariableByName('transform'):
             set_blender_object_transform(light_obj, component.GetVariableByName('transform').EngineTransform)
-    return
-    if component.name == "CSpotLightComponent":
+    
+    elif component.name == "CSpotLightComponent":
         bpy.ops.object.light_add(type='SPOT', radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
         light_obj = bpy.context.selected_objects[:][0]
         light_obj.parent = parent_obj
@@ -546,7 +601,9 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False):
         if component.GetVariableByName('transform'):
             set_blender_object_transform(light_obj, component.GetVariableByName('transform').EngineTransform)
             #TODO should add 90 to X in every spotlight so it matches engine
-            light_obj.rotation_euler[0] = light_obj.rotation_euler[0] + 90
+            rotation_euler = light_obj.rotation_euler
+            rotation_euler.x += 1.5708  # 90 degrees in radians
+            light_obj.rotation_euler = rotation_euler
 
         #light_obj.data.spot_blend = component.GetVariableByName('innerAngle').Value
         light_obj.data.spot_blend = 0
@@ -573,12 +630,15 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
             import_single_mesh(mesh, errors, empty_transform, keep_lod_meshes = keep_lod_meshes)
     if cloth_list:
         for chunk in cloth_list:
-            cloth_name = chunk.GetVariableByName('name').String.String
-            resource = chunk.GetVariableByName('resource').Handles[0].DepotPath
-            resource_apx = get_W3_REDCLOTH_PATH(bpy.context)+"\\"+resource.replace(".redcloth", ".apx")
-            resource = repo_file(resource)
-            cloth_arma = cloth_util.importCloth(False, resource_apx, True, True, True, resource, "CClothComponent", cloth_name)
-            cloth_arma.parent = empty_transform
+            try:
+                cloth_name = chunk.GetVariableByName('name').String.String
+                resource = chunk.GetVariableByName('resource').Handles[0].DepotPath
+                resource_apx = get_W3_REDCLOTH_PATH(bpy.context)+"\\"+resource.replace(".redcloth", ".apx")
+                resource = repo_file(resource)
+                cloth_arma = cloth_util.importCloth(False, resource_apx, True, True, True, resource, "CClothComponent", cloth_name)
+                cloth_arma.parent = empty_transform
+            except Exception as e:
+                log.critical('Problem with cloth import')
     
     for component in ENTITY_OBJECT.Components:
         import_single_component(component, empty_transform, keep_lod_meshes = keep_lod_meshes)

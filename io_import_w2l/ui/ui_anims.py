@@ -3,14 +3,22 @@ from pathlib import Path
 from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
+from io_import_w2l import fbx_util
+from io_import_w2l import get_uncook_path
+from io_import_w2l import get_W3_VOICE_PATH
 from io_import_w2l.importers import import_anims
-from io_import_w2l.importers import import_cutscene
+# from io_import_w2l.importers import import_cutscene
+# from io_import_w2l.importers import import_scene
+from io_import_w2l.ui.ui_utils import WITCH_PT_Base
+
+
 import bpy
 from bpy.types import Panel, Operator, UIList, PropertyGroup
-from bpy.props import IntProperty, StringProperty, CollectionProperty, FloatProperty
+from bpy.props import IntProperty, StringProperty, CollectionProperty, FloatProperty, BoolProperty
 from bpy_extras.io_utils import (
         ImportHelper
         )
+
 
 class ListItem(PropertyGroup):
     """Group of properties representing an item in the list."""
@@ -261,7 +269,6 @@ class ButtonOperatorImportVoice(bpy.types.Operator, ImportHelper):
 
     def execute(self, context):
         fdir = self.filepath
-        #fdir = r"E:\w3.mods\w3.modCakeTest\speech\speech.en.wem\2113445001.lipsyncanim.cr2w"
         if (os.path.exists(fdir+'.json')):
             fdir = fdir + '.json'
         if fdir.endswith('.cr2w'):
@@ -286,10 +293,12 @@ class ButtonOperatorImportVoice(bpy.types.Operator, ImportHelper):
                                 soundPath = str(file)
                                 break
 
+            if not os.path.isfile(soundPath):
+                folder = path.parent.name
 
             #search same directiory
-            #search defined voice dir
             #search speech.en.wav
+            #search defined voice dir
 
             if os.path.isfile(soundPath):
                 log.info('Importing Sound')
@@ -312,29 +321,12 @@ class ButtonOperatorImportW2Anims(bpy.types.Operator, ImportHelper):
         fdir = self.filepath
         import_anims.start_import(context, fdir)
         return {'FINISHED'}
-
-class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
-    """Import W2 Cutscee"""
-    bl_idname = "object.import_w2_cutscene"
-    bl_label = "W2 Cutscene"
-    filename_ext = ".w2cutscene"
-    def execute(self, context):
-        fdir = self.filepath
-        if (os.path.exists(fdir+'.json')):
-            fdir = fdir + '.json'
-        else:
-            #import_anims.start_import(context, fdir)
-            import_cutscene.import_w3_cutscene(fdir)
-        return {'FINISHED'}
-
-from io_import_w2l import get_W3_VOICE_PATH
-from io_import_w2l.ui.ui_utils import WITCH_PT_Base
-
+    
 class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
     #bl_parent_id = "WITCH_PT_ENTITY_Panel"
     bl_idname = "WITCHER_PT_animset_panel"
     bl_label = "Animation Set"
-    bl_description = "Demonstration of UIList Features"
+    bl_description = ""
     #bl_options = {'HEADER_LAYOUT_EXPAND'}
     bl_options = {'DEFAULT_CLOSED'}
 
@@ -352,10 +344,6 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
         row = self.layout.row()
         op = row.operator(ButtonOperatorImportW2Anims.bl_idname, text="Import Set (.w2anims)", icon='SPHERE')
         op.filepath = os.path.join(get_uncook_path(context),"animations\\")
-
-        # row = self.layout.row()
-        # op = row.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Import CS (.w2cutscene)", icon='SPHERE')
-        # op.filepath = os.path.join(get_uncook_path(context),"animations\\")
 
         box = self.layout.box()
         row = box.row()
@@ -396,16 +384,6 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             if len(item.AdditiveType):
                 column.label(text="Additive Type: "+str(item.AdditiveType))
             #row.prop(item, "prop2")
-
-
-import os
-
-from io_import_w2l import fbx_util
-from io_import_w2l import get_uncook_path
-from bpy.props import StringProperty, BoolProperty
-from bpy_extras.io_utils import (
-        ImportHelper
-        )
 
 class WITCH_OT_import_w3_fbx(Operator, ImportHelper):
     """Same as normal FBX import but applies materials. Need seprate "FBX Import plugin for blender" enabled. Download from Nexus"""
@@ -498,7 +476,6 @@ class WITCH_OT_import_w3_fbx(Operator, ImportHelper):
 classes = [
     ButtonOperatorImportW2Anims,
     ButtonOperatorImportVoice,
-    ButtonOperatorImportW2cutscene,
     ListItem,
     TOOL_UL_List,
     TOOL_OT_List_Add,

@@ -12,7 +12,7 @@ from bpy.props import (StringProperty,
 custom_icons = {}
 
 from io_import_w2l.ui.ui_anims import (WITCH_OT_import_w3_fbx)
-from io_import_w2l.ui.ui_mesh import WITCH_OT_w2mesh
+from io_import_w2l.ui.ui_mesh import WITCH_OT_w2mesh, WITCH_OT_w2mesh_export
 from io_import_w2l.ui.ui_mesh import WITCH_OT_apx
 from io_import_w2l import get_uncook_path
 
@@ -32,8 +32,8 @@ class WITCH_MT_Menu(bpy.types.Menu):
         layout.operator(WITCH_OT_import_w3_fbx.bl_idname, text="Mesh (.w2w)", icon='MESH_DATA')
 
 def menu_import(self, context):
-    source_io_icon = custom_icons["main"]["sourceio_icon"]
-    self.layout.menu(WITCH_MT_Menu.bl_idname, icon_value=source_io_icon.icon_id)
+    witcher_icon = custom_icons["main"]["witcher_icon"]
+    self.layout.menu(WITCH_MT_Menu.bl_idname, icon_value=witcher_icon.icon_id)
 
 def load_icon(loader, filename, name):
     script_path = Path(__file__).parent
@@ -43,7 +43,7 @@ def load_icon(loader, filename, name):
 def register_custom_icon():
     import bpy.utils.previews
     pcoll = bpy.utils.previews.new()
-    load_icon(pcoll, 'w_icon.png', "sourceio_icon")
+    load_icon(pcoll, 'w_icon.png', "witcher_icon")
     custom_icons["main"] = pcoll
 
 def unregister_custom_icon():
@@ -55,6 +55,7 @@ def unregister_custom_icon():
 classes = (
     WITCH_OT_import_w3_fbx,
     WITCH_OT_w2mesh,
+    WITCH_OT_w2mesh_export,
     WITCH_OT_apx,
     WITCH_MT_Menu,
 )

@@ -173,7 +173,7 @@ def deduplicate_images():
         else:
             img.user_remap(filepaths[img.filepath])
 
-def importFbx(filepath, ns="cake", name=":", uncook_path=False, keep_lod_meshes = False):
+def importFbx(filepath, ns="mesh", name=":", uncook_path=False, keep_lod_meshes = False):
     
     if filepath.endswith(".w2mesh"):
         (meshes, armatures) = import_mesh.import_mesh(filepath, do_merge_normals = True)

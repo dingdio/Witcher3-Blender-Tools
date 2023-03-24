@@ -41,7 +41,10 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
     bl_options = {'REGISTER', 'UNDO'}
 
     filter_glob: StringProperty(default='*.w2l', options={'HIDDEN'})
-    
+    files: bpy.props.CollectionProperty(
+            type=bpy.types.OperatorFileListElement,
+            options={'HIDDEN', 'SKIP_SAVE'},
+        )
     keep_lod_meshes: BoolProperty(
         name="Keep LODs",
         default=False,
@@ -50,11 +53,18 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         print("Importing layer now!")
         fdir = self.filepath
-
+        files = self.files
+        file: bpy.types.OperatorFileListElement
+            
         start_time = time.time()
         if fdir.endswith(".w2l"):
-            levelFile = CR2W.CR2W_reader.load_w2l(fdir)
-            import_w2l.btn_import_W2L(levelFile, context, self.keep_lod_meshes)
+            cur_dir = Path(self.filepath).parent
+            
+            for file in files:
+                filepath = str(cur_dir / file.name)
+                print("Importing file:", filepath)
+                levelFile = CR2W.CR2W_reader.load_w2l(filepath)
+                import_w2l.btn_import_W2L(levelFile, context, self.keep_lod_meshes)
         else:
             log.warn('Did not select .w2l')
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
@@ -71,13 +81,21 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
     filename_ext = ".w2w"
     bl_options = {'REGISTER', 'UNDO'}
 
-    filter_glob: StringProperty(default='*.w2w', options={'HIDDEN'})
+    filter_glob: StringProperty(default='*.w2w;*.yml', options={'HIDDEN'})
 
     def execute(self, context):
         print("importing world now!")
-        fdir = self.filepath
-        worldFile = CR2W.CR2W_reader.load_w2w(fdir)
-        import_w2w.btn_import_w2w(worldFile)
+        filePath = self.filepath
+
+        if os.path.isdir(filePath):
+            log.warn('Did not select .w2w')
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        if filePath.endswith('.yml'):
+            import_w2w.btn_import_radish(filePath)
+        else:
+            worldFile = CR2W.CR2W_reader.load_w2w(filePath)
+            import_w2w.btn_import_w2w(worldFile, filePath)
         return {'FINISHED'}
 
 

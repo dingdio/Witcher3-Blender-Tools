@@ -65,26 +65,11 @@ def create_lipsync_anim(file, Skeleton_file):
             CAnimationBufferBitwiseCompressed = chunk
     return create_anim(file, CSkeletalAnimation, CAnimationBufferBitwiseCompressed, Skeleton_file)
 
-def create_anim(file, CSkeletalAnimation, CAnimationBufferBitwiseCompressed, Skeleton_file):
+def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton_file):
+
     bones = []
     tracks = []
 
-    #ANIM PART
-    chunk = CSkeletalAnimation
-    SkeletalAnimationType = "SAT_Normal"
-    AdditiveType = None
-    for prop in chunk.PROPS:
-        if prop.theName == "name":
-            name = prop.Index.String
-        if prop.theName == "duration":
-            duration = prop.Value
-        if prop.theName == "framesPerSecond":
-            framesPerSecond = prop.Value
-        if prop.theName == "Animation type for reimport":
-            SkeletalAnimationType = prop.ToString()
-        if prop.theName == "Additive type for reimport":
-            AdditiveType = prop.ToString()
-            
     #BUFFER PART
     chunk = CAnimationBufferBitwiseCompressed
     buffer_duration = chunk.GetVariableByName('duration')
@@ -109,7 +94,7 @@ def create_anim(file, CSkeletalAnimation, CAnimationBufferBitwiseCompressed, Ske
     
     the_data = []
     
-    deferredData = chunk.GetVariableByName("deferredData");
+    deferredData = chunk.GetVariableByName("deferredData")
     streamingOption = chunk.GetVariableByName("streamingOption")
     if (deferredData is not None and deferredData.ValueA != 0):
         if (streamingOption is not None and streamingOption.Index.String == "ABSO_PartiallyStreamable"):
@@ -149,7 +134,7 @@ def create_anim(file, CSkeletalAnimation, CAnimationBufferBitwiseCompressed, Ske
     bones_prop = chunk.GetVariableByName('bones')
     for (idx, bone) in enumerate(bones_prop.More):
         this_bone = w2AnimsFrames(idx,
-            BoneName = Skeleton_file.names[idx],
+            BoneName = Skeleton_file.names[idx] if Skeleton_file else idx,
             position_dt = "",
             position_numFrames = "",
             positionFrames = [],
@@ -265,7 +250,7 @@ def create_anim(file, CSkeletalAnimation, CAnimationBufferBitwiseCompressed, Ske
     if tracks_prop is not None:
         for (idx, track) in enumerate(tracks_prop.More):
             this_track = Track(idx,
-                trackName = Skeleton_file.tracks[idx],
+                trackName = Skeleton_file.tracks[idx] if Skeleton_file else idx,
                 numFrames = "",
                 dt = "",
                 trackFrames = [])
@@ -293,6 +278,43 @@ def create_anim(file, CSkeletalAnimation, CAnimationBufferBitwiseCompressed, Ske
             tracks.append(this_track)
 
     buffer = w3_types.CAnimationBufferBitwiseCompressed(bones, tracks, duration=buffer_duration, numFrames=buffer_numFrames, dt=buffer_dt)
+    return buffer
+
+def create_anim(file, CSkeletalAnimation, CAnimationBuffer, Skeleton_file):
+    #ANIM PART
+    chunk = CSkeletalAnimation
+    SkeletalAnimationType = "SAT_Normal"
+    AdditiveType = None
+    for prop in chunk.PROPS:
+        if prop.theName == "name":
+            name = prop.Index.String
+        if prop.theName == "duration":
+            duration = prop.Value
+        if prop.theName == "framesPerSecond":
+            framesPerSecond = prop.Value
+        if prop.theName == "Animation type for reimport":
+            SkeletalAnimationType = prop.ToString()
+        if prop.theName == "Additive type for reimport":
+            AdditiveType = prop.ToString()
+    if CAnimationBuffer.Type == "CAnimationBufferMultipart":
+        parts = CAnimationBuffer.GetVariableByName('parts')
+        BufferMultipart = w3_types.CAnimationBufferMultipart(numFrames=CAnimationBuffer.GetVariableByName('numFrames').Value,
+                                                             numBones=CAnimationBuffer.GetVariableByName('numBones').Value, 
+                                                             numTracks=CAnimationBuffer.GetVariableByName('numTracks').Value if CAnimationBuffer.GetVariableByName('numTracks') else 0, 
+                                                             firstFrames=CAnimationBuffer.GetVariableByName('firstFrames').value, 
+                                                             parts=[])
+        parts_done = []
+        for part in parts.value:
+            buffer = read_anim_buffer(file, file.CHUNKS.CHUNKS[part-1], duration, Skeleton_file)
+            parts_done.append(buffer)
+        BufferMultipart.parts = parts_done
+        buffer = BufferMultipart
+        
+    else:
+        buffer = read_anim_buffer(file, CAnimationBuffer, duration, Skeleton_file)
+            
+            
+    
     anim = w3_types.CSkeletalAnimation(name, duration, framesPerSecond, animBuffer=buffer, SkeletalAnimationType = SkeletalAnimationType, AdditiveType = AdditiveType)
     return anim
 
@@ -334,7 +356,6 @@ def load_lipsync_file(fileName_in = False) -> w3_types.CSkeletalAnimation:
     anim = create_lipsync_anim(theFile, CMimicFace.floatTrackSkeleton)
     return anim
 
-
 def load_base_skeleton(rigPath):
     with open(rigPath, "rb") as f:
         theFile = getCR2W(f)
@@ -361,11 +382,12 @@ def load_bin_anims_single(fileName, anim_name = None, rigPath = None ) -> w3_typ
     
 def load_bin_anims(fileName, rigPath = False) -> w3_types.CSkeletalAnimationSet:
     
-    if not rigPath:
-        rigPath = repo_file(r"characters\base_entities\man_base\man_base.w2rig")
-        if "witcher_scabbards" in fileName:
-            rigPath = repo_file(r"characters\models\geralt\scabbards\model\scabbards_crossbow.w2rig")
-    rig = load_base_skeleton(rigPath)
+    rig = False
+    # if not rigPath:
+    #     rigPath = repo_file(r"characters\base_entities\man_base\man_base.w2rig")
+    #     if "witcher_scabbards" in fileName:
+    #         rigPath = repo_file(r"characters\models\geralt\scabbards\model\scabbards_crossbow.w2rig")
+    # rig = load_base_skeleton(rigPath)
     #LOAD THE BASE SKELETON
 
 
@@ -375,9 +397,77 @@ def load_bin_anims(fileName, rigPath = False) -> w3_types.CSkeletalAnimationSet:
     anim_set = create_anim_set(theFile, rig)
     return anim_set
 
+
+def create_CCutscene(file):
+    CHUNKS = file.CHUNKS.CHUNKS
+    for chunk in CHUNKS:
+        if chunk.name == "CCutsceneTemplate":
+            set = chunk
+            break;
+    set_animations = set.GetVariableByName('animations')
+    actorsDef = set.GetVariableByName('actorsDef')
+    actors = []
+    actorsdict = {}
+    for actor in actorsDef.More:
+        ActorDef = w3_types.SCutsceneActorDef(False, actor)
+        actors.append(ActorDef)
+        actorsdict[ActorDef.name] = ActorDef
+    animations = []
+    for idx, anim_ptr in enumerate(set_animations.value):
+        anim_entry = CHUNKS[anim_ptr-1]
+        anim = CHUNKS[anim_entry.GetVariableByName('animation').Value-1]
+        anim_name = anim.GetVariableByName('name').Index.String
+        (act, comp, anim_n) = anim_name.split(':')
+        
+        chosen_actor =actorsdict[act]
+        
+        
+        ##
+        #characters\\base_entities\\man_base\\man_base.w2rig
+        #geralt w2fac
+        #loop imports of entity and sub entity and find the first w2rig and w2fac
+        #TODO make a quick read function that can lookup skeleton
+        #filepath = repo_file(chosen_actor.template)
+        
+        # def getskelly(filepath, skeleton, face):
+        #     with open(filepath, "rb") as f:
+        #         theFile = getCR2W(f, do_read_chunks = False)
+        #         if hasattr(theFile, 'CR2WImport'):
+        #             for imp in theFile.CR2WImport:
+        #                 if not skeleton:
+        #                     skeleton = imp.path if imp.path.endswith('.w2rig') else None
+        #                 if not face:
+        #                     face = imp.path if imp.path.endswith('.w2fac') else None
+        #             if skeleton and face:
+        #                 f.close()
+        #                 return skeleton, face
+
+        #             for imp in theFile.CR2WImport:
+        #                 if imp.path.endswith('.w2ent'):
+        #                     skeleton, face = getskelly(repo_file(imp.path), skeleton, face)
+        #                 if imp.path.endswith('.w2mesh'):
+        #                     skeleton, face = getskelly(repo_file(imp.path), skeleton, face)
+                    
+        #         f.close()
+        #         return skeleton, face 
+        
+        # skeleton, face = None, None
+        # skeleton, face = getskelly(filepath, skeleton, face)
+        
+        
+        anim_buffer = CHUNKS[anim.GetVariableByName('animBuffer').Value-1]
+        log.info(str(idx)+" "+anim.GetVariableByName('name').Index.String)
+        animation = create_anim(file, anim, anim_buffer, None)
+        entries = []
+        final_entry = w3_types.CSkeletalAnimationSetEntry(animation, entries)
+        animations.append(final_entry)
+
+    final_set = w3_types.CCutsceneTemplate(animations = animations, SCutsceneActorDefs = actors)
+    return final_set
+
 def load_bin_cutscene(fileName) -> w3_types.CCutsceneTemplate:
     with open(fileName, "rb") as f:
         theFile = getCR2W(f)
         f.close()
-    anim_set = theFile
+    anim_set = create_CCutscene(theFile)
     return anim_set

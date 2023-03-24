@@ -1,9 +1,11 @@
 import os
 
 import bpy
+from io_import_w2l.importers.import_texarray import insert_color, get_texture_node, insert_heightmap_to_disp
 from io_import_w2l.CR2W.CR2W_file import WORLD
 from io_import_w2l import CR2W
 from io_import_w2l.importers import import_w2l
+from io_import_w2l.CR2W.third_party_libs import yaml
 
 from bpy.types import PropertyGroup
 
@@ -427,7 +429,7 @@ def AddCLayerGroup(groups, parent_collection):
 
 
 
-def btn_import_w2w(worldFile: WORLD):
+def btn_import_w2w(worldFile: WORLD, filePath):
     # collection = bpy.data.collections.new(worldFile.worldName)
     # collection['world_path'] = worldFile.worldName
     collection = AddCLayerGroup(worldFile.groups, False)
@@ -435,15 +437,188 @@ def btn_import_w2w(worldFile: WORLD):
     layer_collection = bpy.context.view_layer.layer_collection.children[collection.name]
     bpy.context.view_layer.active_layer_collection = layer_collection
     
+
+    worldFile.heightMap = Path(filePath).stem+'.heightmap.png'
+    worldFile.colormap = Path(filePath).stem+'.overlay.png'
+    do_import_map_terrain(worldFile, filePath)
+
+
+from pathlib import Path
+def btn_import_radish(filename):
+    filePath = Path(filename).parent
+    with open(filename, "r") as file:
+        levels_yml = yaml.full_load(file)
+        data = levels_yml["WorldDefinition"]
+        worldFile = WORLD()
+        worldFile.worldName = data['name']
+        worldFile.terrainSize = data['terrain']['terrainSize']
+        worldFile.lowestElevation = data['terrain']['minHeight']
+        worldFile.highestElevation = data['terrain']['maxHeight']
+        worldFile.heightMap = data['terrain']['heightfield']
+        worldFile.colormap = data['terrain']['colormap']
+        worldFile.tileRes = data['terrain']['tileRes']
+        do_import_map_terrain(worldFile, filePath)
+
+def do_import_map_terrain(worldFile, filePath):
+    heightmap_file:Path = Path(filePath) / worldFile.heightMap
+    colormap_file:Path = Path(filePath) / worldFile.colormap
+    path_to_search_for_maps = Path("E:\w3.modding\w3terrain-extract-v2020-03-30")
+
+    if not heightmap_file.is_file():
+        heightmap_file = Path(r"E:\w3.modding\w3terrain-extract-v2020-03-30\prolog_village\prolog_village.heightmap.png")
+        for fname in path_to_search_for_maps.rglob("*"):
+            if fname.is_file() and fname.name == worldFile.heightMap:
+                heightmap_file = fname
+                break
+    if not colormap_file.is_file():
+        colormap_file = Path(r"E:\w3.modding\w3terrain-extract-v2020-03-30\prolog_village\prolog_village.colormap.png")
+        for fname in path_to_search_for_maps.rglob("*"):
+            if fname.is_file() and fname.name == worldFile.colormap:
+                colormap_file = fname
+                break
+
+    water_obj = bpy.context.scene.objects.get("water_for_map")
+    if not water_obj:
+        bpy.ops.mesh.primitive_plane_add(size=worldFile.terrainSize, enter_editmode=False, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
+        obj: bpy.types.Object = bpy.context.selected_objects[:][0]
+        obj.name = "water_for_map"
+        water_mat = bpy.data.materials.new(name='water_m')
+        water_mat.use_nodes = True
+        water_mat.diffuse_color = [0.0, 0.5, 0.8, 1.0]
+        obj.data.materials.append(water_mat)
     
-    # bpy.ops.mesh.primitive_plane_add(size=worldFile.terrainSize, enter_editmode=False, align='WORLD', location=(0, 0, worldFile.lowestElevation), scale=(1, 1, 1))
-    # obj: bpy.types.Object = bpy.context.selected_objects[:][0]
-    # #obj.location = [0,0]
-    # for a in bpy.context.screen.areas:
-    #     if a.type == 'VIEW_3D':
-    #         for s in a.spaces:
-    #             if s.type == 'VIEW_3D':
-    #                 s.clip_end = 9999 
+    
+    
+    bpy.ops.object.select_all(action='DESELECT')
+    
+    bpy.ops.mesh.primitive_plane_add(size=worldFile.terrainSize, enter_editmode=False, align='WORLD', location=(0, 0, worldFile.lowestElevation), scale=(1, 1, 1))
+    obj: bpy.types.Object = bpy.context.selected_objects[:][0]
+    obj.name = worldFile.worldName
+    #obj.location = [0,0]
+    for a in bpy.context.screen.areas:
+        if a.type == 'VIEW_3D':
+            for s in a.spaces:
+                if s.type == 'VIEW_3D':
+                    s.clip_end = 9999
+    
+    def apply_geo_nodes():
+        #############
+        # MODIFIERS #
+        #bpy.context.scene.cycles.feature_set = 'EXPERIMENTAL'
+        # bpy.context.scene.render.engine = 'CYCLES'
+        # bpy.context.scene.cycles.device = 'GPU'
+        #obj.cycles.use_adaptive_subdivision = True
+
+        #bpy.ops.object.modifier_set_active(modifier="GeometryNodes")
+
+        gn_modifier:bpy.types.Modifier = obj.modifiers.new(type='NODES', name="GeometryNodes")
+
+        ngt:bpy.types.GeometryNodeTree = bpy.context.blend_data.node_groups.new(
+            type='GeometryNodeTree',
+            name='Geometry Nodes'
+        )
+        gn_modifier.node_group = ngt
+
+        # create group inputs
+        group_inputs = ngt.nodes.new('NodeGroupInput')
+        group_inputs.location = (-550,0)
+        # create group outputs
+        group_outputs = ngt.nodes.new('NodeGroupOutput')
+        group_outputs.location = (300,0)
+        
+        ngt.outputs.new('NodeSocketGeometry',"Geometry")
+        ngt.inputs.new('NodeSocketGeometry',"Geometry")
+        ngt.inputs.new('NodeSocketVector',"Input")
+        
+        bpy.ops.object.geometry_nodes_input_attribute_toggle(prop_path="[\"Input_2_use_attribute\"]", modifier_name=gn_modifier.name)
+        gn_modifier["Input_2_attribute_name"] = "UVMap"
+        
+        nodeImg:bpy.types.GeometryNodeImageTexture = ngt.nodes.new(type="GeometryNodeImageTexture")
+        nodeImg.width = 300
+        nodeImg.location = (-320,0)
+        path = str(heightmap_file)
+        image = bpy.data.images.load(path, check_existing=True)
+        image.colorspace_settings.name = 'Non-Color'
+        nodeImg.inputs['Image'].default_value = image
+        
+        nodeS1 = ngt.nodes.new(type="ShaderNodeVectorMath")
+        nodeS1.location = (-320,-300)
+        nodeS1.operation = 'SCALE'
+        nodeS2 = ngt.nodes.new(type="ShaderNodeVectorMath")
+        nodeS2.location = (0,-300)
+        nodeS2.operation = 'SCALE'
+        nodeS2.inputs[3].default_value = abs(worldFile.lowestElevation) + abs(worldFile.highestElevation)
+        ngt.links.new(nodeS1.outputs[0], nodeS2.inputs[0])
+        ngt.links.new(nodeImg.outputs[0], nodeS1.inputs[3])
+        ngt.links.new(group_inputs.outputs[1], nodeImg.inputs[1])
+        
+        nodenorm = ngt.nodes.new('GeometryNodeInputNormal')
+        nodenorm.location = (-350,-350)
+        ngt.links.new(nodenorm.outputs['Normal'], nodeS1.inputs['Vector'])
+        
+        
+        nodeSP = ngt.nodes.new(type="GeometryNodeSetPosition")
+        nodeSP.location = (0,0)
+        ngt.links.new(group_inputs.outputs[0], nodeSP.inputs[0])
+        ngt.links.new(nodeS2.outputs[0], nodeSP.inputs[3])
+        ngt.links.new(nodeSP.outputs[0], group_outputs.inputs[0])
+
+    def apply_materials():
+        #############
+        # MATERIALS #
+        mat = bpy.data.materials.new(name=worldFile.worldName+'_m') #set new material to variable
+        mat.use_nodes = True
+        mat.cycles.displacement_method = 'DISPLACEMENT'
+
+        obj.data.materials.append(mat) #add the material to the object
+        Material_Output = mat.node_tree.nodes.get("Material Output")
+
+        disp_material = mat.node_tree.nodes.get(mat.name+"_Displacement")
+        if disp_material == None:
+            disp_material =  mat.node_tree.nodes.new("ShaderNodeDisplacement")
+            disp_material.name = mat.name+"_Displacement"
+            disp_material.location = (disp_material.location[0]+320, disp_material.location[1]-300)
+
+        disp_material.inputs[1].default_value = worldFile.lowestElevation/100
+        disp_material.inputs[2].default_value = worldFile.highestElevation + abs(worldFile.lowestElevation)
+
+
+
+        mat.node_tree.links.new(Material_Output.inputs["Displacement"], disp_material.outputs["Displacement"])
+
+        #Disp MAP
+        path = str(heightmap_file)
+        filename = os.path.basename(path)
+        tex = get_texture_node(filename, mat)
+        if tex == None:
+            tex = mat.node_tree.nodes.new("ShaderNodeTexImage")
+        insert_heightmap_to_disp(mat, disp_material, tex, path)
+        
+        
+        principled = mat.node_tree.nodes.get("Principled BSDF")
+        if principled == None:
+            principled =  mat.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
+        # mapping =  mat.node_tree.nodes.get("Mapping")
+        # if mapping == None:
+        #     mapping =  mat.node_tree.nodes.new("Mapping")
+        #COLOUR MAP
+        path = str(colormap_file)
+        color_path = path
+        color_filename = os.path.basename(color_path)
+        tex = get_texture_node(color_filename, mat)
+        if tex == None:
+            tex = mat.node_tree.nodes.new("ShaderNodeTexImage")
+        insert_color(mat, principled, tex, None, color_path)
+    
+    def apply_MultiresModifier():
+        multires:bpy.types.MultiresModifier = obj.modifiers.new(type='MULTIRES', name="tileres")
+        
+        for _ in range(7):
+            bpy.ops.object.multires_subdivide(modifier=multires.name, mode='LINEAR')
+
+    apply_geo_nodes()
+    # apply_materials()
+    apply_MultiresModifier()
 
 classes = (
         MyListTreeNode,

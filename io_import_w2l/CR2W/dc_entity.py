@@ -37,16 +37,39 @@ class EntityAppearance(object):
 
 class CMeshComponent(JsonChunk):
     """docstring for CMeshComponent."""
-    def __init__(self, mesh, name=""):
-        super(CMeshComponent, self).__init__()
-        self.mesh = mesh
-        self.name = name
+    def __init__(self, *args, **kwargs):
+        #super(CMeshComponent, self).__init__()
+        self.tags = None #Type="TagList"
+        self.transform = None #Type="EngineTransform"
+        self.transformParent = None #Type="ptr:CHardAttachment"
+        self.guid = None #Type="CGUID"
+        self.name = None #Type="String"
+        self.isStreamed = None #Type="Bool"
+        self.boundingBox = None #Type="Box"
+        self.drawableFlags = None #Type="EDrawableFlags"
+        self.lightChannels = None #Type="ELightChannel"
+        self.renderingPlane = None #Type="ERenderingPlane"
+        self.forceLODLevel = None #Type="Int32"
+        self.forceAutoHideDistance = None #Type="Uint16"
+        self.shadowImportanceBias = None #Type="EMeshShadowImportanceBias"
+        self.defaultEffectParams = None #Type="Vector"
+        self.defaultEffectColor = None #Type="Color"
+        self.mesh = None #Type="handle:CMesh"
+        w3_types.loadProps(self, args)
+    
+    def convert_for_io(self):
+        self.transformParent = self.transformParent.Value-1 if self.transformParent else None
+        self.mesh = self.mesh.ToString() if self.mesh else None
+        self.transform = self.transform.EngineTransform if self.transform else None
+        return self
 
-class CStaticMeshComponent(JsonChunk):
+class CStaticMeshComponent(CMeshComponent):
     """docstring for CStaticMeshComponent."""
-    def __init__(self, mesh):
-        super(CStaticMeshComponent, self).__init__()
-        self.mesh = mesh
+    def __init__(self, *args, **kwargs):
+        super(CStaticMeshComponent, self).__init__(*args, **kwargs)
+        self.pathLibCollisionType = None #Type="EPathLibCollision"
+        self.fadeOnCameraCollision = None #Type="Bool"
+        self.physicalCollisionType = None #Type="CPhysicalCollision"
 
 class CClothComponent(JsonChunk):
     """docstring for CClothComponent."""
@@ -110,10 +133,24 @@ class CAnimatedAttachment(SkinningAttachment):
 
 class CHardAttachment(SkinningAttachment):
     """docstring for CHardAttachment."""
-    def __init__(self, parent:int , child:int , parentSlot:int , parentSlotName:str):
-        super(CHardAttachment, self).__init__(parent, child)
-        self.parentSlotName = parentSlotName
-        self.parentSlot = parentSlot
+    def __init__(self, *args, **kwargs): #parent:int , child:int , parentSlot:int , parentSlotName:str):
+        #super(CHardAttachment, self).__init__(parent, child)
+        self.parent = None # Type="ptr:CNode"
+        self.child = None # Type="ptr:CNode"
+        self.isBroken:bool = None # Type="Bool"
+        self.relativeTransform = None # Type="EngineTransform"
+        self.parentSlotName = None # Type="CName"
+        self.attachmentFlags = None # Type="EHardAttachmentFlags"
+        self.parentSlot = None # Type="ptr:ISlot"
+        w3_types.loadProps(self, args)
+    
+    def convert_for_io(self):
+        self.parent = self.parent.Value-1 if self.parent else None
+        self.child = self.child.Value-1 if self.child else None
+        self.parentSlot = self.parentSlot.Value-1 if self.parentSlot else None
+        self.relativeTransform = self.relativeTransform.EngineTransform if self.relativeTransform else None
+        return self
+
 
 class CAnimDangleConstraint_Breast(JsonChunk):
     """docstring for CAnimDangleConstraint_Breast."""
@@ -163,6 +200,12 @@ class CSkeletonBoneSlot(JsonChunk):
         super(CSkeletonBoneSlot, self).__init__()
         self.boneIndex = boneIndex
 
+class CCameraComponent(JsonChunk):
+    def __init__(self, name):
+        super(CCameraComponent, self).__init__()
+        self.name = name
+        self.transformParent = None #<ptr:CHardAttachment>
+
 entity_type_dict = {
     "CMeshComponent": CMeshComponent,
     "CClothComponent": CClothComponent,
@@ -176,7 +219,8 @@ entity_type_dict = {
     "CStaticMeshComponent": CStaticMeshComponent,
     "CAnimatedComponent": CAnimatedComponent,
     "CHardAttachment": CHardAttachment,
-    "CSkeletonBoneSlot": CSkeletonBoneSlot
+    "CSkeletonBoneSlot": CSkeletonBoneSlot,
+    "CCameraComponent": CCameraComponent
 }
 
 CAnimDangleConstraint_types = {
@@ -196,9 +240,7 @@ def ReadMeshCEntityTemplate(templateFilename: str) -> ModelEnt:
     previous_chunk = False
     for chunk in entity.CHUNKS.CHUNKS:
         if (chunk.Type == "CMeshComponent"):
-            mesh = chunk.GetVariableByName("mesh").ToString()
-            name = chunk.GetVariableByName("name").ToString()
-            new_mesh.chunks.append(CMeshComponent(mesh, name))
+            new_mesh.chunks.append(CMeshComponent(chunk).convert_for_io())
 
         elif (chunk.Type == "CClothComponent"):
             if chunk.GetVariableByName("resource"): #! sometimes there are no resource in files??
@@ -210,8 +252,7 @@ def ReadMeshCEntityTemplate(templateFilename: str) -> ModelEnt:
 
         elif (chunk.Type == "CFurComponent"):
             if (chunk.GetVariableByName("mesh")):
-                mesh = chunk.GetVariableByName("mesh").ToString()
-                new_mesh.chunks.append(CMeshComponent(mesh))
+                new_mesh.chunks.append(CMeshComponent(chunk).convert_for_io())
                 #new_mesh.chunks[-1].refChunk = chunk.cr2w
                 new_mesh.chunks[-1].type = chunk.Type
                 new_mesh.chunks[-1].chunkIndex = chunk.ChunkIndex
@@ -258,11 +299,7 @@ def ReadMeshCEntityTemplate(templateFilename: str) -> ModelEnt:
             new_mesh.chunks.append(CAnimDangleConstraint_types[chunk.Type](skeleton))
         elif (chunk.Type == "CHardAttachment"): #TODO NormalBlend Stuff
             if (chunk.GetVariableByName("parentSlot")):
-                parent = chunk.GetVariableByName("parent").Value-1
-                child = chunk.GetVariableByName("child").Value-1
-                parentSlot = chunk.GetVariableByName("parentSlot").Value-1
-                parentSlotName = chunk.GetVariableByName("parentSlotName").ToString()
-                new_mesh.chunks.append(CHardAttachment(parent, child, parentSlot, parentSlotName))
+                new_mesh.chunks.append(CHardAttachment(chunk).convert_for_io())
         if new_mesh.chunks and previous_chunk != new_mesh.chunks[-1]:
             if chunk.Type in {**entity_type_dict, **CAnimDangleConstraint_types}:
                 #new_mesh.chunks[-1].refChunk = chunk.cr2w
@@ -271,7 +308,6 @@ def ReadMeshCEntityTemplate(templateFilename: str) -> ModelEnt:
         if new_mesh.chunks:
             previous_chunk = new_mesh.chunks[-1]
     return new_mesh
-
 
 def create_CEntity(file):
     hasCMovingPhysicalAgentComponent = False
@@ -332,51 +368,42 @@ def create_CEntity(file):
             if hasattr(chunk, 'Components'):
             #for staticChunkPtr in chunk.GetVariableByName("components").ToArray():
                 for chunk_idx in chunk.Components:
-                    staticChunk = CHUNKS[chunk_idx-1] #staticChunkPtr.Reference
-                    if (staticChunk.Type == "CStaticMeshComponent"):
-                        mesh = staticChunk.GetVariableByName("mesh").ToString()
-                        new_mesh.chunks.append(CStaticMeshComponent(mesh))
+                    chunk = CHUNKS[chunk_idx-1] #staticChunkPtr.Reference
+                    if (chunk.Type == "CStaticMeshComponent"):
+                        new_mesh.chunks.append(CStaticMeshComponent(chunk).convert_for_io())
                         #new_mesh.chunks[-1].refChunk = staticChunk.cr2w
-                        new_mesh.chunks[-1].type = staticChunk.Type
-                        new_mesh.chunks[-1].chunkIndex = staticChunk.ChunkIndex
+                        new_mesh.chunks[-1].type = chunk.Type
+                        new_mesh.chunks[-1].chunkIndex = chunk.ChunkIndex
 
-                    elif (staticChunk.Type == "CMeshComponent"):
-                        mesh = staticChunk.GetVariableByName("mesh").ToString()
-                        new_mesh.chunks.append(CMeshComponent(mesh))
+                    elif (chunk.Type == "CMeshComponent"):
+                        new_mesh.chunks.append(CMeshComponent(chunk).convert_for_io())
                         #new_mesh.chunks[-1].refChunk = staticChunk.cr2w
-                        new_mesh.chunks[-1].type = staticChunk.Type
-                        new_mesh.chunks[-1].chunkIndex = staticChunk.ChunkIndex
+                        new_mesh.chunks[-1].type = chunk.Type
+                        new_mesh.chunks[-1].chunkIndex = chunk.ChunkIndex
 
-                    elif (staticChunk.Type == "CMeshComponent"):
-                        mesh = staticChunk.GetVariableByName("mesh").ToString()
-                        new_mesh.chunks.append(CMeshComponent(mesh))
+                    elif (chunk.Type == "CFurComponent"):
+                        new_mesh.chunks.append(CMeshComponent(chunk).convert_for_io())
                         #new_mesh.chunks[-1].refChunk = staticChunk.cr2w
-                        new_mesh.chunks[-1].type = staticChunk.Type
-                        new_mesh.chunks[-1].chunkIndex = staticChunk.ChunkIndex
+                        new_mesh.chunks[-1].type = chunk.Type
+                        new_mesh.chunks[-1].chunkIndex = chunk.ChunkIndex
 
-                    elif (staticChunk.Type == "CFurComponent"):
-                        mesh = staticChunk.GetVariableByName("mesh").ToString()
-                        new_mesh.chunks.append(CMeshComponent(mesh))
-                        #new_mesh.chunks[-1].refChunk = staticChunk.cr2w
-                        new_mesh.chunks[-1].type = staticChunk.Type
-                        new_mesh.chunks[-1].chunkIndex = staticChunk.ChunkIndex
-
-                    elif (staticChunk.Type == "CAnimatedComponent"):
-                        name = staticChunk.GetVariableByName("name").ToString()
-                        skeleton = staticChunk.GetVariableByName("skeleton").ToString()
+                    elif (chunk.Type == "CAnimatedComponent"):
+                        name = chunk.GetVariableByName("name").ToString()
+                        skeleton = chunk.GetVariableByName("skeleton").ToString()
                         new_mesh.chunks.append(CAnimatedComponent(name, skeleton))
                         #new_mesh.chunks[-1].refChunk = staticChunk.cr2w
-                        new_mesh.chunks[-1].type = staticChunk.Type
-                        new_mesh.chunks[-1].chunkIndex = staticChunk.ChunkIndex
+                        new_mesh.chunks[-1].type = chunk.Type
+                        new_mesh.chunks[-1].chunkIndex = chunk.ChunkIndex
+                    elif (chunk.Type == "CCameraComponent"):
+                        name = chunk.GetVariableByName("name").ToString()
+                        new_mesh.chunks.append(CCameraComponent(name))
+                        new_mesh.chunks[-1].type = chunk.Type
+                        new_mesh.chunks[-1].chunkIndex = chunk.ChunkIndex
                             
 
         elif (chunk.Type == "CHardAttachment"):
-            if (chunk.GetVariableByName("parentSlot")):
-                parent = chunk.GetVariableByName("parent").Value-1
-                child = chunk.GetVariableByName("child").Value-1
-                parentSlot = chunk.GetVariableByName("parentSlot").Value-1
-                parentSlotName = chunk.GetVariableByName("parentSlotName").ToString()
-                new_mesh.chunks.append(CHardAttachment(parent, child, parentSlot, parentSlotName))
+            if (chunk.GetVariableByName("parentSlot")): 
+                new_mesh.chunks.append(CHardAttachment(chunk).convert_for_io())
                 #new_mesh.chunks[-1].refChunk = chunk.cr2w;
                 new_mesh.chunks[-1].type = chunk.Type
                 new_mesh.chunks[-1].chunkIndex = chunk.ChunkIndex
@@ -403,13 +430,15 @@ def create_CEntity(file):
             hasCMovingPhysicalAgentComponent = True;
             this_Entity.MovingPhysicalAgentComponent= new_mesh.chunks[-1]
         elif(chunk.name == "CAnimAnimsetsParam"):
-            this_Entity.CAnimAnimsetsParam.append({ 'name': chunk.GetVariableByName("name").ToString(),
+            if chunk.GetVariableByName("animationSets"):
+                this_Entity.CAnimAnimsetsParam.append({ 'name': chunk.GetVariableByName("name").ToString(),
                                             'animationSets':list(map(lambda x: x.DepotPath, chunk.GetVariableByName("animationSets").ToArray()))
                                            })
         elif(chunk.name == "CAnimMimicParam"):
-            this_Entity.CAnimMimicParam.append({ 'name': "MimicSets",
-                                            'animationSets':list(map(lambda x: x.DepotPath, chunk.GetVariableByName("animationSets").ToArray()))
-                                           })
+            if chunk.GetVariableByName("animationSets"):
+                this_Entity.CAnimMimicParam.append({ 'name': "MimicSets",
+                                                'animationSets':list(map(lambda x: x.DepotPath, chunk.GetVariableByName("animationSets").ToArray()))
+                                            })
 
     
     

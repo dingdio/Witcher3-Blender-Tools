@@ -32,7 +32,6 @@ class AnimsResourceManager:
         # for row in reader:
         #     self.HashdumpDict[row["file"]+";"+row["id"]] = row["id"]
             #self.HashdumpDict[row["file"]] = row["cat1"]+" "+row["cat2"]+" "+row["cat3"]+": "+row["id"]+" "+row["caption"]+row["frames"]
-        print("cake")
     @staticmethod
     def Get():
         if (AnimsResourceManager.resourceManager == None):
@@ -94,43 +93,68 @@ def createCat(cat_name, dict):
 
 from io_import_w2l.filtered_list.animations_manager import CModStoryBoardAnimationListsManager
 from io_import_w2l.filtered_list.storyboardasset import CModStoryBoardActor
+
+def GetAnimationInfoByName(anim_name):
+    uncook_path = get_uncook_path(bpy.context)
+    manager = CModStoryBoardAnimationListsManager.active
+    fdir = None
+    found = False
+    for anim in manager._animMeta.animList:
+        if anim.id == anim_name:
+            fdir = anim.path # animation might not be proper
+            for anim_active in manager.active.active_list._items:
+                if anim_active.id == anim.slotId:
+                    fdir = anim.path
+                    found = True
+                    break
+            if found:
+                break
+    if fdir == None:
+        log.critical('Did not find animation!')
+        return (None, None)
+    #(, ) = item.animLineId.split(';')
+    fdir = os.path.join(uncook_path, fdir)
+    return (anim_name, fdir)
+
+def SetupActor(main_arm_obj):
+    #main_arm_obj = bpy.context.active_object
+    rig_settings = main_arm_obj.data.witcherui_RigSettings
+    animListsManager: CModStoryBoardAnimationListsManager = CModStoryBoardAnimationListsManager()
+
+    actor = CModStoryBoardActor()
+    
+    animset_list = rig_settings.animset_list
+    actor._animPaths = []
+    for set in animset_list:
+        if ":" not in set.path:
+            actor._animPaths.append(set.path)
+    
+    animListsManager.lazyLoad()
+
+    #TODO list should be filtered by the list of w2anims passed into it from the entity object
+    list = animListsManager.getAnimationListFor(actor)
+    #list.setWildcardFilter("")
+    filteredList = list.getFilteredList()
+    print(list.getMatchingItemCount(),"/",list.getTotalCount())
+    myAnims = bpy.context.scene.myAnimList
+    myAnims.clear()
+    for (i, item) in enumerate(filteredList):
+        anim = myAnims.add()
+        anim.id = str(item.id)
+        anim.prefix = item.prefix
+        anim.suffix = item.suffix
+        anim.caption = item.caption
+        anim.child_count = str(item.child_count)
+        anim.isSelected = item.isSelected
+        anim.name = "{}{}{}".format(item.prefix, item.caption, item.suffix)
+        anim.selfIndex = len(myAnims)-1
+        anim.animLineId = str(i)
+
 def SetupNodeData(context):
     ob = context.object
     if ob and ob.type == "ARMATURE" and "CMovingPhysicalAgentComponent" in ob.name:
         main_arm_obj = ob
-        
-        #main_arm_obj = bpy.context.active_object
-        rig_settings = main_arm_obj.data.witcherui_RigSettings
-        animListsManager: CModStoryBoardAnimationListsManager = CModStoryBoardAnimationListsManager()
-
-        actor = CModStoryBoardActor()
-        
-        animset_list = rig_settings.animset_list
-        actor._animPaths = []
-        for set in animset_list:
-            if ":" not in set.path:
-                actor._animPaths.append(set.path)
-        
-        animListsManager.lazyLoad()
-
-        #TODO list should be filtered by the list of w2anims passed into it from the entity object
-        list = animListsManager.getAnimationListFor(actor)
-        #list.setWildcardFilter("")
-        filteredList = list.getFilteredList()
-        print(list.getMatchingItemCount(),"/",list.getTotalCount())
-        myAnims = bpy.context.scene.myAnimList
-        myAnims.clear()
-        for (i, item) in enumerate(filteredList):
-            anim = myAnims.add()
-            anim.id = str(item.id)
-            anim.prefix = item.prefix
-            anim.suffix = item.suffix
-            anim.caption = item.caption
-            anim.child_count = str(item.child_count)
-            anim.isSelected = item.isSelected
-            anim.name = "{}{}{}".format(item.prefix, item.caption, item.suffix)
-            anim.selfIndex = len(myAnims)-1
-            anim.animLineId = str(i)
+        SetupActor(main_arm_obj)
 
 def FilterData(context):
     list = CModStoryBoardAnimationListsManager.active_list
@@ -151,6 +175,17 @@ def FilterData(context):
             anim.name = "{}{}{}".format(item.prefix, item.caption, item.suffix)
             anim.selfIndex = len(myAnims)-1
             anim.animLineId = str(i)
+
+def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0):
+    rig_settings = main_arm_obj.data.witcherui_RigSettings
+    if "_mimic_" in fdir:
+        result = load_bin_anims_single(fdir, anim_name, rigPath=rig_settings.main_face_skeleton)
+    else:
+        result = load_bin_anims_single(fdir, anim_name, rigPath=rig_settings.main_entity_skeleton)
+    animation = result.animations[0]
+    import_anims.import_anim(context, fdir, animation, use_NLA= True, NLA_track = NLA_track, at_frame = at_frame)
+    # print(fdir)
+    # print(anim_name)
 
 class MyAnimListItem_Debug(bpy.types.Operator):
     bl_idname = "witcher.myanimlist_debug"
@@ -177,14 +212,7 @@ class MyAnimListItem_Debug(bpy.types.Operator):
                 #(, ) = item.animLineId.split(';')
                 fdir = os.path.join(uncook_path, fdir)
                 
-                if "_mimic_" in fdir:
-                    result = load_bin_anims_single(fdir, anim_name, rigPath=rig_settings.main_face_skeleton)
-                else:
-                    result = load_bin_anims_single(fdir, anim_name, rigPath=rig_settings.main_entity_skeleton)
-                animation = result.animations[0]
-                import_anims.import_anim(context, fdir, animation, use_NLA= True)
-                print(fdir)
-                print(anim_name)
+                load_anim_into_scene(context, anim_name, fdir, main_arm_obj)
         elif "reset3" == action:
             print("=== Debug Reset ====")
             context.scene.anim_search_str = ""

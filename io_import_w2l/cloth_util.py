@@ -1,5 +1,5 @@
 from pathlib import Path
-from .w3_material import create_param, read_2wmi_params2, setup_w3_material
+from .w3_material import create_param, read_2wmi_params2, setup_w3_material, xml_data_from_CR2W
 from . import CR2W
 import bpy, os, filecmp, shutil
 from typing import List, Tuple, Dict
@@ -8,6 +8,7 @@ import re
 import numpy as np
 from xml.etree import ElementTree
 Element = ElementTree.Element
+from xml.dom import minidom
 
 from io_import_w2l import get_uncook_path
 from io_import_w2l import get_fbx_uncook_path
@@ -21,6 +22,13 @@ from io_scene_apx.importer.import_clothing import read_clothing
 from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
+def prettify(elem):
+    """Return a pretty-printed XML string for the Element.
+    """
+    rough_string = ElementTree.tostring(elem, 'utf-8')
+    reparsed = minidom.parseString(rough_string)
+    return reparsed.toprettyxml(indent="\t")
+
 def setup_w3_material_CR2W(
         uncook_path: str
         ,bl_material: Material
@@ -29,23 +37,25 @@ def setup_w3_material_CR2W(
         ,mat_filename = str
         ,is_instance_file = False
         ):
-        mat_base = mat_bin.GetVariableByName('baseMaterial').Handles[0].DepotPath
-        shader_type = mat_base.split("\\")[-1][:-5]	# The .w2mg or .w2mi file, minus the extension.
-
-        new_xml = ElementTree.Element('material')
-        new_xml.set('name', bl_material.name)
-        new_xml.set('local', "true")
-        new_xml.set('base', mat_base)
-
-        w2mi_params = read_2wmi_params2(mat_bin, uncook_path, mat_bin, shader_type)
-        for name, attrs in w2mi_params.items():
-            create_param(
-                xml_data = new_xml
-                ,name = name 
-                ,type = attrs[0]
-                ,value = attrs[1]
-            )
+        new_xml = xml_data_from_CR2W(mat_bin, bl_material.name)
         bl_material.use_nodes = True
+                    
+        ##return base mat path and if it is local chunk handle
+        bl_material.witcher_props.name = bl_material.name
+        #bl_material.witcher_props.base = "custom"
+        bl_material.witcher_props.base_custom = new_xml.get('base')
+        bl_material.witcher_props.local = True
+        bl_material.witcher_props.xml_text = prettify(new_xml)
+        #enableMask
+        # if hasattr(mat_bin , 'local') and mat_bin.local == True:
+        #     bl_material.witcher_props.local = True
+        if hasattr(mat_bin ,'DepotPath') and hasattr(mat_bin , 'local') and mat_bin.local == False:
+            bl_material.witcher_props.base_custom = mat_bin.DepotPath
+            bl_material.witcher_props.local = False
+        
+        enableMask = mat_bin.GetVariableByName('enableMask')
+        if enableMask and enableMask.Value == 1:
+            bl_material.witcher_props.enableMask = True
         return setup_w3_material(uncook_path, bl_material, xml_data=new_xml, xml_path=mat_filename, force_update=force_update, is_instance_file = is_instance_file)
 
 def load_w3_materials_CR2W(
@@ -159,8 +169,8 @@ def channel_id_to_idx(id):
     return 0
 
 
-def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="", ns="cake", name=":"):
-    
+def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="", ns="cloth", name=":", DO_WEAR_CLOTH = True):
+
     save_selected = bpy.context.selected_objects[:]
     save_active = bpy.context.view_layer.objects.active
     
@@ -186,92 +196,93 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
     arma_objs.sort(key=lambda x: x.name, reverse=True)
     arma = arma_objs[0]
     filename = Path(filepath).stem
-    
-    cloth_group = createEmpty(filename,"_grp")
-    collision_transform = createEmpty(filename, "Collision Spheres", cloth_group)
-    connections_transform = createEmpty(filename, "Collision Spheres Connections", cloth_group)
-    arma.parent = cloth_group
-    
-    arma.name = filename
-    arma.data.name = filename+"_ARM"
-    arma.select_set(True)
-    bpy.context.view_layer.objects.active = arma
-    
-    spheres_coll = bpy.data.collections.get("Collision Spheres")
-    connect_coll = bpy.data.collections.get("Collision Spheres Connections")
-    
-    if spheres_coll:
-        all_spheres_coll = np.concatenate((spheres_coll.all_objects, []))
-    if connect_coll:
-        all_connect_coll = np.concatenate(([], connect_coll.all_objects))
 
-    obj_dict = {}
-    constrains = []
-    if spheres_coll:
-        for obj in all_spheres_coll:
-            bone = obj.name[7:-2]
-            constrains.append([obj.name, bone])
-            obj_dict.update({obj.name : obj})
-            spheres_coll.objects.unlink(obj)
-        bpy.data.collections.remove(spheres_coll)
-    if connect_coll:
-        for obj in all_connect_coll:
-            x, y = obj.name.split('_to_')
-            bone = x[7:-2]
-            constrains.append([obj.name, bone])
-            obj_dict.update({obj.name : obj})
-            connect_coll.objects.unlink(obj)
-        bpy.data.collections.remove(connect_coll)
+    if DO_WEAR_CLOTH:
+        cloth_group = createEmpty(filename,"_grp")
+        collision_transform = createEmpty(filename, "Collision Spheres", cloth_group)
+        connections_transform = createEmpty(filename, "Collision Spheres Connections", cloth_group)
+        arma.parent = cloth_group
         
-    
-    
-    for constrain in constrains:
-        sphere = obj_dict[constrain[0]]
-        child_of = sphere.constraints.new('CHILD_OF')
-        child_of.name = constrain[1] + " to " + sphere.name
-        child_of.target = arma
-        child_of.subtarget = constrain[1]
-
-        # arm_child.data.bones.active = arm_child.data.bones[sphere.name]
-
-
-        # bpy.ops.object.mode_set(mode='EDIT', toggle=False)
-        # bpy.context.active_bone.parent = None
-        # bpy.ops.object.mode_set(mode='POSE', toggle=False)
-
-        #bpy.ops.constraint.childof_set_inverse(constraint=constrain[1] + " to " + sphere.name, owner='BONE')
-
-    
-    
-
-    if spheres_coll:
-        bpy.context.view_layer.objects.active = None
-        bpy.ops.object.select_all(action='DESELECT')
-        collision_transform.select_set(True)
-        bpy.context.view_layer.objects.active = collision_transform
-        for obj in all_spheres_coll:
-            active_coll.objects.link(obj)
-            obj.name = filename+":"+obj.name
-            col_obj = obj.modifiers.new("collision", 'COLLISION')
-            obj.select_set(True)
-            setOrigin(obj)
-        bpy.ops.object.parent_set(type='OBJECT', keep_transform=False)
+        arma.name = filename
+        arma.data.name = filename+"_ARM"
+        arma.select_set(True)
+        bpy.context.view_layer.objects.active = arma
         
-    if connect_coll:
-        bpy.context.view_layer.objects.active = None
-        bpy.ops.object.select_all(action='DESELECT')
-        connections_transform.select_set(True)
-        bpy.context.view_layer.objects.active = connections_transform
-        for obj in all_connect_coll:
-            active_coll.objects.link(obj)
-            obj.name = filename+":"+obj.name
-            col_obj = obj.modifiers.new("collision", 'COLLISION')
-            obj.select_set(True)
-        bpy.ops.object.parent_set(type='OBJECT', keep_transform=False)
+        spheres_coll = bpy.data.collections.get("Collision Spheres")
+        connect_coll = bpy.data.collections.get("Collision Spheres Connections")
+        
+        if spheres_coll:
+            all_spheres_coll = np.concatenate((spheres_coll.all_objects, []))
+        if connect_coll:
+            all_connect_coll = np.concatenate(([], connect_coll.all_objects))
+
+        obj_dict = {}
+        constrains = []
+        if spheres_coll:
+            for obj in all_spheres_coll:
+                bone = obj.name[7:-2]
+                constrains.append([obj.name, bone])
+                obj_dict.update({obj.name : obj})
+                spheres_coll.objects.unlink(obj)
+            bpy.data.collections.remove(spheres_coll)
+        if connect_coll:
+            for obj in all_connect_coll:
+                x, y = obj.name.split('_to_')
+                bone = x[7:-2]
+                constrains.append([obj.name, bone])
+                obj_dict.update({obj.name : obj})
+                connect_coll.objects.unlink(obj)
+            bpy.data.collections.remove(connect_coll)
+            
+        
+        
+        for constrain in constrains:
+            sphere = obj_dict[constrain[0]]
+            child_of = sphere.constraints.new('CHILD_OF')
+            child_of.name = constrain[1] + " to " + sphere.name
+            child_of.target = arma
+            child_of.subtarget = constrain[1]
+
+            # arm_child.data.bones.active = arm_child.data.bones[sphere.name]
+
+
+            # bpy.ops.object.mode_set(mode='EDIT', toggle=False)
+            # bpy.context.active_bone.parent = None
+            # bpy.ops.object.mode_set(mode='POSE', toggle=False)
+
+            #bpy.ops.constraint.childof_set_inverse(constraint=constrain[1] + " to " + sphere.name, owner='BONE')
+
+        
+        
+
+        if spheres_coll:
+            bpy.context.view_layer.objects.active = None
+            bpy.ops.object.select_all(action='DESELECT')
+            collision_transform.select_set(True)
+            bpy.context.view_layer.objects.active = collision_transform
+            for obj in all_spheres_coll:
+                active_coll.objects.link(obj)
+                obj.name = filename+":"+obj.name
+                col_obj = obj.modifiers.new("collision", 'COLLISION')
+                obj.select_set(True)
+                setOrigin(obj)
+            bpy.ops.object.parent_set(type='OBJECT', keep_transform=False)
+            
+        if connect_coll:
+            bpy.context.view_layer.objects.active = None
+            bpy.ops.object.select_all(action='DESELECT')
+            connections_transform.select_set(True)
+            bpy.context.view_layer.objects.active = connections_transform
+            for obj in all_connect_coll:
+                active_coll.objects.link(obj)
+                obj.name = filename+":"+obj.name
+                col_obj = obj.modifiers.new("collision", 'COLLISION')
+                obj.select_set(True)
+            bpy.ops.object.parent_set(type='OBJECT', keep_transform=False)
 
 
 
-    
+        
     bpy.context.view_layer.objects.active = None
     bpy.ops.object.select_all(action='DESELECT')
     GMesh_objs = []
@@ -280,7 +291,8 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
             GMesh_objs.append(ob)
     GMesh_objs.sort(key=lambda x: x.name, reverse=False)
     gmesh = GMesh_objs[0]
-    gmesh.name = filename+":"+gmesh.name
+    if DO_WEAR_CLOTH:
+        gmesh.name = filename+":"+gmesh.name
     
     for o in reversed(GMesh_objs):
         if "lod1" in o.name or \
@@ -289,7 +301,7 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
             "lod4" in o.name:
             bpy.data.objects.remove(o)
 
-    gmesh.select = True
+    gmesh.select_set(True)
     bpy.context.view_layer.objects.active = gmesh
 
     redcloth_material = CR2W.CR2W_reader.load_material(mat_filename)
@@ -302,30 +314,30 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
 
     load_w3_materials_CR2W(gmesh, uncook_path, materials, material_names, mat_filename=mat_filename)
     
+    if DO_WEAR_CLOTH:
+        vcol = gmesh.data.color_attributes['MaximumDistance']
+        
+        vgroup_id = 'SimplyPin'
+        vgroup = gmesh.vertex_groups.new(name=vgroup_id)
+        gmesh.vertex_groups.active_index = vgroup.index
 
-    vcol = gmesh.data.color_attributes['MaximumDistance']
-    
-    vgroup_id = 'SimplyPin'
-    vgroup = gmesh.vertex_groups.new(name=vgroup_id)
-    gmesh.vertex_groups.active_index = vgroup.index
-
-    color_to_weights(gmesh, vcol, 0, vgroup.index)
+        color_to_weights(gmesh, vcol, 0, vgroup.index)
 
 
-    def remove_doubles():
-        merge_threshold = 0.0001
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.mesh.remove_doubles(threshold = merge_threshold)
-        bpy.ops.mesh.select_all(action='DESELECT')
-    bpy.ops.object.mode_set(mode='EDIT', toggle=False)
-    remove_doubles()
-    bpy.ops.object.mode_set(mode='OBJECT')
+        def remove_doubles():
+            merge_threshold = 0.0001
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.remove_doubles(threshold = merge_threshold)
+            bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.object.mode_set(mode='EDIT', toggle=False)
+        remove_doubles()
+        bpy.ops.object.mode_set(mode='OBJECT')
 
-    bpy.context.view_layer.objects.active = None
-    bpy.ops.object.select_all(action='DESELECT')
-    bpy.context.view_layer.objects.active = save_active
-    for ob in save_selected:
-        ob.select_set(True)
+        bpy.context.view_layer.objects.active = None
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.context.view_layer.objects.active = save_active
+        for ob in save_selected:
+            ob.select_set(True)
         
 
     return arma

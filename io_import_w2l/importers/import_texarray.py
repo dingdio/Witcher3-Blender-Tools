@@ -74,7 +74,8 @@ def insert_color(mat, principled, tex, mapping, color_path):
     tex.image = bpy.data.images.load(color_path, check_existing=True)
     tex.image.colorspace_settings.name = 'sRGB'
     mat.node_tree.links.new(principled.inputs["Base Color"], tex.outputs[0])
-    mat.node_tree.links.new(tex.inputs["Vector"], mapping.outputs["Vector"])
+    if mapping:
+        mat.node_tree.links.new(tex.inputs["Vector"], mapping.outputs["Vector"])
 
 def insert_normal(mat, principled, normal_map_node):
     normal_map_node.location = (principled.location[0]-300, principled.location[1]-250)
