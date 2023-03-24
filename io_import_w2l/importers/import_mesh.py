@@ -90,6 +90,15 @@ root_folders = [
     "soundbanks"
 ]
 
+possible_folders = [
+    'files\\Raw\\Mod',
+    'files\\Raw\\DLC',
+    'files\\Mod\\Cooked',
+    'files\\Mod\\Uncooked',
+    'files\\DLC\\Cooked',
+    'files\\DLC\\Uncooked',
+]
+
 def get_repo_from_abs_path(file_path):
     UNCOOK_DIR = get_uncook_path(bpy.context)
     MOD_DIR = get_mod_directory(bpy.context)
@@ -97,6 +106,10 @@ def get_repo_from_abs_path(file_path):
     
     if MOD_DIR in file_path:
         file_path = file_path.replace(MOD_DIR+'\\', '')
+        for folder in possible_folders:
+            if folder in file_path:
+                file_path = file_path.replace(folder+'\\', '')
+                break
         return file_path
     elif UNCOOK_DIR in file_path:
         file_path = file_path.replace(UNCOOK_DIR+'\\', '')

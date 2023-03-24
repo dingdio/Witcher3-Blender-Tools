@@ -14,13 +14,26 @@ from xml.etree import ElementTree
 Element = ElementTree.Element
 
 from .w3_material_constants import *
-from io_import_w2l import get_modded_texture_path, get_uncook_path
+from io_import_w2l import get_modded_texture_path, get_uncook_path, get_mod_directory
 
 TEXTURE_EXT = '.tga'
 
+possible_folders = [
+    'files\\Raw\\Mod',
+    'files\\Raw\\DLC',
+]
+
 def repo_file(filepath: str):
     if filepath.endswith(TEXTURE_EXT):
-        return os.path.join(get_modded_texture_path(bpy.context), filepath)
+        modded_texture = os.path.join(get_modded_texture_path(bpy.context), filepath)
+        if os.path.exists(modded_texture):
+            return modded_texture
+        else:
+            for folder in possible_folders:
+                modded_texture = os.path.join(get_mod_directory(bpy.context)+'\\'+folder, filepath)
+                if os.path.exists(modded_texture):
+                   return modded_texture
+    return filepath
 
 def hide_unused_sockets(node, inp=True, out=True):
     if inp:
