@@ -174,25 +174,32 @@ def split_mesh_by_material_old(mesh_obj):
 
 import mathutils
 
+
+def get_mesh_median(mesh):
+    median = mathutils.Vector()
+    for v in mesh.vertices:
+        median += v.co
+    median /= len(mesh.vertices)
+    return median
+
+def calculate_mesh_radius(obj):
+    mesh = obj.data
+    radius = 0.0
+    median = get_mesh_median(mesh)
+    for v in mesh.vertices:
+        distance = (obj.matrix_world @ v.co - median).length
+        if distance > radius:
+            radius = distance
+    return radius
+
 def get_mesh_radius_and_bounding_box(mesh_object):
     bounding_box = mesh_object.bound_box
-
     x_coords = [v[0] for v in bounding_box]
     y_coords = [v[1] for v in bounding_box]
     z_coords = [v[2] for v in bounding_box]
     max_point = mathutils.Vector((max(x_coords), max(y_coords), max(z_coords)))
     min_point = mathutils.Vector((min(x_coords), min(y_coords), min(z_coords)))
-    center = (min_point + max_point)/2
-
-    generalizedMeshRadius = max(
-        (center - mathutils.Vector([min_point[0], center[1], center[2]])).length, 
-        (center - mathutils.Vector([max_point[0], center[1], center[2]])).length,
-        (center - mathutils.Vector([center[0], min_point[1], center[2]])).length, 
-        (center - mathutils.Vector([center[0], max_point[1], center[2]])).length,
-        (center - mathutils.Vector([center[0], center[1], min_point[2]])).length, 
-        (center - mathutils.Vector([center[0], center[1], max_point[2]])).length
-    ) * 2
-
+    generalizedMeshRadius = calculate_mesh_radius(mesh_object)
     return generalizedMeshRadius, [list(min_point), list(max_point)]
 
 class MeshExporter(object):
@@ -241,6 +248,8 @@ class MeshExporter(object):
             # Block3:[]
             # BoneIndecesMappingBoneIndex:[]
         nameMap = [] #self.__exportBones(meshes)
+        
+        #Note the mesh radius on vanilla w2mesh is calculated for all lods together.
         rad_box = get_mesh_radius_and_bounding_box(self.__meshes[0])
         
         #class Common_Info
@@ -262,9 +271,6 @@ class MeshExporter(object):
             del new_meshes
             ALL_LODS.append([mesh_data, m.witcherui_MeshSettings])
         #mesh_data_orig = [self.__loadMeshData(i, nameMap) for i in self.__meshes]
-        
-
-        
         
         self.cr2w = mesh_builder.BuildMesh(ALL_LODS, self.bone_data, common_info)
 
