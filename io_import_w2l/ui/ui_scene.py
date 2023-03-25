@@ -57,6 +57,11 @@ class ButtonOperatorImportW2scene(bpy.types.Operator, ImportHelper):
         #sceneImporter.execute()
         bpy.context.view_layer.update()
         return {'FINISHED'}
+    def invoke(self, context, event):
+        UNCOOK_PATH = os.path.join(get_uncook_path(context),"animations\\")
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
 
 class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
     """Import W2 Cutscee"""
@@ -70,6 +75,11 @@ class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
 
         cutscene_data = import_cutscene.import_w3_cutscene(self.filepath)
         return {'FINISHED'}
+    def invoke(self, context, event):
+        UNCOOK_PATH = os.path.join(get_uncook_path(context),"animations\\")
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
 
 from io_import_w2l import get_W3_VOICE_PATH
 from io_import_w2l.ui.ui_utils import WITCH_PT_Base
@@ -91,8 +101,8 @@ class WITCHER_PT_scene_panel(WITCH_PT_Base, Panel):
 
 
         row = self.layout.row()
-        op = row.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Import CS (.w2cutscene)", icon='SPHERE')
-        op.filepath = os.path.join(get_uncook_path(context),"animations\\")
+        row.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Import CS (.w2cutscene)", icon='SPHERE')
+        
 
         
         box = self.layout.box()
@@ -105,8 +115,8 @@ class WITCHER_PT_scene_panel(WITCH_PT_Base, Panel):
 
 
         row = self.layout.row()
-        op = row.operator(ButtonOperatorImportW2scene.bl_idname, text="Import Scene (.w2scene)", icon='SPHERE')
-        op.filepath = os.path.join(get_uncook_path(context),"animations\\")
+        row.operator(ButtonOperatorImportW2scene.bl_idname, text="Import Scene (.w2scene)", icon='SPHERE')
+        
         
         object = context.scene
         if object == None:

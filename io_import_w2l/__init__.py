@@ -81,7 +81,7 @@ from io_import_w2l.exporters import (
                                     )
 from io_import_w2l import constrain_util
 from io_import_w2l import file_helpers
-from io_import_w2l.cloth_util import setup_w3_material_CR2W
+#from io_import_w2l.cloth_util import setup_w3_material_CR2W
 
 
 #ui
@@ -94,6 +94,7 @@ from io_import_w2l.ui.ui_map import (WITCH_OT_w2L,
 from io_import_w2l.ui import ui_anims
 from io_import_w2l.ui import ui_entity
 from io_import_w2l.ui import ui_morphs
+from io_import_w2l.ui import ui_material
 from io_import_w2l.ui.ui_morphs import (WITCH_OT_morphs)
 
 from io_import_w2l.ui import ui_voice
@@ -105,6 +106,11 @@ from io_import_w2l.ui.ui_mesh import WITCH_OT_w2mesh, WITCH_OT_apx, WITCH_OT_w2m
 from io_import_w2l.ui.ui_utils import WITCH_PT_Base
 from io_import_w2l.ui.ui_entity import WITCH_OT_ENTITY_lod_toggle
 #from io_import_w2l.ui.ui_entity import WITCH_OT_w2ent_chara
+from io_import_w2l.ui.ui_entity import WITCH_OT_w2ent
+from io_import_w2l.ui.ui_material import WITCH_OT_w2mg, WITCH_OT_w2mi
+
+from io_import_w2l.ui.ui_anims import WITCH_OT_ImportW2Rig, WITCH_OT_ExportW2AnimJson, WITCH_OT_ExportW2RigJson
+
 from io_import_w2l import w3_material_nodes
 from io_import_w2l import w3_material_blender
 from io_import_w2l import w3_material_nodes_custom
@@ -242,101 +248,6 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         layout.prop(self, "use_fbx_repo")
         layout.prop(self, "fbx_uncook_path")
 
-class WITCH_OT_w2mg(bpy.types.Operator, ImportHelper):
-    """Load Witcher 3 Material Shader"""
-    bl_idname = "witcher.import_w2mg"
-    bl_label = "Import .w2mg"
-    filename_ext = ".w2mg"
-    filter_glob: StringProperty(default='*.w2mg', options={'HIDDEN'})
-    do_update_mats: BoolProperty(
-        name="Material Update",
-        default=True,
-        description="If enabled, it will replace the material with same name instead of creating a new one"
-    )
-    def execute(self, context):
-        print("importing material now!")
-        fdir = self.filepath
-        if os.path.isdir(fdir):
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        ext = file_helpers.getFilenameType(fdir)
-        if ext == ".w2mg":
-            w3_material_blender.import_w2mg(fdir, self)
-        else:
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-class WITCH_OT_w2mi(bpy.types.Operator, ImportHelper):
-    """Load Witcher 3 Material Instance"""
-    bl_idname = "witcher.import_w2mi"
-    bl_label = "Import .w2mi"
-    filename_ext = ".w2mi"
-    filter_glob: StringProperty(default='*.w2mi', options={'HIDDEN'})
-    do_update_mats: BoolProperty(
-        name="Material Update",
-        default=True,
-        description="If enabled, it will replace the material with same name instead of creating a new one"
-    )
-    def execute(self, context):
-        print("importing material instance now!")
-        fdir = self.filepath
-        if os.path.isdir(fdir):
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        ext = file_helpers.getFilenameType(fdir)
-        if ext == ".w2mi":
-            bpy.ops.mesh.primitive_plane_add()
-            obj = bpy.context.selected_objects[:][0]
-            instance_filename = Path(fdir).stem
-            materials = []
-            material_file_chunks = CR2W.CR2W_reader.load_material(fdir)
-            for idx, mat in enumerate(material_file_chunks):
-                # if idx > 0:
-                #     raise Exception('wut')
-                target_mat = False
-                if self.do_update_mats:
-                    if instance_filename in obj.data.materials:
-                        target_mat = obj.data.materials[instance_filename] #None
-                    if instance_filename in bpy.data.materials:
-                        target_mat = bpy.data.materials[instance_filename] #None
-                if not target_mat:
-                    target_mat = bpy.data.materials.new(name=instance_filename)
-
-                finished_mat = setup_w3_material_CR2W(get_texture_path(context), target_mat, mat, force_update=True, mat_filename=instance_filename, is_instance_file = True)
-
-                if instance_filename in obj.data.materials and not self.do_update_mats:
-                    obj.material_slots[target_mat.name].material = finished_mat
-                else:
-                    obj.data.materials.append(finished_mat)
-        else:
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-class WITCH_OT_w2ent(bpy.types.Operator, ImportHelper):
-    """Load Witcher 3 Entity File"""
-    bl_idname = "witcher.import_w2ent"
-    bl_label = "Import .w2ent"
-    filename_ext = ".w2ent, flyr"
-    def execute(self, context):
-        print("importing entity now!")
-        fdir = self.filepath
-        if os.path.isdir(fdir):
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        ext = file_helpers.getFilenameType(fdir)
-        if ext == ".flyr":
-            foliage = CR2W.CR2W_reader.load_foliage(fdir)
-            import_w2l.btn_import_w2ent(foliage)
-        elif ext == ".w2ent":
-            entity = CR2W.CR2W_reader.load_entity(fdir)
-            import_w2l.btn_import_w2ent(entity)
-        else:
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
 class WITCH_OT_ViewportNormals(bpy.types.Operator):
     bl_description = "Switch normal map nodes to a faster custom node. Get https://github.com/theoldben/BlenderNormalGroups addon to enable button"
     bl_idname = 'witcher.normal_map_group'
@@ -371,59 +282,6 @@ class WITCH_OT_AddConstraints(bpy.types.Operator):
             constrain_util.attach_weapon("l_weapon")
         return {'FINISHED'}
 
-class WITCH_OT_ImportW2Rig(bpy.types.Operator, ImportHelper):
-    """Load Witcher 3 .w2rig file or .w2rig.json"""
-    bl_idname = "witcher.import_w2_rig"
-    bl_label = "Import .w2rig"
-    filename_ext = ".w2rig, .w2rig.json; w3dyny"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    filter_glob: StringProperty(default='*.w2rig;*.w2rig.json;*.w3dyng;*.w3dyng.json', options={'HIDDEN'})
-
-    do_fix_tail: BoolProperty(
-        name="Connect bones",
-        default=False,
-        description="If enabled, an attempt will be made to connect tail bones. Currently this will mess up rotation of the bones and prevent applying w2anims but useful for creating IK rigs in Blender"
-    )
-    def execute(self, context):
-        print("importing rig now!")
-        fdir = self.filepath
-        if os.path.isdir(fdir):
-            #fdir = r"E:\w3.modding\modkit\r4data\gameplay\camera\model\camera.w2rig"
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        ext = file_helpers.getFilenameType(fdir)
-        if ext == ".w2rig" or ext == ".json":
-            import_rig.start_rig_import(fdir, "default", self.do_fix_tail, context=context)
-        elif ext ==".w3fac":
-            faceData = import_rig.loadFaceFile(fdir)
-            root_bone = import_rig.create_armature(faceData.mimicSkeleton, "yes", context=context)
-        return {'FINISHED'}
-
-class WITCH_OT_ExportW2RigJson(bpy.types.Operator, ExportHelper):
-    """export W2 rig Json"""
-    bl_idname = "witcher.export_w2_rig"
-    bl_label = "Export"
-    filename_ext = ".json"
-    filename = ".w2rig"
-    def execute(self, context):
-        obj = context.object
-        fdir = self.filepath
-        ext = file_helpers.getFilenameType(fdir)
-        import_rig.export_w3_rig(context, fdir)
-        return {'FINISHED'}
-
-class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
-    """export W2 Anim Json"""
-    bl_idname = "witcher.export_w2_anim"
-    bl_label = "Export"
-    filename_ext = ".json"
-    def execute(self, context):
-        obj = context.object
-        fdir = self.filepath
-        ext = file_helpers.getFilenameType(fdir)
-        export_anims.export_w3_anim(context, fdir)
-        return {'FINISHED'}
 
 class WITCH_OT_load_texarray(bpy.types.Operator, ImportHelper):
     """WITCH_OT_load_texarray"""
@@ -510,10 +368,8 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
         row = layout.row().box()
         row = row.column(align=True)
         row.label(text='Map Import')
-        op = row.operator(WITCH_OT_w2L.bl_idname, text="Layer (.w2l)", icon='SPHERE')
-        op.filepath = os.path.join(get_uncook_path(context),"levels\\")
-        op = row.operator(WITCH_OT_w2w.bl_idname, text="World (.w2w)", icon='WORLD_DATA')
-        op.filepath = get_uncook_path(context)+"\\levels\\"
+        row.operator(WITCH_OT_w2L.bl_idname, text="Layer (.w2l)", icon='SPHERE')
+        row.operator(WITCH_OT_w2w.bl_idname, text="World (.w2w)", icon='WORLD_DATA')
         row.operator(WITCH_OT_load_texarray.bl_idname, text="Texarray (.json)", icon='TEXTURE_DATA')
         row = layout.row().box()
         row = row.column(align=True)
@@ -567,22 +423,16 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
         row = layout.row().box()
         row = row.column(align=True)
         row.label(text='Material Import')
-        op = row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
-        op.filepath = get_uncook_path(context)+"\\"
-        op = row.operator(WITCH_OT_w2mg.bl_idname, text="Shader (.w2mg)", icon='MESH_DATA')
-        op.filepath = get_uncook_path(context)+"\\"
-        row.label(text='Material Export')
-        op = row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
-        op.filepath = get_uncook_path(context)+"\\"
+        row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
+        row.operator(WITCH_OT_w2mg.bl_idname, text="Shader (.w2mg)", icon='MESH_DATA')
+        # row.label(text='Material Export')
+        # row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
 
         #Entity
         row = layout.row().box()
         row = row.column(align=True)
         row.label(text='Entity Import')
-        op = row.operator(WITCH_OT_w2ent.bl_idname, text="Items (.w2ent)", icon='SPHERE')
-        op.filepath = os.path.join(get_uncook_path(context),"items\\")
-        # op = row.operator(WITCH_OT_w2ent_chara.bl_idname, text="Import .w2ent (Characters)", icon='SPHERE')
-        # op.filepath = os.path.join(get_uncook_path(context),"characters\\")
+        row.operator(WITCH_OT_w2ent.bl_idname, text="Items (.w2ent)", icon='SPHERE')
 
         #Animation
         row = layout.row().box()
@@ -597,8 +447,7 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
         row = layout.row().box()
         row = row.column(align=True)
         row.label(text='Animation Import')
-        op = row.operator(WITCH_OT_ImportW2Rig.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
-        op.filepath = os.path.join(get_uncook_path(context),"characters\\base_entities\\")
+        row.operator(WITCH_OT_ImportW2Rig.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
 
         row = layout.row().box()
         row = row.column(align=True)
@@ -647,15 +496,15 @@ _classes = [
     WITCH_OT_morphs,
     WITCH_OT_w2L,
     WITCH_OT_w2w,
-    WITCH_OT_w2mi,
-    WITCH_OT_w2mg,
-    WITCH_OT_w2ent,
+    # WITCH_OT_w2mi,
+    # WITCH_OT_w2mg,
+    #WITCH_OT_w2ent,
     WITCH_OT_radish_w2L,
     #anims
     WITCH_OT_AddConstraints,
-    WITCH_OT_ImportW2Rig,
-    WITCH_OT_ExportW2RigJson,
-    WITCH_OT_ExportW2AnimJson,
+    #WITCH_OT_ImportW2Rig,
+    # WITCH_OT_ExportW2RigJson,
+    # WITCH_OT_ExportW2AnimJson,
     WITCH_OT_ViewportNormals,
     WITCH_OT_load_layer,
     WITCH_OT_load_layer_group,
@@ -689,6 +538,7 @@ def register():
     for cls in _classes:
         register_class(cls)
     ui_entity.register()
+    ui_material.register()
     ui_morphs.register()
     ui_import_menu.register()
     #ui_map.register()
@@ -720,6 +570,7 @@ def unregister():
     #ui_map.unregister()
     ui_scene.unregister()
     ui_anims.unregister()
+    ui_material.unregister()
     ui_entity.unregister()
     ui_morphs.unregister()
     ui_voice.unregister()

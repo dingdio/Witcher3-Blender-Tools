@@ -34,9 +34,12 @@ def load_foliage(fileName_in = False):
     foliage = CR2W_file.create_level(CR2WFile, fileName)
     return foliage
 
+import os
 def load_material(fileName_in = False):
     if fileName_in:
         fileName = fileName_in
+    if not os.path.exists(fileName):
+        return []
     CR2WFile = CR2W_file.read_CR2W(fileName)
     #data = CR2W_file.create_level(CR2WFile, fileName)
     data = CR2WFile.CHUNKS.CHUNKS

@@ -6,6 +6,8 @@ import bpy
 from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
+from io_import_w2l import CR2W, file_helpers
+from io_import_w2l.importers import import_w2l
 from io_import_w2l.importers import import_entity
 from io_import_w2l.importers import import_anims
 from io_import_w2l.ui.ui_utils import WITCH_PT_Base
@@ -41,6 +43,34 @@ class WITCH_UL_ENTITY_List(UIList):
         elif self.layout_type in {'GRID'}:
             layout.alignment = 'CENTER'
             layout.label(text="")
+
+class WITCH_OT_w2ent(bpy.types.Operator, ImportHelper):
+    """Load Witcher 3 Entity File"""
+    bl_idname = "witcher.import_w2ent"
+    bl_label = "Import .w2ent"
+    filename_ext = ".w2ent, flyr"
+    def execute(self, context):
+        print("importing entity now!")
+        fdir = self.filepath
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        ext = file_helpers.getFilenameType(fdir)
+        if ext == ".flyr":
+            foliage = CR2W.CR2W_reader.load_foliage(fdir)
+            import_w2l.btn_import_w2ent(foliage)
+        elif ext == ".w2ent":
+            entity = CR2W.CR2W_reader.load_entity(fdir)
+            import_w2l.btn_import_w2ent(entity)
+        else:
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+    def invoke(self, context, event):
+        UNCOOK_PATH = os.path.join(get_uncook_path(context),"items\\")
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
 
 class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
     """Load a Witcher 3 character (.w2ent) file"""
@@ -100,6 +130,12 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
         log.info(message)
         self.report({'INFO'}, message)
         return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        UNCOOK_PATH = os.path.join(get_uncook_path(context),"characters\\")
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
 
 class WITCH_OT_ENTITY_list_loadapp(Operator):
     """ Add an Item to the UIList"""
@@ -154,7 +190,6 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
                 bpy.context.rig_settings.app_list.clear()
 
         return {'FINISHED'}
-
 
 class WITCH_OT_ENTITY_lod_toggle(Operator):
     """ Add an Item to the UIList"""
@@ -276,8 +311,7 @@ class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
         row = layout.row().box()
         row = row.column(align=True)
         row.label(text='Character')
-        op = row.operator(WITCH_OT_ENTITY_w2ent_chara.bl_idname, text="Import Character", icon='SPHERE')
-        op.filepath = os.path.join(get_uncook_path(context),"characters\\")
+        row.operator(WITCH_OT_ENTITY_w2ent_chara.bl_idname, text="Import Character", icon='SPHERE')
 
         
         ob = context.object
@@ -357,6 +391,7 @@ classes = [
     #ListItemAnimset,
     
     #operators
+    WITCH_OT_w2ent,
     WITCH_OT_ENTITY_w2ent_chara,
     WITCH_OT_ENTITY_list_loadapp,
     WITCH_OT_ENTITY_lod_toggle,

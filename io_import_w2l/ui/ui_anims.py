@@ -3,10 +3,11 @@ from pathlib import Path
 from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
-from io_import_w2l import fbx_util
+from io_import_w2l import fbx_util, file_helpers
 from io_import_w2l import get_uncook_path
 from io_import_w2l import get_W3_VOICE_PATH
-from io_import_w2l.importers import import_anims
+from io_import_w2l.importers import import_anims, import_rig
+from io_import_w2l.exporters import export_anims
 # from io_import_w2l.importers import import_cutscene
 # from io_import_w2l.importers import import_scene
 from io_import_w2l.ui.ui_utils import WITCH_PT_Base
@@ -16,7 +17,8 @@ import bpy
 from bpy.types import Panel, Operator, UIList, PropertyGroup
 from bpy.props import IntProperty, StringProperty, CollectionProperty, FloatProperty, BoolProperty
 from bpy_extras.io_utils import (
-        ImportHelper
+        ImportHelper,
+        ExportHelper
         )
 
 
@@ -470,6 +472,65 @@ class WITCH_OT_import_w3_fbx(Operator, ImportHelper):
 
         return {'FINISHED'}
 
+class WITCH_OT_ImportW2Rig(bpy.types.Operator, ImportHelper):
+    """Load Witcher 3 .w2rig file or .w2rig.json"""
+    bl_idname = "witcher.import_w2_rig"
+    bl_label = "Import .w2rig"
+    filename_ext = ".w2rig, .w2rig.json; w3dyny"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filter_glob: StringProperty(default='*.w2rig;*.w2rig.json;*.w3dyng;*.w3dyng.json', options={'HIDDEN'})
+
+    do_fix_tail: BoolProperty(
+        name="Connect bones",
+        default=False,
+        description="If enabled, an attempt will be made to connect tail bones. Currently this will mess up rotation of the bones and prevent applying w2anims but useful for creating IK rigs in Blender"
+    )
+    def execute(self, context):
+        print("importing rig now!")
+        fdir = self.filepath
+        if os.path.isdir(fdir):
+            #fdir = r"E:\w3.modding\modkit\r4data\gameplay\camera\model\camera.w2rig"
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        ext = file_helpers.getFilenameType(fdir)
+        if ext == ".w2rig" or ext == ".json":
+            import_rig.start_rig_import(fdir, "default", self.do_fix_tail, context=context)
+        elif ext ==".w3fac":
+            faceData = import_rig.loadFaceFile(fdir)
+            root_bone = import_rig.create_armature(faceData.mimicSkeleton, "yes", context=context)
+        return {'FINISHED'}
+    def invoke(self, context, event):
+        UNCOOK_PATH = os.path.join(get_uncook_path(context),"characters\\base_entities\\")
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
+
+class WITCH_OT_ExportW2RigJson(bpy.types.Operator, ExportHelper):
+    """export W2 rig Json"""
+    bl_idname = "witcher.export_w2_rig"
+    bl_label = "Export"
+    filename_ext = ".json"
+    filename = ".w2rig"
+    def execute(self, context):
+        obj = context.object
+        fdir = self.filepath
+        ext = file_helpers.getFilenameType(fdir)
+        import_rig.export_w3_rig(context, fdir)
+        return {'FINISHED'}
+
+class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
+    """export W2 Anim Json"""
+    bl_idname = "witcher.export_w2_anim"
+    bl_label = "Export"
+    filename_ext = ".json"
+    def execute(self, context):
+        obj = context.object
+        fdir = self.filepath
+        ext = file_helpers.getFilenameType(fdir)
+        export_anims.export_w3_anim(context, fdir)
+        return {'FINISHED'}
+
 
 #-----------------------------------------------------------------------------
 #
@@ -483,6 +544,9 @@ classes = [
     TOOL_OT_List_Reorder,
     WITCHER_PT_animset_panel,
     TOOL_OT_List_LoadAnim,
+    WITCH_OT_ImportW2Rig,
+    WITCH_OT_ExportW2RigJson,
+    WITCH_OT_ExportW2AnimJson,
 ]
 
 

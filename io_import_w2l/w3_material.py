@@ -529,9 +529,11 @@ def read_2wmi_params(
     #texture_paths = []
     uncook_path_mats = get_uncook_path(bpy.context)
     full_path = os.path.join(uncook_path_mats, w2mi_path)
-    material_bin = CR2W_reader.load_material(full_path)[0]
-
-    return read_2wmi_params2(material_bin)
+    if os.path.exists(full_path):
+        material_bin = CR2W_reader.load_material(full_path)[0]
+        return read_2wmi_params2(material_bin)
+    else:
+        return {}
 
 def guess_texture_type_by_link(mat: Material, img_node):
         socket_name = img_node.outputs[0].links[0].to_socket.name

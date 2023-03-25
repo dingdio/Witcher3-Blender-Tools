@@ -73,6 +73,11 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
         log.info(message)
         self.report({'INFO'}, message)
         return {'FINISHED'}
+    def invoke(self, context, event):
+        UNCOOK_PATH = os.path.join(get_uncook_path(context),"levels\\")
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
 
 class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
     """Load Witcher 3 Level"""
@@ -97,7 +102,11 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
             worldFile = CR2W.CR2W_reader.load_w2w(filePath)
             import_w2w.btn_import_w2w(worldFile, filePath)
         return {'FINISHED'}
-
+    def invoke(self, context, event):
+        UNCOOK_PATH = os.path.join(get_uncook_path(context),"levels\\")
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
 
 def import_group(coll, uncook_path):
     for child in coll.children:
