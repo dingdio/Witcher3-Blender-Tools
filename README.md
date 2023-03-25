@@ -1,23 +1,29 @@
 # Witcher 3 Blender Tools
 Blender addon for working with Witcher 3 files.
 
+<img src="https://user-images.githubusercontent.com/4729750/227740200-4722f6c0-fce9-43f5-a4c2-68d6b90c706a.jpg" height="200">
+
 ## Features
 
-- Mesh importer (.w2mesh)
+- Mesh importer/export (.w2mesh)
 - Rig import/export (.w2rig, .json)
 - Animation import/export (.w2anims, .json)
 - Map importer (.w2l, .w2w)
 - Basic map layer definition export for [radish tools](https://www.nexusmods.com/witcher3/mods/3620) (.yml)
 - Characters/Entity definition (.w2ent) importer
+- WIP Scene/Cutscene import (.w2scene, .w2cutscene)
 - Lipsync Animation (.cr2w)
 
-## Changelog
+## Changelog Latest
 
-### 02-Jan-2023 (v0.5):
+### 25-March-2023 (v0.6.0):
 #### **Changes**:
-* Mesh import (.w2mesh)
-* animation export (.json)
-* improverments to map and entity import
+* Mesh Export (.w2mesh) [wiki/Exporting-Mesh-Notes](https://github.com/dingdio/Witcher3-Blender-Tools/wiki/Exporting-Mesh-Notes) 
+* Tools for materials (.w2mi, .w2mg)
+* Cutscene import (.w2cutscene)
+* Scene import (.w2scene)
+* Improvements to character import (.w2ent)
+
 
 ## Requirements
 - Blender ~3.4.1
@@ -32,8 +38,6 @@ Blender addon for working with Witcher 3 files.
 
 ## Recommended 
 
-- [FBX Import plugin for blender](https://www.nexusmods.com/witcher3/mods/6118) - For working with any fbx files.
-
 - [BlenderNormalGroups](https://github.com/theoldben/BlenderNormalGroups) Can switch normal map nodes to a faster custom node for better animation playback.
 
 - [Prolog World Terrain Setup](https://mega.nz/file/WNZzCQQR#KICtWteq_OxwU_YKj4LU09kdJlBMqzzwIJd8DVGil4Q) - Not really required but has an example of how I set up basic terrain for the prolog world. It won't match how it looks in game but good enough to place game objects in blender. video - https://www.youtube.com/watch?v=qlRfUGMCyvQ
@@ -44,10 +48,12 @@ Launch Blender and activate the addon in Blender Preferences
 
 in the addon settings add your own paths to:
 - uncook_path = main repo where you exported all the game bundles with wcclite.exe .w2mesh files, .w2mi files, .w2ent etc.
-- tex_uncook_path = repo folder with ALL exported .tga from the game
+- tex_uncook_path = repo folder with ALL exported .tga from the game, add-on expects tga, no other format is supported
 - apx_uncook_path = repo folder with ALL exported .apx from the game
 
-All these folders can be the same repo.
+### WolvenKit 7 integration
+- WolvenKit 7 CLI = path to WolvenKit.CLI.exe
+- Your Wolvenkit Project Path = this is the default path meshes will export to. The mesh importer will also check this project first for raw .tga files when loading a new w2mesh
 
 ## Optional Setup
 
@@ -57,7 +63,8 @@ All these folders can be the same repo.
 - [Wiki about speech](https://github.com/dingdio/Witcher3_Blender_Tools/wiki/Speech-Notes)
 
 ### FBX repo settings
-
+>*The tools now import and export w2mesh directly it is not recommended to use FBX*
+- [FBX Import plugin for blender](https://www.nexusmods.com/witcher3/mods/6118) - For working with any fbx files.
 - fbx_uncook_path = repo folder with ALL exported .fbx from the game
 
 Since wcclite.exe has trouble exporting many fbx from the Witcher 3 game I have uploaded my collection of .fbx files along with Redcloth items in .apx format. Find them in this folder: [Folder Link](https://mega.nz/folder/GIR3AZBY#I4EEwkl4tjgnIv07f10n0A) These files are now optional for map/character loader since .w2mesh is now read directly. There is a toggle in settings to use fbx.
