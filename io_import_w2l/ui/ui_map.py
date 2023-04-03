@@ -48,7 +48,17 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
     keep_lod_meshes: BoolProperty(
         name="Keep LODs",
         default=False,
-        description="If enabled, it will keep low quality meshes. An extra empty transfrom will be created for each group of meshes."
+        description="If enabled, it will keep low quality meshes. An extra empty transfrom will be created for each group of meshes"
+    )
+    keep_empty_lods: BoolProperty(
+        name="Keep Empty LODs",
+        default=False,
+        description="If enabled, it will keep empty mesh LODs with zero polygons"
+    )
+    keep_proxy_meshes: BoolProperty(
+        name="Keep Proxy Meshes",
+        default=True,
+        description="If enabled, it will always keep any proxy meshes regardless of lod"
     )
     def execute(self, context):
         print("Importing layer now!")
@@ -64,7 +74,9 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
                 filepath = str(cur_dir / file.name)
                 print("Importing file:", filepath)
                 levelFile = CR2W.CR2W_reader.load_w2l(filepath)
-                import_w2l.btn_import_W2L(levelFile, context, self.keep_lod_meshes)
+                import_w2l.btn_import_W2L(levelFile, context, self.keep_lod_meshes,
+                                          keep_empty_lods = self.keep_empty_lods,
+                                          keep_proxy_meshes = self.keep_proxy_meshes)
         else:
             log.warn('Did not select .w2l')
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")

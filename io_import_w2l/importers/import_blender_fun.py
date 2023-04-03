@@ -199,7 +199,11 @@ from collections import defaultdict
 
 #global repo_lookup_list
 
-def loadLevel(levelData, context = None, keep_lod_meshes = False):
+def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs):
+
+    #keep_empty_lods = kwargs.get('keep_empty_lods', False)
+    #keep_proxy_meshes = kwargs.get('keep_proxy_meshes', False)
+    
     if context == None:
         context = bpy.context
     # global repo_lookup_list
@@ -248,7 +252,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes = False):
                     tree_mesh.meshName = treeFilePath
                     tree_mesh.transform = treeTransform
                     tree_mesh.type = "mesh_foliage"
-                    import_single_mesh(tree_mesh, errors, keep_lod_meshes = keep_lod_meshes)
+                    import_single_mesh(tree_mesh, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
             for treeCollection in levelData.Foliage.Grasses.elements:
                 treeFilePath = treeCollection.TreeType.DepotPath
                 for treeTransform in treeCollection.TreeCollection.elements:
@@ -256,7 +260,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes = False):
                     tree_mesh.meshName = treeFilePath
                     tree_mesh.transform = treeTransform
                     tree_mesh.type = "mesh_foliage"
-                    import_single_mesh(tree_mesh, errors, keep_lod_meshes = keep_lod_meshes)
+                    import_single_mesh(tree_mesh, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
 
         mesh_list = get_CSectorData(levelData)
         if mesh_list:
@@ -282,27 +286,27 @@ def loadLevel(levelData, context = None, keep_lod_meshes = False):
             for idx, mesh in enumerate(mesh_list):
                 #wm.progress_update(idx)
                 if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh:
-                    import_single_mesh(mesh, errors, Mesh_transform, keep_lod_meshes = keep_lod_meshes)
+                    import_single_mesh(mesh, errors, Mesh_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
                     continue
                 if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision:
-                    import_single_mesh(mesh, errors, Collision_transform, keep_lod_meshes = keep_lod_meshes)
+                    import_single_mesh(mesh, errors, Collision_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
                     continue
                 if mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody:
-                    import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes)
+                    import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
                     continue
             #wm.progress_end()
 
         for INCLUDE_OBJECT in levelData.includes:
             for ENTITY_OBJECT in INCLUDE_OBJECT.Entities:
                 if ENTITY_OBJECT.type in Entity_Type_List:
-                    import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes)
+                    import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
             
         for ENTITY_OBJECT in levelData.Entities:
             if ENTITY_OBJECT.type in Entity_Type_List:
-                import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes)
+                import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
         # for idx, ENTITY_OBJECT in enumerate(levelData.meshes):
         #     if ENTITY_OBJECT.type == "Mesh": #A SINGLE MESH WITH NO COMPONENTS
-        #         import_single_mesh(ENTITY_OBJECT, errors)
+        #         import_single_mesh(ENTITY_OBJECT, errors, **kwargs)
         #         #log.info(idx, ENTITY_OBJECT.translation.x,ENTITY_OBJECT.translation.y,ENTITY_OBJECT.translation.z)
         #     if ENTITY_OBJECT.type == "CGameplayEntity" or ENTITY_OBJECT.type == "CSectorData": #A ENTITY WITH A TRANSFORM AND LIST OF MESH/LIGHTS
         #         import_gameplay_entity(ENTITY_OBJECT, errors)
@@ -406,7 +410,7 @@ def check_if_mesh_already_in_scene(repo_path):
             return new_obj
     return False
 
-def import_single_mesh(mesh, errors, parent_transform = False, keep_lod_meshes = False):
+def import_single_mesh(mesh, errors, parent_transform = False, keep_lod_meshes = False, **kwargs):
     use_fbx = get_use_fbx_repo(bpy.context)
 
     obj = check_if_empty_already_in_scene(mesh.meshName)
@@ -428,7 +432,7 @@ def import_single_mesh(mesh, errors, parent_transform = False, keep_lod_meshes =
                 if use_fbx and os.path.exists(mesh.fbxPath()):
                     fbx_util.importFbx(mesh.fbxPath(),mesh.fileName(),mesh.fileName(), keep_lod_meshes=keep_lod_meshes)
                 elif not use_fbx:
-                    import_mesh.import_mesh(mesh.uncookedPath(), keep_lod_meshes = keep_lod_meshes)
+                    import_mesh.import_mesh(mesh.uncookedPath(), keep_lod_meshes = keep_lod_meshes, keep_empty_lods = kwargs.get('keep_empty_lods', False), keep_proxy_meshes = kwargs.get('keep_proxy_meshes', False))
                 else:
                     print("Can't find FBX file", mesh.fbxPath())
                     bpy.ops.mesh.primitive_cube_add()
@@ -559,10 +563,10 @@ def getDataBufferMesh(entity):
 
     return (mesh_list, cloth_list)
 
-def import_single_component(component, parent_obj, keep_lod_meshes = False):
+def import_single_component(component, parent_obj, keep_lod_meshes = False, **kwargs):
     if component.name == "CMeshComponent":
         mesh = meshPath(fbx_uncook_path = get_fbx_uncook_path(bpy.context)).static_from_chunk(component)
-        import_single_mesh(mesh, [], parent_obj, keep_lod_meshes = keep_lod_meshes)
+        import_single_mesh(mesh, [], parent_obj, keep_lod_meshes = keep_lod_meshes, **kwargs)
     elif component.name == "CPointLightComponent":
         bpy.ops.object.light_add(type='POINT', radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
         light_obj = bpy.context.selected_objects[:][0]
@@ -610,7 +614,7 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False):
         light_obj.data.spot_size = component.GetVariableByName('outerAngle').Value
         #light_obj.data.spot_size = component.GetVariableByName('softness').Value
 
-def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_meshes = False):
+def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_meshes = False, **kwargs):
     #TRANSFORM FOR THIS ENTITY
     bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
     empty_transform = bpy.context.object
@@ -627,7 +631,7 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
         raise e
     if mesh_list:
         for mesh in mesh_list:
-            import_single_mesh(mesh, errors, empty_transform, keep_lod_meshes = keep_lod_meshes)
+            import_single_mesh(mesh, errors, empty_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
     if cloth_list:
         for chunk in cloth_list:
             try:
@@ -641,10 +645,10 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
                 log.critical('Problem with cloth import')
     
     for component in ENTITY_OBJECT.Components:
-        import_single_component(component, empty_transform, keep_lod_meshes = keep_lod_meshes)
+        import_single_component(component, empty_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
     #MESH THIS ENTITY HAS
     # for mesh in ENTITY_OBJECT.static_mesh_list:
-    #     import_single_mesh(mesh, errors, empty_transform)
+    #     import_single_mesh(mesh, errors, empty_transform, **kwargs)
     if ENTITY_OBJECT.isCreatedFromTemplate:
         empty_transform['entity_type'] = ENTITY_OBJECT.type
         empty_transform['template'] = ENTITY_OBJECT.templatePath
@@ -662,9 +666,9 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
             import_gameplay_entity(entity, errors, empty_transform, keep_lod_meshes = keep_lod_meshes)
             # mesh_list = getDataBufferMesh(entity)
             # for mesh in mesh_list:
-            #     import_single_mesh(mesh, errors, empty_transform)
+            #     import_single_mesh(mesh, errors, empty_transform, **kwargs)
             # for component in entity.Components:
-            #     import_single_component(component, empty_transform)
+            #     import_single_component(component, empty_transform, **kwargs)
 
     if ENTITY_OBJECT.transform:
         set_blender_object_transform(empty_transform, ENTITY_OBJECT.transform)

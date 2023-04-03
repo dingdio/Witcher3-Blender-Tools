@@ -323,7 +323,12 @@ class ButtonOperatorImportW2Anims(bpy.types.Operator, ImportHelper):
         fdir = self.filepath
         import_anims.start_import(context, fdir)
         return {'FINISHED'}
-    
+    def invoke(self, context, event):
+        UNCOOK_PATH = os.path.join(get_uncook_path(context),"animations\\")
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
+
 class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
     #bl_parent_id = "WITCH_PT_ENTITY_Panel"
     bl_idname = "WITCHER_PT_animset_panel"
@@ -344,8 +349,7 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
         op.filepath = get_W3_VOICE_PATH(bpy.context) #r"\w3.modding\radish-tools\docs.speech\enpc.w3speech-extracted_GOOD\enpc.w3speech-extracted"
 
         row = self.layout.row()
-        op = row.operator(ButtonOperatorImportW2Anims.bl_idname, text="Import Set (.w2anims)", icon='SPHERE')
-        op.filepath = os.path.join(get_uncook_path(context),"animations\\")
+        row.operator(ButtonOperatorImportW2Anims.bl_idname, text="Import Set (.w2anims)", icon='SPHERE')
 
         box = self.layout.box()
         row = box.row()

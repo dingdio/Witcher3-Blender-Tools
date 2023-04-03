@@ -126,6 +126,51 @@ def convert_to_index_values(string_array, second_array):
     return index_array
 
 import bmesh
+def separate_mesh_by_verts(obj, num_verts):
+    mesh = obj.data
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+
+    if len(mesh.vertices) > num_verts:
+        vert_group = obj.vertex_groups.new(name="Separated")
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        for face in mesh.polygons:
+            ignore = False
+            for vert in face.vertices:
+                if vert >= num_verts:
+                    ignore = True
+            if not ignore:
+                vert_group.add(face.vertices, 1.0, 'REPLACE')
+
+        # for vert in mesh.vertices:
+        #     if vert.index >= num_verts:
+        #         vert_group.add([vert.index], 1.0, 'REPLACE')
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='VERT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.object.vertex_group_set_active(group=vert_group.name)
+        bpy.ops.object.vertex_group_select()
+        bpy.ops.mesh.separate(type='SELECTED')
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        new_meshes = bpy.context.selected_objects[:]
+        test_mesh = len(new_meshes[0].data.vertices)
+        fixed_mesh = len(new_meshes[1].data.vertices)
+        
+        if fixed_mesh > num_verts:
+            raise Exception('Bad split')
+        
+        submeshes = []
+        for mesh in reversed(new_meshes):
+            group = mesh.vertex_groups.get("Separated")
+            mesh.vertex_groups.remove(group)
+            submeshes.extend(separate_mesh_by_verts(mesh, num_verts))
+        return submeshes
+    else:
+        return [obj]
 
 
 def split_mesh_by_material(mesh_obj):
@@ -143,38 +188,46 @@ def split_mesh_by_material(mesh_obj):
     new_meshes = bpy.context.selected_objects[:]
     first_element = new_meshes.pop(0)
     new_meshes.append(first_element)
-    return new_meshes
+    #return new_meshes
+    
+    #! seperate work
+    final_meshes = []
+    
+    for mesh in new_meshes:
+        mesh_chunks = separate_mesh_by_verts(mesh, 65534)
+        final_meshes.extend(mesh_chunks)
+    
+    return final_meshes
 
-def split_mesh_by_material_old(mesh_obj):
-    bm = bmesh.new()
-    bm.from_mesh(mesh_obj.data)
-    new_meshes = {}
-    for mat in mesh_obj.material_slots:
-        new_mesh = bpy.data.meshes.new(mat.name)
-        new_mesh.materials.append(mat.material)
-        new_bm = bmesh.new()
-        vert_map = {}
-        added_verts = set()
-        for face in bm.faces:
-            if face.material_index == mat.slot_index:
-                new_face_verts = []
-                for v in face.verts:
-                    if v.index not in vert_map:
-                        new_v = new_bm.verts.new(v.co)
-                        vert_map[v.index] = new_v
-                        added_verts.add(new_v)
-                    new_face_verts.append(vert_map[v.index])
-                new_bm.faces.new(new_face_verts)
-        new_bm.to_mesh(new_mesh)
-        new_bm.free()
-        new_mesh_obj = bpy.data.objects.new(mat.name, new_mesh)
-        new_meshes[mat.name] = new_mesh_obj
-    bm.free()
-    return new_meshes
+# def split_mesh_by_material_old(mesh_obj):
+#     import bmesh
+#     bm = bmesh.new()
+#     bm.from_mesh(mesh_obj.data)
+#     new_meshes = {}
+#     for mat in mesh_obj.material_slots:
+#         new_mesh = bpy.data.meshes.new(mat.name)
+#         new_mesh.materials.append(mat.material)
+#         new_bm = bmesh.new()
+#         vert_map = {}
+#         added_verts = set()
+#         for face in bm.faces:
+#             if face.material_index == mat.slot_index:
+#                 new_face_verts = []
+#                 for v in face.verts:
+#                     if v.index not in vert_map:
+#                         new_v = new_bm.verts.new(v.co)
+#                         vert_map[v.index] = new_v
+#                         added_verts.add(new_v)
+#                     new_face_verts.append(vert_map[v.index])
+#                 new_bm.faces.new(new_face_verts)
+#         new_bm.to_mesh(new_mesh)
+#         new_bm.free()
+#         new_mesh_obj = bpy.data.objects.new(mat.name, new_mesh)
+#         new_meshes[mat.name] = new_mesh_obj
+#     bm.free()
+#     return new_meshes
 
 import mathutils
-
-
 def get_mesh_median(mesh):
     median = mathutils.Vector()
     for v in mesh.vertices:
@@ -262,6 +315,7 @@ class MeshExporter(object):
         #boundingBox
 
         # MESH STUFF
+        #todo chunks are stored in reversed sort order by faces
         ALL_LODS = []
         for m in self.__meshes:
             new_meshes = split_mesh_by_material(m)
@@ -269,6 +323,19 @@ class MeshExporter(object):
             for mesh in new_meshes:
                 bpy.data.meshes.remove(mesh.data)
             del new_meshes
+
+            # final_mesh_data = []
+
+            # for d in mesh_data:
+            #     cake = d[0]
+            #     num_in = cake.meshInfo.numVertices
+            #     if num_in > 65534:
+            #         split_data = cake.split_data()
+            #         for data in split_data:
+            #             final_mesh_data.append([data, d[1]])
+            #     else:
+            #         final_mesh_data.append(d)
+
             ALL_LODS.append([mesh_data, m.witcherui_MeshSettings])
         #mesh_data_orig = [self.__loadMeshData(i, nameMap) for i in self.__meshes]
         

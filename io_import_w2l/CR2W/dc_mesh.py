@@ -23,6 +23,55 @@ class MeshData(object):
         self.normalsAll = []
         self.skinningVerts = []
         self.vertexColor = []
+        self.meshInfo = [SMeshInfos]
+
+    #!Not currently in use
+    def split_data(self):
+        num_verts = 65534
+        num_splits = (len(self.vertex3DCoords) + num_verts - 1) // num_verts
+        split_data = []
+        vertex_faces = {}
+        used_faces = set()
+        for i, face in enumerate(self.faces):
+            for vertex_index in face:
+                if vertex_index not in vertex_faces:
+                    vertex_faces[vertex_index] = set()
+                vertex_faces[vertex_index].add(i)
+
+        for i in range(num_splits):
+            split_mesh = MeshData()
+            start_index = i * num_verts
+            end_index = min((i + 1) * num_verts, len(self.vertex3DCoords))
+            split_mesh.vertex3DCoords = self.vertex3DCoords[start_index:end_index]
+            split_mesh.UV_vertex3DCoords = self.UV_vertex3DCoords[start_index:end_index]
+            split_mesh.UV2_vertex3DCoords = self.UV2_vertex3DCoords[start_index:end_index]
+            split_mesh.tangent_vector = self.tangent_vector[start_index:end_index]
+            split_mesh.extra_vectors = self.extra_vectors[start_index:end_index]
+            split_mesh.faces = self.faces[start_index:end_index]
+            split_mesh.normals = self.normals[start_index:end_index]
+            split_mesh.normalsAll = self.normalsAll[start_index:end_index*3]
+            split_mesh.skinningVerts = self.skinningVerts[start_index:end_index]
+            split_mesh.vertexColor = self.vertexColor[start_index:end_index]
+            faces = []
+            for idx in reversed(range(start_index, end_index)):
+                for face_index in vertex_faces.get(idx, []):
+                    if face_index not in used_faces:
+                        faces.append(self.faces[face_index])
+                        used_faces.add(face_index)
+            split_mesh.faces = self.faces[start_index:len(faces)]
+            split_mesh.meshInfo = SMeshInfos()
+            split_mesh.meshInfo.numVertices = self.meshInfo
+            split_mesh.meshInfo.numIndices = self.meshInfo
+            split_mesh.meshInfo.numBonesPerVertex = self.meshInfo
+            split_mesh.meshInfo.firstVertex = self.meshInfo
+            split_mesh.meshInfo.firstIndex = self.meshInfo
+            split_mesh.meshInfo.vertexType = self.meshInfo
+            split_mesh.meshInfo.materialID = self.meshInfo
+            split_mesh.meshInfo.lod = self.meshInfo 
+            split_mesh.meshInfo.distance = self.meshInfo 
+            split_data.append(split_mesh)
+        return split_data
+
 
 def lin2srgb(lin):
     if lin > 0.0031308:
@@ -38,7 +87,7 @@ def srgb2lin(s):
         lin = pow(((s + 0.055) / 1.055), 2.4)
     return lin
 
-def load_bin_mesh(filename, keep_lod_meshes = True):
+def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
     #OPTIONS
     cToLin = True
     
@@ -51,10 +100,13 @@ def load_bin_mesh(filename, keep_lod_meshes = True):
     f = open(filename,"rb")
     meshFile = getCR2W(f)
     meshName = Path(meshFile.fileName).stem
+    if "proxy" in meshName and keep_proxy_meshes:
+        keep_lod_meshes = True
 
     CData:CommonData = CommonData()
     CData.modelPath = meshFile.fileName
     CData.modelName = meshName
+    CData.meshDataAllMeshes = []
     bonePositions: List[Vector3D] = []
     
     bufferInfos:SBufferInfos = SBufferInfos()
@@ -166,12 +218,22 @@ def load_bin_mesh(filename, keep_lod_meshes = True):
             CData.useExtraStreams = chunk.GetVariableByName("useExtraStreams").Value if chunk.GetVariableByName("useExtraStreams") else None
             CData.mergeInGlobalShadowMesh = chunk.GetVariableByName("mergeInGlobalShadowMesh").Value if chunk.GetVariableByName("mergeInGlobalShadowMesh") else None
             CData.entityProxy = chunk.GetVariableByName("entityProxy").Value if chunk.GetVariableByName("entityProxy") else None
+            CData.isStatic = chunk.GetVariableByName("isStatic").Value if chunk.GetVariableByName("isStatic") else False
 
             ChunkgroupIndeces = chunk.CMesh.ChunkgroupIndeces
             for idx, PaddedBuffer in enumerate(ChunkgroupIndeces.elements):#list of lods
-                for chunkIndex in PaddedBuffer.elements:#chunk list for single lod
-                    CData.meshInfos[chunkIndex.val].lod = idx
-                    CData.meshInfos[chunkIndex.val].distance = PaddedBuffer.padding
+                
+                if PaddedBuffer.elements:
+                    for chunkIndex in PaddedBuffer.elements:#chunk list for single lod
+                        CData.meshInfos[chunkIndex.val].lod = idx
+                        CData.meshInfos[chunkIndex.val].distance = PaddedBuffer.padding
+                else:
+                    #for lod levels with no chunks assigned create a blank meshinfo
+                    meshInfo:SMeshInfos = SMeshInfos()
+                    meshInfo.lod = idx
+                    meshInfo.distance = PaddedBuffer.padding
+                    CData.meshInfos.append(meshInfo)
+            CData.meshInfos.sort(key=lambda x: x.lod)
             # bone names and matrices
             boneNames = chunk.CMesh.BoneNames
             bonematrices = chunk.CMesh.Bonematrices
@@ -187,7 +249,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True):
             CData.boneData.Block3 = [el.val for el in chunk.CMesh.Block3.elements] if hasattr(chunk, "CMesh") and hasattr(chunk.CMesh, "Block3") and hasattr(chunk.CMesh.Block3, "elements") else []
 
     read_lods = keep_lod_meshes
-    CData.meshDataAllMeshes = []
+
     # TODO BETTER CHECK OF COOKED/UNCOOKED
     if rawVertices:
         #=====================================================================#
@@ -422,7 +484,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True):
                     vf = br.ReadHalfFloat()
                     final_meshdata.UV_vertex3DCoords.append([uf,(vf*-1)+1]) # flip
 
-                br.seek(vBufferInf.normalsOffset + firstVertexOffset * 8) 
+                br.seek(vBufferInf.normalsOffset + firstVertexOffset * 8)
                 for i in range(meshInfo.numVertices):
                     bytesN = br.read(4) #normal
                     bytesT = br.read(4) #tangent

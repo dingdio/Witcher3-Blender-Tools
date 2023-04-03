@@ -101,6 +101,10 @@ class AnimImporter:
             length = end_frame - start_frame
             target_strip.frame_end = self.__frame_current + length
             target_strip.blend_type = 'REPLACE'
+            
+            if self.__NLA_track:
+                if self.__NLA_track == 'mimic_import' or self.__NLA_track == 'voice_import' or self.__NLA_track == 'anim_import':
+                    target_strip.blend_type = 'COMBINE'
             # try:
             #     __frame_start = self.__NLA_frame_margin + self.__frame_current #TODO exact float start
             #     target_strip = target_track.strips.new(action.name, int(__frame_start), action)

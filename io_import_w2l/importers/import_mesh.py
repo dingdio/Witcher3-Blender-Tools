@@ -38,19 +38,23 @@ def import_mesh(filename:str,
                 do_import_armature:bool = True,
                 keep_lod_meshes:bool = False,
                 do_merge_normals:bool = False,
-                rotate_180:bool = False) -> w3_types.CSkeletalAnimationSet:
+                rotate_180:bool = False,
+                keep_empty_lods:bool = False,
+                keep_proxy_meshes:bool = False) -> w3_types.CSkeletalAnimationSet:
     dirpath, file = os.path.split(filename)
     basename, ext = os.path.splitext(file)
     if ext.lower() in ('.w2mesh'):
         with open(filename) as file:
             try:
-                (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile) = io_import_w2l.CR2W.dc_mesh.load_bin_mesh(filename, keep_lod_meshes)
+                (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile) = io_import_w2l.CR2W.dc_mesh.load_bin_mesh(filename, keep_lod_meshes, keep_proxy_meshes)
                 (final_bl_meshes, armatures) = prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, meshName, meshFile,
                     do_import_mats,
                     do_import_armature,
                     keep_lod_meshes,
                     do_merge_normals,
-                    rotate_180)
+                    rotate_180,
+                    keep_empty_lods,
+                    keep_proxy_meshes)
                 
                 if rotate_180:
                     if armatures:
@@ -134,7 +138,9 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                 do_import_armature,
                 keep_lod_meshes,
                 do_merge_normals,
-                rotate_180):
+                rotate_180,
+                keep_empty_lods,
+                keep_proxy_meshes):
     #TODO proxy meshes don't have lod0 they start at lod1, should import proxy anyway if requested
     #meshData = meshFile
     created_mesh_bl = []
@@ -148,6 +154,8 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
         #TODO some meshes seem to have no real data and should be discarded, prob a result of auto LOD creation
         #TODO trying to create them crashes blender
         skip = True
+        if not meshDataBl.vertex3DCoords and keep_empty_lods:
+            skip = False # most likely a proxy mesh with zero verts
         for faces in meshDataBl.faces:
             if faces.count(0) == 3:
                 continue
@@ -172,15 +180,6 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                     obj.witcherui_MeshSettings['useExtraStreams'] = CData.useExtraStreams
                     obj.witcherui_MeshSettings['mergeInGlobalShadowMesh'] = CData.mergeInGlobalShadowMesh
                     obj.witcherui_MeshSettings['entityProxy'] = CData.entityProxy
-                    
-                # autohideDistance="100.00"
-                # isTwoSided="false"
-                # useExtraStreams="true"
-                # mergeInGlobalShadowMesh="true"
-                # entityProxy="false"
-                # <LOD_info distance="0.00" />
-                # <LOD_info distance="5.00" />
-                # <LOD_info distance="12.00" />
                 created_mesh_bl.append(obj)
         except Exception as e:
             log.error("warning couldn't create one of the meshes at index ", idx)
@@ -296,7 +295,7 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                         armature_mod = mesh_obj.modifiers.new(name="Armature", type='ARMATURE')
                         armature_mod.object = armature_obj
                         armature_mod.use_vertex_groups = True
-                if not keep_lod_meshes:
+                if not keep_lod_meshes and not keep_proxy_meshes:
                     break
                         # if bl_mesh != lod_meshes[0]:
                         #     lod_meshes[0].append(bl_mesh)
@@ -443,15 +442,13 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
         for idx in CData.boneData.BoneIndecesMappingBoneIndex:
             mesh_ob.vertex_groups.new(name=CData.boneData.jointNames[idx])
         for vert in meshDataBl.skinningVerts:
-            assignVertexGroup(vert, CData, mesh_ob)
+            try:
+                assignVertexGroup(vert, CData, mesh_ob)
+            except Exception as e:
+                if CData.isStatic:
+                    log.critical('found skinning verts on static mesh')
+                    break
 
-        #! REMOVE ###################
-        #group_names = [group.name for group in mesh_ob.vertex_groups]
-        #test_plane = bpy.data.objects['Mesh_lod0']#['body_03_wa__ciri_Mesh']#['Plane']
-        #meshDataBl = get_mesh_info(test_plane.data, test_plane, meshDataBl)
-        #get_mesh_info(mesh, mesh_ob, meshDataBl)
-        #! REMOVE
-        
         return mesh_ob
     except Exception as e:
         log.warning("Not in Blender")
@@ -531,12 +528,15 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
     new_normals = [None] * len(me.vertices)
     for l in me.loops:
         new_normals[l.vertex_index] = l.normal[:]
-    
-    for normal in new_normals:
-        exportMeshdata.normals.append(list(normal))
-        exportMeshdata.normalsAll.append(normal[0])
-        exportMeshdata.normalsAll.append(normal[1])
-        exportMeshdata.normalsAll.append(normal[2])
+
+    try:
+        for idy, normal in enumerate(new_normals):
+                exportMeshdata.normals.append(list(normal))
+                exportMeshdata.normalsAll.append(normal[0])
+                exportMeshdata.normalsAll.append(normal[1])
+                exportMeshdata.normalsAll.append(normal[2])
+    except Exception as e:
+        raise e # something happened to normals during chunk generation
 
     loop_nbr = len(me.loops)
     t_pvi = array.array(data_types.ARRAY_INT32, (0,)) * loop_nbr

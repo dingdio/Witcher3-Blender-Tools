@@ -14,7 +14,7 @@ class CommonData(object):
         self.boneData = BoneData()
         self.w3_DataCache = W3_DataCache()
         
-        
+        self.isStatic = False
         self.autohideDistance:float = 100
         self.isTwoSided:bool = False
         self.useExtraStreams:bool = True

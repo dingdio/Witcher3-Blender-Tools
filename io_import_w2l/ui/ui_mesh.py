@@ -186,6 +186,11 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
         default=False,
         description="If enabled, it will keep low quality meshes and materials"
     )
+    keep_empty_lods: BoolProperty(
+        name="Keep Empty LODs",
+        default=False,
+        description="If enabled, it will keep empty mesh LODs with zero polygons"
+    )
     # do_merge_normals: BoolProperty(
     #     name="Merge Normals",
     #     default=False,
@@ -211,6 +216,7 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
             "Settings" : ["do_import_mats",
                         "do_import_armature",
                         "keep_lod_meshes",
+                        "keep_empty_lods",
                         #"do_merge_normals",
                         "rotate_180"]
         }
@@ -235,7 +241,8 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
                                     self.do_import_armature,
                                     self.keep_lod_meshes,
                                     self.do_merge_normals,
-                                    self.rotate_180)
+                                    self.rotate_180,
+                                    self.keep_empty_lods)
             message = f'Imported .w2mesh file in {time.time() - s} seconds.'
             log.info(message)
             self.report({'INFO'}, message)

@@ -234,7 +234,7 @@ class WITCH_OT_ENTITY_lod_toggle(Operator):
                     o.hide_set(hidden_bool)
             
         elif action in lods:
-            lod_idx = int(action[-1:])+1
+            lod_idx = int(action[-1:])
             lod_meshes = []
             for mesh in scene.objects:
                 # only for meshes

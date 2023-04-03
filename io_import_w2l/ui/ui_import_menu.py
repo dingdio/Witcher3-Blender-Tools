@@ -11,7 +11,7 @@ from bpy.props import (StringProperty,
 
 custom_icons = {}
 
-from io_import_w2l.ui.ui_anims import (WITCH_OT_import_w3_fbx, WITCH_OT_ImportW2Rig, WITCH_OT_ExportW2AnimJson, WITCH_OT_ExportW2RigJson)
+from io_import_w2l.ui.ui_anims import (ButtonOperatorImportW2Anims, WITCH_OT_import_w3_fbx, WITCH_OT_ImportW2Rig, WITCH_OT_ExportW2AnimJson, WITCH_OT_ExportW2RigJson)
 from io_import_w2l.ui.ui_mesh import WITCH_OT_w2mesh, WITCH_OT_w2mesh_export
 from io_import_w2l.ui.ui_mesh import WITCH_OT_apx
 from io_import_w2l.ui.ui_entity import WITCH_OT_w2ent, WITCH_OT_ENTITY_w2ent_chara
@@ -40,6 +40,7 @@ class WITCH_MT_Menu(bpy.types.Menu):
         layout.operator(WITCH_OT_w2mg.bl_idname, text="Shader (.w2mg)", icon='MESH_DATA')
         layout.separator()
         layout.operator(WITCH_OT_ImportW2Rig.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
+        layout.operator(ButtonOperatorImportW2Anims.bl_idname, text="Animation (.w2anims)", icon='ARMATURE_DATA')
         layout.separator()
         layout.operator(WITCH_OT_w2L.bl_idname, text="Layer (.w2l)", icon='SPHERE')
         layout.operator(WITCH_OT_w2w.bl_idname, text="World (.w2w)", icon='WORLD_DATA')

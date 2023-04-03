@@ -1746,6 +1746,12 @@ class W_CLASS:
                 self.PROPS.append(prop)
                 # if prop.theName == 'importFileTimeStamp' and self.Type == 'CSkeletalAnimation':
                 #     ckae = f.tell()
+                        #ReadAllRedVariables
+            if currentClass == "CMesh":
+                #ReadAllRedVariables
+                #REDBuffers
+                self.CMesh = CMesh(CR2WFILE)
+                self.CMesh.Read(f, 0)
         elif currentClass == "CStorySceneSection":
             while True:
                 prop = PROPERTY(f, CR2WFILE, self)
