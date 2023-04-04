@@ -323,15 +323,23 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                         if dlc_uncooked_dir.exists():
                             self.filepath = str(dlc_uncooked_dir)
 
-                    self.filepath += "\\" + main_mesh.witcherui_MeshSettings['item_repo_path'] + self.filename_ext
+
+                    game_repo_path = os.path.splitdrive(main_mesh.witcherui_MeshSettings['item_repo_path'])[1]
+
+                    self.filepath += "\\" + game_repo_path + self.filename_ext
                     directory = os.path.dirname(self.filepath)
+                    directory = os.path.normpath(directory)
                     if os.path.exists(directory):
                         pass
                     elif main_mesh.witcherui_MeshSettings.make_export_dir:
                         # Create the directory if it does not exist
                         if not os.path.exists(directory):
-                            os.makedirs(directory)
-                            print(directory, ' created!')
+                            try:
+                                os.makedirs(directory)
+                                print(directory, ' created!')
+                            except Exception as e:
+                                log.critical(e)
+                                log.critical("Check repo path is valid")
                 else:
                     self.filepath += "\\" + bpy.context.active_object.name + ".w2mesh" + self.filename_ext
             else:

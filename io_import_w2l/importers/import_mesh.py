@@ -131,7 +131,8 @@ def get_repo_from_abs_path(file_path):
                 first_part, second_part = file_path, ""
             return second_part
 
-    return file_path
+    game_repo_path = os.path.splitdrive(file_path)[1]
+    return game_repo_path
 
 def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, meshName, meshFile,
                 do_import_mats,
