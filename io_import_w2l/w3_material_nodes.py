@@ -304,7 +304,7 @@ def register():
     
     for __class in __classes:
         bpy.utils.register_class(__class)
-    bpy.app.handlers.depsgraph_update_post.append(update_node_group_inputs)
+    #bpy.app.handlers.depsgraph_update_post.append(update_node_group_inputs)
 
 
     #bpy.utils.register_class(MyNodeMenu)
@@ -324,8 +324,8 @@ def unregister():
     
     bpy.utils.unregister_class(WitcherMaterialProperties)
     bpy.utils.unregister_class(NodeGroupInputProperties) #! imp to reg first
-    if update_node_group_inputs in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(update_node_group_inputs)
+    # if update_node_group_inputs in bpy.app.handlers.depsgraph_update_post:
+    #     bpy.app.handlers.depsgraph_update_post.remove(update_node_group_inputs)
     #for handle in bpy.app.handlers.depsgraph_update_post:
 
     for __class in __classes:

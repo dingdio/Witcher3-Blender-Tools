@@ -283,17 +283,22 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
 
             #wm = context.window_manager
             #wm.progress_begin(0, len(mesh_list))
+            total_loops = len(mesh_list)
             for idx, mesh in enumerate(mesh_list):
                 #wm.progress_update(idx)
+                
+                progress_msg = f"{idx+1}/{total_loops} - {os.path.basename(mesh.meshName)}"
                 if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh:
                     import_single_mesh(mesh, errors, Mesh_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                    continue
-                if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision:
+                    #continue
+                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision:
                     import_single_mesh(mesh, errors, Collision_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                    continue
-                if mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody:
+                    #continue
+                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody:
                     import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                    continue
+                    #continue
+                progress_msg += " " * (80 - len(progress_msg))
+                print(progress_msg, end="\r")
             #wm.progress_end()
 
         for INCLUDE_OBJECT in levelData.includes:

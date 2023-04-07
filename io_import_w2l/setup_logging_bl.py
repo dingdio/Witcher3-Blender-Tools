@@ -18,8 +18,8 @@ for name in ('io_import_w2l.importers.import_anims',):
 for name in ('io_import_w2l.importers.import_scene',):
     logging.getLogger(name).setLevel(logging.INFO)
 
-for name in ('io_import_w2l.ui.ui_map'):
-    logging.getLogger(name).setLevel(logging.CRITICAL)
+for name in ('io_import_w2l.ui.ui_map',):
+    logging.getLogger(name).setLevel(logging.INFO)
 
 
 def register():
