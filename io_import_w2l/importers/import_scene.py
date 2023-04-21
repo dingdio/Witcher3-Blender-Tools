@@ -10,7 +10,7 @@ from io_import_w2l.CR2W import w3_types
 from io_import_w2l.CR2W.CR2W_types import EngineTransform
 from io_import_w2l.CR2W.dc_scene import load_bin_scene
 from io_import_w2l.importers import import_entity
-from io_import_w2l.importers.import_blender_fun import set_blender_object_transform, set_blender_pose_bone_transform
+from io_import_w2l.importers.import_helpers import set_blender_object_transform#, set_blender_pose_bone_transform
 from .import_cutscene import check_if_actor_already_in_scene
 from mathutils import Euler
 from math import radians

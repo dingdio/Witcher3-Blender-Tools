@@ -14,17 +14,23 @@ from xml.etree import ElementTree
 Element = ElementTree.Element
 
 from .w3_material_constants import *
-from io_import_w2l import get_modded_texture_path, get_uncook_path, get_mod_directory
+from io_import_w2l import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext
+from io_import_w2l.ui.blender_fun import convert_xbm_to_dds
 
-TEXTURE_EXT = '.tga'
 
 possible_folders = [
     'files\\Raw\\Mod',
     'files\\Raw\\DLC',
 ]
 
+tex_types = [
+    '.tga',
+    '.dds',
+    '.png'
+]
+
 def repo_file(filepath: str):
-    if filepath.endswith(TEXTURE_EXT):
+    if filepath.endswith(get_tex_ext(bpy.context)):
         modded_texture = os.path.join(get_modded_texture_path(bpy.context), filepath)
         if os.path.exists(modded_texture):
             return modded_texture
@@ -33,6 +39,13 @@ def repo_file(filepath: str):
                 modded_texture = os.path.join(get_mod_directory(bpy.context)+'\\'+folder, filepath)
                 if os.path.exists(modded_texture):
                    return modded_texture
+    # if filepath.endswith('.tga'):
+    #     changed_filepath = filepath.replace(".tga", get_tex_ext(bpy.context))
+    # elif filepath.endswith('.dds'):
+    #     changed_filepath = filepath.replace(".dds", get_tex_ext(bpy.context))
+    # elif filepath.endswith('.png'):
+    #     changed_filepath = filepath.replace(".png", get_tex_ext(bpy.context))
+    
     return filepath
 
 def hide_unused_sockets(node, inp=True, out=True):
@@ -298,15 +311,24 @@ def setup_w3_material(
         log.info("No material base, skipping: " + material.name)
         return
 
+
+    do_instance = False
     params = {}
     for p in xml_data:
         params[p.get('name')] = p.get('value')
+        par_name = p.get('name')
+        if par_name in EQUIVALENT_PARAMS:
+            do_instance = True
+            log.info(f"EQUIVALENT_PARAMS found {par_name}, replacing {EQUIVALENT_PARAMS[par_name]}, creating new material node instance for {bpy.context.active_object.name}")
 
     shader_type = mat_base.split("\\")[-1][:-5]	# The .w2mg or .w2mi file, minus the extension.
 
     nodes = material.node_tree.nodes
     links = material.node_tree.links
-
+    
+    if material.witcher_props.material_version == 'witcher2':
+        shader_type = guess_shader_type(shader_type) # for witcher 2
+    
     if mat_base.endswith(".w2mi"):
         # The XML contains little to no info about material instances, but the FBX importer
         # imported some image nodes we can use.
@@ -314,6 +336,10 @@ def setup_w3_material(
         w2mi_path = xml_data.get('base')
         #w2mi_tex_params = read_2wmi_params(material, uncook_path, w2mi_path, shader_type)
         w2mi_params = read_2wmi_params(w2mi_path)
+        for par_name in w2mi_params.keys():
+            if par_name in EQUIVALENT_PARAMS:
+                do_instance = True
+                log.info(f"EQUIVALENT_PARAMS found {par_name}, replacing {EQUIVALENT_PARAMS[par_name]}, creating new material node instance for {bpy.context.active_object.name}")
 
 
     # Checking if this material was already imported by comparing some custom properties
@@ -384,6 +410,7 @@ def setup_w3_material(
                                             
 
                 except Exception as e:
+                    log.critical(f"MATERIAL ERROR {e}")
                     print(e)
         
 
@@ -397,8 +424,7 @@ def setup_w3_material(
             try:
                 material.node_tree.links.new(all_instances_params[0][1].outputs[par_name], nodegroup_node_base_shader.inputs[par_name])
             except Exception as e:
-                #raise e
-                print(e)
+                log.critical(f"MATERIAL ERROR {e}") #raise e
     else:
         if mat_base.endswith(".w2mi"):
             #remove w2mi_params the main material instance already provided
@@ -433,6 +459,9 @@ def setup_w3_material(
         # Clean existing nodes and create core nodegroup.
         nodegroup_node = init_material_nodes(material, shader_type)
         nodegroup_node.name = mat_base[-60:]
+        if do_instance:
+            nodegroup_node.node_tree = nodegroup_node.node_tree.copy()
+
         nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
 
         # Order parameters so input nodes get created in a specified order, from top to bottom relative to the inputs of the nodegroup.
@@ -455,7 +484,8 @@ def setup_w3_material(
 
         #if the material is a .w2mi file use the filename, otherwise use diffues name for materal
         if not is_instance_file:
-            mat_set_name_by_diffuse(material, nodegroup_node, nodes)
+            pass
+            #mat_set_name_by_diffuse(material, nodegroup_node, nodes)
         mat_ensure_dummy_transparent_img_node(material, nodegroup_node, shader_type, nodes)
         mat_apply_settings(material, shader_type)
 
@@ -507,15 +537,17 @@ def read_instance_params(material, final_params):
                         +str(PROP.More[2].Value)+"; "
                         +str(PROP.More[3].Value))
             final_params[PROP.theName] = (PROP.theType, theValue)
-        elif PROP.theType == "handle:ITexture":
+        elif PROP.theType == "handle:ITexture" or PROP.theType == 'handle:CTextureArray':
                 # ,name = param[0]
                 # ,type = param[1]
                 # ,value = param[2]
             if PROP.Handles[0].DepotPath:
                 file_path = PROP.Handles[0].DepotPath
-                file_path = file_path.replace(".xbm", TEXTURE_EXT)
+                file_path = file_path.replace(".xbm", get_tex_ext(bpy.context))
                 #texture_paths.append(file_path)
                 final_params[PROP.theName] = (PROP.theType, file_path)
+        else:
+            log.critical(f'Warning unsuppored param type in CR2W "{PROP.theType}"')
     return final_params
 
 def read_2wmi_params(
@@ -721,6 +753,21 @@ def mat_load_params_into_nodes(
             node.witcher_include = True
 
 
+def fix_texture_node(par_name, node):
+    if node and node.image:
+        if par_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse','diffuse','diffusemap','diff', 'tex_Diffuse'] or 'DiffuseArray' in par_name:
+            node.image.colorspace_settings.name = 'sRGB'
+        else:
+            node.image.colorspace_settings.name = 'Non-Color'
+            
+    if node and node.image and len(node.outputs[0].links) > 0:
+        pin_name = node.outputs[0].links[0].to_socket.name
+        if pin_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse','diffuse','diffusemap','diff', 'tex_Diffuse'] or 'DiffuseArray' in par_name:
+            node.image.colorspace_settings.name = 'sRGB'
+        else:
+            node.image.colorspace_settings.name = 'Non-Color'
+    return node
+    
 def create_node_for_param(
         mat: Material
         ,param: Element
@@ -739,26 +786,56 @@ def create_node_for_param(
     if 'debug' in par_value:
         return
 
-    if par_value == 'NULL' or par_name in IGNORED_PARAMS:
+    if par_value == 'NULL': #or par_name in IGNORED_PARAMS:
         return
+    if par_name in IGNORED_PARAMS:
+        log.warning('FOUND IGNORED PARAM', par_name)
 
     node_label = par_name
     node = None
 
-    if par_type in ['handle:ITexture', 'handle:CTextureArray']:
+    if par_type in ['handle:ITexture']:
         node = create_node_texture(mat, param, node_ng, y_loc, uncook_path, texarray_index)
-        if node and node.image:
-            if par_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse']:
-                node.image.colorspace_settings.name = 'sRGB'
-            else:
-                node.image.colorspace_settings.name = 'Non-Color'
-                
-        if node and node.image and len(node.outputs[0].links) > 0:
-            pin_name = node.outputs[0].links[0].to_socket.name
-            if pin_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse']:
-                node.image.colorspace_settings.name = 'sRGB'
-            else:
-                node.image.colorspace_settings.name = 'Non-Color'
+        node = fix_texture_node(par_name, node)
+
+    elif par_type in ['handle:CTextureArray']:
+        #create all the textures for this array
+        #create the tex array and link it
+
+        texture_array = []
+        tex_index = 0
+        
+        texarray_path = os.path.abspath( uncook_path + os.sep + f"{par_value}.texture_{str(tex_index)}{get_tex_ext(bpy.context)}" )
+        create_one = True
+        
+        while create_one or Path(texarray_path).exists():
+            create_one = False
+            sub_param = {
+                'name' : f"{par_value}.texture_{str(tex_index)}{get_tex_ext(bpy.context)}",
+                'value' :texarray_path
+            }
+            sub_node = create_node_texture(mat, sub_param, node_ng, y_loc, uncook_path, texarray_index)
+            sub_node = fix_texture_node(par_name, sub_node)
+            sub_node.location = (-800, y_loc)
+            texture_array.append(sub_node)
+            tex_index+=1
+            texarray_path = os.path.abspath( uncook_path + os.sep + f"{par_value}.texture_{str(tex_index)}{get_tex_ext(bpy.context)}" )
+
+        #full_path = os.path.join(get_uncook_path(bpy.context), par_value)
+        #texarray_ = CR2W_reader.load_material(full_path)
+
+        tex_array_group = create_texarray( ARRAY_SIZE = len(texture_array))
+        TexArray_ng = mat.node_tree.nodes.new(type='ShaderNodeGroup')
+        TexArray_ng.node_tree = tex_array_group
+        TexArray_ng.location = (200, 0)
+        
+        for idx, sub_n in enumerate(texture_array):
+            links.new(sub_n.outputs[0], TexArray_ng.inputs[idx])
+        
+        
+        #node_ng.width = 350
+        node = TexArray_ng
+
     elif par_type == 'Float':
         node = create_node_float(mat, param, node_ng)
     elif par_type == 'Color':
@@ -779,7 +856,12 @@ def create_node_for_param(
 
     # Linking the node to the nodegroup
     if par_name in EQUIVALENT_PARAMS:
+        log.info(f"EQUIVALENT_PARAMS found {par_name} replacing {EQUIVALENT_PARAMS[par_name]}")
+        #todo clone the material group and replace instead of changing param name?
         input_pin = node_ng.inputs.get(EQUIVALENT_PARAMS[par_name])
+        if input_pin != None:
+            input_inner = node_ng.node_tree.inputs.get(EQUIVALENT_PARAMS[par_name])
+            input_inner.name = par_name
     else:
         input_pin = node_ng.inputs.get(par_name)
     
@@ -803,19 +885,22 @@ def create_node_for_param(
             node_ng.node_tree.inputs.new('NodeSocketFloat', par_name)
         elif par_type == "handle:ITexture":
             node_ng.node_tree.inputs.new('NodeSocketColor', par_name)
+        elif par_type == 'handle:CTextureArray':
+            node_ng.node_tree.inputs.new('NodeSocketColor', par_name)
         elif par_type == 'Vector':
             node_ng.node_tree.inputs.new('NodeSocketVector', par_name)
         input_pin = node_ng.inputs.get(par_name)
-
 
     if input_pin and len(input_pin.links) == 0:
         # Only connect the node if some other node isn't already connected.
         # This is because if there are two diffuse textures defined, we are better off prioritizing
         # the first one.
-        links.new(node.outputs[0], input_pin)
-        if par_type == 'Vector':
-            links.new(node_w.outputs[0], input_pin_vec_W)
-
+        try:
+            links.new(node.outputs[0], input_pin)
+            if par_type == 'Vector':
+                links.new(node_w.outputs[0], input_pin_vec_W)
+        except Exception as e:
+            log.critical(f'PIN LINKING ERROR {e}')
     return node
 
 def create_node_texture(
@@ -875,19 +960,37 @@ def create_node_texture(
     
     
     if par_value.endswith('.texarray'):
-        par_value = par_value+".texture_%s%s" % texarray_index, TEXTURE_EXT
+        par_value = f"{par_value}.texture_{texarray_index}{get_tex_ext(bpy.context)}"
     # We use os.path.abspath() to make sure the filepath has consistent slashes and backslashes,
     # so that we can compare image file paths to each other for duplicate checking.
-    final_tga_path = par_value.replace(".xbm", TEXTURE_EXT)
+    final_tex_path = par_value.replace(".xbm", get_tex_ext(bpy.context))
     try:
-        final_texture = repo_file(final_tga_path) # TODO fix loading texarray
+        final_texture = repo_file(final_tex_path) # TODO fix loading texarray
         if not Path(final_texture).exists():
-            final_texture = uncook_path + os.sep + final_tga_path
+            final_texture = uncook_path + os.sep + final_tex_path
     except Exception as e:
         #raise e
+        log.critical(f"TEXTURE ERROR {e}")
         final_texture= None
     
     tex_path = os.path.abspath( final_texture )
+    
+    ## didn't find the texture, try find and convert xbm
+    if not Path(tex_path).exists():
+        for ext in ['.tga','.dds', '.png']:
+            if tex_path.endswith(ext):
+                xbm_path = tex_path.replace(ext, ".xbm")
+                dds_path = tex_path.replace(ext, ".dds") if ext is not '.dds' else tex_path
+                break
+        #create dds if none exist
+        if not Path(dds_path).exists():
+            if Path(xbm_path).exists():
+                convert_xbm_to_dds(xbm_path)
+                if Path(dds_path).exists():
+                    tex_path = dds_path
+        else:
+            tex_path = dds_path
+    
     node.image = load_texture(mat, tex_path, uncook_path)
     if not node.image:
         node.label = "MISSING:" + par_value
@@ -1095,3 +1198,101 @@ def mat_apply_settings(mat, shader_type: str):
         mat.shadow_method = 'HASHED' # TODO: Could use some testing.
     else:
         mat.blend_method = 'CLIP'
+
+
+
+
+def create_texarray(group_name = "WitcherTexArray", ARRAY_SIZE = 2):
+    vertex_color_data = []
+    obj = bpy.context.active_object
+    me = obj.data
+    highest_green = 0
+    for vert in me.vertices:
+        if me.color_attributes.active:
+            color = me.color_attributes.active.data[vert.index].color
+            vertex_color_data.append(list(color))
+            highest_green = max(highest_green, color[1])
+
+    # # Check if group already exists
+    # if group_name in bpy.data.node_groups:
+    #     group = bpy.data.node_groups[group_name]
+    #     group.nodes.clear()
+    #     group.inputs.clear()
+    # else:
+    #     # Create a new node group
+    group = bpy.data.node_groups.new(group_name, 'ShaderNodeTree')
+    
+    output = group.nodes.new('NodeGroupOutput')
+    output.location = (700, 0)
+    # Create a single input with two sockets
+    input = group.nodes.new('NodeGroupInput')
+    input.name = 'Array'
+    input.location = (-400, 0)
+    
+    try:
+        array_step = highest_green/ARRAY_SIZE
+    except Exception as e:
+        log.critical('ERROR CREATING TEXTURE ARRAY')
+        return group
+
+
+    for index in range(0,ARRAY_SIZE):
+        this_index = index
+        group.inputs.new('NodeSocketColor', f"Array_{str(this_index)}")
+
+
+    #create the first mix
+    mix = group.nodes.new('ShaderNodeMixRGB')
+    mix.blend_type = 'MIX'
+    mix.inputs[0].default_value = 0.5
+    mix.location = (0, -100)
+    
+    privious_mix = mix
+    
+    if ARRAY_SIZE > 1:
+        group.links.new(input.outputs[0], mix.inputs[1])
+        group.links.new(input.outputs[1], mix.inputs[2])
+    # for i in range(ARRAY_SIZE):
+    #     group.links.new(input.outputs[i], mix.inputs[i+1])
+
+    group.links.new(mix.outputs[0], output.inputs[0])
+
+    color_attr = group.nodes.new('ShaderNodeVertexColor')
+    color_attr.layer_name = "Color"
+    color_attr.location = (-300, 400)
+    
+    color_ramp = group.nodes.new('ShaderNodeValToRGB')
+    #color_ramp.color_ramp.elements[1].position = array_step/1.2
+    color_ramp.color_ramp.elements[1].position = array_step
+    color_ramp.location = (200, 400)
+
+    separate_color = group.nodes.new('ShaderNodeSeparateRGB')
+    separate_color.location = (0, 400)
+
+
+    group.links.new(color_attr.outputs[0], separate_color.inputs[0])
+    group.links.new(separate_color.outputs[1], color_ramp.inputs[0])
+    group.links.new(color_ramp.outputs[0], mix.inputs[0])
+    
+    for i in range(ARRAY_SIZE-2):
+        i+=1
+        color_ramp = group.nodes.new('ShaderNodeValToRGB')
+        #color_ramp.color_ramp.elements[1].position = (array_step*(i+1))/1.2
+        color_ramp.color_ramp.elements[1].position = array_step*(i+1)
+        color_ramp.location = (-200, -400 * i)
+        
+        mix = group.nodes.new('ShaderNodeMixRGB')
+        mix.blend_type = 'MIX'
+        mix.inputs[0].default_value = 0.5
+        mix.location = (200, -400 * i )
+        group.links.new(color_ramp.outputs[0], mix.inputs[0])
+        group.links.new(privious_mix.outputs[0], mix.inputs[1])
+        group.links.new(input.outputs[i+1], mix.inputs[2])
+        group.links.new(separate_color.outputs[1], color_ramp.inputs[0])
+        group.links.new(mix.outputs[0], output.inputs[0])
+        
+        privious_mix = mix
+
+    
+    
+    return group

@@ -60,7 +60,14 @@ Entity_Type_List = ["CEntity",
                     "CNewNPC",
                     "W3PlayerWitcher",
                     "W3ReplacerCiri",
-                    "CCamera"]
+                    "CCamera",
+                    
+                    #####!WITCHER_2
+                    "CDoor",
+                    "CContainer",
+                    "CActionPoint",
+                    #"CDeniedAreaComponent",
+                    ]
 
 v_types = [
     'String',
@@ -1136,18 +1143,45 @@ class PROPERTY:
         if ("curveData" in arrayDataType):
             pass
         elif ("handle" in Type.type): #//sub-class sorting
-            if (doesExist(Type.type, "]")):
-                f.seek(8,1)
-                count = (int)((strartofthis + Type.size + 4 - f.tell()) / 4)
-            self.Handles = []
-            startofHandles = f.tell()
-            for _ in range(0, count):
-                self.Handles.append(HANDLE(f,CR2WFILE, self))
-            f.seek(startofHandles); # FSeek(startof(Handles));
+            if CR2WFILE.HEADER.version <= 115:
+                if (count == 1 and "array" not in Type.type):
+                    self.Handles = []
+                    for _ in range(0,count):
+                        self.Handles.append(HANDLE(f,CR2WFILE,self))
+                        if self.Handles[0].ChunkHandle:
+                            self.Value = self.Handles[0].val
+                else:
+                    elementTypeName = STRINGINDEX(f,CR2WFILE, self)
+                    unk2 = readInt16(f)
+                    if unk2 != -1:
+                        raise ValueError('Unexpected value for unk2')
+                    #tell = f.tell()
+                    self.Handles = []
+                    for _ in range(0,count):
+                        self.Handles.append(HANDLE(f,CR2WFILE,self))
+                f.seek(-1,os.SEEK_CUR)
+            else:
+                if (doesExist(Type.type, "]")):
+                    f.seek(8,1)
+                    count = (int)((strartofthis + Type.size + 4 - f.tell()) / 4)
+                self.Handles = []
+                startofHandles = f.tell()
+                for _ in range(0, count):
+                    self.Handles.append(HANDLE(f,CR2WFILE, self))
+                f.seek(startofHandles); # FSeek(startof(Handles));
         elif (Type.type == "array:String" or Type.type == "array:2,0,String"):
-                self.elements = []
-                for _ in range(0,count):
-                    self.elements.append(STRING(f)) #<name="submesh">; #not needed remove later
+                if CR2WFILE.HEADER.version <= 115:
+                    elementTypeName = STRINGINDEX(f,CR2WFILE, self)
+                    unk2 = readInt16(f)
+                    if unk2 != -1:
+                        raise ValueError('Unexpected value for unk2')
+                    self.elements = []
+                    for _ in range(0,count):
+                        self.elements.append(STRING(f))
+                else:
+                    self.elements = []
+                    for _ in range(0,count):
+                        self.elements.append(STRING(f)) #<name="submesh">; #not needed remove later
         elif ("array:array" in Type.type):
             pass
         elif ("StringAnsi" in Type.type):
@@ -1298,12 +1332,27 @@ class PROPERTY:
                     self.value.append(readUByte(f)) # uint64
             return
         elif("ptr:" in Type.type ):
-            if (count == 1 and "array" not in Type.type):
-                self.Value = readU32(f)
-            else:
-                self.value = []
-                for _ in range(0,count):
-                    self.value.append(readU32(f))
+                if (count == 1 and "array" not in Type.type):
+                    if CR2WFILE.HEADER.version <= 115:
+                        self.Handles = []
+                        for _ in range(0,count):
+                            self.Handles.append(HANDLE(f,CR2WFILE,self))
+                    else:
+                        self.Value = readU32(f)
+                else:
+                    if CR2WFILE.HEADER.version <= 115:
+                        elementTypeName = STRINGINDEX(f,CR2WFILE, self)
+                        unk2 = readInt16(f)
+                        if unk2 != -1:
+                            raise ValueError('Unexpected value for unk2')
+                        tell = f.tell()
+                        self.Handles = []
+                        for _ in range(0,count):
+                            self.Handles.append(HANDLE(f,CR2WFILE,self))
+                    else:
+                        self.value = []
+                        for _ in range(0,count):
+                            self.value.append(readU32(f))
         elif theType == "SharedDataBuffer":
             self.Bufferdata = CByteArray(f)
             #self.PackageHdr = PROPSTART(f, CR2WFILE, self); f.seek(4,1) #FSkip(4); #//start of new CR2W
@@ -1689,6 +1738,16 @@ class CLayerGroup(object):
 
 
 class W_CLASS:
+    def get_CR2W_version(self):
+        return self.__CR2WFILE.HEADER.version
+    
+    def get_name_prop_string(self):
+        entity_name = self.GetVariableByName('name')
+        if entity_name:
+            return f"{entity_name.String.String} ({self.name})"
+        else:
+            return self.name
+
     def GetVariableByName(self, str):
         for item in self.PROPS:
             if item.theName == str:
@@ -1729,29 +1788,85 @@ class W_CLASS:
         #     log.debug("CAnimationBufferBitwiseCompressed class")
         # if self.name == "CSkeleton":
         #     log.debug("CSkeleton")
-        # if self.name == "CHardAttachment":
-        #     log.debug("CHardAttachment")
+        if self.name == "CHardAttachment":
+            log.debug("CHardAttachment")
         # if self.name == "CHardAttachment":
         #     log.debug("CHardAttachment")
         tempClass  = parent.currentClass; # local string
+
 
         if CR2WFILE.HEADER.version <= 115: #? WITCHER 2
             startofthis -=1
             self.classEnd -=1
             f.seek(-1, os.SEEK_CUR)
             while True:
-                prop = PROPERTY(f, CR2WFILE, self)
+                prop = None
+                try:
+                    prop = PROPERTY(f, CR2WFILE, self)
+                except Exception as e:
+                    log.warn(f"Witcher 2 Prop Read Error \"{e}\"")
+                if prop == None:
+                    props_error = f.tell()
+                    continue
                 if prop.Type == None:
+                    props_end = f.tell()
                     break
                 self.PROPS.append(prop)
-                # if prop.theName == 'importFileTimeStamp' and self.Type == 'CSkeletalAnimation':
-                #     ckae = f.tell()
-                        #ReadAllRedVariables
-            if currentClass == "CMesh":
-                #ReadAllRedVariables
-                #REDBuffers
+                
+            if self.name in Entity_Type_List:
+                CR2WFILE.entity_count +=1
+                self.isCreatedFromTemplate = False
+                self.Template = self.GetVariableByName('template')
+                #self.Transform = self.GetVariableByName('transform').EngineTransform
+                if self.Template and self.Template.Handles and self.Template.Handles[0].DepotPath:
+                    self.isCreatedFromTemplate = True
+                self.Components = []
+                f.seek(10,1)
+                size = self.classEnd - startofthis
+                endPos = f.tell()
+                bytesleft = size - (endPos - startofthis)
+                log.info(self.name)
+                if (not self.isCreatedFromTemplate):
+                    f.seek(63,1)
+                    if bytesleft > 0:
+                        testpos = f.tell()
+                        elementcount = ReadBit6(f)
+                        if elementcount < 300:
+                            for item in range(0,elementcount):
+                                self.Components.append(readInt32(f))
+                        else:
+                            log.critical('Waring found too many Components')
+                else:
+                    log.info(f'Found {self.name} Template')
+                    pass #template buffers??
+                
+                endPos = f.tell()
+                bytesleft = size - (endPos - startofthis)
+                self.BufferV2 = False
+                if (self.isCreatedFromTemplate):
+                    f.seek(-10,1)
+                    self.BufferV2 = CBufferUInt32(CR2WFILE, SEntityBufferType2)
+                    if (bytesleft > 0):
+                        self.BufferV2.Read(f, 0)
+                        self.BufferV2 = self.BufferV2.elements
+                    else:
+                        log.warning("unknown CEntity Fileformat.")
+                
+
+            elif currentClass == "CMesh": #! for now CMesh is read in dc_mesh
                 self.CMesh = CMesh(CR2WFILE)
-                self.CMesh.Read(f, 0)
+            elif self.name == "CMaterialInstance":
+                f.seek(1, os.SEEK_CUR)
+                
+                # 'diffusecolor'
+                # 'fadeSharpness'
+                # 'fogColor'
+                #nMatElement = readInt32(f)
+                
+                MyMaterialInstance = CMaterialInstance(CR2WFILE)
+                MyMaterialInstance.Read(f)
+                self.CMaterialInstance = MyMaterialInstance
+
         elif currentClass == "CStorySceneSection":
             while True:
                 prop = PROPERTY(f, CR2WFILE, self)
@@ -2306,13 +2421,17 @@ class CR2W:
         (StringDictionary, newstrings, nameslist, importslist) = self.GenerateStringtable()
 
     def Read(self, f = None, anim_name = None):
+        #!debug
+        self.entity_count = 0
+        
+        #!
         self.LocalizedStrings:List[LocalizedString] = []
         self.fileName:np.string_ = f.name
         start:np.uint = f.tell()
         self.start = start
         self.HEADER:CR2W_header = CR2W_header(f)
         table_range:np.uint = 10
-        if self.HEADER.version == 112: table_range = 4
+        #if self.HEADER.version == 112: table_range = 4 !# seems to be wrong for some 112 files
 
 
         if (self.HEADER.version <= 115): #? WITCHER 2
@@ -2328,13 +2447,24 @@ class CR2W:
                 self.STRINGS = []
                 f.seek(self.CR2WTable[0].offset + start)
                 for _ in range(0, self.CR2WTable[0].itemCount):
+                    # Array = 3, // @
+                    # Pointer = 4, // *
+                    # Handle = 5, // #
+                    # SoftHandle = 6, // ~
+                    
                     Str = STRING(f).String
                     if "@*" in Str:
-                        Str = Str.replace("@*", "array:2,0,ptr:")
+                        #Str = Str.replace("@*", "array:2,0,ptr:")
+                        Str = Str.replace("@*", "array:2,0,handle:")
+                    elif "@#" in Str:
+                        Str = Str.replace('@#', 'array:2,0,handle:')
                     elif "@" in Str:
                         Str = Str.replace("@", "array:2,0,")
                     elif "*" in Str:
-                        Str = Str.replace("*", "ptr:")
+                        #Str = Str.replace("*", "ptr:")
+                        Str = Str.replace("*", "handle:") ##TODO check why, pointers are pointing to depot paths etc
+                    elif "#" in Str:
+                        Str = Str.replace("#", "handle:")
                     self.STRINGS.append(Str)
             self.CNAMES = []
             self.CNAMES.append(W2NAME(""))
@@ -2347,35 +2477,26 @@ class CR2W:
                 for _ in range(0, self.CR2WTable[1].itemCount):
                     self.CR2WExport.append(CR2WExport_Witcher2(f, self))
 
+            ## IMPORTS
+            if (self.CR2WTable[2].offset > 0) :
+                self.CR2WImport = []
+                f.seek(self.CR2WTable[2].offset + start)
+                for _ in range(0, self.CR2WTable[2].itemCount):
+                    lent = ReadBit6(f)
+                    #the_path = getStringOfLen(f, readSByte(f)-1)
+                    the_path = getStringOfLen(f, lent-1)
+                    
+                    myImport = CR2WImport(
+                        path = the_path,
+                        className = readUShort(f),
+                        flags = readUShort(f),
+                    )
+                    self.CR2WImport.append(myImport)
+            
             self.CR2WTable[4] = self.CR2WTable[1]
 
             self.CHUNKS = DATA(f, self, anim_name)
 
-            # nameDataOffset:int = readU32(f)
-            # nameCount:int = readU32(f)
-            # objectDataOffset:int = readU32(f)
-            # objectCount:int = readU32(f)
-            # linkDataOffset:int = readU32(f)
-            # linkCount:int = readU32(f)
-            # dependencyDataOffset:int = 0
-            # dependencyCount:int = 0
-
-            # if (self.HEADER.version >= 46):
-            #     dependencyDataOffset:int = readU32(f)
-            #     dependencyCount:int = readU32(f)
-
-            # if (nameDataOffset > 0):
-            #     self.STRINGS = []
-            #     f.seek(nameDataOffset + start)
-            #     for _ in range(0, nameCount): #uses enum table count??
-            #         self.STRINGS.append(STRING(f).String)
-            # log.debug("str")
-
-            # if (dependencyDataOffset > 0 and dependencyCount >1):
-            #     self.Dependencies = []
-            #     f.seek(dependencyDataOffset + start)
-            #     for _ in range(0, dependencyCount): #uses enum table count??
-            #         self.Dependencies.append(STRING(f).String)
         else:
 
             self.CR2WTable = []

@@ -72,14 +72,23 @@ PARAM_ORDER = ['Diffuse', 'Diffusemap', 'DiffuseArray',
 
 # TODO: I should probably go about this in a better way. It should probably be a Pin:[Equivalents] dict, not an equivalent:pin dict.
 EQUIVALENT_PARAMS = {
-	'Diffusemap' : 'Diffuse'
+	'diffusemap' : 'Diffuse'
+	,'normalmap' : 'Normal'
+	,'Diffusemap' : 'Diffuse'
 	,'Normalmap' : 'Normal'
 	,'Ambientmap' : 'TintMask'
 
 	,'DiffuseArray' : 'Diffuse'
 	,'NormalArray' : 'Normal'
 
+	#w2hair
+	,'tex_Diffuse': 'Diffuse'
+	,'tex_Normalmap': 'Normal'
+	,'tex_Specular': 'SpecularTexture'
+	#,'tex_SpecShift': ''
+
 	,'diffuse' : 'Diffuse'
+	,'difuse' : 'Diffuse'
 	,'normal' : 'Normal'
 
 	,'diff' : 'Diffuse'

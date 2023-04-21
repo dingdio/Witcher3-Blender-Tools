@@ -6,7 +6,7 @@ from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
 
 import bpy
-from bpy.props import StringProperty, BoolProperty
+from bpy.props import StringProperty, BoolProperty, CollectionProperty
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 import addon_utils
 
@@ -37,6 +37,9 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
     """Load Witcher 3 Level"""
     bl_idname = "witcher.import_w2l"
     bl_label = "Import .w2l"
+
+    #filepath: StringProperty(subtype='FILE_PATH', )
+
     filename_ext = ".w2l"
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -45,6 +48,36 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
             type=bpy.types.OperatorFileListElement,
             options={'HIDDEN', 'SKIP_SAVE'},
         )
+    do_import_Mesh: BoolProperty(
+        name="Mesh",
+        default=True,
+        description="If enabled, mesh types are imported"
+    )
+    do_import_Collision: BoolProperty(
+        name="Collision",
+        default=True,
+        description="If enabled, mesh types are imported"
+    )
+    do_import_RigidBody: BoolProperty(
+        name="RigidBody",
+        default=True,
+        description="If enabled, mesh types are imported"
+    )
+    do_import_Entity: BoolProperty(
+        name="Entity",
+        default=True,
+        description="If enabled, Differnt types of Entities are imported"
+    )
+    do_import_PointLight: BoolProperty(
+        name="PointLight",
+        default=True,
+        description="If enabled, PointLight types are imported"
+    )
+    do_import_SpotLight: BoolProperty(
+        name="SpotLight",
+        default=True,
+        description="If enabled, SpotLight types are imported"
+    )
     keep_lod_meshes: BoolProperty(
         name="Keep LODs",
         default=False,
@@ -60,12 +93,35 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
         default=True,
         description="If enabled, it will always keep any proxy meshes regardless of lod"
     )
+    
+    def draw(self, context):
+        layout = self.layout
+        sections = ["Import Filter", "Settings"]
+        section_options = {
+            "Import Filter" : ["do_import_Mesh","do_import_Collision","do_import_RigidBody","do_import_Entity",
+                               "do_import_PointLight", "do_import_SpotLight",],
+            "Settings" : [
+                        "keep_lod_meshes",
+                        "keep_empty_lods",
+                        "keep_proxy_meshes"]
+        }
+        for section in sections:
+            row = layout.row()
+            box = row.box()
+            box.label(text=section)
+            for prop in section_options[section]:
+                box.prop(self, prop)
+    
     def execute(self, context):
         print("Importing layer now!")
         fdir = self.filepath
         files = self.files
         file: bpy.types.OperatorFileListElement
-            
+        
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        
         start_time = time.time()
         if fdir.endswith(".w2l"):
             cur_dir = Path(self.filepath).parent
@@ -76,7 +132,13 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
                 levelFile = CR2W.CR2W_reader.load_w2l(filepath)
                 import_w2l.btn_import_W2L(levelFile, context, self.keep_lod_meshes,
                                           keep_empty_lods = self.keep_empty_lods,
-                                          keep_proxy_meshes = self.keep_proxy_meshes)
+                                          keep_proxy_meshes = self.keep_proxy_meshes,
+                                        do_import_Mesh = self.do_import_Mesh,
+                                        do_import_Collision = self.do_import_Collision,
+                                        do_import_RigidBody = self.do_import_RigidBody,
+                                        do_import_Entity = self.do_import_Entity,
+                                        do_import_PointLight = self.do_import_PointLight,
+                                        do_import_SpotLight = self.do_import_SpotLight,)
         else:
             log.warn('Did not select .w2l')
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")

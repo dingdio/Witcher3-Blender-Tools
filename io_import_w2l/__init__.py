@@ -9,6 +9,10 @@ def get_game_path(context) -> str:
     witcher_game_path = addon_prefs.witcher_game_path
     return witcher_game_path
 
+def get_witcher2_game_path(context) -> str:
+    addon_prefs = context.preferences.addons[__package__].preferences
+    return addon_prefs.witcher2_game_path
+
 def get_uncook_path(context) -> str:
     addon_prefs = context.preferences.addons[__package__].preferences
     uncook_path = addon_prefs.uncook_path
@@ -34,10 +38,20 @@ def get_texture_path(context) -> str:
     tex_uncook_path = addon_prefs.tex_uncook_path
     return tex_uncook_path
 
+def get_w2_unbundle_path(context) -> str:
+    addon_prefs = context.preferences.addons[__package__].preferences
+    w2_unbundle_path = addon_prefs.w2_unbundle_path
+    return w2_unbundle_path
+
 def get_modded_texture_path(context) -> str:
     addon_prefs = context.preferences.addons[__package__].preferences
     tex_mod_uncook_path = addon_prefs.tex_mod_uncook_path
     return tex_mod_uncook_path
+
+def get_tex_ext(context) -> str:
+    addon_prefs = context.preferences.addons[__package__].preferences
+    tex_ext = addon_prefs.tex_ext
+    return tex_ext
 
 def get_W3_VOICE_PATH(context) -> str:
     addon_prefs = context.preferences.addons[__package__].preferences
@@ -107,7 +121,7 @@ from io_import_w2l.ui.ui_utils import WITCH_PT_Base
 from io_import_w2l.ui.ui_entity import WITCH_OT_ENTITY_lod_toggle
 #from io_import_w2l.ui.ui_entity import WITCH_OT_w2ent_chara
 from io_import_w2l.ui.ui_entity import WITCH_OT_w2ent
-from io_import_w2l.ui.ui_material import WITCH_OT_w2mg, WITCH_OT_w2mi
+from io_import_w2l.ui.ui_material import WITCH_OT_w2mg, WITCH_OT_w2mi, WITCH_OT_xbm
 
 from io_import_w2l.ui.ui_anims import WITCH_OT_ImportW2Rig, WITCH_OT_ExportW2AnimJson, WITCH_OT_ExportW2RigJson
 
@@ -125,10 +139,10 @@ import addon_utils
 bl_info = {
     "name": "Witcher 3 Tools",
     "author": "Dingdio",
-    "version": (0, 6, 0),
+    "version": (0, 7, 0),
     "blender": (3, 4, 1),
     "location": "File > Import-Export > Witcher 3 Assets",
-    "description": "Tools for Witcher 3",
+    "description": "Tools for Witcher 3 and Witcher 2",
     "warning": "",
     "doc_url": "https://github.com/dingdio/Witcher3_Blender_Tools",
     "category": "Import-Export"
@@ -145,7 +159,12 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         default="E:\\GOG Games\\The Witcher 3 Wild Hunt GOTY",
         description="Path where The Witcher 3 is installed."
     )
-    
+    witcher2_game_path: StringProperty(
+        name="Witcher 2 Path",
+        subtype='DIR_PATH',
+        default="G:\\GOG Games\\The Witcher 2",
+        description="Path where The Witcher 2 is installed."
+    )
     uncook_path: StringProperty(
         name="Uncook Path",
         subtype='DIR_PATH',
@@ -161,7 +180,8 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     mod_directory: StringProperty(
         name="Wolvenkit Project Path",
         subtype='DIR_PATH',
-        default="E:\\w3.mods\\wolvenProjects\\mesh_import_testing",
+        #default="E:\\w3.mods\\wolvenProjects\\mesh_import_testing",
+        default="E:\\w3.mods\\wolvenProjects\\mesh_replace_new",
         description="Path of the current Wolvenkit mod."
     )
     fbx_uncook_path: StringProperty(
@@ -177,6 +197,13 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         default='E:\\w3_uncook_new',#"E:\\w3_uncook_new",#
         description="Path where you exported the tga files."
     )
+    
+    w2_unbundle_path: StringProperty(
+        name="Witcher 2 Unbundle",
+        subtype='DIR_PATH',
+        default='D:\\Witcher2_extracted',
+        description="Extracted Witcher 2 dzip files"
+    )
 
     tex_mod_uncook_path: StringProperty(
         name="(optional) Uncook Path modded TEXTURES (.tga)",
@@ -184,6 +211,20 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         default='E:\\w3.modding\\modkit\\modZOldWitcherArmour',
         description="(optional) Path where you exported the tga files from a mod."
     )
+    
+    tex_ext_opts = [
+        #("custom", "Custom", "Description for value 1"),
+        (".tga", ".tga", ".tga"),
+        (".dds", ".dds", ".dds"),
+        (".png", ".png", ".png"),
+    ]
+    tex_ext: bpy.props.EnumProperty(
+        name="Texture Type",
+        description="Select prefered texture type",
+        items=tex_ext_opts,
+        default=".tga",
+    )
+    
 
     W3_FOLIAGE_PATH: StringProperty(
         name="Uncook Path FOLIAGE (.fbx)",
@@ -228,23 +269,32 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     #importFacePoses
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Witcher 3 Tools settings:")
+        layout.label(text="<< WITCHER 3 SETTINGS >>")
         layout.prop(self, "uncook_path")
         layout.prop(self, "tex_uncook_path")
         layout.prop(self, "witcher_game_path")
         
-        layout.label(text='MOD PATHS:')
+        layout.label(text="<< WITCHER 2 SETTINGS >>")
+        layout.prop(self, "w2_unbundle_path")
+        layout.prop(self, "witcher2_game_path")
+        
+        layout.label(text="<< COMMON SETTINGS >>")
+        layout.prop(self, "tex_ext")
+        
+        layout.label(text='<< MOD PATHS >>')
         layout.prop(self, "wolvenkit")
         layout.prop(self, "mod_directory")
         layout.prop(self, "tex_mod_uncook_path")
         
-        layout.label(text='EXTRA SETTINGS:')
+        
+        layout.label(text='<< WITCHER 3 EXTRA SETTINGS  >>')
         layout.prop(self, "W3_FOLIAGE_PATH")
         layout.prop(self, "W3_REDCLOTH_PATH")
         layout.prop(self, "W3_REDFUR_PATH")
         layout.prop(self, "W3_VOICE_PATH")
         layout.prop(self, "W3_OGG_PATH")
-        layout.label(text="FBX:")
+        
+        layout.label(text="<< FBX >>")
         layout.prop(self, "use_fbx_repo")
         layout.prop(self, "fbx_uncook_path")
 
@@ -425,6 +475,7 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
         row.label(text='Material Import')
         row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
         row.operator(WITCH_OT_w2mg.bl_idname, text="Shader (.w2mg)", icon='MESH_DATA')
+
         # row.label(text='Material Export')
         # row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
 
@@ -463,6 +514,11 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
         row = row.column(align=True)
         row.label(text='Morphs')
         row.operator(WITCH_OT_morphs.bl_idname, text="Load Face Morphs", icon='SHAPEKEY_DATA')
+
+        row = layout.row().box()
+        row = row.column(align=True)
+        row.label(text='WITCHER 2 Only Import')
+        row.operator(WITCH_OT_xbm.bl_idname, text="WITCHER 2 Texture (.xbm)", icon='SPHERE')
 
         #General Settings
         row = layout.row().box()

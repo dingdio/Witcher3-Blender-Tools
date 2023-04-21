@@ -9,60 +9,82 @@ import numpy as np
 from pathlib import Path
 
 import addon_utils
-from io_import_w2l import import_rig, get_uncook_path
+from io_import_w2l import import_rig, get_uncook_path, get_W3_REDCLOTH_PATH
 #from io_import_w2l import settings
 from io_import_w2l import fbx_util
 from io_import_w2l import cloth_util
 from io_import_w2l import constrain_util
 from io_import_w2l.CR2W import read_json_w3
-from io_import_w2l.CR2W.dc_entity import load_bin_entity
 from io_import_w2l.CR2W import w3_types
-from io_import_w2l import get_W3_REDCLOTH_PATH
+from io_import_w2l.CR2W.dc_entity import load_bin_entity
 from io_import_w2l.CR2W.CR2W_types import EngineTransform
-from io_import_w2l.importers.import_blender_fun import set_blender_object_transform
+from io_import_w2l.importers.import_helpers import set_blender_object_transform
 
 from mathutils import Euler
 from math import radians
 
-def repo_file(filepath: str):
-    if filepath.endswith('.fbx'):
-        return os.path.join(bpy.context.preferences.addons['io_import_w2l'].preferences.fbx_uncook_path, filepath)
-    else:
-        return os.path.join(bpy.context.preferences.addons['io_import_w2l'].preferences.uncook_path, filepath)
-    #repo = "D:/Witcher_uncooked_clean/raw_ent/"
-    #return settings.get().repopath+filepath
+# def repo_file(filepath: str):
+#     if filepath.endswith('.fbx'):
+#         return os.path.join(bpy.context.preferences.addons['io_import_w2l'].preferences.fbx_uncook_path, filepath)
+#     else:
+#         return os.path.join(bpy.context.preferences.addons['io_import_w2l'].preferences.uncook_path, filepath)
+#     #repo = "D:/Witcher_uncooked_clean/raw_ent/"
+#     #return settings.get().repopath+filepath
+addon_name = "io_import_w2l"
+def repo_file(filepath: str, version = 999):
+    
+    try:
+        fbx_uncook_path = bpy.context.preferences.addons[addon_name].preferences.fbx_uncook_path
+        uncook_path = bpy.context.preferences.addons[addon_name].preferences.uncook_path
+        
+        if version <= 115:
+            fbx_uncook_path = bpy.context.preferences.addons[addon_name].preferences.fbx_uncook_path
+            uncook_path = bpy.context.preferences.addons[addon_name].preferences.witcher2_game_path + '\\data'
+    except Exception as e:
+        fbx_uncook_path = "E:\\w3_uncook\\FBXs"
+        uncook_path = "E:\\w3.modding\\modkit\\r4data"
+        if version <= 115:
+            fbx_uncook_path = "E:\\w3_uncook\\FBXs"
+            uncook_path = "G:\\GOG Games\\The Witcher 2\\data"
 
-def fixed(entity):
+    if filepath.endswith('.fbx'):
+        return os.path.join(fbx_uncook_path, filepath)
+    else:
+        return os.path.join(uncook_path, filepath)
+
+
+
+def fixed(entity, version = 999):
     use_fbx = False
     ext = ".fbx" if use_fbx else ".w2mesh"
     suffix ="" #"_CONVERT_"
-    entity.MovingPhysicalAgentComponent.skeleton = repo_file(entity.MovingPhysicalAgentComponent.skeleton)#+".json";
+    entity.MovingPhysicalAgentComponent.skeleton = repo_file(entity.MovingPhysicalAgentComponent.skeleton, version)#+".json";
 
     for appearance in entity.appearances:
         for template in appearance.includedTemplates:
             for chunk in template['chunks']:
                 if "mesh" in chunk:
-                    chunk['mesh'] = repo_file(chunk['mesh'].replace(".w2mesh", suffix+ext))
+                    chunk['mesh'] = repo_file(chunk['mesh'].replace(".w2mesh", suffix+ext), version)
                 if chunk['type'] == "CClothComponent":
                     resource = chunk['resource']
-                    chunk['resource'] = repo_file(resource)
+                    chunk['resource'] = repo_file(resource, version)
                     chunk['resource_apx'] = get_W3_REDCLOTH_PATH(bpy.context)+"\\"+resource.replace(".redcloth", ".apx")
                 if "morphSource" in chunk:
-                    chunk['morphSource'] = repo_file(chunk['morphSource'].replace(".w2mesh", suffix+ext))
+                    chunk['morphSource'] = repo_file(chunk['morphSource'].replace(".w2mesh", suffix+ext), version)
                 if "morphTarget" in chunk:
-                    chunk['morphTarget'] = repo_file(chunk['morphTarget'].replace(".w2mesh", suffix+ext))
+                    chunk['morphTarget'] = repo_file(chunk['morphTarget'].replace(".w2mesh", suffix+ext), version)
                 if "skeleton" in chunk:
-                    chunk['skeleton'] = repo_file(chunk['skeleton'])#+".json"
+                    chunk['skeleton'] = repo_file(chunk['skeleton'], version)#+".json"
                 if "dyng" in chunk:
-                    chunk['dyng'] = repo_file(chunk['dyng'])#+".json"
+                    chunk['dyng'] = repo_file(chunk['dyng'], version)#+".json"
                 if "mimicFace" in chunk:
-                    chunk['mimicFace'] = repo_file(chunk['mimicFace'])#+".json"
+                    chunk['mimicFace'] = repo_file(chunk['mimicFace'], version)#+".json"
     if entity.staticMeshes:
         for chunk in entity.staticMeshes.get('chunks', []):
             if "mesh" in chunk:
-                chunk['mesh'] = repo_file(chunk['mesh'].replace(".w2mesh", suffix+ext))
+                chunk['mesh'] = repo_file(chunk['mesh'].replace(".w2mesh", suffix+ext), version)
             if "skeleton" in chunk:
-                chunk['skeleton'] = repo_file(chunk['skeleton'])#+".json"
+                chunk['skeleton'] = repo_file(chunk['skeleton'], version)#+".json"
     return entity
 
 def isChildNode(chunkIndex, templateChunks):
@@ -94,6 +116,8 @@ def NewAnimsetListItem( treeList, path, name):
 things = []
 def class_fun(thing):
     try:
+        if hasattr(thing,'theType') and thing.theType == 'CGUID' or hasattr(thing,'theType') and thing.theType == 'EPathEngineCollision':
+            return None
         things.append(thing)
         return vars(thing)
     except Exception as e:
@@ -112,20 +136,25 @@ def test_load_entity(filename) ->  w3_types.Entity:
         entity = read_json_w3.readEntFile(filename)
     elif ext.lower().endswith('.w2ent'):
         bin_data = load_bin_entity(filename)
-        class_to_json = json.loads(json.dumps(bin_data,indent=2, default=class_fun, sort_keys=False))
+        
+        the_json = json.dumps(bin_data,indent=2, default=class_fun, sort_keys=False)
+        class_to_json = json.loads(the_json)
         entity = w3_types.Entity()
         entity = entity.from_json(class_to_json)
     else:
         entity = None
     return entity
 
-def import_ent_template(filename, load_face_poses = False, import_apperance = 0):
+def import_ent_template(filename, load_face_poses = False, import_apperance = 0, parent_transform = None):
     app_idx = import_apperance-1
     context = bpy.context
     entity = test_load_entity(filename)
-    entity = fixed(entity)
-    base_animation_skeleton = import_MovingPhysicalAgentComponent(entity)
+    entity = fixed(entity, entity.version)
+    base_animation_skeleton = import_MovingPhysicalAgentComponent(entity, parent_transform)
     main_arm_obj = base_animation_skeleton
+    
+    if not main_arm_obj:
+        return None
     rig_settings = main_arm_obj.data.witcherui_RigSettings
 
     rig_settings.jsonData = json.dumps(entity,indent=2, default=vars, sort_keys=False)
@@ -301,6 +330,13 @@ def do_constraints(constrains, objdict, meshdict, HardAttachments, group_parent 
             rt = EngineTransform.from_json(**relativeTransform)
             set_blender_object_transform(target_object, rt, rotate_180 = False)#, from_this_object= parent_arm, pose_bone = p_bone if p_bone is not None else False)
 
+
+    #if there are leftover meshes parent to top object TODO
+    # for mesh in meshdict.values():
+    #     if mesh.parent == None:
+    #         if objdict:
+    #             mesh.parent = list(objdict.values())[0]
+
     return return_objs
 
 def import_chunks(entity,
@@ -429,7 +465,7 @@ def import_chunks(entity,
             child = chunk['child']
             childNS = False
             parentSlotName = chunk['parentSlotName']
-            parentSlot = chunk['parentSlot']
+            parentSlot = chunk['parentSlot'] # ??
             for findChunk in cur_chunks:
                 if findChunk['chunkIndex'] == parent:
                     if findChunk['type'] == "CAnimDangleComponent":
@@ -441,6 +477,7 @@ def import_chunks(entity,
                         childNS = GetChunkNS(findChunk['constraint'], cur_chunks, i)
                     else:
                         childNS = findChunk['type']+str(i)+str(child)
+
             if parentSlotName and childNS:
                 #log.debug([parentSlotName, childNS])
                 # if pm.objExists(ent_namespace+parentSlotName) and pm.objExists( ent_namespace+childNS):
@@ -450,7 +487,7 @@ def import_chunks(entity,
     return (constrains, objdict, meshdict, HardAttachments, root_skeleton)
 
 
-def import_MovingPhysicalAgentComponent(entity):
+def import_MovingPhysicalAgentComponent(entity, parent_transform = None):
     ent_namespace = entity.name+":"
 
     #OPTIONS
@@ -467,12 +504,21 @@ def import_MovingPhysicalAgentComponent(entity):
     #DICTS
     objdict = {}
     meshdict = {}
-
+    
+    
     if entity.staticMeshes is not None:
         cur_chunks = entity.staticMeshes.get('chunks', [])
         (constrains, objdict, meshdict, HardAttachments, root_skeleton) = import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdict, HardAttachments, hide_shadowmesh, root_skeleton, i='')
+    
+    
+    
     do_constraints(constrains, objdict, meshdict, HardAttachments)
 
+    if parent_transform:
+        root_skeleton.parent = parent_transform
+        for mesh in list(objdict.values()) + list(meshdict.values()):
+            if mesh.parent == None:
+                mesh.parent = parent_transform
     return root_skeleton
 
 def reset_transforms(new_obj):

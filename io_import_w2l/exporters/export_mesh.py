@@ -63,10 +63,21 @@ def get_mesh_material_info(mesh_bl):
                     if input_socket.is_linked:
                         linked_socket = input_socket.links[0].from_socket
                         if linked_socket.node.witcher_include:
-                            mat_dict['witcher_props']['input_props'].append(
-                                {'name':input_socket.name,
-                                 'type': linked_socket.node.type,
-                                 'value':get_socket_value(input_socket)})
+                            
+                            if linked_socket.node.type == 'GROUP':
+                                for input_socket_group in linked_socket.node.inputs:
+                                    if input_socket_group.is_linked:
+                                        linked_socket_inner = input_socket_group.links[0].from_socket
+                                        mat_dict['witcher_props']['input_props'].append(
+                                            {'name':linked_socket.node.name,
+                                            'type': 'handle:CTextureArray',#linked_socket_inner.node.type,
+                                            'value':get_socket_value(input_socket_group)})
+                                        break
+                            else:
+                                mat_dict['witcher_props']['input_props'].append(
+                                    {'name':input_socket.name,
+                                    'type': linked_socket.node.type,
+                                    'value':get_socket_value(input_socket)})
         
         
         # create Vector4 if W value

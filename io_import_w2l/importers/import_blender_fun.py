@@ -1,9 +1,10 @@
 from pathlib import Path
+
 from ..CR2W.CR2W_helpers import Enums
 from ..CR2W.CR2W_types import Entity_Type_List
 import bpy
 import os
-from io_import_w2l.importers.import_helpers import MatrixToArray, checkLevel, meshPath
+from io_import_w2l.importers.import_helpers import MatrixToArray, checkLevel, meshPath, set_blender_object_transform
 from mathutils import Matrix, Euler
 from math import radians
 import time
@@ -24,6 +25,23 @@ from bpy_extras.wm_utils.progress_report import (
     ProgressReportSubstep,
 )
 
+
+class lightObject:
+    def __init__(self, meshName = "Light Item",
+                    translation = False,
+                    matrix = False,
+                    transform = False,
+                    block = False,
+                    BlockDataObjectType = Enums.BlockDataObjectType.Mesh):
+        self.name = meshName
+        self.meshName = meshName
+        self.translation = translation
+        self.matrix = matrix
+        self.transform = transform
+        self.type = "Light"
+        self.block = block
+        self.BlockDataObjectType = BlockDataObjectType
+
 def repo_file(filepath: str):
     if filepath.endswith('.fbx'):
         return os.path.join(bpy.context.preferences.addons['io_import_w2l'].preferences.fbx_uncook_path, filepath)
@@ -31,111 +49,6 @@ def repo_file(filepath: str):
         return os.path.join(bpy.context.preferences.addons['io_import_w2l'].preferences.uncook_path, filepath)
 
 from io_import_w2l import get_W3_REDCLOTH_PATH
-
-def set_blender_pose_bone_transform(obj, EngineTransform, rotate_180 = False):
-    if EngineTransform.Yaw == 0.0 and EngineTransform.Pitch == 0.0 and EngineTransform.Roll == 0.0:
-        pass
-    else:
-        x, y, z = ( radians(EngineTransform.Yaw),
-                    radians(EngineTransform.Pitch),
-                    radians(EngineTransform.Roll))
-        orders =  ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']
-        mat = Euler((x, y, z), orders[2]).to_matrix().to_4x4()
-
-        if rotate_180:
-            mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
-            mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
-            mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
-        else:
-            mat[0][0], mat[0][1], mat[0][2] = mat[0][0], mat[0][1], mat[0][2]
-            mat[1][0], mat[1][1], mat[1][2] = mat[1][0], mat[1][1], mat[1][2]
-            mat[2][0], mat[2][1], mat[2][2] = mat[2][0], mat[2][1], mat[2][2]
-            
-
-        obj.matrix = obj.parent.bone.matrix_local.inverted() @ mat
-    obj.location[0] = EngineTransform.X
-    obj.location[1] = EngineTransform.Y
-    obj.location[2] = EngineTransform.Z
-
-    if hasattr(EngineTransform, "Scale_x"):
-        obj.scale[0] =EngineTransform.Scale_x
-        obj.scale[1] =EngineTransform.Scale_y
-        obj.scale[2] =EngineTransform.Scale_z
-
-def set_blender_object_transform(obj, EngineTransform, rotate_180 = False, from_this_object= False, pose_bone = None):
-    """Sets blender object to RED Engine Transform
-
-    Args:
-        obj (Blender Object): A Blender Object
-        EngineTransform (RED Engine Transform): A RED Engine Transform
-    """    
-    if from_this_object:
-        obj.matrix_world = from_this_object.matrix_world
-        obj.matrix_local = from_this_object.matrix_local
-        obj.matrix_basis = from_this_object.matrix_basis
-        obj.location = from_this_object.location
-        
-
-    # obj.rotation_euler[0] = EngineTransform.Pitch
-    # obj.rotation_euler[1] = EngineTransform.Yaw
-    # obj.rotation_euler[2] = EngineTransform.Roll
-    #obj.location[0] += EngineTransform.X
-    #obj.location[1] += EngineTransform.Y
-    #obj.location[2] += EngineTransform.Z
-    if EngineTransform.Yaw == 0.0 and EngineTransform.Pitch == 0.0 and EngineTransform.Roll == 0.0:
-        mat = obj.matrix_basis
-    else:
-        #THIS WORKS?
-        x, y,  z = (radians(EngineTransform.Yaw),
-                    radians(EngineTransform.Pitch),
-                    radians(EngineTransform.Roll))
-        orders =  ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']
-        mat = Euler((x, y, z), orders[2]).to_matrix().to_4x4()
-
-        if rotate_180:
-            mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
-            mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
-            mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
-        else:
-            mat[0][0], mat[0][1], mat[0][2] = mat[0][0], mat[0][1], mat[0][2]
-            mat[1][0], mat[1][1], mat[1][2] = mat[1][0], mat[1][1], mat[1][2]
-            mat[2][0], mat[2][1], mat[2][2] = mat[2][0], mat[2][1], mat[2][2]
-
-    mat.translation = [EngineTransform.X,EngineTransform.Y,EngineTransform.Z] #obj.location
-    obj.matrix_world @= mat
-
-    #foliage transforms don't have scale
-    if hasattr(EngineTransform, "Scale_x"):
-        obj.scale[0] = EngineTransform.Scale_x
-        obj.scale[1] = EngineTransform.Scale_y
-        obj.scale[2] = EngineTransform.Scale_z
-        # else:
-        #     obj.scale[0] =0.01
-        #     obj.scale[1] =0.01
-        #     obj.scale[2] =0.01
-        
-        
-    #! OLD
-    # x, y, z = (radians(EngineTransform.Pitch), radians(EngineTransform.Yaw), radians(EngineTransform.Roll))
-
-    # mat = Euler((x, y, z)).to_matrix().to_4x4()
-
-    # # mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
-    # # mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
-    # # mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
-
-
-
-    # obj.matrix_world @= mat
-    # # obj.rotation_euler[0] = EngineTransform.Pitch
-    # # obj.rotation_euler[1] = EngineTransform.Yaw
-    # # obj.rotation_euler[2] = EngineTransform.Roll
-    # obj.location[0] = EngineTransform.X
-    # obj.location[1] = EngineTransform.Y
-    # obj.location[2] = EngineTransform.Z
-    # obj.scale[0] =EngineTransform.Scale_x
-    # obj.scale[1] =EngineTransform.Scale_y
-    # obj.scale[2] =EngineTransform.Scale_z
 
 def get_CSectorData(level):
     if level.CSectorData:
@@ -165,7 +78,9 @@ def get_CSectorData(level):
                 log.info("found Collision in CSectorData")
             if block.packedObjectType == Enums.BlockDataObjectType.PointLight:
                 log.info("found point light in CSectorData")
+                static_mesh_list.append(lightObject("PointLight", block.position, MatrixToArray(block.rotationMatrix), block = block, BlockDataObjectType = Enums.BlockDataObjectType.PointLight))
             if block.packedObjectType == Enums.BlockDataObjectType.SpotLight:
+                static_mesh_list.append(lightObject("SpotLight", block.position, MatrixToArray(block.rotationMatrix), block = block, BlockDataObjectType = Enums.BlockDataObjectType.SpotLight))
                 #light_path = level.CSectorData.Resources[block.resourceIndex].pathHash
                 log.info("found spot light in CSectorData")
             if block.packedObjectType == Enums.BlockDataObjectType.Invalid:
@@ -197,12 +112,97 @@ def recurLayerCollection(layerColl, collName):
 from collections import defaultdict
 
 
+def import_light(mesh, parent_transform = False):
+    block = mesh.block
+    light_data = block.packedObject
+    if block.packedObjectType == Enums.BlockDataObjectType.PointLight:
+        bpy.ops.object.light_add(type='POINT', radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
+        light_obj = bpy.context.selected_objects[:][0]
+        light_obj.data.energy = light_data.brightness * 10
+        light_obj.data.color[0] = light_data.color.Red/255
+        light_obj.data.color[1] = light_data.color.Green/255
+        light_obj.data.color[2] = light_data.color.Blue/255
+        # do some custom val? #light_obj.data.color[3] = color.Value/255
+        light_obj.data.shadow_soft_size = light_data.radius/255
+        #set_blender_object_transform(light_obj, component.GetVariableByName('transform').EngineTransform)
+        
+    elif block.packedObjectType == Enums.BlockDataObjectType.SpotLight:
+        bpy.ops.object.light_add(type='SPOT', radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
+        light_obj = bpy.context.selected_objects[:][0]
+        light_obj.data.energy = light_data.brightness * 3
+        light_obj.data.color[0] = light_data.color.Red/255
+        light_obj.data.color[1] = light_data.color.Green/255
+        light_obj.data.color[2] = light_data.color.Blue/255
+        light_obj.data.shadow_soft_size = light_data.radius/255
+
+        #light_obj.data.spot_blend = component.GetVariableByName('innerAngle').Value
+        light_obj.data.spot_blend = 0
+        light_obj.data.spot_size = light_data.outerAngle
+        #light_obj.data.spot_size = component.GetVariableByName('softness').Value
+
+
+
+    obj = light_obj
+    if parent_transform:
+        obj.parent = parent_transform
+
+    if mesh.transform:
+        obj.rotation_euler = (0,0,0)
+        x, y,  z = (radians(mesh.transform.Yaw),
+                    radians(mesh.transform.Pitch),
+                    radians(mesh.transform.Roll))
+        orders =  ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']
+        mat = Euler((x, y, z), orders[2]).to_matrix().to_4x4()
+
+        obj.matrix_world @= mat
+        obj.location[0] = mesh.transform.X
+        obj.location[1] = mesh.transform.Y
+        obj.location[2] = mesh.transform.Z
+
+        if hasattr(mesh.transform, "Scale_x"):
+            obj.scale[0] =mesh.transform.Scale_x
+            obj.scale[1] =mesh.transform.Scale_y
+            obj.scale[2] =mesh.transform.Scale_z
+
+    if mesh.matrix:
+        try:
+            log.info(obj.name)
+            mat = Matrix()
+            #log.info(mat)
+            obj.matrix_world = obj.matrix_world @ mat
+        except:
+            error_message = "ERROR MESH IMPORTER: Can't import: " + mesh.fbxPath()
+            log.info(error_message)
+    if mesh.translation:
+        obj.location[0] = mesh.translation.x
+        obj.location[1] = mesh.translation.y
+        obj.location[2] = mesh.translation.z
+        
+    if block.packedObjectType == Enums.BlockDataObjectType.SpotLight:
+        # 90 to X in every spotlight
+        rotation_euler = light_obj.rotation_euler
+        rotation_euler.x += 1.5708  # 90 degrees in radians
+        light_obj.rotation_euler = rotation_euler
+
 #global repo_lookup_list
 
-def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs):
+# import cProfile
+# import pstats
 
+def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs):
+    #! profiler = cProfile.Profile()
+    #! profiler.enable()
+    
     #keep_empty_lods = kwargs.get('keep_empty_lods', False)
     #keep_proxy_meshes = kwargs.get('keep_proxy_meshes', False)
+    
+    do_import_Mesh = kwargs.get('do_import_Mesh', True)
+    do_import_Collision = kwargs.get('do_import_Collision', True)
+    do_import_RigidBody = kwargs.get('do_import_RigidBody', True)
+    do_import_PointLight = kwargs.get('do_import_PointLight', True)
+    do_import_SpotLight = kwargs.get('do_import_SpotLight', True)
+    do_import_Entity = kwargs.get('do_import_Entity', True)
+    
     
     if context == None:
         context = bpy.context
@@ -280,6 +280,14 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
             Mesh_transform = bpy.context.object
             Mesh_transform.name = "Mesh"
             Mesh_transform.parent = empty_transform
+            bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
+            PointLight_transform = bpy.context.object
+            PointLight_transform.name = "PointLight"
+            PointLight_transform.parent = empty_transform
+            bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
+            SpotLight_transform = bpy.context.object
+            SpotLight_transform.name = "SpotLight"
+            SpotLight_transform.parent = empty_transform
 
             #wm = context.window_manager
             #wm.progress_begin(0, len(mesh_list))
@@ -288,43 +296,72 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                 #wm.progress_update(idx)
                 
                 progress_msg = f"{idx+1}/{total_loops} - {os.path.basename(mesh.meshName)}"
-                if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh:
+                if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh and do_import_Mesh:
                     import_single_mesh(mesh, errors, Mesh_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
                     #continue
-                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision:
+                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
                     import_single_mesh(mesh, errors, Collision_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
                     #continue
-                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody:
+                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
                     import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
                     #continue
+                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
+                    import_light(mesh, PointLight_transform)
+                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.SpotLight and do_import_SpotLight:
+                    import_light(mesh, SpotLight_transform)
                 progress_msg += " " * (80 - len(progress_msg))
                 print(progress_msg, end="\r")
             #wm.progress_end()
 
-        for INCLUDE_OBJECT in levelData.includes:
-            for ENTITY_OBJECT in INCLUDE_OBJECT.Entities:
-                if ENTITY_OBJECT.type in Entity_Type_List:
-                    import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
-            
-        for ENTITY_OBJECT in levelData.Entities:
-            if ENTITY_OBJECT.type in Entity_Type_List:
-                import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
-        # for idx, ENTITY_OBJECT in enumerate(levelData.meshes):
-        #     if ENTITY_OBJECT.type == "Mesh": #A SINGLE MESH WITH NO COMPONENTS
-        #         import_single_mesh(ENTITY_OBJECT, errors, **kwargs)
-        #         #log.info(idx, ENTITY_OBJECT.translation.x,ENTITY_OBJECT.translation.y,ENTITY_OBJECT.translation.z)
-        #     if ENTITY_OBJECT.type == "CGameplayEntity" or ENTITY_OBJECT.type == "CSectorData": #A ENTITY WITH A TRANSFORM AND LIST OF MESH/LIGHTS
-        #         import_gameplay_entity(ENTITY_OBJECT, errors)
-        #     if ENTITY_OBJECT.type == "CEntity": # A MESH WITH COMPONENTS
-        #         bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-        #         Entity_transform = bpy.context.object
-        #         Entity_transform.name = ENTITY_OBJECT.meshName #"CGameplayEntity_empty_transform"
-        #         for comp in ENTITY_OBJECT.components:
-        #             import_gameplay_entity(comp, errors, Entity_transform)
-        #         set_blender_object_transform(Entity_transform, ENTITY_OBJECT.transform)
+        if do_import_Entity:
+            for INCLUDE_OBJECT in levelData.includes:
+                for ENTITY_OBJECT in INCLUDE_OBJECT.Entities:
+                    if ENTITY_OBJECT.type in Entity_Type_List:
+                        import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
+                
+            total_loops = len(levelData.Entities)
+            for idx, ENTITY_OBJECT in enumerate(levelData.Entities):
+                
+                #!REMOVE
+                if True: #ENTITY_OBJECT.name == "basement_doors4 (CDoor)":
+                    progress_msg = f"{idx+1}/{total_loops} - {ENTITY_OBJECT.name}"
+                    if ENTITY_OBJECT.type in Entity_Type_List:
+                        import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
+                    progress_msg += " " * (80 - len(progress_msg))
+                    print(progress_msg, end="\r")
+            # for idx, ENTITY_OBJECT in enumerate(levelData.meshes):
+            #     if ENTITY_OBJECT.type == "Mesh": #A SINGLE MESH WITH NO COMPONENTS
+            #         import_single_mesh(ENTITY_OBJECT, errors, **kwargs)
+            #         #log.info(idx, ENTITY_OBJECT.translation.x,ENTITY_OBJECT.translation.y,ENTITY_OBJECT.translation.z)
+            #     if ENTITY_OBJECT.type == "CGameplayEntity" or ENTITY_OBJECT.type == "CSectorData": #A ENTITY WITH A TRANSFORM AND LIST OF MESH/LIGHTS
+            #         import_gameplay_entity(ENTITY_OBJECT, errors)
+            #     if ENTITY_OBJECT.type == "CEntity": # A MESH WITH COMPONENTS
+            #         bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
+            #         Entity_transform = bpy.context.object
+            #         Entity_transform.name = ENTITY_OBJECT.meshName #"CGameplayEntity_empty_transform"
+            #         for comp in ENTITY_OBJECT.components:
+            #             import_gameplay_entity(comp, errors, Entity_transform)
+            #         set_blender_object_transform(Entity_transform, ENTITY_OBJECT.transform)
 
     for error in errors:
         log.error(error)
+    
+        
+    #! #################
+    #!     #PROFILER
+    #! #################
+    #! profiler.disable()
+    
+    #! # Dump profiling data to file
+    #! with open('profile_results.log', 'w') as f:
+    #!     profiler.dump_stats(f.name)
+
+    #! # Read profiling data from file and print to log file
+    #! with open('log_file.txt', 'w') as log_file:
+    #!     stats = pstats.Stats('profile_results.log', stream=log_file)
+    #!     stats.sort_stats('cumulative')
+    #!     stats.print_stats()
+    
     return {'FINISHED'}
 
 from bpy.types import Object, Mesh
@@ -568,10 +605,17 @@ def getDataBufferMesh(entity):
 
     return (mesh_list, cloth_list)
 
+from io_import_w2l import get_witcher2_game_path
+
 def import_single_component(component, parent_obj, keep_lod_meshes = False, **kwargs):
-    if component.name == "CMeshComponent":
-        mesh = meshPath(fbx_uncook_path = get_fbx_uncook_path(bpy.context)).static_from_chunk(component)
-        import_single_mesh(mesh, [], parent_obj, keep_lod_meshes = keep_lod_meshes, **kwargs)
+    if component.name == "CMeshComponent" or component.name == "CStaticMeshComponent":
+        try:
+            mesh = meshPath(fbx_uncook_path = get_fbx_uncook_path(bpy.context)).static_from_chunk(component)
+            if component.get_CR2W_version() <= 115:
+                mesh.uncook_path = get_witcher2_game_path(bpy.context) + '\\data'
+            import_single_mesh(mesh, [], parent_obj, keep_lod_meshes = keep_lod_meshes, **kwargs)
+        except Exception as e:
+            log.critical('import_single_component mesh fail') #w2 has embedded here??
     elif component.name == "CPointLightComponent":
         bpy.ops.object.light_add(type='POINT', radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
         light_obj = bpy.context.selected_objects[:][0]
@@ -579,16 +623,22 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False, **kw
         if component.GetVariableByName('brightness'):
             light_obj.data.energy = component.GetVariableByName('brightness').Value * 10
 
-        if component.GetVariableByName('color'):
-            for color in component.GetVariableByName('color').More:
+        
+        COLOR = component.GetVariableByName('color')
+        if COLOR:
+            for color in COLOR.More:
                 if color.theName == "Red":
                     light_obj.data.color[0] = color.Value/255
-                if color.theName == "Green":
+                elif color.theName == "Green":
                     light_obj.data.color[1] = color.Value/255
-                if color.theName == "Blue":
+                elif color.theName == "Blue":
                     light_obj.data.color[2] = color.Value/255
-        if component.GetVariableByName('radius'):
-            light_obj.data.shadow_soft_size = component.GetVariableByName('radius').Value
+                elif color.theName == "Alpha":
+                    pass # do some custom val?
+                    #light_obj.data.color[3] = color.Value/255
+        RADIUS = component.GetVariableByName('radius')
+        if RADIUS:
+            light_obj.data.shadow_soft_size = RADIUS.Value
         if component.GetVariableByName('transform'):
             set_blender_object_transform(light_obj, component.GetVariableByName('transform').EngineTransform)
     
@@ -598,15 +648,21 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False, **kw
         light_obj.parent = parent_obj
         light_obj.data.energy = component.GetVariableByName('brightness').Value * 3
 
-        if component.GetVariableByName('color'):
-            for color in component.GetVariableByName('color').More:
+        COLOR = component.GetVariableByName('color')
+        if COLOR:
+            for color in COLOR.More:
                 if color.theName == "Red":
                     light_obj.data.color[0] = color.Value/255
-                if color.theName == "Green":
+                elif color.theName == "Green":
                     light_obj.data.color[1] = color.Value/255
-                if color.theName == "Blue":
+                elif color.theName == "Blue":
                     light_obj.data.color[2] = color.Value/255
-        light_obj.data.shadow_soft_size = component.GetVariableByName('radius').Value
+                elif color.theName == "Alpha":
+                    pass # do some custom val?
+                    #light_obj.data.color[3] = color.Value/255
+        RADIUS = component.GetVariableByName('radius')
+        if RADIUS:
+            light_obj.data.shadow_soft_size = RADIUS.Value
         if component.GetVariableByName('transform'):
             set_blender_object_transform(light_obj, component.GetVariableByName('transform').EngineTransform)
             #TODO should add 90 to X in every spotlight so it matches engine
@@ -658,22 +714,30 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
         empty_transform['entity_type'] = ENTITY_OBJECT.type
         empty_transform['template'] = ENTITY_OBJECT.templatePath
 
-        if ENTITY_OBJECT.template.includes:
-            bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-            include_transform = bpy.context.object
-            include_transform.name = "INCLUDES"
-            include_transform.parent = empty_transform
-            for INCLUDE_OBJECT in ENTITY_OBJECT.template.includes:
-                for inc_entity in INCLUDE_OBJECT.Entities:
-                    if inc_entity.type in Entity_Type_List:
-                        import_gameplay_entity(inc_entity, errors, include_transform, keep_lod_meshes = keep_lod_meshes)
-        for entity in ENTITY_OBJECT.template.Entities:
-            import_gameplay_entity(entity, errors, empty_transform, keep_lod_meshes = keep_lod_meshes)
-            # mesh_list = getDataBufferMesh(entity)
-            # for mesh in mesh_list:
-            #     import_single_mesh(mesh, errors, empty_transform, **kwargs)
-            # for component in entity.Components:
-            #     import_single_component(component, empty_transform, **kwargs)
+    
+        #TODO work for all animated objects
+        if '(CDoor)' in ENTITY_OBJECT.name:
+            from io_import_w2l.importers import import_entity
+            ent_template = import_entity.import_ent_template(ENTITY_OBJECT.template.layerNode, False, 0, empty_transform)
+            ent_template.parent = empty_transform
+            pass
+        else:
+            if ENTITY_OBJECT.template.includes:
+                bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
+                include_transform = bpy.context.object
+                include_transform.name = "INCLUDES"
+                include_transform.parent = empty_transform
+                for INCLUDE_OBJECT in ENTITY_OBJECT.template.includes:
+                    for inc_entity in INCLUDE_OBJECT.Entities:
+                        if inc_entity.type in Entity_Type_List:
+                            import_gameplay_entity(inc_entity, errors, include_transform, keep_lod_meshes = keep_lod_meshes)
+            for entity in ENTITY_OBJECT.template.Entities:
+                import_gameplay_entity(entity, errors, empty_transform, keep_lod_meshes = keep_lod_meshes)
+                # mesh_list = getDataBufferMesh(entity)
+                # for mesh in mesh_list:
+                #     import_single_mesh(mesh, errors, empty_transform, **kwargs)
+                # for component in entity.Components:
+                #     import_single_component(component, empty_transform, **kwargs)
 
     if ENTITY_OBJECT.transform:
         set_blender_object_transform(empty_transform, ENTITY_OBJECT.transform)

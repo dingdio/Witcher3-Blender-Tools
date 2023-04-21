@@ -316,10 +316,49 @@ def create_CEntity(file):
     this_Entity.name = Path(file.fileName).stem
     this_Entity.appearances = []
     this_Entity.coloringEntries = []
-    
     new_mesh = ModelEnt("staticMeshes", "staticMeshes")
     this_Entity.CAnimAnimsetsParam = []
     this_Entity.CAnimMimicParam = []
+    
+    
+    
+    if file.HEADER.version <= 115:
+        ## Witcher 2 has CExternalProxyComponent that replaces chunks with chunks in the templates include
+        #CExternalProxyAttachment + orginal makes for final attachment
+        this_includes = []
+        guids = {}
+        
+        for chunk in CHUNKS:
+            if chunk.name == "CEntityTemplate" and chunk.GetVariableByName("includes"):
+                includes = chunk.GetVariableByName('includes')
+                if includes and hasattr(includes, 'Handles'): #!TODO witcher2 includes
+                    for include in includes.Handles:  ## array:2,0,#CEntityTemplate WITCHER2
+                        try:
+                            fileName = repo_file(include.DepotPath, file.HEADER.version)
+                            CR2WFile = read_CR2W(fileName)
+                            #entity = create_CEntity(CR2WFile)
+                            this_includes.append(CR2WFile)
+                        except Exception as e:
+                            log.exception("Problem Importing an include")
+
+            if chunk.name == "CExternalProxyComponent":
+                guids[chunk.GetVariableByName("guid").GUID.GuidString] = chunk
+        for inc in this_includes:
+            for chunk in inc.CHUNKS.CHUNKS:
+                if chunk.GetVariableByName("guid"):
+                    if chunk.GetVariableByName("guid").GUID.GuidString in guids:
+                        old_chunk = guids[chunk.GetVariableByName("guid").GUID.GuidString]
+                        chunk.ChunkIndex = old_chunk.ChunkIndex
+                        guids[chunk.GetVariableByName("guid").GUID.GuidString] = chunk
+                        CHUNKS[chunk.ChunkIndex] = chunk
+    
+        #CExternalProxyAttachments = {}
+        for chunk in CHUNKS:
+            if chunk.name == "CExternalProxyAttachment":
+                attachment = CHUNKS[chunk.GetVariableByName("originalAttachment").Value-1]
+                attachment.PROPS.extend(chunk.PROPS)
+                #CExternalProxyAttachments[chunk.ChunkIndex] = (chunk, attachment)
+
     for chunk in CHUNKS:
         if(chunk.Type == "CEntityTemplate" and chunk.GetVariableByName("appearances")):
             appearances = chunk.GetVariableByName("appearances").More
@@ -455,4 +494,5 @@ def load_bin_entity(fileName) -> w3_types.Entity:
         theFile = getCR2W(f)
         f.close()
         CEntity = create_CEntity(theFile)
+        CEntity.version = theFile.HEADER.version
     return CEntity

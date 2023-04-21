@@ -26,10 +26,10 @@ class radishExporter(object):
                 print("obj: ", obj.name.replace(".","_"))
                 if "repo_path" in obj:
                     print(obj['repo_path'])
-                    print(obj.rotation_euler)
-                    rot_z = math.degrees(obj.rotation_euler[2])
-                    if math.degrees(obj.rotation_euler[1]) == 0.0 and math.degrees(obj.rotation_euler[0]) == 0.0:
-                        rot_z = rot_z + 180
+                    #print(obj.rotation_euler)
+                    # rot_z = math.degrees(obj.rotation_euler[2])
+                    # if math.degrees(obj.rotation_euler[1]) == 0.0 and math.degrees(obj.rotation_euler[0]) == 0.0:
+                    #     rot_z = rot_z + 180
 
                     self.items.append(
                         MeshItem(obj.name.replace(".","_"),
@@ -37,10 +37,24 @@ class radishExporter(object):
                         [obj.location[0],obj.location[1],obj.location[2]],
                             [math.degrees(obj.rotation_euler[1]),
                             math.degrees(obj.rotation_euler[0]),
-                            rot_z
+                            math.degrees(obj.rotation_euler[2])
+                            #rot_z
                             ],
                         [obj.scale[0],obj.scale[1],obj.scale[2]])
                     )
+            if obj.witcherui_MeshSettings.item_repo_path != '':
+                self.items.append(
+                    MeshItem(obj.name.replace(".","_"),
+                    obj.witcherui_MeshSettings.item_repo_path,
+                    [obj.location[0],obj.location[1],obj.location[2]],
+                        [math.degrees(obj.rotation_euler[1]),
+                        math.degrees(obj.rotation_euler[0]),
+                        math.degrees(obj.rotation_euler[2])
+                        #rot_z
+                        ],
+                    [obj.scale[0],obj.scale[1],obj.scale[2]])
+                )
+                    
 
     def __export(self, filename):
         items = self.items

@@ -1,4 +1,5 @@
 import os
+import struct
 import bpy
 from pathlib import Path
 from bpy.types import (Panel, Operator)
@@ -9,6 +10,9 @@ import addon_utils
 from io_import_w2l import file_helpers, w3_material_blender, CR2W, get_texture_path, get_uncook_path
 from io_import_w2l.cloth_util import setup_w3_material_CR2W
 
+from io_import_w2l.CR2W.CR2W_types import getCR2W
+from io_import_w2l.CR2W import bStream
+from io_import_w2l.ui.blender_fun import convert_xbm_to_dds
 
 class WITCH_OT_w2mg(bpy.types.Operator, ImportHelper):
     """Load Witcher 3 Material Shader"""
@@ -94,9 +98,39 @@ class WITCH_OT_w2mi(bpy.types.Operator, ImportHelper):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
 
+class WITCH_OT_xbm(bpy.types.Operator, ImportHelper):
+    """Load Witcher 2 Texture"""
+    bl_idname = "witcher.import_xbm"
+    bl_label = "Import W2 .xbm"
+    filename_ext = ".xbm"
+    filter_glob: StringProperty(default='*.xbm', options={'HIDDEN'})
+    def execute(self, context):
+        print("importing xbm")
+        fdir = self.filepath
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        ext = file_helpers.getFilenameType(fdir)
+        if ext == ".xbm":
+            dds_path = convert_xbm_to_dds(fdir)
+            bpy.data.images.load(dds_path,check_existing=True)
+                    
+        else:
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        UNCOOK_PATH = get_uncook_path(context) + '\\'
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
+
+
 from bpy.utils import (register_class, unregister_class)
 
 _classes= [
+    WITCH_OT_xbm,
     WITCH_OT_w2mi,
     WITCH_OT_w2mg,
 ]

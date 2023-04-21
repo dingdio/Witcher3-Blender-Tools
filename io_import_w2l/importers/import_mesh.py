@@ -9,7 +9,7 @@ import numpy as np
 import array
 
 from io_import_w2l.cloth_util import setup_w3_material_CR2W
-from io_import_w2l import get_texture_path, get_uncook_path
+from io_import_w2l import get_texture_path, get_uncook_path, get_w2_unbundle_path, get_witcher2_game_path
 from io_import_w2l import file_helpers
 from io_import_w2l.CR2W import w3_types
 from io_import_w2l.CR2W import read_json_w3
@@ -311,8 +311,14 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
     if do_import_mats and final_bl_meshes:
         ### MATERIALS
         force_mat_update = True
-        uncook_path = get_texture_path(bpy.context)+"\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
-        uncook_path_modkit = get_uncook_path(bpy.context)
+        
+        
+        if meshFile.HEADER.version <= 115:
+            uncook_path = get_witcher2_game_path(bpy.context)+"\\data\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
+            uncook_path_modkit = get_witcher2_game_path(bpy.context)
+        else:
+            uncook_path = get_texture_path(bpy.context)+"\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
+            uncook_path_modkit = get_uncook_path(bpy.context)
         xml_path = "w2mesh"
         
         materials = []
@@ -328,6 +334,7 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                         materials[-1].local = False
                         materials[-1].DepotPath = o.DepotPath
         #material_names = [o.String.split('::')[1] for o in chunk.GetVariableByName('apexMaterialNames').elements]
+
         load_materials = True
         if load_materials:
             mat_filename = "witcher_mat"
@@ -440,8 +447,28 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
         #=========#
         # Weights #
         #=========#
-        for idx in CData.boneData.BoneIndecesMappingBoneIndex:
-            mesh_ob.vertex_groups.new(name=CData.boneData.jointNames[idx])
+        sorted_array = []
+
+
+
+        # for Witcher 2
+        for index in CData.boneData.BoneIndecesMappingBoneIndex:
+            if index < len(CData.boneData.jointNames):
+                sorted_array.append(CData.boneData.jointNames[index])
+
+        if len(sorted_array) < len(CData.boneData.BoneIndecesMappingBoneIndex):
+            for the_bone in CData.boneData.jointNames:
+                if the_bone not in sorted_array:
+                    sorted_array.append(the_bone)
+                if len(sorted_array) == len(CData.boneData.BoneIndecesMappingBoneIndex):
+                    break
+
+        #todo check skinning verts for any groups that are not created for some reason
+        for group_name in sorted_array:
+            try:
+                mesh_ob.vertex_groups.new(name=group_name)
+            except Exception as e:
+                print(e)
         for vert in meshDataBl.skinningVerts:
             try:
                 assignVertexGroup(vert, CData, mesh_ob)

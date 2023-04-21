@@ -20,12 +20,14 @@ class WITCH_PT_materials(bpy.types.Panel):
             row = layout.row()
             row.enabled = not mat.witcher_props.bind_name
             row.prop(mat.witcher_props, "name", text="Name")
+            layout.prop(mat.witcher_props, "material_version")
             layout.prop(mat.witcher_props, "local")
             layout.prop(mat.witcher_props, "enableMask")
             #layout.prop(mat.witcher_props, "base")
             #layout.prop(mat.witcher_props, "base")
             #if mat.witcher_props.base == 'custom':
             layout.prop(mat.witcher_props, "base_custom")
+            
             #group_inputs = get_group_inputs(mat)
             if mat.witcher_props.local:
                 group_inputs = get_group_inputs(mat)
@@ -167,6 +169,19 @@ class WitcherMaterialProperties(bpy.types.PropertyGroup):
         name="Base Path",
         description="Enter a .w2mi or .w2mg path",
         default=r"engine\materials\graphs\pbr_std.w2mg",
+    )
+    
+    
+    material_version_options = [
+        #("custom", "Custom", "Description for value 1"),
+        ("witcher3", "Witcher 3", "This is a Witcher 3 material"),
+        ("witcher2", "Witcher 2", "This is a Witcher 2 material"),
+    ]
+    material_version: bpy.props.EnumProperty(
+        name="Game",
+        description="What game this material was orignally for",
+        items=material_version_options,
+        default="witcher3",
     )
     
 def get_group_inputs(mat):

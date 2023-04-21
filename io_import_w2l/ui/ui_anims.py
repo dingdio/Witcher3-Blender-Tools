@@ -494,7 +494,6 @@ class WITCH_OT_ImportW2Rig(bpy.types.Operator, ImportHelper):
         print("importing rig now!")
         fdir = self.filepath
         if os.path.isdir(fdir):
-            #fdir = r"E:\w3.modding\modkit\r4data\gameplay\camera\model\camera.w2rig"
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
             return {'CANCELLED'}
         ext = file_helpers.getFilenameType(fdir)

@@ -120,6 +120,11 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         print("importing character now!")
         fdir = self.filepath
+        
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        
         s = time.time()
         if fdir.endswith(".w2ent") or fdir.endswith(".json"):
             import_entity.import_ent_template(fdir, False, self.import_apperance)

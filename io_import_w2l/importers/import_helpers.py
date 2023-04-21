@@ -1,12 +1,17 @@
 import os
 try:
     import bpy
-    from io_import_w2l import get_fbx_uncook_path, get_uncook_path
+    from mathutils import Matrix, Euler
+    from io_import_w2l import get_fbx_uncook_path, get_uncook_path, get_witcher2_game_path
 except Exception as e:
     pass
+from math import radians
 from pathlib import Path
 
 from ..CR2W.CR2W_helpers import Enums
+
+
+
 
 #from io_import_w2l.setup_logging_bl import *
 from ..CR2W.setup_logging import *
@@ -322,3 +327,107 @@ def checkLevel(levelData):
             print(error)
         return False
 
+def set_blender_pose_bone_transform(obj, EngineTransform, rotate_180 = False):
+    if EngineTransform.Yaw == 0.0 and EngineTransform.Pitch == 0.0 and EngineTransform.Roll == 0.0:
+        pass
+    else:
+        x, y, z = ( radians(EngineTransform.Yaw),
+                    radians(EngineTransform.Pitch),
+                    radians(EngineTransform.Roll))
+        orders =  ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']
+        mat = Euler((x, y, z), orders[2]).to_matrix().to_4x4()
+
+        if rotate_180:
+            mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
+        else:
+            mat[0][0], mat[0][1], mat[0][2] = mat[0][0], mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = mat[1][0], mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = mat[2][0], mat[2][1], mat[2][2]
+            
+
+        obj.matrix = obj.parent.bone.matrix_local.inverted() @ mat
+    obj.location[0] = EngineTransform.X
+    obj.location[1] = EngineTransform.Y
+    obj.location[2] = EngineTransform.Z
+
+    if hasattr(EngineTransform, "Scale_x"):
+        obj.scale[0] =EngineTransform.Scale_x
+        obj.scale[1] =EngineTransform.Scale_y
+        obj.scale[2] =EngineTransform.Scale_z
+
+def set_blender_object_transform(obj, EngineTransform, rotate_180 = False, from_this_object= False, pose_bone = None):
+    """Sets blender object to RED Engine Transform
+
+    Args:
+        obj (Blender Object): A Blender Object
+        EngineTransform (RED Engine Transform): A RED Engine Transform
+    """    
+    if from_this_object:
+        obj.matrix_world = from_this_object.matrix_world
+        obj.matrix_local = from_this_object.matrix_local
+        obj.matrix_basis = from_this_object.matrix_basis
+        obj.location = from_this_object.location
+        
+
+    # obj.rotation_euler[0] = EngineTransform.Pitch
+    # obj.rotation_euler[1] = EngineTransform.Yaw
+    # obj.rotation_euler[2] = EngineTransform.Roll
+    #obj.location[0] += EngineTransform.X
+    #obj.location[1] += EngineTransform.Y
+    #obj.location[2] += EngineTransform.Z
+    if EngineTransform.Yaw == 0.0 and EngineTransform.Pitch == 0.0 and EngineTransform.Roll == 0.0:
+        mat = obj.matrix_basis
+    else:
+        #THIS WORKS?
+        x, y,  z = (radians(EngineTransform.Yaw),
+                    radians(EngineTransform.Pitch),
+                    radians(EngineTransform.Roll))
+        orders =  ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']
+        mat = Euler((x, y, z), orders[2]).to_matrix().to_4x4()
+
+        if rotate_180:
+            mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
+        else:
+            mat[0][0], mat[0][1], mat[0][2] = mat[0][0], mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = mat[1][0], mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = mat[2][0], mat[2][1], mat[2][2]
+
+    mat.translation = [EngineTransform.X,EngineTransform.Y,EngineTransform.Z] #obj.location
+    obj.matrix_world @= mat
+
+    #foliage transforms don't have scale
+    if hasattr(EngineTransform, "Scale_x"):
+        obj.scale[0] = EngineTransform.Scale_x
+        obj.scale[1] = EngineTransform.Scale_y
+        obj.scale[2] = EngineTransform.Scale_z
+        # else:
+        #     obj.scale[0] =0.01
+        #     obj.scale[1] =0.01
+        #     obj.scale[2] =0.01
+        
+        
+    #! OLD
+    # x, y, z = (radians(EngineTransform.Pitch), radians(EngineTransform.Yaw), radians(EngineTransform.Roll))
+
+    # mat = Euler((x, y, z)).to_matrix().to_4x4()
+
+    # # mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
+    # # mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
+    # # mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
+
+
+
+    # obj.matrix_world @= mat
+    # # obj.rotation_euler[0] = EngineTransform.Pitch
+    # # obj.rotation_euler[1] = EngineTransform.Yaw
+    # # obj.rotation_euler[2] = EngineTransform.Roll
+    # obj.location[0] = EngineTransform.X
+    # obj.location[1] = EngineTransform.Y
+    # obj.location[2] = EngineTransform.Z
+    # obj.scale[0] =EngineTransform.Scale_x
+    # obj.scale[1] =EngineTransform.Scale_y
+    # obj.scale[2] =EngineTransform.Scale_z

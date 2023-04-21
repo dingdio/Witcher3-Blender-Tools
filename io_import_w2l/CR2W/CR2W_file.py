@@ -259,6 +259,38 @@ class W3NewDoor(W3LockableEntity):
     def show(self):
         super().show()
 
+## WITCHER 2 Classes
+#CDoor
+#CContainer
+
+class CDoor(W3LockableEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "W3NewDoor"
+        self.type = "W3NewDoor"
+
+    def show(self):
+        super().show()
+
+class CContainer(W3LockableEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CContainer"
+        self.type = "CContainer"
+
+    def show(self):
+        super().show()
+
+class CActionPoint(W3LockableEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CActionPoint"
+        self.type = "CActionPoint"
+
+    def show(self):
+        super().show()
+
+
 from . import CR2W_file
 
 def create_level(file, filename):
@@ -281,10 +313,10 @@ def create_level(file, filename):
             
         if chunk.name == "CEntityTemplate":
             includes = chunk.GetVariableByName('includes')
-            if includes:
-                for include in includes.Handles:
+            if includes and hasattr(includes, 'Handles'): #!TODO witcher2 includes
+                for include in includes.Handles:  ## array:2,0,#CEntityTemplate WITCHER2
                     try:
-                        fileName = repo_file(include.DepotPath)
+                        fileName = repo_file(include.DepotPath, file.HEADER.version)
                         CR2WFile = read_CR2W(fileName)
                         entity = create_level(CR2WFile, fileName)
                         level.includes.append(entity)
@@ -300,7 +332,7 @@ def create_level(file, filename):
                 #raise e
                 continue
             Entity = class_()
-
+            Entity.name = chunk.get_name_prop_string()
             if chunk.GetVariableByName('transform'):
                 Entity.transform = chunk.GetVariableByName('transform').EngineTransform
             #each transform should have it's own equlivant blender object.
@@ -310,7 +342,7 @@ def create_level(file, filename):
                 #broken template? Need to read include files if can't find mesh buffer?
                 if chunk.Template.Handles[0].DepotPath == r"gameplay\containers\new_locations\novigrad\indoors\average\simple_dresser_table.w2ent":
                     chunk.Template.Handles[0].DepotPath = r"environment\decorations\containers\dressers\simple_dresser\simple_dresser_table.w2ent"
-                fileName = repo_file(chunk.Template.Handles[0].DepotPath)
+                fileName = repo_file(chunk.Template.Handles[0].DepotPath, file.HEADER.version)
                 CR2WFile = read_CR2W(fileName)
                 entity = create_level(CR2WFile, fileName)
                 Entity.template = entity
@@ -327,19 +359,24 @@ def create_level(file, filename):
                     entity = create_level(bufferedCR2W, chunk.name)
                     Entity.streamingDataBuffer = entity
 
-                if hasattr(chunk, 'Components'):
-                    for chunk_id in chunk.Components:
-                        sub_chunk  = CHUNKS[chunk_id-1]
-                        if sub_chunk.name == "CPointLightComponent":
-                            Entity.Components.append(sub_chunk)
-                        elif sub_chunk.name == "CSpotLightComponent":
-                            Entity.Components.append(sub_chunk)
-                        elif sub_chunk.name == "CMeshComponent":
-                            Entity.Components.append(sub_chunk)
-                        elif sub_chunk.name == "CAreaComponent":
-                            Entity.Components.append(sub_chunk)
-                        elif sub_chunk.name == "CWaterComponent":
-                            Entity.Components.append(sub_chunk)
+                try:
+                    if hasattr(chunk, 'Components'):
+                        for chunk_id in chunk.Components:
+                            sub_chunk  = CHUNKS[chunk_id-1]
+                            if sub_chunk.name == "CPointLightComponent":
+                                Entity.Components.append(sub_chunk)
+                            elif sub_chunk.name == "CSpotLightComponent":
+                                Entity.Components.append(sub_chunk)
+                            elif sub_chunk.name == "CMeshComponent":
+                                Entity.Components.append(sub_chunk)
+                            elif sub_chunk.name == "CStaticMeshComponent":
+                                Entity.Components.append(sub_chunk)
+                            elif sub_chunk.name == "CAreaComponent":
+                                Entity.Components.append(sub_chunk)
+                            elif sub_chunk.name == "CWaterComponent":
+                                Entity.Components.append(sub_chunk)
+                except Exception as e:
+                    pass#raise e
                 Entities.append(Entity)
     level.CSectorData = CSectorData
     level.Entities = Entities

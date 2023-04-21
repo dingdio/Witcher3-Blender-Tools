@@ -9,6 +9,7 @@ def load_w2l(fileName_in = False):
     if fileName_in:
         fileName = fileName_in
     CR2WFile = CR2W_file.read_CR2W(fileName)
+
     level = CR2W_file.create_level(CR2WFile, fileName)
     return level
 

@@ -15,7 +15,7 @@ from io_import_w2l.ui.ui_anims import (ButtonOperatorImportW2Anims, WITCH_OT_imp
 from io_import_w2l.ui.ui_mesh import WITCH_OT_w2mesh, WITCH_OT_w2mesh_export
 from io_import_w2l.ui.ui_mesh import WITCH_OT_apx
 from io_import_w2l.ui.ui_entity import WITCH_OT_w2ent, WITCH_OT_ENTITY_w2ent_chara
-from io_import_w2l.ui.ui_material import WITCH_OT_w2mg, WITCH_OT_w2mi
+from io_import_w2l.ui.ui_material import WITCH_OT_w2mg, WITCH_OT_w2mi, WITCH_OT_xbm
 from io_import_w2l.ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_w2w,
                                     #  WITCH_OT_load_layer,
@@ -38,12 +38,16 @@ class WITCH_MT_Menu(bpy.types.Menu):
         layout.separator()
         layout.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
         layout.operator(WITCH_OT_w2mg.bl_idname, text="Shader (.w2mg)", icon='MESH_DATA')
+        #layout.operator(WITCH_OT_xbm.bl_idname, text="Texture (.xbm)", icon='SPHERE')
         layout.separator()
         layout.operator(WITCH_OT_ImportW2Rig.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
         layout.operator(ButtonOperatorImportW2Anims.bl_idname, text="Animation (.w2anims)", icon='ARMATURE_DATA')
         layout.separator()
         layout.operator(WITCH_OT_w2L.bl_idname, text="Layer (.w2l)", icon='SPHERE')
         layout.operator(WITCH_OT_w2w.bl_idname, text="World (.w2w)", icon='WORLD_DATA')
+
+
+
 
 def menu_import(self, context):
     witcher_icon = custom_icons["main"]["witcher_icon"]

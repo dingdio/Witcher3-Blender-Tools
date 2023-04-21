@@ -53,6 +53,9 @@ def setup_w3_material_CR2W(
             bl_material.witcher_props.base_custom = mat_bin.DepotPath
             bl_material.witcher_props.local = False
         
+        if mat_bin.get_CR2W_version() <= 115:
+            bl_material.witcher_props.material_version = "witcher2"
+            
         enableMask = mat_bin.GetVariableByName('enableMask')
         if enableMask and enableMask.Value == 1:
             bl_material.witcher_props.enableMask = True

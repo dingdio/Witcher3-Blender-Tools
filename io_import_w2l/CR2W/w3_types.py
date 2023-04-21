@@ -2154,7 +2154,8 @@ class Entity(base_w3):
                 staticMeshes = {},
                 CAnimAnimsetsParam = [],
                 CAnimMimicParam = [],
-                coloringEntries = []):
+                coloringEntries = [],
+                version = 999,):
         self.name:str = name
         self.MovingPhysicalAgentComponent = MovingPhysicalAgentComponent
         self.appearances = appearances
@@ -2162,6 +2163,7 @@ class Entity(base_w3):
         self.CAnimAnimsetsParam = CAnimAnimsetsParam
         self.CAnimMimicParam = CAnimMimicParam,
         self.coloringEntries: List[SEntityTemplateColoringEntry] = coloringEntries
+        self.version:int = version
 
     @classmethod
     def from_json(cls, data):

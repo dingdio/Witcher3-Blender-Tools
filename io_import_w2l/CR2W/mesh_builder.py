@@ -1,5 +1,6 @@
 
 import os
+import re
 
 from .bStream import bStream
 from .dc_mesh import lin2srgb, srgb2lin
@@ -469,22 +470,31 @@ def Build_CMaterialInstance_Chunk(cr2w, inst):
         cMaterialInstance.InstanceParameters = CArray(cr2w, CVariantSizeNameType) # CREATE ARRAY
         
         for param in input_props:
-            if param['type'] == 'TEX_IMAGE':
+            if param['type'] == 'TEX_IMAGE' or  param['type'] == "handle:CTextureArray":
+                _className = 'CBitmapTexture'
+                _theType = 'handle:ITexture'
+                _texPath = param['value'].rsplit('.', 1)[0] + '.xbm'
+                if param['type'] == "handle:CTextureArray" or '.texarray.' in param['value']:
+                    _className = 'CTextureArray'
+                    _theType = 'handle:CTextureArray'
+                    _texPath = re.sub(r'(.texarray).*', r'\1', param['value'])
+                
                 new_param = CVariantSizeNameType(cr2w)
                 handle = HANDLE(CR2WFILE=cr2w,
                                 ChunkHandle = False,
-                                ClassName = 'CBitmapTexture',
-                                DepotPath = param['value'].replace('.tga', '.xbm'),
+                                ClassName = _className, #'CBitmapTexture',
+                                DepotPath = _texPath,#param['value'].replace('.tga', '.xbm'),
                                 Flags = 0,
                                 Index = None,
                                 Reference = None,
-                                theType = 'handle:Texture',
+                                theType = _theType, #'handle:Texture',
                                 val = -2)
                 new_param.PROP = PROPERTY(CR2WFILE=cr2w,
                                             Handles = [handle],
                                             theName=param['name'],
-                                            theType='handle:ITexture')
+                                            theType= _theType)#'handle:ITexture')
                 cMaterialInstance.InstanceParameters.elements.append(new_param)
+
             elif param['type'] == 'RGB':
                 (R,G,B,A) = param['value'].split(' ; ')
                 (R,G,B,A) = float(R)*255,float(G)*255,float(B)*255,float(A)*255,
@@ -588,9 +598,18 @@ def BuildMesh(ALL_LODS, bone_data, common_info):
                 br.writeFloat(bl_mesh_info.normals[i][0])    # normx:float = 0.0
                 br.writeFloat(bl_mesh_info.normals[i][1])    # normy:float = 0.0
                 br.writeFloat(bl_mesh_info.normals[i][2])    # normz:float = 0.0
-                br.writeUInt8(int(lin2srgb(bl_mesh_info.vertexColor[i][0]) * 255))    # r:np.ubyte = 0.0
-                br.writeUInt8(int(lin2srgb(bl_mesh_info.vertexColor[i][1]) * 255))    # g:np.ubyte = 0.0
-                br.writeUInt8(int(lin2srgb(bl_mesh_info.vertexColor[i][2]) * 255))    # b:np.ubyte = 0.0
+                
+                do_lin2srgb = True
+                
+                if do_lin2srgb:
+                    br.writeUInt8(int(lin2srgb(bl_mesh_info.vertexColor[i][0]) * 255))    # r:np.ubyte = 0.0
+                    br.writeUInt8(int(lin2srgb(bl_mesh_info.vertexColor[i][1]) * 255))    # g:np.ubyte = 0.0
+                    br.writeUInt8(int(lin2srgb(bl_mesh_info.vertexColor[i][2]) * 255))    # b:np.ubyte = 0.0
+                else:
+                    br.writeUInt8(int(bl_mesh_info.vertexColor[i][0] * 255))    # r:np.ubyte = 0.0
+                    br.writeUInt8(int(bl_mesh_info.vertexColor[i][1] * 255))    # g:np.ubyte = 0.0
+                    br.writeUInt8(int(bl_mesh_info.vertexColor[i][2] * 255))    # b:np.ubyte = 0.0
+                    
                 br.writeUInt8(int(bl_mesh_info.vertexColor[i][3] * 255))    # a:np.ubyte = 0.0
                 br.writeFloat(bl_mesh_info.UV_vertex3DCoords[i][0])    # ux:float = 0.0
                 br.writeFloat(flip_v(bl_mesh_info.UV_vertex3DCoords[i][1]))    # uv:float = 0.0
