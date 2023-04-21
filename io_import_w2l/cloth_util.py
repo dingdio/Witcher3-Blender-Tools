@@ -16,8 +16,6 @@ from io_import_w2l import get_texture_path
 
 from . import CR2W
 import bpy
-import io_scene_apx
-from io_scene_apx.importer.import_clothing import read_clothing
 
 from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
@@ -182,7 +180,16 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
 
     uncook_path = get_texture_path(context)+"\\" # PATH WITH TEXTURES
 
-    read_clothing(context, filepath, use_mat, rotate_180, rm_ph_me)
+
+    try:
+        from io_scene_apx.importer.import_clothing import read_clothing
+        read_clothing(context, filepath, use_mat, rotate_180, rm_ph_me)
+    except Exception as e:
+        log.critical('No Cloth plugin')
+        return None
+
+
+
     # objs = bpy.context.objects[:]
     # for obj in objs:
     #     print (obj.name)
