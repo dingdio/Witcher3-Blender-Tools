@@ -8,8 +8,9 @@ from pathlib import Path
 from enum import Enum
 from typing import List
 
+from .Types.CBitmapTexture import CBitmapTexture
 from .Types.CMesh import CMesh
-from .Types.VariousTypes import CPaddedBuffer, CNAME, CNAME_INDEX, CMatrix4x4, NAME, CBufferVLQInt32, CColor
+from .Types.VariousTypes import CPaddedBuffer, CNAME, CNAME_INDEX, CMatrix4x4, NAME, CBufferVLQInt32, CColor, CCompressedBuffer
 from .json_convert.CR2WJsonObject import CR2WJsonData, CR2WJsonChunkMap, CR2WJsonMap, CR2WJsonScalar, CR2WJsonArray
 from .W3Strings import LoadStringsManager
 from .bStream import *
@@ -1444,36 +1445,6 @@ class PROPERTY:
                     f.seek(1,1)
         #f.seek(dataEnd,1)
 
-class CQuaternion:
-    def __init__(self, f):
-        self.x = readFloat(f)
-        self.y = readFloat(f)
-        self.z = readFloat(f)
-        self.w = readFloat(f)
-    def __iter__(self):
-        return iter(['x','y','z','w'])
-    def __getitem__(self, item):
-        return getattr(self, item)
-
-class SSkeletonRigData:
-    def __init__(self, f):
-        self.position = CQuaternion(f)
-        self.rotation = CQuaternion(f)
-        self.scale = CQuaternion(f)
-
-class CCompressedBuffer:
-    def __init__(self, f, CR2WFILE, parent, Name = "rigData"):
-        self.Name = Name
-        self.parent = parent
-        self.CR2WFILE = CR2WFILE
-        self.rigData = []
-    def Read(self, f, size, count):
-        m_count = count
-        #tell = f.tell()
-        f.seek(2,1)
-        for _ in range(0, m_count):
-            self.rigData.append(SSkeletonRigData(f))
-
 import uuid
 
 class CGUID(object):
@@ -1885,6 +1856,15 @@ class W_CLASS:
             #REDBuffers
             self.CMesh = CMesh(CR2WFILE)
             self.CMesh.Read(f, 0)
+        elif currentClass == "CBitmapTexture":
+            while True:
+                prop = PROPERTY(f, CR2WFILE, self)
+                if prop.Type == None:
+                    break
+                self.PROPS.append(prop)
+
+            self.CBitmapTexture = CBitmapTexture(CR2WFILE)
+            self.CBitmapTexture.Read(f, 0)
         elif self.name == "CMaterialInstance":
             while True:
                 prop = PROPERTY(f, CR2WFILE, self)

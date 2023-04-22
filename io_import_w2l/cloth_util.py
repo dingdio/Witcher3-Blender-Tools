@@ -182,11 +182,15 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
 
 
     try:
-        from io_scene_apx.importer.import_clothing import read_clothing
-        read_clothing(context, filepath, use_mat, rotate_180, rm_ph_me)
+        from io_mesh_apx.importer.import_clothing import read_clothing
+        read_clothing(context, filepath, rotate_180, rm_ph_me)
     except Exception as e:
-        log.critical('No Cloth plugin')
-        return None
+        try:
+            from io_scene_apx.importer.import_clothing import read_clothing
+            read_clothing(context, filepath, use_mat, rotate_180, rm_ph_me)
+        except Exception as e:
+            log.critical(f'Cloth plugin problem {e}')
+            return None
 
 
 
@@ -322,7 +326,22 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
             materials = [redcloth_material[o.Reference] for o in chunk.GetVariableByName('materials').Handles] 
             material_names = [o.String.split('::')[1] for o in chunk.GetVariableByName('apexMaterialNames').elements]
 
-    load_w3_materials_CR2W(gmesh, uncook_path, materials, material_names, mat_filename=mat_filename)
+    target_mat = False
+    for idx, mat in enumerate(materials):
+        xml_mat_name = material_names[idx]
+        if xml_mat_name in gmesh.data.materials:
+            target_mat = gmesh.data.materials[xml_mat_name] #None
+        if not target_mat:
+            for m in gmesh.data.materials:
+                if m.name in xml_mat_name:
+                    target_mat = m
+
+    if not target_mat:
+        for idx, m in enumerate(gmesh.data.materials):
+            m.name = material_names[idx]
+
+    if redcloth_material:
+        load_w3_materials_CR2W(gmesh, uncook_path, materials, material_names, mat_filename=mat_filename)
     
     if DO_WEAR_CLOTH:
         vcol = gmesh.data.color_attributes['MaximumDistance']
@@ -349,5 +368,7 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
         for ob in save_selected:
             ob.select_set(True)
         
-
-    return arma
+    if DO_WEAR_CLOTH:
+        return cloth_group
+    else:
+        return arma

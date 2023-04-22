@@ -38,7 +38,7 @@ class WITCH_MT_Menu(bpy.types.Menu):
         layout.separator()
         layout.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
         layout.operator(WITCH_OT_w2mg.bl_idname, text="Shader (.w2mg)", icon='MESH_DATA')
-        #layout.operator(WITCH_OT_xbm.bl_idname, text="Texture (.xbm)", icon='SPHERE')
+        layout.operator(WITCH_OT_xbm.bl_idname, text="Texture (.xbm)", icon='SPHERE')
         layout.separator()
         layout.operator(WITCH_OT_ImportW2Rig.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
         layout.operator(ButtonOperatorImportW2Anims.bl_idname, text="Animation (.w2anims)", icon='ARMATURE_DATA')

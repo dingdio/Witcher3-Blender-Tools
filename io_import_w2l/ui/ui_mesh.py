@@ -84,7 +84,9 @@ class WITCH_OT_apx(bpy.types.Operator, ImportHelper):
     @classmethod
     def poll(self, context):
         #print(bpy.ops) # debug ops _utils
-        (exist, enabled) = addon_utils.check("io_scene_apx")
+        (exist, enabled) = addon_utils.check("io_mesh_apx")
+        if not enabled:
+            (exist, enabled) = addon_utils.check("io_scene_apx")
         return enabled
     
     def execute(self, context):

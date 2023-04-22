@@ -5,7 +5,8 @@ from .bStream import *
 from .w3_types import Quaternion, Vector3D
 from .read_json_w3 import readCSkeletonData
 from . import w3_types
-from .CR2W_types import getCR2W, CQuaternion
+from .CR2W_types import getCR2W
+from .Types.VariousTypes import CQuaternion
 
 class MimicPose(w3_types.base_w3):
     """docstring for MimicPose."""

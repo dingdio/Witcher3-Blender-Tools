@@ -1,5 +1,5 @@
 from pathlib import Path
-
+import re
 from ..CR2W.CR2W_helpers import Enums
 from ..CR2W.CR2W_types import Entity_Type_List
 import bpy
@@ -202,6 +202,8 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
     do_import_PointLight = kwargs.get('do_import_PointLight', True)
     do_import_SpotLight = kwargs.get('do_import_SpotLight', True)
     do_import_Entity = kwargs.get('do_import_Entity', True)
+    do_enable_name_filter = kwargs.get('do_enable_name_filter', False)
+    do_name_filter_regex = kwargs.get('do_name_filter_regex', '')
     
     
     if context == None:
@@ -292,25 +294,26 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
             #wm = context.window_manager
             #wm.progress_begin(0, len(mesh_list))
             total_loops = len(mesh_list)
+            mesh:meshPath
             for idx, mesh in enumerate(mesh_list):
                 #wm.progress_update(idx)
-                
-                progress_msg = f"{idx+1}/{total_loops} - {os.path.basename(mesh.meshName)}"
-                if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh and do_import_Mesh:
-                    import_single_mesh(mesh, errors, Mesh_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                    #continue
-                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
-                    import_single_mesh(mesh, errors, Collision_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                    #continue
-                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
-                    import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                    #continue
-                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
-                    import_light(mesh, PointLight_transform)
-                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.SpotLight and do_import_SpotLight:
-                    import_light(mesh, SpotLight_transform)
-                progress_msg += " " * (80 - len(progress_msg))
-                print(progress_msg, end="\r")
+                if re.search(do_name_filter_regex, mesh.fileName()) if do_enable_name_filter else True:
+                    progress_msg = f"{idx+1}/{total_loops} - {os.path.basename(mesh.meshName)}"
+                    if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh and do_import_Mesh:
+                        import_single_mesh(mesh, errors, Mesh_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
+                        #continue
+                    elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
+                        import_single_mesh(mesh, errors, Collision_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
+                        #continue
+                    elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
+                        import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
+                        #continue
+                    elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
+                        import_light(mesh, PointLight_transform)
+                    elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.SpotLight and do_import_SpotLight:
+                        import_light(mesh, SpotLight_transform)
+                    progress_msg += " " * (80 - len(progress_msg))
+                    print(progress_msg, end="\r")
             #wm.progress_end()
 
         if do_import_Entity:
@@ -323,7 +326,8 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
             for idx, ENTITY_OBJECT in enumerate(levelData.Entities):
                 
                 #!REMOVE
-                if True: #ENTITY_OBJECT.name == "basement_doors4 (CDoor)":
+                #if True: #ENTITY_OBJECT.name == "basement_doors4 (CDoor)":
+                if re.search(do_name_filter_regex, ENTITY_OBJECT.name) if do_enable_name_filter else True:
                     progress_msg = f"{idx+1}/{total_loops} - {ENTITY_OBJECT.name}"
                     if ENTITY_OBJECT.type in Entity_Type_List:
                         import_gameplay_entity(ENTITY_OBJECT, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
@@ -700,7 +704,7 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
                 resource = chunk.GetVariableByName('resource').Handles[0].DepotPath
                 resource_apx = get_W3_REDCLOTH_PATH(bpy.context)+"\\"+resource.replace(".redcloth", ".apx")
                 resource = repo_file(resource)
-                cloth_arma = cloth_util.importCloth(False, resource_apx, True, True, True, resource, "CClothComponent", cloth_name)
+                cloth_arma = cloth_util.importCloth(False, resource_apx, True, False, True, resource, "CClothComponent", cloth_name)
                 cloth_arma.parent = empty_transform
             except Exception as e:
                 log.critical('Problem with cloth import')

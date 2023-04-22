@@ -475,6 +475,7 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
         row.label(text='Material Import')
         row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
         row.operator(WITCH_OT_w2mg.bl_idname, text="Shader (.w2mg)", icon='MESH_DATA')
+        row.operator(WITCH_OT_xbm.bl_idname, text="Texture (.xbm)", icon='SPHERE')
 
         # row.label(text='Material Export')
         # row.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
@@ -514,11 +515,6 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
         row = row.column(align=True)
         row.label(text='Morphs')
         row.operator(WITCH_OT_morphs.bl_idname, text="Load Face Morphs", icon='SHAPEKEY_DATA')
-
-        row = layout.row().box()
-        row = row.column(align=True)
-        row.label(text='WITCHER 2 Only Import')
-        row.operator(WITCH_OT_xbm.bl_idname, text="WITCHER 2 Texture (.xbm)", icon='SPHERE')
 
         #General Settings
         row = layout.row().box()

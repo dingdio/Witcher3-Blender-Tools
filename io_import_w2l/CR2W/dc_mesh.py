@@ -121,7 +121,6 @@ class SubmeshData:
 def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
     #OPTIONS
     cToLin = True
-    read_lods = keep_lod_meshes
 
     #raise NotImplementedError
     log.info('FileLoading: '+ filename)
@@ -756,7 +755,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
         lastVertOffset = 0
         lastIOffset = 0
         for idx, meshInfo in enumerate(CData.meshInfos):
-            if (meshInfo.lod == 0 or read_lods):
+            if (meshInfo.lod == 0 or keep_lod_meshes):
                 final_meshdata:MeshData = MeshData()
                 final_meshdata.meshInfo = meshInfo
                 CData.meshDataAllMeshes.append(final_meshdata)
@@ -930,7 +929,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
                     firstIndiceOffset = meshInfo.firstIndex - (nbIndices - vBufferInf.nbIndices)
                     break
             # Load only best LOD
-            if (meshInfo.lod == 0 or read_lods):
+            if (meshInfo.lod == 0 or keep_lod_meshes):
                 final_meshdata:MeshData = MeshData()
                 final_meshdata.meshInfo = meshInfo
                 CData.meshDataAllMeshes.append(final_meshdata)

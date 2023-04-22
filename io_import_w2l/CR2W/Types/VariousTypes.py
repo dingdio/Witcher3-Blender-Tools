@@ -89,7 +89,7 @@ class CNAME_INDEX:
 
 class CFloat(object):
     """docstring for CFloat."""
-    def __init__(self, CR2WFILE, val = None):
+    def __init__(self, CR2WFILE = None, val = None):
         self.val = val
         self.type = 'Float'
         self.theType = 'CFloat'
@@ -100,7 +100,7 @@ class CFloat(object):
 
 class CMatrix4x4(object):
     """docstring for CMatrix4x4."""
-    def __init__(self, CR2WFILE):
+    def __init__(self, CR2WFILE = None):
         self.theType = 'CMatrix4x4'
         super(CMatrix4x4, self).__init__()
         self.fields = []
@@ -184,7 +184,7 @@ class CMatrix4x4(object):
 
 class CUInt32(object):
     """docstring for CUInt32."""
-    def __init__(self, CR2WFILE, val = None):
+    def __init__(self, CR2WFILE = None, val = None):
         super(CUInt32, self).__init__()
         self.val = val
         self.type = 'Uint32'
@@ -195,12 +195,23 @@ class CUInt32(object):
 
 class CUInt16(object):
     """docstring for CUInt16."""
-    def __init__(self, CR2WFILE, val = None):
+    def __init__(self, CR2WFILE = None, val = None):
         super(CUInt16, self).__init__()
         self.val = val
         self.type = 'Uint16'
     def Read(self, f, size):
         self.val = readUShort(f)
+    def Write():
+        pass
+
+class CBytes():
+    """docstring for CBytes."""
+    def __init__(self, CR2WFILE = None, val = None):
+        super(CBytes, self).__init__()
+        self.val = val
+        self.type = 'Cbytes'
+    def Read(self, f, size):
+        self.val = f.read(size)
     def Write():
         pass
 
@@ -255,3 +266,68 @@ class CBufferVLQInt32():
                 element.theType = self.theType[16:]
             element.Read(f, 0)
             self.elements.append(element)
+            
+            
+class CQuaternion:
+    def __init__(self, f):
+        self.x = readFloat(f)
+        self.y = readFloat(f)
+        self.z = readFloat(f)
+        self.w = readFloat(f)
+    def __iter__(self):
+        return iter(['x','y','z','w'])
+    def __getitem__(self, item):
+        return getattr(self, item)
+
+class SSkeletonRigData:
+    def __init__(self, f):
+        self.position = CQuaternion(f)
+        self.rotation = CQuaternion(f)
+        self.scale = CQuaternion(f)
+
+class CCompressedBuffer:
+    def __init__(self, f, CR2WFILE, parent, Name = "rigData"):
+        self.Name = Name
+        self.parent = parent
+        self.CR2WFILE = CR2WFILE
+        self.rigData = []
+    def Read(self, f, size, count, buffer_type = SSkeletonRigData):
+        m_count = count
+        #tell = f.tell()
+        f.seek(2,1)
+        for _ in range(0, m_count):
+            self.rigData.append(buffer_type(f))
+
+
+class SMipData():
+    def __init__(self):
+        self.Width = CUInt32()
+        self.Height = CUInt32()
+        self.Blocksize = CUInt32()
+        self.Mip = CByteArray()
+    def Read(self, f, size):
+        self.Width.Read(f, size)
+        self.Height.Read(f, size)
+        self.Blocksize.Read(f, size)
+        self.Mip = CByteArray(f, size)
+
+class CCompressedBufferTexture:
+    def __init__(self, Name = "SMipData"):
+        self.Name = Name
+        self.bufferData = []
+    def Read(self, f, size, count, buffer_type = SMipData):
+        m_count = count
+        for _ in range(0, m_count):
+            data = buffer_type()
+            data.Read(f,0)
+            self.bufferData.append(data)
+
+class CByteArray():
+    def __init__(self, CR2WFILE = None, val = None):
+        self.val = val
+        self.type = 'CByteArray'
+    def Read(self, f, size):
+        arraysize = readU32(f)
+        self.val = f.read(size)
+    def Write():
+        pass

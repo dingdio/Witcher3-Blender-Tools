@@ -975,12 +975,18 @@ def create_node_texture(
     
     tex_path = os.path.abspath( final_texture )
     
+            
+    if not Path(tex_path).exists() and '_proxy' in os.path.basename(tex_path):
+        bundle_texture = os.path.join(get_uncook_path(bpy.context), par_value)
+        bundle_texture_xbm = bundle_texture.rsplit('.', 1)[0] + '.xbm'
+        tex_path = bundle_texture
+    
     ## didn't find the texture, try find and convert xbm
     if not Path(tex_path).exists():
         for ext in ['.tga','.dds', '.png']:
             if tex_path.endswith(ext):
                 xbm_path = tex_path.replace(ext, ".xbm")
-                dds_path = tex_path.replace(ext, ".dds") if ext is not '.dds' else tex_path
+                dds_path = tex_path.replace(ext, ".dds") if ext != '.dds' else tex_path
                 break
         #create dds if none exist
         if not Path(dds_path).exists():
@@ -990,6 +996,7 @@ def create_node_texture(
                     tex_path = dds_path
         else:
             tex_path = dds_path
+
     
     node.image = load_texture(mat, tex_path, uncook_path)
     if not node.image:
@@ -1224,6 +1231,7 @@ def create_texarray(group_name = "WitcherTexArray", ARRAY_SIZE = 2):
     
     output = group.nodes.new('NodeGroupOutput')
     output.location = (700, 0)
+    group.outputs.new('NodeSocketColor','Output')
     # Create a single input with two sockets
     input = group.nodes.new('NodeGroupInput')
     input.name = 'Array'

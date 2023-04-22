@@ -415,7 +415,16 @@ def import_chunks(entity,
         if "resource" in chunk:
             if do_import_redcloth:
                 cloth_arma = cloth_util.importCloth(False, chunk['resource_apx'], True, True, True, chunk['resource'], chunk['type']+str(i)+str(chunk['chunkIndex']), entity.name)
-
+                if cloth_arma.type == 'EMPTY':
+                    #group_empty = cloth_arma
+                    for child in cloth_arma.children:
+                        if child.type == 'ARMATURE':
+                            cloth_arma = child
+                            cloth_arma.parent = None
+                            break
+                    # for child in group_empty.children:
+                    #     bpy.data.objects.remove(child)
+                    # bpy.data.objects.remove(group_empty)
                 objdict.update({chunk_namespace:cloth_arma})
         if "morphComponentId" in chunk:
             morphSource = fbx_util.importFbx(chunk['morphSource'], chunk['type']+str(i)+str(chunk['chunkIndex']), entity.name)
@@ -540,7 +549,9 @@ def import_app(context,
                entity,
                base_animation_skeleton,
                do_import_redcloth):
-    (exist, enabled) = addon_utils.check("io_scene_apx")
+    (exist, enabled) = addon_utils.check("io_mesh_apx")
+    if not enabled:
+        (exist, enabled) = addon_utils.check("io_scene_apx")
     if not enabled:
         do_import_redcloth = False
 

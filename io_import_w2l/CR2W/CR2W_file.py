@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import sys
 from .third_party_libs import yaml
 from .common_blender import repo_file
@@ -358,7 +359,16 @@ def create_level(file, filename):
                     bufferedCR2W = getCR2W(f)
                     entity = create_level(bufferedCR2W, chunk.name)
                     Entity.streamingDataBuffer = entity
-
+                    if Entity.name == Entity.type:
+                        try:
+                            if Entity.streamingDataBuffer.CHUNKS.CHUNKS[0].Type == 'CClothComponent':
+                                Entity.name = Path(Entity.streamingDataBuffer.CHUNKS.CHUNKS[0].GetVariableByName('resource').Handles[0].DepotPath).stem
+                                Entity.name += f" ({Entity.type}) (CClothComponent)"
+                            else:
+                                Entity.name = Path(Entity.streamingDataBuffer.CHUNKS.CHUNKS[0].GetVariableByName('mesh').Handles[0].DepotPath).stem
+                                Entity.name += f" ({Entity.type})"
+                        except Exception as e:
+                            log.warn(e)
                 try:
                     if hasattr(chunk, 'Components'):
                         for chunk_id in chunk.Components:

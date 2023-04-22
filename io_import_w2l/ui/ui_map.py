@@ -93,6 +93,16 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
         default=True,
         description="If enabled, it will always keep any proxy meshes regardless of lod"
     )
+    do_enable_name_filter: BoolProperty(
+        name="Enable Regex Filter",
+        default=False,
+        description="If enabled, only filenames matching the regex are imported"
+    )
+    do_name_filter_regex: StringProperty(
+        name="Regex Filter",
+        default='_proxy',
+        description="Enter regex string such as \"_proxy|box\""
+    )
     
     def draw(self, context):
         layout = self.layout
@@ -103,7 +113,9 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
             "Settings" : [
                         "keep_lod_meshes",
                         "keep_empty_lods",
-                        "keep_proxy_meshes"]
+                        "keep_proxy_meshes",
+                        "do_enable_name_filter",
+                        "do_name_filter_regex"]
         }
         for section in sections:
             row = layout.row()
@@ -138,7 +150,10 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
                                         do_import_RigidBody = self.do_import_RigidBody,
                                         do_import_Entity = self.do_import_Entity,
                                         do_import_PointLight = self.do_import_PointLight,
-                                        do_import_SpotLight = self.do_import_SpotLight,)
+                                        do_import_SpotLight = self.do_import_SpotLight,
+                                        do_enable_name_filter = self.do_enable_name_filter,
+                                        do_name_filter_regex = self.do_name_filter_regex,
+                                        )
         else:
             log.warn('Did not select .w2l')
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
