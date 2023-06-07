@@ -1,10 +1,11 @@
 # Witcher 3 Blender Tools
-Blender addon for working with Witcher 3 files.
+Blender addon for working with Witcher 3 files with some support for Witcher 2 files. Get the latest [Release](https://redkitwiki.cdprojektred.com/welcome+to+the+redkit+wiki.htm)
 
 <img src="https://user-images.githubusercontent.com/4729750/227740200-4722f6c0-fce9-43f5-a4c2-68d6b90c706a.jpg" height="200">
 
 ## Features
 
+### Witcher 3
 - Mesh importer/export (.w2mesh)
 - Rig import/export (.w2rig, .json)
 - Animation import/export (.w2anims, .json)
@@ -14,19 +15,14 @@ Blender addon for working with Witcher 3 files.
 - WIP Scene/Cutscene import (.w2scene, .w2cutscene)
 - Lipsync Animation (.cr2w)
 
-## Changelog Latest
-
-### 25-March-2023 (v0.6.0):
-#### **Changes**:
-* Mesh Export (.w2mesh) [wiki/Exporting-Mesh-Notes](https://github.com/dingdio/Witcher3-Blender-Tools/wiki/Exporting-Mesh-Notes) 
-* Tools for materials (.w2mi, .w2mg)
-* Cutscene import (.w2cutscene)
-* Scene import (.w2scene)
-* Improvements to character import (.w2ent)
-
+### Witcher 2 / REDkit
+- .w2mesh import
+- .w2rig import
+- .w2l import
+- Works best with [REDkit](https://redkitwiki.cdprojektred.com/welcome+to+the+redkit+wiki.htm) files.
 
 ## Requirements
-- Blender ~3.4.1
+- Blender ~3.5.1
 
 - [ArdCarraigh Blender_APX_Addon](https://github.com/ArdCarraigh/Blender_APX_Addon) - The APX addon is needed to load any redcloth items. You will have to export or download all apx from the game and add the Redcloth repo in addon settings. [Download all vanilla apx here.](https://mega.nz/file/CchGVCSb#ahDgIhxvicClEA9VHecPu6S95iT8ih2Q5kRMUHoY5ec)
 
@@ -46,10 +42,14 @@ Blender addon for working with Witcher 3 files.
 Put "io_import_w2l" folder into your blender addons folder
 Launch Blender and activate the addon in Blender Preferences
 
+#### Settings for Witcher 3
 in the addon settings add your own paths to:
 - uncook_path = main repo where you exported all the game bundles with wcclite.exe .w2mesh files, .w2mi files, .w2ent etc.
-- tex_uncook_path = repo folder with ALL exported .tga from the game, add-on expects tga, no other format is supported
+- tex_uncook_path = repo folder with ALL exported .tga/.png/.dds from the game
 - apx_uncook_path = repo folder with ALL exported .apx from the game
+
+#### Settings for Witcher 2 / REDKit
+- Witcher 2 Path = This should be the path to your Wither 2 Instalation with REDKit also installed.
 
 ### WolvenKit 7 integration
 - WolvenKit 7 CLI = path to WolvenKit.CLI.exe
