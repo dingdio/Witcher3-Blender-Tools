@@ -1,5 +1,5 @@
 # Witcher 3 Blender Tools
-Blender addon for working with Witcher 3 files with some support for Witcher 2 files. Get the latest [Release](https://redkitwiki.cdprojektred.com/welcome+to+the+redkit+wiki.htm)
+Blender addon for working with Witcher 3 files with some support for Witcher 2 files. Get the latest [Release](https://github.com/dingdio/Witcher3-Blender-Tools/releases)
 
 <img src="https://user-images.githubusercontent.com/4729750/227740200-4722f6c0-fce9-43f5-a4c2-68d6b90c706a.jpg" height="200">
 
