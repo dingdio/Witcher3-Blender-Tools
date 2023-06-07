@@ -1214,11 +1214,12 @@ def create_texarray(group_name = "WitcherTexArray", ARRAY_SIZE = 2):
     obj = bpy.context.active_object
     me = obj.data
     highest_green = 0
-    for vert in me.vertices:
-        if me.color_attributes.active:
-            color = me.color_attributes.active.data[vert.index].color
-            vertex_color_data.append(list(color))
-            highest_green = max(highest_green, color[1])
+    if obj.type == "MESH":
+        for vert in me.vertices:
+            if me.color_attributes.active:
+                color = me.color_attributes.active.data[vert.index].color
+                vertex_color_data.append(list(color))
+                highest_green = max(highest_green, color[1])
 
     # # Check if group already exists
     # if group_name in bpy.data.node_groups:

@@ -93,7 +93,7 @@ class bStream():
                 continue
             chunk_len = 0x100
             for i in range(0, len(read_bytes)-1, 2):
-                if read_bytes[i] is '\x00' and read_bytes[i+1] == '\x00':
+                if read_bytes[i] == '\x00' and read_bytes[i+1] == '\x00':
                     null_found = True
                     stringSize += i+2
                     break

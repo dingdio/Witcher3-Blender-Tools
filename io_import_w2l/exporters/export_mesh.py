@@ -277,6 +277,25 @@ class MeshExporter(object):
 
     def __loadMeshData(self, meshObj, bone_map):
         bl_mesh = meshObj.data
+        
+        has_excess_weights = False
+        for vertex in bl_mesh.vertices:
+            vertex_groups = vertex.groups
+            if len(vertex_groups) > 4:
+                has_excess_weights = True
+                break
+
+        if has_excess_weights:
+            bpy.context.view_layer.objects.active = meshObj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.object.vertex_group_limit_total(limit=4)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            log.debug("Applied 'Limit Total' operation to mesh part.")
+        #else:
+            #print("The mesh does not have vertices with more than 4 weights.")
+        
+        
         triangulated = len(bl_mesh.loops) == len(bl_mesh.polygons) * 3
         mesh_for_work = bl_mesh
         if not triangulated:
