@@ -134,7 +134,7 @@ def test_load_entity(filename) ->  w3_types.Entity:
     basename, ext = os.path.splitext(file)
     if ext.lower() in ('.json'):
         entity = read_json_w3.readEntFile(filename)
-    elif ext.lower().endswith('.w2ent'):
+    elif ext.lower().endswith('.w2ent') or ext.lower().endswith('.w3app'):
         bin_data = load_bin_entity(filename)
         
         the_json = json.dumps(bin_data,indent=2, default=class_fun, sort_keys=False)
@@ -166,7 +166,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
             item = NewListItem(treeList, node)
             rig_settings.app_list_index = app_idx if idx == app_idx else 0
             import_from_list_item(context, item, False) if idx == app_idx else 0
-
+    rig_settings.app_list_index = 0 if app_idx == -1 else app_idx
     rig_settings.main_entity_skeleton = entity.MovingPhysicalAgentComponent.skeleton
     if get_uncook_path(context) in filename:
         rig_settings.repo_path = filename.replace(get_uncook_path(context)+"\\", '')

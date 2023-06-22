@@ -593,7 +593,7 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
 
     for vert in me.vertices:
         exportMeshdata.vertex3DCoords.append([vert.co.x, vert.co.y, vert.co.z] )
-        if me.color_attributes.active:
+        if me.color_attributes.active_color_index != -1 and me.color_attributes.active:
             color = me.color_attributes.active.data[vert.index].color
             colarr = []
             for col in color:

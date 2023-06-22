@@ -133,7 +133,7 @@ def get_vertex_group_info(armobj, mesh_ob):
 def convert_to_index_values(string_array, second_array):
     index_array = []
     for string in string_array:
-        index_array.append(second_array.index(string))
+        index_array.append(second_array.index(string)) if string in second_array else False
     return index_array
 
 import bmesh

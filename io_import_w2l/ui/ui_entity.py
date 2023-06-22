@@ -2,6 +2,7 @@
 import os
 import time
 import bpy
+import json
 
 from io_import_w2l.setup_logging_bl import *
 log = logging.getLogger(__name__)
@@ -11,9 +12,10 @@ from io_import_w2l.importers import import_w2l
 from io_import_w2l.importers import import_entity
 from io_import_w2l.importers import import_anims
 from io_import_w2l.ui.ui_utils import WITCH_PT_Base
-from bpy.types import Panel, Operator, UIList, PropertyGroup
-from bpy.props import IntProperty, StringProperty, CollectionProperty, BoolProperty
-from io_import_w2l.importers.import_entity import test_load_entity
+from bpy.types import Panel, Operator, UIList
+from bpy.props import IntProperty, StringProperty
+from io_import_w2l.importers.import_entity import test_load_entity, fixed
+from io_import_w2l.CR2W import w3_types
 
 from io_import_w2l import get_uncook_path
 
@@ -43,6 +45,44 @@ class WITCH_UL_ENTITY_List(UIList):
         elif self.layout_type in {'GRID'}:
             layout.alignment = 'CENTER'
             layout.label(text="")
+
+class WITCH_OT_w3app(bpy.types.Operator, ImportHelper):
+    """Load Witcher 3 Appearance File"""
+    bl_idname = "witcher.import_w3app"
+    bl_label = "Import .w3app"
+    filename_ext = ".w3app"
+    def execute(self, context):
+        fdir = self.filepath
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        ext = file_helpers.getFilenameType(fdir)
+        if ext == ".w3app":
+            entity_w3a = test_load_entity(fdir)
+            entity_w3a = fixed(entity_w3a, entity_w3a.version)
+            ob = context.object
+            if ob and ob.type == "ARMATURE" and "CMovingPhysicalAgentComponent" in ob.name:
+                main_arm_obj:bpy.types.Object = ob
+                rig_settings = main_arm_obj.data.witcherui_RigSettings
+                treeList = rig_settings.app_list
+                item = treeList.add()
+                node = entity_w3a.appearances[0]
+                item.name = node.name
+                class_to_json = json.loads(rig_settings.jsonData)
+                entity = w3_types.Entity.from_json(class_to_json)
+                entity.appearances.append(entity_w3a.appearances[0])
+                rig_settings.jsonData = json.dumps(entity, indent=2, default=vars, sort_keys=False)
+                rig_settings.app_list_index = len(entity.appearances)-1
+                import_entity.import_from_list_item(context, item, rig_settings.do_import_redcloth)
+        else:
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+    def invoke(self, context, event):
+        UNCOOK_PATH = os.path.join(get_uncook_path(context),"dlc\\")
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
 
 class WITCH_OT_w2ent(bpy.types.Operator, ImportHelper):
     """Load Witcher 3 Entity File"""
@@ -334,8 +374,9 @@ class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
                 col.template_list("WITCH_UL_ENTITY_List", "The_List", object,
                                     "app_list", object, "app_list_index")
 
-                grid = row.grid_flow( columns = 2 )
-                grid.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Load").action = "load"
+                grid = row.grid_flow( columns = 1 )
+                grid.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Load Selected").action = "load"
+                grid.operator(WITCH_OT_w3app.bl_idname, text="Import .w3app")
                 #grid.operator(WITCH_OT_ENTITY_list_loadapp.bl_idname, text="Clear List").action = "clear"
                 sections = ["Import Settings"]
                 section_options = {
@@ -396,6 +437,7 @@ classes = [
     #ListItemAnimset,
     
     #operators
+    WITCH_OT_w3app,
     WITCH_OT_w2ent,
     WITCH_OT_ENTITY_w2ent_chara,
     WITCH_OT_ENTITY_list_loadapp,

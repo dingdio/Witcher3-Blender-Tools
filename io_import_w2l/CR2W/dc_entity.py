@@ -360,8 +360,13 @@ def create_CEntity(file):
                 #CExternalProxyAttachments[chunk.ChunkIndex] = (chunk, attachment)
 
     for chunk in CHUNKS:
-        if(chunk.Type == "CEntityTemplate" and chunk.GetVariableByName("appearances")):
-            appearances = chunk.GetVariableByName("appearances").More
+        if((chunk.Type == "CEntityTemplate" and chunk.GetVariableByName("appearances")) or chunk.Type == "CEntityExternalAppearance"):
+            
+            
+            if chunk.Type == "CEntityExternalAppearance":
+                appearances = [chunk.GetVariableByName("appearance")]
+            else:
+                appearances = chunk.GetVariableByName("appearances").More
             for appearance in appearances:
                 name = appearance.GetVariableByName("name").ToString()
                 currentApp = EntityAppearance()
