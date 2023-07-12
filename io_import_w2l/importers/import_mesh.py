@@ -594,7 +594,11 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
     for vert in me.vertices:
         exportMeshdata.vertex3DCoords.append([vert.co.x, vert.co.y, vert.co.z] )
         if me.color_attributes.active_color_index != -1 and me.color_attributes.active:
-            color = me.color_attributes.active.data[vert.index].color
+            color_attribute = me.color_attributes.active
+            if color_attribute.data_type == 'FLOAT_VECTOR':
+                bpy.ops.geometry.color_attribute_convert(domain='POINT', data_type='BYTE_COLOR')
+                color_attribute = me.color_attributes.active
+            color = color_attribute.data[vert.index].color
             colarr = []
             for col in color:
                 colarr.append(col)

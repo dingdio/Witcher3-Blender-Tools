@@ -415,7 +415,7 @@ def import_chunks(entity,
         if "resource" in chunk:
             if do_import_redcloth:
                 cloth_arma = cloth_util.importCloth(False, chunk['resource_apx'], True, True, True, chunk['resource'], chunk['type']+str(i)+str(chunk['chunkIndex']), entity.name)
-                if cloth_arma.type == 'EMPTY':
+                if cloth_arma != None and cloth_arma.type == 'EMPTY':
                     #group_empty = cloth_arma
                     for child in cloth_arma.children:
                         if child.type == 'ARMATURE':

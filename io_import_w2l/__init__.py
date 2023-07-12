@@ -139,8 +139,8 @@ import addon_utils
 bl_info = {
     "name": "Witcher 3 Tools",
     "author": "Dingdio",
-    "version": (0, 7, 1),
-    "blender": (3, 5, 1),
+    "version": (0, 7, 2),
+    "blender": (3, 6, 0),
     "location": "File > Import-Export > Witcher 3 Assets",
     "description": "Tools for Witcher 3 and Witcher 2",
     "warning": "",

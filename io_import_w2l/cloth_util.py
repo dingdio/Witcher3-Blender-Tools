@@ -1,4 +1,5 @@
 from pathlib import Path
+import inspect
 from .w3_material import create_param, read_2wmi_params2, setup_w3_material, xml_data_from_CR2W
 from . import CR2W
 import bpy, os, filecmp, shutil
@@ -169,6 +170,19 @@ def channel_id_to_idx(id):
     # default to red
     return 0
 
+import importlib
+try:
+    importlib.import_module("io_mesh_apx")
+    addon_installed = True
+except ImportError:
+    addon_installed = False
+    
+try:
+    importlib.import_module("io_scene_apx")
+    older_addon_installed = True
+except ImportError:
+    older_addon_installed = False
+
 
 def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="", ns="cloth", name=":", DO_WEAR_CLOTH = True):
 
@@ -181,10 +195,13 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
     uncook_path = get_texture_path(context)+"\\" # PATH WITH TEXTURES
 
 
-    try:
+    if addon_installed:
         from io_mesh_apx.importer.import_clothing import read_clothing
-        read_clothing(context, filepath, rotate_180, rm_ph_me)
-    except Exception as e:
+        
+        args_count = len(inspect.signature(read_clothing).parameters)
+        if args_count == 4:
+            read_clothing(context, filepath, rotate_180, rm_ph_me)
+    elif older_addon_installed:
         try:
             from io_scene_apx.importer.import_clothing import read_clothing
             read_clothing(context, filepath, use_mat, rotate_180, rm_ph_me)

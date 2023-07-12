@@ -184,6 +184,27 @@ def separate_mesh_by_verts(obj, num_verts):
         return [obj]
 
 
+def split_UV_islands():
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.mark_seam(clear=True)
+    bpy.ops.uv.seams_from_islands(mark_sharp = False)
+    bpy.ops.mesh.select_all(action='DESELECT')
+    obj = bpy.context.active_object
+    bm = bmesh.from_edit_mesh(obj.data)
+
+    for e in bm.edges[:]:
+        if e.seam:
+            e.select_set(True)
+    bmesh.update_edit_mesh(obj.data)
+
+    if bpy.context.active_object.data.total_edge_sel:
+        bpy.ops.mesh.edge_split(type='EDGE')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.mark_seam(clear=True)
+        bpy.ops.mesh.select_all(action='DESELECT')
+    else:
+        pass #print('Skipping edge_split')
+
 def split_mesh_by_material(mesh_obj):
     mesh_copy = mesh_obj.copy()
     mesh_copy.data = mesh_obj.data.copy()
@@ -193,6 +214,7 @@ def split_mesh_by_material(mesh_obj):
     mesh_copy.select_set(True)
     bpy.context.view_layer.objects.active = mesh_copy
     bpy.ops.object.mode_set(mode='EDIT')
+    split_UV_islands()
     bpy.ops.mesh.select_all(action='SELECT')
     bpy.ops.mesh.separate(type='MATERIAL')
     bpy.ops.object.mode_set(mode='OBJECT')
@@ -288,10 +310,12 @@ class MeshExporter(object):
         if has_excess_weights:
             bpy.context.view_layer.objects.active = meshObj
             bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.reveal()
             bpy.ops.mesh.select_all(action='SELECT')
             bpy.ops.object.vertex_group_limit_total(limit=4)
             bpy.ops.object.mode_set(mode='OBJECT')
             log.debug("Applied 'Limit Total' operation to mesh part.")
+            bl_mesh.update()
         #else:
             #print("The mesh does not have vertices with more than 4 weights.")
         
