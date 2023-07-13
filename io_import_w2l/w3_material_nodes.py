@@ -41,6 +41,9 @@ class WITCH_PT_materials(bpy.types.Panel):
 
                             if linked_socket.node.type == 'TEX_IMAGE':
                                 row.prop(linked_socket.node, "image", text="")
+                                if linked_socket.node.image != None:
+                                    final_path = get_repo_from_abs_path(linked_socket.node.image.filepath)
+                                    row.label(text = final_path)
                             elif linked_socket.node.type == 'RGB':
                                 row.prop(linked_socket, "default_value", text="")
                             elif linked_socket.node.type == 'VALUE':
@@ -219,15 +222,20 @@ def get_repo_from_abs_path(texture_path):
     MOD_DIR = get_mod_directory(bpy.context)
     MOD_TEX_PATH = get_modded_texture_path(bpy.context)
     
-    if TEXTURE_PATH in texture_path:
+    #path_obj = Path(texture_path)
+    TEXTURE_PATH_obj = Path(TEXTURE_PATH)
+    MOD_DIR_obj = Path(MOD_DIR)
+    MOD_TEX_PATH_obj = Path(MOD_TEX_PATH)
+    
+    if TEXTURE_PATH_obj.exists() and TEXTURE_PATH in texture_path:
         texture_path = texture_path.replace(TEXTURE_PATH+'\\', '')
-    elif MOD_DIR in texture_path:
+    elif MOD_DIR_obj.exists() and MOD_DIR in texture_path:
         texture_path = texture_path.replace(MOD_DIR+'\\', '')
         for folder in possible_folders:
             if folder in texture_path:
                 texture_path = texture_path.replace(folder+'\\', '')
                 break
-    elif MOD_TEX_PATH in texture_path:
+    elif MOD_TEX_PATH_obj.exists() and MOD_TEX_PATH in texture_path:
         texture_path = texture_path.replace(MOD_TEX_PATH+'\\', '')
 
     return texture_path
