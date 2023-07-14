@@ -188,8 +188,6 @@ class W3AnimationExporter:
             if bone is None:
                 logging.warning(' * Bone not found: %s', m.group(1))
                 continue
-            if bone.is_mmd_shadow_bone:
-                continue
             prop_name = m.group(2)
             if prop_name not in {'location', prop_rotation_map.get(bone.rotation_mode, 'rotation_euler')}:
                 continue
