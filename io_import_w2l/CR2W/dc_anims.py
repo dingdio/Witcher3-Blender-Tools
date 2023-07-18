@@ -15,7 +15,7 @@ from .read_json_w3 import readCSkeletonData
 from . import w3_types
 from .w3_types import ( Track, w2AnimsFrames, Quaternion, Vector3D )
 
-from .bin_helpers import (ReadUlong48, readUShort,
+from .bin_helpers import (ReadUlong40, ReadUlong48, readUShort,
                         readFloat,
                         ReadFloat24,
                         ReadFloat16)
@@ -201,16 +201,16 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
                 orients[3] = -orients[3]
                 this_bone.rotationFrames.append(Quaternion(orients[0], orients[1], orients[2], orients[3]))
                 #print(bits)
-            if "ABOCM_AsFloat_XYZSignedWInLastBit" in orientationCompressionMethod:
+            elif "ABOCM_AsFloat_XYZSignedWInLastBit" in orientationCompressionMethod:
                 (x, y, z) = CVector3D(f, compression).getList()
                 int_values = [x for x in bytearray(struct.pack("f", z))]
-                signW = (int_values[0] & 1) > 0;
-                minScalar = min(x * x + y * y + z * z, 1.0);
-                w = math.sqrt(1.0 - minScalar);
+                signW = (int_values[0] & 1) > 0
+                minScalar = min(x * x + y * y + z * z, 1.0)
+                w = math.sqrt(1.0 - minScalar)
                 if (not signW):
-                    w = -w;
+                    w = -w
                 this_bone.rotationFrames.append(Quaternion(x, y, z, w))
-            if "ABOCM_PackIn64bitsW" in orientationCompressionMethod:
+            elif "ABOCM_PackIn64bitsW" in orientationCompressionMethod:
                 orients = []
                 orients.append(readUShort(f))
                 orients.append(readUShort(f))
@@ -221,6 +221,20 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
                     orients[i] = (32768.0 - orients[i]) * (1 / 32767.0)
                 orients[3] = -orients[3]
                 this_bone.rotationFrames.append(Quaternion(orients[0], orients[1], orients[2], orients[3]))
+            elif "ABOCM_PackIn40bitsW" in orientationCompressionMethod:
+                bits = ReadUlong40(f)
+                orients = []
+                orients.append((bits >> 30) & 0b1111111111)
+                orients.append((bits >> 20) & 0b1111111111)
+                orients.append((bits >> 10) & 0b1111111111)
+                orients.append(bits & 0b1111111111)
+                for (i, item) in enumerate(orients):
+                    orients[i] = (511.0 - orients[i]) * (1 / 512.0)
+                orients[3] = -orients[3]
+                this_bone.rotationFrames.append(Quaternion(orients[0], orients[1], orients[2], orients[3]))
+            else:
+                log.error('UNDEFINED orientationCompressionMethod FOUND')
+                #raise Exception('UNDEFINED orientationCompressionMethod FOUND')
         this_bone.scale_dt = bone.scale.GetVariableByName('dt').Value
         this_bone.scale_numFrames = bone.scale.GetVariableByName('numFrames').Value
         compression = bone.scale.GetVariableByName('compression')

@@ -153,6 +153,12 @@ def ReadFloat24(file):
     # b3 = file.read(1)
     # return (b3 << 24) |(b2 << 16) | (b1 << 8) |(pad);
 
+def ReadUlong40(file):
+    bytes = file.read(5)
+    int_values = [x for x in bytearray(bytes)]
+    bits = int_values[0] << 32 | int_values[1] << 24 | int_values[2] << 16 | int_values[3] << 8 | int_values[4]
+    return bits
+
 def ReadUlong48(file):
     bytes = file.read(6)
     int_values = [x for x in bytearray(bytes)]
