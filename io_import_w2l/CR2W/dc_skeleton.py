@@ -49,6 +49,7 @@ def read_skelly(skelly):
         if item.theName == "bones":
             for bone in item.More:
                 this_skeleton.names.append(bone.elementName)
+            this_skeleton.nbBones = len(item.More)
         if item.theName == "tracks":
             for track in item.More:
                 this_skeleton.tracks.append(track.elementName)
