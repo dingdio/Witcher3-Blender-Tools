@@ -217,7 +217,8 @@ possible_folders = [
 ]
 
 from io_import_w2l import get_mod_directory, get_texture_path, get_modded_texture_path
-def get_repo_from_abs_path(texture_path):
+def get_repo_from_abs_path(texture_path_input):
+    texture_path = os.path.realpath(bpy.path.abspath(texture_path_input))
     TEXTURE_PATH = get_texture_path(bpy.context)
     MOD_DIR = get_mod_directory(bpy.context)
     MOD_TEX_PATH = get_modded_texture_path(bpy.context)
