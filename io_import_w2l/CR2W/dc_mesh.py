@@ -183,6 +183,9 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
                     subMeshesData:List[SubmeshData] = []
 
                     def readUncookedSubmeshData(br:bStream):
+                        extra_vectors = True
+                        if meshFile.HEADER.version == 92:
+                            extra_vectors = False
                         submesh = SubmeshData()
                         submesh.vertexType_w2 = br.readUInt16() # TODO check this
                         if submesh.vertexType_w2 in [1,5] :
@@ -273,12 +276,13 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
                             f_0 = br.readFloat()
                             f_1 = br.readFloat()
                             f_2 = br.readFloat()
-                            f_3 = br.readFloat()
-                            f_4 = br.readFloat()
-                            f_5 = br.readFloat()
-                            f_6 = br.readFloat()
-                            f_7 = br.readFloat()
-                            f_8 = br.readFloat()
+                            
+                            f_3 = br.readFloat() if extra_vectors else 0
+                            f_4 = br.readFloat() if extra_vectors else 0
+                            f_5 = br.readFloat() if extra_vectors else 0
+                            f_6 = br.readFloat() if extra_vectors else 0
+                            f_7 = br.readFloat() if extra_vectors else 0
+                            f_8 = br.readFloat() if extra_vectors else 0
                             final_meshdata.extra_vectors.append([f_0,f_1,f_2,f_3,f_4,f_5,f_6,f_7,f_8])
 
                             vertex3DCoord = [x,y,z]
