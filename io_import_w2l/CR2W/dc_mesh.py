@@ -177,14 +177,18 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
                 
                 if is_uncooked:
                     ############! UNCOOKED STUFF
-                    yes = br.read(7)
-                    nbSubMesh = br.readUByte()
+                    if meshFile.HEADER.version <= 86:
+                        yes = br.read(3)
+                        nbSubMesh = br.readUByte()
+                    else:
+                        yes = br.read(7)
+                        nbSubMesh = br.readUByte()
 
                     subMeshesData:List[SubmeshData] = []
 
                     def readUncookedSubmeshData(br:bStream):
                         extra_vectors = True
-                        if meshFile.HEADER.version == 92:
+                        if meshFile.HEADER.version <= 100: # 95, 92 lowest
                             extra_vectors = False
                         submesh = SubmeshData()
                         submesh.vertexType_w2 = br.readUInt16() # TODO check this
@@ -374,9 +378,13 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
                         boneName.Read(br.fhandle, 0)
                         chunk.CMesh.BoneNames.elements.append(boneName)
 
-                        block3 = CFloat(meshFile)
-                        block3.Read(br.fhandle, 0)
-                        chunk.CMesh.Block3.elements.append(block3)
+                        #! TODO FIX BONES LESS THAN VERSION 89
+                        if meshFile.HEADER.version <= 89:
+                            pass
+                        else:
+                            block3 = CFloat(meshFile)
+                            block3.Read(br.fhandle, 0)
+                            chunk.CMesh.Block3.elements.append(block3)
 
                 chunk.CMesh.BoneIndecesMappingBoneIndex.Read(br.fhandle,0)
                 BoneIndecesMappingBoneIndex = [el.val for el in chunk.CMesh.BoneIndecesMappingBoneIndex.elements] if hasattr(chunk, "CMesh") and hasattr(chunk.CMesh, "BoneIndecesMappingBoneIndex") and hasattr(chunk.CMesh.BoneIndecesMappingBoneIndex, "elements") else []
@@ -414,6 +422,10 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
                 CData.boneData.BoneIndecesMappingBoneIndex = [el.val for el in chunk.CMesh.BoneIndecesMappingBoneIndex.elements] if hasattr(chunk, "CMesh") and hasattr(chunk.CMesh, "BoneIndecesMappingBoneIndex") and hasattr(chunk.CMesh.BoneIndecesMappingBoneIndex, "elements") else []
                 CData.boneData.Block3 = [el.val for el in chunk.CMesh.Block3.elements] if hasattr(chunk, "CMesh") and hasattr(chunk.CMesh, "Block3") and hasattr(chunk.CMesh.Block3, "elements") else []
 
+                #TODO fix wrong weights being applied
+                if meshFile.HEADER.version <= 89:
+                    #CData.boneData.BoneIndecesMappingBoneIndex = [index for index in range(CData.boneData.nbBones)]
+                    CData.boneData.Block3 = [0.0] * CData.boneData.nbBones
                 ###! REPEATED CODE
 
                 materialIds = []
