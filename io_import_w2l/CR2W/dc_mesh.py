@@ -169,7 +169,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
 
                 is_uncooked = False
                 yes = br.read(8)
-                if (yes[3] != 5): #
+                if (yes[3] != 5 or meshFile.HEADER.version <= 83): #
                     is_uncooked = True
                     br.seek(-8,1)
                     #log.critical('Error reading LODs')
