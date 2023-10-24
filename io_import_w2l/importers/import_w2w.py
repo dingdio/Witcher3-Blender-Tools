@@ -460,8 +460,8 @@ def btn_import_radish(filename):
         do_import_map_terrain(worldFile, filePath)
 
 def do_import_map_terrain(worldFile, filePath):
-    heightmap_file:Path = Path(filePath) / worldFile.heightMap
-    colormap_file:Path = Path(filePath) / worldFile.colormap
+    heightmap_file:Path = Path(filePath).parent / worldFile.heightMap
+    colormap_file:Path = Path(filePath).parent / worldFile.colormap
     path_to_search_for_maps = Path("E:\w3.modding\w3terrain-extract-v2020-03-30")
 
     if not heightmap_file.is_file():
