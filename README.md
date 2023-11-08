@@ -21,8 +21,10 @@ Blender addon for working with Witcher 3 files with some support for Witcher 2 f
 - .w2l import
 - Works best with [REDkit](https://redkitwiki.cdprojektred.com/welcome+to+the+redkit+wiki.htm) files.
 
+Check out the [wiki](https://github.com/dingdio/Witcher3-Blender-Tools/wiki) for info on usage.
+
 ## Requirements
-- Blender ~3.5.1
+- Blender ~3.6
 
 - [ArdCarraigh Blender_APX_Addon](https://github.com/ArdCarraigh/Blender_APX_Addon) - The APX addon is needed to load any redcloth items. You will have to export or download all apx from the game and add the Redcloth repo in addon settings. [Download all vanilla apx here.](https://mega.nz/file/CchGVCSb#ahDgIhxvicClEA9VHecPu6S95iT8ih2Q5kRMUHoY5ec)
 
