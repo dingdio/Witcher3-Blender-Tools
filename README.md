@@ -62,7 +62,7 @@ in the addon settings add your own paths to:
 ### Speech / Lipsync repo settings
 - Extracted Lipsync repo = folder with .cr2w files
 - Converted wem files = folder with (.ogg)s 
-- [Wiki about speech](https://github.com/dingdio/Witcher3_Blender_Tools/wiki/Speech-Notes)
+- [Wiki about speech](https://github.com/dingdio/Witcher3-Blender-Tools/wiki/Speech-and-Lipsync-Notes)
 
 ### FBX repo settings
 >*The tools now import and export w2mesh directly it is not recommended to use FBX*
