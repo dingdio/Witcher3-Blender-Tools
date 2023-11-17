@@ -133,7 +133,7 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
     f = the_data
     bones_prop = chunk.GetVariableByName('bones')
     for (idx, bone) in enumerate(bones_prop.More):
-        if idx == Skeleton_file.nbBones:
+        if Skeleton_file and idx == Skeleton_file.nbBones:
             log.warning(f'Animation has more bone entiries than skeleton. Rig:{str(Skeleton_file.nbBones)}  Anim:{str(len(bones_prop.More))}')
             break
         this_bone = w2AnimsFrames(idx,
