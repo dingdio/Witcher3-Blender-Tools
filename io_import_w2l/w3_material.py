@@ -253,7 +253,7 @@ def create_instance_group(  material,
     return (ordered_params, nodegroup_node)
 
 def xml_data_from_CR2W(mat_bin, name = None):
-    mat_base = mat_bin.GetVariableByName('baseMaterial').Handles[0].DepotPath
+    mat_base = mat_bin.GetVariableByName('baseMaterial').Handles[0].DepotPath if mat_bin.GetVariableByName('baseMaterial') else 'engine\materials\graphs\pbr_std.w2mg'
     shader_type = mat_base.split("\\")[-1][:-5]	# The .w2mg or .w2mi file, minus the extension.
     
     if name == None:
@@ -767,7 +767,13 @@ def fix_texture_node(par_name, node):
         else:
             node.image.colorspace_settings.name = 'Non-Color'
     return node
-    
+
+def node_tree_inputs_new(node_ng, par_type, par_name ):
+    if bpy.app.version >= (4, 0, 0):
+        node_ng.node_tree.interface.new_socket(name=par_name, in_out='INPUT', socket_type=par_type)
+    else:
+        node_ng.node_tree.inputs.new(par_type, par_name)
+
 def create_node_for_param(
         mat: Material
         ,param: Element
@@ -860,7 +866,11 @@ def create_node_for_param(
         #todo clone the material group and replace instead of changing param name?
         input_pin = node_ng.inputs.get(EQUIVALENT_PARAMS[par_name])
         if input_pin != None:
-            input_inner = node_ng.node_tree.inputs.get(EQUIVALENT_PARAMS[par_name])
+            
+            if bpy.app.version >= (4, 0, 0):
+                input_inner = node_ng.node_tree.interface.items_tree.get(EQUIVALENT_PARAMS[par_name])
+            else:
+                input_inner = node_ng.node_tree.inputs.get(EQUIVALENT_PARAMS[par_name])
             input_inner.name = par_name
     else:
         input_pin = node_ng.inputs.get(par_name)
@@ -870,7 +880,7 @@ def create_node_for_param(
         #create the W float node and pins
         input_pin_vec_W = node_ng.inputs.get(par_name+'_W')
         if input_pin_vec_W == None:
-            node_ng.node_tree.inputs.new('NodeSocketFloat', par_name+'_W')
+            node_tree_inputs_new( node_ng, 'NodeSocketFloat', par_name+'_W')
             input_pin_vec_W = node_ng.inputs.get(par_name+'_W')
         node_w.location = (-450, y_loc)
         node_w.name = par_name+'_W'
@@ -880,15 +890,15 @@ def create_node_for_param(
     #TODO check for same names but differnt types defined on instance vs shader.
     if input_pin == None:
         if par_type == "Color":
-            node_ng.node_tree.inputs.new('NodeSocketColor', par_name)
+            node_tree_inputs_new( node_ng, 'NodeSocketColor', par_name)
         elif par_type == "Float":
-            node_ng.node_tree.inputs.new('NodeSocketFloat', par_name)
+            node_tree_inputs_new( node_ng, 'NodeSocketFloat', par_name)
         elif par_type == "handle:ITexture":
-            node_ng.node_tree.inputs.new('NodeSocketColor', par_name)
+            node_tree_inputs_new( node_ng, 'NodeSocketColor', par_name)
         elif par_type == 'handle:CTextureArray':
-            node_ng.node_tree.inputs.new('NodeSocketColor', par_name)
+            node_tree_inputs_new( node_ng, 'NodeSocketColor', par_name)
         elif par_type == 'Vector':
-            node_ng.node_tree.inputs.new('NodeSocketVector', par_name)
+            node_tree_inputs_new( node_ng, 'NodeSocketVector', par_name)
         input_pin = node_ng.inputs.get(par_name)
 
     if input_pin and len(input_pin.links) == 0:

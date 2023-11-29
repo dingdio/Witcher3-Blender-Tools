@@ -620,11 +620,11 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
         importer.assign(i)
     log.info(' Finished importing motion in %f seconds.', time.time() - start_time)
 
-    update_scene_settings = True # MAKE BLEND IMPORT PROP
+    #update_scene_settings = True # MAKE BLEND IMPORT PROP
     if update_scene_settings:
         auto_scene_setup.setupFrameRanges(use_NLA)
         auto_scene_setup.setupFps()
-    context.scene.frame_set(context.scene.frame_current)
+        bpy.context.scene.frame_current = 0#context.scene.frame_current)
     return {'FINISHED'}
 
 global GLOBAL_ANIMSET

@@ -366,10 +366,9 @@ class WITCH_OT_morphs(bpy.types.Operator):
                 pb.matrix_basis.identity()
             #bpy.ops.object.mode_set(mode='POSE', toggle=False)
             #bpy.ops.pose.transforms_clear()
-            import_anims.import_anim(context, "inported", set_entry, facePose=True, override_select=[face_rig])
+            import_anims.import_anim(context, "imported", set_entry, facePose=True, override_select=[face_rig], update_scene_settings=False , at_frame=0)
 
 
-            context.scene.frame_current = 0
             #!GET MESH OBJECTS FOR THIS AND APPLY SHAPE KEYS
 
             for face_mesh in face_meshes:
