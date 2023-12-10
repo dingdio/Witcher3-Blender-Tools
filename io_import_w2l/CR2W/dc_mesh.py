@@ -325,6 +325,10 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
                         for _ in range(bonesId_count):
                             submesh.bonesId.append(br.readUInt16())
 
+                        #Replace skinning ids with mapped id
+                        for skinningVert in final_meshdata.skinningVerts:
+                            skinningVert.boneId = submesh.bonesId[skinningVert.boneId]
+
                         final_meshdata.meshInfo = submesh
                         return submesh
 
