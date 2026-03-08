@@ -964,6 +964,21 @@ class EngineTransform:
         if f:
             self.Read(f)
 
+    def __getitem__(self, item):
+        return getattr(self, item)
+
+    def get(self, item, default=None):
+        return getattr(self, item, default)
+
+    def __contains__(self, item):
+        return hasattr(self, item)
+
+    def keys(self):
+        return vars(self).keys()
+
+    def items(self):
+        return vars(self).items()
+
     def Read(self, f):
         flags = readSByte(f)
 

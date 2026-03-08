@@ -610,6 +610,24 @@ class JsonChunk(object):
         #![JsonIgnore]
         #self.refChunk = 0
 
+    def __getitem__(self, item):
+        return getattr(self, item)
+
+    def __setitem__(self, item, value):
+        setattr(self, item, value)
+
+    def get(self, item, default=None):
+        return getattr(self, item, default)
+
+    def __contains__(self, item):
+        return hasattr(self, item)
+
+    def keys(self):
+        return vars(self).keys()
+
+    def items(self):
+        return vars(self).items()
+
 class ModelEnt(object):
     """docstring for ModelEnt."""
     def __init__(self, templateFilename, ns):
@@ -620,6 +638,21 @@ class ModelEnt(object):
         #self.animation_face_object = False
     def __getitem__(self, item):
         return getattr(self, item)
+
+    def __setitem__(self, item, value):
+        setattr(self, item, value)
+
+    def get(self, item, default=None):
+        return getattr(self, item, default)
+
+    def __contains__(self, item):
+        return hasattr(self, item)
+
+    def keys(self):
+        return vars(self).keys()
+
+    def items(self):
+        return vars(self).items()
 
 class CRigidMeshComponent(JsonChunk):
     """docstring for CRigidMeshComponent."""

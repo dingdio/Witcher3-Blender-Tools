@@ -12,6 +12,21 @@ from . import read_json_w3
 class base_w3(object):
     def __getitem__(self, item):
         return getattr(self, item)
+
+    def __setitem__(self, item, value):
+        setattr(self, item, value)
+
+    def get(self, item, default=None):
+        return getattr(self, item, default)
+
+    def __contains__(self, item):
+        return hasattr(self, item)
+
+    def keys(self):
+        return vars(self).keys()
+
+    def items(self):
+        return vars(self).items()
     
 from .w3_types_CStorySceneEvent import elementTypes
 
@@ -3312,7 +3327,12 @@ class CStorySceneWaypointComponent(CComponent):
 
 
 def loadJSON(self, args):
-    for key, value in args[0].items():
+    source = args[0]
+    if hasattr(source, "items"):
+        items = source.items()
+    else:
+        items = vars(source).items()
+    for key, value in items:
         setattr(self, key, value)
 
 

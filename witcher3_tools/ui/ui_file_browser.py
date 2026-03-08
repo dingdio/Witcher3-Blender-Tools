@@ -4087,7 +4087,8 @@ class FileActionOperatorImportToScene(Operator):
                     self.report({'ERROR'}, f"Cubemap import failed: {os.path.basename(abs_file_path)}")
                     return {'CANCELLED'}
             elif ext == ".w2ent":
-                import_entity.import_ent_template(abs_file_path, False, 0)
+                if not import_entity.try_apply_inventory_file_to_selected_character(context, abs_file_path):
+                    import_entity.import_ent_template(abs_file_path, False, 0)
             elif ext == ".flyr":
                 from ..CR2W import CR2W_reader
                 from ..importers import import_w2l
@@ -4612,7 +4613,8 @@ class FileActionOperator(Operator):
 
         # Auto-import for certain file types
         if export_path.endswith(".w2ent"):
-            import_entity.import_ent_template(export_path, False, 0)
+            if not import_entity.try_apply_inventory_file_to_selected_character(context, export_path):
+                import_entity.import_ent_template(export_path, False, 0)
 
         # For terrain tiles, emit per-tile images next to extracted buffers.
         if effective_cache_type == "Bundle" and full_path_norm.lower().endswith(".w2ter"):

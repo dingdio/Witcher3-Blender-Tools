@@ -1818,29 +1818,48 @@ def get_current_appearance_name(rig_settings):
 
 def _get_coloring_entries_for_appearance(entity_data, appearance_name):
     """Return entity-level coloringEntries for the selected appearance."""
-    if not appearance_name or not isinstance(entity_data, dict):
+    if not appearance_name or entity_data is None:
         return []
-    entries = entity_data.get("coloringEntries", [])
+    if isinstance(entity_data, dict):
+        entries = entity_data.get("coloringEntries", [])
+    else:
+        entries = getattr(entity_data, "coloringEntries", [])
     if not isinstance(entries, list):
         return []
     filtered = []
     for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("appearance", "")) != str(appearance_name):
+        if isinstance(entry, dict):
+            entry_appearance = entry.get("appearance", "")
+            component_name = entry.get("componentName", "")
+        else:
+            entry_appearance = getattr(entry, "appearance", "")
+            component_name = getattr(entry, "componentName", "")
+        if str(entry_appearance) != str(appearance_name):
             continue
         filtered.append(entry)
-    filtered.sort(key=lambda e: str(e.get("componentName", "")).lower())
+    filtered.sort(
+        key=lambda e: str(
+            e.get("componentName", "") if isinstance(e, dict) else getattr(e, "componentName", "")
+        ).lower()
+    )
     return filtered
 
 
 def _format_color_shift_summary(shift_data):
-    if not isinstance(shift_data, dict) or not shift_data:
+    if not shift_data:
         return "None"
+    if isinstance(shift_data, dict):
+        hue = shift_data.get('hue', 0)
+        saturation = shift_data.get('saturation', 0)
+        luminance = shift_data.get('luminance', 0)
+    else:
+        hue = getattr(shift_data, 'hue', 0)
+        saturation = getattr(shift_data, 'saturation', 0)
+        luminance = getattr(shift_data, 'luminance', 0)
     return (
-        f"H:{shift_data.get('hue', 0)} "
-        f"S:{shift_data.get('saturation', 0)} "
-        f"L:{shift_data.get('luminance', 0)}"
+        f"H:{hue} "
+        f"S:{saturation} "
+        f"L:{luminance}"
     )
 
 
@@ -3076,11 +3095,9 @@ class EQUIPMENT_OT_SaveEquipmentEntries(bpy.types.Operator):
         app_list = rig_settings.app_list
         app_list_index = rig_settings.app_list_index
         
-        # Load the entire jsonData
-        try:
-            entity_data = json.loads(rig_settings.jsonData)
-        except json.JSONDecodeError:
-            self.report({'ERROR'}, "Invalid JSON data in rig settings.")
+        _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+        if entity_data is None:
+            self.report({'ERROR'}, "Failed to load cached entity data.")
             return {'CANCELLED'}
         
         appearances = entity_data.get('appearances', [])
@@ -3118,8 +3135,9 @@ class EQUIPMENT_OT_SaveEquipmentEntries(bpy.types.Operator):
 
             selected_appearance['includedTemplates'] = included_templates_data
 
-            # Save back to jsonData
-            rig_settings.jsonData = json.dumps(entity_data, indent=2)
+            if import_entity.cache_rig_entity_state_from_data(rig_settings, entity_data, update_json=True) is None:
+                self.report({'ERROR'}, "Failed to rebuild entity state after editing equipment entries.")
+                return {'CANCELLED'}
             self.report({'INFO'}, "Equipment entries saved.")
             return {'FINISHED'}
         else:
@@ -3174,11 +3192,9 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
             except Exception:
                 pass
 
-        # Load the entire jsonData
-        try:
-            entity_data = json.loads(rig_settings.jsonData)
-        except json.JSONDecodeError:
-            layout.label(text="Invalid JSON data in rig settings.")
+        _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+        if entity_data is None:
+            layout.label(text="Failed to load cached entity data.")
             return
 
         appearances = entity_data.get('appearances', [])
@@ -3790,23 +3806,19 @@ def sync_equipment_slots_to_temp(context, rig_settings):
 
 
 def _get_entity_and_appearance(rig_settings):
-    """Load entity and current appearance from rig_settings JSON. Returns (entity, appearance) or (None, None)."""
-    from ..CR2W import w3_types
-    raw_json = getattr(rig_settings, "jsonData", "") or ""
+    """Load entity and current appearance from runtime cache. Returns (entity, appearance) or (None, None)."""
     app_index = int(getattr(rig_settings, "app_list_index", -1))
     try:
         rig_key = rig_settings.as_pointer()
     except Exception:
         rig_key = id(rig_settings)
-    cache_key = (rig_key, len(raw_json), hash(raw_json), app_index)
+    entity, _entity_data = import_entity.get_rig_entity_state(rig_settings)
+    cache_key = (rig_key, id(entity), app_index)
     cached = _ENTITY_APPEARANCE_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    try:
-        class_to_json = json.loads(raw_json)
-        entity = w3_types.Entity.from_json(class_to_json)
-    except (json.JSONDecodeError, Exception):
+    if entity is None:
         return None, None
 
     appearances = getattr(entity, 'appearances', [])
@@ -4115,8 +4127,8 @@ def load_template_item(context, armature, slot_index, rig_settings=None):
 
     # Get ALL appearances that use this template from entity data
     try:
-        entity_data = json.loads(rig_settings.jsonData)
-        template_map = build_template_appearance_map(entity_data)
+        _cached_entity, _entity_data = import_entity.get_rig_entity_state(rig_settings)
+        template_map = build_template_appearance_map(entity)
         template_appearances = template_map.get(slot.template_filename, {}).get('indices', [])
     except Exception:
         template_appearances = []
@@ -4358,10 +4370,9 @@ class EQUIPMENT_OT_LoadAllAppearances(bpy.types.Operator):
             self.report({'ERROR'}, "Failed to load entity data.")
             return {'CANCELLED'}
 
-        try:
-            entity_data = json.loads(rig_settings.jsonData)
-        except json.JSONDecodeError:
-            self.report({'ERROR'}, "Invalid JSON data.")
+        _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+        if entity_data is None:
+            self.report({'ERROR'}, "Failed to load cached entity data.")
             return {'CANCELLED'}
 
         appearances = entity_data.get('appearances', [])
@@ -4426,9 +4437,10 @@ class EQUIPMENT_OT_UnloadTemplate(bpy.types.Operator):
         
         # Get template->appearances map to check for shared templates
         try:
-            entity_data = json.loads(rig_settings.jsonData)
+            entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
             from ..importers.import_entity import build_template_appearance_map
-            template_map = build_template_appearance_map(entity_data)
+            template_source = entity if entity is not None else entity_data
+            template_map = build_template_appearance_map(template_source) if template_source else {}
         except Exception:
             template_map = {}
         
@@ -4469,10 +4481,9 @@ class EQUIPMENT_OT_RefreshTemplateData(bpy.types.Operator):
             self.report({'WARNING'}, "No valid armature selected.")
             return {'CANCELLED'}
 
-        try:
-            entity_data = json.loads(rig_settings.jsonData)
-        except json.JSONDecodeError:
-            self.report({'ERROR'}, "Invalid JSON data in rig settings.")
+        _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+        if entity_data is None:
+            self.report({'ERROR'}, "Failed to load cached entity data.")
             return {'CANCELLED'}
 
         appearances = entity_data.get('appearances', [])
@@ -4608,10 +4619,9 @@ class EQUIPMENT_OT_SyncTemplatesToAppearance(bpy.types.Operator):
             self.report({'WARNING'}, "No valid armature selected.")
             return {'CANCELLED'}
 
-        try:
-            entity_data = json.loads(rig_settings.jsonData)
-        except json.JSONDecodeError:
-            self.report({'ERROR'}, "Invalid JSON data.")
+        _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+        if entity_data is None:
+            self.report({'ERROR'}, "Failed to load cached entity data.")
             return {'CANCELLED'}
 
         appearances = entity_data.get('appearances', [])

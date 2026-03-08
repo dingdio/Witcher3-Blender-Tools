@@ -572,10 +572,12 @@ class WITCH_OT_w3app(bpy.types.Operator, ImportHelper):
             item = treeList.add()
             node = entity_w3a.appearances[0]
             item.name = node.name
-            class_to_json = json.loads(rig_settings.jsonData)
-            entity = w3_types.Entity.from_json(class_to_json)
+            entity, _entity_data = import_entity.get_rig_entity_state(rig_settings)
+            if entity is None:
+                self.report({'WARNING'}, "No cached entity state on the target armature.")
+                return {'CANCELLED'}
             entity.appearances.append(entity_w3a.appearances[0])
-            rig_settings.jsonData = json.dumps(entity, indent=2, default=vars, sort_keys=False)
+            import_entity.cache_rig_entity_state(rig_settings, entity, update_json=True)
             rig_settings.app_list_index = len(entity.appearances)-1
             with mod_loading_context(context):
                 import_entity.import_from_list_item(context, item)
@@ -837,9 +839,11 @@ class WITCH_OT_ENTITY_import_inventory(bpy.types.Operator, ImportHelper):
             remember=True,
             fallback=True,
         )
-        if rig_settings and not getattr(rig_settings, "jsonData", ""):
-            armature = None
-            rig_settings = None
+        if rig_settings:
+            entity, _entity_data = import_entity.get_rig_entity_state(rig_settings)
+            if entity is None:
+                armature = None
+                rig_settings = None
 
         # Build list of items to import from preview
         preview_items = []
@@ -1366,9 +1370,8 @@ class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
                 col.separator()
                 col.label(text=f"Selected: {active_app.name}", icon='CHECKMARK')
 
-                try:
-                    entity_data = json.loads(rig_settings.jsonData) if getattr(rig_settings, "jsonData", "") else {}
-                except Exception:
+                _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+                if entity_data is None:
                     entity_data = {}
                 try:
                     color_entries = ui_equipment._get_coloring_entries_for_appearance(entity_data, str(active_app.name))

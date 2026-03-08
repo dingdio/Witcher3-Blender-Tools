@@ -2572,7 +2572,8 @@ class MyImageActionOperator(bpy.types.Operator):
         if not abs_path or not win_path_exists(abs_path):
             self.report({'WARNING'}, f"Could not find/export: {self.repo_path}")
             return {'CANCELLED'}
-        import_entity.import_ent_template(abs_path, False, 1)
+        if not import_entity.try_apply_inventory_file_to_selected_character(context, abs_path):
+            import_entity.import_ent_template(abs_path, False, 1)
         # If you still want to use print, uncomment the following line
         # print(f"Selected image: {self.image_name}, Repo Path: {self.repo_path}")
         return {'FINISHED'}

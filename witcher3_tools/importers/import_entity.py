@@ -3,6 +3,7 @@ from ..CR2W.witcher_cache.Bundles import BundleItem, LoadBundleManager
 log = logging.getLogger(__name__)
 
 import json
+import copy
 import os
 import re
 import bpy
@@ -54,6 +55,7 @@ from math import radians
 #     #repo = "D:/Witcher_uncooked_clean/raw_ent/"
 #     #return settings.get().repopath+filepath
 addon_name = get_addon_name()
+_ENTITY_RUNTIME_CACHE = {}
 
 
 def _norm_redcloth_key_path(value) -> str:
@@ -173,13 +175,156 @@ def NewAnimsetListItem( treeList, path, name):
     return item
 
 
-def class_fun(thing):
-    try:
-        if hasattr(thing,'theType') and thing.theType == 'CGUID' or hasattr(thing,'theType') and thing.theType == 'EPathEngineCollision':
-            return None
-        return vars(thing)
-    except Exception as e:
+def _rig_settings_cache_key(rig_settings):
+    if rig_settings is None:
         return None
+    try:
+        return int(rig_settings.as_pointer())
+    except Exception:
+        return id(rig_settings)
+
+
+def _json_token(text):
+    raw_text = text or ""
+    return (len(raw_text), hash(raw_text))
+
+
+def _to_plain_data(value, _visited=None):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return list(value)
+    if isinstance(value, memoryview):
+        return list(value.tobytes())
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        if _visited is None:
+            _visited = set()
+        return {key: _to_plain_data(item, _visited) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        if _visited is None:
+            _visited = set()
+        return [_to_plain_data(item, _visited) for item in value]
+
+    item_getter = getattr(value, "item", None)
+    if callable(item_getter):
+        try:
+            return _to_plain_data(item_getter(), _visited)
+        except Exception:
+            pass
+
+    if _visited is None:
+        _visited = set()
+    obj_id = id(value)
+    if obj_id in _visited:
+        return None
+    _visited.add(obj_id)
+    try:
+        if hasattr(value, "__json_serializable__"):
+            return _to_plain_data(value.__json_serializable__(), _visited)
+        if hasattr(value, "__dict__"):
+            return {
+                key: _to_plain_data(item, _visited)
+                for key, item in vars(value).items()
+            }
+        return value
+    finally:
+        _visited.remove(obj_id)
+
+
+def _to_json_text(value, default_text="{}", indent=None):
+    if value is None:
+        return default_text
+    plain_value = _to_plain_data(value)
+    if plain_value is None:
+        return default_text
+    return json.dumps(plain_value, indent=indent, sort_keys=False)
+
+
+def _coerce_engine_transform(value):
+    if not value:
+        return None
+    if isinstance(value, EngineTransform):
+        return value
+    plain_value = value if isinstance(value, dict) else _to_plain_data(value)
+    if not isinstance(plain_value, dict):
+        return None
+    try:
+        return EngineTransform.from_json(**plain_value)
+    except Exception:
+        return None
+
+
+def _load_entity_state_from_json(rig_settings):
+    raw_json = getattr(rig_settings, "jsonData", "") or ""
+    if not raw_json:
+        return None, None
+    try:
+        entity_data = json.loads(raw_json)
+    except Exception:
+        return None, None
+
+    try:
+        entity = w3_types.Entity.from_json(copy.deepcopy(entity_data))
+    except Exception:
+        entity = None
+    return entity, entity_data
+
+
+def cache_rig_entity_state(rig_settings, entity, entity_data=None, update_json=False):
+    cache_key = _rig_settings_cache_key(rig_settings)
+    if cache_key is None or entity is None:
+        return None
+    if entity_data is None:
+        entity_data = _to_plain_data(entity)
+    else:
+        entity_data = _to_plain_data(entity_data)
+    _ENTITY_RUNTIME_CACHE[cache_key] = {
+        "entity": entity,
+        "entity_data": entity_data,
+        "json_token": _json_token(getattr(rig_settings, "jsonData", "") or ""),
+    }
+    if update_json:
+        rig_settings.jsonData = json.dumps(entity_data, sort_keys=False)
+        _ENTITY_RUNTIME_CACHE[cache_key]["json_token"] = _json_token(getattr(rig_settings, "jsonData", "") or "")
+    return entity_data
+
+
+def cache_rig_entity_state_from_data(rig_settings, entity_data, update_json=False):
+    if entity_data is None:
+        return None
+    try:
+        entity = w3_types.Entity.from_json(copy.deepcopy(entity_data))
+    except Exception:
+        return None
+    cache_rig_entity_state(rig_settings, entity, entity_data=entity_data, update_json=update_json)
+    return entity
+
+
+def get_rig_entity_state(rig_settings, allow_json_fallback=True):
+    cache_key = _rig_settings_cache_key(rig_settings)
+    if cache_key is None:
+        return None, None
+
+    cached = _ENTITY_RUNTIME_CACHE.get(cache_key)
+    current_json_token = _json_token(getattr(rig_settings, "jsonData", "") or "")
+    if cached is not None and cached.get("json_token") == current_json_token:
+        return cached.get("entity"), cached.get("entity_data")
+
+    if not allow_json_fallback:
+        return None, None
+
+    entity, entity_data = _load_entity_state_from_json(rig_settings)
+    if entity is None and entity_data is None:
+        return None, None
+
+    _ENTITY_RUNTIME_CACHE[cache_key] = {
+        "entity": entity,
+        "entity_data": entity_data,
+        "json_token": current_json_token,
+    }
+    return entity, entity_data
 
 
 def _coerce_version(value, default=999):
@@ -207,15 +352,7 @@ def test_load_entity(filename) ->  w3_types.Entity:
     if ext.lower() in ('.json'):
         entity = read_json_w3.readEntFile(filename)
     elif ext.lower().endswith('.w2ent') or ext.lower().endswith('.w3app'):
-        bin_data = load_bin_entity(filename)
-
-        # Witcher 2 equipment entities can contain back-references once related
-        # templates/inventory initializers are resolved, so use the cycle-safe
-        # encoder here instead of plain json.dumps(..., default=...).
-        the_json = json.dumps(bin_data, cls=CircularRefEncoder, sort_keys=False)
-        class_to_json = json.loads(the_json)
-        entity = w3_types.Entity()
-        entity = entity.from_json(class_to_json)
+        entity = load_bin_entity(filename)
     else:
         entity = None
     return entity
@@ -240,8 +377,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
         pass
     try:
         rig_settings = main_arm_obj.data.witcherui_RigSettings
-        #!make sure to store json before fixing paths
-        rig_settings.jsonData = json.dumps(entity, default=vars, sort_keys=False)
+        cache_rig_entity_state(rig_settings, entity, update_json=True)
         #entity = fixed_chunk_paths(entity, entity.version)
 
         treeList = rig_settings.app_list
@@ -254,7 +390,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                 base_chunks = entity.staticMeshes.get('chunks', []) or []
             except Exception:
                 base_chunks = []
-        base_mesh_count = sum(1 for c in base_chunks if isinstance(c, dict) and c.get('mesh'))
+        base_mesh_count = sum(1 for c in base_chunks if c and c.get('mesh'))
 
         if entity.appearances:
             if app_idx >= len(entity.appearances):
@@ -593,6 +729,76 @@ def _iter_inventory_entries(selected_appearance, entity=None):
         yield from _yield_from(selected_appearance)
     if entity is not None:
         yield from _yield_from(entity)
+
+
+def entity_has_inventory_entries(entity) -> bool:
+    if entity is None:
+        return False
+
+    if next(_iter_inventory_entries(None, entity), None) is not None:
+        return True
+
+    appearances = _get_entry_attr(entity, "appearances", []) or []
+    for appearance in appearances:
+        if next(_iter_inventory_entries(appearance, None), None) is not None:
+            return True
+    return False
+
+
+def entity_has_main_skeleton(entity) -> bool:
+    moving_agent = _get_entry_attr(entity, "MovingPhysicalAgentComponent", None)
+    return bool(_get_entry_attr(moving_agent, "skeleton", None))
+
+
+def can_apply_inventory_to_selected_character(context) -> bool:
+    context = context or bpy.context
+    armature, rig_settings = get_main_armature_and_rig_settings(
+        context,
+        prefer_active=True,
+        remember=True,
+        fallback=True,
+    )
+    if armature is None or rig_settings is None:
+        return False
+
+    entity, entity_data = get_rig_entity_state(rig_settings)
+    return bool(entity is not None or entity_data is not None)
+
+
+def try_apply_inventory_file_to_selected_character(context, filename, import_mode='MOUNTS') -> bool:
+    context = context or bpy.context
+    if not filename:
+        return False
+    if not can_apply_inventory_to_selected_character(context):
+        return False
+
+    try:
+        entity = test_load_entity(filename)
+    except Exception as exc:
+        log.debug("Inventory probe failed for %s: %s", filename, exc)
+        return False
+
+    if entity is None:
+        return False
+    if entity_has_main_skeleton(entity):
+        return False
+    if not entity_has_inventory_entries(entity):
+        return False
+
+    try:
+        result = bpy.ops.witcher.import_w2ent_inventory(
+            'EXEC_DEFAULT',
+            filepath=filename,
+            import_mode=import_mode,
+        )
+    except Exception:
+        log.warning("Inventory apply failed for %s", filename, exc_info=True)
+        return False
+
+    finished = isinstance(result, set) and 'FINISHED' in result
+    if finished:
+        log.info("Applied inventory from %s to selected character", filename)
+    return finished
 
 def _get_entry_attr(entry, key, default=None):
     if isinstance(entry, dict):
@@ -988,7 +1194,7 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
         pass
 
 
-def build_template_appearance_map(entity_data):
+def build_template_appearance_map(entity_source):
     """Build a mapping of template filename -> list of appearance indices.
     
     Scans all appearances in the entity and identifies which appearances use each template.
@@ -996,13 +1202,13 @@ def build_template_appearance_map(entity_data):
     """
     template_map = {}
     
-    appearances = entity_data.get('appearances', [])
+    appearances = _get_entry_attr(entity_source, 'appearances', []) or []
     for app_index, appearance in enumerate(appearances):
-        app_name = appearance.get('name', str(app_index))
-        included_templates = appearance.get('includedTemplates', [])
+        app_name = _get_entry_attr(appearance, 'name', str(app_index))
+        included_templates = _get_entry_attr(appearance, 'includedTemplates', []) or []
         
         for template in included_templates:
-            filename = template.get('templateFilename', '')
+            filename = _get_entry_attr(template, 'templateFilename', '')
             if filename:
                 if filename not in template_map:
                     template_map[filename] = {'indices': [], 'names': []}
@@ -1015,13 +1221,12 @@ def build_template_appearance_map(entity_data):
 
 def get_template_appearances_from_entity(rig_settings, template_filename):
     """Get list of appearance indices that use this template (from entity data)."""
-    import json
-    try:
-        entity_data = json.loads(rig_settings.jsonData)
-    except Exception:
+    entity, entity_data = get_rig_entity_state(rig_settings)
+    entity_source = entity if entity is not None else entity_data
+    if not entity_source:
         return []
     
-    template_map = build_template_appearance_map(entity_data)
+    template_map = build_template_appearance_map(entity_source)
     if template_filename in template_map:
         return template_map[template_filename]['indices']
     return []
@@ -1200,8 +1405,9 @@ def process_special_attachment(constraint, objdict):
 
         # Apply relativeTransform if present
         if relativeTransform:
-            rt = EngineTransform.from_json(**relativeTransform)
-            set_blender_object_transform(target_object, rt, rotate_180=False)
+            rt = _coerce_engine_transform(relativeTransform)
+            if rt is not None:
+                set_blender_object_transform(target_object, rt, rotate_180=False)
 
         # Camera components need a rot90-facing offset when the rig is rotated
         if "CCameraComponent" in child_name and use_rot90:
@@ -1240,8 +1446,9 @@ def process_regular_attachment(constraint, objdict, meshdict):
 
     # Apply relativeTransform if present
     if relativeTransform:
-        rt = EngineTransform.from_json(**relativeTransform)
-        set_blender_object_transform(target_transform, rt, rotate_180=False)
+        rt = _coerce_engine_transform(relativeTransform)
+        if rt is not None:
+            set_blender_object_transform(target_transform, rt, rotate_180=False)
 
 def join_as_shape_keys(source_meshes, target_meshes, morphComponentId):
     for source, target in zip(source_meshes, target_meshes):
@@ -1347,8 +1554,9 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                             _force_shadowmesh_hidden(mesh)
                         
                 if 'transform' in chunk and chunk['transform']:
-                    rt = EngineTransform.from_json(**chunk['transform'])
-                    set_blender_object_transform(mesh, rt, rotate_180=False)
+                    rt = _coerce_engine_transform(chunk['transform'])
+                    if rt is not None:
+                        set_blender_object_transform(mesh, rt, rotate_180=False)
 
         # Handle cloth resources
         if "resource" in chunk and not import_redcloth_enabled:
@@ -1690,7 +1898,7 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None):
 
         # Process each slot
         for slot in entity.slots:
-            this_slot = w3_types.EntitySlot(True, slot)
+            this_slot = slot if isinstance(slot, w3_types.EntitySlot) else w3_types.EntitySlot(True, slot)
             componentName = this_slot.componentName
 
             # Store slot data in rig_settings for persistence
@@ -1698,7 +1906,7 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None):
             slot_entry.slot_name = this_slot.name or ""
             slot_entry.component_name = componentName or ""
             slot_entry.bone_name = this_slot.boneName or ""
-            slot_entry.transform_json = json.dumps(this_slot.transform) if this_slot.transform else "{}"
+            slot_entry.transform_json = _to_json_text(this_slot.transform)
             slot_entry.free_position_x = this_slot.freePositionAxisX or False
             slot_entry.free_position_y = this_slot.freePositionAxisY or False
             slot_entry.free_position_z = this_slot.freePositionAxisZ or False
@@ -1802,30 +2010,6 @@ def reset_transforms(new_obj):
     new_obj.scale[2] = 1
 
 
-class CircularRefEncoder(json.JSONEncoder):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.visited = set()
-
-    def default(self, obj):
-        if obj is None:
-            return None
-        obj_id = id(obj)
-        if obj_id in self.visited:
-            return None  # Handle circular references
-        self.visited.add(obj_id)
-        try:
-            if isinstance(obj, (list, tuple)):
-                return [self.default(item) for item in obj]
-            elif isinstance(obj, dict):
-                return {key: self.default(value) for key, value in obj.items()}
-            elif hasattr(obj, '__dict__'):
-                return {key: self.default(value) for key, value in vars(obj).items()}
-            else:
-                return str(obj)
-        finally:
-            self.visited.remove(obj_id)
-
 def add_app_template(   entity,
                                 base_animation_skeleton,
                                 group_parent,
@@ -1863,12 +2047,7 @@ def add_app_template(   entity,
     else:
         (templateMesh, entity_back) = LoadCEntityTemplateFile(templateFilename)
     
-    # Transform chunks to json objects
     cur_chunks = templateMesh['chunks']
-    #the_json = json.dumps(cur_chunks, indent=2, cls=CircularRefEncoder, sort_keys=False)
-    the_json = json.dumps(cur_chunks, indent=2, cls=CircularRefEncoder, sort_keys=False)
-    class_to_json = json.loads(the_json)
-    cur_chunks = class_to_json
     
     local_morphs_todo = []
     (constrains, objdict, meshdict, HardAttachments, root_skeleton, local_morphs_todo) = import_chunks(
@@ -1962,8 +2141,7 @@ def import_app(context,
     app_name = selectedAppearance.name
 
     # Build template->appearances map from entity data for correct driver expressions
-    entity_data_dict = json.loads(rig_settings.jsonData)
-    template_map = build_template_appearance_map(entity_data_dict)
+    template_map = build_template_appearance_map(entity)
 
     # Build lookup of already-loaded templates by filename
     loaded_templates = {slot.template_filename: slot for slot in rig_settings.template_slots}
@@ -2006,8 +2184,9 @@ def import_app(context,
             if not slot_has_objects:
                 slot.template_guid = ""
             slot.is_loaded = False
-            slot.ns = selectedAppearance.includedTemplates[i].get('ns', '')
-            slot.data_json = json.dumps(selectedAppearance.includedTemplates[i], indent=2)
+            template_data = selectedAppearance.includedTemplates[i]
+            slot.ns = _get_entry_attr(template_data, 'ns', '')
+            slot.data_json = _to_json_text(template_data, indent=2)
 
             guid = generate_guid()
             before = set(bpy.data.objects)
@@ -2044,8 +2223,9 @@ def import_app(context,
         # New template — create slot and import
         slot = rig_settings.template_slots.add()
         slot.template_filename = templateFilename
-        slot.ns = selectedAppearance.includedTemplates[i].get('ns', '')
-        slot.data_json = json.dumps(selectedAppearance.includedTemplates[i], indent=2)
+        template_data = selectedAppearance.includedTemplates[i]
+        slot.ns = _get_entry_attr(template_data, 'ns', '')
+        slot.data_json = _to_json_text(template_data, indent=2)
         slot.appearance_names = app_name
 
         guid = generate_guid()
@@ -2336,9 +2516,10 @@ def import_from_list_item(context, item):
         fallback=True,
     )
     if base_animation_skeleton and rig_settings:
-        class_to_json = json.loads(rig_settings.jsonData)
-        entity = w3_types.Entity.from_json(class_to_json)
-        #entity = fixed_chunk_paths(entity)
+        entity, _entity_data = get_rig_entity_state(rig_settings)
+        if entity is None:
+            log.warning("import_from_list_item: no cached entity state for armature '%s'.", base_animation_skeleton.name)
+            return
 
         for app in entity.appearances:
             if app.name == item.name:
