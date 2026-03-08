@@ -1468,13 +1468,11 @@ def process_special_attachment(constraint, objdict):
             elif hasattr(rig_settings, "rot90_imported"):
                 use_rot90 = bool(rig_settings.rot90_imported)
 
-        # Determine parent bone
+        # Determine parent bone.
+        # Only bind when parentSlotName is explicitly set in the CHardAttachment. Binding everything caused issues with crossbows
+        p_bone = None
         if p_bone_name:
             p_bone = parent_arm.pose.bones.get(p_bone_name)
-        elif parent_arm.pose.bones.get(target_object.pose.bones[0].name):
-            p_bone = parent_arm.pose.bones.get(target_object.pose.bones[0].name)
-        else:
-            p_bone = parent_arm.pose.bones[0]
 
         if p_bone is not None:
             target_object.parent = parent_arm
@@ -1597,6 +1595,9 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
     for chunk in cur_chunks:
         chunk_ns = get_chunk_namespace(chunk)
         if not isChildNode(chunk['chunkIndex'], cur_chunks):
+            # CAnimatedComponent sub-skeletons must NOT be bone-name-matched to the parent entity via CreateConstraints2. Cause problems with crossbows etc.
+            if chunk['type'] == 'CAnimatedComponent' and chunk.get('skeleton'):
+                continue
             constrains.append([entity.name, chunk_ns])
 
     for chunk in cur_chunks:
@@ -1871,7 +1872,7 @@ def _coerce_real(value, default=0.0):
         return default
 
 
-def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_180=False, rotate_90=False, rotate_90_dir=1, use_world_replace=False):
+def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_180=False, rotate_90=False, rotate_90_dir=1):
     """
     Sets the relative position of an empty object based on the EngineTransform,
     offsetting it from the target bone if boneName is provided.
@@ -1879,6 +1880,8 @@ def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_
     If bone_name is None, the empty is constrained to the armature object.
     
     Updated to use COPY_TRANSFORMS for consistency with equipment mounting system.
+    Rot90 compensation must preserve the slot's world placement when the bone
+    basis is rotated for Blender display.
     """
     # Check if bone exists
     has_bone = bone_name and bone_name in armature_obj.pose.bones
@@ -1893,18 +1896,14 @@ def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_
     constraint.name = "W2_SLOT"
     constraint.target = armature_obj
     constraint.subtarget = bone_name if has_bone else ''
-    if use_world_replace:
-        constraint.owner_space = 'WORLD'
-        constraint.target_space = 'WORLD'
-        constraint.mix_mode = 'REPLACE'
-    else:
-        # Local space avoids double transforms while keeping hierarchy
-        constraint.owner_space = 'LOCAL'
-        constraint.target_space = 'POSE'
-        constraint.mix_mode = 'BEFORE'
+    # Keep one consistent slot binding mode regardless of Rot90 state so
+    # toggling Rot90 only changes local orientation compensation, not placement.
+    constraint.owner_space = 'LOCAL'
+    constraint.target_space = 'POSE'
+    constraint.mix_mode = 'BEFORE'
     
     # Now set the empty's local transform for offset
-    if transform is not None and not use_world_replace:
+    if transform is not None:
         # Create rotation matrix based on yaw, pitch, roll from transform
         x = radians(_coerce_real(transform.get('Yaw', 0.0), 0.0))
         y = radians(_coerce_real(transform.get('Pitch', 0.0), 0.0))
@@ -1935,15 +1934,17 @@ def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_
         # Combine and set as local transform
         transform_matrix = location @ rotation_matrix @ scale_matrix
 
-        # Apply optional 90-degree compensation (matches rotated bone import)
+        # Convert the authored slot transform into the rotated bone basis.
+        # Applying the correction on the left preserves world placement for
+        # translated slots when Rot90 changes the bone's local axes.
         if rotate_90:
             rot90 = Matrix.Rotation(radians(90 * rotate_90_dir), 4, 'Z')
-            transform_matrix = transform_matrix @ rot90
+            transform_matrix = rot90 @ transform_matrix
 
         empty_obj.matrix_local = transform_matrix
     else:
         # No offset - place at origin (constraint will position it)
-        if rotate_90 and not use_world_replace:
+        if rotate_90:
             empty_obj.matrix_local = Matrix.Rotation(radians(90 * rotate_90_dir), 4, 'Z')
         else:
             empty_obj.matrix_local = Matrix.Identity(4)
@@ -2070,15 +2071,12 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None):
             # Set the empty's position and constrain it with offset
             use_rot90 = False
             rot90_dir = 1
-            use_world_replace = False
             if root_skeleton and root_skeleton.type == 'ARMATURE':
                 rig_settings = root_skeleton.data.witcherui_RigSettings
                 use_rot90 = getattr(rig_settings, "rot90_compensate", False)
                 rot90_dir = 1
-                use_world_replace = not getattr(rig_settings, "rot90_imported", False)
             set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform,
-                                  rotate_90=use_rot90, rotate_90_dir=rot90_dir,
-                                  use_world_replace=use_world_replace)
+                                  rotate_90=use_rot90, rotate_90_dir=rot90_dir)
 
             # Hide by default
             empty_obj.hide_set(True)

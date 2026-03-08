@@ -1805,10 +1805,8 @@ def refresh_slot_constraints(armature):
             
             use_rot90 = get_rig_rot90_enabled(rig_settings, default=False)
             rot90_dir = 1
-            use_world_replace = not use_rot90
             set_empty_bone_offset(slot_empty, target_armature, bone_name, transform_data,
-                                  rotate_90=use_rot90, rotate_90_dir=rot90_dir,
-                                  use_world_replace=use_world_replace)
+                                  rotate_90=use_rot90, rotate_90_dir=rot90_dir)
             updated_count += 1
     
     return updated_count
