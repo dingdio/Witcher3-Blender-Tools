@@ -359,6 +359,12 @@ def unregister():
     if _auto_sync_active_armature_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_auto_sync_active_armature_handler)
 
+    try:
+        from ..importers.import_entity import _unregister_entity_cache_handler
+        _unregister_entity_cache_handler()
+    except Exception:
+        pass
+
     if hasattr(bpy.types.Scene, "witcher_main_armature_explicit_none"):
         del bpy.types.Scene.witcher_main_armature_explicit_none
     if hasattr(bpy.types.Scene, "witcher_main_armature"):

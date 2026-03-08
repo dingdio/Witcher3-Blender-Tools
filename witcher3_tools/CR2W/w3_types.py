@@ -3328,11 +3328,7 @@ class CStorySceneWaypointComponent(CComponent):
 
 def loadJSON(self, args):
     source = args[0]
-    if hasattr(source, "items"):
-        items = source.items()
-    else:
-        items = vars(source).items()
-    for key, value in items:
+    for key, value in source.items():
         setattr(self, key, value)
 
 

@@ -9,6 +9,7 @@ import re
 import bpy
 import numpy as np
 from pathlib import Path
+from bpy.app.handlers import persistent
 
 import addon_utils
 from .. import (
@@ -56,6 +57,30 @@ from math import radians
 #     #return settings.get().repopath+filepath
 addon_name = get_addon_name()
 _ENTITY_RUNTIME_CACHE = {}
+
+
+@persistent
+def _clear_entity_cache_on_load(_filepath=""):
+    """Clear the runtime entity cache whenever a new .blend file is loaded.
+
+    Memory addresses (as_pointer) and Python ids from the old session are
+    meaningless after a file load; clearing here prevents stale cache hits and
+    lets the old Entity objects be garbage-collected.
+    """
+    _ENTITY_RUNTIME_CACHE.clear()
+
+
+def _register_entity_cache_handler():
+    if _clear_entity_cache_on_load not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_clear_entity_cache_on_load)
+
+
+def _unregister_entity_cache_handler():
+    if _clear_entity_cache_on_load in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_clear_entity_cache_on_load)
+
+
+_register_entity_cache_handler()
 
 
 def _norm_redcloth_key_path(value) -> str:
@@ -176,12 +201,24 @@ def NewAnimsetListItem( treeList, path, name):
 
 
 def _rig_settings_cache_key(rig_settings):
+    """Return a stable cache key for rig_settings.
+
+    Uses the owning armature data-block name as the primary key so the key
+    survives undo steps and file reloads (which recreate C pointers).  The
+    pointer is appended as a session-local tiebreaker for the rare case of
+    two data-blocks sharing a name within one session.
+    """
     if rig_settings is None:
         return None
     try:
-        return int(rig_settings.as_pointer())
+        owner_name = rig_settings.id_data.name
     except Exception:
-        return id(rig_settings)
+        owner_name = ""
+    try:
+        ptr = int(rig_settings.as_pointer())
+    except Exception:
+        ptr = id(rig_settings)
+    return (owner_name, ptr)
 
 
 def _json_token(text):
@@ -189,7 +226,10 @@ def _json_token(text):
     return (len(raw_text), hash(raw_text))
 
 
-def _to_plain_data(value, _visited=None):
+_TO_PLAIN_DATA_MAX_DEPTH = 64
+
+
+def _to_plain_data(value, _visited=None, _depth=0):
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, (bytes, bytearray)):
@@ -198,39 +238,45 @@ def _to_plain_data(value, _visited=None):
         return list(value.tobytes())
     if isinstance(value, Path):
         return str(value)
+    if _depth > _TO_PLAIN_DATA_MAX_DEPTH:
+        return None
     if isinstance(value, dict):
         if _visited is None:
             _visited = set()
-        return {key: _to_plain_data(item, _visited) for key, item in value.items()}
+        return {key: _to_plain_data(item, _visited, _depth + 1) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         if _visited is None:
             _visited = set()
-        return [_to_plain_data(item, _visited) for item in value]
+        return [_to_plain_data(item, _visited, _depth + 1) for item in value]
 
+    # item() handler: only attempt if depth budget remains; use current _visited (init if needed)
+    if _visited is None:
+        _visited = set()
     item_getter = getattr(value, "item", None)
     if callable(item_getter):
         try:
-            return _to_plain_data(item_getter(), _visited)
+            inner = item_getter()
+            # Only recurse if the result is a different type (avoids wrapper-producing loops)
+            if type(inner) is not type(value):
+                return _to_plain_data(inner, _visited, _depth + 1)
         except Exception:
             pass
 
-    if _visited is None:
-        _visited = set()
     obj_id = id(value)
     if obj_id in _visited:
         return None
     _visited.add(obj_id)
     try:
         if hasattr(value, "__json_serializable__"):
-            return _to_plain_data(value.__json_serializable__(), _visited)
+            return _to_plain_data(value.__json_serializable__(), _visited, _depth + 1)
         if hasattr(value, "__dict__"):
             return {
-                key: _to_plain_data(item, _visited)
+                key: _to_plain_data(item, _visited, _depth + 1)
                 for key, item in vars(value).items()
             }
         return value
     finally:
-        _visited.remove(obj_id)
+        _visited.discard(obj_id)
 
 
 def _to_json_text(value, default_text="{}", indent=None):
@@ -769,7 +815,11 @@ def try_apply_inventory_file_to_selected_character(context, filename, import_mod
     context = context or bpy.context
     if not filename:
         return False
-    if not can_apply_inventory_to_selected_character(context):
+    try:
+        if not can_apply_inventory_to_selected_character(context):
+            return False
+    except Exception as exc:
+        log.debug("Inventory applicability check failed for %s: %s", filename, exc)
         return False
 
     try:

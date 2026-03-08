@@ -4127,7 +4127,6 @@ def load_template_item(context, armature, slot_index, rig_settings=None):
 
     # Get ALL appearances that use this template from entity data
     try:
-        _cached_entity, _entity_data = import_entity.get_rig_entity_state(rig_settings)
         template_map = build_template_appearance_map(entity)
         template_appearances = template_map.get(slot.template_filename, {}).get('indices', [])
     except Exception:
