@@ -1,0 +1,838 @@
+{
+  "name": "player",
+  "MovingPhysicalAgentComponent": {
+    "skeleton": "characters\\base_entities\\man_base\\man_base.w2rig",
+    "name": "man_base"
+  },
+  "appearances": [
+    {
+      "name": "geralt_player",
+      "includedTemplates": [
+        {
+          "templateFilename": "items\\bodyparts\\geralt_items\\heads\\h_00_mg__geralt.w2ent",
+          "ns": "h_00_mg__geralt",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CMimicComponent",
+              "name": "head",
+              "mimicFace": "characters\\models\\geralt\\head\\model\\h_01_mg__geralt.w3fac"
+            },
+            {
+              "chunkIndex": 3,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 4
+            },
+            {
+              "chunkIndex": 4,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\head\\model\\h_00_mg__geralt.w2mesh",
+              "name": "h_00_mg__geralt"
+            },
+            {
+              "chunkIndex": 9,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 10
+            },
+            {
+              "chunkIndex": 10,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\head\\model\\he_01_mg__geralt.w2mesh",
+              "name": "he_01_mg__geralt"
+            }
+          ]
+        },
+        {
+          "templateFilename": "items\\bodyparts\\geralt_items\\coif\\c_01_mg__witcher.w2ent",
+          "ns": "c_01_mg__witcher",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CAnimDangleComponent",
+              "name": "c_02_mg__half_tail",
+              "constraint": 3
+            },
+            {
+              "chunkIndex": 3,
+              "type": "CAnimDangleConstraint_Dyng",
+              "dyng": "characters\\models\\geralt\\coif\\model\\c_02_mg__half_tail.w3dyng"
+            },
+            {
+              "chunkIndex": 4,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 5
+            },
+            {
+              "chunkIndex": 5,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\coif\\model\\c_02_mg__hair_tie.w2mesh",
+              "name": "c_02_mg__hair_tie"
+            },
+            {
+              "chunkIndex": 6,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 7
+            },
+            {
+              "chunkIndex": 7,
+              "type": "CFurComponent",
+              "mesh": "characters\\models\\geralt\\coif\\model\\c_02_mg__halftail_bangs.w2mesh",
+              "name": ""
+            },
+            {
+              "chunkIndex": 8,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 9
+            },
+            {
+              "chunkIndex": 9,
+              "type": "CFurComponent",
+              "mesh": "characters\\models\\geralt\\coif\\model\\c_02_mg__halftail_crown.w2mesh",
+              "name": ""
+            },
+            {
+              "chunkIndex": 10,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 11
+            },
+            {
+              "chunkIndex": 11,
+              "type": "CFurComponent",
+              "mesh": "characters\\models\\geralt\\coif\\model\\c_02_mg__halftail_long.w2mesh",
+              "name": ""
+            },
+            {
+              "chunkIndex": 12,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 13
+            },
+            {
+              "chunkIndex": 13,
+              "type": "CFurComponent",
+              "mesh": "characters\\models\\geralt\\coif\\model\\c_02_mg__halftail_pony.w2mesh",
+              "name": ""
+            },
+            {
+              "chunkIndex": 14,
+              "type": "CMeshSkinningAttachment",
+              "parent": 2,
+              "child": 15
+            }
+          ]
+        },
+        {
+          "templateFilename": "characters\\models\\geralt\\armor\\armor__viper\\t_01_mg__viper_lvl3_meshes.w2ent",
+          "ns": "t_01_mg__viper_lvl3_meshes",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\t_01_mg__viper.w2mesh",
+              "name": "torso"
+            },
+            {
+              "chunkIndex": 3,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\i_01_mg__viper.w2mesh",
+              "name": "i_01_mg__viper"
+            },
+            {
+              "chunkIndex": 4,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\pendant_01_mg__viper.w2mesh",
+              "name": "pendant_01_mg__viper"
+            },
+            {
+              "chunkIndex": 5,
+              "type": "CAnimDangleComponent",
+              "name": "viper_armour_pendant",
+              "constraint": 7
+            },
+            {
+              "chunkIndex": 6,
+              "type": "CMeshSkinningAttachment",
+              "parent": 5,
+              "child": 4
+            },
+            {
+              "chunkIndex": 7,
+              "type": "CAnimDangleConstraint_Dyng",
+              "dyng": "characters\\models\\geralt\\armor\\armor__viper\\viper_armour_pendant.w3dyng"
+            },
+            {
+              "chunkIndex": 8,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\hook_01_mg__viper.w2mesh",
+              "name": "hook_01_mg__viper"
+            },
+            {
+              "chunkIndex": 9,
+              "type": "CClothComponent",
+              "resource": "characters\\models\\geralt\\armor\\armor__viper\\t_01_mg__viper_cloth_px.redcloth"
+            }
+          ]
+        },
+        {
+          "templateFilename": "characters\\models\\geralt\\armor\\armor__viper\\g_01_mg__viper_lvl3_meshes.w2ent",
+          "ns": "g_01_mg__viper_lvl3_meshes",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\g_01_mg__viper.w2mesh",
+              "name": "gloves"
+            },
+            {
+              "chunkIndex": 3,
+              "type": "CClothComponent",
+              "resource": "characters\\models\\geralt\\armor\\armor__viper\\t_01_mg__viper_cloth2_px.redcloth"
+            }
+          ]
+        },
+        {
+          "templateFilename": "characters\\models\\geralt\\armor\\armor__viper\\l_01_mg__viper_lvl3_meshes.w2ent",
+          "ns": "l_01_mg__viper_lvl3_meshes",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\l_01_mg__viper.w2mesh",
+              "name": "pants"
+            }
+          ]
+        },
+        {
+          "templateFilename": "characters\\models\\geralt\\armor\\armor__viper\\s_01_mg__viper_lvl3_meshes.w2ent",
+          "ns": "s_01_mg__viper_lvl3_meshes",
+          "chunks": [
+            {
+              "chunkIndex": 2,
+              "type": "CMeshComponent",
+              "mesh": "characters\\models\\geralt\\armor\\armor__viper\\s_01_mg__viper.w2mesh",
+              "name": "shoes"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "staticMeshes": {
+    "templateFilename": "staticMeshes",
+    "ns": "staticMeshes",
+    "chunks": [
+      {
+        "chunkIndex": 39,
+        "type": "CAnimatedComponent",
+        "name": "scabbards_skeleton",
+        "skeleton": "characters\\models\\geralt\\scabbards\\model\\scabbards_crossbow.w2rig"
+      },
+      {
+        "tags": null,
+        "transform": null,
+        "transformParent": 41,
+        "guid": {
+          "Type": {
+            "strIdx": {
+              "Index": 68,
+              "String": "guid",
+              "Path": "animations\\man\\dialogs\\man_dialog_additives.w2anims"
+            },
+            "dataType": {
+              "Index": 69,
+              "String": "CGUID",
+              "Path": "animations\\man\\dialogs\\man_dialog_lookats.w2anims"
+            },
+            "name": "guid",
+            "type": "CGUID",
+            "size": 20,
+            "Data": {}
+          },
+          "theName": "guid",
+          "theType": "CGUID",
+          "dataEnd": 760883,
+          "classEnd": 761077,
+          "GUID": {
+            "_guid": null
+          },
+          "lastProp": "",
+          "ElementCounter": 0
+        },
+        "name": "h_mg__neck_transition",
+        "isStreamed": 0,
+        "boundingBox": {
+          "Type": {
+            "strIdx": {
+              "Index": 127,
+              "String": "boundingBox"
+            },
+            "dataType": {
+              "Index": 128,
+              "String": "Box"
+            },
+            "name": "boundingBox",
+            "type": "Box",
+            "size": 125,
+            "Data": {}
+          },
+          "theName": "boundingBox",
+          "theType": "Box",
+          "dataEnd": 761051,
+          "classEnd": 761077,
+          "lastProp": "",
+          "ElementCounter": 0,
+          "More": [
+            {
+              "Type": {
+                "strIdx": {
+                  "Index": 129,
+                  "String": "Min"
+                },
+                "dataType": {
+                  "Index": 130,
+                  "String": "Vector"
+                },
+                "name": "Min",
+                "type": "Vector",
+                "size": 55,
+                "Data": {}
+              },
+              "theName": "Min",
+              "theType": "Vector",
+              "dataEnd": 760990,
+              "classEnd": 761077,
+              "lastProp": "",
+              "ElementCounter": 0,
+              "More": [
+                {
+                  "Type": {
+                    "strIdx": {
+                      "Index": 131,
+                      "String": "X"
+                    },
+                    "dataType": {
+                      "Index": 47,
+                      "String": "Float",
+                      "Path": "gameplay\\behaviors\\pc\\behaviorgraph\\pc_gameplay.w2beh"
+                    },
+                    "name": "X",
+                    "type": "Float",
+                    "size": 8,
+                    "Data": {}
+                  },
+                  "theName": "X",
+                  "theType": "Float",
+                  "dataEnd": 760952,
+                  "classEnd": 761077,
+                  "Value": 2139095039,
+                  "lastProp": "",
+                  "ElementCounter": 0
+                },
+                {
+                  "Type": {
+                    "strIdx": {
+                      "Index": 132,
+                      "String": "Y"
+                    },
+                    "dataType": {
+                      "Index": 47,
+                      "String": "Float",
+                      "Path": "gameplay\\behaviors\\pc\\behaviorgraph\\pc_gameplay.w2beh"
+                    },
+                    "name": "Y",
+                    "type": "Float",
+                    "size": 8,
+                    "Data": {}
+                  },
+                  "theName": "Y",
+                  "theType": "Float",
+                  "dataEnd": 760964,
+                  "classEnd": 761077,
+                  "Value": 2139095039,
+                  "lastProp": "",
+                  "ElementCounter": 0
+                },
+                {
+                  "Type": {
+                    "strIdx": {
+                      "Index": 133,
+                      "String": "Z"
+                    },
+                    "dataType": {
+                      "Index": 47,
+                      "String": "Float",
+                      "Path": "gameplay\\behaviors\\pc\\behaviorgraph\\pc_gameplay.w2beh"
+                    },
+                    "name": "Z",
+                    "type": "Float",
+                    "size": 8,
+                    "Data": {}
+                  },
+                  "theName": "Z",
+                  "theType": "Float",
+                  "dataEnd": 760976,
+                  "classEnd": 761077,
+                  "Value": 2139095039,
+                  "lastProp": "",
+                  "ElementCounter": 0
+                },
+                {
+                  "Type": {
+                    "strIdx": {
+                      "Index": 134,
+                      "String": "W"
+                    },
+                    "dataType": {
+                      "Index": 47,
+                      "String": "Float",
+                      "Path": "gameplay\\behaviors\\pc\\behaviorgraph\\pc_gameplay.w2beh"
+                    },
+                    "name": "W",
+                    "type": "Float",
+                    "size": 8,
+                    "Data": {}
+                  },
+                  "theName": "W",
+                  "theType": "Float",
+                  "dataEnd": 760988,
+                  "classEnd": 761077,
+                  "Value": 1.0,
+                  "lastProp": "",
+                  "ElementCounter": 0
+                }
+              ]
+            },
+            {
+              "Type": {
+                "strIdx": {
+                  "Index": 135,
+                  "String": "Max"
+                },
+                "dataType": {
+                  "Index": 130,
+                  "String": "Vector"
+                },
+                "name": "Max",
+                "type": "Vector",
+                "size": 55,
+                "Data": {}
+              },
+              "theName": "Max",
+              "theType": "Vector",
+              "dataEnd": 761049,
+              "classEnd": 761077,
+              "lastProp": "",
+              "ElementCounter": 0,
+              "More": [
+                {
+                  "Type": {
+                    "strIdx": {
+                      "Index": 131,
+                      "String": "X"
+                    },
+                    "dataType": {
+                      "Index": 47,
+                      "String": "Float",
+                      "Path": "gameplay\\behaviors\\pc\\behaviorgraph\\pc_gameplay.w2beh"
+                    },
+                    "name": "X",
+                    "type": "Float",
+                    "size": 8,
+                    "Data": {}
+                  },
+                  "theName": "X",
+                  "theType": "Float",
+                  "dataEnd": 761011,
+                  "classEnd": 761077,
+                  "Value": 2147483647,
+                  "lastProp": "",
+                  "ElementCounter": 0
+                },
+                {
+                  "Type": {
+                    "strIdx": {
+                      "Index": 132,
+                      "String": "Y"
+                    },
+                    "dataType": {
+                      "Index": 47,
+                      "String": "Float",
+                      "Path": "gameplay\\behaviors\\pc\\behaviorgraph\\pc_gameplay.w2beh"
+                    },
+                    "name": "Y",
+                    "type": "Float",
+                    "size": 8,
+                    "Data": {}
+                  },
+                  "theName": "Y",
+                  "theType": "Float",
+                  "dataEnd": 761023,
+                  "classEnd": 761077,
+                  "Value": 2147483647,
+                  "lastProp": "",
+                  "ElementCounter": 0
+                },
+                {
+                  "Type": {
+                    "strIdx": {
+                      "Index": 133,
+                      "String": "Z"
+                    },
+                    "dataType": {
+                      "Index": 47,
+                      "String": "Float",
+                      "Path": "gameplay\\behaviors\\pc\\behaviorgraph\\pc_gameplay.w2beh"
+                    },
+                    "name": "Z",
+                    "type": "Float",
+                    "size": 8,
+                    "Data": {}
+                  },
+                  "theName": "Z",
+                  "theType": "Float",
+                  "dataEnd": 761035,
+                  "classEnd": 761077,
+                  "Value": 2147483647,
+                  "lastProp": "",
+                  "ElementCounter": 0
+                },
+                {
+                  "Type": {
+                    "strIdx": {
+                      "Index": 134,
+                      "String": "W"
+                    },
+                    "dataType": {
+                      "Index": 47,
+                      "String": "Float",
+                      "Path": "gameplay\\behaviors\\pc\\behaviorgraph\\pc_gameplay.w2beh"
+                    },
+                    "name": "W",
+                    "type": "Float",
+                    "size": 8,
+                    "Data": {}
+                  },
+                  "theName": "W",
+                  "theType": "Float",
+                  "dataEnd": 761047,
+                  "classEnd": 761077,
+                  "Value": 1.0,
+                  "lastProp": "",
+                  "ElementCounter": 0
+                }
+              ]
+            }
+          ]
+        },
+        "drawableFlags": null,
+        "lightChannels": null,
+        "renderingPlane": null,
+        "forceLODLevel": null,
+        "forceAutoHideDistance": null,
+        "shadowImportanceBias": null,
+        "defaultEffectParams": null,
+        "defaultEffectColor": null,
+        "mesh": "characters\\models\\geralt\\head\\model\\h_mg__neck_transition.w2mesh",
+        "type": "CMeshComponent",
+        "chunkIndex": 42
+      },
+      {
+        "skeleton": "characters\\base_entities\\man_base\\man_base.w2rig",
+        "name": "man_base",
+        "type": "CMovingPhysicalAgentComponent",
+        "chunkIndex": 13
+      },
+      {
+        "parent": 13,
+        "child": 12,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": null,
+        "attachmentFlags": null,
+        "parentSlot": null,
+        "type": "CHardAttachment",
+        "chunkIndex": 14
+      },
+      {
+        "parent": 13,
+        "child": 16,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": "torso3",
+        "attachmentFlags": null,
+        "parentSlot": 17,
+        "type": "CHardAttachment",
+        "chunkIndex": 15
+      },
+      {
+        "chunkIndex": 17,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 12
+      },
+      {
+        "parent": 13,
+        "child": 19,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": null,
+        "attachmentFlags": null,
+        "parentSlot": null,
+        "type": "CHardAttachment",
+        "chunkIndex": 18
+      },
+      {
+        "parent": 13,
+        "child": 21,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": "l_shin",
+        "attachmentFlags": null,
+        "parentSlot": 22,
+        "type": "CHardAttachment",
+        "chunkIndex": 20
+      },
+      {
+        "chunkIndex": 22,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 16
+      },
+      {
+        "parent": 13,
+        "child": 24,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": "r_shin",
+        "attachmentFlags": null,
+        "parentSlot": 25,
+        "type": "CHardAttachment",
+        "chunkIndex": 23
+      },
+      {
+        "chunkIndex": 25,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 19
+      },
+      {
+        "parent": 13,
+        "child": 27,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": "torso",
+        "attachmentFlags": null,
+        "parentSlot": 28,
+        "type": "CHardAttachment",
+        "chunkIndex": 26
+      },
+      {
+        "chunkIndex": 28,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 10
+      },
+      {
+        "parent": 13,
+        "child": 30,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": "r_forearm",
+        "attachmentFlags": null,
+        "parentSlot": 31,
+        "type": "CHardAttachment",
+        "chunkIndex": 29
+      },
+      {
+        "chunkIndex": 31,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 29
+      },
+      {
+        "parent": 13,
+        "child": 33,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": "l_forearm",
+        "attachmentFlags": null,
+        "parentSlot": 34,
+        "type": "CHardAttachment",
+        "chunkIndex": 32
+      },
+      {
+        "chunkIndex": 34,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 23
+      },
+      {
+        "chunkIndex": 35,
+        "type": "CAnimatedAttachment",
+        "parent": 13,
+        "child": 36
+      },
+      {
+        "chunkIndex": 36,
+        "type": "CAnimDangleComponent",
+        "name": "CAnimDangleComponent0",
+        "constraint": 37
+      },
+      {
+        "chunkIndex": 37,
+        "type": "CAnimDangleConstraint_Dyng",
+        "skeleton": null,
+        "dyng": "characters\\models\\geralt\\coif\\model\\c_02_mg__half_tail.w3dyng"
+      },
+      {
+        "parent": 13,
+        "child": 39,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": "torso3",
+        "attachmentFlags": null,
+        "parentSlot": 40,
+        "type": "CHardAttachment",
+        "chunkIndex": 38
+      },
+      {
+        "chunkIndex": 40,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 12
+      },
+      {
+        "chunkIndex": 41,
+        "type": "CMeshSkinningAttachment",
+        "parent": 13,
+        "child": 42
+      },
+      {
+        "parent": 13,
+        "child": 44,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": "torso3",
+        "attachmentFlags": null,
+        "parentSlot": 45,
+        "type": "CHardAttachment",
+        "chunkIndex": 43
+      },
+      {
+        "chunkIndex": 45,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 12
+      },
+      {
+        "parent": 13,
+        "child": 47,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": "torso3",
+        "attachmentFlags": null,
+        "parentSlot": 48,
+        "type": "CHardAttachment",
+        "chunkIndex": 46
+      },
+      {
+        "chunkIndex": 48,
+        "type": "CSkeletonBoneSlot",
+        "boneIndex": 12
+      },
+      {
+        "parent": 13,
+        "child": 50,
+        "isBroken": null,
+        "relativeTransform": null,
+        "parentSlotName": null,
+        "attachmentFlags": null,
+        "parentSlot": null,
+        "type": "CHardAttachment",
+        "chunkIndex": 49
+      }
+    ]
+  },
+  "CAnimAnimsetsParam": [
+    {
+      "name": "geralt",
+      "animationSets": [
+        "animations\\interaction\\boat\\boat_geralt_sailor.w2anims",
+        "animations\\man\\movement\\man_geralt_exploration.w2anims",
+        "animations\\man\\movement\\man_movement_prototype.w2anims",
+        "animations\\interaction\\horse_draft\\horse_draft_geralt_rider.w2anims",
+        "animations\\man\\combat\\man_geralt_sword.w2anims",
+        "animations\\man\\inventory\\geralt_inventory_gui_animation.w2anims",
+        null,
+        "animations\\interaction\\mini_games\\drinking_game\\drinking_game.w2anims",
+        "animations\\man\\movement\\man_geralt_swimming.w2anims",
+        "animations\\man\\movement\\man_geralt_movement.w2anims",
+        "animations\\interaction\\environment\\man_meditation.w2anims",
+        "animations\\interaction\\environment\\man_geralt_focus.w2anims",
+        "animations\\man\\combat\\man_geralt_sword_locomotion.w2anims",
+        "animations\\man\\combat\\man_fistfight.w2anims",
+        "animations\\man\\combat\\man_longsword.w2anims",
+        "animations\\man\\community\\man_work.w2anims",
+        "animations\\interaction\\environment\\man_geralt_carry_item.w2anims",
+        "animations\\man\\combat\\man_geralt_gabriel.w2anims",
+        "animations\\man\\combat\\man_geralt_petard.w2anims",
+        "animations\\interaction\\finishers\\geralt_finishers.w2anims",
+        "animations\\man\\combat\\man_geralt_horse_combat.w2anims",
+        "animations\\interaction\\horse_draft\\man_horse_sword.w2anims",
+        "animations\\man\\combat\\man_geralt_signs.w2anims",
+        "animations\\interaction\\environment\\man_geralt_switch.w2anims",
+        "animations\\man\\quest\\q602_geralt_salsa_dancing.w2anims",
+        "animations\\man\\quest\\q602_geralt_ghost.w2anims",
+        "animations\\man\\combat\\man_geralt_tornado.w2anims"
+      ]
+    },
+    {
+      "name": "scabbards",
+      "animationSets": [
+        "animations\\items\\weapon\\witcher_scabbards.w2anims"
+      ]
+    },
+    {
+      "name": "man_dialog",
+      "animationSets": [
+        "animations\\man\\dialogs\\man_dialog_sitting_table.w2anims",
+        "animations\\man\\dialogs\\man_dialog_standing.w2anims",
+        "animations\\man\\quest\\man_quest.w2anims",
+        "animations\\man\\dialogs\\man_dialog_standing_to_standing.w2anims",
+        "animations\\man\\dialogs\\man_dialog_standing_leaning.w2anims",
+        "animations\\man\\dialogs\\man_dialog_sitting.w2anims",
+        "animations\\man\\dialogs\\man_dialog_item_interaction.w2anims",
+        "animations\\man\\dialogs\\man_dialog_standing_leaning_back.w2anims",
+        "animations\\man\\dialogs\\man_dialog_gameplay_recompress.w2anims",
+        "animations\\man\\dialogs\\man_dialog_kneeling.w2anims",
+        "animations\\man\\dialogs\\man_dialog_additives.w2anims",
+        "animations\\man\\dialogs\\man_dialog_lookats.w2anims",
+        "animations\\man\\dialogs\\man_dialog_sitting_ground.w2anims",
+        "animations\\man\\dialogs\\man_dialog_lying.w2anims",
+        "animations\\man\\dialogs\\man_dialog_locomotion.w2anims",
+        "animations\\man\\dialogs\\ep1_man_dialog_animation.w2anims"
+      ]
+    }
+  ],
+  "CAnimMimicParam": [
+    [
+      {
+        "name": "MimicSets",
+        "animationSets": [
+          "animations\\mimics\\geralt_mimic_animation.w2anims",
+          "animations\\mimics\\geralt_mimic_layers.w2anims",
+          "animations\\mimics\\geralt_mimic_inventory.w2anims",
+          "animations\\mimics\\gameplay_geralt_high_mimic_animation.w2anims",
+          "animations\\mimics\\ep1_geralt_mimic_animation.w2anims"
+        ]
+      },
+      {
+        "name": "MimicSets",
+        "animationSets": [
+          "animations\\mimics\\man_mimic_animation.w2anims",
+          "animations\\mimics\\man_mimic_layers.w2anims",
+          "animations\\mimics\\gameplay_man_mimic_animation.w2anims"
+        ]
+      }
+    ]
+  ],
+  "coloringEntries": []
+}

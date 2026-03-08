@@ -1,0 +1,322 @@
+{
+    "_comment": "Copy this file to dev_config.json and fill in your local paths. Set dev_mode_enabled=false to hard-disable all dev UI and overrides.",
+    "dev_mode_enabled": false,
+    "addon_prefs_defaults": {
+        "witcher_game_path": "",
+        "witcher2_game_path": "",
+        "wolvenkit": "",
+        "mod_directory": "",
+        "redkit_depot_path": "",
+        "redkit_uncooked_path": "",
+        "fbx_uncook_path": "",
+        "w2_unbundle_path": "",
+        "tex_mod_uncook_path": "",
+        "W3_FOLIAGE_PATH": "",
+        "W3_REDCLOTH_PATH": "",
+        "W3_REDFUR_PATH": "",
+        "W3_VOICE_PATH": "",
+        "W3_OGG_PATH": ""
+    },
+    "dev_panel_overrides": {
+        "fallback_game_path": "",
+        "fallback_fbx_uncook_path": "",
+        "fallback_uncook_path_w3": "",
+        "fallback_w2_data_path": "",
+        "fallback_voice_path": "",
+        "fallback_ogg_path": ""
+    },
+    "redkit_projects": [],
+    "test_paths": {
+        "w2mesh": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Example Meshes",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add your .w2mesh paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "nxs": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Collision Files",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add your .nxs paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "apx": {
+            "enabled": false,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Redcloth Files",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add your .redcloth paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "w2ent_chara": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Character Entities",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add character .w2ent paths here (e.g. ciri.w2ent)"
+                        }
+                    ]
+                }
+            ]
+        },
+        "w2ent": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Item/Prop Entities",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add item/prop .w2ent paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "w2anims": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Animation Sets",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add your .w2anims paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "w2rig": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Rigs",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add your .w2rig paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "w2l": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Layers",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add your .w2l paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "w2w": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Worlds",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add your .w2w paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "w2scene": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Scenes",
+                    "paths": []
+                }
+            ]
+        },
+        "w2cutscene": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Cutscenes",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add your .w2cutscene paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "w2mi": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Material Instances",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add your .w2mi paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "w2mg": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Material Shaders",
+                    "paths": []
+                }
+            ]
+        },
+        "xbm": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Textures",
+                    "paths": [
+                        {
+                            "path": "",
+                            "note": "Add your .xbm paths here"
+                        }
+                    ]
+                }
+            ]
+        },
+        "w2cube": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Cubemaps",
+                    "paths": []
+                }
+            ]
+        },
+        "inventory": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Inventory Files",
+                    "paths": []
+                }
+            ]
+        },
+        "w3app": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Appearances",
+                    "paths": []
+                }
+            ]
+        },
+        "fbx": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "FBX Files",
+                    "paths": []
+                }
+            ]
+        },
+        "voice": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Voice/Lipsync Files",
+                    "paths": []
+                }
+            ]
+        },
+        "flyr": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Foliage Files",
+                    "paths": []
+                }
+            ]
+        },
+        "srt": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "SpeedTree Files",
+                    "paths": []
+                }
+            ]
+        }
+    }
+}

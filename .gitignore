@@ -1,17 +1,12 @@
 *.pyc
 .vscode/*
-
-# Local History for Visual Studio Code
 .history/
 qt/*
+witcher3_tools/.vscode/
+witcher3_tools/.venv/
+__pycache__/
+DEV_STUFF/
 TEMP/
-io_import_w2l/test.py
-io_import_w2l/.vscode/
-io_import_w2l/TEMP_PATHS.py
-io_import_w2l/JSON_EXPORT_TEMP/
-LINKS/
-witcher_texture/
-Cache/
-io_import_w2l/blender_render.log
-io_import_w2l/CR2W/W3Strings/string_cache.json
-io_import_w2l/temp_json/
+
+# Machine-specific dev config
+witcher3_tools/dev/dev_config.json

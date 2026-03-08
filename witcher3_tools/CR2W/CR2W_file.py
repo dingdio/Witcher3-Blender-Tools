@@ -1,0 +1,462 @@
+import logging
+import os
+from pathlib import Path
+from .third_party_libs import yaml
+from .common_blender import repo_file
+from ..extension_paths import get_dev_override
+log = logging.getLogger(__name__)
+import io
+
+from .bin_helpers import (ReadUlong48, readUShort,
+                        readFloat,
+                        ReadFloat24,
+                        ReadFloat16)
+
+from .CR2W_types import ( Entity_Type_List, getCR2W, W_CLASS )
+
+from .bStream import *
+
+class ReadCompressFloat():
+    def __init__(self, f, compression):
+        val = 0;
+        if (compression == 0):
+            val = readFloat(f)
+        if (compression == 1):
+            val = ReadFloat24(f)
+        if (compression == 2):
+            val = ReadFloat16(f)
+        self.val = val
+
+class LayerGroup(object):
+    yaml_loader = yaml.SafeLoader
+    yaml_tag = u'!LayerGroup'
+
+    def __init__(self, name = "GROUP_NAME"):
+        self.name = name
+        self.ChildrenGroups = []
+        self.ChildrenInfos = []
+
+
+class CLayerInfo(object):
+    def __init__(self, name = "", depotFilePath = "", layerBuildTag = ""):
+        self.name = name
+        self.depotFilePath = depotFilePath
+        self.layerBuildTag = layerBuildTag # enumb check wolvenkit fix in _types
+
+class WORLD:
+    def __init__(self):
+        self.worldName = "WORLD_NAME"
+        self.terrainClipMap = None
+        self.tileRes:int = 256
+        self.clipSize:int = 0
+        self.clipmapSize:int = 0
+        self.terrainSize:float = 2000
+        self.lowestElevation:float = 0
+        self.highestElevation:float = 100
+        self.groups = []
+
+def write_yml(world, output_path=None):
+    if output_path is None:
+        output_path = get_dev_override("cr2w_write_yml_output", "")
+    if not output_path:
+        raise RuntimeError("No output path provided for write_yml")
+
+    with open(output_path, "w") as f:
+
+        # layerName = 'architecture'
+        # worldName = world.worldName
+        # dict = {}
+        # dict['layers'] = {}
+        # dict['layers'][layerName] = {}
+        # dict['layers'][layerName]['statics'] = {}
+        # dict['layers'][layerName]['statics']
+        # dict['layers'][layerName]["world"] = worldName
+        # for group in world.groups:
+        #     dict['layers'][layerName]['statics'][group.name] = {}
+        #     dict['layers'][layerName]['statics'][group.name]['.type'] = "CEntity"
+        #     dict['layers'][layerName]['statics'][group.name]['path'] = r"<depot/path/to/file>"
+        # yaml.dump(dict, f, indent=None)
+        yaml.dump(world, f, indent=None, default_flow_style=False)
+
+def getChildrenInfos(info, CHUNKS):
+    tag = info.GetVariableByName('layerBuildTag')
+    if tag:
+        layerBuildTag = info.GetVariableByName('layerBuildTag').Index.String
+    else:
+        layerBuildTag = None
+    name = info.GetVariableByName('shortName')
+    if name:
+        shortName = info.GetVariableByName('shortName').String.String
+    else:
+        shortName = None
+    if info.GetVariableByName('depotFilePath'):
+        depotFilePath = info.GetVariableByName('depotFilePath').String.String
+    else:
+        depotFilePath = "ERROR"
+    info_obj = CLayerInfo(shortName,depotFilePath, layerBuildTag)
+    return info_obj
+
+def getChildrenGroups(group, CHUNKS):
+    groupName = group.GetVariableByName('name').String.String
+    group_obj = LayerGroup(groupName)
+    if group.ChildrenGroups:
+        for ChildGroup in group.ChildrenGroups:
+            group_obj.ChildrenGroups.append(getChildrenGroups(ChildGroup.GetRef(CHUNKS), CHUNKS))
+    if group.ChildrenInfos:
+        for ChildInfo in group.ChildrenInfos:
+            group_obj.ChildrenInfos.append(getChildrenInfos(ChildInfo.GetRef(CHUNKS), CHUNKS))
+    return group_obj
+
+def create_world(file):
+
+    world = WORLD()
+    CHUNKS = file.CHUNKS.CHUNKS
+    for chunk in CHUNKS:
+        if chunk.name == "CGameWorld":
+            CGameWorld:W_CLASS = chunk
+    firstLayer = CHUNKS[CGameWorld.Firstlayer.Reference]
+    
+    world.terrainClipMap = CHUNKS[CGameWorld.GetVariableByName('terrainClipMap').Value-1]
+    clip_size = world.terrainClipMap.GetVariableByName('clipSize')
+    if clip_size:
+        world.clipSize = clip_size.Value
+    clipmap_size = world.terrainClipMap.GetVariableByName('clipmapSize')
+    if not clipmap_size:
+        clipmap_size = world.terrainClipMap.GetVariableByName('clipMapSize')
+    if clipmap_size:
+        world.clipmapSize = clipmap_size.Value
+    world.tileRes:int = world.terrainClipMap.GetVariableByName('tileRes').Value
+    world.terrainSize:float = world.terrainClipMap.GetVariableByName('terrainSize').Value
+    world.lowestElevation:float = world.terrainClipMap.GetVariableByName('lowestElevation').Value
+    world.highestElevation:float = world.terrainClipMap.GetVariableByName('highestElevation').Value
+    
+    world.groups = getChildrenGroups(firstLayer, CHUNKS)
+    world.worldName = world.groups.name
+    # for ChildGroup in firstLayer.ChildrenGroups:
+    #     groupName = ChildGroup.GetRef(CHUNKS).GetVariableByName('name').String.String
+    #     print(groupName);
+    #     world.groups.append(LayerGroup(groupName))
+    return world
+
+#Top level entity of a file. Represents Clayer or CEntityTemplate
+class LEVEL():
+    def __init__(self):
+        self.layerNode = "LEVEL_NAME"
+        self.CSectorData = {}
+        self.Entities = []
+        self.includes = []
+        self.Foliage = False
+        self.type = "Clayer"
+
+class CLayerInfo(object):
+    def __init__(self, name = "", depotFilePath = "", layerBuildTag = ""):
+        self.name = name
+        self.depotFilePath = depotFilePath
+        self.layerBuildTag = layerBuildTag # enumb check wolvenkit fix in _types
+
+class CEntity():
+    def __init__(self):
+        self.name = "CEntity"
+        self.type = "CEntity"
+        self.transform = False
+        self.template = False
+        self.templatePath = False
+        self.Components = []
+        self.BufferV1 = False
+        self.BufferV2 = False
+        self.isCreatedFromTemplate = False
+        self.streamingDataBuffer = False
+
+    def show(self):
+        log.debug("Inside Parent")
+
+class CGameplayEntity(CEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CGameplayEntity"
+        self.type = "CGameplayEntity"
+
+    def show(self):
+        super().show()
+
+class CItemEntity(CEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CItemEntity"
+        self.type = "CItemEntity"
+
+    def show(self):
+        super().show()
+        
+        
+class CWitcherSword(CEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CWitcherSword"
+        self.type = "CWitcherSword"
+
+    def show(self):
+        super().show()
+
+
+class Crossbow(CEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "Crossbow"
+        self.type = "Crossbow"
+
+    def show(self):
+        super().show()
+
+
+class CWitcherJacket(CItemEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CWitcherJacket"
+        self.type = "CWitcherJacket"
+
+    def show(self):
+        super().show()
+
+
+class CWitcherPants(CItemEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CWitcherPants"
+        self.type = "CWitcherPants"
+
+    def show(self):
+        super().show()
+
+
+class CWitcherBoots(CItemEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CWitcherBoots"
+        self.type = "CWitcherBoots"
+
+    def show(self):
+        super().show()
+
+#Actor Entities
+class CActor(CGameplayEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CActor"
+        self.type = "CActor"
+
+    def show(self):
+        super().show()
+        
+class CNewNPC(CActor):
+    def __init__(self):
+        super().__init__()
+        self.name = "CNewNPC"
+        self.type = "CNewNPC"
+
+    def show(self):
+        super().show()
+        
+class CPlayer(CActor):
+    def __init__(self):
+        super().__init__()
+        self.name = "CPlayer"
+        self.type = "CPlayer"
+
+    def show(self):
+        super().show()
+
+#Container Entities
+class W3LockableEntity(CGameplayEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "W3LockableEntity"
+        self.type = "W3LockableEntity"
+
+    def show(self):
+        super().show()
+
+class W3Container(W3LockableEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "W3Container"
+        self.type = "W3Container"
+
+    def show(self):
+        super().show()
+
+class W3AnimatedContainer(W3Container):
+    def __init__(self):
+        super().__init__()
+        self.name = "W3AnimatedContainer"
+        self.type = "W3AnimatedContainer"
+
+    def show(self):
+        super().show()
+
+#DOOR ENTITIES
+class W3LockableEntity(CGameplayEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "W3LockableEntity"
+        self.type = "W3LockableEntity"
+
+    def show(self):
+        super().show()
+
+class W3NewDoor(W3LockableEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "W3NewDoor"
+        self.type = "W3NewDoor"
+
+    def show(self):
+        super().show()
+
+## WITCHER 2 Classes
+#CDoor
+#CContainer
+
+class CDoor(W3LockableEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "W3NewDoor"
+        self.type = "W3NewDoor"
+
+    def show(self):
+        super().show()
+
+class CContainer(W3LockableEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CContainer"
+        self.type = "CContainer"
+
+    def show(self):
+        super().show()
+
+class CActionPoint(W3LockableEntity):
+    def __init__(self):
+        super().__init__()
+        self.name = "CActionPoint"
+        self.type = "CActionPoint"
+
+    def show(self):
+        super().show()
+
+
+from . import CR2W_file
+
+def create_level(file, filename):
+    level = LEVEL()
+    level.layerNode = filename
+    CHUNKS = file.CHUNKS.CHUNKS
+    CSectorData =  False
+    Entities = []
+    level.name = CHUNKS[0].name
+    level.type = CHUNKS[0].name
+
+    #only create a LEVEL for these types otherwise return entire file
+    top_level_list = [ "CLayer", "CEntityTemplate", "CFoliageResource" ]
+    if level.type not in top_level_list:
+        return file
+        
+    for chunk in CHUNKS:
+        if chunk.name == "CFoliageResource":
+            level.Foliage = chunk
+            
+        if chunk.name == "CEntityTemplate":
+            includes = chunk.GetVariableByName('includes')
+            if includes and hasattr(includes, 'Handles'): #!TODO witcher2 includes
+                for include in includes.Handles:  ## array:2,0,#CEntityTemplate WITCHER2
+                    try:
+                        include_path = getattr(include, "DepotPath", None)
+                        if not include_path:
+                            continue
+                        fileName = repo_file(include_path, file.HEADER.version)
+                        CR2WFile = read_CR2W(fileName)
+                        entity = create_level(CR2WFile, fileName)
+                        level.includes.append(entity)
+                    except Exception as e:
+                        log.exception("Problem Importing an include")
+        if chunk.name == "CSectorData":
+            CSectorData = chunk
+        if chunk.name in Entity_Type_List:
+            try:
+                class_ = getattr(CR2W_file, chunk.name)
+            except Exception as e:
+                log.critical(f'Found undefined entity class "{chunk.name}", skipping')
+                #raise e
+                continue
+            Entity = class_()
+            Entity.name = chunk.get_name_prop_string()
+            if chunk.GetVariableByName('transform'):
+                Entity.transform = chunk.GetVariableByName('transform').EngineTransform
+            #each transform should have it's own equlivant blender object.
+            if hasattr(chunk, "isCreatedFromTemplate") and chunk.isCreatedFromTemplate:
+                Entity.BufferV2 = chunk.BufferV2
+                Entity.isCreatedFromTemplate = chunk.isCreatedFromTemplate
+                #broken template? Need to read include files if can't find mesh buffer?
+                if chunk.Template.Handles[0].DepotPath == r"gameplay\containers\new_locations\novigrad\indoors\average\simple_dresser_table.w2ent":
+                    chunk.Template.Handles[0].DepotPath = r"environment\decorations\containers\dressers\simple_dresser\simple_dresser_table.w2ent"
+                template_path = getattr(chunk.Template.Handles[0], "DepotPath", None)
+                if not template_path:
+                    continue
+                fileName = repo_file(template_path, file.HEADER.version)
+                CR2WFile = read_CR2W(fileName)
+                entity = create_level(CR2WFile, fileName)
+                Entity.template = entity
+                Entity.templatePath = template_path
+                Entities.append(Entity)
+            else:
+                # Entity chunk has no Template handle — occurs with inline/streamed entities
+                # (e.g. CWitcherSword, Crossbow). Read from streamingDataBuffer instead.
+                if chunk.GetVariableByName('streamingDataBuffer'):
+                    Bufferdata = chunk.GetVariableByName('streamingDataBuffer').Bufferdata
+                    f = bStream(data = bytearray(Bufferdata.Bytes))
+                    f.name = "DATA_BUFFER"
+                    bufferedCR2W = getCR2W(f)
+                    entity = create_level(bufferedCR2W, chunk.name)
+                    Entity.streamingDataBuffer = entity
+                    if Entity.name == Entity.type:
+                        try:
+                            if Entity.streamingDataBuffer.CHUNKS.CHUNKS[0].Type == 'CClothComponent':
+                                Entity.name = Path(Entity.streamingDataBuffer.CHUNKS.CHUNKS[0].GetVariableByName('resource').Handles[0].DepotPath).stem
+                                Entity.name += f" ({Entity.type}) (CClothComponent)"
+                            else:
+                                Entity.name = Path(Entity.streamingDataBuffer.CHUNKS.CHUNKS[0].GetVariableByName('mesh').Handles[0].DepotPath).stem
+                                Entity.name += f" ({Entity.type})"
+                        except Exception as e:
+                            log.warn(e)
+                try:
+                    if hasattr(chunk, 'Components'):
+                        for chunk_id in chunk.Components:
+                            sub_chunk  = CHUNKS[chunk_id-1]
+                            if sub_chunk.name == "CPointLightComponent":
+                                Entity.Components.append(sub_chunk)
+                            elif sub_chunk.name == "CSpotLightComponent":
+                                Entity.Components.append(sub_chunk)
+                            elif sub_chunk.name == "CMeshComponent":
+                                Entity.Components.append(sub_chunk)
+                            elif sub_chunk.name == "CStaticMeshComponent":
+                                Entity.Components.append(sub_chunk)
+                            elif sub_chunk.name == "CAreaComponent":
+                                Entity.Components.append(sub_chunk)
+                            elif sub_chunk.name == "CWaterComponent":
+                                Entity.Components.append(sub_chunk)
+                except Exception as e:
+                    pass#raise e
+                Entities.append(Entity)
+    level.CSectorData = CSectorData
+    level.Entities = Entities
+
+    return level
+
+def read_CR2W(filename): #lipsync load face first
+    with open(filename,"rb") as f:
+        theFile = getCR2W(f)
+        f.close()
+    # f = bStream(path = filename)
+    # theFile = getCR2W(f)
+    # f.close()
+    return theFile

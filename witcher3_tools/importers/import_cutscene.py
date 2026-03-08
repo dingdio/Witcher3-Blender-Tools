@@ -1,0 +1,64 @@
+import os
+import json
+from .. import get_uncook_path
+from ..CR2W import read_json_w3
+from ..CR2W import w3_types
+from ..importers import import_entity
+from ..CR2W.dc_anims import load_bin_cutscene
+from ..CR2W.common_blender import repo_file
+
+def loadCutsceneFile(filename):
+    dirpath, file = os.path.split(filename)
+    basename, ext = os.path.splitext(file)
+    if ext.lower() in ('.json'):
+        with open(filename) as file:
+            return read_json_w3.Read_CCutsceneTemplate(json.loads(file.read()))
+    elif ext.lower().endswith('.w2cutscene'):
+        return load_bin_cutscene(filename)
+    else:
+        return None
+
+import bpy
+from .import_anims import NewW2ANIMSListItem#, set_global_set #!USE NEW METHOD
+
+def check_if_actor_already_in_scene(repo_path):
+    for o in bpy.context.scene.objects:
+        if o.type != 'ARMATURE':
+            continue
+        if len(o.name) > 4 and o.name[-4] != "." and o.data.witcherui_RigSettings.repo_path == repo_path:
+            return o
+    return False
+
+def import_w3_cutscene(filename):
+    CCutsceneTemplate = loadCutsceneFile(filename)
+    context = bpy.context
+    treeList = context.scene.witcher_w2cutscene_list
+    treeList.clear()
+    context.scene.witcher_loaded_w2cutscene_path = filename
+    #set_global_set(CCutsceneTemplate)
+    for node in CCutsceneTemplate.animations:
+        item = NewW2ANIMSListItem(treeList, node)
+    
+    #check if user wants to import actors
+    #TODO new property group for all cutscene data??
+    actor:w3_types.SCutsceneActorDef
+    for actor in CCutsceneTemplate.SCutsceneActorDefs:
+        actor.useMimic = False
+        #!find actor in scene
+        #!if not actor import actor
+        #!apply stuff like voice tags etc.
+        
+        #? make sure to duplicate the template if there are multiple in scene and apply unique tags
+        actor_obj = check_if_actor_already_in_scene(actor.template)
+        if not actor_obj:
+            import_entity.import_ent_template(repo_file(actor.template), load_face_poses=actor.useMimic)
+            #if not apperance import and apply apperance
+
+        # if actor.name == "trajectories":
+        #     actor_obj = False #check_if_actor_already_in_scene(actor.template)
+        #     if not actor_obj and actor.name == "trajectories":
+        #         import_entity.import_ent_template(get_uncook_path(bpy.context)+'\\'+actor.template, load_face_poses=actor.useMimic)
+        #!if usemimic check and load face morphs
+
+    return CCutsceneTemplate
+

@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+id = "witcher3_tools"
+version = "1.0.1"
+name = "Witcher 3 Tools"
+tagline = "Import and export Witcher assets"
+maintainer = "Dingdio"
+type = "add-on"
+blender_version_min = "4.5.0"
+license = ["SPDX:GPL-3.0-or-later"]
+website = "https://github.com/dingdio/Witcher3_Blender_Tools"
+wheels = [
+  "wheels/cramjam-2.8.1-cp310-none-win_amd64.whl",
+  "wheels/cramjam-2.8.1-cp311-none-win_amd64.whl",
+]
+
+[permissions]
+files = "Read game data and write caches/exports"

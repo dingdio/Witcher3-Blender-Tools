@@ -1,0 +1,132 @@
+{
+  "_extension": "",
+  "_imports": [],
+  "_properties": [
+    {
+      "Property": {
+        "className": 0,
+        "classFlags": 0,
+        "propertyName": 0,
+        "propertyFlags": 0,
+        "hash": 0
+      }
+    }
+  ],
+  "_buffers": [],
+  "_embedded": [],
+  "_chunks": {
+    "CSkeleton #0": {
+      "_key": "CSkeleton #0",
+      "_parentKey": "",
+      "_flags": 8192,
+      "_unknownBytes": null,
+      "_vars": {
+        "bones": {
+          "_bufferPadding": null,
+          "_elements": [
+            {
+              "_vars": {
+                "name": {
+                  "_value": "Root",
+                  "_type": "StringAnsi"
+                },
+                "nameAsCName": {
+                  "_value": "Root",
+                  "_type": "CName"
+                }
+              },
+              "_type": "SSkeletonBone"
+            }
+          ],
+          "_type": "array:2,0,SSkeletonBone"
+        },
+        "parentIndices": {
+          "_bufferPadding": null,
+          "_elements": [
+            {
+              "_value": -1,
+              "_type": "Int16"
+            }
+          ],
+          "_type": "array:2,0,Int16"
+        },
+        "rigdata": {
+          "_bufferPadding": null,
+          "_elements": [
+            {
+              "_vars": {
+                "Position": {
+                  "_vars": {
+                    "X": {
+                      "_value": 0.0,
+                      "_type": "Float"
+                    },
+                    "Y": {
+                      "_value": 0.0,
+                      "_type": "Float"
+                    },
+                    "Z": {
+                      "_value": 0.0,
+                      "_type": "Float"
+                    },
+                    "W": {
+                      "_value": 1.0,
+                      "_type": "Float"
+                    }
+                  },
+                  "_type": "SVector4D"
+                },
+                "Rotation": {
+                  "_vars": {
+                    "X": {
+                      "_value": 0.0,
+                      "_type": "Float"
+                    },
+                    "Y": {
+                      "_value": 0.0,
+                      "_type": "Float"
+                    },
+                    "Z": {
+                      "_value": 0.0,
+                      "_type": "Float"
+                    },
+                    "W": {
+                      "_value": 1.0,
+                      "_type": "Float"
+                    }
+                  },
+                  "_type": "SVector4D"
+                },
+                "Scale": {
+                  "_vars": {
+                    "X": {
+                      "_value": 1.0,
+                      "_type": "Float"
+                    },
+                    "Y": {
+                      "_value": 1.0,
+                      "_type": "Float"
+                    },
+                    "Z": {
+                      "_value": 1.0,
+                      "_type": "Float"
+                    },
+                    "W": {
+                      "_value": 1.0,
+                      "_type": "Float"
+                    }
+                  },
+                  "_type": "SVector4D"
+                }
+              },
+              "_type": "SSkeletonRigData"
+            }
+          ],
+          "_type": "CCompressedBuffer:SSkeletonRigData"
+        }
+      },
+      "_type": "CSkeleton"
+    }
+  },
+  "_type": "CR2W"
+}
