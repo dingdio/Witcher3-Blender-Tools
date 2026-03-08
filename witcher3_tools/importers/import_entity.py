@@ -403,6 +403,34 @@ def test_load_entity(filename) ->  w3_types.Entity:
         entity = None
     return entity
 
+def _try_import_armature_from_item_appearances(entity, parent_transform=None):
+    """For CItemEntity (no MovingPhysicalAgentComponent), try to find a skeleton
+    inside the first appearance's included templates.  Returns an armature object
+    if one is found, otherwise None."""
+    appearances = getattr(entity, 'appearances', None) or []
+    if not appearances:
+        return None
+    first_app = appearances[0]
+    templates = getattr(first_app, 'includedTemplates', None) or []
+    for tmpl in templates:
+        if isinstance(tmpl, dict):
+            tmpl_filename = tmpl.get('templateFilename', '')
+        else:
+            tmpl_filename = getattr(tmpl, 'templateFilename', '')
+        if not tmpl_filename:
+            continue
+        try:
+            (_, sub_entity) = LoadCEntityTemplateFile(tmpl_filename)
+            if sub_entity is None:
+                continue
+            arm = import_MovingPhysicalAgentComponent(sub_entity, parent_transform)
+            if arm:
+                return arm
+        except Exception:
+            continue
+    return None
+
+
 def import_ent_template(filename, load_face_poses = False, import_apperance = 0, parent_transform = None):
     clear_template_cache()
     app_idx = import_apperance - 1
@@ -413,7 +441,25 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
     main_arm_obj = base_animation_skeleton
 
     if not main_arm_obj:
-        return None
+        # Only handle entities that actually have appearance variants (e.g. CItemEntity dye
+        # variants).  Static items / weapons without appearances keep returning None.
+        if getattr(entity, 'appearances', None):
+            # Try to find a skeleton inside the first appearance's included templates.
+            # Skeletal equipment (armour, capes …) embed their rig inside the mesh template.
+            arm_from_tmpl = _try_import_armature_from_item_appearances(entity, parent_transform)
+            if arm_from_tmpl:
+                main_arm_obj = arm_from_tmpl
+            else:
+                # No skeleton anywhere — create a minimal empty armature as a scene anchor
+                # so the appearance list and mesh imports still work.
+                bpy.ops.object.armature_add(enter_editmode=True)
+                main_arm_obj = bpy.context.object
+                main_arm_obj.name = Path(filename).stem
+                for bone in main_arm_obj.data.edit_bones:
+                    main_arm_obj.data.edit_bones.remove(bone)
+                bpy.ops.object.mode_set(mode='OBJECT')
+        else:
+            return None
     set_main_armature(context.scene, main_arm_obj)
     main_arm_obj["_w3_entity_import_in_progress"] = True
     try:
@@ -459,7 +505,10 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
             rig_settings.app_list_index = 0 if app_idx == -1 else app_idx
         else:
             rig_settings.app_list_index = -1
-        rig_settings.main_entity_skeleton = entity.MovingPhysicalAgentComponent.skeleton
+        try:
+            rig_settings.main_entity_skeleton = entity.MovingPhysicalAgentComponent.skeleton
+        except Exception:
+            rig_settings.main_entity_skeleton = ""
         if get_uncook_path(context) in filename:
             rig_settings.repo_path = filename.replace(get_uncook_path(context)+"\\", '')
         else:
@@ -2134,6 +2183,49 @@ def add_app_template(   entity,
             create_app_drivers(base_animation_skeleton, empty_transform, appearance_indices)
     
 
+def _apply_coloring_entries_to_objects(objects, coloring_entries, appearance_name):
+    """Apply coloringEntry custom properties to Blender mesh objects.
+
+    Works with both SEntityTemplateColoringEntry objects (base_w3 supports dict-style
+    access via __getitem__/get) and plain dicts.
+    Matches each object's 'witcher_name' custom property against componentName.
+    """
+    if not coloring_entries or not appearance_name:
+        return
+    for obj in objects:
+        if obj is None or obj.type != 'MESH':
+            continue
+        component_name = obj.get('witcher_name', '')
+        if not component_name:
+            continue
+        for entry in coloring_entries:
+            try:
+                if entry['appearance'] != appearance_name or entry['componentName'] != component_name:
+                    continue
+                cs1 = entry.get('colorShift1')
+                cs2 = entry.get('colorShift2')
+                if cs1 is not None:
+                    obj['colorShift1_hue'] = cs1['hue']
+                    obj['colorShift1_saturation'] = cs1['saturation']
+                    obj['colorShift1_luminance'] = cs1['luminance']
+                else:
+                    obj.pop('colorShift1_hue', None)
+                    obj.pop('colorShift1_saturation', None)
+                    obj.pop('colorShift1_luminance', None)
+                if cs2 is not None:
+                    obj['colorShift2_hue'] = cs2['hue']
+                    obj['colorShift2_saturation'] = cs2['saturation']
+                    obj['colorShift2_luminance'] = cs2['luminance']
+                else:
+                    obj.pop('colorShift2_hue', None)
+                    obj.pop('colorShift2_saturation', None)
+                    obj.pop('colorShift2_luminance', None)
+                obj.update_tag()
+                break
+            except Exception:
+                continue
+
+
 def import_app(context,
                selectedAppearance,
                entity,
@@ -2228,6 +2320,13 @@ def import_app(context,
                     for obj in guid_index.get(slot.template_guid, []):
                         obj.hide_set(False)
                     slot.is_hidden = False
+                # Re-apply coloring entries for this appearance (appearance may have changed)
+                if getattr(entity, 'coloringEntries', None):
+                    _apply_coloring_entries_to_objects(
+                        guid_index.get(slot.template_guid, []),
+                        entity.coloringEntries,
+                        app_name,
+                    )
                 continue  # Skip re-importing - preserves morphs and shape keys
 
             # Template slot exists but is missing in the scene or unloaded - reimport

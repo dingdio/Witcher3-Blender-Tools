@@ -1104,8 +1104,30 @@ def _get_cached_equipment_item_entity(export_path, prepared_context=None):
         local_cache[cache_key] = item_entity
     return item_entity
 
+def _update_slot_coloring_json(slot, item_entity):
+    """Populate slot.item_coloring_json from item_entity.coloringEntries for the selected appearance."""
+    coloring_entries = getattr(item_entity, 'coloringEntries', None) or []
+    selected_app = getattr(slot, 'item_appearance_name', '') or '__default__'
+    result = []
+    for entry in coloring_entries:
+        entry_app = getattr(entry, 'appearance', '') or ''
+        if selected_app == '__default__' or not entry_app or entry_app == selected_app:
+            cs1 = getattr(entry, 'colorShift1', None)
+            cs2 = getattr(entry, 'colorShift2', None)
+            result.append({
+                'componentName': getattr(entry, 'componentName', ''),
+                'hue1': getattr(cs1, 'hue', 0) if cs1 else 0,
+                'sat1': getattr(cs1, 'saturation', 0) if cs1 else 0,
+                'lum1': getattr(cs1, 'luminance', 0) if cs1 else 0,
+                'hue2': getattr(cs2, 'hue', 0) if cs2 else 0,
+                'sat2': getattr(cs2, 'saturation', 0) if cs2 else 0,
+                'lum2': getattr(cs2, 'luminance', 0) if cs2 else 0,
+            })
+    slot.item_coloring_json = json.dumps(result)
+
+
 def _import_item_entity(export_path, final_item_name, entity, armature, appearance, slot_index, empty_transform,
-                        use_app_drivers=True, prepared_context=None):
+                        use_app_drivers=True, prepared_context=None, item_appearance_name=None):
     """Import a w2ent item (handles includedTemplates)."""
     from ..importers.import_entity import add_app_template
     ent_namespace = entity.name + ":"
@@ -1118,9 +1140,14 @@ def _import_item_entity(export_path, final_item_name, entity, armature, appearan
     except Exception:
         item_entity = None
     if item_entity and hasattr(item_entity, 'appearances') and item_entity.appearances:
-        first_app = item_entity.appearances[0]
-        if hasattr(first_app, 'includedTemplates') and first_app.includedTemplates:
-            included_templates = first_app.includedTemplates
+        selected_app = item_entity.appearances[0]
+        if item_appearance_name and item_appearance_name != '__default__':
+            for app in item_entity.appearances:
+                if getattr(app, 'name', '') == item_appearance_name:
+                    selected_app = app
+                    break
+        if hasattr(selected_app, 'includedTemplates') and selected_app.includedTemplates:
+            included_templates = selected_app.includedTemplates
 
     static_template_data = None
     static_meshes = getattr(item_entity, 'staticMeshes', None) if item_entity else None
@@ -3446,6 +3473,24 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                         op = row.operator("witcher.equipment_load_equipment", text="", icon='IMPORT')
                         op.slot_index = i
 
+                    # Appearance dropdown for items with multiple dye/appearance variants
+                    item_app_names = _safe_json_list(getattr(slot, 'item_appearances_json', ''))
+                    if len(item_app_names) > 1:
+                        app_row = box.row(align=True)
+                        app_row.label(text="  Appearance:")
+                        app_row.prop(slot, "item_appearance_name", text="")
+                        try:
+                            coloring = json.loads(slot.item_coloring_json or '[]')
+                        except Exception:
+                            coloring = []
+                        for col_entry in coloring:
+                            comp = col_entry.get('componentName', '')
+                            h1 = col_entry.get('hue1', 0)
+                            s1 = col_entry.get('sat1', 0)
+                            l1 = col_entry.get('lum1', 0)
+                            col_row = box.row(align=True)
+                            col_row.label(text=f"    {comp}: H{h1:+.0f} S{s1:+.0f} L{l1:+.0f}", icon='COLORSET_01_VEC')
+
                     bound_items = _safe_json_list(getattr(slot, "bound_items_json", ""))
                     if bound_items:
                         for bound_name in bound_items:
@@ -3922,6 +3967,16 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         log.warning(reason)
         return False
 
+    # Populate item appearance list from entity (runs even if already loaded)
+    item_entity_for_apps = _get_cached_equipment_item_entity(export_path, prepared_context=prepared)
+    if item_entity_for_apps and getattr(item_entity_for_apps, 'appearances', None):
+        app_names = [getattr(a, 'name', '') for a in item_entity_for_apps.appearances]
+        slot.item_appearances_json = json.dumps([n for n in app_names if n])
+        _update_slot_coloring_json(slot, item_entity_for_apps)
+    else:
+        slot.item_appearances_json = ""
+        slot.item_coloring_json = ""
+
     entity = prepared.get("entity")
     appearance = prepared.get("appearance")
     if entity is None:
@@ -3961,6 +4016,7 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
             empty_transform,
             use_app_drivers=not getattr(slot, "is_inventory", False),
             prepared_context=prepared,
+            item_appearance_name=getattr(slot, 'item_appearance_name', None) or None,
         )
     except Exception as e:
         reason = f"Import failed for '{getattr(final_item, 'name', effective_template)}': {e}"
@@ -3973,6 +4029,23 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
     new_objects = tag_new_objects_with_guid(before, guid, "witcher_equip_guid")
     slot.equip_guid = guid
     slot.is_loaded = True
+
+    # Apply coloring entries from the item entity to newly imported mesh objects.
+    # The character entity's coloringEntries don't cover equipment items, so we
+    # apply the item entity's own coloring here using witcher_name for matching.
+    try:
+        item_coloring_entries = getattr(item_entity_for_apps, 'coloringEntries', None) or []
+        selected_app_name = getattr(slot, 'item_appearance_name', '') or ''
+        if not selected_app_name or selected_app_name == '__default__':
+            # Use first appearance name as fallback
+            app_names = json.loads(slot.item_appearances_json or '[]')
+            selected_app_name = app_names[0] if app_names else ''
+        if item_coloring_entries and selected_app_name:
+            from ..importers.import_entity import _apply_coloring_entries_to_objects
+            _apply_coloring_entries_to_objects(new_objects, item_coloring_entries, selected_app_name)
+    except Exception as e:
+        log.warning(f"Failed to apply coloring entries for '{slot.item_name}': {e}")
+
     try:
         bpy.context.view_layer.update()
     except Exception:

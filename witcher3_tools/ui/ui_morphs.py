@@ -174,6 +174,66 @@ def _update_rune_level(self, context):
     from ..ui.ui_equipment import update_rune_level
     update_rune_level(self, context)
 
+
+def _get_item_app_enum_items(self, context):
+    import json
+    try:
+        names = json.loads(self.item_appearances_json or '[]')
+    except Exception:
+        names = []
+    if not names:
+        return [('__default__', 'Default', '')]
+    return [(n, n, '') for n in names]
+
+
+def _on_item_appearance_changed(self, context):
+    """Reload the equipment item when the user picks a different appearance."""
+    try:
+        armature_obj = None
+        ob = getattr(context, "object", None) if context else None
+        if ob and ob.type == 'ARMATURE':
+            armature_obj = ob
+        else:
+            arm_data = getattr(self, "id_data", None)
+            if arm_data:
+                for obj in bpy.data.objects:
+                    if obj.type == 'ARMATURE' and obj.data == arm_data:
+                        armature_obj = obj
+                        break
+        if not armature_obj:
+            return
+
+        rig_settings = armature_obj.data.witcherui_RigSettings
+        slots = rig_settings.equipment_slots
+        slot_index = None
+        for i, slot in enumerate(slots):
+            if slot == self:
+                slot_index = i
+                break
+        if slot_index is None:
+            return
+
+        from ..ui.ui_equipment import load_equipment_item
+        if self.is_loaded:
+            saved_active = context.view_layer.objects.active
+            saved_selection = [obj for obj in context.selected_objects]
+            load_equipment_item(context, armature_obj, slot_index, rig_settings)
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in saved_selection:
+                try:
+                    if obj and obj.name in bpy.data.objects:
+                        obj.select_set(True)
+                except ReferenceError:
+                    continue
+            try:
+                if saved_active and saved_active.name in bpy.data.objects:
+                    context.view_layer.objects.active = saved_active
+            except ReferenceError:
+                pass
+    except Exception:
+        pass
+
+
 class EquipmentSlotEntry(bpy.types.PropertyGroup):
     """Persistent equipment slot stored on the armature. Survives Blender restarts."""
     category: StringProperty(name="Category", default="")
@@ -206,6 +266,22 @@ class EquipmentSlotEntry(bpy.types.PropertyGroup):
         ],
         default='NONE',
         update=_update_rune_level
+    )
+    item_appearances_json: StringProperty(
+        name="Item Appearances JSON",
+        default="",
+        description="JSON array of appearance names available on this item entity"
+    )
+    item_appearance_name: EnumProperty(
+        name="Item Appearance",
+        items=_get_item_app_enum_items,
+        update=_on_item_appearance_changed,
+        description="Select appearance (dye variant) for this item"
+    )
+    item_coloring_json: StringProperty(
+        name="Item Coloring JSON",
+        default="",
+        description="JSON list of coloring entries for the selected appearance"
     )
 
 
