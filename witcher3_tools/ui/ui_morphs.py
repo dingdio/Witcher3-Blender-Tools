@@ -1037,6 +1037,8 @@ class WITCH_OT_morphs(bpy.types.Operator):
                         pb.matrix_basis.identity()
                     if face_rig.animation_data:
                         face_rig.animation_data.action = None
+                        if hasattr(face_rig.animation_data, "action_slot"):
+                            face_rig.animation_data.action_slot = None
             finally:
                 if prev_bake_every_frame is not None:
                     scene.witcher_bake_every_frame = prev_bake_every_frame

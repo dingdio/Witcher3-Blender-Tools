@@ -12,6 +12,7 @@ from .. import get_rig_rot90_enabled
 from .. import get_all_addon_prefs
 from ..importers import import_anims, import_rig
 from ..exporters import export_anims
+from ..action_compat import iter_action_fcurves, new_action_fcurve, remove_action_fcurve
 # from io_import_w2l.importers import import_cutscene
 # from io_import_w2l.importers import import_scene
 from ..ui.ui_utils import WITCH_PT_Base
@@ -742,12 +743,12 @@ def apply_root_orientation(armature_obj):
     ]
 
     fcurves_to_remove = []
-    for fc in action.fcurves:
+    for fc in iter_action_fcurves(action, target=armature_obj):
         if fc.data_path in root_data_paths:
             fcurves_to_remove.append(fc)
 
     for fc in fcurves_to_remove:
-        action.fcurves.remove(fc)
+        remove_action_fcurve(action, fc, target=armature_obj)
 
     log.info(f"Removed {len(fcurves_to_remove)} fcurves from Root bone")
 
@@ -788,13 +789,13 @@ def apply_root_orientation(armature_obj):
     # Create quaternion fcurves with the calculated rotation
     quat_values = [pose_quat.w, pose_quat.x, pose_quat.y, pose_quat.z]
     for i, val in enumerate(quat_values):
-        fc = action.fcurves.new(data_path=quat_path, index=i)
+        fc = new_action_fcurve(action, armature_obj, data_path=quat_path, index=i, group_name="Root")
         kp = fc.keyframe_points.insert(1, val)
         kp.interpolation = 'LINEAR'
 
     # Create location fcurves at origin
     for i in range(3):
-        fc = action.fcurves.new(data_path=loc_path, index=i)
+        fc = new_action_fcurve(action, armature_obj, data_path=loc_path, index=i, group_name="Root")
         kp = fc.keyframe_points.insert(1, 0.0)
         kp.interpolation = 'LINEAR'
 

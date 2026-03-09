@@ -4,6 +4,7 @@ from ..importers import import_anims
 log = logging.getLogger(__name__)
 from .. import get_uncook_path, get_W3_VOICE_PATH, get_W3_OGG_PATH, get_vgmstream_path, get_all_addon_prefs
 from ..extension_paths import get_cache_root, get_dev_override, get_dev_override_list
+from ..action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
 from ..CR2W.witcher_cache.Speech import LoadSpeechManager
 from ..CR2W.witcher_cache.Speech.W3Speech import SpeechEntry
 from ..CR2W.witcher_cache.W3Strings import LoadStringsManager
@@ -366,7 +367,7 @@ def _apply_phoneme_action(armature, pose_bone, phoneme_list, frames, phoneme_val
         pts = _compress_to_keyframes(phoneme_values[idx], frames)
         if not pts:
             continue
-        fcurve = action.fcurves.new(data_path=data_path)
+        fcurve = new_action_fcurve(action, armature, data_path=data_path)
         fcurve.keyframe_points.add(len(pts))
         for ki, (fr, val) in enumerate(pts):
             fcurve.keyframe_points[ki].co = (fr, val)
@@ -384,6 +385,7 @@ def _apply_phoneme_action(armature, pose_bone, phoneme_list, frames, phoneme_val
         start_frame = frames[0]
         end_frame = frames[-1] + 1
         strip = track.strips.new(action.name, int(start_frame), action)
+        bind_strip_action_slot(strip, resolve_action_slot(action, target=armature, ensure=True))
         strip.frame_start = start_frame
         strip.frame_end = end_frame
         strip.blend_type = 'COMBINE'

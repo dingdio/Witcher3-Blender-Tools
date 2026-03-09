@@ -5,6 +5,7 @@ import base64
 import math
 from ..CR2W import w3_types
 from ..CR2W.om import MQuaternion
+from ..action_compat import assign_action, iter_action_fcurves, new_action_fcurve
 import bpy
 
 log = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ def get_bone_animation_data(obj, bone_name):
                     action = strip.action
                     break
     if action:
-        for fcurve in action.fcurves:
+        for fcurve in iter_action_fcurves(action, target=obj):
             if bone_name in fcurve.data_path:
                 for keyframe in fcurve.keyframe_points:
                     frame_number = int(keyframe.co[0])
@@ -221,8 +222,7 @@ def apply_motion(obj, motion_extraction):
 
     # Create a new action for the object
     action = bpy.data.actions.new(name="MotionExtractionAction")
-    obj.animation_data_create()
-    obj.animation_data.action = action
+    assign_action(obj, action)
 
     # Flags interpretation
     x_movement = (motion_extraction.flags & 1) > 0
@@ -233,18 +233,13 @@ def apply_motion(obj, motion_extraction):
     # Create FCurves based on flags
     fcurves = []
     if x_movement:
-        fcurves.append(action.fcurves.new(data_path="location", index=0))
+        fcurves.append(new_action_fcurve(action, obj, data_path="location", index=0))
     if z_movement:
-        fcurves.append(action.fcurves.new(data_path="location", index=1))
+        fcurves.append(new_action_fcurve(action, obj, data_path="location", index=1))
     if y_movement:
-        fcurves.append(action.fcurves.new(data_path="location", index=2))
+        fcurves.append(new_action_fcurve(action, obj, data_path="location", index=2))
     if yaw_rotation:
-        fcurves.append(action.fcurves.new(data_path="rotation_euler", index=2))
-
-    # Blender 4.4+ slotted actions: assign the slot after FCurves are created
-    # See: https://developer.blender.org/docs/release_notes/4.4/upgrading/slotted_actions/
-    if bpy.app.version >= (4, 4, 0) and hasattr(action, 'slots') and len(action.slots) > 0:
-        obj.animation_data.action_slot = action.slots[0]
+        fcurves.append(new_action_fcurve(action, obj, data_path="rotation_euler", index=2))
 
     # Insert keyframes
     frame_number = 0

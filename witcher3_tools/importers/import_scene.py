@@ -11,6 +11,7 @@ from ..CR2W.CR2W_types import EngineTransform
 from ..CR2W.dc_scene import load_bin_scene
 from ..importers import import_entity
 from ..importers.import_helpers import set_blender_object_transform#, set_blender_pose_bone_transform
+from ..action_compat import assign_action, bind_strip_action_slot, new_action_fcurve, resolve_action_slot
 from .import_cutscene import check_if_actor_already_in_scene
 from mathutils import Euler
 from math import radians
@@ -109,7 +110,7 @@ class SceneImporter():
         track_name == track_name if track_name else self.__NLA_track
 
         if not self.__use_NLA:
-            target.animation_data.action = action
+            assign_action(target, action)
         else:
             #frame_current = bpy.context.scene.frame_current
             if track_name:
@@ -143,6 +144,7 @@ class SceneImporter():
                 start_frame, end_frame = action.frame_range
                 length = end_frame - start_frame
                 target_strip.frame_end = self.__frame_current + length
+            bind_strip_action_slot(target_strip, resolve_action_slot(action, target=target, ensure=True))
             target_strip.blend_type = 'REPLACE'
 
     def loadSceneFile(self, filePath):
@@ -188,7 +190,7 @@ class SceneImporter():
             placeCube.name = "SCENE_POINT"
 
 
-        scene_camera_entity_path =  "gameplay\camera\scene_camera.w2ent"
+        scene_camera_entity_path = "gameplay\\camera\\scene_camera.w2ent"
 
         scene_cam_obj = check_if_actor_already_in_scene(scene_camera_entity_path)
         if not scene_cam_obj:
@@ -305,7 +307,7 @@ class SceneImporter():
                 pos_curves = [dummy_keyframe_points] * 3
                 dialogframe = self.__frame_current
                 for axis_i in range(3):
-                    pos_curves[axis_i] = action.fcurves.new(data_path='location', index=axis_i, action_group="PAUSE")
+                    pos_curves[axis_i] = new_action_fcurve(action, scene_cam_obj, data_path='location', index=axis_i, group_name="PAUSE")
                 #PAUSE BEGIN
                 for i in range(3):
                     pos_curves[i].keyframe_points.add(1)
@@ -329,7 +331,7 @@ class SceneImporter():
                 pos_curves = [dummy_keyframe_points] * 3
                 dialogframe = self.__frame_current
                 for axis_i in range(3):
-                    pos_curves[axis_i] = action.fcurves.new(data_path='location', index=axis_i, action_group="dialogLine")
+                    pos_curves[axis_i] = new_action_fcurve(action, scene_cam_obj, data_path='location', index=axis_i, group_name="dialogLine")
                 #PAUSE BEGIN
                 for i in range(3):
                     pos_curves[i].keyframe_points.add(1)
@@ -386,12 +388,12 @@ class SceneImporter():
                     bone_rotation = getattr(bl_bone, data_path_rot)
                     data_path = 'pose.bones["%s"].location'%bl_bone.name
                     for axis_i in range(3):
-                        pos_curves[axis_i] = InterpolationAction.fcurves.new(data_path=data_path, index=axis_i, action_group=bl_bone.name)
+                        pos_curves[axis_i] = new_action_fcurve(InterpolationAction, scene_cam_obj, data_path=data_path, index=axis_i, group_name=bl_bone.name)
                     data_path = 'pose.bones["%s"].%s'%(bl_bone.name, data_path_rot)
                     for axis_i in range(len(bone_rotation)):
-                        rot_curves[axis_i] = InterpolationAction.fcurves.new(data_path=data_path, index=axis_i, action_group=bl_bone.name)
+                        rot_curves[axis_i] = new_action_fcurve(InterpolationAction, scene_cam_obj, data_path=data_path, index=axis_i, group_name=bl_bone.name)
 
-                    track_curves = [InterpolationAction.fcurves.new(data_path="pose.bones[\"Camera_Node\"][\"hctFOV\"]")] 
+                    track_curves = [new_action_fcurve(InterpolationAction, scene_cam_obj, data_path="pose.bones[\"Camera_Node\"][\"hctFOV\"]")] 
                     
                     keyGuidsObjs = []
                     for guid in event.keyGuids.More:
@@ -457,12 +459,12 @@ class SceneImporter():
                     bone_rotation = getattr(bl_bone, data_path_rot)
                     data_path = 'pose.bones["%s"].location'%bl_bone.name
                     for axis_i in range(3):
-                        pos_curves[axis_i] = InterpolationAction.fcurves.new(data_path=data_path, index=axis_i, action_group=bl_bone.name)
+                        pos_curves[axis_i] = new_action_fcurve(InterpolationAction, scene_cam_obj, data_path=data_path, index=axis_i, group_name=bl_bone.name)
                     data_path = 'pose.bones["%s"].%s'%(bl_bone.name, data_path_rot)
                     for axis_i in range(len(bone_rotation)):
-                        rot_curves[axis_i] = InterpolationAction.fcurves.new(data_path=data_path, index=axis_i, action_group=bl_bone.name)
+                        rot_curves[axis_i] = new_action_fcurve(InterpolationAction, scene_cam_obj, data_path=data_path, index=axis_i, group_name=bl_bone.name)
 
-                    track_curves = [InterpolationAction.fcurves.new(data_path="pose.bones[\"Camera_Node\"][\"hctFOV\"]")] 
+                    track_curves = [new_action_fcurve(InterpolationAction, scene_cam_obj, data_path="pose.bones[\"Camera_Node\"][\"hctFOV\"]")] 
                     
                     interFrame = 0
                     for cam1, event in keyGuidsObjs:

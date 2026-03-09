@@ -9,6 +9,7 @@ from typing import List, Optional, Set
 import bpy
 import mathutils
 from mathutils import Vector, Quaternion, Euler, Matrix
+from ..action_compat import iter_action_fcurves
 
 log = logging.getLogger(__name__)
 
@@ -419,7 +420,7 @@ class W3AnimationExporter:
         anim_bones = {}
         rePath = re.compile(r'^pose\.bones\["(.+)"\]\.([a-z_]+)$')
         prop_rotation_map = {'QUATERNION':'rotation_quaternion', 'AXIS_ANGLE':'rotation_axis_angle'}
-        for fcurve in action.fcurves:
+        for fcurve in iter_action_fcurves(action, target=armObj):
             m = rePath.match(fcurve.data_path)
             if m is None:
                 continue

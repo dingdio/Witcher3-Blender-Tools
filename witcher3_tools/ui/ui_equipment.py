@@ -717,10 +717,14 @@ def _set_pose_all_armatures(root_armature, pose_value):
     for obj in [root_armature] + list(root_armature.children_recursive):
         if obj.type == 'ARMATURE':
             action = None
+            action_slot = None
             if obj.animation_data:
                 action = obj.animation_data.action
+                action_slot = getattr(obj.animation_data, "action_slot", None)
                 obj.animation_data.action = None
-            changed.append((obj, obj.data.pose_position, action))
+                if hasattr(obj.animation_data, "action_slot"):
+                    obj.animation_data.action_slot = None
+            changed.append((obj, obj.data.pose_position, action, action_slot))
             obj.data.pose_position = pose_value
     try:
         bpy.context.view_layer.update()
@@ -730,11 +734,13 @@ def _set_pose_all_armatures(root_armature, pose_value):
 
 def _restore_pose_all_armatures(changed):
     """Restore pose_position for armatures changed by _set_pose_all_armatures."""
-    for obj, prev_pose, action in changed:
+    for obj, prev_pose, action, action_slot in changed:
         if obj and obj.type == 'ARMATURE':
             obj.data.pose_position = prev_pose
             if obj.animation_data is not None:
                 obj.animation_data.action = action
+                if hasattr(obj.animation_data, "action_slot"):
+                    obj.animation_data.action_slot = action_slot
     try:
         bpy.context.view_layer.update()
     except Exception:

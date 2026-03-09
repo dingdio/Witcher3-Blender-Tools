@@ -10,6 +10,7 @@ Export: Samples w3_face_poses per frame -> temporary mesh + armature -> RE expor
 import os
 import bpy
 import logging
+from ..action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
 from bpy.props import BoolProperty, StringProperty, FloatProperty
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 
@@ -261,7 +262,7 @@ class WITCH_OT_ImportREMimic(bpy.types.Operator, ImportHelper):
         fcs = {}
         for name in all_morphs:
             dp = f'pose.bones["{CONTROL_BONE}"]["{name}"]'
-            fcs[name] = action.fcurves.new(data_path=dp)
+            fcs[name] = new_action_fcurve(action, armature, data_path=dp)
 
         for f, vals in enumerate(normalised):
             for name, value in vals.items():
@@ -288,9 +289,14 @@ class WITCH_OT_ImportREMimic(bpy.types.Operator, ImportHelper):
             insert = max(insert, int(s.frame_end) + 1)
         try:
             strip = track.strips.new(action.name, insert, action)
+            bind_strip_action_slot(strip, resolve_action_slot(action, target=armature, ensure=True))
             strip.blend_type = 'COMBINE'
         except Exception:
             armature.animation_data.action = action
+            if hasattr(armature.animation_data, "action_slot"):
+                slot = resolve_action_slot(action, target=armature, ensure=True)
+                if slot is not None:
+                    armature.animation_data.action_slot = slot
 
         self.report({'INFO'},
                     f"Imported {len(all_morphs)} morphs x {len(normalised)} frames")

@@ -22,6 +22,7 @@ from typing import Union
 import numpy as np
 
 import bpy
+from ..action_compat import assign_action, bind_strip_action_slot, new_action_fcurve, resolve_action_slot
 matmul = (lambda a, b: a*b) if bpy.app.version < (2, 80, 0) else (lambda a, b: a.__matmul__(b))
 
 
@@ -305,7 +306,7 @@ class AnimImporter:
             target.animation_data_create()
 
         if not self.__use_NLA:
-            target.animation_data.action = action
+            assign_action(target, action)
         else:
             #frame_current = bpy.context.scene.frame_current
             if self.__NLA_track:
@@ -330,6 +331,7 @@ class AnimImporter:
             except Exception as e:
                 target_strip = target_track.strips.new(action.name, int(last_strip.frame_end + 1), action)
             target_strip.frame_start = self.__frame_current
+            bind_strip_action_slot(target_strip, resolve_action_slot(action, target=target, ensure=True))
             start_frame, end_frame = action.frame_range
             length = end_frame - start_frame
             target_strip.frame_end = self.__frame_current + length
@@ -430,7 +432,6 @@ class AnimImporter:
                 continue
             valid_bones.append(bone_data)
             bone_name = bone_data.BoneName
-            group = action.groups.new(name=bone_name)
             pos_curves = [dummy_keyframe_points] * 3
             rot_curves = [dummy_keyframe_points] * 4
             fcurves_rot = [dummy_keyframe_points]*4 # r0, r1, r2, (r3)
@@ -439,10 +440,10 @@ class AnimImporter:
             bone_rotation = getattr(bl_bone, data_path_rot)
             data_path = 'pose.bones["%s"].location'%bl_bone.name
             for axis_i in range(3):
-                fcurves_loc[axis_i] = action.fcurves.new(data_path=data_path, index=axis_i, action_group=bl_bone.name)
+                fcurves_loc[axis_i] = new_action_fcurve(action, armObj, data_path=data_path, index=axis_i, group_name=bl_bone.name)
             data_path = 'pose.bones["%s"].%s'%(bl_bone.name, data_path_rot)
             for axis_i in range(len(bone_rotation)):
-                fcurves_rot[axis_i] = action.fcurves.new(data_path=data_path, index=axis_i, action_group=bl_bone.name)
+                fcurves_rot[axis_i] = new_action_fcurve(action, armObj, data_path=data_path, index=axis_i, group_name=bl_bone.name)
 
             pos_curves = fcurves_loc
             rot_curves = fcurves_rot
@@ -690,7 +691,7 @@ class AnimImporter:
 
                     log.info('(mesh) frames:%5d  name: %s', len(keyFrames), name)
                     shapeKey = shapeKeyDict[name]
-                    fcurve = action.fcurves.new(data_path='pose.bones["%s"]["%s"]'% (control_bone_name, name))#  (data_path='key_blocks["%s"].value'%shapeKey.name)
+                    fcurve = new_action_fcurve(action, armObj, data_path='pose.bones["%s"]["%s"]'% (control_bone_name, name))#  (data_path='key_blocks["%s"].value'%shapeKey.name)
                     fcurve.keyframe_points.add(len(keyFrames))
                     #keyFrames.sort(key=lambda x:x.frame_number)
 
@@ -777,7 +778,7 @@ class AnimImporter:
                 continue
             log.info('(mesh) frames:%5d  name: %s', len(keyFrames), name)
             shapeKey = shapeKeyDict[name]
-            fcurve = action.fcurves.new(data_path='key_blocks["%s"].value'%shapeKey.name)
+            fcurve = new_action_fcurve(action, meshObj.data.shape_keys, data_path='key_blocks["%s"].value'%shapeKey.name)
             fcurve.keyframe_points.add(len(keyFrames))
             #keyFrames.sort(key=lambda x:x.frame_number)
             frame_number = 0
