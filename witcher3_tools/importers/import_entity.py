@@ -470,7 +470,17 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
     try:
         rig_settings = main_arm_obj.data.witcherui_RigSettings
         cache_rig_entity_state(rig_settings, entity, update_json=True)
-        #entity = fixed_chunk_paths(entity, entity.version)
+
+        # Set entity_name early so equipment/inventory loading can use it
+        rig_settings.entity_name = Path(filename).stem
+        if get_uncook_path(context) in filename:
+            rig_settings.repo_path = filename.replace(get_uncook_path(context)+"\\", '')
+        else:
+            rig_settings.repo_path = filename
+        try:
+            rig_settings.main_entity_skeleton = entity.MovingPhysicalAgentComponent.skeleton
+        except Exception:
+            rig_settings.main_entity_skeleton = ""
 
         treeList = rig_settings.app_list
         treeList.clear()
@@ -505,16 +515,6 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
             rig_settings.app_list_index = 0 if app_idx == -1 else app_idx
         else:
             rig_settings.app_list_index = -1
-        try:
-            rig_settings.main_entity_skeleton = entity.MovingPhysicalAgentComponent.skeleton
-        except Exception:
-            rig_settings.main_entity_skeleton = ""
-        if get_uncook_path(context) in filename:
-            rig_settings.repo_path = filename.replace(get_uncook_path(context)+"\\", '')
-        else:
-            rig_settings.repo_path = filename
-            pass # find the entity another way
-        rig_settings.entity_name = Path(filename).stem
 
         #Find the first (and only?) CMimicComponent and use it to import face animations
         for ent in entity.appearances:
@@ -2535,47 +2535,11 @@ def import_app(context,
             pass
 
         if equip_template and equip_template != "None":
-            if _coerce_version(getattr(entity, "version", 999), 999) > 115:
-                # Witcher 3 appearance equipment should go through the shared
-                # loader so slot mounting/bound items behave the same as manual
-                # equipment loads. The older direct add_app_template path
-                # imports meshes but skips the actual slot-attach step.
-                deferred_default_slot_indices.append(slot_index)
-                continue
-
-            final_item = None
-            export_path = None
-            try:
-                from ..ui.ui_equipment import _resolve_bundle_item_by_template
-                final_item, export_path, _search_pattern = _resolve_bundle_item_by_template(
-                    equip_template,
-                    search_roots=source_roots,
-                )
-            except Exception as e:
-                log.warning("Failed to resolve equipment template '%s': %s", equip_template, e)
-
-            resolved_template_filename = getattr(final_item, "name", None) if final_item else None
-            if resolved_template_filename and export_path and os.path.exists(export_path):
-                guid = generate_guid()
-                before = set(bpy.data.objects)
-
-                add_app_template(entity,
-                                 base_animation_skeleton,
-                                 group_parent,
-                                 ent_namespace,
-                                 import_redcloth_enabled,
-                                 i,
-                                 selectedAppearance,
-                                 hide_shadowmesh,
-                                 empty_transform,
-                                 root_skeleton,
-                                 export_path,
-                                 morphs_todo_accum=morphs_todo)
-
-                tag_new_objects_with_guid(before, guid, "witcher_equip_guid")
-                slot.equip_guid = guid
-                slot.is_loaded = True
-                continue
+            # All equipment (W2 and W3) goes through the shared loader so
+            # slot mounting, bound items (belt, scabbards) and attachment
+            # type handling work consistently.
+            deferred_default_slot_indices.append(slot_index)
+            continue
 
     # Apply inventory-mounted items (overrides defaults when present).
     # Witcher 2 entities can also express equipped gear through inventory

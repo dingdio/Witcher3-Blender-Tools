@@ -580,6 +580,8 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
 
     deferredData = chunk.GetVariableByName("deferredData")
     streamingOption = chunk.GetVariableByName("streamingOption")
+    data_prop = chunk.GetVariableByName('data')
+    data_in_file = data_prop.value if data_prop is not None and hasattr(data_prop, 'value') and data_prop.value else b""
     _stream_opt = streamingOption.Index.String if streamingOption else "None"
     log.debug(f"[anim_buffer] duration={buffer_duration}, numFrames={buffer_numFrames}, dt={buffer_dt}, orientMethod={orientationCompressionMethod}, streaming={_stream_opt}")
 
@@ -592,6 +594,14 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
     # For uncooked animations (e.g., from REDkit), data may be in 'data' property or 'fallbackData'
     if (deferredData is not None and deferredData.ValueA != 0):
         def_path = file.fileName + "." + str(deferredData.ValueA) + ".buffer"
+        buffer_index = deferredData.ValueA - 1  # Convert to 0-based index
+        has_embedded_buffer = (
+            hasattr(file, 'BufferData')
+            and file.BufferData
+            and buffer_index >= 0
+            and buffer_index < len(file.BufferData)
+        )
+        has_embedded_anim_data = bool(embedded_data and len(embedded_data) > 0)
 
         # Ensure the buffer file exists before loading.
         # If missing and the file is under the uncook path, extract all missing
@@ -600,7 +610,7 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
             from .common_blender import extract_missing_buffers
             extract_missing_buffers(file.fileName)
 
-            if not os.path.exists(def_path):
+            if not os.path.exists(def_path) and not has_embedded_buffer and not has_embedded_anim_data:
                 raise FileNotFoundError(
                     f"Missing buffer file: {def_path}\n"
                     f"Animation requires this buffer but it could not be found or extracted.\n"
@@ -614,7 +624,6 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
                 # Partial streaming: combine inline data + buffer file
                 f = open(def_path,"rb")
                 def_data = f.read()
-                data_in_file = chunk.GetVariableByName('data').value
                 inline_size = len(data_in_file) if data_in_file else 0
                 log.warning(f"[anim_buffer] ABSO_PartiallyStreamable: inline_data={inline_size}B, buffer={len(def_data)}B, path={def_path}")
                 b = bytearray(data_in_file) + def_data
@@ -630,9 +639,6 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
                 source_detail = f"buffer_file:{def_path}"
         else:
             # For uncooked files the animation data lives in embedded CR2W buffers.
-            # The deferredData.ValueA points to a 1-based buffer index
-            buffer_index = deferredData.ValueA - 1  # Convert to 0-based index
-            
             # Check scene toggle for prefer_uncompressed
             prefer_uncompressed = False
             try:
@@ -649,9 +655,21 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
                 return buffer
             
             # Check if the CR2W file has embedded buffers
-            if hasattr(file, 'BufferData') and file.BufferData and buffer_index >= 0 and buffer_index < len(file.BufferData):
-                buffer_size = len(file.BufferData[buffer_index])
-                log.info(f"Buffer file not found, checking embedded CR2W buffer #{buffer_index + 1} ({buffer_size} bytes)")
+            if has_embedded_buffer:
+                embedded_buffer = file.BufferData[buffer_index]
+                if (streamingOption is not None and streamingOption.Index.String == "ABSO_PartiallyStreamable"):
+                    b = bytearray(data_in_file) + bytearray(embedded_buffer)
+                    buffer_size = len(b)
+                    log.info(
+                        f"Buffer file not found, combining inline data ({len(data_in_file)} bytes) "
+                        f"with embedded CR2W buffer #{buffer_index + 1} ({len(embedded_buffer)} bytes)"
+                    )
+                    source_detail = f"embedded_buffer+inline:{buffer_index + 1}"
+                else:
+                    b = bytearray(embedded_buffer)
+                    buffer_size = len(b)
+                    log.info(f"Buffer file not found, checking embedded CR2W buffer #{buffer_index + 1} ({buffer_size} bytes)")
+                    source_detail = f"embedded_buffer:{buffer_index + 1}"
 
                 # Check if bone dataAddr values exceed buffer size - if so, the buffer is incompatible
                 max_data_addr = 0
@@ -689,8 +707,7 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
                         log.warning("No embedded data available for fallback, animation may fail")
 
                 # Use the embedded buffer with the standard cooked format (dataAddr offsets)
-                the_data = bStream(data = bytearray(file.BufferData[buffer_index]))
-                source_detail = f"embedded_buffer:{buffer_index + 1}"
+                the_data = bStream(data = b)
             elif embedded_data and len(embedded_data) > 0:
                 # Fallback: try the old embeddedAnimData from CSkeletalAnimation
                 log.info(f"No embedded buffers, trying read_uncooked_anim_buffer for {len(embedded_data)} bytes")
@@ -709,7 +726,6 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
                     the_data = bStream(data = bytearray())
     else:
         # No deferred data - all animation data is inline
-        data_prop = chunk.GetVariableByName('data')
         if data_prop is not None and hasattr(data_prop, 'value') and data_prop.value:
             the_data = bStream(data = bytearray(data_prop.value))
             source_detail = "inline_data"

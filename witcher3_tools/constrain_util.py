@@ -6,15 +6,6 @@ from . import file_helpers
 
 log = logging.getLogger(__name__)
 
-_MESH_COMPONENT_ARMATURE_TYPES = {
-    "CMeshComponent",
-    "CStaticMeshComponent",
-    "CFurComponent",
-    "CRigidMeshComponent",
-    "CRagdollMeshComponent",
-}
-
-
 def _normalized_bone_name(name):
     return file_helpers.rm_ns(name or "")
 
@@ -73,19 +64,12 @@ def should_auto_align_armatures(arm_parent, arm_child):
     if arm_parent.type != 'ARMATURE' or arm_child.type != 'ARMATURE':
         return False
 
-    child_witcher_type = str(arm_child.get("witcher_type", "")).strip()
-    child_path = _normalized_object_path(arm_child)
-    if (child_witcher_type in _MESH_COMPONENT_ARMATURE_TYPES
-            or child_path.endswith((".w2mesh", ".w3mesh", ".fbx"))):
-        # Mesh-derived equipment/bodypart armatures rely on the older CHILD_OF
-        # root behavior; pre-aligning them regresses W2 hair/scabbard imports.
-        return False
-
     matches = get_matching_pose_bone_pairs(arm_parent, arm_child)
     if not matches:
         return False
 
     parent_path = _normalized_object_path(arm_parent)
+    child_path = _normalized_object_path(arm_child)
     if parent_path and child_path and parent_path == child_path:
         return True
 
