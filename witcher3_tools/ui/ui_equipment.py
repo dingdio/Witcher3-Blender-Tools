@@ -722,8 +722,6 @@ def _set_pose_all_armatures(root_armature, pose_value):
                 action = obj.animation_data.action
                 action_slot = getattr(obj.animation_data, "action_slot", None)
                 obj.animation_data.action = None
-                if hasattr(obj.animation_data, "action_slot"):
-                    obj.animation_data.action_slot = None
             changed.append((obj, obj.data.pose_position, action, action_slot))
             obj.data.pose_position = pose_value
     try:
@@ -739,7 +737,7 @@ def _restore_pose_all_armatures(changed):
             obj.data.pose_position = prev_pose
             if obj.animation_data is not None:
                 obj.animation_data.action = action
-                if hasattr(obj.animation_data, "action_slot"):
+                if action is not None and action_slot is not None and hasattr(obj.animation_data, "action_slot"):
                     obj.animation_data.action_slot = action_slot
     try:
         bpy.context.view_layer.update()

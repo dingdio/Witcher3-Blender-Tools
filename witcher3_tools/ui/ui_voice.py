@@ -872,11 +872,20 @@ def _get_selected_speaker(context):
         return scene.witcher_voice_list[scene.witcher_voice_list_index].speaker
     return ""
 
+def _get_sequence_editor_strips(sequence_editor):
+    if sequence_editor is None:
+        return None
+    strips = getattr(sequence_editor, "sequences", None)
+    if strips is None:
+        strips = getattr(sequence_editor, "strips", None)
+    return strips
+
 def _get_next_sound_channel(scene):
-    if not scene.sequence_editor:
+    strips = _get_sequence_editor_strips(getattr(scene, "sequence_editor", None))
+    if strips is None:
         return 1
     channels = [
-        strip.channel for strip in scene.sequence_editor.sequences
+        strip.channel for strip in strips
         if strip.type == 'SOUND'
     ]
     return max(channels) + 1 if channels else 1
@@ -1369,17 +1378,20 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
 
         if not scene.sequence_editor:
             scene.sequence_editor_create()
+        strips = _get_sequence_editor_strips(scene.sequence_editor)
+        if strips is None:
+            raise RuntimeError("Blender sequence editor strips API is unavailable")
 
         if getattr(scene, "witcher_voice_replace_audio", False):
-            sound_strips = [strip for strip in scene.sequence_editor.sequences if strip.type == 'SOUND']
+            sound_strips = [strip for strip in strips if strip.type == 'SOUND']
             for strip in sound_strips:
-                scene.sequence_editor.sequences.remove(strip)
+                strips.remove(strip)
 
         # try:
         #     soundstrip = scene.sequence_editor.sequences.new_sound("voiceline", str(soundPath), 1, at_frame)
         # except Exception as e:
         channel = 1 if getattr(scene, "witcher_voice_replace_audio", False) else _get_next_sound_channel(scene)
-        soundstrip = scene.sequence_editor.sequences.new_sound(
+        soundstrip = strips.new_sound(
             soundPath.stem,
             str(soundPath),
             channel=channel,

@@ -185,9 +185,14 @@ class ButtonOperatorImportVoice(bpy.types.Operator, ImportHelper):
                 bpy.ops.sequencer.delete()
                 if not scene.sequence_editor:
                     scene.sequence_editor_create()
+                from .ui_voice import _get_sequence_editor_strips
+                strips = _get_sequence_editor_strips(scene.sequence_editor)
+                if strips is None:
+                    self.report({'ERROR'}, "Blender sequencer strips API is unavailable.")
+                    return {'CANCELLED'}
 
                 #Sequences.new_sound(name, filepath, channel, frame_start)
-                soundstrip = scene.sequence_editor.sequences.new_sound("voiceline", soundPath, 3, 0)
+                soundstrip = strips.new_sound("voiceline", soundPath, 3, 0)
             if not active_armature:
                 self.report({'WARNING'}, "No armature selected. Load the action onto a character after import.")
             elif not _armature_has_face_morphs(active_armature):

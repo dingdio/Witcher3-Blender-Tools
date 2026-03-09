@@ -1239,6 +1239,8 @@ class WITCH_OT_toggle_rot90(bpy.types.Operator):
     def _is_special_attachment_armature(self, arm_obj):
         if not arm_obj or arm_obj.type != 'ARMATURE':
             return False
+        if str(arm_obj.get("w2_special_attachment_mode", "")).strip() == "matched_armature":
+            return False
         if bool(arm_obj.get("w2_special_attachment", False)):
             return True
         if arm_obj.get("witcher_type") in self._SPECIAL_ATTACHMENT_TYPES:

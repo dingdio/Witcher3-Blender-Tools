@@ -6,6 +6,176 @@ from . import file_helpers
 
 log = logging.getLogger(__name__)
 
+
+def _normalized_bone_name(name):
+    return file_helpers.rm_ns(name or "")
+
+
+def _normalized_object_path(obj):
+    if not obj:
+        return ""
+    value = obj.get("witcher_path", "")
+    if not value:
+        return ""
+    return os.path.normcase(str(value).replace("/", "\\"))
+
+
+def _build_pose_bone_map(armature_obj):
+    if not armature_obj or armature_obj.type != 'ARMATURE' or not armature_obj.pose:
+        return {}
+    bone_map = {}
+    for pose_bone in armature_obj.pose.bones:
+        bone_map[_normalized_bone_name(pose_bone.name)] = pose_bone
+    return bone_map
+
+
+def _should_copy_root_for_child_armature(arm_child):
+    if not arm_child or arm_child.type != 'ARMATURE':
+        return False
+    witcher_type = str(arm_child.get("witcher_type", "")).strip()
+    if witcher_type == "CMimicComponent":
+        return True
+    if str(arm_child.get("mimicFaceFile", "")).strip():
+        return True
+    return False
+
+
+def get_matching_pose_bone_pairs(arm_parent, arm_child):
+    if not arm_parent or not arm_child:
+        return []
+    parent_map = _build_pose_bone_map(arm_parent)
+    if not parent_map:
+        return []
+
+    matches = []
+    child_pose = getattr(arm_child, "pose", None)
+    if not child_pose:
+        return matches
+
+    for child_bone in child_pose.bones:
+        parent_bone = parent_map.get(_normalized_bone_name(child_bone.name))
+        if parent_bone is not None:
+            matches.append((parent_bone, child_bone))
+    return matches
+
+
+def should_auto_align_armatures(arm_parent, arm_child):
+    if not arm_parent or not arm_child:
+        return False
+    if arm_parent.type != 'ARMATURE' or arm_child.type != 'ARMATURE':
+        return False
+
+    matches = get_matching_pose_bone_pairs(arm_parent, arm_child)
+    if not matches:
+        return False
+
+    parent_path = _normalized_object_path(arm_parent)
+    child_path = _normalized_object_path(arm_child)
+    if parent_path and child_path and parent_path == child_path:
+        return True
+
+    parent_bone_count = len(getattr(getattr(arm_parent, "pose", None), "bones", []))
+    child_bone_count = len(getattr(getattr(arm_child, "pose", None), "bones", []))
+    if not parent_bone_count or not child_bone_count:
+        return False
+
+    match_count = len(matches)
+    smaller_rig = min(parent_bone_count, child_bone_count)
+    if child_bone_count >= 2 and match_count == child_bone_count:
+        return True
+    if smaller_rig >= 4 and match_count >= 4 and (match_count / smaller_rig) >= 0.6:
+        return True
+    return False
+
+
+def align_armatures_for_constraints(arm_parent, arm_child):
+    """Snap the child armature into the parent's current pose before adding constraints."""
+    if not should_auto_align_armatures(arm_parent, arm_child):
+        return 0
+
+    aligned = 0
+    saved_active = None
+    saved_selection = []
+    try:
+        saved_active = bpy.context.view_layer.objects.active
+        saved_selection = [obj for obj in bpy.context.selected_objects]
+    except Exception:
+        saved_selection = []
+
+    try:
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+        except Exception:
+            pass
+
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+
+        dg = None
+        parent_eval = arm_parent
+        try:
+            dg = bpy.context.evaluated_depsgraph_get()
+            parent_eval = arm_parent.evaluated_get(dg)
+        except Exception:
+            parent_eval = arm_parent
+
+        parent_world = parent_eval.matrix_world.copy()
+        parent_eval_map = _build_pose_bone_map(parent_eval)
+        if not parent_eval_map:
+            return 0
+
+        try:
+            arm_child.matrix_world = parent_world
+        except Exception:
+            pass
+
+        bpy.ops.object.select_all(action='DESELECT')
+        arm_child.select_set(True)
+        bpy.context.view_layer.objects.active = arm_child
+        bpy.ops.object.mode_set(mode='POSE', toggle=False)
+
+        inv_child_world = arm_child.matrix_world.inverted()
+        for child_bone in arm_child.pose.bones:
+            parent_bone = parent_eval_map.get(_normalized_bone_name(child_bone.name))
+            if parent_bone is None:
+                continue
+            target_world_matrix = parent_world @ parent_bone.matrix
+            try:
+                child_bone.matrix = inv_child_world @ target_world_matrix
+                aligned += 1
+            except Exception:
+                continue
+
+        bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+    finally:
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+        except Exception:
+            pass
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in saved_selection:
+                if obj:
+                    obj.select_set(True)
+            bpy.context.view_layer.objects.active = saved_active
+        except Exception:
+            pass
+
+    if aligned:
+        log.info(
+            "Aligned %d matching bones on '%s' to '%s' before creating constraints.",
+            aligned,
+            arm_child.name,
+            arm_parent.name,
+        )
+    return aligned
+
 #add copytransforms on def bones
 def CreateConstraints(arm_parent, arm_child):
     #switch to pose mode and find pose bones    
@@ -55,11 +225,18 @@ def constrain_w3_rig(arm_parent, arm_child, mo=False):
     log.info("Creating constraints...")
     CreateConstraints(arm_parent, arm_child)   
 
-def CreateConstraints2(arm_parent: bpy.types.Object, arm_child:bpy.types.Object):
+def CreateConstraints2(arm_parent: bpy.types.Object, arm_child:bpy.types.Object, align_before=True):
     if not isinstance(arm_parent, bpy.types.Object) or arm_parent.type != 'ARMATURE':
         raise TypeError("arm_parent must be a Blender armature object")
     if not isinstance(arm_child, bpy.types.Object) or arm_child.type != 'ARMATURE':
         raise TypeError("arm_child must be a Blender armature object")
+
+    aligned_count = 0
+    if align_before:
+        try:
+            aligned_count = align_armatures_for_constraints(arm_parent, arm_child)
+        except Exception as e:
+            log.debug("Pre-constraint armature alignment failed for %s -> %s: %s", arm_parent.name, arm_child.name, e)
 
     bpy.ops.object.select_all(action='DESELECT')
     arm_parent.select_set(True)
@@ -74,6 +251,7 @@ def CreateConstraints2(arm_parent: bpy.types.Object, arm_child:bpy.types.Object)
     
     #flat_child_hierarchy = all(bone.parent is None for bone in arm_child.data.edit_bones)
     is_dyng = (sum(bone.name.startswith("dyng_") for bone in arm_child.data.bones) > len(arm_child.data.bones) / 2) or 'dyng' in arm_child.name.lower()
+    force_root_copy = _should_copy_root_for_child_armature(arm_child)
     
     for tgt_parent_bone in arm_parent.pose.bones:
         tgt_child_bone = False
@@ -102,10 +280,16 @@ def CreateConstraints2(arm_parent: bpy.types.Object, arm_child:bpy.types.Object)
             for cons in tgt_child_bone.constraints:
                 tgt_child_bone.constraints.remove(cons)
             if tgt_child_bone.parent is None and not is_dyng: #and tgt_parent_bone.parent is None and is_dyng: # check for root bone that needs moving into position
-                child_of = tgt_child_bone.constraints.new('CHILD_OF')
-                child_of.name = tgt_parent_bone.name + " to " + tgt_child_bone.name
-                child_of.target = arm_parent
-                child_of.subtarget = tgt_parent_bone.name
+                if aligned_count > 0 or force_root_copy:
+                    copyTransform = tgt_child_bone.constraints.new('COPY_TRANSFORMS')
+                    copyTransform.name = tgt_parent_bone.name + " to " + tgt_child_bone.name
+                    copyTransform.target = arm_parent
+                    copyTransform.subtarget = tgt_parent_bone.name
+                else:
+                    child_of = tgt_child_bone.constraints.new('CHILD_OF')
+                    child_of.name = tgt_parent_bone.name + " to " + tgt_child_bone.name
+                    child_of.target = arm_parent
+                    child_of.subtarget = tgt_parent_bone.name
             else:
                 copyTransform = tgt_child_bone.constraints.new('COPY_TRANSFORMS')
                 copyTransform.name = tgt_parent_bone.name + " to " + tgt_child_bone.name

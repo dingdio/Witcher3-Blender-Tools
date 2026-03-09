@@ -1469,16 +1469,33 @@ def process_special_attachment(constraint, objdict):
                 use_rot90 = bool(rig_settings.rot90_imported)
 
         # Determine parent bone.
-        # Only bind when parentSlotName is explicitly set in the CHardAttachment. Binding everything caused issues with crossbows
+        # Prefer full-rig matching only for clear duplicate skeletons; otherwise
+        # only bind when parentSlotName is explicitly set in the CHardAttachment.
         p_bone = None
         if p_bone_name:
             p_bone = parent_arm.pose.bones.get(p_bone_name)
 
-        if p_bone is not None:
+        can_match_full_armature = (
+            target_object.type == 'ARMATURE'
+            and constrain_util.should_auto_align_armatures(parent_arm, target_object)
+        )
+
+        if can_match_full_armature:
+            target_object.parent = parent_arm
+            target_object["w2_special_attachment"] = True
+            target_object["w2_special_parent_arm"] = parent_arm.name
+            target_object["w2_special_parent_bone"] = p_bone.name if p_bone else ""
+            target_object["w2_special_attachment_mode"] = "matched_armature"
+            target_object.parent_type = "OBJECT"
+            target_object.parent_bone = ""
+            constrain_util.CreateConstraints2(parent_arm, target_object)
+
+        elif p_bone is not None:
             target_object.parent = parent_arm
             target_object["w2_special_attachment"] = True
             target_object["w2_special_parent_arm"] = parent_arm.name
             target_object["w2_special_parent_bone"] = p_bone.name
+            target_object["w2_special_attachment_mode"] = "root_copy"
             # Keep one consistent binding mode for special attachment armatures:
             # always object parent + root COPY_TRANSFORMS, regardless of Rot90 state.
             if target_object.pose:
@@ -1656,7 +1673,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 if 'transform' in chunk and chunk['transform']:
                     rt = _coerce_engine_transform(chunk['transform'])
                     if rt is not None:
-                        set_blender_object_transform(mesh, rt, rotate_180=False)
+                        set_blender_object_transform(mesh, rt, rotate_180=False, no_rotation=True)
 
         # Handle cloth resources
         if "resource" in chunk and not import_redcloth_enabled:
@@ -2256,17 +2273,25 @@ def import_app(context,
     if group_parent:
         group_parent = entity.name
         # Check if appearance group empty already exists (prevents duplicates on re-load)
+        # Use custom property 'witcher_app_name' to match regardless of Blender-renamed object names
         empty_transform = None
         for child in base_animation_skeleton.children:
-            if child.type == 'EMPTY' and child.name == selectedAppearance.name:
+            if child.type == 'EMPTY' and child.get("witcher_app_name") == selectedAppearance.name:
                 empty_transform = child
                 break
-        
+        if empty_transform is None:
+            # Fallback: name match for empties created before this fix
+            for child in base_animation_skeleton.children:
+                if child.type == 'EMPTY' and child.name == selectedAppearance.name:
+                    empty_transform = child
+                    break
+
         if empty_transform is None:
             # Create new group for this appearance
             bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
             empty_transform = bpy.context.object
             empty_transform.name = selectedAppearance.name
+            empty_transform["witcher_app_name"] = selectedAppearance.name
             empty_transform.parent = base_animation_skeleton
 
     morphs_todo = []
