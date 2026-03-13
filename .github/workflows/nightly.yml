@@ -1,0 +1,49 @@
+name: Nightly Release
+
+on:
+  push:
+    branches: [dev_new]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify structure
+        run: |
+          echo "Checking that blender_manifest.toml is at the root of witcher3_tools/..."
+          ls witcher3_tools/blender_manifest.toml
+
+      - name: Zip addon
+        run: |
+          cd witcher3_tools
+          zip -r ../witcher3_tools.zip .
+          cd ..
+          echo "--- Zip contents ---"
+          unzip -l witcher3_tools.zip | head -30
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Update nightly release
+        uses: andelf/nightly-release@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: nightly
+          name: "Nightly Build"
+          prerelease: true
+          body: |
+            Automated nightly build from `dev_new` branch.
+            Commit: ${{ steps.sha.outputs.short }}
+            Built: ${{ github.event.head_commit.timestamp }}
+
+            ⚠️ This is an unstable development build — use at your own risk.
+
+            **Install:** Download `witcher3_tools.zip` and install via Blender's addon preferences.
+          files: witcher3_tools.zip
