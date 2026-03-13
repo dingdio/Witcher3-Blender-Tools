@@ -803,17 +803,19 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
         # Vertex Color #
         #==============#
         color_data = meshDataBl.vertexColor
-        if len(color_data) != vert_count:
+        if color_data is not None and len(color_data) != vert_count:
             color_data = [[0.0, 0.0, 0.0, 0.0] for _ in range(vert_count)]
 
-        has_meaningful_color = any(
+        has_meaningful_color = color_data is not None and any(
             abs(float(col[0])) > 1e-6
             or abs(float(col[1])) > 1e-6
             or abs(float(col[2])) > 1e-6
             or abs(float(col[3])) > 1e-6
-            for col in (color_data or [])
+            for col in color_data
         )
         if CData.useExtraStreams or has_meaningful_color:
+            if color_data is None:
+                color_data = [[1.0, 1.0, 1.0, 1.0]] * vert_count
             color_attr = mesh.color_attributes.new(name = 'Color', domain = 'POINT', type = 'BYTE_COLOR')
             flat_colors = np.array(color_data, dtype=np.float32).ravel()
             color_attr.data.foreach_set("color", flat_colors)

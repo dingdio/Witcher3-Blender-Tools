@@ -1004,7 +1004,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
                     final_meshdata.vertexColor = colors
                     final_meshdata.UV2_vertex3DCoords = uv2s
                 else:
-                    final_meshdata.vertexColor = [[1.0, 1.0, 1.0, 1.0]] * meshInfo.numVertices
+                    final_meshdata.vertexColor = None
                     final_meshdata.UV2_vertex3DCoords = [[0.0, 1.0]] * meshInfo.numVertices
 
                 #TODO there is zero padding after the final vertex of all meshes
