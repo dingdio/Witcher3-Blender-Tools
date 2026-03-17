@@ -15,6 +15,7 @@ from pathlib import Path
 from bpy.props import StringProperty, IntProperty, EnumProperty, BoolProperty
 from bpy.types import Panel, Operator
 
+from .. import w3_asset_browser
 from ..extension_paths import get_dev_panel_overrides
 
 
@@ -60,6 +61,12 @@ def save_config(data):
 # Global config cache
 _config_cache = None
 _config_mtime = 0
+_journal_browser_diag_cache = {}
+
+_JOURNAL_BROWSER_LABELS = {
+    "BESTIARY": "Bestiary Browser",
+    "CHARACTERS": "Character Browser",
+}
 
 
 def get_config():
@@ -84,6 +91,139 @@ def invalidate_cache():
     global _config_cache, _config_mtime
     _config_cache = None
     _config_mtime = 0
+
+
+def _safe_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _normalize_browser_path(path):
+    path = _safe_text(path)
+    if not path:
+        return ""
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    return w3_asset_browser._normalize_depot_path(path)
+
+
+def _path_signature(path):
+    path = _safe_text(path)
+    if not path:
+        return "missing"
+    try:
+        stat = os.stat(path)
+        return f"{int(stat.st_mtime)}:{stat.st_size}"
+    except OSError:
+        return "missing"
+
+
+def _is_w2ent_path(path):
+    return _safe_text(path).lower().endswith(".w2ent")
+
+
+def _journal_browser_diag_signature(browser_key):
+    cache_path, _meta_path = w3_asset_browser._cache_file_paths(browser_key)
+    map_path = w3_asset_browser._builtin_character_entity_map_path(browser_key)
+    return (
+        _path_signature(cache_path),
+        _path_signature(map_path),
+    )
+
+
+def _build_journal_browser_diag_item(entry, overrides):
+    journal_path = _normalize_browser_path(entry.get("journal_path"))
+    name = _safe_text(entry.get("name")) or Path(journal_path).stem or "<unnamed>"
+    override_present = journal_path in overrides
+    override_value = _normalize_browser_path(overrides.get(journal_path, "")) if override_present else ""
+    cached_repo_path = _normalize_browser_path(entry.get("repo_path"))
+    cached_repo_source = _safe_text(entry.get("repo_source")) or "missing"
+
+    if cached_repo_source == "journal" and _is_w2ent_path(cached_repo_path):
+        repo_path = cached_repo_path
+        repo_source = "journal"
+    elif _is_w2ent_path(override_value):
+        repo_path = override_value
+        repo_source = "override"
+    else:
+        repo_path = ""
+        repo_source = "missing"
+
+    if repo_source == "journal":
+        resolution_state = "journal"
+    elif repo_source == "override":
+        resolution_state = "override"
+    elif override_present:
+        resolution_state = "override-empty"
+    else:
+        resolution_state = "override-missing"
+
+    return {
+        "name": name,
+        "journal_path": journal_path,
+        "repo_path": repo_path,
+        "repo_source": repo_source,
+        "override_present": override_present,
+        "override_value": override_value,
+        "resolution_state": resolution_state,
+    }
+
+
+def _load_journal_browser_diagnostics(browser_key):
+    browser_key = _safe_text(browser_key).upper() or "BESTIARY"
+    signature = _journal_browser_diag_signature(browser_key)
+    cached = _journal_browser_diag_cache.get(browser_key)
+    if cached and cached.get("signature") == signature:
+        return cached.get("data")
+
+    entries = w3_asset_browser._load_journal_entries_from_disk_payload(browser_key)
+    overrides = w3_asset_browser._load_builtin_character_entity_map(browser_key)
+
+    data = {
+        "browser_key": browser_key,
+        "label": _JOURNAL_BROWSER_LABELS.get(browser_key, browser_key.title()),
+        "cache_available": isinstance(entries, list),
+        "override_count": len(overrides),
+        "override_path": w3_asset_browser._builtin_character_entity_map_path(browser_key),
+        "entry_count": 0,
+        "resolved_count": 0,
+        "unresolved": [],
+    }
+
+    if isinstance(entries, list):
+        for entry in entries:
+            if _safe_text(entry.get("entry_kind")).lower() == "group":
+                continue
+
+            item = _build_journal_browser_diag_item(entry, overrides)
+            data["entry_count"] += 1
+
+            if _is_w2ent_path(item["repo_path"]):
+                data["resolved_count"] += 1
+            else:
+                data["unresolved"].append(item)
+
+    data["unresolved"].sort(
+        key=lambda item: (
+            _safe_text(item.get("name")).lower(),
+            _safe_text(item.get("journal_path")).lower(),
+        )
+    )
+
+    _journal_browser_diag_cache[browser_key] = {
+        "signature": signature,
+        "data": data,
+    }
+    return data
+
+
+def _journal_browser_diag_status_text(item):
+    if _safe_text(item.get("resolution_state")) == "override-empty":
+        return "override entry is blank"
+    return "missing from overrides"
 
 
 # =============================================================================
@@ -253,6 +393,20 @@ class DEV_OT_OpenInExplorer(Operator):
                 subprocess.Popen(f'explorer "{parent}"')
             else:
                 self.report({'WARNING'}, f"Path not found: {self.filepath}")
+        return {'FINISHED'}
+
+
+class DEV_OT_CopyText(Operator):
+    """Copy text to clipboard"""
+    bl_idname = "witcher_dev.copy_text"
+    bl_label = "Copy Text"
+
+    value: StringProperty(default="")
+    report_label: StringProperty(default="Text")
+
+    def execute(self, context):
+        context.window_manager.clipboard = self.value
+        self.report({'INFO'}, f"Copied {self.report_label}")
         return {'FINISHED'}
 
 
@@ -781,6 +935,9 @@ class VIEW3D_PT_witcher_dev(Panel):
         sections = op_data.get("sections", [])
         for sec_idx, section in enumerate(sections):
             self._draw_section(layout, op_type, section, sec_idx, selected_sec, selected_path)
+
+        layout.separator()
+        self._draw_journal_browser_diagnostics(layout)
     
     def _draw_section(self, layout, op_type, section, sec_idx, selected_sec, selected_path):
         """Draw a single section with its paths."""
@@ -877,6 +1034,59 @@ class VIEW3D_PT_witcher_dev(Panel):
         op.operator_type = op_type
         op.section_index = sec_idx
 
+    def _draw_journal_browser_diagnostics(self, layout):
+        root = layout.box()
+        root.label(text="Journal Browser .w2ent Diagnostics", icon='FILE')
+
+        for browser_key in ("BESTIARY", "CHARACTERS"):
+            diagnostics = _load_journal_browser_diagnostics(browser_key)
+            self._draw_journal_browser_diagnostic_box(root, diagnostics)
+
+    def _draw_journal_browser_diagnostic_box(self, layout, diagnostics):
+        box = layout.box()
+        header = box.row(align=True)
+        header.label(text=diagnostics.get("label", "Journal Browser"), icon='FILE')
+        refresh = header.operator("witcher.journal_browser_refresh", text="", icon='FILE_REFRESH')
+        refresh.browser_key = diagnostics.get("browser_key", "")
+
+        if not diagnostics.get("cache_available"):
+            info = box.column(align=True)
+            info.label(text="No browser cache found yet.", icon='INFO')
+            info.label(text="Use refresh here or open the browser once to populate diagnostics.", icon='BLANK1')
+            return
+
+        counts = box.column(align=True)
+        counts.label(text=f"Entries: {int(diagnostics.get('entry_count', 0))}", icon='INFO')
+        counts.label(text=f"Resolved: {int(diagnostics.get('resolved_count', 0))}", icon='CHECKMARK')
+        counts.label(text=f"Unresolved: {len(diagnostics.get('unresolved', []))}", icon='ERROR')
+        counts.label(text=f"Override entries: {int(diagnostics.get('override_count', 0))}", icon='FILE_TEXT')
+
+        override_row = box.row(align=True)
+        override_row.label(text="Overrides JSON", icon='FILE_TEXT')
+        copy_override = override_row.operator("witcher_dev.copy_text", text="", icon='COPYDOWN')
+        copy_override.value = _safe_text(diagnostics.get("override_path"))
+        copy_override.report_label = f"{diagnostics.get('label', 'browser')} override path"
+
+        unresolved_box = box.box()
+        unresolved = diagnostics.get("unresolved", [])
+        unresolved_box.label(text=f"Unresolved Entries: {len(unresolved)}", icon='ERROR')
+
+        if not unresolved:
+            unresolved_box.label(text="All current entries resolved by journal or overrides.", icon='CHECKMARK')
+            return
+
+        column = unresolved_box.column(align=True)
+        for item in unresolved:
+            row = column.row(align=True)
+            row.label(text=_safe_text(item.get("name")) or "<unnamed>", icon='ERROR')
+            row.label(text=_journal_browser_diag_status_text(item))
+            copy_path = row.operator("witcher_dev.copy_text", text="", icon='COPYDOWN')
+            copy_path.value = _safe_text(item.get("journal_path"))
+            copy_path.report_label = "journal repo path"
+
+            path_row = column.row(align=True)
+            path_row.label(text=_safe_text(item.get("journal_path")), icon='FILE')
+
 
 # =============================================================================
 # Registration
@@ -885,6 +1095,7 @@ class VIEW3D_PT_witcher_dev(Panel):
 classes = [
     DEV_OT_OpenConfigFile,
     DEV_OT_OpenInExplorer,
+    DEV_OT_CopyText,
     DEV_OT_ReloadConfig,
     DEV_OT_AddSection,
     DEV_OT_RemoveSection,

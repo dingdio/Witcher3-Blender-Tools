@@ -1450,18 +1450,6 @@ CACHE_ITEMS = (
         "description": "Characters browser entry cache.",
     },
     {
-        "name": "character_journal_entity_map.json",
-        "relative_path": os.path.join("JournalBrowser", "character_journal_entity_map.json"),
-        "label": "character_journal_entity_map.json",
-        "description": "Manual and auto-resolved mapping for Character journal entries to entity templates.",
-    },
-    {
-        "name": "bestiary_journal_entity_map.json",
-        "relative_path": os.path.join("JournalBrowser", "bestiary_journal_entity_map.json"),
-        "label": "bestiary_journal_entity_map.json",
-        "description": "Manual and auto-resolved mapping for Bestiary journal entries to entity templates.",
-    },
-    {
         "name": "journal_icons_bestiary",
         "relative_path": os.path.join("JournalBrowser", "icons", "bestiary"),
         "label": "journal icons (bestiary)",
@@ -1686,8 +1674,6 @@ def _refresh_cache_by_name(cache_name: str) -> bool:
         "bundle_cache_mods.pkl": lambda: BundleManager.Get(loadmods=True, reset_cache=True),
         "journal_browser_bestiary.pkl": lambda: _refresh_journal_cache("BESTIARY"),
         "journal_browser_characters.pkl": lambda: _refresh_journal_cache("CHARACTERS"),
-        "character_journal_entity_map.json": lambda: _refresh_journal_cache("CHARACTERS"),
-        "bestiary_journal_entity_map.json": lambda: _refresh_journal_cache("BESTIARY"),
         "journal_icons_bestiary": lambda: _refresh_journal_cache("BESTIARY"),
         "journal_icons_characters": lambda: _refresh_journal_cache("CHARACTERS"),
         "pathhashes.csv": _refresh_pathhashes_cache,

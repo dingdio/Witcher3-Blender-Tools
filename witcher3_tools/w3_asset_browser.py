@@ -10,8 +10,6 @@ import shutil
 import re
 from collections import Counter
 from typing import Iterable
-from datetime import datetime, timezone
-from difflib import SequenceMatcher
 
 log = logging.getLogger(__name__)
 from .importers import import_entity
@@ -21,7 +19,7 @@ from .CR2W.witcher_cache.Bundles import LoadBundleManager
 from .CR2W.witcher_cache.Bundles.BundleItem import BundleItem
 from .CR2W.witcher_cache.blender_common import get_game_path
 from .CR2W.witcher_cache import cache_meta
-from . import get_uncook_path, get_all_addon_prefs
+from . import get_uncook_path
 from .extension_paths import get_cache_root
 from .CR2W.common_blender import (
     repo_file,
@@ -35,29 +33,15 @@ from .CR2W.witcher_cache.TextureCache import LoadTextureManager
 from .CR2W.witcher_cache.TextureCache.TextureCacheItem import TextureCacheItem
 
 IMAGE_BROWSER_PAGE_PROP = "witcher_image_browser_current_page"
-JOURNAL_BROWSER_CACHE_VERSION = 8
-JOURNAL_ENTITY_MAP_VERSION = 1
+JOURNAL_BROWSER_CACHE_VERSION = 10
 
-_CHARACTER_ENTITY_MAP_FILE = "character_journal_entity_map.json"
-_BESTIARY_ENTITY_MAP_FILE = "bestiary_journal_entity_map.json"
-_CHARACTER_QUEST_SEARCH_SUBDIRS = (
-    r"quests\main_npcs",
-    r"quests\secondary_npcs",
-    r"dlc\bob\data\quests\main_npcs",
-    r"dlc\bob\data\quests\secondary_npcs",
-    r"dlc\ep1\data\quests\main_npcs",
-    r"dlc\ep1\data\quests\secondary_npcs",
-)
-_MONSTER_ENTITY_SEARCH_SUBDIRS = (
-    r"characters\npc_entities\monsters",
-    r"dlc\bob\data\characters\npc_entities\monsters",
-    r"dlc\ep1\data\characters\npc_entities\monsters",
-)
-_ENTITY_MAP_FILE_BY_BROWSER_KEY = {
-    "CHARACTERS": _CHARACTER_ENTITY_MAP_FILE,
-    "BESTIARY": _BESTIARY_ENTITY_MAP_FILE,
+_BUILTIN_CHARACTER_ENTITY_MAP_FILE = "journal_entity_overrides.characters.json"
+_BUILTIN_BESTIARY_ENTITY_MAP_FILE = "journal_entity_overrides.bestiary.json"
+_BUILTIN_ENTITY_MAP_FILE_BY_BROWSER_KEY = {
+    "CHARACTERS": _BUILTIN_CHARACTER_ENTITY_MAP_FILE,
+    "BESTIARY": _BUILTIN_BESTIARY_ENTITY_MAP_FILE,
 }
-_ENTITY_RESOLVE_BROWSER_KEYS = frozenset(_ENTITY_MAP_FILE_BY_BROWSER_KEY.keys())
+_ENTITY_RESOLVE_BROWSER_KEYS = frozenset(_BUILTIN_ENTITY_MAP_FILE_BY_BROWSER_KEY.keys())
 
 JOURNAL_BROWSER_CONFIGS = {
     "BESTIARY": {
@@ -104,6 +88,7 @@ _JOURNAL_BROWSER_REFRESH_SERIAL = {
     "BESTIARY": 0,
     "CHARACTERS": 0,
 }
+_BUILTIN_JOURNAL_ENTITY_MAP_CACHE = {}
 
 
 def _normalize_depot_path(path: str) -> str:
@@ -144,17 +129,13 @@ def _cache_file_paths(browser_key: str):
     return cache_path, cache_meta.get_meta_path(cache_path)
 
 
-def _character_entity_map_path(browser_key: str = "CHARACTERS"):
+def _builtin_character_entity_map_path(browser_key: str = "CHARACTERS"):
     browser_key = _safe_text(browser_key).upper() or "CHARACTERS"
-    cache_root = get_cache_root(create=True)
-    cache_dir = os.path.join(cache_root, "JournalBrowser")
-    os.makedirs(cache_dir, exist_ok=True)
-    file_name = _ENTITY_MAP_FILE_BY_BROWSER_KEY.get(browser_key, _CHARACTER_ENTITY_MAP_FILE)
-    return os.path.join(cache_dir, file_name)
+    file_name = _BUILTIN_ENTITY_MAP_FILE_BY_BROWSER_KEY.get(browser_key, _BUILTIN_CHARACTER_ENTITY_MAP_FILE)
+    return os.path.join(os.path.dirname(__file__), "CR2W", "data", file_name)
 
 
-def _character_entity_map_signature_token(browser_key: str = "CHARACTERS"):
-    path = _character_entity_map_path(browser_key)
+def _file_signature_token(path: str):
     if not win_path_exists(path):
         return "missing"
     try:
@@ -163,34 +144,8 @@ def _character_entity_map_signature_token(browser_key: str = "CHARACTERS"):
         return "unknown"
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _normalize_name_key(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", _safe_text(text).lower())
-
-
-def _tokenize_name(text: str):
-    return [t for t in re.split(r"[^a-z0-9]+", _safe_text(text).lower()) if t]
-
-
-def _journal_scope_from_depot_path(path: str) -> str:
-    lower = _normalize_depot_path(path).lower()
-    if lower.startswith("dlc\\bob\\"):
-        return "bob"
-    if lower.startswith("dlc\\ep1\\"):
-        return "ep1"
-    return "base"
-
-
-def _candidate_scope_from_path(path: str) -> str:
-    lower = _safe_text(path).replace("/", "\\").lower()
-    if "\\dlc\\bob\\data\\" in lower or lower.startswith("dlc\\bob\\data\\"):
-        return "bob"
-    if "\\dlc\\ep1\\data\\" in lower or lower.startswith("dlc\\ep1\\data\\"):
-        return "ep1"
-    return "base"
+def _builtin_character_entity_map_signature_token(browser_key: str = "CHARACTERS"):
+    return _file_signature_token(_builtin_character_entity_map_path(browser_key))
 
 
 def _normalize_mapped_repo_path(path: str) -> str:
@@ -202,357 +157,74 @@ def _normalize_mapped_repo_path(path: str) -> str:
     return _normalize_depot_path(path)
 
 
-def _depot_like_path_from_r4data(abs_path: str) -> str:
-    normalized = _safe_text(abs_path).replace("/", "\\")
-    lower = normalized.lower()
-    marker = "\\r4data\\"
-    idx = lower.find(marker)
-    if idx >= 0:
-        rel = normalized[idx + len(marker):]
-        return _normalize_depot_path(rel)
-    return _normalize_depot_path(normalized)
-
-
-def _character_entity_search_roots(browser_key: str = "CHARACTERS"):
+def _load_builtin_character_entity_map(browser_key: str = "CHARACTERS"):
     browser_key = _safe_text(browser_key).upper() or "CHARACTERS"
-    roots = []
+    path = _builtin_character_entity_map_path(browser_key)
+    token = _builtin_character_entity_map_signature_token(browser_key)
+    cached = _BUILTIN_JOURNAL_ENTITY_MAP_CACHE.get(browser_key)
+    if cached and cached.get("token") == token:
+        return dict(cached.get("data") or {})
 
-    def add(path: str):
-        path = _safe_text(path)
-        if not path:
-            return
+    mapping = {}
+    if win_path_exists(path):
         try:
-            resolved = os.path.normpath(bpy.path.abspath(path))
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
         except Exception:
-            resolved = os.path.normpath(path)
-        if not resolved:
-            return
-        try:
-            if not os.path.isdir(resolved):
-                return
-        except Exception:
-            return
-        if resolved not in roots:
-            roots.append(resolved)
+            log.warning("Failed to read built-in journal entity overrides: %s", path, exc_info=True)
+            loaded = {}
 
-    base_roots = []
-    try:
-        prefs = get_all_addon_prefs(bpy.context)
-        for attr_name in ("redkit_depot_path", "uncook_path"):
-            value = _safe_text(getattr(prefs, attr_name, ""))
-            if value:
-                base_roots.append(value)
-    except Exception:
-        pass
+        if isinstance(loaded, dict) and isinstance(loaded.get("journals"), dict):
+            loaded = loaded.get("journals")
 
-    subdirs = _CHARACTER_QUEST_SEARCH_SUBDIRS
-    if browser_key == "BESTIARY":
-        subdirs = _MONSTER_ENTITY_SEARCH_SUBDIRS
-
-    for base_root in base_roots:
-        for rel in subdirs:
-            add(os.path.join(base_root, rel))
-    return roots
-
-
-def _build_character_entity_candidates(search_roots: list[str], browser_key: str = "CHARACTERS"):
-    candidates = []
-    seen_repo_paths = set()
-    for root in search_roots:
-        try:
-            walker = os.walk(root)
-        except Exception:
-            continue
-        for dirpath, _dirnames, filenames in walker:
-            for filename in filenames:
-                if not filename.lower().endswith(".w2ent"):
+        if isinstance(loaded, dict):
+            for journal_path, repo_path in loaded.items():
+                if not isinstance(journal_path, str) or not isinstance(repo_path, str):
                     continue
-                abs_path = os.path.normpath(os.path.join(dirpath, filename))
-                depot_path = _depot_like_path_from_r4data(abs_path)
-                repo_path = depot_path or abs_path
-                repo_key = repo_path.lower()
-                if repo_key in seen_repo_paths:
-                    continue
-                seen_repo_paths.add(repo_key)
+                normalized_journal = _normalize_depot_path(journal_path)
+                normalized_repo = _normalize_mapped_repo_path(repo_path)
+                if normalized_journal:
+                    mapping[normalized_journal] = normalized_repo
 
-                stem = os.path.splitext(filename)[0]
-                path_without_ext = os.path.splitext(depot_path or abs_path)[0]
-                token_text = stem + " " + path_without_ext.replace("\\", " ")
-                candidates.append({
-                    "abs_path": abs_path,
-                    "repo_path": repo_path,
-                    "stem": stem,
-                    "stem_key": _normalize_name_key(stem),
-                    "path_key": _normalize_name_key(path_without_ext),
-                    "tokens": set(_tokenize_name(token_text)),
-                    "scope": _candidate_scope_from_path(depot_path or abs_path),
-                })
-    log.info(
-        "%s journal entity matching: indexed %d candidate .w2ent files from %d roots",
-        browser_key,
-        len(candidates),
-        len(search_roots),
-    )
-    return candidates
-
-
-def _score_character_entity_candidate(journal_depot_path: str, journal_name: str, journal_stem: str, candidate: dict) -> int:
-    score = 0
-    journal_name_key = _normalize_name_key(journal_name)
-    journal_stem_key = _normalize_name_key(journal_stem)
-    primary_key = journal_stem_key or journal_name_key
-    candidate_stem_key = _safe_text(candidate.get("stem_key"))
-    candidate_path_key = _safe_text(candidate.get("path_key"))
-
-    if primary_key and candidate_stem_key == primary_key:
-        score += 320
-    if journal_name_key and candidate_stem_key == journal_name_key:
-        score += 260
-
-    if primary_key and candidate_stem_key and primary_key in candidate_stem_key:
-        score += 170
-    if journal_name_key and candidate_stem_key and journal_name_key in candidate_stem_key:
-        score += 150
-    if primary_key and candidate_path_key and primary_key in candidate_path_key:
-        score += 120
-    if journal_name_key and candidate_path_key and journal_name_key in candidate_path_key:
-        score += 90
-    if primary_key and candidate_stem_key and candidate_stem_key in primary_key and len(candidate_stem_key) >= 5:
-        score += 90
-
-    if primary_key and candidate_stem_key:
-        score += int(80 * SequenceMatcher(None, primary_key, candidate_stem_key).ratio())
-    if journal_name_key and candidate_stem_key:
-        score += int(50 * SequenceMatcher(None, journal_name_key, candidate_stem_key).ratio())
-
-    journal_tokens = set(_tokenize_name(journal_name) + _tokenize_name(journal_stem))
-    candidate_tokens = set(candidate.get("tokens") or ())
-    if journal_tokens and candidate_tokens:
-        overlap = journal_tokens & candidate_tokens
-        if overlap:
-            score += len(overlap) * 26
-            score += int((len(overlap) / max(1, len(journal_tokens))) * 70)
-
-    journal_scope = _journal_scope_from_depot_path(journal_depot_path)
-    candidate_scope = _safe_text(candidate.get("scope")) or "base"
-    if journal_scope == candidate_scope:
-        score += 60
-    elif journal_scope == "base" and candidate_scope != "base":
-        score -= 30
-    elif journal_scope != "base" and candidate_scope == "base":
-        score -= 10
-    elif journal_scope != candidate_scope:
-        score -= 50
-
-    candidate_repo_lower = _safe_text(candidate.get("repo_path")).lower()
-    if "\\main_npcs\\" in candidate_repo_lower:
-        score += 8
-    if "\\secondary_npcs\\" in candidate_repo_lower:
-        score += 4
-    if "\\monsters\\" in candidate_repo_lower:
-        score += 10
-
-    return score
-
-
-def _guess_character_entity_match(journal_depot_path: str, journal_name: str, candidates: list[dict], limit: int = 8):
-    journal_stem = os.path.splitext(os.path.basename(_normalize_depot_path(journal_depot_path)))[0]
-    scored = []
-    for candidate in candidates:
-        score = _score_character_entity_candidate(journal_depot_path, journal_name, journal_stem, candidate)
-        if score <= 0:
-            continue
-        scored.append((score, candidate))
-
-    scored.sort(
-        key=lambda row: (
-            row[0],
-            len(_safe_text(row[1].get("repo_path"))),
-            _safe_text(row[1].get("repo_path")).lower(),
-        ),
-        reverse=True,
-    )
-    top = scored[:limit]
-
-    candidates_out = []
-    for score, candidate in top:
-        candidates_out.append({
-            "repo_path": _safe_text(candidate.get("repo_path")),
-            "abs_path": _safe_text(candidate.get("abs_path")),
-            "score": int(score),
-            "stem": _safe_text(candidate.get("stem")),
-        })
-
-    auto_repo_path = ""
-    if top:
-        best_score = top[0][0]
-        second_score = top[1][0] if len(top) > 1 else -999
-        if best_score >= 165 and (best_score - second_score >= 15 or best_score >= 260):
-            auto_repo_path = _safe_text(top[0][1].get("repo_path"))
-    return auto_repo_path, candidates_out
-
-
-def _default_character_entity_map():
-    return {
-        "version": JOURNAL_ENTITY_MAP_VERSION,
-        "updated_utc": "",
-        "search_roots": [],
-        "notes": [
-            "Edit `manual_repo_path` for any journal to override auto matching.",
-            "`resolved_repo_path` is computed by the browser and used as fallback when journal entityTemplate is missing.",
-        ],
-        "journals": {},
+    _BUILTIN_JOURNAL_ENTITY_MAP_CACHE[browser_key] = {
+        "token": token,
+        "data": dict(mapping),
     }
-
-
-def _load_character_entity_map(browser_key: str = "CHARACTERS"):
-    path = _character_entity_map_path(browser_key)
-    data = _default_character_entity_map()
-    if not win_path_exists(path):
-        return data
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            loaded = json.load(handle)
-    except Exception:
-        log.warning("Failed to read character journal entity map: %s", path, exc_info=True)
-        return data
-
-    if isinstance(loaded, dict) and "journals" in loaded and isinstance(loaded.get("journals"), dict):
-        data.update(loaded)
-        if not isinstance(data.get("journals"), dict):
-            data["journals"] = {}
-        return data
-
-    # Backward-compat fallback: flat map {journal_path: repo_path}
-    if isinstance(loaded, dict):
-        journals = {}
-        for journal_path, repo_path in loaded.items():
-            if not isinstance(journal_path, str):
-                continue
-            if not isinstance(repo_path, str):
-                continue
-            journals[_normalize_depot_path(journal_path)] = {
-                "manual_repo_path": _normalize_mapped_repo_path(repo_path),
-            }
-        data["journals"] = journals
-    return data
-
-
-def _save_character_entity_map(map_data: dict, browser_key: str = "CHARACTERS"):
-    path = _character_entity_map_path(browser_key)
-    try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(map_data, handle, ensure_ascii=False, indent=2, sort_keys=True)
-    except Exception:
-        log.warning("Failed to write character journal entity map: %s", path, exc_info=True)
+    return mapping
 
 
 def _create_character_entity_resolver(browser_key: str = "CHARACTERS"):
     browser_key = _safe_text(browser_key).upper() or "CHARACTERS"
-    map_data = _load_character_entity_map(browser_key)
-    search_roots = _character_entity_search_roots(browser_key)
-    journals = map_data.get("journals")
-    if not isinstance(journals, dict):
-        journals = {}
-        map_data["journals"] = journals
-    map_data["version"] = JOURNAL_ENTITY_MAP_VERSION
-    map_data["search_roots"] = list(search_roots)
-    if search_roots:
-        log.info("%s journal entity matching roots: %s", browser_key, "; ".join(search_roots))
-    else:
-        log.info("%s journal entity matching roots: none found (set REDkit Depot Path or uncook_path to r4data)", browser_key)
+    builtin_map = _load_builtin_character_entity_map(browser_key)
+    if builtin_map:
+        log.info("%s journal entity overrides: %d built-in mappings loaded", browser_key, len(builtin_map))
     return {
         "browser_key": browser_key,
-        "map_data": map_data,
-        "dirty": False,
-        "search_roots": search_roots,
-        "candidates": None,
+        "builtin_map": builtin_map,
         "stats": Counter(),
     }
 
 
-def _resolve_character_repo_path_with_map(resolver: dict, journal_depot_path: str, journal_name: str, journal_repo_path: str):
+def _resolve_character_repo_path_with_overrides(resolver: dict, journal_depot_path: str, _journal_name: str, journal_repo_path: str):
+    journal_repo = _normalize_mapped_repo_path(journal_repo_path)
+    if journal_repo:
+        return journal_repo, "journal"
+
     if resolver is None:
-        return journal_repo_path, "journal" if journal_repo_path else "missing"
+        return "", "missing"
 
     journal_key = _normalize_depot_path(journal_depot_path)
-    journals = resolver["map_data"].setdefault("journals", {})
-    existing = journals.get(journal_key)
-    if not isinstance(existing, dict):
-        existing = {}
+    builtin_map = resolver.get("builtin_map") or {}
+    if journal_key in builtin_map:
+        override_repo = _normalize_mapped_repo_path(builtin_map.get(journal_key))
+        if override_repo:
+            resolver["stats"]["override_hits"] += 1
+            return override_repo, "override"
+        resolver["stats"]["override_empty"] += 1
+        return "", "missing"
 
-    record = dict(existing)
-    existing_stable = dict(existing)
-    existing_stable.pop("updated_utc", None)
-
-    record["journal_path"] = journal_key
-    record["journal_file"] = os.path.basename(journal_key)
-    record["name"] = _safe_text(journal_name)
-    record["journal_entity_template"] = _normalize_mapped_repo_path(journal_repo_path)
-
-    manual_repo = _normalize_mapped_repo_path(_safe_text(record.get("manual_repo_path")) or _safe_text(record.get("repo_path")))
-    if manual_repo:
-        record["manual_repo_path"] = manual_repo
-    else:
-        record["manual_repo_path"] = ""
-
-    resolved_repo = record["journal_entity_template"]
-    resolved_source = "journal" if resolved_repo else "missing"
-
-    if not resolved_repo and manual_repo:
-        resolved_repo = manual_repo
-        resolved_source = "manual"
-        resolver["stats"]["manual_hits"] += 1
-
-    if not resolved_repo:
-        if resolver.get("candidates") is None:
-            resolver["candidates"] = _build_character_entity_candidates(
-                resolver.get("search_roots") or [],
-                _safe_text(resolver.get("browser_key")) or "CHARACTERS",
-            )
-        auto_repo, auto_candidates = _guess_character_entity_match(
-            journal_key,
-            _safe_text(journal_name),
-            resolver.get("candidates") or [],
-            limit=8,
-        )
-        if auto_candidates:
-            record["auto_candidates"] = auto_candidates
-        if auto_repo:
-            record["auto_repo_path"] = _normalize_mapped_repo_path(auto_repo)
-            resolved_repo = _normalize_mapped_repo_path(auto_repo)
-            resolved_source = "auto"
-            resolver["stats"]["auto_hits"] += 1
-        else:
-            existing_auto = _normalize_mapped_repo_path(_safe_text(record.get("auto_repo_path")))
-            if existing_auto:
-                resolved_repo = existing_auto
-                resolved_source = "auto"
-
-    record["resolved_repo_path"] = _normalize_mapped_repo_path(resolved_repo)
-    record["resolved_source"] = resolved_source
-
-    new_stable = dict(record)
-    new_stable.pop("updated_utc", None)
-    if json.dumps(existing_stable, ensure_ascii=False, sort_keys=True) != json.dumps(new_stable, ensure_ascii=False, sort_keys=True):
-        record["updated_utc"] = _utc_now_iso()
-        resolver["dirty"] = True
-    elif _safe_text(existing.get("updated_utc")):
-        record["updated_utc"] = _safe_text(existing.get("updated_utc"))
-
-    journals[journal_key] = record
-
-    return record["resolved_repo_path"], resolved_source
-
-
-def _finalize_character_entity_resolver(resolver: dict | None):
-    if resolver is None:
-        return
-    browser_key = _safe_text(resolver.get("browser_key")) or "CHARACTERS"
-    map_data = resolver.get("map_data") or {}
-    map_data["updated_utc"] = _utc_now_iso()
-    if resolver.get("dirty") or not win_path_exists(_character_entity_map_path(browser_key)):
-        _save_character_entity_map(map_data, browser_key)
+    resolver["stats"]["override_missing"] += 1
+    return "", "missing"
 
 
 def _icon_cache_dir(browser_key: str):
@@ -638,10 +310,10 @@ def _journal_browser_signature(browser_key: str):
         return lower.endswith(".bundle") or lower.endswith(".cache") or lower.endswith(".reddlc")
 
     signature = cache_meta.compute_signature(cache_meta.iter_files(roots, _predicate))
-    character_entity_map_token = ""
+    builtin_entity_map_token = ""
     if browser_key in _ENTITY_RESOLVE_BROWSER_KEYS:
-        character_entity_map_token = _character_entity_map_signature_token(browser_key)
-        mix = f"{signature.get('hash', '')}|entity_map:{character_entity_map_token}"
+        builtin_entity_map_token = _builtin_character_entity_map_signature_token(browser_key)
+        mix = f"{signature.get('hash', '')}|builtin_entity_map:{builtin_entity_map_token}"
         signature["hash"] = hashlib.sha1(mix.encode("utf-8", "ignore")).hexdigest()
 
     source = {
@@ -650,7 +322,7 @@ def _journal_browser_signature(browser_key: str):
         "base_path": base_path,
         "uncook_path": _safe_text(get_uncook_path(bpy.context)),
         "roots": roots,
-        "character_entity_map_token": character_entity_map_token,
+        "builtin_character_entity_map_token": builtin_entity_map_token,
         "version": JOURNAL_BROWSER_CACHE_VERSION,
     }
     return signature, source
@@ -1064,7 +736,7 @@ def _build_entry_tooltip(entry: dict) -> str:
     if repo_path:
         lines.append(f"w2ent: {repo_path}")
     else:
-        lines.append("w2ent: <not provided by journal>")
+        lines.append("w2ent: <not resolved>")
     repo_source = _safe_text(entry.get("repo_source"))
     if repo_source and repo_source != "journal":
         lines.append(f"Entity Source: {repo_source}")
@@ -1595,16 +1267,14 @@ def _build_journal_entry_from_bundle_item(
                 stats["missing_repo_path"] += 1
 
             if browser_key in _ENTITY_RESOLVE_BROWSER_KEYS:
-                repo_path, repo_source = _resolve_character_repo_path_with_map(
+                repo_path, repo_source = _resolve_character_repo_path_with_overrides(
                     entity_resolver,
                     journal_depot_path,
                     name,
                     repo_path,
                 )
-                if repo_source == "manual":
-                    stats["map_manual_fallback"] += 1
-                elif repo_source == "auto":
-                    stats["map_auto_fallback"] += 1
+                if repo_source == "override":
+                    stats["map_override_fallback"] += 1
 
         source_kind, dlc_name, source_label = _source_info_from_depot_path(journal_depot_path)
         description = _extract_journal_description(journal) if not is_group else ""
@@ -1682,12 +1352,11 @@ def _build_journal_entries(browser_key: str, journal_dirs: list[str], image_dirs
         seen_entries.add(entry_key)
         entries.append(entry)
 
-    _finalize_character_entity_resolver(entity_resolver)
     _apply_journal_group_metadata(entries)
 
     entries.sort(key=lambda e: (_safe_text(e.get("name")).lower(), _safe_text(e.get("repo_path")).lower()))
     log.info(
-        "Journal browser build [%s]: entries=%d leaf=%d groups=%d bundles=%d no_chunk=%d no_repo=%d map_auto=%d map_manual=%d missing_icon=%d parse_fail=%d",
+        "Journal browser build [%s]: entries=%d leaf=%d groups=%d bundles=%d no_chunk=%d no_repo=%d map_override=%d missing_icon=%d parse_fail=%d",
         browser_key,
         stats.get("entries_added", 0),
         stats.get("leaf_entries_added", 0),
@@ -1695,8 +1364,7 @@ def _build_journal_entries(browser_key: str, journal_dirs: list[str], image_dirs
         stats.get("bundle_items_seen", 0),
         stats.get("no_display_chunk", 0),
         stats.get("missing_repo_path", 0),
-        stats.get("map_auto_fallback", 0),
-        stats.get("map_manual_fallback", 0),
+        stats.get("map_override_fallback", 0),
         stats.get("missing_icon_file", 0),
         stats.get("cr2w_parse_fail", 0),
     )
@@ -1823,9 +1491,6 @@ def _smart_refresh_journal_cache(browser_key: str):
     if browser_key not in JOURNAL_BROWSER_CONFIGS:
         return {"added": 0, "removed": 0, "updated": 0, "total": 0}
 
-    if browser_key in _ENTITY_RESOLVE_BROWSER_KEYS and not win_path_exists(_character_entity_map_path(browser_key)):
-        _save_character_entity_map(_default_character_entity_map(), browser_key)
-
     try:
         LoadTextureManager()
     except Exception:
@@ -1860,10 +1525,10 @@ def _smart_refresh_journal_cache(browser_key: str):
         entry = dict(existing_by_path[journal_path])
         if browser_key in _ENTITY_RESOLVE_BROWSER_KEYS and not _is_group_entry(entry):
             seed_journal_repo = _safe_text(entry.get("repo_path")) if _safe_text(entry.get("repo_source")) == "journal" else ""
-            resolved_repo, resolved_source = _resolve_character_repo_path_with_map(
+            resolved_repo, resolved_source = _resolve_character_repo_path_with_overrides(
                 entity_resolver,
                 journal_path,
-                _safe_text(entry.get("name")),
+                "",
                 seed_journal_repo,
             )
             entry["repo_path"] = resolved_repo
@@ -1881,7 +1546,6 @@ def _smart_refresh_journal_cache(browser_key: str):
         if entry:
             merged_entries.append(entry)
 
-    _finalize_character_entity_resolver(entity_resolver)
     _apply_journal_group_metadata(merged_entries)
     _repair_cached_entry_image_paths(browser_key, merged_entries)
     merged_entries.sort(key=lambda e: (_safe_text(e.get("name")).lower(), _safe_text(e.get("repo_path")).lower()))
@@ -1897,8 +1561,6 @@ def _smart_refresh_journal_cache(browser_key: str):
 
 def _load_journal_entries_cached(browser_key: str, force_refresh: bool = False):
     browser_key = browser_key.upper()
-    if browser_key in _ENTITY_RESOLVE_BROWSER_KEYS and not win_path_exists(_character_entity_map_path(browser_key)):
-        _save_character_entity_map(_default_character_entity_map(), browser_key)
     base_path = _safe_text(get_game_path() or "")
     uncook_path = _safe_text(get_uncook_path(bpy.context))
     mem_key = (browser_key, base_path, uncook_path)
@@ -2425,8 +2087,7 @@ class _JournalBrowserMixin:
 
             source_kind = _safe_text(entry.get("source_kind"))
             dlc_name = _safe_text(entry.get("dlc_name"))
-            source_tag = "BG" if source_kind != "DLC" else (dlc_name or "DLC")
-            source_tag = source_tag[:10]
+            source_tag = (dlc_name or "DLC")[:10] if source_kind == "DLC" else ""
             action_row.label(text=source_tag)
 
             desc_text = _safe_text(entry.get("description_short"))
@@ -2514,7 +2175,7 @@ class MyJournalEntryFileOperator(bpy.types.Operator):
     def execute(self, context):
         repo_path = _normalize_depot_path(self.repo_path)
         if not repo_path:
-            self.report({'INFO'}, "This journal entry has no entity template path (journal-only entry).")
+            self.report({'INFO'}, "This journal entry has no resolved entity path.")
             return {'CANCELLED'}
 
         if self.action == "UNBUNDLE":
@@ -2566,7 +2227,7 @@ class MyImageActionOperator(bpy.types.Operator):
         # Now also prints the repo path
         logging.info(f"Selected image: {self.image_name}, Repo Path: {self.repo_path}")
         if not _normalize_depot_path(self.repo_path):
-            self.report({'INFO'}, "This journal entry has no entityTemplate path in the .journal file.")
+            self.report({'INFO'}, "This journal entry has no resolved entity path.")
             return {'CANCELLED'}
         abs_path = _ensure_depot_path_exported(self.repo_path)
         if not abs_path or not win_path_exists(abs_path):
