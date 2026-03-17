@@ -192,6 +192,49 @@ def readXML(xml_path) -> Element:
             data = myFile.read()
     return ElementTree.fromstring(data)
 
+def _ngt_new_input(ngt, socket_type, name):
+    """Add an input socket to a node group tree, compatible with Blender 4.0+."""
+    if bpy.app.version >= (4, 0, 0):
+        ngt.interface.new_socket(name=name, in_out='INPUT', socket_type=socket_type)
+    else:
+        ngt.inputs.new(socket_type, name)
+
+def _ngt_new_output(ngt, socket_type, name):
+    """Add an output socket to a node group tree, compatible with Blender 4.0+."""
+    if bpy.app.version >= (4, 0, 0):
+        ngt.interface.new_socket(name=name, in_out='OUTPUT', socket_type=socket_type)
+    else:
+        ngt.outputs.new(socket_type, name)
+
+def _new_mix_color_node(node_tree):
+    """Create a color mix node compatible with Blender 4.0+."""
+    if bpy.app.version >= (4, 0, 0):
+        node = node_tree.nodes.new('ShaderNodeMix')
+        node.data_type = 'RGBA'
+        node.blend_type = 'MIX'
+    else:
+        node = node_tree.nodes.new('ShaderNodeMixRGB')
+        node.blend_type = 'MIX'
+    return node
+
+def _mix_fac_input(mix_node):
+    """Return the factor input index for a mix node."""
+    if bpy.app.version >= (4, 0, 0):
+        return mix_node.inputs[0]  # "Factor" at index 0
+    return mix_node.inputs[0]  # "Fac" at index 0
+
+def _mix_color_inputs(mix_node):
+    """Return (color_A_input, color_B_input) for a mix node."""
+    if bpy.app.version >= (4, 0, 0):
+        return mix_node.inputs[6], mix_node.inputs[7]  # A, B for RGBA
+    return mix_node.inputs[1], mix_node.inputs[2]  # Color1, Color2
+
+def _mix_color_output(mix_node):
+    """Return the color output socket for a mix node."""
+    if bpy.app.version >= (4, 0, 0):
+        return mix_node.outputs[2]  # Result (RGBA)
+    return mix_node.outputs[0]  # Color
+
 def create_instance_group(  material,
                             xml_data,
                             xml_path,
@@ -205,9 +248,9 @@ def create_instance_group(  material,
     nodegroup_node = init_instance_nodes(material, shader_type, clear = False, x_loc = x_loc)
     nodegroup_node.name = material.name
     #nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
-    
+
     ngt = nodegroup_node.node_tree
-    
+
     # create group inputs
     group_inputs = ngt.nodes.new('NodeGroupInput')
     group_inputs.location = (-550,0)
@@ -219,14 +262,14 @@ def create_instance_group(  material,
     # Purely for neatness of the node noodles.
     ordered_params = order_elements_by_attribute(xml_data, PARAM_ORDER, 'name')
 
-    
+
     for idx, p in enumerate(ordered_params):
         par_name = p.get('name')
         par_type = p.get('type')
         par_value = p.get('value')
         if par_type == "Color":
-            ngt.inputs.new('NodeSocketColor', par_name)
-            ngt.outputs.new('NodeSocketColor',par_name)
+            _ngt_new_input(ngt, 'NodeSocketColor', par_name)
+            _ngt_new_output(ngt, 'NodeSocketColor', par_name)
             values = [float(f) for f in par_value.split("; ")]
             d_val = (
                 values[0] / 255
@@ -237,32 +280,32 @@ def create_instance_group(  material,
             ngt.inputs[par_name].default_value = d_val
             nodegroup_node.inputs[par_name].default_value = d_val
         elif par_type == "Float":
-            ngt.inputs.new('NodeSocketFloat', par_name)
-            ngt.outputs.new('NodeSocketFloat',par_name)
+            _ngt_new_input(ngt, 'NodeSocketFloat', par_name)
+            _ngt_new_output(ngt, 'NodeSocketFloat', par_name)
             ngt.inputs[par_name].default_value = float(par_value)
             nodegroup_node.inputs[par_name].default_value = float(par_value)
-            
+
             ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
         elif par_type == "handle:ITexture":
-            ngt.inputs.new('NodeSocketColor', par_name)
-            ngt.outputs.new('NodeSocketColor',par_name)
-            active_node = ngt.inputs.new('NodeSocketFloat', par_name+"_active")
-            
+            _ngt_new_input(ngt, 'NodeSocketColor', par_name)
+            _ngt_new_output(ngt, 'NodeSocketColor', par_name)
+            _ngt_new_input(ngt, 'NodeSocketFloat', par_name+"_active")
+
             # create three math nodes in a group
-            mix_node_1 = ngt.nodes.new('ShaderNodeMixRGB')
-            mix_node_1.blend_type = 'MIX'
+            mix_node_1 = _new_mix_color_node(ngt)
             mix_node_1.location = (0,0+(-500*idx))
-            ngt.links.new(group_inputs.outputs[par_name], mix_node_1.inputs["Color2"])
-            ngt.links.new(mix_node_1.outputs["Color"], group_outputs.inputs[par_name])
-            
+            color_a, color_b = _mix_color_inputs(mix_node_1)
+            ngt.links.new(group_inputs.outputs[par_name], color_b)
+            ngt.links.new(_mix_color_output(mix_node_1), group_outputs.inputs[par_name])
+
             math_node_1 = ngt.nodes.new('ShaderNodeMath')
             math_node_1.location = (-320,200+(-500*idx))
             math_node_1.operation = 'GREATER_THAN'
-            
-            
-            ngt.links.new(mix_node_1.inputs[0], math_node_1.outputs[0])
+
+
+            ngt.links.new(_mix_fac_input(mix_node_1), math_node_1.outputs[0])
             ngt.links.new(math_node_1.inputs[0], group_inputs.outputs[par_name+"_active"])
-            
+
             #node = ngt.nodes.new(type="ShaderNodeTexImage")
             #node.width = 300
             node = create_node_texture(material, p, ngt, 0+(500*idx), uncook_path, 0, using_node_tree = True)
@@ -273,18 +316,18 @@ def create_instance_group(  material,
                     node.image.colorspace_settings.name = 'sRGB'
                 else:
                     node.image.colorspace_settings.name = 'Non-Color'
-                    
+
             if node and node.image and len(node.outputs[0].links) > 0:
                 pin_name = node.outputs[0].links[0].to_socket.name
                 if pin_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse']:
                     node.image.colorspace_settings.name = 'sRGB'
                 else:
                     node.image.colorspace_settings.name = 'Non-Color'
-            ngt.links.new(node.outputs["Color"], mix_node_1.inputs["Color1"])
-            
+            ngt.links.new(node.outputs["Color"], color_a)
+
         elif par_type == 'Vector':
-            ngt.inputs.new('NodeSocketVector', par_name)
-            ngt.outputs.new('NodeSocketVector',par_name)
+            _ngt_new_input(ngt, 'NodeSocketVector', par_name)
+            _ngt_new_output(ngt, 'NodeSocketVector', par_name)
             ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
 
             values = [float(f) for f in par_value.split("; ")]
@@ -296,10 +339,10 @@ def create_instance_group(  material,
             ngt.inputs[par_name].default_value = d_val
             nodegroup_node.inputs[par_name].default_value = d_val
         else:
-            ngt.inputs.new('NodeSocketFloat', par_name)
-            ngt.outputs.new('NodeSocketFloat',par_name)
+            _ngt_new_input(ngt, 'NodeSocketFloat', par_name)
+            _ngt_new_output(ngt, 'NodeSocketFloat', par_name)
             ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
-        
+
     return (ordered_params, nodegroup_node)
 
 def xml_data_from_CR2W(mat_bin, name = None):
@@ -1558,22 +1601,29 @@ def mat_apply_settings(mat, shader_type: str):
     mat.metallic = 0
     mat.roughness = 0.5
     mat.diffuse_color = (0.3, 0.3, 0.3, 1)
+    # blend_method, show_transparent_back, use_screen_refraction, use_sss_translucency
+    # were removed in Blender 4.2 (EEVEE Next). Only set them on older versions.
+    _has_blend = hasattr(mat, 'blend_method')
     if shader_type == 'pbr_eye_shadow':
-        mat.blend_method = 'BLEND'
-        mat.show_transparent_back = False
-        mat.use_screen_refraction = True
-        mat.use_sss_translucency = True
+        if _has_blend:
+            mat.blend_method = 'BLEND'
+            mat.show_transparent_back = False
+            mat.use_screen_refraction = True
+            mat.use_sss_translucency = True
         set_shadow_method(mat)
     elif shader_type == 'pbr_eye':
-        mat.use_screen_refraction = True
+        if _has_blend:
+            mat.use_screen_refraction = True
     elif shader_type == 'transparent_lit':
-        mat.blend_method = 'BLEND'
-        mat.show_transparent_back = False	# TODO: Is this correct most of the time? Can we tell by some material parameter?
-        mat.use_screen_refraction = True
-        mat.use_sss_translucency = True # We don't use this right now, but just in case.
+        if _has_blend:
+            mat.blend_method = 'BLEND'
+            mat.show_transparent_back = False
+            mat.use_screen_refraction = True
+            mat.use_sss_translucency = True
         set_shadow_method(mat)
     else:
-        mat.blend_method = 'CLIP'
+        if _has_blend:
+            mat.blend_method = 'CLIP'
 
 
 
@@ -1586,7 +1636,8 @@ def create_texarray(group_name = "WitcherTexArray", ARRAY_SIZE = 2):
     if obj.type == "MESH":
         for vert in me.vertices:
             if me.color_attributes.active:
-                color = me.color_attributes.active.data[vert.index].color
+                elem = me.color_attributes.active.data[vert.index]
+                color = elem.color if hasattr(elem, 'color') else elem.vector
                 vertex_color_data.append(list(color))
                 highest_green = max(highest_green, color[1])
 
@@ -1629,23 +1680,28 @@ def create_texarray(group_name = "WitcherTexArray", ARRAY_SIZE = 2):
 
 
     #create the first mix
-    mix = group.nodes.new('ShaderNodeMixRGB')
-    mix.blend_type = 'MIX'
-    mix.inputs[0].default_value = 0.5
+    mix = _new_mix_color_node(group)
+    _mix_fac_input(mix).default_value = 0.5
     mix.location = (0, -100)
-    
+
     privious_mix = mix
-    
+
     if ARRAY_SIZE > 1:
-        group.links.new(input.outputs[0], mix.inputs[1])
-        group.links.new(input.outputs[1], mix.inputs[2])
+        mix_a, mix_b = _mix_color_inputs(mix)
+        group.links.new(input.outputs[0], mix_a)
+        group.links.new(input.outputs[1], mix_b)
     # for i in range(ARRAY_SIZE):
     #     group.links.new(input.outputs[i], mix.inputs[i+1])
 
-    group.links.new(mix.outputs[0], output.inputs[0])
+    group.links.new(_mix_color_output(mix), output.inputs[0])
 
-    color_attr = group.nodes.new('ShaderNodeVertexColor')
-    color_attr.layer_name = "Color"
+    if bpy.app.version >= (4, 0, 0):
+        color_attr = group.nodes.new('ShaderNodeAttribute')
+        color_attr.attribute_type = 'GEOMETRY'
+        color_attr.attribute_name = "Color"
+    else:
+        color_attr = group.nodes.new('ShaderNodeVertexColor')
+        color_attr.layer_name = "Color"
     color_attr.location = (-300, 400)
     
     color_ramp = group.nodes.new('ShaderNodeValToRGB')
@@ -1653,31 +1709,31 @@ def create_texarray(group_name = "WitcherTexArray", ARRAY_SIZE = 2):
     color_ramp.color_ramp.elements[1].position = array_step
     color_ramp.location = (200, 400)
 
-    separate_color = group.nodes.new('ShaderNodeSeparateRGB')
+    separate_color = group.nodes.new('ShaderNodeSeparateColor')
     separate_color.location = (0, 400)
 
 
     group.links.new(color_attr.outputs[0], separate_color.inputs[0])
     group.links.new(separate_color.outputs[1], color_ramp.inputs[0])
-    group.links.new(color_ramp.outputs[0], mix.inputs[0])
-    
+    group.links.new(color_ramp.outputs[0], _mix_fac_input(mix))
+
     for i in range(ARRAY_SIZE-2):
         i+=1
         color_ramp = group.nodes.new('ShaderNodeValToRGB')
         #color_ramp.color_ramp.elements[1].position = (array_step*(i+1))/1.2
         color_ramp.color_ramp.elements[1].position = array_step*(i+1)
         color_ramp.location = (-200, -400 * i)
-        
-        mix = group.nodes.new('ShaderNodeMixRGB')
-        mix.blend_type = 'MIX'
-        mix.inputs[0].default_value = 0.5
+
+        mix = _new_mix_color_node(group)
+        _mix_fac_input(mix).default_value = 0.5
         mix.location = (200, -400 * i )
-        group.links.new(color_ramp.outputs[0], mix.inputs[0])
-        group.links.new(privious_mix.outputs[0], mix.inputs[1])
-        group.links.new(input.outputs[i+1], mix.inputs[2])
+        mix_a, mix_b = _mix_color_inputs(mix)
+        group.links.new(color_ramp.outputs[0], _mix_fac_input(mix))
+        group.links.new(_mix_color_output(privious_mix), mix_a)
+        group.links.new(input.outputs[i+1], mix_b)
         group.links.new(separate_color.outputs[1], color_ramp.inputs[0])
-        group.links.new(mix.outputs[0], output.inputs[0])
-        
+        group.links.new(_mix_color_output(mix), output.inputs[0])
+
         privious_mix = mix
 
     
@@ -1685,10 +1741,11 @@ def create_texarray(group_name = "WitcherTexArray", ARRAY_SIZE = 2):
     return group
 
 def set_shadow_method(mat):
-    blender_version = bpy.app.version
     render_engine = bpy.context.scene.render.engine
 
     if render_engine in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'):
-        mat.blend_method = 'HASHED'
+        if hasattr(mat, 'blend_method'):
+            mat.blend_method = 'HASHED'
     elif render_engine == 'CYCLES':
-        mat.use_transparent_shadow = True  # Corrected property
+        if hasattr(mat, 'use_transparent_shadow'):
+            mat.use_transparent_shadow = True

@@ -89,6 +89,12 @@ class WITCH_OT_apx(bpy.types.Operator, ImportHelper):
             for prop in section_options[section]:
                 box.prop(self, prop)
 
+        addon_prefs = get_all_addon_prefs(context)
+        row = layout.row()
+        box = row.box()
+        box.label(text="Character", icon='OUTLINER_OB_ARMATURE')
+        box.prop(addon_prefs, "DO_WEAR_CLOTH")
+
     @classmethod
     def poll(self, context):
         #print(bpy.ops) # debug ops _utils

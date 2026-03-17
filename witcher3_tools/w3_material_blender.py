@@ -3,6 +3,7 @@ from pathlib import Path
 from . import CR2W
 import bpy
 from bpy.types import Image, Material, Object, Node
+from .w3_material import _ngt_new_input
 
 def init_shader_nodes(material: Material, group_name: str, clear:bool = True, x_loc:int = -250):
     """Wipe all nodes, then create a node group node and return it."""
@@ -51,7 +52,7 @@ def create_shader_group( params_to_create, bl_material, group_name):
         par_type = p.get('type')
         par_value = p.get('value')
         if par_type == "CMaterialParameterColor": # "Color":
-            ngt.inputs.new('NodeSocketColor', par_name)
+            _ngt_new_input(ngt, 'NodeSocketColor', par_name)
             #ngt.outputs.new('NodeSocketColor',par_name)
             values = par_value#[float(f) for f in par_value.split("; ")]
             d_val = (
@@ -63,14 +64,14 @@ def create_shader_group( params_to_create, bl_material, group_name):
             ngt.inputs[par_name].default_value = d_val
             nodegroup_node.inputs[par_name].default_value = d_val
         elif par_type == "CMaterialParameterScalar": #"Float":
-            ngt.inputs.new('NodeSocketFloat', par_name)
+            _ngt_new_input(ngt, 'NodeSocketFloat', par_name)
             #ngt.outputs.new('NodeSocketFloat',par_name)
             ngt.inputs[par_name].default_value = float(par_value)
             nodegroup_node.inputs[par_name].default_value = float(par_value)
-            
+
             #ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
         elif par_type == "CMaterialParameterTexture": #"handle:ITexture":
-            ngt.inputs.new('NodeSocketColor', par_name)
+            _ngt_new_input(ngt, 'NodeSocketColor', par_name)
             #ngt.outputs.new('NodeSocketColor',par_name)
             #active_node = ngt.inputs.new('NodeSocketFloat', par_name+"_active")
             
@@ -109,7 +110,7 @@ def create_shader_group( params_to_create, bl_material, group_name):
             # ngt.links.new(node.outputs["Color"], mix_node_1.inputs["Color1"])
             
         elif par_type == "CMaterialParameterVector": # 'Vector':
-            ngt.inputs.new('NodeSocketVector', par_name)
+            _ngt_new_input(ngt, 'NodeSocketVector', par_name)
             #ngt.outputs.new('NodeSocketVector',par_name)
             #ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
 
@@ -122,7 +123,7 @@ def create_shader_group( params_to_create, bl_material, group_name):
             ngt.inputs[par_name].default_value = d_val
             nodegroup_node.inputs[par_name].default_value = d_val
         else:
-            ngt.inputs.new('NodeSocketFloat', par_name)
+            _ngt_new_input(ngt, 'NodeSocketFloat', par_name)
             #ngt.outputs.new('NodeSocketFloat',par_name)
             #ngt.links.new(group_inputs.outputs[par_name], group_outputs.inputs[par_name])
         

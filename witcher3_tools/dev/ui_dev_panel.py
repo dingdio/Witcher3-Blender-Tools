@@ -773,8 +773,7 @@ class DEV_OT_ImportPath(Operator):
                     elif self.operator_type == 'nxs':
                         bpy.ops.witcher.import_nxs(invoke_mode, filepath=filepath)
                     elif self.operator_type == 'apx':
-                        # bl_idname is "witcher.import_apx_materials" - use getattr since 'import' is reserved
-                        getattr(bpy.ops, 'import').apx_materials(invoke_mode, filepath=filepath)
+                        bpy.ops.witcher.import_apx_materials(invoke_mode, filepath=filepath)
                     elif self.operator_type == 'w2ent_chara':
                         bpy.ops.witcher.import_w2ent_character(invoke_mode, filepath=filepath)
                     elif self.operator_type == 'w2ent':

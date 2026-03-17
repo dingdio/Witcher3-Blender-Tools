@@ -135,9 +135,9 @@ def create_normal_map_group(principled_node, mat, group_node):
     normal_map_node.location = (pl[0] + -500, pl[1] + 200)
     #mat.node_tree.links.new(normal_map_node.inputs[0], group_outer.outputs[0])
 
-    Separate = mat.node_tree.nodes.new(type="ShaderNodeSeparateRGB")
-    Separate.location = (pl[0] + -500,pl[1] + 300) 
-    Combine = mat.node_tree.nodes.new(type="ShaderNodeCombineRGB")
+    Separate = mat.node_tree.nodes.new(type="ShaderNodeSeparateColor")
+    Separate.location = (pl[0] + -500,pl[1] + 300)
+    Combine = mat.node_tree.nodes.new(type="ShaderNodeCombineColor")
     Combine.location = (pl[0] + -500,pl[1] + 600) 
     Invert = mat.node_tree.nodes.new(type="ShaderNodeInvert")
     Invert.location = (pl[0] + -500,pl[1] + 700) 

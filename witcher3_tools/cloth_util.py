@@ -1500,10 +1500,12 @@ def color_to_weights(obj, src_vcol, src_channel_idx, dst_vgroup_idx):
     vertex_values3 = [[0.0, 0] for i in range(0, len(mesh.vertices))]
     
     for idx, vertex in enumerate(vertex_values):
-        vertex_values[idx][0] = src_vcol.data[idx].color[1]
-        vertex_values1[idx][0] = src_vcol.data[idx].color[1]
-        vertex_values2[idx][0] = src_vcol.data[idx].color[2]
-        vertex_values3[idx][0] = src_vcol.data[idx].color[3]
+        elem = src_vcol.data[idx]
+        c = elem.color if hasattr(elem, 'color') else elem.vector
+        vertex_values[idx][0] = c[1]
+        vertex_values1[idx][0] = c[1]
+        vertex_values2[idx][0] = c[2]
+        vertex_values3[idx][0] = c[3]
     
     group = obj.vertex_groups[dst_vgroup_idx]
     mode = 'REPLACE'

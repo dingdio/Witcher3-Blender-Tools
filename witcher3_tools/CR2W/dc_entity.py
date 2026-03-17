@@ -1611,7 +1611,8 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
             chunk_append(new_mesh, chunk, CAnimDangleBufferComponent(name, skeleton))
         elif (chunk.Type == "CAnimDangleComponent"):
             name = chunk.GetVariableByName("name").ToString()
-            constraint = chunk.GetVariableByName("constraint").Value-1
+            constraint_var = chunk.GetVariableByName("constraint")
+            constraint = constraint_var.Value - 1 if constraint_var else None
             chunk_append(new_mesh, chunk, CAnimDangleComponent(name, constraint))
         elif (chunk.Type == "CAnimDangleConstraint_Dyng"):
             dyng = _resolve_repo_path(chunk, "dyng", ".w3dyng") if chunk.GetVariableByName("dyng") else None
@@ -2286,7 +2287,8 @@ def create_CEntity(file, _inherit_visited=None):
             chunk_append(new_mesh, chunk, CAnimDangleBufferComponent(name, skeleton))
         elif (chunk.Type == "CAnimDangleComponent"):
             name = chunk.GetVariableByName("name").ToString()
-            constraint = chunk.GetVariableByName("constraint").Value-1
+            constraint_var = chunk.GetVariableByName("constraint")
+            constraint = constraint_var.Value - 1 if constraint_var else None
             chunk_append(new_mesh, chunk, CAnimDangleComponent(name, constraint))
         elif (chunk.Type == "CAnimDangleConstraint_Dyng"):
             dyng = _resolve_repo_path(chunk, "dyng", ".w3dyng") if chunk.GetVariableByName("dyng") else None
