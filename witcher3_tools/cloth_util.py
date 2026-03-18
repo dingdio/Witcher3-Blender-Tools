@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 import inspect
 import bmesh
+import json
 
 log = logging.getLogger(__name__)
 
@@ -1713,6 +1714,15 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
     gmesh = GMesh_objs[0]
     if DO_WEAR_CLOTH:
         gmesh.name = filename+":"+gmesh.name
+    mesh_name_payload = json.dumps([gmesh.name])
+    try:
+        arma["witcher_redcloth_mesh_name"] = gmesh.name
+        arma["witcher_redcloth_mesh_names"] = mesh_name_payload
+        if DO_WEAR_CLOTH and 'cloth_group' in locals():
+            cloth_group["witcher_redcloth_mesh_name"] = gmesh.name
+            cloth_group["witcher_redcloth_mesh_names"] = mesh_name_payload
+    except Exception:
+        pass
     
     for o in reversed(GMesh_objs):
         if "lod1" in o.name or \

@@ -91,6 +91,158 @@ def _make_redcloth_reuse_key(resource_path: str, redcloth_mat_path: str) -> str:
     return f"{_norm_redcloth_key_path(resource_path)}|{_norm_redcloth_key_path(redcloth_mat_path)}"
 
 
+def _get_chunk_component_name(chunk) -> str:
+    component_name = str(chunk.get("name", "") or "").strip()
+    if component_name:
+        return component_name
+    resource_path = str(chunk.get("resource", "") or "").strip()
+    if resource_path.lower().endswith(".redcloth"):
+        return Path(resource_path.replace("/", "\\")).stem
+    return ""
+
+
+def _mesh_uses_armature(obj, armature_obj) -> bool:
+    if obj is None or obj.type != 'MESH' or armature_obj is None:
+        return False
+    for mod in getattr(obj, "modifiers", []):
+        if mod.type == 'ARMATURE' and mod.object == armature_obj:
+            return True
+    return False
+
+
+def _iter_tagged_redcloth_meshes_from_carrier(carrier_obj):
+    if carrier_obj is None or not hasattr(carrier_obj, "get"):
+        return
+    seen_names = set()
+
+    def _yield_named_mesh(name):
+        mesh_name = str(name or "").strip()
+        if not mesh_name or mesh_name in seen_names:
+            return
+        seen_names.add(mesh_name)
+        mesh_obj = bpy.data.objects.get(mesh_name)
+        if mesh_obj is not None and mesh_obj.type == 'MESH':
+            yield mesh_obj
+
+    mesh_name = carrier_obj.get("witcher_redcloth_mesh_name", "")
+    if mesh_name:
+        yield from _yield_named_mesh(mesh_name)
+
+    raw_mesh_names = carrier_obj.get("witcher_redcloth_mesh_names", "")
+    if not raw_mesh_names:
+        return
+    try:
+        mesh_names = json.loads(raw_mesh_names)
+    except Exception:
+        mesh_names = [raw_mesh_names]
+    if not isinstance(mesh_names, (list, tuple)):
+        mesh_names = [mesh_names]
+    for name in mesh_names:
+        yield from _yield_named_mesh(name)
+
+
+def _get_redcloth_tag_targets(cloth_armature):
+    targets = []
+    if cloth_armature is not None:
+        targets.append(cloth_armature)
+        parent = getattr(cloth_armature, "parent", None)
+        if parent is not None:
+            targets.append(parent)
+    return targets
+
+
+def _get_tagged_redcloth_meshes(cloth_armature):
+    meshes = []
+    seen = set()
+    for carrier in _get_redcloth_tag_targets(cloth_armature):
+        for mesh in _iter_tagged_redcloth_meshes_from_carrier(carrier):
+            mesh_id = id(mesh)
+            if mesh_id in seen:
+                continue
+            seen.add(mesh_id)
+            meshes.append(mesh)
+    return meshes
+
+
+def _collect_redcloth_meshes(cloth_armature):
+    meshes = []
+    seen = set()
+
+    def _add_mesh(mesh_obj):
+        if mesh_obj is None or mesh_obj.type != 'MESH':
+            return
+        mesh_id = id(mesh_obj)
+        if mesh_id in seen:
+            return
+        seen.add(mesh_id)
+        meshes.append(mesh_obj)
+
+    for obj in _iter_object_descendants(cloth_armature):
+        if obj.type == 'MESH':
+            _add_mesh(obj)
+
+    for mesh in _get_tagged_redcloth_meshes(cloth_armature):
+        _add_mesh(mesh)
+
+    if meshes:
+        return meshes
+
+    collections = set(getattr(cloth_armature, "users_collection", []))
+    parent = getattr(cloth_armature, "parent", None)
+    if parent is not None:
+        collections.update(getattr(parent, "users_collection", []))
+    for collection in collections:
+        for obj in getattr(collection, "all_objects", []):
+            if _mesh_uses_armature(obj, cloth_armature):
+                _add_mesh(obj)
+    return meshes
+
+
+def build_component_mesh_index_in_hierarchy(root_obj):
+    if root_obj is None:
+        return {}
+
+    component_mesh_index = {}
+    seen_mesh_ids = set()
+    stack = [root_obj]
+    seen_objects = set()
+
+    def _add_mesh(mesh_obj):
+        if mesh_obj is None or mesh_obj.type != 'MESH':
+            return
+        component_name = str(mesh_obj.get('witcher_name', '') or '').strip()
+        if not component_name:
+            return
+        mesh_id = id(mesh_obj)
+        if mesh_id in seen_mesh_ids:
+            return
+        seen_mesh_ids.add(mesh_id)
+        component_mesh_index.setdefault(component_name, []).append(mesh_obj)
+
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in seen_objects:
+            continue
+        seen_objects.add(obj_id)
+
+        _add_mesh(obj)
+        for mesh in _iter_tagged_redcloth_meshes_from_carrier(obj):
+            _add_mesh(mesh)
+        stack.extend(list(getattr(obj, "children", [])))
+
+    return component_mesh_index
+
+
+def find_component_meshes_in_hierarchy(root_obj, component_name):
+    component_name = str(component_name or "").strip()
+    if root_obj is None or not component_name:
+        return []
+    return build_component_mesh_index_in_hierarchy(root_obj).get(component_name, [])
+
+
 def _iter_object_descendants(root_obj):
     if root_obj is None:
         return
@@ -136,6 +288,64 @@ def _tag_redcloth_for_reuse(cloth_armature, reuse_key: str, resource_path: str, 
             obj["witcher_redcloth_material"] = redcloth_mat_path or ""
         except Exception:
             pass
+
+
+def _build_coloring_entry_lookup(coloring_entries, appearance_name):
+    if not coloring_entries or not appearance_name:
+        return {}
+
+    lookup = {}
+    for entry in coloring_entries:
+        try:
+            if entry['appearance'] != appearance_name:
+                continue
+            component_name = str(entry['componentName'] or "")
+            if component_name:
+                lookup[component_name] = entry
+        except Exception:
+            continue
+    return lookup
+
+
+def _set_idprop_value(obj, key, value) -> bool:
+    current_value = obj.get(key)
+    if value is None:
+        if current_value is None:
+            return False
+        obj.pop(key, None)
+        return True
+    if current_value == value:
+        return False
+    obj[key] = value
+    return True
+
+
+def _apply_coloring_entry_to_object(obj, entry):
+    changed = False
+    cs1 = entry.get('colorShift1') if entry is not None else None
+    cs2 = entry.get('colorShift2') if entry is not None else None
+
+    changed |= _set_idprop_value(obj, 'colorShift1_hue', cs1['hue'] if cs1 is not None else None)
+    changed |= _set_idprop_value(obj, 'colorShift1_saturation', cs1['saturation'] if cs1 is not None else None)
+    changed |= _set_idprop_value(obj, 'colorShift1_luminance', cs1['luminance'] if cs1 is not None else None)
+    changed |= _set_idprop_value(obj, 'colorShift2_hue', cs2['hue'] if cs2 is not None else None)
+    changed |= _set_idprop_value(obj, 'colorShift2_saturation', cs2['saturation'] if cs2 is not None else None)
+    changed |= _set_idprop_value(obj, 'colorShift2_luminance', cs2['luminance'] if cs2 is not None else None)
+
+    if changed:
+        obj.update_tag()
+
+
+def _apply_coloring_lookup_to_objects(objects, coloring_lookup):
+    if not objects:
+        return
+    for obj in objects:
+        if obj is None or obj.type != 'MESH':
+            continue
+        component_name = obj.get('witcher_name', '')
+        if not component_name:
+            continue
+        _apply_coloring_entry_to_object(obj, coloring_lookup.get(component_name))
 
 def fixed_chunk_paths(entity, version = 999):
     use_fbx = False
@@ -1585,6 +1795,11 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                  selectedAppearance=None, import_redcloth_enabled=True, morphs_todo=None):
     if morphs_todo is None:
         morphs_todo = []
+    selected_appearance_name = getattr(selectedAppearance, "name", "")
+    coloring_entry_lookup = _build_coloring_entry_lookup(
+        getattr(entity, "coloringEntries", None),
+        selected_appearance_name,
+    )
     
     def get_chunk_namespace(chunk):
         return f"{ent_namespace}{chunk['type']}{i}{chunk['chunkIndex']}"
@@ -1597,11 +1812,14 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 return f"{chunk['type']}{i}{chunk_index}"
         return None
     
-    def add_chunk_metadata(obj, chunk, path=None):
+    def add_chunk_metadata(obj, chunk, path=None, component_name=None):
         """Add metadata as custom properties to the Blender object"""
         if hasattr(obj, 'bl_rna'):  # Verify it's a Blender object
             obj['witcher_type'] = chunk['type']
-            if 'name' in chunk and chunk['name']:
+            resolved_component_name = str(component_name or "").strip()
+            if resolved_component_name:
+                obj['witcher_name'] = resolved_component_name
+            elif 'name' in chunk and chunk['name']:
                 obj['witcher_name'] = chunk['name']
             if path:
                 obj['witcher_path'] = path
@@ -1633,33 +1851,24 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             if not is_valid_mesh_path(mesh_path):
                 log.warning(f"Skipping chunk with invalid mesh path ({chunk['type']} #{chunk['chunkIndex']}): {mesh_path}")
             else:
+                component_name = _get_chunk_component_name(chunk)
                 meshes, armatures = fbx_util.import_model(repo_file(mesh_path, entity.version), 
                                                      f"{chunk['type']}{i}{chunk['chunkIndex']}", 
                                                      entity.name)
-            
-                # Handle appearances
-                if selectedAppearance and chunk.get('name'):
-                    for color_entry in entity.coloringEntries:
-                        if selectedAppearance.name == color_entry['appearance'] and \
-                           color_entry['componentName'] == chunk['name']:
-                            for mesh in meshes:
-                                if color_shift1 := color_entry.get('colorShift1'):
-                                    mesh['colorShift1_hue'] = color_shift1['hue']
-                                    mesh['colorShift1_saturation'] = color_shift1['saturation']
-                                    mesh['colorShift1_luminance'] = color_shift1['luminance']
-                                if color_shift2 := color_entry.get('colorShift2'):
-                                    mesh['colorShift2_hue'] = color_shift2['hue']
-                                    mesh['colorShift2_saturation'] = color_shift2['saturation']
-                                    mesh['colorShift2_luminance'] = color_shift2['luminance']
-                                mesh.update_tag()
+             
+                if component_name:
+                    for mesh in meshes:
+                        mesh['witcher_name'] = component_name
+                if selected_appearance_name and component_name:
+                    _apply_coloring_lookup_to_objects(meshes, coloring_entry_lookup)
 
                 # Store objects directly while adding metadata
                 for arm in armatures:
-                    add_chunk_metadata(arm, chunk, mesh_path)
+                    add_chunk_metadata(arm, chunk, mesh_path, component_name=component_name)
                     objdict[chunk_ns] = arm
                     
                 for mesh in meshes:
-                    add_chunk_metadata(mesh, chunk, mesh_path)
+                    add_chunk_metadata(mesh, chunk, mesh_path, component_name=component_name)
                     if mesh.name[-5:-1] == "_lod":
                         meshdict[chunk_ns + mesh.name[-5:]] = mesh
                     else:
@@ -1707,6 +1916,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         if "resource" in chunk and import_redcloth_enabled:
             redcloth_resource = chunk["resource"]
             redcloth_mat_path = repo_file(redcloth_resource, entity.version)
+            component_name = _get_chunk_component_name(chunk)
             owner_armature = objdict.get(entity.name)
             redcloth_reuse_key = _make_redcloth_reuse_key(redcloth_resource, redcloth_mat_path)
             cloth_arma = _find_reusable_redcloth_armature(owner_armature, redcloth_reuse_key)
@@ -1781,8 +1991,15 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                             cloth_arma = child
                             break
                 _tag_redcloth_for_reuse(cloth_arma, redcloth_reuse_key, redcloth_resource, redcloth_mat_path)
-                add_chunk_metadata(cloth_arma, chunk, chunk['resource'])
+                add_chunk_metadata(cloth_arma, chunk, chunk['resource'], component_name=component_name)
                 objdict[chunk_ns] = cloth_arma
+
+                cloth_meshes = _collect_redcloth_meshes(cloth_arma)
+                if component_name:
+                    for mesh in cloth_meshes:
+                        mesh['witcher_name'] = component_name
+                if selected_appearance_name and component_name:
+                    _apply_coloring_lookup_to_objects(cloth_meshes, coloring_entry_lookup)
 
         # Handle morphs
         if "morphComponentId" in chunk:
@@ -2205,40 +2422,10 @@ def _apply_coloring_entries_to_objects(objects, coloring_entries, appearance_nam
     access via __getitem__/get) and plain dicts.
     Matches each object's 'witcher_name' custom property against componentName.
     """
-    if not coloring_entries or not appearance_name:
+    if not objects:
         return
-    for obj in objects:
-        if obj is None or obj.type != 'MESH':
-            continue
-        component_name = obj.get('witcher_name', '')
-        if not component_name:
-            continue
-        for entry in coloring_entries:
-            try:
-                if entry['appearance'] != appearance_name or entry['componentName'] != component_name:
-                    continue
-                cs1 = entry.get('colorShift1')
-                cs2 = entry.get('colorShift2')
-                if cs1 is not None:
-                    obj['colorShift1_hue'] = cs1['hue']
-                    obj['colorShift1_saturation'] = cs1['saturation']
-                    obj['colorShift1_luminance'] = cs1['luminance']
-                else:
-                    obj.pop('colorShift1_hue', None)
-                    obj.pop('colorShift1_saturation', None)
-                    obj.pop('colorShift1_luminance', None)
-                if cs2 is not None:
-                    obj['colorShift2_hue'] = cs2['hue']
-                    obj['colorShift2_saturation'] = cs2['saturation']
-                    obj['colorShift2_luminance'] = cs2['luminance']
-                else:
-                    obj.pop('colorShift2_hue', None)
-                    obj.pop('colorShift2_saturation', None)
-                    obj.pop('colorShift2_luminance', None)
-                obj.update_tag()
-                break
-            except Exception:
-                continue
+    coloring_lookup = _build_coloring_entry_lookup(coloring_entries, appearance_name)
+    _apply_coloring_lookup_to_objects(objects, coloring_lookup)
 
 
 def import_app(context,

@@ -58,6 +58,44 @@ def _short_panel_header_text(text: str, max_len: int = 28) -> str:
     return value if len(value) <= max_len else (value[: max_len - 1] + "…")
 
 
+def _find_coloring_objects(context, component_name):
+    """Find matching mesh objects inside the active character hierarchy only."""
+    component_name = str(component_name or "").strip()
+    if not component_name:
+        return []
+    return _build_coloring_object_index(context).get(component_name, [])
+
+
+def _build_coloring_object_index(context):
+    """Build a component->objects index for the active character hierarchy."""
+    main_arm_obj, _rig_settings = get_main_armature_and_rig_settings(
+        context, prefer_active=True, remember=False, fallback=True,
+    )
+    if not main_arm_obj:
+        return {}
+    return import_entity.build_component_mesh_index_in_hierarchy(main_arm_obj)
+
+
+def _show_coloring_object_props(layout, objects):
+    """Show editable colorShift custom properties for matching objects."""
+    for obj in objects:
+        has_shift = any(obj.get(k) is not None for k in ('colorShift1_hue', 'colorShift2_hue'))
+        if not has_shift:
+            continue
+        prop_box = layout.box()
+        prop_box.label(text=f"{obj.name}", icon='OBJECT_DATA')
+        if obj.get('colorShift1_hue') is not None:
+            row = prop_box.row(align=True)
+            row.prop(obj, '["colorShift1_hue"]', text="H1")
+            row.prop(obj, '["colorShift1_saturation"]', text="S1")
+            row.prop(obj, '["colorShift1_luminance"]', text="L1")
+        if obj.get('colorShift2_hue') is not None:
+            row = prop_box.row(align=True)
+            row.prop(obj, '["colorShift2_hue"]', text="H2")
+            row.prop(obj, '["colorShift2_saturation"]', text="S2")
+            row.prop(obj, '["colorShift2_luminance"]', text="L2")
+
+
 def _get_character_panel_header_status(context) -> str:
     try:
         main_arm_obj, rig_settings = get_main_armature_and_rig_settings(
@@ -1091,6 +1129,33 @@ class WITCH_OT_AnimSetPathInfo(Operator):
         return {'FINISHED'}
 
 
+class WITCH_OT_coloring_select_component(Operator):
+    """Select mesh objects matching this coloring entry's component name"""
+    bl_idname = "witcher.coloring_select_component"
+    bl_label = "Select Component"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    component_name: StringProperty(default="")
+
+    def execute(self, context):
+        if not self.component_name:
+            self.report({'WARNING'}, "No component name specified.")
+            return {'CANCELLED'}
+
+        bpy.ops.object.select_all(action='DESELECT')
+        found = _find_coloring_objects(context, self.component_name)
+        for obj in found:
+            obj.select_set(True)
+
+        if found:
+            context.view_layer.objects.active = found[0]
+            self.report({'INFO'}, f"Selected {len(found)} object(s) for '{self.component_name}'")
+        else:
+            self.report({'WARNING'}, f"No mesh objects found with component name '{self.component_name}'")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 class WITCH_OT_ENTITY_list_loadapp(Operator):
     """ Load appearance or animation set for this character"""
     bl_idname = "witcher.list_loadapp"
@@ -1384,10 +1449,18 @@ class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
                     color_box.label(text="No coloring entries for this appearance.", icon='INFO')
                 else:
                     color_box.label(text=f"{len(color_entries)} entries", icon='CHECKMARK')
+                    coloring_object_index = _build_coloring_object_index(context)
                     for entry in color_entries:
                         entry_box = color_box.box()
                         component_name = str(entry.get("componentName", "") or "<unnamed component>")
-                        entry_box.label(text=component_name, icon='MESH_DATA')
+                        matching_objects = coloring_object_index.get(component_name, [])
+                        header_row = entry_box.row(align=True)
+                        header_row.label(text=component_name, icon='MESH_DATA')
+                        sel_op = header_row.operator(
+                            WITCH_OT_coloring_select_component.bl_idname,
+                            text="", icon='RESTRICT_SELECT_OFF',
+                        )
+                        sel_op.component_name = component_name
                         try:
                             shift1 = ui_equipment._format_color_shift_summary(entry.get('colorShift1'))
                         except Exception:
@@ -1398,6 +1471,9 @@ class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
                             shift2 = "-"
                         entry_box.label(text=f"Shift 1: {shift1}")
                         entry_box.label(text=f"Shift 2: {shift2}")
+
+                        # Show editable colorShift properties for any matching imported objects
+                        _show_coloring_object_props(entry_box, matching_objects)
 
         # ===================== EQUIPMENT TAB =====================
         elif char_tab == "EQUIPMENT":
@@ -1453,6 +1529,7 @@ classes = [
     WITCH_UL_InventoryPreview,
 
     #operators
+    WITCH_OT_coloring_select_component,
     WITCH_OT_AnimSetPathInfo,
     WITCH_OT_RevealAnimInExplorer,
     WITCH_OT_w3app,
