@@ -1,5 +1,12 @@
 import bpy
 from .w3_material import init_material_nodes
+from .w3_vector_param import (
+    get_legacy_w_value,
+    get_mapping_vector_input,
+    get_vector_node_values,
+    is_vector_param_node,
+    mark_vector_param_node,
+)
 from . import get_all_addon_prefs
 
 import bpy
@@ -189,10 +196,25 @@ class WITCH_PT_materials(bpy.types.Panel):
                             elif linked_socket.node.type == 'VALUE':
                                 row.prop(linked_socket, "default_value", text="")
                             elif input_socket.type == 'VECTOR':
-                                row.prop(linked_socket.node.inputs[0], "default_value", text="")
-                                row.prop(linked_socket.node.inputs[1], "default_value", text="")
-                                row.prop(linked_socket.node.inputs[2], "default_value", text="")
-                                #row.prop(linked_socket.node.outputs[0], "default_value", text="") #not working??
+                                vector_node = linked_socket.node
+                                if vector_node.type == 'MAPPING':
+                                    vector_input = get_mapping_vector_input(vector_node, input_socket.name)
+                                    if vector_input is not None:
+                                        row.prop(vector_input, "default_value", index=0, text="")
+                                        row.prop(vector_input, "default_value", index=1, text="")
+                                        row.prop(vector_input, "default_value", index=2, text="")
+                                elif vector_node.type == 'COMBXYZ':
+                                    row.prop(vector_node.inputs[0], "default_value", text="")
+                                    row.prop(vector_node.inputs[1], "default_value", text="")
+                                    row.prop(vector_node.inputs[2], "default_value", text="")
+                                else:
+                                    row.label(text=vector_node.bl_label or vector_node.type)
+                                if is_vector_param_node(vector_node):
+                                    if not getattr(vector_node, "witcher_param_kind", ""):
+                                        legacy_w = get_legacy_w_value(input_socket, None)
+                                        if legacy_w is not None:
+                                            mark_vector_param_node(vector_node, input_socket.name, legacy_w)
+                                    row.prop(vector_node, "witcher_vector_w", text="")
                             else:
                                 row.prop(linked_socket, "default_value", text="")
                 if mat.witcher_props.xml_text:
@@ -315,8 +337,17 @@ def get_group_inputs(mat):
                     if output_socket.is_linked:
                         target_node = output_socket.links[0].to_node
                         if target_node.type == 'OUTPUT_MATERIAL':
-                            group_inputs = node.inputs
-                            return group_inputs
+                            input_names = {
+                                str(getattr(input_socket, "name", "") or "")
+                                for input_socket in node.inputs
+                            }
+                            return [
+                                input_socket for input_socket in node.inputs
+                                if not (
+                                    str(getattr(input_socket, "name", "") or "").endswith("_W")
+                                    and str(getattr(input_socket, "name", "") or "")[:-2] in input_names
+                                )
+                            ]
                             #for input_socket in group_inputs:
     return None
 
@@ -466,12 +497,19 @@ def get_socket_value(input_socket):
             value = linked_socket.node.outputs[0].default_value
             return value
         elif linked_socket.type == 'VECTOR':
-            value = [
-                linked_socket.node.inputs[0].default_value,
-                linked_socket.node.inputs[1].default_value,
-                linked_socket.node.inputs[2].default_value,
-            ]
-            default_value = " ; ".join(str(x) for x in value)
+            vector_node = linked_socket.node
+            if vector_node.type in {'COMBXYZ', 'MAPPING'}:
+                if not getattr(vector_node, "witcher_param_kind", ""):
+                    legacy_w = get_legacy_w_value(input_socket, None)
+                    if legacy_w is not None:
+                        mark_vector_param_node(vector_node, input_socket.name, legacy_w)
+                value = get_vector_node_values(vector_node, input_socket.name, get_legacy_w_value(input_socket, 1.0))
+                return value
+            try:
+                value = [float(input_socket.default_value[i]) for i in range(3)]
+            except Exception:
+                value = [0.0, 0.0, 0.0]
+            value.append(float(get_legacy_w_value(input_socket, 1.0)))
             return value
     try:
         default_value = " ; ".join(str(x) for x in input_socket.default_value)
@@ -550,6 +588,10 @@ __classes = [
 def register():
     bpy.types.Node.witcher_include = bpy.props.BoolProperty(default=False)
     bpy.types.Node.witcher_final_path = bpy.props.StringProperty(default="")
+    bpy.types.Node.witcher_param_kind = bpy.props.StringProperty(default="")
+    bpy.types.Node.witcher_param_name = bpy.props.StringProperty(default="")
+    bpy.types.Node.witcher_vector_source = bpy.props.StringProperty(default="")
+    bpy.types.Node.witcher_vector_w = bpy.props.FloatProperty(default=1.0)
     bpy.utils.register_class(NodeGroupInputProperties) #! imp to reg first
     bpy.utils.register_class(WitcherMaterialProperties)
     bpy.types.Material.witcher_props = bpy.props.PointerProperty(type=WitcherMaterialProperties)
@@ -586,4 +628,8 @@ def unregister():
     del bpy.types.Material.witcher_props
     del bpy.types.Node.witcher_include
     del bpy.types.Node.witcher_final_path
+    del bpy.types.Node.witcher_param_kind
+    del bpy.types.Node.witcher_param_name
+    del bpy.types.Node.witcher_vector_source
+    del bpy.types.Node.witcher_vector_w
     #bpy.types.SpaceNodeEditor.draw_handler_remove(open_menu, 'WINDOW')

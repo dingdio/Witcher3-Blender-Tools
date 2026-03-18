@@ -7,14 +7,22 @@ log = logging.getLogger(__name__)
 from pathlib import Path
 from math import radians
 from .CR2W import CR2W_reader
+from .CR2W.bin_helpers import ReadVLQInt32, readUByte, readUShort, readU32
 import bpy, os
-from typing import List, Dict
+from typing import List, Dict, Optional, Set
 from bpy.types import Image, Material, Object, Node
 
 from xml.etree import ElementTree
 Element = ElementTree.Element
 
 from .w3_material_constants import *
+from .w3_vector_param import (
+    VECTOR_PARAM_KIND,
+    VECTOR_SOURCE_XYZ,
+    get_legacy_w_value,
+    get_vector_w,
+    mark_vector_param_node,
+)
 from . import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext, get_texture_path
 from .ui.blender_fun import convert_xbm_to_dds, load_w2cube_image, load_w2cube_blick_equirect_image
 from .CR2W.common_blender import repo_file, win_safe_path, bpy_image_load_safe, win_path_key, win_unprefix_path
@@ -89,6 +97,25 @@ def ensure_node_group(ng_name, resource_path=RES_PATH):
 
 def normalize_depot_path(path: str) -> str:
     return (path or "").replace("/", "\\").lower()
+
+
+_material_param_cache: Dict[str, Dict[str, tuple[str, str]]] = {}
+_resolved_w2mg_cache: Dict[str, Optional[str]] = {}
+_graph_buffer_meta_cache: Dict[str, Dict[str, object]] = {}
+MATERIAL_SETUP_VERSION = 4
+
+# Some graph parameters exist in PixelParameters but do not serialize a scalar field on
+# their CMaterialParameterScalar chunk. Until the raw value block is decoded, use exact
+# graph/path matches for the known graph-only defaults we have to preserve.
+GRAPH_MISSING_SCALAR_DEFAULTS: Dict[str, Dict[str, str]] = {
+    normalize_depot_path(r"engine\materials\graphs\pbr_std_tint_mask_det.w2mg"): {
+        "ColorShift_Enabled": "1.0",
+        "ColorShift_ KeepGray": "1.0",
+        "DetailPower": "1.0",
+        "RSpecScale": "1.0",
+        "Roughness_max": "1.0",
+    },
+}
 
 
 def is_witcher2_material(material: Material) -> bool:
@@ -235,6 +262,16 @@ def _mix_color_output(mix_node):
         return mix_node.outputs[2]  # Result (RGBA)
     return mix_node.outputs[0]  # Color
 
+
+def _sanitize_node_name_part(value: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in str(value or ""))
+
+
+def _internal_helper_node_name(kind: str, *parts: str) -> str:
+    safe_parts = [_sanitize_node_name_part(part) for part in parts if part]
+    joined = "_".join(part for part in safe_parts if part)
+    return f"__W3_{kind}_{joined}" if joined else f"__W3_{kind}"
+
 def create_instance_group(  material,
                             xml_data,
                             xml_path,
@@ -375,23 +412,156 @@ def xml_data_from_CR2W(mat_bin, name = None):
         )
     return new_xml
 
+def _load_material_root_chunk(material_path: str):
+    full_path = repo_file(material_path)
+    if not os.path.exists(full_path):
+        return None
+
+    material_file_chunks = CR2W_reader.load_material(full_path)
+    for chunk in material_file_chunks:
+        if chunk.Type in ("CMaterialInstance", "CMaterialGraph"):
+            if chunk.Type == "CMaterialGraph":
+                chunk._graph_params = [
+                    c for c in material_file_chunks
+                    if c.Type.startswith("CMaterialParameter")
+                ]
+                chunk._graph_material_path = material_path
+                chunk._graph_buffer_meta = _read_material_graph_buffer_meta(chunk, full_path)
+            return chunk
+    return None
+
+
+def _read_graph_parameter_buffer(file_handle, cr2w_file) -> List[Dict[str, object]]:
+    params: List[Dict[str, object]] = []
+    count = ReadVLQInt32(file_handle)
+    if count <= 0:
+        return params
+
+    for _ in range(count):
+        param_type = readUByte(file_handle)
+        offset = readUByte(file_handle)
+        name_index = readUShort(file_handle)
+        try:
+            name = cr2w_file.CNAMES[name_index].name.value
+        except Exception:
+            name = ""
+        params.append({
+            "type": param_type,
+            "offset": offset,
+            "name": name,
+        })
+    return params
+
+
+def _read_material_graph_buffer_meta(material_bin, full_path: str) -> Dict[str, object]:
+    cache_key = win_path_key(full_path)
+    cached = _graph_buffer_meta_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    cr2w_file = getattr(material_bin, "_W_CLASS__CR2WFILE", None)
+    if cr2w_file is None:
+        return {}
+
+    try:
+        export = cr2w_file.CR2WExport[material_bin.ChunkIndex]
+    except Exception:
+        return {}
+
+    prop_end = max((getattr(prop, "dataEnd", 0) for prop in getattr(material_bin, "PROPS", [])), default=export.dataOffset + 1)
+    buffer_start = prop_end + 2
+    export_end = export.dataOffset + export.dataSize
+    if buffer_start >= export_end:
+        return {}
+
+    meta: Dict[str, object] = {}
+    try:
+        with open(win_safe_path(full_path), "rb") as file_handle:
+            file_handle.seek(buffer_start)
+            meta["pixel_params"] = _read_graph_parameter_buffer(file_handle, cr2w_file)
+            meta["vertex_params"] = _read_graph_parameter_buffer(file_handle, cr2w_file)
+            if file_handle.tell() + 4 <= export_end:
+                meta["unk1"] = readU32(file_handle)
+    except Exception as exc:
+        log.warning("Failed to read buffered graph params from '%s': %s", full_path, exc)
+        meta = {}
+
+    _graph_buffer_meta_cache[cache_key] = meta
+    return meta
+
+
+def _read_material_params_from_bin(material_bin, seen_paths: Optional[Set[str]] = None):
+    final_params: Dict[str, tuple[str, str]] = {}
+    baseMaterial = material_bin.GetVariableByName('baseMaterial')
+    if baseMaterial and getattr(baseMaterial, "Handles", None):
+        handle = baseMaterial.Handles[0]
+        base_path = getattr(handle, "DepotPath", None)
+        if baseMaterial.theType == "handle:IMaterial" and base_path:
+            final_params.update(read_material_params_from_path(base_path, seen_paths=seen_paths))
+    read_instance_params(material_bin, final_params)
+    return final_params
+
+
+def read_material_params_from_path(
+        material_path: str,
+        seen_paths: Optional[Set[str]] = None
+        ) -> Dict[str, tuple[str, str]]:
+    if not material_path:
+        return {}
+
+    normalized_path = normalize_depot_path(material_path)
+    cached = _material_param_cache.get(normalized_path)
+    if cached is not None:
+        return dict(cached)
+
+    if seen_paths is None:
+        seen_paths = set()
+    if normalized_path in seen_paths:
+        log.warning("Detected cyclic material inheritance while reading '%s'", material_path)
+        return {}
+
+    seen_paths.add(normalized_path)
+    try:
+        material_bin = _load_material_root_chunk(material_path)
+        if material_bin is None:
+            return {}
+
+        params = _read_material_params_from_bin(material_bin, seen_paths=seen_paths)
+        _material_param_cache[normalized_path] = dict(params)
+        return dict(params)
+    finally:
+        seen_paths.discard(normalized_path)
+
+
 def resolve_w2mg(w2mi_path):
     """Follow w2mi baseMaterial chain to find the final .w2mg shader path."""
+    if not w2mi_path:
+        return None
+
+    normalized_path = normalize_depot_path(w2mi_path)
+    if normalized_path in _resolved_w2mg_cache:
+        return _resolved_w2mg_cache[normalized_path]
+
     try:
-        full_path = repo_file(w2mi_path)
-        if not os.path.exists(full_path):
+        material_bin = _load_material_root_chunk(w2mi_path)
+        if material_bin is None:
+            _resolved_w2mg_cache[normalized_path] = None
             return None
-        material_bin = CR2W_reader.load_material(full_path)[0]
         base_var = material_bin.GetVariableByName('baseMaterial')
         if not base_var:
+            _resolved_w2mg_cache[normalized_path] = None
             return None
         base_path = base_var.Handles[0].DepotPath
         if base_path.endswith(".w2mg"):
+            _resolved_w2mg_cache[normalized_path] = base_path
             return base_path
         elif base_path.endswith(".w2mi"):
-            return resolve_w2mg(base_path)
+            resolved = resolve_w2mg(base_path)
+            _resolved_w2mg_cache[normalized_path] = resolved
+            return resolved
     except Exception:
         pass
+    _resolved_w2mg_cache[normalized_path] = None
     return None
 
 def get_all_w2mi(w2mi_path, all_instances):
@@ -416,7 +586,6 @@ def setup_w3_material(
         ,is_instance_file = False
         ):
 
-    force_update = False
     is_instance_file = False # This is the multi-group method, still not working
 
     # Checks for duplicate materials
@@ -442,6 +611,7 @@ def setup_w3_material(
 
     shader_type = mat_base.split("\\")[-1][:-5]	# The .w2mg or .w2mi file, minus the extension.
     resolved_mat_base = mat_base
+    inherited_params: Dict[str, tuple[str, str]] = {}
 
     nodes = material.node_tree.nodes
     links = material.node_tree.links
@@ -452,7 +622,7 @@ def setup_w3_material(
         fallback_shader_type = guess_shader_type(shader_type)
         w2mi_path = xml_data.get('base')
         #w2mi_tex_params = read_2wmi_params(material, uncook_path, w2mi_path, shader_type)
-        w2mi_params = read_2wmi_params(w2mi_path)
+        inherited_params = read_2wmi_params(w2mi_path)
 
         # Try to resolve the actual .w2mg base shader from the w2mi chain
         resolved_w2mg = resolve_w2mg(w2mi_path)
@@ -463,7 +633,13 @@ def setup_w3_material(
         else:
             shader_type = fallback_shader_type
 
-        for par_name in w2mi_params.keys():
+        for par_name in inherited_params.keys():
+            if par_name in EQUIVALENT_PARAMS:
+                do_instance = True
+                log.info(f"EQUIVALENT_PARAMS found {par_name}, replacing {EQUIVALENT_PARAMS[par_name]}, creating new material node instance for {bpy.context.active_object.name}")
+    elif mat_base.endswith(".w2mg"):
+        inherited_params = read_material_params_from_path(mat_base)
+        for par_name in inherited_params.keys():
             if par_name in EQUIVALENT_PARAMS:
                 do_instance = True
                 log.info(f"EQUIVALENT_PARAMS found {par_name}, replacing {EQUIVALENT_PARAMS[par_name]}, creating new material node instance for {bpy.context.active_object.name}")
@@ -483,6 +659,7 @@ def setup_w3_material(
     # (See just above)
     material['witcher3_mat_base'] = mat_base
     material['witcher3_mat_params'] = params
+    material['witcher3_material_setup_version'] = MATERIAL_SETUP_VERSION
 
     #TODO Create the material instance NodeGroup
     #TODO instances contained within w2mesh files will be imported as materials.
@@ -556,26 +733,6 @@ def setup_w3_material(
             except Exception as e:
                 log.critical(f"MATERIAL ERROR {e}") #raise e
     else:
-        if mat_base.endswith(".w2mi"):
-            #remove w2mi_params the main material instance already provided
-            for name, attrs in params.items():
-                w2mi_params.pop(name, None)
-
-            for name, attrs in w2mi_params.items():
-                create_param(
-                    xml_data = xml_data
-                    ,name = name 
-                    ,type = attrs[0]
-                    ,value = attrs[1]
-                )
-            # for tex_path, tex_type in w2mi_tex_params.items():
-            #     create_texture_param(
-            #         xml_data = xml_data
-            #         ,name = tex_type
-            #         ,tex_filepath = tex_path
-            #     )
-
-
         only_basic_maps = True
         # if only_basic_maps:
         #     new_xml = ElementTree.Element(xml_data.tag, xml_data.attrib)
@@ -603,10 +760,10 @@ def setup_w3_material(
                 if param1.attrib['name'] == name:
                     param1.set("witcher_include", True)
 
-        
         #links nodes to created output
         #! Missing params will be created by this function
         mat_load_params_into_nodes(material, ordered_params, nodegroup_node, uncook_path)
+        apply_shader_default_overrides(material, nodegroup_node, inherited_params, uncook_path)
         if shader_type == 'pbr_eye':
             setup_eye_reflection_nodes(material, nodegroup_node, nodes, links)
         hide_unused_sockets(nodegroup_node)
@@ -621,12 +778,6 @@ def setup_w3_material(
         mat_ensure_dummy_transparent_img_node(material, nodegroup_node, shader_type, nodes)
         mat_apply_settings(material, shader_type)
 
-        DetailTile_node = nodes.get("DetailTile")
-        Pattern_Array_mapping_node = nodes.get("Pattern_Array_Mapping")
-        if DetailTile_node and Pattern_Array_mapping_node:
-            Pattern_Array_mapping_node.inputs[3].default_value[0] = DetailTile_node.inputs[3].default_value[0]
-            Pattern_Array_mapping_node.inputs[3].default_value[1] = DetailTile_node.inputs[3].default_value[1]
-
     return material
 
 def find_material(mat_base, params):
@@ -636,6 +787,7 @@ def find_material(mat_base, params):
     """
     for m in bpy.data.materials:
         if (
+            m.get('witcher3_material_setup_version', 0) == MATERIAL_SETUP_VERSION and \
             'witcher3_mat_params' in m and \
             mat_base == m['witcher3_mat_base'] and \
             params == m['witcher3_mat_params'].to_dict()
@@ -645,24 +797,20 @@ def find_material(mat_base, params):
 
 def read_2wmi_params2(
         material_bin: str
-        ) -> Dict[str, str]:
-    final_params: Dict[str, str] = {}	# texture filepath : texture type
-    baseMaterial = material_bin.GetVariableByName('baseMaterial')
-    if baseMaterial:
-        handle = baseMaterial.Handles[0]
-        if baseMaterial.theType == "handle:IMaterial" and handle.ClassName == "CMaterialInstance":
-            more_tex_params = read_2wmi_params(handle.DepotPath)
-            #TODO THESE PARAMS SHOULD NOT OVERRIDE EXISTING PARAMS
-            #TODO NEED TO COMPARE and replace PROPs
-            final_params.update(more_tex_params)
-    read_instance_params(material_bin, final_params)
-    return final_params
+        ) -> Dict[str, tuple[str, str]]:
+    return _read_material_params_from_bin(material_bin)
     
-def _read_graph_param_chunks(chunks, final_params):
+def _read_graph_param_chunks(
+        chunks,
+        final_params,
+        graph_meta: Optional[Dict[str, object]] = None,
+        material_path: Optional[str] = None
+        ):
     """Read CMaterialParameter* chunks from a .w2mg graph file into final_params.
     This extracts the default parameter values defined as graph nodes (textures,
     colours, scalars, vectors) that are siblings of the CMaterialGraph chunk.
     """
+    chunks_by_name = {}
     for chunk in chunks:
         name_var = chunk.GetVariableByName('parameterName')
         if name_var is None:
@@ -670,6 +818,7 @@ def _read_graph_param_chunks(chunks, final_params):
         par_name = name_var.Index.String
         if not par_name:
             continue
+        chunks_by_name[par_name] = chunk
         try:
             if chunk.Type == "CMaterialParameterTexture":
                 texture = chunk.GetVariableByName('texture')
@@ -698,6 +847,28 @@ def _read_graph_param_chunks(chunks, final_params):
         except Exception as e:
             log.warning(f"Failed to read graph param chunk {chunk.Type} '{par_name}': {e}")
 
+    missing_defaults = GRAPH_MISSING_SCALAR_DEFAULTS.get(normalize_depot_path(material_path or ""), {})
+    pixel_params = graph_meta.get("pixel_params", []) if graph_meta else []
+    for pixel_param in pixel_params:
+        par_name = pixel_param.get("name")
+        if not par_name or par_name in final_params:
+            continue
+        if pixel_param.get("type") != 5:
+            continue
+        chunk = chunks_by_name.get(par_name)
+        if chunk is None or chunk.Type != "CMaterialParameterScalar":
+            continue
+        fallback_value = missing_defaults.get(par_name)
+        if fallback_value is None:
+            continue
+        final_params[par_name] = ('Float', fallback_value)
+        log.debug(
+            "Applied graph scalar fallback for '%s' from '%s' -> %s",
+            par_name,
+            material_path,
+            fallback_value,
+        )
+
 
 def read_instance_params(material, final_params):
     mat_instance = getattr(material, 'CMaterialInstance', None)
@@ -705,7 +876,12 @@ def read_instance_params(material, final_params):
         # CMaterialGraph used directly — read default params from attached graph parameter chunks
         graph_params = getattr(material, '_graph_params', None)
         if graph_params:
-            _read_graph_param_chunks(graph_params, final_params)
+            _read_graph_param_chunks(
+                graph_params,
+                final_params,
+                graph_meta=getattr(material, '_graph_buffer_meta', None),
+                material_path=getattr(material, '_graph_material_path', None),
+            )
         return final_params
     for mat_param in mat_instance.InstanceParameters.elements:
         PROP = mat_param.PROP
@@ -727,20 +903,12 @@ def read_instance_params(material, final_params):
 
 def read_2wmi_params(
         w2mi_path: str
-        ) -> Dict[str, str]:
+        ) -> Dict[str, tuple[str, str]]:
     # Check if the .w2mi file references any textures or texarrays, and do the same there.
     # Load the .w2mi file.
     log.info("READING W2MI: " + w2mi_path) # FIX PATHS WITH SPACES bob_broken_woods_longpile
 
-    extra = []
-    #texture_paths = []
-    #uncook_path_mats = get_uncook_path(bpy.context)
-    full_path = repo_file(w2mi_path) #os.path.join(uncook_path_mats, w2mi_path)
-    if os.path.exists(full_path):
-        material_bin = CR2W_reader.load_material(full_path)[0]
-        return read_2wmi_params2(material_bin)
-    else:
-        return {}
+    return read_material_params_from_path(w2mi_path)
 
 def guess_texture_type_by_link(mat: Material, img_node):
         socket_name = img_node.outputs[0].links[0].to_socket.name
@@ -882,6 +1050,169 @@ def nodes_create_outputs(material, nodes, links, node_ng, xml_data, xml_path):
     node_output_eevee.name = xml_path[-60:]
     links.new(node_ng.outputs[1], node_output_eevee.inputs[0])
 
+def _find_socket_by_name(sockets, name: str):
+    if not name:
+        return None
+    try:
+        socket = sockets.get(name)
+        if socket is not None:
+            return socket
+    except Exception:
+        pass
+    for socket in sockets:
+        if getattr(socket, "name", None) == name:
+            return socket
+    return None
+
+
+def find_group_input_socket(node_ng: Node, par_name: str):
+    candidate_names = [par_name]
+    mapped_name = EQUIVALENT_PARAMS.get(par_name)
+    if mapped_name and mapped_name not in candidate_names:
+        candidate_names.append(mapped_name)
+
+    for candidate_name in candidate_names:
+        socket = _find_socket_by_name(node_ng.inputs, candidate_name)
+        if socket is not None:
+            return socket
+    return None
+
+
+def _values_differ(expected, actual, tolerance: float = 1e-5) -> bool:
+    try:
+        if isinstance(expected, (tuple, list)) and isinstance(actual, (tuple, list)):
+            if len(expected) != len(actual):
+                return True
+            return any(abs(float(a) - float(b)) > tolerance for a, b in zip(expected, actual))
+        return abs(float(expected) - float(actual)) > tolerance
+    except Exception:
+        return expected != actual
+
+
+def _shader_default_differs(node_ng: Node, input_pin, par_type: str, par_value: str) -> bool:
+    if input_pin is None:
+        return False
+
+    if par_type == 'Float':
+        return _values_differ(float(par_value), float(input_pin.default_value))
+
+    if par_type == 'Color':
+        values = [float(f.strip()) for f in par_value.split(";")]
+        normalized = tuple(value / 255.0 for value in values[:4])
+        current = tuple(input_pin.default_value[:4])
+        return _values_differ(normalized, current)
+
+    if par_type == 'Vector':
+        values = [float(f.strip()) for f in par_value.split(";")]
+        current_xyz = tuple(input_pin.default_value[:3])
+        if _values_differ(tuple(values[:3]), current_xyz):
+            return True
+        if len(values) > 3:
+            existing_w = None
+            if len(input_pin.links) != 0:
+                try:
+                    linked_node = input_pin.links[0].from_socket.node
+                    if str(getattr(linked_node, "witcher_param_kind", "") or "") == VECTOR_PARAM_KIND:
+                        existing_w = get_vector_w(linked_node, None)
+                except Exception:
+                    existing_w = None
+            if existing_w is None:
+                existing_w = get_legacy_w_value(input_pin, None)
+            if existing_w is not None:
+                return _values_differ(values[3], float(existing_w))
+        return False
+
+    if par_type in ('handle:ITexture', 'handle:CTextureArray', 'handle:CCubeTexture'):
+        return True
+
+    return False
+
+
+def build_param_element(name: str, param_type: str, value: str, **extra_attrs) -> Element:
+    param = ElementTree.Element('param')
+    param.set('name', _sanitize_xml_attr(name, "param"))
+    param.set('type', _sanitize_xml_attr(param_type, "Float"))
+    param.set('value', _sanitize_xml_attr(value))
+    for attr_name, attr_value in extra_attrs.items():
+        if attr_value is not None:
+            param.set(attr_name, str(attr_value))
+    return param
+
+
+def build_shader_default_override_params(
+        node_ng: Node,
+        inherited_params: Dict[str, tuple[str, str]]
+        ) -> List[Element]:
+    if not inherited_params:
+        return []
+
+    shader_default_params: List[Element] = []
+    for par_name, attrs in inherited_params.items():
+        par_type, par_value = attrs
+        input_pin = find_group_input_socket(node_ng, par_name)
+        if input_pin is None:
+            continue
+        if len(input_pin.links) != 0:
+            continue
+        if not _shader_default_differs(node_ng, input_pin, par_type, par_value):
+            continue
+
+        shader_default_params.append(
+            build_param_element(
+                input_pin.name,
+                par_type,
+                par_value,
+                witcher_shader_default="true",
+                witcher_require_socket="true",
+                witcher_source_name=par_name,
+            )
+        )
+
+    return shader_default_params
+
+
+def mark_shader_default_node(node):
+    if not node:
+        return
+    node.use_custom_color = True
+    node.color = (0.38, 0.52, 0.22)
+    try:
+        node["witcher_shader_default"] = True
+    except Exception:
+        pass
+
+
+def _next_shader_default_y(mat: Material) -> int:
+    nodes = mat.node_tree.nodes
+    if not nodes:
+        return 1000
+    min_y = min(int(getattr(node.location, "y", node.location[1])) for node in nodes)
+    return min_y - 170
+
+
+def apply_shader_default_overrides(
+        mat: Material,
+        node_ng: Node,
+        inherited_params: Dict[str, tuple[str, str]],
+        uncook_path: str
+        ):
+    shader_default_params = build_shader_default_override_params(node_ng, inherited_params)
+    if not shader_default_params:
+        return
+
+    ordered_defaults = order_elements_by_attribute(shader_default_params, PARAM_ORDER, 'name')
+    y_loc = _next_shader_default_y(mat)
+    for param in ordered_defaults:
+        node = create_node_for_param(mat, param, node_ng, uncook_path, y_loc)
+        if not node:
+            continue
+        if node.type == 'TEX_IMAGE':
+            y_loc -= 320
+        elif node.type == 'RGB':
+            y_loc -= 220
+        else:
+            y_loc -= 170
+
 def order_elements_by_attribute(
         elements: List[Element]
         ,order: List[str]
@@ -978,6 +1309,13 @@ def create_node_for_param(
 
     node_label = par_name
     node = None
+    require_existing_socket = param.get("witcher_require_socket") == "true"
+    is_shader_default = param.get("witcher_shader_default") == "true"
+    input_pin = find_group_input_socket(node_ng, par_name)
+
+    if require_existing_socket and input_pin is None:
+        log.debug("Skipping shader default param %s: no exact matching socket on nodegroup", par_name)
+        return
 
     if par_type in ['handle:ITexture']:
         node = create_node_texture(mat, param, node_ng, y_loc, uncook_path, texarray_index)
@@ -1029,7 +1367,7 @@ def create_node_for_param(
     elif par_type == 'Color':
         node = create_node_color(mat, param, node_ng)
     elif par_type == 'Vector':
-        (node, node_w) = create_node_vector(mat, param, node_ng, do_vec_4 = True)
+        node = create_node_vector(mat, param, node_ng, do_vec_4 = True)
     else:
         log.debug("Unhandled material parameter type: %s", par_type)
         node = create_node_attribute(mat, param, node_ng)
@@ -1046,31 +1384,20 @@ def create_node_for_param(
     if par_name in EQUIVALENT_PARAMS:
         log.info(f"EQUIVALENT_PARAMS found {par_name} replacing {EQUIVALENT_PARAMS[par_name]}")
         #todo clone the material group and replace instead of changing param name?
-        input_pin = node_ng.inputs.get(EQUIVALENT_PARAMS[par_name])
-        if input_pin != None:
+        input_pin = _find_socket_by_name(node_ng.inputs, EQUIVALENT_PARAMS[par_name])
+        if input_pin != None and not is_shader_default:
             
             if bpy.app.version >= (4, 0, 0):
                 input_inner = node_ng.node_tree.interface.items_tree.get(EQUIVALENT_PARAMS[par_name])
             else:
                 input_inner = node_ng.node_tree.inputs.get(EQUIVALENT_PARAMS[par_name])
             input_inner.name = par_name
-    else:
-        input_pin = node_ng.inputs.get(par_name)
     
-    input_pin_vec_W = None
-    if par_type == 'Vector':
-        #create the W float node and pins
-        input_pin_vec_W = node_ng.inputs.get(par_name+'_W')
-        if input_pin_vec_W == None:
-            node_tree_inputs_new( node_ng, 'NodeSocketFloat', par_name+'_W')
-            input_pin_vec_W = node_ng.inputs.get(par_name+'_W')
-        node_w.location = (-450, y_loc)
-        node_w.name = par_name+'_W'
-        node_w.label = node_label+'_W'
-
     #this will create the input pin on the shader node gorup if it doesn't exist. Idealy all shader pins would be defined. But some w2mi have values that don't exist on their shader
     #TODO check for same names but differnt types defined on instance vs shader.
     if input_pin == None:
+        if require_existing_socket:
+            return
         if par_type == "Color":
             node_tree_inputs_new( node_ng, 'NodeSocketColor', par_name)
         elif par_type == "Float":
@@ -1081,7 +1408,10 @@ def create_node_for_param(
             node_tree_inputs_new( node_ng, 'NodeSocketColor', par_name)
         elif par_type == 'Vector':
             node_tree_inputs_new( node_ng, 'NodeSocketVector', par_name)
-        input_pin = node_ng.inputs.get(par_name)
+        input_pin = _find_socket_by_name(node_ng.inputs, par_name)
+
+    if is_shader_default:
+        mark_shader_default_node(node)
 
     if input_pin and len(input_pin.links) == 0:
         # Only connect the node if some other node isn't already connected.
@@ -1089,8 +1419,6 @@ def create_node_for_param(
         # the first one.
         try:
             links.new(node.outputs[0], input_pin)
-            if par_type == 'Vector':
-                links.new(node_w.outputs[0], input_pin_vec_W)
             # Connect texture alpha to {par_name}_alpha if that input exists on the nodegroup
             if par_type in ['handle:ITexture'] and node.type == 'TEX_IMAGE':
                 alpha_pin = node_ng.inputs.get(f"{par_name}_alpha")
@@ -1140,6 +1468,8 @@ def create_node_texture(
         node_mapping = nodes.new(type='ShaderNodeMapping')
         node_mapping.location = (-600, y_loc-200)
         node_mapping.hide = True
+        node_mapping.label = f"{par_name} Mapping"
+        node_mapping.name = _internal_helper_node_name("Mapping", par_name)
         links.new(node_mapping.outputs[0], node.inputs[0])
 
         node_uv = nodes.new(type='ShaderNodeUVMap')
@@ -1149,8 +1479,6 @@ def create_node_texture(
         
         # Set default X and Y scale values to the DetailTile value.
         # Value based on pbr_std_tint_mask_det.w2mg material graph TODO check
-        if par_name == "Pattern_Array":
-            node_mapping.name = "Pattern_Array_Mapping"
         node_mapping.inputs[3].default_value[0] = 5
         node_mapping.inputs[3].default_value[1] = 5
 
@@ -1158,6 +1486,8 @@ def create_node_texture(
         node_mapping = nodes.new(type='ShaderNodeMapping')
         node_mapping.location = (-600, y_loc-200)
         node_mapping.hide = True
+        node_mapping.label = "rune_normal Mapping"
+        node_mapping.name = _internal_helper_node_name("Mapping", par_name)
         node_mapping.inputs[1].default_value[0] = 0.75  # X Location
         node_mapping.inputs[3].default_value[0] = 0.25  # X Scale
         links.new(node_mapping.outputs[0], node.inputs[0])
@@ -1488,51 +1818,91 @@ def create_node_color(mat, param, node_ng):
 
 def create_node_vector(mat, param, node_ng, do_vec_4 = False):
     nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
     par_name = param.get('name')
     par_value = param.get('value')
 
     values = [float(f) for f in par_value.split("; ")]
-    
-    def assign_uv_scale_values(mat, target_node):
-        if not target_node:
-            return
-        if len(target_node.inputs[0].links) > 0:
-            mapping_node = target_node.inputs[0].links[0].from_node
-            if mapping_node.type == 'MAPPING':
-                # Set X and Y scale values to the DetailTile value.
-                mapping_node.inputs[3].default_value[0] = values[0]
-                mapping_node.inputs[3].default_value[1] = values[1]
-            else:
-                log.warning(f"Expected a mapping node for {par_name}, got {mapping_node.type} instead!")
-                return
-            mapping_node.label = mapping_node.name = par_name
-        else:
-            log.warning(f"Warning: Node {target_node.name} in material {mat.name} was expected to have a Mapping node plugged into it!")
-
-    # Handling UV scale/tile nodes params
-    if 'Tile' in par_name:
-        for name in ['Diffuse', 'Normal']:
-            target_node = nodes.get(par_name.replace('Tile', name))
-            assign_uv_scale_values(mat, target_node)
-    elif par_name == 'SpecularShiftUVScale':
-        target_node = nodes.get('SpecularShiftTexture')
-        assign_uv_scale_values(mat, target_node)
-        #return
-    # if values[3] != 1 and values[3] != 0:
-    # 	The 4th value on vectors is probably always useless.
-    # 	log.warning("Warning: Discarded vector 4th value: " + str(values) + " in parameter: " + par_name)
 
     node = nodes.new(type='ShaderNodeCombineXYZ')
     node.inputs[0].default_value = values[0]
     node.inputs[1].default_value = values[1]
     node.inputs[2].default_value = values[2]
+    mark_vector_param_node(
+        node,
+        par_name,
+        values[3] if len(values) > 3 else 1.0,
+        VECTOR_SOURCE_XYZ,
+    )
+
+    def find_texture_mapping_node(target_node_name):
+        target_node = nodes.get(target_node_name)
+        if not target_node:
+            return None
+        if len(target_node.inputs[0].links) == 0:
+            log.warning(f"Warning: Node {target_node.name} in material {mat.name} was expected to have a Mapping node plugged into it!")
+            return None
+        mapping_node = target_node.inputs[0].links[0].from_node
+        if mapping_node.type != 'MAPPING':
+            log.warning(f"Expected a mapping node for {par_name}, got {mapping_node.type} instead!")
+            return None
+        return mapping_node
+
+    def get_mapping_targets():
+        mapping_targets = []
+        mapping_input_idx = None
+
+        if 'Rotation' in par_name:
+            mapping_input_idx = 2
+            replace_token = 'Rotation'
+        elif 'Offset' in par_name:
+            mapping_input_idx = 1
+            replace_token = 'Offset'
+        elif 'Tile' in par_name:
+            mapping_input_idx = 3
+            replace_token = 'Tile'
+        elif par_name == 'SpecularShiftUVScale':
+            mapping_input_idx = 3
+            replace_token = None
+        else:
+            replace_token = None
+
+        if replace_token == 'Tile':
+            for name in ['Diffuse', 'Normal']:
+                target_name = par_name.replace(replace_token, name)
+                mapping_node = find_texture_mapping_node(target_name)
+                if mapping_node and mapping_node not in mapping_targets:
+                    mapping_targets.append(mapping_node)
+            if par_name == 'DetailTile':
+                pattern_mapping = nodes.get(_internal_helper_node_name("Mapping", "Pattern_Array"))
+                if pattern_mapping and pattern_mapping.type == 'MAPPING' and pattern_mapping not in mapping_targets:
+                    mapping_targets.append(pattern_mapping)
+        elif replace_token in {'Rotation', 'Offset'}:
+            for name in ['Diffuse', 'Normal']:
+                target_name = par_name.replace(replace_token, name)
+                mapping_node = find_texture_mapping_node(target_name)
+                if mapping_node and mapping_node not in mapping_targets:
+                    mapping_targets.append(mapping_node)
+        elif par_name == 'SpecularShiftUVScale':
+            mapping_node = find_texture_mapping_node('SpecularShiftTexture')
+            if mapping_node:
+                mapping_targets.append(mapping_node)
+
+        return mapping_input_idx, mapping_targets
+
+    mapping_input_idx, mapping_targets = get_mapping_targets()
+    if mapping_input_idx is not None:
+        for mapping_node in mapping_targets:
+            mapping_input = mapping_node.inputs[mapping_input_idx]
+            mapping_node.label = f"{par_name} Mapping"
+            for idx in range(min(3, len(mapping_input.default_value))):
+                mapping_input.default_value[idx] = values[idx]
+            if not mapping_input.is_linked:
+                links.new(node.outputs[0], mapping_input)
 
     if do_vec_4:
-        node_w = nodes.new(type='ShaderNodeValue')
-        node_w.outputs[0].default_value = float(values[3])
-        return node, node_w
-    else:
         return node
+    return node
 
 def create_node_attribute(mat, param, node_ng):
     nodes = mat.node_tree.nodes

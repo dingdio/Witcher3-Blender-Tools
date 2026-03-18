@@ -239,9 +239,12 @@ def get_mesh_material_info(mesh_bl, mesh_obj=None):
                                             'value':get_socket_value(input_socket_group)})
                                         break
                             else:
+                                export_type = linked_socket.node.type
+                                if input_socket.type == 'VECTOR':
+                                    export_type = 'COMBXYZ'
                                 mat_dict['witcher_props']['input_props'].append(
                                     {'name':input_socket.name,
-                                    'type': linked_socket.node.type,
+                                    'type': export_type,
                                     'value':get_socket_value(input_socket)})
             else:
                 # No Witcher node group — check for a Principled BSDF and auto-convert
@@ -257,15 +260,6 @@ def get_mesh_material_info(mesh_bl, mesh_obj=None):
                     log.info(f"Auto-converted Principled BSDF material '{mat.name}' → pbr_std with {[p['name'] for p in bsdf_props]}")
         
         
-        # create Vector4 if W value
-        for prop in mat_dict['witcher_props']['input_props']:
-            if prop['type'] == 'COMBXYZ':
-                for w_prop in mat_dict['witcher_props']['input_props']:
-                    if w_prop['name'] == prop['name']+'_W':
-                        mat_dict['witcher_props']['input_props'].remove(w_prop)
-                        prop['value'].append(w_prop['value'])
-                        break
-
         material_props.append(mat_dict)
     return material_props
 
