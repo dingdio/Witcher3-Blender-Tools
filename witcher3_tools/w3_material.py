@@ -102,7 +102,11 @@ def normalize_depot_path(path: str) -> str:
 _material_param_cache: Dict[str, Dict[str, tuple[str, str]]] = {}
 _resolved_w2mg_cache: Dict[str, Optional[str]] = {}
 _graph_buffer_meta_cache: Dict[str, Dict[str, object]] = {}
+_graph_declared_param_cache: Dict[str, Optional[Set[str]]] = {}
 MATERIAL_SETUP_VERSION = 4
+
+# Some instance params in game files can mess up the Blender shared material by having old params that are no longer on the current shader. eg. SpecularColor when the shader only calls for SpecularTexture
+GRAPH_DECLARED_INSTANCE_PARAMS: Set[str] = {"SpecularColor"}
 
 # Some graph parameters exist in PixelParameters but do not serialize a scalar field on
 # their CMaterialParameterScalar chunk. Until the raw value block is decoded, use exact
@@ -410,6 +414,7 @@ def xml_data_from_CR2W(mat_bin, name = None):
             ,type = attrs[0]
             ,value = attrs[1]
         )
+    prune_unsupported_instance_params(new_xml, mat_base)
     return new_xml
 
 def _load_material_root_chunk(material_path: str):
@@ -488,6 +493,74 @@ def _read_material_graph_buffer_meta(material_bin, full_path: str) -> Dict[str, 
 
     _graph_buffer_meta_cache[cache_key] = meta
     return meta
+
+
+def read_declared_graph_params(material_path: str) -> Optional[Set[str]]:
+    if not material_path:
+        return None
+
+    graph_path = material_path
+    if material_path.lower().endswith(".w2mi"):
+        resolved_graph = resolve_w2mg(material_path)
+        if not resolved_graph:
+            return None
+        graph_path = resolved_graph
+
+    normalized_path = normalize_depot_path(graph_path)
+    if normalized_path in _graph_declared_param_cache:
+        cached = _graph_declared_param_cache[normalized_path]
+        return set(cached) if cached is not None else None
+
+    material_bin = _load_material_root_chunk(graph_path)
+    if material_bin is None or material_bin.Type != "CMaterialGraph":
+        _graph_declared_param_cache[normalized_path] = None
+        return None
+
+    declared_params: Set[str] = set()
+    for chunk in getattr(material_bin, "_graph_params", []) or []:
+        name_var = chunk.GetVariableByName('parameterName')
+        if name_var is None:
+            continue
+        par_name = getattr(getattr(name_var, "Index", None), "String", None)
+        if par_name:
+            declared_params.add(par_name)
+
+    graph_meta = getattr(material_bin, "_graph_buffer_meta", None) or {}
+    for buffer_name in ("pixel_params", "vertex_params"):
+        for graph_param in graph_meta.get(buffer_name, []):
+            par_name = graph_param.get("name")
+            if par_name:
+                declared_params.add(par_name)
+
+    cached_value = set(declared_params)
+    _graph_declared_param_cache[normalized_path] = cached_value
+    return set(cached_value)
+
+
+def prune_unsupported_instance_params(
+        xml_data: Element,
+        shader_graph_path: str,
+        params: Optional[Dict[str, str]] = None
+        ) -> None:
+    declared_params = read_declared_graph_params(shader_graph_path)
+    if declared_params is None:
+        return
+
+    for param in list(xml_data):
+        par_name = param.get('name')
+        if par_name not in GRAPH_DECLARED_INSTANCE_PARAMS:
+            continue
+        if par_name in declared_params:
+            continue
+
+        xml_data.remove(param)
+        if params is not None:
+            params.pop(par_name, None)
+        log.info(
+            "Skipping stale instance param '%s': shader graph '%s' does not declare it",
+            par_name,
+            shader_graph_path,
+        )
 
 
 def _read_material_params_from_bin(material_bin, seen_paths: Optional[Set[str]] = None):
@@ -600,14 +673,9 @@ def setup_w3_material(
         return
 
 
-    do_instance = False
     params = {}
     for p in xml_data:
         params[p.get('name')] = p.get('value')
-        par_name = p.get('name')
-        if par_name in EQUIVALENT_PARAMS:
-            do_instance = True
-            log.info(f"EQUIVALENT_PARAMS found {par_name}, replacing {EQUIVALENT_PARAMS[par_name]}, creating new material node instance for {bpy.context.active_object.name}")
 
     shader_type = mat_base.split("\\")[-1][:-5]	# The .w2mg or .w2mi file, minus the extension.
     resolved_mat_base = mat_base
@@ -633,20 +701,13 @@ def setup_w3_material(
         else:
             shader_type = fallback_shader_type
 
-        for par_name in inherited_params.keys():
-            if par_name in EQUIVALENT_PARAMS:
-                do_instance = True
-                log.info(f"EQUIVALENT_PARAMS found {par_name}, replacing {EQUIVALENT_PARAMS[par_name]}, creating new material node instance for {bpy.context.active_object.name}")
     elif mat_base.endswith(".w2mg"):
         inherited_params = read_material_params_from_path(mat_base)
-        for par_name in inherited_params.keys():
-            if par_name in EQUIVALENT_PARAMS:
-                do_instance = True
-                log.info(f"EQUIVALENT_PARAMS found {par_name}, replacing {EQUIVALENT_PARAMS[par_name]}, creating new material node instance for {bpy.context.active_object.name}")
 
     if is_witcher2_material(material):
         shader_type = resolve_witcher2_shader_type(resolved_mat_base, shader_type)
 
+    prune_unsupported_instance_params(xml_data, resolved_mat_base, params=params)
 
     # Checking if this material was already imported by comparing some custom properties
     # that we create on imported materials.
@@ -746,8 +807,6 @@ def setup_w3_material(
         # Clean existing nodes and create core nodegroup.
         nodegroup_node = init_material_nodes(material, shader_type)
         nodegroup_node.name = mat_base[-60:]
-        if do_instance:
-            nodegroup_node.node_tree = nodegroup_node.node_tree.copy()
 
         nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
 
@@ -1380,19 +1439,6 @@ def create_node_for_param(
     node.name = par_name
     node.label = node_label
 
-    # Linking the node to the nodegroup
-    if par_name in EQUIVALENT_PARAMS:
-        log.info(f"EQUIVALENT_PARAMS found {par_name} replacing {EQUIVALENT_PARAMS[par_name]}")
-        #todo clone the material group and replace instead of changing param name?
-        input_pin = _find_socket_by_name(node_ng.inputs, EQUIVALENT_PARAMS[par_name])
-        if input_pin != None and not is_shader_default:
-            
-            if bpy.app.version >= (4, 0, 0):
-                input_inner = node_ng.node_tree.interface.items_tree.get(EQUIVALENT_PARAMS[par_name])
-            else:
-                input_inner = node_ng.node_tree.inputs.get(EQUIVALENT_PARAMS[par_name])
-            input_inner.name = par_name
-    
     #this will create the input pin on the shader node gorup if it doesn't exist. Idealy all shader pins would be defined. But some w2mi have values that don't exist on their shader
     #TODO check for same names but differnt types defined on instance vs shader.
     if input_pin == None:
