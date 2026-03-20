@@ -369,6 +369,63 @@ def prepare_extraction_target(abs_path: str, uncook_path: str) -> bool:
 def _strip_buffer_suffix(path: str) -> str:
     return re.sub(r"\.\d+\.buffer$", "", path, flags=re.IGNORECASE)
 
+_BULK_BUFFER_PROBE_LIMIT = 100
+
+def _get_buffer_sidecar_index(path: str, base_path: str):
+    if not path or not base_path:
+        return None
+    norm_path = path.replace("/", "\\")
+    norm_base = base_path.replace("/", "\\")
+    prefix = norm_base + "."
+    lower_path = norm_path.lower()
+    if not lower_path.startswith(prefix.lower()) or not lower_path.endswith(".buffer"):
+        return None
+    suffix = norm_path[len(prefix):-len(".buffer")]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+def _collect_buffer_sidecar_entries(entries, base_path: str):
+    matches = []
+    for entry_path, item_list in entries:
+        if not isinstance(entry_path, str):
+            continue
+        sidecar_index = _get_buffer_sidecar_index(entry_path, base_path)
+        if sidecar_index is None:
+            continue
+        matches.append((sidecar_index, entry_path.replace("/", "\\"), item_list))
+    matches.sort(key=lambda item: item[0])
+    return matches
+
+def _collect_buffer_sidecar_items(bundle_manager, filepath: str):
+    matches = []
+    for buf_idx in range(1, _BULK_BUFFER_PROBE_LIMIT + 1):
+        rel_path = f"{filepath}.{buf_idx}.buffer"
+        item_list = bundle_manager.find_item_by_hash(rel_path)
+        if item_list:
+            matches.append((rel_path, item_list))
+            continue
+        if buf_idx < _BULK_BUFFER_PROBE_LIMIT:
+            return matches
+        break
+
+    seen_paths = {path.lower() for path, _ in matches}
+    for _, rel_path, item_list in _collect_buffer_sidecar_entries(bundle_manager.Items.items(), filepath):
+        rel_key = rel_path.lower()
+        if rel_key in seen_paths:
+            continue
+        matches.append((rel_path, item_list))
+    return matches
+
+def _collect_bundle_extract_items(bundle_manager, filepath: str):
+    items = []
+    base_item = bundle_manager.find_item_by_hash(filepath)
+    if base_item:
+        items.append((filepath, base_item))
+    if filepath.endswith('.w2mesh') or filepath.endswith('.w2anims'):
+        items.extend(_collect_buffer_sidecar_items(bundle_manager, filepath))
+    return items
+
 def _normalize_mod_inner_path(inner: str) -> str:
     if not inner:
         return inner
@@ -570,13 +627,11 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                     return abs_filename
 
                 base_item = None
-                buffer_items = []
+                buffer_items = _collect_buffer_sidecar_entries(mod_entry["items"], filepath)
                 for inner, item_list in mod_entry["items"]:
                     inner_norm = _normalize_mod_inner_path(inner)
                     if inner_norm.lower() == filepath_key:
                         base_item = (inner_norm, item_list)
-                    else:
-                        buffer_items.append((inner_norm, item_list))
 
                 extracted_any = False
                 base_extracted = False
@@ -589,7 +644,7 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                         base_extracted = True
 
                 if base_extracted or base_from_same_mod:
-                    for inner, item_list in buffer_items:
+                    for _, inner, item_list in buffer_items:
                         out_path = os.path.join(extract_root, inner)
                         if not prepare_extraction_target(out_path, extract_root):
                             continue
@@ -614,29 +669,12 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                 return abs_filename
             log.info("Extracting %s", filepath)
             bundle_manager = LoadBundleManager()
-            items = None
-            if filepath.endswith('.w2mesh') or filepath.endswith('.w2anims'): # if it's a mesh get the .1.buffer files
-                # Direct dict lookups instead of scanning all items with regex
-                items = []
-                base_item = bundle_manager.find_item_by_hash(filepath)
-                if base_item:
-                    items.append(base_item)
-                # Check for all associated .N.buffer sidecar files
-                for buf_idx in range(1, 256):
-                    buf_key = f"{filepath}.{buf_idx}.buffer"
-                    buf_item = bundle_manager.find_item_by_hash(buf_key)
-                    if buf_item:
-                        items.append(buf_item)
-                    else:
-                        break  # buffer files are sequential, stop at first gap
-            else:
-                item = bundle_manager.find_item_by_hash(filepath)
-                items = [item] if item else []
+            items = _collect_bundle_extract_items(bundle_manager, filepath)
             if items:
                 extracted_any = False
-                for item in items:
+                for rel_path, item in items:
                     final_item:BundleItem = item[-1]
-                    out_path = os.path.join(extract_root, final_item.name)
+                    out_path = os.path.join(extract_root, rel_path)
                     if not prepare_extraction_target(out_path, extract_root):
                         continue
                     final_item.extract_to_file(out_path)
@@ -652,22 +690,12 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                         filepath = repaired_filepath
                         filepath_key = filepath.lower()
                         abs_filename = os.path.join(extract_root, filepath)
-                        items = []
-                        base_item = bundle_manager.find_item_by_hash(filepath)
-                        if base_item:
-                            items.append(base_item)
-                        for buf_idx in range(1, 256):
-                            buf_key = f"{filepath}.{buf_idx}.buffer"
-                            buf_item = bundle_manager.find_item_by_hash(buf_key)
-                            if buf_item:
-                                items.append(buf_item)
-                            else:
-                                break
+                        items = _collect_bundle_extract_items(bundle_manager, filepath)
                 if items:
                     extracted_any = False
-                    for item in items:
+                    for rel_path, item in items:
                         final_item:BundleItem = item[-1]
-                        out_path = os.path.join(extract_root, final_item.name)
+                        out_path = os.path.join(extract_root, rel_path)
                         if not prepare_extraction_target(out_path, extract_root):
                             continue
                         final_item.extract_to_file(out_path)
@@ -684,13 +712,11 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                                 return abs_filename
                             mod_label = f"mod:{mod_entry['mod']}"
                             base_item = None
-                            buffer_items = []
+                            buffer_items = _collect_buffer_sidecar_entries(mod_entry["items"], filepath)
                             for inner, item_list in mod_entry["items"]:
                                 inner_norm = _normalize_mod_inner_path(inner)
                                 if inner_norm.lower() == filepath_key:
                                     base_item = (inner_norm, item_list)
-                                else:
-                                    buffer_items.append((inner_norm, item_list))
 
                             extracted_any = False
                             base_extracted = False
@@ -703,7 +729,7 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                                     base_extracted = True
 
                             if base_extracted:
-                                for inner, item_list in buffer_items:
+                                for _, inner, item_list in buffer_items:
                                     out_path = os.path.join(extract_root, inner)
                                     if not prepare_extraction_target(out_path, extract_root):
                                         continue
@@ -715,42 +741,55 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                                 set_source_for_path(extract_root, filepath, mod_label)
         return abs_filename
 
-def extract_missing_buffers(abs_w2anims_path: str):
+def extract_missing_buffers(abs_w2anims_path: str, required_index: int | None = None) -> set[int]:
     """Extract any missing .N.buffer sidecar files for a .w2anims/.w2mesh.
 
     Called on-demand by dc_anims when a specific buffer is missing, NOT on
-    every repo_file call.  Extracts all missing buffers in one pass so the
-    bundle manager is only loaded once.
+    every repo_file call. If required_index is provided, only that sidecar is
+    probed and extracted; otherwise all missing sidecars are extracted in one
+    pass so the bundle manager is only loaded once.
     """
+    extracted = set()
     prefs = _get_addon_prefs()
     if prefs:
         uncook_path = prefs.uncook_path
     else:
         uncook_path = get_dev_override("fallback_uncook_path_w3", "")
     if not uncook_path:
-        return
+        return extracted
     norm_file = os.path.normcase(os.path.normpath(abs_w2anims_path))
     norm_uncook = os.path.normcase(os.path.normpath(uncook_path))
     if not norm_file.startswith(norm_uncook):
-        return  # external file – don't extract
+        return extracted
     rel_path = os.path.relpath(abs_w2anims_path, uncook_path)
-    bundle_manager = None
-    for buf_idx in range(1, 256):
-        buf_rel = f"{rel_path}.{buf_idx}.buffer"
-        buf_abs = f"{abs_w2anims_path}.{buf_idx}.buffer"
+    bundle_manager = LoadBundleManager()
+
+    if required_index is not None:
+        buf_rel = f"{rel_path}.{required_index}.buffer"
+        buf_abs = f"{abs_w2anims_path}.{required_index}.buffer"
         if os.path.exists(win_safe_path(buf_abs)):
-            continue
-        if bundle_manager is None:
-            bundle_manager = LoadBundleManager()
+            return extracted
         buf_item = bundle_manager.find_item_by_hash(buf_rel)
         if buf_item:
             final_item: BundleItem = buf_item[-1]
-            out_path = os.path.join(uncook_path, final_item.name)
+            out_path = os.path.join(uncook_path, buf_rel)
             if prepare_extraction_target(out_path, uncook_path):
                 final_item.extract_to_file(out_path)
+                extracted.add(required_index)
                 log.info("Extracted missing buffer: %s", buf_rel)
-        else:
-            break  # sequential – no more buffers in the bundle
+        return extracted
+
+    for buf_idx, buf_rel, buf_item in _collect_buffer_sidecar_entries(bundle_manager.Items.items(), rel_path):
+        buf_abs = f"{abs_w2anims_path}.{buf_idx}.buffer"
+        if os.path.exists(win_safe_path(buf_abs)):
+            continue
+        final_item: BundleItem = buf_item[-1]
+        out_path = os.path.join(uncook_path, buf_rel)
+        if prepare_extraction_target(out_path, uncook_path):
+            final_item.extract_to_file(out_path)
+            extracted.add(buf_idx)
+            log.info("Extracted missing buffer: %s", buf_rel)
+    return extracted
 
 def get_game_path():
     prefs = _get_addon_prefs()

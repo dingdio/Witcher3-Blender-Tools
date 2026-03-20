@@ -47,6 +47,12 @@ class ReadCompressFloat():
             val = ReadFloat16(f)
         self.val = val
 
+def _has_valid_embedded_anim_data(embedded_data) -> bool:
+    return bool(embedded_data and len(embedded_data) > 20)
+
+def _is_raw_embedded_buffer(buffer_bytes) -> bool:
+    return bool(buffer_bytes) and bytes(buffer_bytes[:4]) != b"CR2W"
+
 
 def _safe_track_name(skeleton_file, idx):
     if not skeleton_file:
@@ -593,29 +599,39 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
     # For cooked animations, data is stored in external .buffer files
     # For uncooked animations (e.g., from REDkit), data may be in 'data' property or 'fallbackData'
     if (deferredData is not None and deferredData.ValueA != 0):
-        def_path = file.fileName + "." + str(deferredData.ValueA) + ".buffer"
-        buffer_index = deferredData.ValueA - 1  # Convert to 0-based index
-        has_embedded_buffer = (
+        required_buffer_index = deferredData.ValueA
+        def_path = file.fileName + "." + str(required_buffer_index) + ".buffer"
+        buffer_index = required_buffer_index - 1  # Convert to 0-based index
+        embedded_buffer = None
+        if (
             hasattr(file, 'BufferData')
             and file.BufferData
             and buffer_index >= 0
             and buffer_index < len(file.BufferData)
-        )
-        has_embedded_anim_data = bool(embedded_data and len(embedded_data) > 0)
+        ):
+            embedded_buffer = file.BufferData[buffer_index]
+        has_embedded_buffer = embedded_buffer is not None
+        has_raw_embedded_buffer = _is_raw_embedded_buffer(embedded_buffer)
+        has_valid_embedded_anim_data = _has_valid_embedded_anim_data(embedded_data)
+
+        def _raise_missing_buffer(reason: str):
+            raise FileNotFoundError(f"Missing required animation buffer {def_path}; {reason}")
 
         # Ensure the buffer file exists before loading.
-        # If missing and the file is under the uncook path, extract all missing
-        # buffers in one pass.  External files (mod projects) get a clear error.
+        # If missing and the file is under the uncook path, extract only the
+        # required sidecar. External files (mod projects) get a clear error.
         if not os.path.exists(def_path):
             from .common_blender import extract_missing_buffers
-            extract_missing_buffers(file.fileName)
+            extract_missing_buffers(file.fileName, required_index=required_buffer_index)
 
-            if not os.path.exists(def_path) and not has_embedded_buffer and not has_embedded_anim_data:
-                raise FileNotFoundError(
-                    f"Missing buffer file: {def_path}\n"
-                    f"Animation requires this buffer but it could not be found or extracted.\n"
-                    f"If loading from a mod project, ensure all .buffer files are present alongside the .w2anims."
-                )
+        if not os.path.exists(def_path) and has_embedded_buffer and not has_raw_embedded_buffer and not has_valid_embedded_anim_data:
+            _raise_missing_buffer(
+                f"embedded CR2W buffer {required_buffer_index} is not a raw sidecar, import cancelled to avoid corrupt animation."
+            )
+        if not os.path.exists(def_path) and not has_raw_embedded_buffer and not has_valid_embedded_anim_data:
+            _raise_missing_buffer(
+                f"buffer index {required_buffer_index} could not be found or extracted, and no valid embedded animation data fallback is available."
+            )
 
         # Load from buffer file if it exists (cooked path)
         if os.path.exists(def_path):
@@ -648,15 +664,14 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
                 pass
             
             # If prefer_uncompressed is enabled and we have embedded animation data, use it
-            if prefer_uncompressed and embedded_data and len(embedded_data) > 20:
+            if prefer_uncompressed and has_valid_embedded_anim_data:
                 log.info(f"prefer_uncompressed enabled: using uncompressed animation data ({len(embedded_data)} bytes)")
                 buffer = read_uncooked_anim_buffer(embedded_data, chunk, duration, Skeleton_file)
                 buffer._source_detail = "embeddedAnimData:prefer_uncompressed"
                 return buffer
             
             # Check if the CR2W file has embedded buffers
-            if has_embedded_buffer:
-                embedded_buffer = file.BufferData[buffer_index]
+            if has_raw_embedded_buffer:
                 if (streamingOption is not None and streamingOption.Index.String == "ABSO_PartiallyStreamable"):
                     b = bytearray(data_in_file) + bytearray(embedded_buffer)
                     buffer_size = len(b)
@@ -698,32 +713,40 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
 
                 if max_data_addr > buffer_size:
                     log.warning(f"Buffer size ({buffer_size}) smaller than required ({max_data_addr}), dataAddr values exceed buffer bounds")
-                    if embedded_data and len(embedded_data) > 0:
+                    if has_valid_embedded_anim_data:
                         log.info(f"Falling back to uncompressed embedded data ({len(embedded_data)} bytes)")
                         buffer = read_uncooked_anim_buffer(embedded_data, chunk, duration, Skeleton_file)
                         buffer._source_detail = "embeddedAnimData:buffer_too_small"
                         return buffer
-                    else:
-                        log.warning("No embedded data available for fallback, animation may fail")
+                    _raise_missing_buffer(
+                        f"embedded raw buffer {required_buffer_index} is smaller than required ({buffer_size} < {max_data_addr}), and no valid embedded animation data fallback is available."
+                    )
 
                 # Use the embedded buffer with the standard cooked format (dataAddr offsets)
                 the_data = bStream(data = b)
-            elif embedded_data and len(embedded_data) > 0:
+            elif has_embedded_buffer and not has_raw_embedded_buffer:
+                log.warning(
+                    "Buffer file not found, embedded CR2W buffer #%d is wrapped and cannot be used as a raw sidecar",
+                    required_buffer_index,
+                )
+                if has_valid_embedded_anim_data:
+                    log.info(f"Falling back to embedded animation data ({len(embedded_data)} bytes)")
+                    buffer = read_uncooked_anim_buffer(embedded_data, chunk, duration, Skeleton_file)
+                    buffer._source_detail = "embeddedAnimData:wrapped_embedded_buffer"
+                    return buffer
+                _raise_missing_buffer(
+                    f"embedded CR2W buffer {required_buffer_index} is not a raw sidecar, import cancelled to avoid corrupt animation."
+                )
+            elif has_valid_embedded_anim_data:
                 # Fallback: try the old embeddedAnimData from CSkeletalAnimation
                 log.info(f"No embedded buffers, trying read_uncooked_anim_buffer for {len(embedded_data)} bytes")
                 buffer = read_uncooked_anim_buffer(embedded_data, chunk, duration, Skeleton_file)
                 buffer._source_detail = "embeddedAnimData:no_embedded_buffers"
                 return buffer
             else:
-                # No embedded buffers, no embedded data - try inline data as fallback
-                data_prop = chunk.GetVariableByName('data')
-                if data_prop is not None and hasattr(data_prop, 'value') and data_prop.value and len(data_prop.value) > 0:
-                    the_data = bStream(data = bytearray(data_prop.value))
-                    source_detail = "inline_data"
-                elif the_fallback_data is None:
-                    # No buffer file, no inline data, no fallback, no embedded data
-                    log.warning("No animation data source found")
-                    the_data = bStream(data = bytearray())
+                _raise_missing_buffer(
+                    f"buffer index {required_buffer_index} could not be found or extracted, and no valid embedded animation data fallback is available."
+                )
     else:
         # No deferred data - all animation data is inline
         if data_prop is not None and hasattr(data_prop, 'value') and data_prop.value:
