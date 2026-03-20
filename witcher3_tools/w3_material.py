@@ -7,9 +7,8 @@ log = logging.getLogger(__name__)
 from pathlib import Path
 from math import radians
 from .CR2W import CR2W_reader
-from .CR2W.bin_helpers import ReadVLQInt32, readUByte, readUShort, readU32
 import bpy, os
-from typing import List, Dict, Optional, Set
+from typing import Any, List, Dict, Optional, Set, Tuple
 from bpy.types import Image, Material, Object, Node
 
 from xml.etree import ElementTree
@@ -22,6 +21,14 @@ from .w3_vector_param import (
     get_legacy_w_value,
     get_vector_w,
     mark_vector_param_node,
+)
+from .w3_material_reader import (
+    _read_material_params_from_bin,
+    normalize_depot_path,
+    prune_unsupported_instance_params,
+    read_instance_params,
+    read_material_params_from_path,
+    resolve_w2mg,
 )
 from . import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext, get_texture_path
 from .ui.blender_fun import convert_xbm_to_dds, load_w2cube_image, load_w2cube_blick_equirect_image
@@ -95,31 +102,7 @@ def ensure_node_group(ng_name, resource_path=RES_PATH):
     return ng
 
 
-def normalize_depot_path(path: str) -> str:
-    return (path or "").replace("/", "\\").lower()
-
-
-_material_param_cache: Dict[str, Dict[str, tuple[str, str]]] = {}
-_resolved_w2mg_cache: Dict[str, Optional[str]] = {}
-_graph_buffer_meta_cache: Dict[str, Dict[str, object]] = {}
-_graph_declared_param_cache: Dict[str, Optional[Set[str]]] = {}
 MATERIAL_SETUP_VERSION = 4
-
-# Some instance params in game files can mess up the Blender shared material by having old params that are no longer on the current shader. eg. SpecularColor when the shader only calls for SpecularTexture
-GRAPH_DECLARED_INSTANCE_PARAMS: Set[str] = {"SpecularColor"}
-
-# Some graph parameters exist in PixelParameters but do not serialize a scalar field on
-# their CMaterialParameterScalar chunk. Until the raw value block is decoded, use exact
-# graph/path matches for the known graph-only defaults we have to preserve.
-GRAPH_MISSING_SCALAR_DEFAULTS: Dict[str, Dict[str, str]] = {
-    normalize_depot_path(r"engine\materials\graphs\pbr_std_tint_mask_det.w2mg"): {
-        "ColorShift_Enabled": "1.0",
-        "ColorShift_ KeepGray": "1.0",
-        "DetailPower": "1.0",
-        "RSpecScale": "1.0",
-        "Roughness_max": "1.0",
-    },
-}
 
 
 def is_witcher2_material(material: Material) -> bool:
@@ -417,226 +400,6 @@ def xml_data_from_CR2W(mat_bin, name = None):
     prune_unsupported_instance_params(new_xml, mat_base)
     return new_xml
 
-def _load_material_root_chunk(material_path: str):
-    full_path = repo_file(material_path)
-    if not os.path.exists(full_path):
-        return None
-
-    material_file_chunks = CR2W_reader.load_material(full_path)
-    for chunk in material_file_chunks:
-        if chunk.Type in ("CMaterialInstance", "CMaterialGraph"):
-            if chunk.Type == "CMaterialGraph":
-                chunk._graph_params = [
-                    c for c in material_file_chunks
-                    if c.Type.startswith("CMaterialParameter")
-                ]
-                chunk._graph_material_path = material_path
-                chunk._graph_buffer_meta = _read_material_graph_buffer_meta(chunk, full_path)
-            return chunk
-    return None
-
-
-def _read_graph_parameter_buffer(file_handle, cr2w_file) -> List[Dict[str, object]]:
-    params: List[Dict[str, object]] = []
-    count = ReadVLQInt32(file_handle)
-    if count <= 0:
-        return params
-
-    for _ in range(count):
-        param_type = readUByte(file_handle)
-        offset = readUByte(file_handle)
-        name_index = readUShort(file_handle)
-        try:
-            name = cr2w_file.CNAMES[name_index].name.value
-        except Exception:
-            name = ""
-        params.append({
-            "type": param_type,
-            "offset": offset,
-            "name": name,
-        })
-    return params
-
-
-def _read_material_graph_buffer_meta(material_bin, full_path: str) -> Dict[str, object]:
-    cache_key = win_path_key(full_path)
-    cached = _graph_buffer_meta_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    cr2w_file = getattr(material_bin, "_W_CLASS__CR2WFILE", None)
-    if cr2w_file is None:
-        return {}
-
-    try:
-        export = cr2w_file.CR2WExport[material_bin.ChunkIndex]
-    except Exception:
-        return {}
-
-    prop_end = max((getattr(prop, "dataEnd", 0) for prop in getattr(material_bin, "PROPS", [])), default=export.dataOffset + 1)
-    buffer_start = prop_end + 2
-    export_end = export.dataOffset + export.dataSize
-    if buffer_start >= export_end:
-        return {}
-
-    meta: Dict[str, object] = {}
-    try:
-        with open(win_safe_path(full_path), "rb") as file_handle:
-            file_handle.seek(buffer_start)
-            meta["pixel_params"] = _read_graph_parameter_buffer(file_handle, cr2w_file)
-            meta["vertex_params"] = _read_graph_parameter_buffer(file_handle, cr2w_file)
-            if file_handle.tell() + 4 <= export_end:
-                meta["unk1"] = readU32(file_handle)
-    except Exception as exc:
-        log.warning("Failed to read buffered graph params from '%s': %s", full_path, exc)
-        meta = {}
-
-    _graph_buffer_meta_cache[cache_key] = meta
-    return meta
-
-
-def read_declared_graph_params(material_path: str) -> Optional[Set[str]]:
-    if not material_path:
-        return None
-
-    graph_path = material_path
-    if material_path.lower().endswith(".w2mi"):
-        resolved_graph = resolve_w2mg(material_path)
-        if not resolved_graph:
-            return None
-        graph_path = resolved_graph
-
-    normalized_path = normalize_depot_path(graph_path)
-    if normalized_path in _graph_declared_param_cache:
-        cached = _graph_declared_param_cache[normalized_path]
-        return set(cached) if cached is not None else None
-
-    material_bin = _load_material_root_chunk(graph_path)
-    if material_bin is None or material_bin.Type != "CMaterialGraph":
-        _graph_declared_param_cache[normalized_path] = None
-        return None
-
-    declared_params: Set[str] = set()
-    for chunk in getattr(material_bin, "_graph_params", []) or []:
-        name_var = chunk.GetVariableByName('parameterName')
-        if name_var is None:
-            continue
-        par_name = getattr(getattr(name_var, "Index", None), "String", None)
-        if par_name:
-            declared_params.add(par_name)
-
-    graph_meta = getattr(material_bin, "_graph_buffer_meta", None) or {}
-    for buffer_name in ("pixel_params", "vertex_params"):
-        for graph_param in graph_meta.get(buffer_name, []):
-            par_name = graph_param.get("name")
-            if par_name:
-                declared_params.add(par_name)
-
-    cached_value = set(declared_params)
-    _graph_declared_param_cache[normalized_path] = cached_value
-    return set(cached_value)
-
-
-def prune_unsupported_instance_params(
-        xml_data: Element,
-        shader_graph_path: str,
-        params: Optional[Dict[str, str]] = None
-        ) -> None:
-    declared_params = read_declared_graph_params(shader_graph_path)
-    if declared_params is None:
-        return
-
-    for param in list(xml_data):
-        par_name = param.get('name')
-        if par_name not in GRAPH_DECLARED_INSTANCE_PARAMS:
-            continue
-        if par_name in declared_params:
-            continue
-
-        xml_data.remove(param)
-        if params is not None:
-            params.pop(par_name, None)
-        log.info(
-            "Skipping stale instance param '%s': shader graph '%s' does not declare it",
-            par_name,
-            shader_graph_path,
-        )
-
-
-def _read_material_params_from_bin(material_bin, seen_paths: Optional[Set[str]] = None):
-    final_params: Dict[str, tuple[str, str]] = {}
-    baseMaterial = material_bin.GetVariableByName('baseMaterial')
-    if baseMaterial and getattr(baseMaterial, "Handles", None):
-        handle = baseMaterial.Handles[0]
-        base_path = getattr(handle, "DepotPath", None)
-        if baseMaterial.theType == "handle:IMaterial" and base_path:
-            final_params.update(read_material_params_from_path(base_path, seen_paths=seen_paths))
-    read_instance_params(material_bin, final_params)
-    return final_params
-
-
-def read_material_params_from_path(
-        material_path: str,
-        seen_paths: Optional[Set[str]] = None
-        ) -> Dict[str, tuple[str, str]]:
-    if not material_path:
-        return {}
-
-    normalized_path = normalize_depot_path(material_path)
-    cached = _material_param_cache.get(normalized_path)
-    if cached is not None:
-        return dict(cached)
-
-    if seen_paths is None:
-        seen_paths = set()
-    if normalized_path in seen_paths:
-        log.warning("Detected cyclic material inheritance while reading '%s'", material_path)
-        return {}
-
-    seen_paths.add(normalized_path)
-    try:
-        material_bin = _load_material_root_chunk(material_path)
-        if material_bin is None:
-            return {}
-
-        params = _read_material_params_from_bin(material_bin, seen_paths=seen_paths)
-        _material_param_cache[normalized_path] = dict(params)
-        return dict(params)
-    finally:
-        seen_paths.discard(normalized_path)
-
-
-def resolve_w2mg(w2mi_path):
-    """Follow w2mi baseMaterial chain to find the final .w2mg shader path."""
-    if not w2mi_path:
-        return None
-
-    normalized_path = normalize_depot_path(w2mi_path)
-    if normalized_path in _resolved_w2mg_cache:
-        return _resolved_w2mg_cache[normalized_path]
-
-    try:
-        material_bin = _load_material_root_chunk(w2mi_path)
-        if material_bin is None:
-            _resolved_w2mg_cache[normalized_path] = None
-            return None
-        base_var = material_bin.GetVariableByName('baseMaterial')
-        if not base_var:
-            _resolved_w2mg_cache[normalized_path] = None
-            return None
-        base_path = base_var.Handles[0].DepotPath
-        if base_path.endswith(".w2mg"):
-            _resolved_w2mg_cache[normalized_path] = base_path
-            return base_path
-        elif base_path.endswith(".w2mi"):
-            resolved = resolve_w2mg(base_path)
-            _resolved_w2mg_cache[normalized_path] = resolved
-            return resolved
-    except Exception:
-        pass
-    _resolved_w2mg_cache[normalized_path] = None
-    return None
-
 def get_all_w2mi(w2mi_path, all_instances):
     full_path = repo_file(w2mi_path) #os.path.join(get_uncook_path(bpy.context), w2mi_path)
     material_bin = CR2W_reader.load_material(full_path)[0]
@@ -858,107 +621,6 @@ def read_2wmi_params2(
         material_bin: str
         ) -> Dict[str, tuple[str, str]]:
     return _read_material_params_from_bin(material_bin)
-    
-def _read_graph_param_chunks(
-        chunks,
-        final_params,
-        graph_meta: Optional[Dict[str, object]] = None,
-        material_path: Optional[str] = None
-        ):
-    """Read CMaterialParameter* chunks from a .w2mg graph file into final_params.
-    This extracts the default parameter values defined as graph nodes (textures,
-    colours, scalars, vectors) that are siblings of the CMaterialGraph chunk.
-    """
-    chunks_by_name = {}
-    for chunk in chunks:
-        name_var = chunk.GetVariableByName('parameterName')
-        if name_var is None:
-            continue
-        par_name = name_var.Index.String
-        if not par_name:
-            continue
-        chunks_by_name[par_name] = chunk
-        try:
-            if chunk.Type == "CMaterialParameterTexture":
-                texture = chunk.GetVariableByName('texture')
-                if texture and texture.Handles and texture.Handles[0].DepotPath:
-                    final_params[par_name] = ('handle:ITexture', texture.Handles[0].DepotPath)
-            elif chunk.Type == "CMaterialParameterColor":
-                color = chunk.GetVariableByName('color')
-                if color:
-                    R = color.GetVariableByName('Red').Value
-                    G = color.GetVariableByName('Green').Value
-                    B = color.GetVariableByName('Blue').Value
-                    A = color.GetVariableByName('Alpha').Value
-                    final_params[par_name] = ('Color', f"{R}; {G}; {B}; {A}")
-            elif chunk.Type == "CMaterialParameterScalar":
-                scalar = chunk.GetVariableByName('scalar')
-                if scalar:
-                    final_params[par_name] = ('Float', str(scalar.Value))
-            elif chunk.Type == "CMaterialParameterVector":
-                vector = chunk.GetVariableByName('vector')
-                if vector:
-                    X = vector.GetVariableByName('X').Value
-                    Y = vector.GetVariableByName('Y').Value
-                    Z = vector.GetVariableByName('Z').Value
-                    W = vector.GetVariableByName('W').Value
-                    final_params[par_name] = ('Vector', f"{X}; {Y}; {Z}; {W}")
-        except Exception as e:
-            log.warning(f"Failed to read graph param chunk {chunk.Type} '{par_name}': {e}")
-
-    missing_defaults = GRAPH_MISSING_SCALAR_DEFAULTS.get(normalize_depot_path(material_path or ""), {})
-    pixel_params = graph_meta.get("pixel_params", []) if graph_meta else []
-    for pixel_param in pixel_params:
-        par_name = pixel_param.get("name")
-        if not par_name or par_name in final_params:
-            continue
-        if pixel_param.get("type") != 5:
-            continue
-        chunk = chunks_by_name.get(par_name)
-        if chunk is None or chunk.Type != "CMaterialParameterScalar":
-            continue
-        fallback_value = missing_defaults.get(par_name)
-        if fallback_value is None:
-            continue
-        final_params[par_name] = ('Float', fallback_value)
-        log.debug(
-            "Applied graph scalar fallback for '%s' from '%s' -> %s",
-            par_name,
-            material_path,
-            fallback_value,
-        )
-
-
-def read_instance_params(material, final_params):
-    mat_instance = getattr(material, 'CMaterialInstance', None)
-    if mat_instance is None:
-        # CMaterialGraph used directly — read default params from attached graph parameter chunks
-        graph_params = getattr(material, '_graph_params', None)
-        if graph_params:
-            _read_graph_param_chunks(
-                graph_params,
-                final_params,
-                graph_meta=getattr(material, '_graph_buffer_meta', None),
-                material_path=getattr(material, '_graph_material_path', None),
-            )
-        return final_params
-    for mat_param in mat_instance.InstanceParameters.elements:
-        PROP = mat_param.PROP
-        if PROP.theType == "Float":
-            final_params[PROP.theName] = (PROP.theType, str(PROP.Value))
-        elif PROP.theType == "Vector" or PROP.theType == "Color":
-            theValue = (str(PROP.More[0].Value)+"; "
-                        +str(PROP.More[1].Value)+"; "
-                        +str(PROP.More[2].Value)+"; "
-                        +str(PROP.More[3].Value))
-            final_params[PROP.theName] = (PROP.theType, theValue)
-        elif PROP.theType in ("handle:ITexture", "handle:CTextureArray", "handle:CCubeTexture"):
-            if PROP.Handles[0].DepotPath:
-                file_path = PROP.Handles[0].DepotPath
-                final_params[PROP.theName] = (PROP.theType, file_path)
-        else:
-            log.warning(f'Unsupported param type in CR2W "{PROP.theType}"')
-    return final_params
 
 def read_2wmi_params(
         w2mi_path: str
@@ -1134,6 +796,29 @@ def find_group_input_socket(node_ng: Node, par_name: str):
         socket = _find_socket_by_name(node_ng.inputs, candidate_name)
         if socket is not None:
             return socket
+    return None
+
+
+def get_active_witcher_group_node(material: Optional[Material]) -> Optional[Node]:
+    if material is None or getattr(material, "node_tree", None) is None:
+        return None
+    nodes = material.node_tree.nodes
+    active_outputs = [
+        node for node in nodes
+        if node.type == 'OUTPUT_MATERIAL' and bool(getattr(node, "is_active_output", True))
+    ]
+    if not active_outputs:
+        active_outputs = [node for node in nodes if node.type == 'OUTPUT_MATERIAL']
+    if not active_outputs:
+        return None
+
+    for node in nodes:
+        if node.type != 'GROUP' or getattr(node, "node_tree", None) is None:
+            continue
+        for output_socket in getattr(node, "outputs", []):
+            for link in getattr(output_socket, "links", []):
+                if link.to_node in active_outputs:
+                    return node
     return None
 
 
@@ -1473,6 +1158,7 @@ def create_node_for_param(
         except Exception as e:
             log.critical(f'PIN LINKING ERROR {e}')
     return node
+
 
 def create_node_texture(
         mat: Material

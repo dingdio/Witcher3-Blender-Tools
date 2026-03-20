@@ -1,5 +1,16 @@
+import logging
+
 import bpy
-from .w3_material import init_material_nodes
+from .w3_material import (
+    get_active_witcher_group_node,
+    init_material_nodes,
+)
+from .w3_material_base_path import (
+    create_base_material_helper,
+    inspect_material_base_path,
+    refresh_base_material_entry_state,
+)
+from .w3_material_reader import normalize_depot_path
 from .w3_vector_param import (
     get_legacy_w_value,
     get_mapping_vector_input,
@@ -7,9 +18,12 @@ from .w3_vector_param import (
     is_vector_param_node,
     mark_vector_param_node,
 )
-from . import get_all_addon_prefs
+from . import get_all_addon_prefs, get_texture_path, get_uncook_path
+import os
+from pathlib import Path
+from types import SimpleNamespace
 
-import bpy
+log = logging.getLogger(__name__)
 
 class ReplacePrincipledBSDFOperator(bpy.types.Operator):
     """Replace the selected Principled BSDF with a custom node group and reconnect inputs"""
@@ -94,138 +108,468 @@ class ReplacePrincipledBSDFOperator(bpy.types.Operator):
         self.report({'INFO'}, "Principled BSDF replaced successfully")
         return {'FINISHED'}
 
+
+def _base_read_is_stale(mat_props) -> bool:
+    return normalize_depot_path(getattr(mat_props, "base_read_requested_path", "")) != normalize_depot_path(getattr(mat_props, "base_custom", ""))
+
+
+def _short_path_label(path: str, max_len: int = 64) -> str:
+    text = str(path or "")
+    if len(text) <= max_len:
+        return text
+    return "..." + text[-(max_len - 3):]
+
+
+def _source_kind_label(source_kind: str) -> str:
+    labels = {
+        "instance": "Instance",
+        "graph_default": "Graph Default",
+        "declared_only": "Declared Only",
+    }
+    return labels.get(str(source_kind or ""), str(source_kind or "") or "Unknown")
+
+
+def _status_icon(item) -> str:
+    status = str(getattr(item, "status", "") or "")
+    if status == "present_linked":
+        return 'CHECKMARK'
+    if status == "available_to_create":
+        return 'ADD'
+    if status == "unsupported_export_only":
+        return 'LINKED'
+    return 'INFO'
+
+
+def _status_label(item) -> str:
+    status = str(getattr(item, "status", "") or "")
+    if status == "present_linked":
+        return "Linked"
+    if status == "available_to_create":
+        return "Available"
+    if status == "unsupported_export_only":
+        return "Export Only"
+    return "Info"
+
+
+def _item_to_dict(item) -> dict:
+    return {
+        "name": str(getattr(item, "name", "") or ""),
+        "param_type": str(getattr(item, "param_type", "") or ""),
+        "value": str(getattr(item, "value", "") or ""),
+        "source_kind": str(getattr(item, "source_kind", "") or ""),
+        "source_path": str(getattr(item, "source_path", "") or ""),
+        "has_value": bool(getattr(item, "has_value", False)),
+        "has_matching_socket": bool(getattr(item, "has_matching_socket", False)),
+        "is_linked": bool(getattr(item, "is_linked", False)),
+        "is_supported": bool(getattr(item, "is_supported", False)),
+        "is_declared_only": bool(getattr(item, "is_declared_only", False)),
+        "can_create": bool(getattr(item, "can_create", False)),
+        "status": str(getattr(item, "status", "") or ""),
+        "message": str(getattr(item, "message", "") or ""),
+    }
+
+
+def _chain_text_from_inspection(inspection: dict) -> str:
+    lines = []
+    for entry in inspection.get("chain", []) or []:
+        source_kind = _source_kind_label(entry.get("source_kind", ""))
+        lines.append(f"{source_kind}: {entry.get('path', '')}")
+    return "\n".join(lines)
+
+
+def _set_base_read_snapshot(material, inspection: dict, *, status: str = "ok", message: str = "", count_created: int = 0):
+    props = material.witcher_props
+    props.base_read_status = status
+    props.base_read_message = str(message or "")
+    props.base_read_requested_path = str(inspection.get("requested_path", "") or "")
+    props.base_read_resolved_graph = str(inspection.get("resolved_graph", "") or "")
+    props.base_read_chain_text = _chain_text_from_inspection(inspection)
+    props.base_read_count_created = int(count_created)
+
+    counts = inspection.get("counts", {}) or {}
+    props.base_read_count_present = int(counts.get("present", 0) or 0)
+    props.base_read_count_unsupported = int(counts.get("unsupported", 0) or 0)
+    props.base_read_count_declared_only = int(counts.get("declared_only", 0) or 0)
+
+    props.base_read_params.clear()
+    for entry in inspection.get("inventory", []) or []:
+        item = props.base_read_params.add()
+        item.name = str(entry.get("name", "") or "")
+        item.param_type = str(entry.get("param_type", "") or "")
+        item.value = str(entry.get("value", "") or "")
+        item.source_kind = str(entry.get("source_kind", "") or "")
+        item.source_path = str(entry.get("source_path", "") or "")
+        item.has_value = bool(entry.get("has_value", False))
+        item.has_matching_socket = bool(entry.get("has_matching_socket", False))
+        item.is_linked = bool(entry.get("is_linked", False))
+        item.is_supported = bool(entry.get("is_supported", False))
+        item.is_declared_only = bool(entry.get("is_declared_only", False))
+        item.can_create = bool(entry.get("can_create", False))
+        item.status = str(entry.get("status", "") or "")
+        item.message = str(entry.get("message", "") or "")
+
+    props.base_read_show_inspector = bool(props.base_read_params)
+
+
+def _sync_base_read_snapshot_state(material) -> None:
+    if material is None or getattr(material, "witcher_props", None) is None:
+        return
+    props = material.witcher_props
+    if not props.base_read_status or not props.base_read_requested_path:
+        return
+
+    present_count = 0
+    unsupported_count = 0
+    declared_count = 0
+    for item in props.base_read_params:
+        refreshed = refresh_base_material_entry_state(material, _item_to_dict(item))
+        item.has_matching_socket = bool(refreshed.get("has_matching_socket", False))
+        item.is_linked = bool(refreshed.get("is_linked", False))
+        item.is_supported = bool(refreshed.get("is_supported", False))
+        item.is_declared_only = bool(refreshed.get("is_declared_only", False))
+        item.can_create = bool(refreshed.get("can_create", False))
+        item.status = str(refreshed.get("status", "") or "")
+        item.message = str(refreshed.get("message", "") or "")
+        if item.status == "present_linked":
+            present_count += 1
+        if item.status == "unsupported_export_only":
+            unsupported_count += 1
+        if item.is_declared_only:
+            declared_count += 1
+
+    props.base_read_count_present = present_count
+    props.base_read_count_unsupported = unsupported_count
+    props.base_read_count_declared_only = declared_count
+
+
+def _get_live_base_read_snapshot_state(material):
+    if material is None or getattr(material, "witcher_props", None) is None:
+        return [], {"present": 0, "unsupported": 0, "declared_only": 0}
+
+    props = material.witcher_props
+    if not props.base_read_status or not props.base_read_requested_path:
+        items = [SimpleNamespace(**_item_to_dict(item)) for item in props.base_read_params]
+        return items, {
+            "present": int(getattr(props, "base_read_count_present", 0) or 0),
+            "unsupported": int(getattr(props, "base_read_count_unsupported", 0) or 0),
+            "declared_only": int(getattr(props, "base_read_count_declared_only", 0) or 0),
+        }
+
+    present_count = 0
+    unsupported_count = 0
+    declared_count = 0
+    items = []
+    for item in props.base_read_params:
+        merged = _item_to_dict(item)
+        refreshed = refresh_base_material_entry_state(material, merged)
+        merged["has_matching_socket"] = bool(refreshed.get("has_matching_socket", False))
+        merged["is_linked"] = bool(refreshed.get("is_linked", False))
+        merged["is_supported"] = bool(refreshed.get("is_supported", False))
+        merged["is_declared_only"] = bool(refreshed.get("is_declared_only", False))
+        merged["can_create"] = bool(refreshed.get("can_create", False))
+        merged["status"] = str(refreshed.get("status", "") or "")
+        merged["message"] = str(refreshed.get("message", "") or "")
+        if merged["status"] == "present_linked":
+            present_count += 1
+        if merged["status"] == "unsupported_export_only":
+            unsupported_count += 1
+        if merged["is_declared_only"]:
+            declared_count += 1
+        items.append(SimpleNamespace(**merged))
+
+    return items, {
+        "present": present_count,
+        "unsupported": unsupported_count,
+        "declared_only": declared_count,
+    }
+
+
+def _find_base_read_param_item(mat_props, param_name: str):
+    for item in mat_props.base_read_params:
+        if item.name == param_name:
+            return item
+    return None
+
+
+def _apply_base_read_entries(context, material, entries, *, allow_export_socket: bool = False):
+    if not entries:
+        return 0, 0
+
+    node_ng = get_active_witcher_group_node(material)
+    created = 0
+    reused = 0
+    uncook_path = get_texture_path(context)
+    for entry in entries:
+        node_ng, node, action = create_base_material_helper(
+            material,
+            entry,
+            uncook_path,
+            node_ng=node_ng,
+            allow_export_socket=allow_export_socket,
+        )
+        if action == "created":
+            created += 1
+        elif action == "reused":
+            reused += 1
+    return created, reused
+
 class WITCH_PT_materials(bpy.types.Panel):
     bl_label = "Witcher"
     bl_space_type = 'NODE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "Witcher"
 
-    
-    
+    def _draw_base_read_items(self, layout, mat, items, *, action_enabled: bool):
+        for item in items:
+            item_box = layout.box()
+            row = item_box.row(align=True)
+            row.label(text=item.name, icon=_status_icon(item))
+            if item.param_type:
+                row.label(text=item.param_type)
+
+            if action_enabled and item.can_create and not item.is_linked:
+                op = row.operator(
+                    "witcher.create_base_material_param",
+                    text="Create" if item.has_matching_socket else "Create Export Param",
+                    icon='ADD' if item.has_matching_socket else 'LINKED',
+                )
+                op.param_name = item.name
+                op.create_export_socket = not item.has_matching_socket
+            else:
+                row.label(text=_status_label(item))
+
+            meta = item_box.row(align=True)
+            meta.scale_y = 0.9
+            meta.label(text=_source_kind_label(item.source_kind))
+            if item.source_path:
+                meta.label(text=_short_path_label(item.source_path))
+            if item.message:
+                note = item_box.row()
+                note.scale_y = 0.9
+                note.label(text=item.message, icon='INFO')
+
+    def _draw_base_read_group(self, layout, mat, items, collapse_attr: str, label: str, *, action_enabled: bool):
+        if not items:
+            return
+        props = mat.witcher_props
+        box = layout.box()
+        collapsed = getattr(props, collapse_attr)
+        row = box.row(align=True)
+        row.prop(
+            props,
+            collapse_attr,
+            icon="TRIA_DOWN" if not collapsed else "TRIA_RIGHT",
+            icon_only=True,
+            emboss=False,
+        )
+        row.label(text=f"{label} ({len(items)})")
+        if collapsed:
+            return
+        self._draw_base_read_items(box, mat, items, action_enabled=action_enabled)
+
+    def _draw_base_read_section(self, layout, context, mat):
+        props = mat.witcher_props
+        row = layout.row(align=True)
+        row.prop(props, "base_custom")
+        row.operator("witcher.read_base_material", text="Read Base Path...", icon='FILE_REFRESH')
+
+        if not props.base_read_status:
+            return
+        try:
+            live_items, live_counts = _get_live_base_read_snapshot_state(mat)
+            stale = _base_read_is_stale(props)
+            material_ready = bool(get_active_witcher_group_node(mat))
+            header_box = layout.box()
+            header_row = header_box.row(align=True)
+            if props.base_read_status == "error":
+                header_row.label(text="Base Path read failed", icon='ERROR')
+            elif stale:
+                header_row.label(text="Loaded Base Path snapshot is stale", icon='ERROR')
+            else:
+                header_row.label(text="Base Path snapshot loaded", icon='CHECKMARK')
+
+            if props.base_read_message:
+                msg = header_box.row()
+                msg.scale_y = 0.9
+                msg.label(text=props.base_read_message, icon='INFO')
+
+            if props.base_read_requested_path:
+                header_box.label(text=f"Requested: {_short_path_label(props.base_read_requested_path, 80)}")
+            if props.base_read_resolved_graph:
+                header_box.label(text=f"Resolved Graph: {_short_path_label(props.base_read_resolved_graph, 80)}")
+
+            if props.base_read_chain_text:
+                chain_box = header_box.box()
+                chain_box.label(text="Chain", icon='LINKED')
+                for line in props.base_read_chain_text.splitlines():
+                    chain_box.label(text=_short_path_label(line, 90))
+
+            counts_row = header_box.row(align=True)
+            counts_row.label(text=f"Linked {live_counts['present']}")
+            counts_row.label(text=f"Unsupported {live_counts['unsupported']}")
+            counts_row.label(text=f"Declared {live_counts['declared_only']}")
+            if props.base_read_count_created:
+                counts_row.label(text=f"Last Created {props.base_read_count_created}")
+
+            if not material_ready:
+                warn = header_box.row()
+                warn.label(text="No active Witcher shader group is connected to Material Output.", icon='INFO')
+
+            action_row = header_box.row(align=True)
+            action_row.enabled = (
+                props.base_read_status == "ok"
+                and not stale
+                and material_ready
+                and any(
+                    item.status == "available_to_create" and item.can_create
+                    for item in live_items
+                )
+            )
+            action_row.operator("witcher.create_missing_base_material_params", text="Create Missing Supported", icon='ADD')
+
+            inspector_row = header_box.row(align=True)
+            inspector_row.prop(
+                props,
+                "base_read_show_inspector",
+                icon="TRIA_DOWN" if props.base_read_show_inspector else "TRIA_RIGHT",
+                icon_only=True,
+                emboss=False,
+            )
+            inspector_row.label(text="Loaded Param Inspector")
+            if not props.base_read_show_inspector:
+                return
+
+            items = live_items
+            present_items = [item for item in items if item.status == "present_linked"]
+            available_items = [item for item in items if item.status == "available_to_create"]
+            declared_items = [
+                item for item in items
+                if item.status in {"unsupported_export_only", "declared_only_info"}
+            ]
+
+            action_enabled = props.base_read_status == "ok" and not stale and material_ready
+            self._draw_base_read_group(header_box, mat, present_items, "base_read_present_collapse", "Present / Linked", action_enabled=False)
+            self._draw_base_read_group(header_box, mat, available_items, "base_read_available_collapse", "Available Defaults", action_enabled=action_enabled)
+            self._draw_base_read_group(header_box, mat, declared_items, "base_read_declared_collapse", "Declared / Unsupported", action_enabled=action_enabled)
+        except Exception:
+            log.exception("Failed to draw Base Path UI for material '%s'", getattr(mat, "name", "<unknown>"))
+            error_row = layout.row()
+            error_row.label(text="Base Path UI error. See console for details.", icon='ERROR')
+
+    def _draw_material_socket_controls(self, layout, mat):
+        group_inputs = get_group_inputs(mat)
+        if not group_inputs:
+            layout.label(text="No active Witcher shader group inputs found.", icon='INFO')
+            return
+
+        linked_count = 0
+        for input_socket in group_inputs:
+            if input_socket.is_linked:
+                linked_count += 1
+                linked_socket = input_socket.links[0].from_socket
+
+                row = layout.row()
+                row.prop(linked_socket.node, "witcher_include", text=input_socket.name + ":")
+
+                if linked_socket.node.type == 'TEX_IMAGE':
+                    row.prop(linked_socket.node, "image", text="")
+                    if linked_socket.node.image is not None:
+                        rel_path = win_unprefix_path(linked_socket.node.image.filepath)
+                        abs_path = win_unprefix_path(bpy.path.abspath(rel_path))
+                        texture_path = os.path.normpath(abs_path)
+                        final_path = get_repo_from_abs_path(texture_path)
+                        if mat.witcher_props.override_texture_root:
+                            display_path = mat.witcher_props.custom_texture_root + os.path.basename(final_path)
+                        else:
+                            display_path = final_path
+                        resolved = is_path_resolved(display_path)
+                        icon = 'CHECKMARK' if resolved else 'ERROR'
+                        path_row = layout.row(align=True)
+                        path_row.label(text="", icon=icon)
+                        path_row.label(text=display_path)
+                        op = path_row.operator("witcher.copy_texture_path", text="", icon='COPYDOWN')
+                        op.path = display_path
+                elif linked_socket.node.type == 'RGB':
+                    row.prop(linked_socket, "default_value", text="")
+                elif linked_socket.node.type == 'VALUE':
+                    row.prop(linked_socket, "default_value", text="")
+                elif input_socket.type == 'VECTOR':
+                    vector_node = linked_socket.node
+                    if vector_node.type == 'MAPPING':
+                        vector_input = get_mapping_vector_input(vector_node, input_socket.name)
+                        if vector_input is not None:
+                            row.prop(vector_input, "default_value", index=0, text="")
+                            row.prop(vector_input, "default_value", index=1, text="")
+                            row.prop(vector_input, "default_value", index=2, text="")
+                    elif vector_node.type == 'COMBXYZ':
+                        row.prop(vector_node.inputs[0], "default_value", text="")
+                        row.prop(vector_node.inputs[1], "default_value", text="")
+                        row.prop(vector_node.inputs[2], "default_value", text="")
+                    else:
+                        row.label(text=vector_node.bl_label or vector_node.type)
+                    if is_vector_param_node(vector_node):
+                        if not getattr(vector_node, "witcher_param_kind", ""):
+                            legacy_w = get_legacy_w_value(input_socket, None)
+                            if legacy_w is not None:
+                                mark_vector_param_node(vector_node, input_socket.name, legacy_w)
+                        row.prop(vector_node, "witcher_vector_w", text="")
+                else:
+                    row.prop(linked_socket, "default_value", text="")
+
+        if linked_count == 0:
+            layout.label(text="No linked local params on the active Witcher shader group.", icon='INFO')
+
     def draw(self, context):
         layout = self.layout
         mat = context.material
-        if mat and mat.witcher_props:
+        if not (mat and mat.witcher_props):
+            return
 
-            box = layout.box()
-            row = box.row(align=False)
-            row.prop(mat.witcher_props, "witcher_material_settings_collapse", icon="TRIA_DOWN" if not mat.witcher_props.witcher_material_settings_collapse else "TRIA_RIGHT", icon_only=True, emboss=False)
-            row.label(text="Global Settings")
+        box = layout.box()
+        row = box.row(align=False)
+        row.prop(mat.witcher_props, "witcher_material_settings_collapse", icon="TRIA_DOWN" if not mat.witcher_props.witcher_material_settings_collapse else "TRIA_RIGHT", icon_only=True, emboss=False)
+        row.label(text="Global Settings")
 
-            if not mat.witcher_props.witcher_material_settings_collapse:
-                addon_prefs = get_all_addon_prefs(context)
-
-                # Add UI elements for editing preferences
-                box.prop(addon_prefs, "mod_directory")
-                
-                box.label(text="Texture Root Paths:")
-                # New list of paths
-                row = box.row()
-                col = row.column()
-                col.template_list(
-                    "WITCHER_UL_path_list", 
-                    "", 
-                    addon_prefs, "path_list", 
-                    addon_prefs, "active_path_index"
-                )
-                col = row.column()
-                top = col.column(align=True)
-                top.operator("witcher.add_path", text="", icon="ADD")
-                top.operator("witcher.remove_path", text="", icon="REMOVE")
-
-                # Editable field for the selected path
-                if addon_prefs.path_list and 0 <= addon_prefs.active_path_index < len(addon_prefs.path_list):
-                    selected_item = addon_prefs.path_list[addon_prefs.active_path_index]
-                    box.prop(selected_item, "path", text="Selected Path")
-                
-            # Create a box for the texture override properties and operator
-            box = layout.box()
-            box.prop(mat.witcher_props, "override_texture_root", text="Override Texture Root")
+        if not mat.witcher_props.witcher_material_settings_collapse:
+            addon_prefs = get_all_addon_prefs(context)
+            box.prop(addon_prefs, "mod_directory")
+            box.label(text="Texture Root Paths:")
             row = box.row()
-            row.enabled = mat.witcher_props.override_texture_root
-            row.prop(mat.witcher_props, "custom_texture_root", text="Texture Root")
-            box.operator("witcher.replace_principled_bsdf", text="Replace Principled BSDF")
-            
-            #layout.operator("witcher.clear_input_props", text="Reset Parameters")
-            layout.prop(mat.witcher_props, "bind_name")
-            # if not mat.witcher_props.bind_name:
-            #     layout.prop(mat.witcher_props, "name", text="Name")
-            row = layout.row()
-            row.enabled = not mat.witcher_props.bind_name
-            row.prop(mat.witcher_props, "name", text="Name")
-            layout.prop(mat.witcher_props, "material_version")
-            layout.prop(mat.witcher_props, "local")
-            layout.prop(mat.witcher_props, "enableMask")
-            #layout.prop(mat.witcher_props, "base")
-            #layout.prop(mat.witcher_props, "base")
-            #if mat.witcher_props.base == 'custom':
-            layout.prop(mat.witcher_props, "base_custom")
-            
-            #group_inputs = get_group_inputs(mat)
-            if mat.witcher_props.local:
-                group_inputs = get_group_inputs(mat)
-                if group_inputs:
-                    for input_socket in group_inputs:
-                        if input_socket.is_linked:
-                            linked_socket = input_socket.links[0].from_socket
-                            
-                            row = layout.row()
-                            row.prop(linked_socket.node, "witcher_include", text=input_socket.name+":")
+            col = row.column()
+            col.template_list(
+                "WITCHER_UL_path_list",
+                "",
+                addon_prefs, "path_list",
+                addon_prefs, "active_path_index"
+            )
+            col = row.column()
+            top = col.column(align=True)
+            top.operator("witcher.add_path", text="", icon="ADD")
+            top.operator("witcher.remove_path", text="", icon="REMOVE")
+            if addon_prefs.path_list and 0 <= addon_prefs.active_path_index < len(addon_prefs.path_list):
+                selected_item = addon_prefs.path_list[addon_prefs.active_path_index]
+                box.prop(selected_item, "path", text="Selected Path")
 
-                            if linked_socket.node.type == 'TEX_IMAGE':
-                                row.prop(linked_socket.node, "image", text="")
-                                if linked_socket.node.image != None:
-                                    rel_path = win_unprefix_path(linked_socket.node.image.filepath)
-                                    abs_path = win_unprefix_path(bpy.path.abspath(rel_path))
-                                    texture_path = os.path.normpath(abs_path)
-                                    final_path = get_repo_from_abs_path(texture_path)
-                                    if mat.witcher_props.override_texture_root:
-                                        display_path = mat.witcher_props.custom_texture_root + os.path.basename(final_path)
-                                    else:
-                                        display_path = final_path
-                                    resolved = is_path_resolved(display_path)
-                                    icon = 'CHECKMARK' if resolved else 'ERROR'
-                                    # Show filename for readability, full path via copy button tooltip
-                                    path_row = layout.row(align=True)
-                                    path_row.label(text="", icon=icon)
-                                    path_row.label(text=display_path)
-                                    op = path_row.operator("witcher.copy_texture_path", text="", icon='COPYDOWN')
-                                    op.path = display_path
-                            elif linked_socket.node.type == 'RGB':
-                                row.prop(linked_socket, "default_value", text="")
-                            elif linked_socket.node.type == 'VALUE':
-                                row.prop(linked_socket, "default_value", text="")
-                            elif input_socket.type == 'VECTOR':
-                                vector_node = linked_socket.node
-                                if vector_node.type == 'MAPPING':
-                                    vector_input = get_mapping_vector_input(vector_node, input_socket.name)
-                                    if vector_input is not None:
-                                        row.prop(vector_input, "default_value", index=0, text="")
-                                        row.prop(vector_input, "default_value", index=1, text="")
-                                        row.prop(vector_input, "default_value", index=2, text="")
-                                elif vector_node.type == 'COMBXYZ':
-                                    row.prop(vector_node.inputs[0], "default_value", text="")
-                                    row.prop(vector_node.inputs[1], "default_value", text="")
-                                    row.prop(vector_node.inputs[2], "default_value", text="")
-                                else:
-                                    row.label(text=vector_node.bl_label or vector_node.type)
-                                if is_vector_param_node(vector_node):
-                                    if not getattr(vector_node, "witcher_param_kind", ""):
-                                        legacy_w = get_legacy_w_value(input_socket, None)
-                                        if legacy_w is not None:
-                                            mark_vector_param_node(vector_node, input_socket.name, legacy_w)
-                                    row.prop(vector_node, "witcher_vector_w", text="")
-                            else:
-                                row.prop(linked_socket, "default_value", text="")
-                if mat.witcher_props.xml_text:
-                    layout.prop(mat.witcher_props, "xml_text", text="Local Instance XML", 
-                                expand=True)
-                # row = layout.row()
-                # row.prop(context.scene, "path_a", text="Source Path")
-                # row = layout.row()
-                # row.prop(context.scene, "path_b", text="Destination Path")
-                # row = layout.row()
-                # row.operator("object.move_textures", text="Move Textures")
+        box = layout.box()
+        box.prop(mat.witcher_props, "override_texture_root", text="Override Texture Root")
+        row = box.row()
+        row.enabled = mat.witcher_props.override_texture_root
+        row.prop(mat.witcher_props, "custom_texture_root", text="Texture Root")
+        box.operator("witcher.replace_principled_bsdf", text="Replace Principled BSDF")
+
+        layout.prop(mat.witcher_props, "bind_name")
+        row = layout.row()
+        row.enabled = not mat.witcher_props.bind_name
+        row.prop(mat.witcher_props, "name", text="Name")
+        layout.prop(mat.witcher_props, "material_version")
+        layout.prop(mat.witcher_props, "local")
+        layout.prop(mat.witcher_props, "enableMask")
+        self._draw_base_read_section(layout, context, mat)
+
+        if mat.witcher_props.local:
+            self._draw_material_socket_controls(layout, mat)
+            if mat.witcher_props.xml_text:
+                layout.prop(mat.witcher_props, "xml_text", text="Local Instance XML", expand=True)
 
 
 class NodeGroupInputProperties(bpy.types.PropertyGroup):
@@ -238,6 +582,22 @@ class NodeGroupInputProperties(bpy.types.PropertyGroup):
     is_enabled: bpy.props.BoolProperty(name="Is Enabled", default=False)
     is_enabled_temp: bpy.props.BoolProperty(name="Export", default=False)
     is_linked: bpy.props.BoolProperty(name="is_linked", default=False)
+
+
+class BaseMaterialParamItem(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty(name="Name")
+    param_type: bpy.props.StringProperty(name="Type")
+    value: bpy.props.StringProperty(name="Value")
+    source_kind: bpy.props.StringProperty(name="Source Kind")
+    source_path: bpy.props.StringProperty(name="Source Path")
+    has_value: bpy.props.BoolProperty(name="Has Value", default=False)
+    has_matching_socket: bpy.props.BoolProperty(name="Has Matching Socket", default=False)
+    is_linked: bpy.props.BoolProperty(name="Is Linked", default=False)
+    is_supported: bpy.props.BoolProperty(name="Is Supported", default=False)
+    is_declared_only: bpy.props.BoolProperty(name="Is Declared Only", default=False)
+    can_create: bpy.props.BoolProperty(name="Can Create", default=False)
+    status: bpy.props.StringProperty(name="Status")
+    message: bpy.props.StringProperty(name="Message")
 
 class WitcherMaterialProperties(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="name", default="Material")
@@ -252,6 +612,20 @@ class WitcherMaterialProperties(bpy.types.PropertyGroup):
     witcher_material_settings_collapse: bpy.props.BoolProperty(default = False)
     override_texture_root: bpy.props.BoolProperty(name="override_texture_root", default=False, description="Specify a root path")
     custom_texture_root: bpy.props.StringProperty(name="custom_texture_root", default="", description="Root path of textures for this material")
+    base_read_status: bpy.props.StringProperty(name="Base Read Status", default="")
+    base_read_message: bpy.props.StringProperty(name="Base Read Message", default="")
+    base_read_requested_path: bpy.props.StringProperty(name="Base Read Requested Path", default="")
+    base_read_resolved_graph: bpy.props.StringProperty(name="Base Read Resolved Graph", default="")
+    base_read_chain_text: bpy.props.StringProperty(name="Base Read Chain", default="")
+    base_read_params: bpy.props.CollectionProperty(type=BaseMaterialParamItem)
+    base_read_count_created: bpy.props.IntProperty(name="Base Read Created", default=0)
+    base_read_count_present: bpy.props.IntProperty(name="Base Read Present", default=0)
+    base_read_count_unsupported: bpy.props.IntProperty(name="Base Read Unsupported", default=0)
+    base_read_count_declared_only: bpy.props.IntProperty(name="Base Read Declared Only", default=0)
+    base_read_show_inspector: bpy.props.BoolProperty(name="Show Base Read Inspector", default=True)
+    base_read_present_collapse: bpy.props.BoolProperty(name="Show Present Linked", default=False)
+    base_read_available_collapse: bpy.props.BoolProperty(name="Show Available Defaults", default=False)
+    base_read_declared_collapse: bpy.props.BoolProperty(name="Show Declared Unsupported", default=False)
 
 
 
@@ -329,31 +703,22 @@ class WitcherMaterialProperties(bpy.types.PropertyGroup):
     
 def get_group_inputs(mat):
     if mat and mat.witcher_props and mat.node_tree and mat.node_tree.nodes:
-        node_tree = mat.node_tree
-        for node in node_tree.nodes:
-            if node.type == 'GROUP':
-                group_outputs = node.outputs
-                for output_socket in group_outputs:
-                    if output_socket.is_linked:
-                        target_node = output_socket.links[0].to_node
-                        if target_node.type == 'OUTPUT_MATERIAL':
-                            input_names = {
-                                str(getattr(input_socket, "name", "") or "")
-                                for input_socket in node.inputs
-                            }
-                            return [
-                                input_socket for input_socket in node.inputs
-                                if not (
-                                    str(getattr(input_socket, "name", "") or "").endswith("_W")
-                                    and str(getattr(input_socket, "name", "") or "")[:-2] in input_names
-                                )
-                            ]
-                            #for input_socket in group_inputs:
+        node = get_active_witcher_group_node(mat)
+        if node is None:
+            return None
+        input_names = {
+            str(getattr(input_socket, "name", "") or "")
+            for input_socket in node.inputs
+        }
+        return [
+            input_socket for input_socket in node.inputs
+            if not (
+                str(getattr(input_socket, "name", "") or "").endswith("_W")
+                and str(getattr(input_socket, "name", "") or "")[:-2] in input_names
+            )
+        ]
     return None
 
-from . import get_texture_path
-from pathlib import Path
-import os
 from .CR2W.common_blender import win_unprefix_path
 
 
@@ -366,7 +731,7 @@ possible_folders = [
     'files\\DLC\\Uncooked',
 ]
 
-from . import get_mod_directory, get_texture_path, get_modded_texture_path, get_uncook_path
+from . import get_mod_directory, get_modded_texture_path
 # def get_repo_from_abs_path(texture_path_input):
 #     texture_path = os.path.realpath(bpy.path.abspath(texture_path_input))
 #     TEXTURE_PATH = get_texture_path(bpy.context)
@@ -517,6 +882,207 @@ def get_socket_value(input_socket):
         default_value = str(input_socket.default_value)
     return default_value
 
+
+def _refresh_base_read_snapshot(material, material_path: str, *, count_created: int = 0, status: str = "ok", message: str = "") -> dict:
+    inspection = inspect_material_base_path(material, material_path)
+    if inspection.get("errors"):
+        status = "error"
+        if not message:
+            message = str(inspection["errors"][0])
+    _set_base_read_snapshot(material, inspection, status=status, message=message, count_created=count_created)
+    return inspection
+
+
+class WITCH_OT_read_base_material(bpy.types.Operator):
+    bl_idname = "witcher.read_base_material"
+    bl_label = "Read Base Path"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def _inspection(self, context):
+        inspection = getattr(self, "_cached_inspection", None)
+        if inspection is None:
+            inspection = inspect_material_base_path(context.material)
+            self._cached_inspection = inspection
+        return inspection
+
+    def invoke(self, context, event):
+        material = context.material
+        if material is None or getattr(material, "witcher_props", None) is None:
+            self.report({'ERROR'}, "No material selected")
+            return {'CANCELLED'}
+
+        inspection = inspect_material_base_path(material)
+        self._cached_inspection = inspection
+        if inspection.get("errors"):
+            message = str(inspection["errors"][0])
+            _set_base_read_snapshot(material, inspection, status="error", message=message, count_created=0)
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=560)
+
+    def draw(self, context):
+        inspection = self._inspection(context)
+        layout = self.layout
+        counts = inspection.get("counts", {}) or {}
+
+        layout.label(text="Read the current Base Path and fill only missing supported sockets.", icon='INFO')
+        layout.label(text=f"Requested: {_short_path_label(inspection.get('requested_path', ''), 96)}")
+        if inspection.get("resolved_graph"):
+            layout.label(text=f"Resolved Graph: {_short_path_label(inspection.get('resolved_graph', ''), 96)}")
+
+        chain_box = layout.box()
+        chain_box.label(text="Inheritance Chain", icon='LINKED')
+        for entry in inspection.get("chain", []) or []:
+            chain_box.label(text=_short_path_label(f"{_source_kind_label(entry.get('source_kind', ''))}: {entry.get('path', '')}", 100))
+
+        counts_box = layout.box()
+        counts_box.label(text=f"Concrete Params: {counts.get('concrete', 0)}")
+        counts_box.label(text=f"Declared Only: {counts.get('declared_only', 0)}")
+        counts_box.label(text=f"Missing Supported Sockets: {counts.get('available', 0)}")
+        counts_box.label(text=f"Already Linked: {counts.get('present', 0)}")
+        counts_box.label(text=f"Unsupported / Export Only: {counts.get('unsupported', 0)}")
+
+        note_box = layout.box()
+        note_box.label(text="Existing links are preserved.", icon='CHECKMARK')
+        note_box.label(text="Generated helper nodes start with export disabled.", icon='CHECKMARK')
+        if not inspection.get("has_active_witcher_group"):
+            note_box.label(text="No active Witcher shader group is connected; this read will only load the snapshot.", icon='INFO')
+
+    def execute(self, context):
+        material = context.material
+        inspection = self._inspection(context)
+        if material is None:
+            self.report({'ERROR'}, "No material selected")
+            return {'CANCELLED'}
+        if inspection.get("errors"):
+            message = str(inspection["errors"][0])
+            _set_base_read_snapshot(material, inspection, status="error", message=message, count_created=0)
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
+
+        entries = [
+            entry for entry in inspection.get("inventory", []) or []
+            if entry.get("status") == "available_to_create" and entry.get("has_matching_socket") and entry.get("can_create")
+        ]
+        created, reused = _apply_base_read_entries(context, material, entries, allow_export_socket=False)
+
+        message = f"Loaded Base Path snapshot. Created {created} helper node(s)"
+        if reused:
+            message += f", reused {reused}"
+        if not inspection.get("has_active_witcher_group"):
+            message += ". No active Witcher shader group was connected, so no nodes were created."
+        post = _refresh_base_read_snapshot(
+            material,
+            inspection.get("requested_path", ""),
+            count_created=created,
+            status="ok",
+            message=message,
+        )
+        if post.get("warnings"):
+            message = f"{message}. {post['warnings'][0]}"
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
+class WITCH_OT_create_missing_base_material_params(bpy.types.Operator):
+    bl_idname = "witcher.create_missing_base_material_params"
+    bl_label = "Create Missing Supported Base Material Params"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        material = context.material
+        if material is None or getattr(material, "witcher_props", None) is None:
+            self.report({'ERROR'}, "No material selected")
+            return {'CANCELLED'}
+
+        props = material.witcher_props
+        if props.base_read_status != "ok" or not props.base_read_requested_path:
+            self.report({'WARNING'}, "Read the Base Path first.")
+            return {'CANCELLED'}
+        _sync_base_read_snapshot_state(material)
+        if _base_read_is_stale(props):
+            self.report({'WARNING'}, "The loaded Base Path snapshot is stale. Read the current Base Path again.")
+            return {'CANCELLED'}
+
+        entries = [
+            _item_to_dict(item) for item in props.base_read_params
+            if item.status == "available_to_create" and item.can_create and item.has_matching_socket and not item.is_linked
+        ]
+        created, reused = _apply_base_read_entries(context, material, entries, allow_export_socket=False)
+        message = f"Created {created} missing helper node(s)"
+        if reused:
+            message += f", reused {reused}"
+        _refresh_base_read_snapshot(
+            material,
+            props.base_read_requested_path,
+            count_created=created,
+            status="ok",
+            message=message,
+        )
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
+class WITCH_OT_create_base_material_param(bpy.types.Operator):
+    bl_idname = "witcher.create_base_material_param"
+    bl_label = "Create Base Material Param"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    param_name: bpy.props.StringProperty()
+    create_export_socket: bpy.props.BoolProperty(default=False)
+
+    def execute(self, context):
+        material = context.material
+        if material is None or getattr(material, "witcher_props", None) is None:
+            self.report({'ERROR'}, "No material selected")
+            return {'CANCELLED'}
+
+        props = material.witcher_props
+        if props.base_read_status != "ok" or not props.base_read_requested_path:
+            self.report({'WARNING'}, "Read the Base Path first.")
+            return {'CANCELLED'}
+        _sync_base_read_snapshot_state(material)
+        if _base_read_is_stale(props):
+            self.report({'WARNING'}, "The loaded Base Path snapshot is stale. Read the current Base Path again.")
+            return {'CANCELLED'}
+
+        item = _find_base_read_param_item(props, self.param_name)
+        if item is None:
+            self.report({'WARNING'}, f"Param '{self.param_name}' is not in the loaded snapshot.")
+            return {'CANCELLED'}
+        if item.is_linked:
+            self.report({'INFO'}, f"'{self.param_name}' is already linked.")
+            return {'FINISHED'}
+        if not item.can_create:
+            self.report({'WARNING'}, item.message or f"'{self.param_name}' cannot be created.")
+            return {'CANCELLED'}
+
+        created, reused = _apply_base_read_entries(
+            context,
+            material,
+            [_item_to_dict(item)],
+            allow_export_socket=bool(self.create_export_socket),
+        )
+        if created == 0 and reused == 0:
+            self.report({'WARNING'}, item.message or f"No change for '{self.param_name}'.")
+            return {'CANCELLED'}
+
+        if self.create_export_socket:
+            message = f"Created export-only param '{self.param_name}'"
+        else:
+            message = f"Created helper param '{self.param_name}'"
+        if reused:
+            message += f" (reused {reused})"
+        _refresh_base_read_snapshot(
+            material,
+            props.base_read_requested_path,
+            count_created=created,
+            status="ok",
+            message=message,
+        )
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
 def update_node_group_inputs(depsgraph):
     for ob in depsgraph.objects:
         mat = ob.active_material
@@ -580,6 +1146,9 @@ class WITCH_OT_copy_texture_path(bpy.types.Operator):
 
 __classes = [
     ClearInputPropsOperator,
+    WITCH_OT_read_base_material,
+    WITCH_OT_create_missing_base_material_params,
+    WITCH_OT_create_base_material_param,
     WITCH_PT_materials,
     ReplacePrincipledBSDFOperator,
     WITCH_OT_copy_texture_path,
@@ -593,6 +1162,7 @@ def register():
     bpy.types.Node.witcher_vector_source = bpy.props.StringProperty(default="")
     bpy.types.Node.witcher_vector_w = bpy.props.FloatProperty(default=1.0)
     bpy.utils.register_class(NodeGroupInputProperties) #! imp to reg first
+    bpy.utils.register_class(BaseMaterialParamItem)
     bpy.utils.register_class(WitcherMaterialProperties)
     bpy.types.Material.witcher_props = bpy.props.PointerProperty(type=WitcherMaterialProperties)
 
@@ -617,14 +1187,14 @@ def unregister():
     # del bpy.types.Scene.path_a
     # del bpy.types.Scene.path_b
     
+    for __class in __classes:
+        bpy.utils.unregister_class(__class)
     bpy.utils.unregister_class(WitcherMaterialProperties)
+    bpy.utils.unregister_class(BaseMaterialParamItem)
     bpy.utils.unregister_class(NodeGroupInputProperties) #! imp to reg first
     # if update_node_group_inputs in bpy.app.handlers.depsgraph_update_post:
     #     bpy.app.handlers.depsgraph_update_post.remove(update_node_group_inputs)
     #for handle in bpy.app.handlers.depsgraph_update_post:
-
-    for __class in __classes:
-        bpy.utils.unregister_class(__class)
     del bpy.types.Material.witcher_props
     del bpy.types.Node.witcher_include
     del bpy.types.Node.witcher_final_path
