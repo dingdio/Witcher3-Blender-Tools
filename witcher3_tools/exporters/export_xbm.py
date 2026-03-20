@@ -1,6 +1,8 @@
 """Export a Blender image as a Witcher 3 .xbm texture file."""
 
 import logging
+import os
+from datetime import datetime
 
 import numpy as np
 
@@ -17,9 +19,41 @@ def export_xbm(image, filepath):
         raise ValueError("Image has zero dimensions")
 
     mip_payloads = _blender_image_to_rgba8_mips(image)
-    cr2w = BuildXBM(mip_payloads, width, height)
+    import_file, import_timestamp = _get_import_metadata(image, filepath)
+    cr2w = BuildXBM(
+        mip_payloads,
+        width,
+        height,
+        import_file=import_file,
+        import_timestamp=import_timestamp,
+    )
     cr2w_writer.write_xbm(cr2w, filepath)
     log.info("Exported XBM: %s (%dx%d, %d mips)", filepath, width, height, len(mip_payloads))
+
+
+def _get_import_metadata(image, export_filepath):
+    """Best-effort import file metadata for the exported texture."""
+    source_path = ""
+
+    filepath_from_user = getattr(image, "filepath_from_user", None)
+    if callable(filepath_from_user):
+        try:
+            source_path = filepath_from_user() or ""
+        except Exception:
+            source_path = ""
+
+    if not source_path:
+        source_path = getattr(image, "filepath_raw", "") or getattr(image, "filepath", "") or ""
+
+    source_path = os.path.abspath(source_path) if source_path else ""
+    import_file = source_path or os.path.abspath(export_filepath)
+
+    if source_path and os.path.isfile(source_path):
+        import_timestamp = datetime.fromtimestamp(os.path.getmtime(source_path))
+    else:
+        import_timestamp = datetime.now()
+
+    return import_file, import_timestamp
 
 
 def _blender_image_to_rgba8_mips(image):

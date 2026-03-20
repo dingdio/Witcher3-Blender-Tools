@@ -1,12 +1,14 @@
 """Build a CR2W file containing a CBitmapTexture chunk from raw RGBA8 mip data."""
 
 from collections.abc import Sequence
+from datetime import datetime
 from types import SimpleNamespace
 
 from .CR2W_types import (
     CR2W,
     CR2W_header,
     CDATETIME,
+    CSTRING,
     CR2WExport,
     CR2WProperty,
     DATA,
@@ -16,7 +18,14 @@ from .CR2W_types import (
 from .Types.VariousTypes import CUInt32, CBytes
 
 
-def BuildXBM(pixel_data: bytes | Sequence[bytes], width: int, height: int) -> CR2W:
+def BuildXBM(
+    pixel_data: bytes | Sequence[bytes],
+    width: int,
+    height: int,
+    *,
+    import_file: str = "",
+    import_timestamp: datetime | None = None,
+) -> CR2W:
     """Construct a CR2W object with a single CBitmapTexture chunk.
 
     Args:
@@ -24,11 +33,14 @@ def BuildXBM(pixel_data: bytes | Sequence[bytes], width: int, height: int) -> CR
                     Can be a single top-level mip or a full mip chain.
         width: Image width in pixels.
         height: Image height in pixels.
+        import_file: Source file path recorded in CR2W metadata.
+        import_timestamp: Source file timestamp recorded in CR2W metadata.
 
     Returns:
         A CR2W object ready to be serialized with cr2w_writer.write_xbm().
     """
     mip_payloads = _normalize_mip_payloads(pixel_data)
+    import_timestamp = import_timestamp or datetime.now()
 
     cr2w = CR2W()
     cr2w.CNAMES = []
@@ -52,7 +64,7 @@ def BuildXBM(pixel_data: bytes | Sequence[bytes], width: int, height: int) -> CR
     cr2w.CHUNKS = DATA()
     cr2w.CR2WExport = []
 
-    chunk = _build_cbitmap_chunk(cr2w, mip_payloads, width, height)
+    chunk = _build_cbitmap_chunk(cr2w, mip_payloads, width, height, import_file, import_timestamp)
     cr2w.CHUNKS.CHUNKS.append(chunk)
 
     return cr2w
@@ -70,7 +82,7 @@ def _normalize_mip_payloads(pixel_data: bytes | Sequence[bytes]) -> list[bytes]:
     return mip_payloads
 
 
-def _build_cbitmap_chunk(cr2w, mip_payloads, width, height):
+def _build_cbitmap_chunk(cr2w, mip_payloads, width, height, import_file, import_timestamp):
     """Build the CBitmapTexture W_CLASS chunk with properties and binary data."""
     cr2w.CR2WExport.append(CR2WExport(
         crc32=0,
@@ -91,9 +103,14 @@ def _build_cbitmap_chunk(cr2w, mip_payloads, width, height):
     )
 
     chunk.PROPS.append(PROPERTY(
+        theName='importFile',
+        theType='String',
+        String=CSTRING(isUTF=False, String=import_file),
+    ))
+    chunk.PROPS.append(PROPERTY(
         theName='importFileTimeStamp',
         theType='CDateTime',
-        DateTime=CDATETIME(Value=247518305951179776, String='2010/01/26 13:47:23'),
+        DateTime=_make_cdatetime(import_timestamp),
     ))
     chunk.PROPS.append(PROPERTY(theName='width', theType='Uint32', Value=width))
     chunk.PROPS.append(PROPERTY(theName='height', theType='Uint32', Value=height))
@@ -135,3 +152,20 @@ def _build_cbitmap_chunk(cr2w, mip_payloads, width, height):
     chunk.CBitmapTexture = cbt
 
     return chunk
+
+
+def _make_cdatetime(value: datetime) -> CDATETIME:
+    timestamp_value = _encode_cdatetime_value(value)
+    return CDATETIME(Value=timestamp_value, String=value.strftime("%Y/%m/%d %H:%M:%S"))
+
+
+def _encode_cdatetime_value(value: datetime) -> int:
+    encoded = value.hour & 0x1FF
+    encoded = (encoded << 6) | (value.minute & 0x3F)
+    encoded = (encoded << 6) | (value.second & 0x3F)
+    encoded = (encoded << 10) | ((value.microsecond // 1000) & 0x3FF)
+    encoded = (encoded << 12) | (value.year & 0xFFF)
+    encoded = (encoded << 5) | ((value.month - 1) & 0x1F)
+    encoded = (encoded << 5) | ((value.day - 1) & 0x1F)
+    encoded <<= 10
+    return encoded

@@ -23,7 +23,7 @@ from ..ui.ui_entity import WITCH_OT_w2ent, WITCH_OT_flyr, WITCH_OT_ENTITY_w2ent_
 from ..ui.ui_scene import ButtonOperatorImportW2scene, ButtonOperatorImportW2cutscene
 from ..ui.ui_speech import ButtonOperatorImportVoice, ImportWEM
 from ..ui.ui_material import WITCH_OT_w2mg, WITCH_OT_w2mi, WITCH_OT_xbm, WITCH_OT_w2cube
-from ..ui.ui_texture_export import WITCH_OT_xbm_export
+from ..ui.ui_texture_export import WITCH_OT_xbm_export, WITCH_OT_dds_convert
 from ..ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_w2w,
                                     #  WITCH_OT_load_layer,
@@ -175,6 +175,7 @@ class WITCH_MT_MenuExport(bpy.types.Menu):
         layout.operator(WITCH_OT_ExportW2AnimJson.bl_idname, text="Animation (.w2anims)", icon='ARMATURE_DATA')
         layout.separator()
         layout.operator(WITCH_OT_xbm_export.bl_idname, text="Texture (.xbm)", icon='IMAGE_DATA')
+        layout.operator(WITCH_OT_dds_convert.bl_idname, text="Convert DDS to Editable", icon='FILE_REFRESH')
 
 def menu_export(self, context):
     self.layout.menu(WITCH_MT_MenuExport.bl_idname, **_witcher_menu_icon_kwargs())
@@ -198,6 +199,7 @@ classes = (
     WITCH_OT_nxs,
     WITCH_OT_srt,
     WITCH_OT_xbm_export,
+    WITCH_OT_dds_convert,
     WITCH_MT_Menu,
     WITCH_MT_MenuExport,
     WITCH_MT_Menu_witcher_2
