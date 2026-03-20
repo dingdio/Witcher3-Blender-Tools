@@ -1,8 +1,13 @@
+import json
 import logging
+import re
 
 import bpy
+from .CR2W.witcher_cache.Bundles import LoadBundleManager
 from .w3_material import (
+    ensure_node_group,
     get_active_witcher_group_node,
+    get_recommended_node_group_for_base_path,
     init_material_nodes,
 )
 from .w3_material_base_path import (
@@ -19,11 +24,172 @@ from .w3_vector_param import (
     mark_vector_param_node,
 )
 from . import get_all_addon_prefs, get_texture_path, get_uncook_path
+from .extension_paths import get_cache_root
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 log = logging.getLogger(__name__)
+
+_BASE_PATH_CACHE_FILE = Path(get_cache_root(create=True)) / "material_base_paths.json"
+_BASE_PATH_ENUM_CACHE = {}
+_NUMERIC_SUFFIX_RE = re.compile(r"\.\d{3}$")
+
+
+def _cache_base_path_enum_items(cache_key, items):
+    stable_items = []
+    for item in items or [("", "No base materials found", "")]:
+        identifier = str(item[0] or "")
+        label = str(item[1] or identifier or "No base materials found")
+        description = str(item[2] or "")
+        stable_items.append((identifier, label, description))
+    _BASE_PATH_ENUM_CACHE[cache_key] = stable_items
+    return stable_items
+
+
+def _load_material_base_path_cache():
+    try:
+        if not _BASE_PATH_CACHE_FILE.exists():
+            return []
+        with open(_BASE_PATH_CACHE_FILE, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+        paths = payload.get("paths", [])
+        if not isinstance(paths, list):
+            return []
+        return [str(path) for path in paths if str(path or "").strip()]
+    except Exception:
+        log.warning("Failed to load material base path cache from %s", _BASE_PATH_CACHE_FILE, exc_info=True)
+        return []
+
+
+def _save_material_base_path_cache(paths):
+    try:
+        _BASE_PATH_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_BASE_PATH_CACHE_FILE, 'w', encoding='utf-8') as handle:
+            json.dump({"paths": list(paths)}, handle, indent=2)
+    except Exception:
+        log.warning("Failed to save material base path cache to %s", _BASE_PATH_CACHE_FILE, exc_info=True)
+
+
+def _gather_material_base_paths_from_bundles():
+    paths = set()
+
+    def add_candidate(candidate):
+        normalized = normalize_depot_path(str(candidate or ""))
+        if normalized.endswith((".w2mi", ".w2mg")):
+            paths.add(normalized)
+
+    bundle_manager = LoadBundleManager()
+    items = getattr(bundle_manager, "Items", None) or {}
+    for key, item_list in items.items():
+        add_candidate(key)
+        if not item_list:
+            continue
+        final_item = item_list[-1] if isinstance(item_list, list) else item_list
+        add_candidate(getattr(final_item, "name", getattr(final_item, "Name", "")))
+
+    return sorted(paths, key=str.lower)
+
+
+def _material_base_path_enum_items(force_refresh: bool = False):
+    cache_key = "bundle_material_base_paths"
+    if not force_refresh and cache_key in _BASE_PATH_ENUM_CACHE:
+        return _BASE_PATH_ENUM_CACHE[cache_key]
+
+    paths = [] if force_refresh else _load_material_base_path_cache()
+    if not paths:
+        try:
+            paths = _gather_material_base_paths_from_bundles()
+        except Exception:
+            log.warning("Failed to gather base material paths from bundles", exc_info=True)
+            paths = []
+        if paths:
+            _save_material_base_path_cache(paths)
+
+    items = [
+        (
+            path,
+            path,
+            f"Bundle material path ({Path(path).name})",
+        )
+        for path in paths
+    ]
+    return _cache_base_path_enum_items(cache_key, items)
+
+
+def _material_base_path_values(force_refresh: bool = False):
+    return [
+        identifier
+        for identifier, _label, _description in _material_base_path_enum_items(force_refresh)
+        if identifier
+    ]
+
+
+def _filtered_material_base_paths(query: str = "", *, file_type: str = "ALL", limit: int = 0):
+    paths = _material_base_path_values()
+    if file_type == "W2MI":
+        paths = [path for path in paths if path.lower().endswith(".w2mi")]
+    elif file_type == "W2MG":
+        paths = [path for path in paths if path.lower().endswith(".w2mg")]
+
+    if not query:
+        total = len(paths)
+        return (paths[:limit] if limit > 0 else paths), total
+
+    normalized_query = normalize_depot_path(str(query or "")).lower()
+
+    def sort_key(path: str):
+        lower = path.lower()
+        basename = Path(path).name.lower()
+        return (
+            normalized_query not in basename,
+            not basename.startswith(normalized_query),
+            normalized_query not in lower,
+            lower,
+        )
+
+    filtered = [
+        path for path in paths
+        if normalized_query in path.lower() or normalized_query in Path(path).name.lower()
+    ]
+    filtered.sort(key=sort_key)
+    total = len(filtered)
+    return (filtered[:limit] if limit > 0 else filtered), total
+
+
+def _node_group_family_name(node_tree) -> str:
+    name = str(getattr(node_tree, "name", "") or "")
+    if not name:
+        return ""
+    return _NUMERIC_SUFFIX_RE.sub("", name)
+
+
+def _base_path_group_recommendation(material):
+    props = getattr(material, "witcher_props", None)
+    if material is None or props is None:
+        return None
+
+    base_path = normalize_depot_path(getattr(props, "base_custom", ""))
+    if not base_path:
+        return None
+
+    recommendation = get_recommended_node_group_for_base_path(material, base_path)
+    if not recommendation.get("node_group_name"):
+        return None
+
+    active_group = get_active_witcher_group_node(material)
+    current_tree = getattr(active_group, "node_tree", None) if active_group else None
+    current_tree_name = str(getattr(current_tree, "name", "") or "")
+    current_family = _node_group_family_name(current_tree)
+
+    result = dict(recommendation)
+    result["has_active_group"] = bool(active_group)
+    result["current_tree_name"] = current_tree_name
+    result["current_group_name"] = current_family
+    result["matches_current"] = bool(
+        current_family and current_family == _node_group_family_name(SimpleNamespace(name=recommendation["node_group_name"]))
+    )
+    return result
 
 class ReplacePrincipledBSDFOperator(bpy.types.Operator):
     """Replace the selected Principled BSDF with a custom node group and reconnect inputs"""
@@ -127,6 +293,21 @@ def _source_kind_label(source_kind: str) -> str:
         "declared_only": "Declared Only",
     }
     return labels.get(str(source_kind or ""), str(source_kind or "") or "Unknown")
+
+
+def _compact_param_type_label(param_type: str) -> str:
+    text = str(param_type or "")
+    if text.startswith("handle:"):
+        return text.split(":", 1)[1]
+    return text
+
+
+def _source_file_label(source_path: str) -> str:
+    normalized = normalize_depot_path(source_path)
+    if not normalized:
+        return ""
+    name = normalized.rsplit("\\", 1)[-1]
+    return _short_path_label(name, 32)
 
 
 def _status_icon(item) -> str:
@@ -327,7 +508,27 @@ class WITCH_PT_materials(bpy.types.Panel):
         props = mat.witcher_props
         row = layout.row(align=True)
         row.prop(props, "base_custom", text="Base Path")
-        row.operator("witcher.read_base_material", text="Read Base Path...", icon='FILE_REFRESH')
+        row.operator("witcher.search_base_material_path", text="", icon='VIEWZOOM')
+        row.operator("witcher.read_base_material", text="Load", icon='FILE_REFRESH')
+
+        recommendation = _base_path_group_recommendation(mat)
+        if not recommendation:
+            return
+
+        suggested_row = layout.row(align=True)
+        suggested_row.scale_y = 0.9
+        suggested_row.label(text=f"Suggested Group: {recommendation['node_group_name']}", icon='NODETREE')
+        if recommendation.get("shader_type"):
+            suggested_row.label(text=recommendation["shader_type"])
+
+        if recommendation.get("has_active_group") and not recommendation.get("matches_current"):
+            mismatch_row = layout.row(align=True)
+            mismatch_row.alert = True
+            mismatch_row.label(
+                text=f"Current Group: {recommendation.get('current_tree_name') or recommendation.get('current_group_name') or 'None'}",
+                icon='ERROR',
+            )
+            mismatch_row.operator("witcher.use_recommended_base_material_group", text="Use Recommended Group", icon='FILE_REFRESH')
 
     def _draw_base_read_items(self, layout, mat, items, *, action_enabled: bool):
         for stored_item, item in items:
@@ -341,7 +542,10 @@ class WITCH_PT_materials(bpy.types.Panel):
             )
             row.label(text=item.name, icon=_status_icon(item))
             if item.param_type:
-                row.label(text=item.param_type)
+                row.label(text=_compact_param_type_label(item.param_type))
+            source_file = _source_file_label(getattr(item, "source_path", ""))
+            if source_file:
+                row.label(text=source_file)
 
             if action_enabled and item.can_create and not item.is_linked:
                 op = row.operator(
@@ -352,7 +556,10 @@ class WITCH_PT_materials(bpy.types.Panel):
                 op.param_name = item.name
                 op.create_export_socket = not item.has_matching_socket
             else:
-                row.label(text=_status_label(item))
+                status = str(getattr(item, "status", "") or "")
+                status_text = _status_label(item)
+                if status != "present_linked" and status_text:
+                    row.label(text=status_text)
 
             if not stored_item.show_details:
                 continue
@@ -371,6 +578,8 @@ class WITCH_PT_materials(bpy.types.Panel):
     def _draw_base_read_section(self, layout, context, mat):
         props = mat.witcher_props
         if not props.base_read_status:
+            empty_row = layout.row()
+            empty_row.label(text="Base Path not loaded.", icon='INFO')
             return
         try:
             stored_items = list(props.base_read_params)
@@ -609,6 +818,15 @@ class NodeGroupInputProperties(bpy.types.PropertyGroup):
     is_linked: bpy.props.BoolProperty(name="is_linked", default=False)
 
 
+class BaseMaterialPathItem(bpy.types.PropertyGroup):
+    path: bpy.props.StringProperty(name="Path")
+
+
+class WITCH_UL_base_material_paths(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        layout.label(text=getattr(item, "path", "") or "", icon='FILE')
+
+
 class BaseMaterialParamItem(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Name")
     param_type: bpy.props.StringProperty(name="Type")
@@ -633,7 +851,7 @@ class WitcherMaterialProperties(bpy.types.PropertyGroup):
         name="Material UI Tab",
         items=[
             ('EXPORT', "Export Params", "Export-connected local params"),
-            ('BASE', "Loaded Base", "Read base path and create params from it"),
+            ('BASE', "Base", "Read base path and create params from it"),
         ],
         default='EXPORT',
     )
@@ -928,9 +1146,140 @@ def _refresh_base_read_snapshot(material, material_path: str, *, count_created: 
     return inspection
 
 
+class WITCH_OT_search_base_material_path(bpy.types.Operator):
+    bl_idname = "witcher.search_base_material_path"
+    bl_label = "Search Base Path"
+    bl_description = "Search bundle .w2mi and .w2mg paths to populate the Base Path"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    filter_text: bpy.props.StringProperty(name="Search", default="")
+    file_type: bpy.props.EnumProperty(
+        name="Type",
+        items=[
+            ('ALL', "All", "Show both .w2mi and .w2mg"),
+            ('W2MI', "w2mi", "Show only .w2mi"),
+            ('W2MG', "w2mg", "Show only .w2mg"),
+        ],
+        default='ALL',
+    )
+    base_path_items: bpy.props.CollectionProperty(type=BaseMaterialPathItem)
+    base_path_items_index: bpy.props.IntProperty(default=0)
+
+    def _rebuild_items(self):
+        matches, _total = _filtered_material_base_paths(self.filter_text, file_type=self.file_type)
+        self.base_path_items.clear()
+        for path in matches:
+            item = self.base_path_items.add()
+            item.path = path
+        if self.base_path_items:
+            self.base_path_items_index = min(max(int(self.base_path_items_index), 0), len(self.base_path_items) - 1)
+        else:
+            self.base_path_items_index = -1
+
+    def invoke(self, context, event):
+        material = context.material
+        if material is None or getattr(material, "witcher_props", None) is None:
+            self.report({'ERROR'}, "No material selected")
+            return {'CANCELLED'}
+
+        current = normalize_depot_path(getattr(material.witcher_props, "base_custom", ""))
+        self.filter_text = ""
+        self.file_type = 'ALL'
+
+        if not _material_base_path_values():
+            self.report({'WARNING'}, "No .w2mi or .w2mg bundle paths were found")
+            return {'CANCELLED'}
+
+        self._rebuild_items()
+        if current and self.base_path_items:
+            for idx, item in enumerate(self.base_path_items):
+                if normalize_depot_path(getattr(item, "path", "")) == current:
+                    self.base_path_items_index = idx
+                    break
+
+        return context.window_manager.invoke_props_dialog(self, width=980)
+
+    def check(self, context):
+        self._rebuild_items()
+        return True
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row(align=True)
+        row.prop(self, "filter_text", text="", icon='VIEWZOOM')
+        type_row = layout.row(align=True)
+        type_row.prop(self, "file_type", expand=True)
+
+        total = len(self.base_path_items)
+        if total == 0:
+            layout.label(text="No matching .w2mi or .w2mg paths found.", icon='INFO')
+            return
+
+        list_box = layout.box()
+        list_box.template_list(
+            "WITCH_UL_base_material_paths",
+            "",
+            self,
+            "base_path_items",
+            self,
+            "base_path_items_index",
+            rows=18,
+        )
+        layout.label(text=f"{total} path(s)", icon='INFO')
+
+    def execute(self, context):
+        material = context.material
+        if material is None or getattr(material, "witcher_props", None) is None:
+            return {'CANCELLED'}
+        if not (0 <= self.base_path_items_index < len(self.base_path_items)):
+            return {'CANCELLED'}
+        material.witcher_props.base_custom = self.base_path_items[self.base_path_items_index].path
+        return {'FINISHED'}
+
+
+class WITCH_OT_use_recommended_base_material_group(bpy.types.Operator):
+    bl_idname = "witcher.use_recommended_base_material_group"
+    bl_label = "Use Recommended Group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        material = context.material
+        if material is None or getattr(material, "witcher_props", None) is None:
+            self.report({'ERROR'}, "No material selected")
+            return {'CANCELLED'}
+
+        node_ng = get_active_witcher_group_node(material)
+        if node_ng is None:
+            self.report({'ERROR'}, "No active Witcher shader group is connected to Material Output")
+            return {'CANCELLED'}
+
+        recommendation = _base_path_group_recommendation(material)
+        if not recommendation:
+            self.report({'ERROR'}, "Base Path does not resolve to a recommended node group")
+            return {'CANCELLED'}
+
+        recommended_name = str(recommendation.get("node_group_name", "") or "")
+        if not recommended_name:
+            self.report({'ERROR'}, "No recommended node group was found")
+            return {'CANCELLED'}
+
+        current_tree = getattr(node_ng, "node_tree", None)
+        if _node_group_family_name(current_tree) == _node_group_family_name(SimpleNamespace(name=recommended_name)):
+            self.report({'INFO'}, f"Active group already matches {recommended_name}")
+            return {'CANCELLED'}
+
+        ng = ensure_node_group(recommended_name, resource_path=recommendation.get("resource_path"))
+        node_ng.node_tree = ng
+        if recommendation.get("shader_type"):
+            node_ng.label = recommendation["shader_type"]
+        material.witcher_props.node_group_name = ng.name
+        self.report({'INFO'}, f"Updated active group to {ng.name}")
+        return {'FINISHED'}
+
+
 class WITCH_OT_read_base_material(bpy.types.Operator):
     bl_idname = "witcher.read_base_material"
-    bl_label = "Read Base Path"
+    bl_label = "Load"
     bl_options = {'REGISTER', 'UNDO'}
 
     def _inspection(self, context):
@@ -1181,9 +1530,12 @@ class WITCH_OT_copy_texture_path(bpy.types.Operator):
 
 __classes = [
     ClearInputPropsOperator,
+    WITCH_OT_search_base_material_path,
+    WITCH_OT_use_recommended_base_material_group,
     WITCH_OT_read_base_material,
     WITCH_OT_create_missing_base_material_params,
     WITCH_OT_create_base_material_param,
+    WITCH_UL_base_material_paths,
     WITCH_PT_materials,
     ReplacePrincipledBSDFOperator,
     WITCH_OT_copy_texture_path,
@@ -1197,6 +1549,7 @@ def register():
     bpy.types.Node.witcher_vector_source = bpy.props.StringProperty(default="")
     bpy.types.Node.witcher_vector_w = bpy.props.FloatProperty(default=1.0)
     bpy.utils.register_class(NodeGroupInputProperties) #! imp to reg first
+    bpy.utils.register_class(BaseMaterialPathItem)
     bpy.utils.register_class(BaseMaterialParamItem)
     bpy.utils.register_class(WitcherMaterialProperties)
     bpy.types.Material.witcher_props = bpy.props.PointerProperty(type=WitcherMaterialProperties)
@@ -1226,6 +1579,7 @@ def unregister():
         bpy.utils.unregister_class(__class)
     bpy.utils.unregister_class(WitcherMaterialProperties)
     bpy.utils.unregister_class(BaseMaterialParamItem)
+    bpy.utils.unregister_class(BaseMaterialPathItem)
     bpy.utils.unregister_class(NodeGroupInputProperties) #! imp to reg first
     # if update_node_group_inputs in bpy.app.handlers.depsgraph_update_post:
     #     bpy.app.handlers.depsgraph_update_post.remove(update_node_group_inputs)

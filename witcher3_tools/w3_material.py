@@ -103,6 +103,7 @@ def ensure_node_group(ng_name, resource_path=RES_PATH):
 
 
 MATERIAL_SETUP_VERSION = 4
+_BASE_PATH_NODE_GROUP_CACHE: Dict[Tuple[str, str], Dict[str, str]] = {}
 
 
 def is_witcher2_material(material: Material) -> bool:
@@ -133,6 +134,58 @@ def get_shader_resources_for_material(material: Material):
     if is_witcher2_material(material):
         return SHADER_MAPPING_W2, 'Witcher2_Main', RES_PATH
     return SHADER_MAPPING, 'Witcher3_Main', RES_PATH
+
+
+def _shader_name_from_material_path(material_path: str) -> str:
+    normalized_path = normalize_depot_path(material_path)
+    if not normalized_path:
+        return ""
+    return os.path.splitext(normalized_path.rsplit("\\", 1)[-1])[0]
+
+
+def get_recommended_node_group_for_base_path(material: Material, material_path: str) -> Dict[str, str]:
+    normalized_path = normalize_depot_path(material_path)
+    shader_mapping, fallback_ng_name, resource_path = get_shader_resources_for_material(material)
+    material_version = 'witcher2' if is_witcher2_material(material) else 'witcher3'
+    cache_key = (material_version, normalized_path)
+
+    if cache_key in _BASE_PATH_NODE_GROUP_CACHE:
+        cached = dict(_BASE_PATH_NODE_GROUP_CACHE[cache_key])
+        cached["requested_path"] = material_path or ""
+        return cached
+
+    result = {
+        "requested_path": material_path or "",
+        "normalized_path": normalized_path,
+        "resolved_path": normalized_path,
+        "shader_type": "",
+        "node_group_name": "",
+        "resource_path": resource_path,
+    }
+    if not normalized_path:
+        return result
+
+    shader_type = _shader_name_from_material_path(normalized_path)
+    resolved_path = normalized_path
+
+    if normalized_path.endswith(".w2mi"):
+        fallback_shader_type = guess_shader_type(shader_type)
+        resolved_w2mg = resolve_w2mg(normalized_path)
+        if resolved_w2mg:
+            resolved_path = normalize_depot_path(resolved_w2mg)
+            shader_type = _shader_name_from_material_path(resolved_path)
+        else:
+            shader_type = fallback_shader_type
+
+    if is_witcher2_material(material):
+        shader_type = resolve_witcher2_shader_type(resolved_path, shader_type)
+
+    result["resolved_path"] = resolved_path
+    result["shader_type"] = shader_type
+    result["node_group_name"] = shader_mapping.get(shader_type, fallback_ng_name)
+
+    _BASE_PATH_NODE_GROUP_CACHE[cache_key] = dict(result)
+    return result
 
 
 def load_w3_materials_XML(

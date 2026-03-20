@@ -542,7 +542,6 @@ def create_base_material_helper(
 
     input_pin = find_group_input_socket(node_ng, par_name)
     if input_pin is None and allow_export_socket:
-        node_ng = ensure_local_material_group_node(material, node_ng)
         input_pin = ensure_group_input_socket(node_ng, par_name, par_type)
 
     if input_pin is not None and len(input_pin.links) != 0:
