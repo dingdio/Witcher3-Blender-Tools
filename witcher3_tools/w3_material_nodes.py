@@ -145,9 +145,13 @@ def _status_label(item) -> str:
     if status == "present_linked":
         return "Linked"
     if status == "available_to_create":
-        return "Available"
+        return "Create"
     if status == "unsupported_export_only":
         return "Export Only"
+    if status == "ignored_info":
+        return "Ignored"
+    if status == "declared_only_info":
+        return "Declared Only"
     return "Info"
 
 
@@ -319,10 +323,22 @@ class WITCH_PT_materials(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Witcher"
 
+    def _draw_base_path_controls(self, layout, mat):
+        props = mat.witcher_props
+        row = layout.row(align=True)
+        row.prop(props, "base_custom", text="Base Path")
+        row.operator("witcher.read_base_material", text="Read Base Path...", icon='FILE_REFRESH')
+
     def _draw_base_read_items(self, layout, mat, items, *, action_enabled: bool):
-        for item in items:
-            item_box = layout.box()
-            row = item_box.row(align=True)
+        for stored_item, item in items:
+            row = layout.row(align=True)
+            row.prop(
+                stored_item,
+                "show_details",
+                icon="TRIA_DOWN" if stored_item.show_details else "TRIA_RIGHT",
+                icon_only=True,
+                emboss=False,
+            )
             row.label(text=item.name, icon=_status_icon(item))
             if item.param_type:
                 row.label(text=item.param_type)
@@ -330,7 +346,7 @@ class WITCH_PT_materials(bpy.types.Panel):
             if action_enabled and item.can_create and not item.is_linked:
                 op = row.operator(
                     "witcher.create_base_material_param",
-                    text="Create" if item.has_matching_socket else "Create Export Param",
+                    text=_status_label(item),
                     icon='ADD' if item.has_matching_socket else 'LINKED',
                 )
                 op.param_name = item.name
@@ -338,119 +354,119 @@ class WITCH_PT_materials(bpy.types.Panel):
             else:
                 row.label(text=_status_label(item))
 
-            meta = item_box.row(align=True)
-            meta.scale_y = 0.9
-            meta.label(text=_source_kind_label(item.source_kind))
-            if item.source_path:
-                meta.label(text=_short_path_label(item.source_path))
-            if item.message:
-                note = item_box.row()
-                note.scale_y = 0.9
-                note.label(text=item.message, icon='INFO')
+            if not stored_item.show_details:
+                continue
 
-    def _draw_base_read_group(self, layout, mat, items, collapse_attr: str, label: str, *, action_enabled: bool):
-        if not items:
-            return
-        props = mat.witcher_props
-        box = layout.box()
-        collapsed = getattr(props, collapse_attr)
-        row = box.row(align=True)
-        row.prop(
-            props,
-            collapse_attr,
-            icon="TRIA_DOWN" if not collapsed else "TRIA_RIGHT",
-            icon_only=True,
-            emboss=False,
-        )
-        row.label(text=f"{label} ({len(items)})")
-        if collapsed:
-            return
-        self._draw_base_read_items(box, mat, items, action_enabled=action_enabled)
+            details = layout.column(align=True)
+            details.scale_y = 0.9
+            if item.value:
+                details.label(text=f"Value: {item.value}")
+            if item.source_kind:
+                details.label(text=f"Source: {_source_kind_label(item.source_kind)}")
+            if item.source_path:
+                details.label(text=f"Path: {item.source_path}")
+            if item.message:
+                details.label(text=item.message, icon='INFO')
 
     def _draw_base_read_section(self, layout, context, mat):
         props = mat.witcher_props
-        row = layout.row(align=True)
-        row.prop(props, "base_custom")
-        row.operator("witcher.read_base_material", text="Read Base Path...", icon='FILE_REFRESH')
-
         if not props.base_read_status:
             return
         try:
+            stored_items = list(props.base_read_params)
             live_items, live_counts = _get_live_base_read_snapshot_state(mat)
+            items = [
+                (stored_item, live_items[idx] if idx < len(live_items) else stored_item)
+                for idx, stored_item in enumerate(stored_items)
+            ]
             stale = _base_read_is_stale(props)
             material_ready = bool(get_active_witcher_group_node(mat))
-            header_box = layout.box()
-            header_row = header_box.row(align=True)
-            if props.base_read_status == "error":
-                header_row.label(text="Base Path read failed", icon='ERROR')
-            elif stale:
-                header_row.label(text="Loaded Base Path snapshot is stale", icon='ERROR')
-            else:
-                header_row.label(text="Base Path snapshot loaded", icon='CHECKMARK')
-
-            if props.base_read_message:
-                msg = header_box.row()
-                msg.scale_y = 0.9
-                msg.label(text=props.base_read_message, icon='INFO')
-
-            if props.base_read_requested_path:
-                header_box.label(text=f"Requested: {_short_path_label(props.base_read_requested_path, 80)}")
-            if props.base_read_resolved_graph:
-                header_box.label(text=f"Resolved Graph: {_short_path_label(props.base_read_resolved_graph, 80)}")
-
-            if props.base_read_chain_text:
-                chain_box = header_box.box()
-                chain_box.label(text="Chain", icon='LINKED')
-                for line in props.base_read_chain_text.splitlines():
-                    chain_box.label(text=_short_path_label(line, 90))
-
-            counts_row = header_box.row(align=True)
-            counts_row.label(text=f"Linked {live_counts['present']}")
-            counts_row.label(text=f"Unsupported {live_counts['unsupported']}")
-            counts_row.label(text=f"Declared {live_counts['declared_only']}")
-            if props.base_read_count_created:
-                counts_row.label(text=f"Last Created {props.base_read_count_created}")
-
-            if not material_ready:
-                warn = header_box.row()
-                warn.label(text="No active Witcher shader group is connected to Material Output.", icon='INFO')
-
-            action_row = header_box.row(align=True)
-            action_row.enabled = (
-                props.base_read_status == "ok"
-                and not stale
-                and material_ready
-                and any(
-                    item.status == "available_to_create" and item.can_create
-                    for item in live_items
-                )
+            available_count = sum(
+                1 for _, item in items
+                if item.status == "available_to_create" and item.can_create
             )
-            action_row.operator("witcher.create_missing_base_material_params", text="Create Missing Supported", icon='ADD')
+            counts_text = (
+                f"Linked {live_counts['present']}"
+                f" | Available {available_count}"
+                f" | Export-only {live_counts['unsupported']}"
+                f" | Declared {live_counts['declared_only']}"
+            )
 
-            inspector_row = header_box.row(align=True)
-            inspector_row.prop(
+            snapshot_box = layout.box()
+            header_row = snapshot_box.row(align=True)
+            header_row.prop(
                 props,
                 "base_read_show_inspector",
                 icon="TRIA_DOWN" if props.base_read_show_inspector else "TRIA_RIGHT",
                 icon_only=True,
                 emboss=False,
             )
-            inspector_row.label(text="Loaded Param Inspector")
+            alert_text = ""
+            if props.base_read_status == "error":
+                header_row.label(text="Read failed", icon='ERROR')
+                alert_text = props.base_read_message or "Base Path read failed."
+            elif stale:
+                header_row.label(text="Snapshot is stale", icon='ERROR')
+                alert_text = "Base Path changed; read again."
+            else:
+                header_row.label(text="Snapshot loaded", icon='CHECKMARK')
+            header_row.label(text="Base Path Snapshot")
+            header_row.label(text=counts_text)
+
+            action_row = header_row.row(align=True)
+            action_row.enabled = (
+                props.base_read_status == "ok"
+                and not stale
+                and material_ready
+                and any(
+                    item.status == "available_to_create" and item.can_create
+                    for _, item in items
+                )
+            )
+            action_row.operator("witcher.create_missing_base_material_params", text="Create Missing Supported", icon='ADD')
+
             if not props.base_read_show_inspector:
                 return
 
-            items = live_items
-            present_items = [item for item in items if item.status == "present_linked"]
-            available_items = [item for item in items if item.status == "available_to_create"]
-            declared_items = [
-                item for item in items
-                if item.status in {"unsupported_export_only", "declared_only_info"}
-            ]
+            if alert_text:
+                alert_row = snapshot_box.row()
+                alert_row.alert = True
+                alert_row.label(text=alert_text, icon='ERROR')
+
+            if props.base_read_chain_text:
+                chain_col = snapshot_box.column(align=True)
+                chain_col.scale_y = 0.9
+                chain_col.label(text="Material Chain", icon='LINKED')
+                for line in props.base_read_chain_text.splitlines():
+                    chain_col.label(text=_short_path_label(line, 100))
+
+            info_row = snapshot_box.row(align=True)
+            info_row.prop(
+                props,
+                "base_read_show_info",
+                icon="TRIA_DOWN" if props.base_read_show_info else "TRIA_RIGHT",
+                icon_only=True,
+                emboss=False,
+            )
+            info_row.label(text="Info")
+            if props.base_read_show_info:
+                info_col = snapshot_box.column(align=True)
+                info_col.scale_y = 0.9
+                if props.base_read_message:
+                    info_col.label(text=props.base_read_message, icon='INFO')
+                if props.base_read_requested_path:
+                    info_col.label(text=f"Requested: {props.base_read_requested_path}")
+                if props.base_read_resolved_graph:
+                    info_col.label(text=f"Resolved Graph: {props.base_read_resolved_graph}")
+                if props.base_read_chain_text:
+                    info_col.label(text="Chain:", icon='LINKED')
+                    for line in props.base_read_chain_text.splitlines():
+                        info_col.label(text=line)
+                if props.base_read_count_created:
+                    info_col.label(text=f"Last Created {props.base_read_count_created}")
 
             action_enabled = props.base_read_status == "ok" and not stale and material_ready
-            self._draw_base_read_group(header_box, mat, present_items, "base_read_present_collapse", "Present / Linked", action_enabled=False)
-            self._draw_base_read_group(header_box, mat, available_items, "base_read_available_collapse", "Available Defaults", action_enabled=action_enabled)
-            self._draw_base_read_group(header_box, mat, declared_items, "base_read_declared_collapse", "Declared / Unsupported", action_enabled=action_enabled)
+            self._draw_base_read_items(snapshot_box, mat, items, action_enabled=action_enabled)
         except Exception:
             log.exception("Failed to draw Base Path UI for material '%s'", getattr(mat, "name", "<unknown>"))
             error_row = layout.row()
@@ -564,12 +580,21 @@ class WITCH_PT_materials(bpy.types.Panel):
         layout.prop(mat.witcher_props, "material_version")
         layout.prop(mat.witcher_props, "local")
         layout.prop(mat.witcher_props, "enableMask")
-        self._draw_base_read_section(layout, context, mat)
+        self._draw_base_path_controls(layout, mat)
 
         if mat.witcher_props.local:
-            self._draw_material_socket_controls(layout, mat)
-            if mat.witcher_props.xml_text:
-                layout.prop(mat.witcher_props, "xml_text", text="Local Instance XML", expand=True)
+            tab_row = layout.row(align=True)
+            tab_row.prop_enum(mat.witcher_props, "material_ui_tab", 'EXPORT')
+            tab_row.prop_enum(mat.witcher_props, "material_ui_tab", 'BASE')
+
+            if mat.witcher_props.material_ui_tab == 'EXPORT':
+                self._draw_material_socket_controls(layout, mat)
+                if mat.witcher_props.xml_text:
+                    layout.prop(mat.witcher_props, "xml_text", text="Local Instance XML", expand=True)
+            else:
+                self._draw_base_read_section(layout, context, mat)
+        else:
+            self._draw_base_read_section(layout, context, mat)
 
 
 class NodeGroupInputProperties(bpy.types.PropertyGroup):
@@ -598,11 +623,20 @@ class BaseMaterialParamItem(bpy.types.PropertyGroup):
     can_create: bpy.props.BoolProperty(name="Can Create", default=False)
     status: bpy.props.StringProperty(name="Status")
     message: bpy.props.StringProperty(name="Message")
+    show_details: bpy.props.BoolProperty(name="Show Details", default=False)
 
 class WitcherMaterialProperties(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="name", default="Material")
     enableMask: bpy.props.BoolProperty(name="enableMask", default=False, description="Enable Mask of hair etc")
     local: bpy.props.BoolProperty(name="local", default=True, description="Local materials will be embedded in the .w2mesh. Non-local will use the defined base material without any instances.")
+    material_ui_tab: bpy.props.EnumProperty(
+        name="Material UI Tab",
+        items=[
+            ('EXPORT', "Export Params", "Export-connected local params"),
+            ('BASE', "Loaded Base", "Read base path and create params from it"),
+        ],
+        default='EXPORT',
+    )
     #base: bpy.props.StringProperty(name="base", default="engine\materials\graphs\pbr_std.w2mg")
     bind_name: bpy.props.BoolProperty(name="Use Blender Material Name", default=True)
     node_group_name: bpy.props.StringProperty(name="Node Group", default="")
@@ -623,6 +657,7 @@ class WitcherMaterialProperties(bpy.types.PropertyGroup):
     base_read_count_unsupported: bpy.props.IntProperty(name="Base Read Unsupported", default=0)
     base_read_count_declared_only: bpy.props.IntProperty(name="Base Read Declared Only", default=0)
     base_read_show_inspector: bpy.props.BoolProperty(name="Show Base Read Inspector", default=True)
+    base_read_show_info: bpy.props.BoolProperty(name="Show Base Read Info", default=False)
     base_read_present_collapse: bpy.props.BoolProperty(name="Show Present Linked", default=False)
     base_read_available_collapse: bpy.props.BoolProperty(name="Show Available Defaults", default=False)
     base_read_declared_collapse: bpy.props.BoolProperty(name="Show Declared Unsupported", default=False)

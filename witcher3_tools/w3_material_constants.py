@@ -131,7 +131,7 @@ TODO_params = ['Pattern_Array', 'Pattern_Mixer', 'Pattern_Index', 'Pattern_Offse
 	'Pattern_Roughness_Influence', 'Pattern_Color1', 'Pattern_Color2', 'Pattern_Color3'
 	]
 
-IGNORED_PARAMS = ['DetailRange']
+IGNORED_PARAMS = []
 # IGNORED_PARAMS.extend(TODO_params)
 
 import os

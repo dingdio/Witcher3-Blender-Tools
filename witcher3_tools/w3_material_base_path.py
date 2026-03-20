@@ -10,7 +10,7 @@ from .w3_material import (
     get_active_witcher_group_node,
     node_tree_inputs_new,
 )
-from .w3_material_constants import PARAM_ORDER
+from .w3_material_constants import IGNORED_PARAMS, PARAM_ORDER
 from .w3_material_reader import (
     collect_material_chain,
     read_declared_graph_params,
@@ -62,6 +62,7 @@ def _build_inventory_entry(
         message: str = "",
     ) -> Dict[str, Any]:
     is_supported = bool(param_type in SUPPORTED_BASE_MATERIAL_PARAM_TYPES)
+    is_ignored = bool(name in IGNORED_PARAMS)
     input_pin = find_group_input_socket(node_ng, name) if node_ng else None
     has_matching_socket = bool(input_pin)
     is_linked = bool(input_pin and len(input_pin.links) != 0)
@@ -76,6 +77,11 @@ def _build_inventory_entry(
         can_create = False
         if not message:
             message = "Already linked on the active shader group."
+    elif is_ignored:
+        status = "ignored_info"
+        can_create = False
+        if not message:
+            message = "Ignored by the current material node builder."
     elif not material_ready:
         status = "available_to_create" if is_supported else "declared_only_info"
         can_create = False
