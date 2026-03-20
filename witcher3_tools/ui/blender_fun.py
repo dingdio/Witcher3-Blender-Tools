@@ -75,6 +75,21 @@ def GetDDSMetadata(chunk):
     ddsformat = ImageUtility.GetEFormatFromCompression(dxt)
     return DDSMetadata(width, height, mipcount, ddsformat)
 
+
+def _swizzle_rgba8_bytes_to_bgra(raw_bytes: bytes) -> bytes:
+    """Convert RGBA8 payload bytes to BGRA8 for legacy DDS A8R8G8B8 masks."""
+    if not raw_bytes:
+        return raw_bytes
+
+    src = memoryview(raw_bytes)
+    out = bytearray(len(raw_bytes))
+    for i in range(0, len(raw_bytes), 4):
+        out[i + 0] = src[i + 2]
+        out[i + 1] = src[i + 1]
+        out[i + 2] = src[i + 0]
+        out[i + 3] = src[i + 3]
+    return bytes(out)
+
 def convert_xbm_to_dds(fdir):
     import os
     f = open(fdir,"rb")
@@ -199,17 +214,18 @@ def convert_xbm_to_dds(fdir):
                         output_stream:bStream = bStream(path = dds_path)
                         output_stream.decoder = 'ISO-8859-1'
                         DDSUtils.GenerateAndWriteHeader(output_stream, metadata)
-                        
+
                         if is_cooked:
-                            output_stream.write(chunk.CBitmapTexture.Residentmip.val)
+                            payload = chunk.CBitmapTexture.Residentmip.val
                         else:
                             if len(chunk.CBitmapTexture.Mipdata.bufferData) <= 0:
                                 return None
-                            bytesource = b''
-                            for buff in chunk.CBitmapTexture.Mipdata.bufferData:
-                                bytesource = bytesource + buff.Mip.Bytes
-                            output_stream.write(bytesource)
-                        
+                            payload = b''.join(buff.Mip.Bytes for buff in chunk.CBitmapTexture.Mipdata.bufferData)
+
+                        if metadata.format == EFormat.R8G8B8A8_UNORM:
+                            payload = _swizzle_rgba8_bytes_to_bgra(payload)
+                        output_stream.write(payload)
+
                         output_stream.close()
                     #load texture cache object
                     #use object to lookup key
@@ -229,17 +245,18 @@ def convert_xbm_to_dds(fdir):
                     new.seek(0x54) #84
                     new.write(dxt)
                     new.seek(128)
-                    
+
                     if is_cooked:
-                        new.write(chunk.CBitmapTexture.Residentmip.val)
+                        payload = chunk.CBitmapTexture.Residentmip.val
                     else:
                         if len(chunk.CBitmapTexture.Mipdata.bufferData) <= 0:
                             return None
-                        bytesource = b''
-                        for buff in chunk.CBitmapTexture.Mipdata.bufferData:
-                            bytesource = bytesource + buff.Mip.Bytes
-                        new.write(bytesource)
-                    
+                        payload = b''.join(buff.Mip.Bytes for buff in chunk.CBitmapTexture.Mipdata.bufferData)
+
+                    if metadata.format == EFormat.R8G8B8A8_UNORM:
+                        payload = _swizzle_rgba8_bytes_to_bgra(payload)
+                    new.write(payload)
+
                     new.close()
                 
                 

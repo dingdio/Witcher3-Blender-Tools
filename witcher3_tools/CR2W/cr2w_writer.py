@@ -39,6 +39,13 @@ def write_w2cutscene(cr2w, file_path):
         f.write(data)
 
 
+def write_xbm(cr2w, file_path):
+    _ensure_parent_dir(file_path)
+    data = _build_cr2w_bytes(cr2w)
+    with open(file_path, "wb") as f:
+        f.write(data)
+
+
 def _build_cr2w_bytes(cr2w):
     names, imports = _collect_names_and_imports(cr2w)
     name_to_index = {name: idx for idx, name in enumerate(names)}
@@ -526,6 +533,9 @@ def _encode_chunk(chunk, name_to_index, import_index):
         params = getattr(chunk.CMaterialInstance, "InstanceParameters", None)
         out.write(_encode_instance_parameters(params, name_to_index, import_index))
 
+    if hasattr(chunk, "CBitmapTexture"):
+        out.write(_encode_cbitmap_texture(chunk.CBitmapTexture))
+
     # Post-property trailing data (e.g. events on CSkeletalAnimationSetEntry)
     post = getattr(chunk, "postPropsData", None)
     if post:
@@ -736,6 +746,36 @@ def _encode_cmesh_buffers(cmesh, name_to_index):
     out.write(_encode_cbuffer_vlq_int32(getattr(cmesh, "Bonematrices", None), name_to_index))
     out.write(_encode_cbuffer_vlq_int32(getattr(cmesh, "Block3", None), name_to_index))
     out.write(_encode_cbuffer_vlq_int32(getattr(cmesh, "BoneIndecesMappingBoneIndex", None), name_to_index))
+    return out.getvalue()
+
+
+def _encode_cbitmap_texture(cbt):
+    """Encode CBitmapTexture post-property binary data.
+
+    Layout matches the reader at Types/VariousTypes.py (SMipData, CByteArray),
+    with optional trailing unk1/unk2 fields for newer writer variants.
+    """
+    out = io.BytesIO()
+    out.write(struct.pack("<I", int(getattr(getattr(cbt, "unk", None), "val", 0) or 0)))
+    out.write(struct.pack("<I", int(getattr(getattr(cbt, "MipsCount", None), "val", 0) or 0)))
+    for mip in getattr(getattr(cbt, "Mipdata", None), "bufferData", []) or []:
+        mip_bytes = getattr(getattr(mip, "Mip", None), "Bytes", None) or b""
+        out.write(struct.pack("<I", int(getattr(getattr(mip, "Width", None), "val", 0) or 0)))
+        out.write(struct.pack("<I", int(getattr(getattr(mip, "Height", None), "val", 0) or 0)))
+        out.write(struct.pack("<I", int(getattr(getattr(mip, "Blocksize", None), "val", 0) or 0)))
+        out.write(struct.pack("<I", len(mip_bytes)))
+        out.write(mip_bytes)
+    out.write(struct.pack("<I", int(getattr(getattr(cbt, "ResidentmipSize", None), "val", 0) or 0)))
+
+    unk1 = getattr(getattr(cbt, "unk1", None), "val", None)
+    unk2 = getattr(getattr(cbt, "unk2", None), "val", None)
+    if unk1 is not None or unk2 is not None:
+        out.write(struct.pack("<H", int(unk1 or 0)))
+        out.write(struct.pack("<H", int(unk2 or 0)))
+
+    resident = getattr(getattr(cbt, "Residentmip", None), "val", None)
+    if resident is not None:
+        out.write(resident)
     return out.getvalue()
 
 
