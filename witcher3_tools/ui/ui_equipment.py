@@ -1463,19 +1463,39 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
         if seen_template_keys.intersection(current_template_keys):
             continue
 
-        # Determine attachment type for parenting decisions
+        # Bound items follow their own equip slot when defined. Only no-slot
+        # bound items should use the skinning attachment path.
+        attrs = {}
         attachment_type = ""
+        bound_equip_slot = ""
         try:
             attrs = _lookup_item_attributes(bound_name, source_game)
             if not attrs and template and template != bound_name:
                 attrs = _lookup_item_attributes(template, source_game)
             attachment_type = attrs.get("attachment_type", "")
+            bound_equip_slot = attrs.get("equip_slot", "")
         except Exception:
+            attrs = {}
             attachment_type = ""
+            bound_equip_slot = ""
 
-        # Create a visible group for non-skinning bound items
+        bound_slot_empty = None
+        if bound_equip_slot:
+            bound_slot_empty = find_slot_empty(rig_settings.entity_name, bound_equip_slot, armature)
+            if not bound_slot_empty and slot_empty and slot_empty.get("witcher_slot_name") == bound_equip_slot:
+                bound_slot_empty = slot_empty
+            if not bound_slot_empty:
+                log.warning(
+                    f"Bound item '{bound_name}' requested slot '{bound_equip_slot}' but no slot empty was found"
+                )
+
+        use_skinning_attachment = bool(
+            not bound_equip_slot and attachment_type == "skinning" and target_armature
+        )
+
+        # Create a visible group only for generic non-slot, non-skinning bound items.
         bound_group = None
-        if attachment_type != "skinning":
+        if not bound_slot_empty and not use_skinning_attachment:
             bpy.ops.object.empty_add(type="PLAIN_AXES", radius=0.5)
             bound_group = bpy.context.object
             bound_group.name = f"{bound_name}_bound" if bound_name else "bound_item"
@@ -1520,7 +1540,11 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
             obj["witcher_bound_item_name"] = bound_name
 
         # Apply parenting/attachment rules
-        if attachment_type == "skinning" and target_armature:
+        roots = [obj for obj in new_objects if obj.parent not in new_objects]
+        if bound_slot_empty:
+            for root in roots:
+                mount_equipment_to_slot(root, bound_slot_empty, armature, snap=True)
+        elif use_skinning_attachment:
             # Keep bound item hierarchy intact: parent its root armature(s) to target armature
             root_armatures = [obj for obj in new_objects
                               if obj.type == 'ARMATURE' and (obj.parent is None or obj.parent not in new_objects)]
@@ -1541,7 +1565,6 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
                 _bind_objects_to_armature(new_objects, target_armature)
         elif bound_group:
             # Parent root objects under the bound group
-            roots = [obj for obj in new_objects if obj.parent not in new_objects]
             for root in roots:
                 root.parent = bound_group
 
