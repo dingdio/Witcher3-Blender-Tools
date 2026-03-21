@@ -1346,7 +1346,13 @@ class WITCH_OT_xbm(bpy.types.Operator, ImportHelper):
         ext = file_helpers.getFilenameType(fdir)
         if ext == ".xbm":
             dds_path = convert_xbm_to_dds(fdir)
-            bpy_image_load_safe(dds_path, check_existing=True)
+            image = bpy_image_load_safe(dds_path, check_existing=True)
+            try:
+                from ..ui.ui_texture_export import apply_texture_image_metadata
+
+                apply_texture_image_metadata(context, image, fdir)
+            except Exception:
+                log.exception("Failed to seed image metadata from imported XBM: %s", fdir)
                     
         else:
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")

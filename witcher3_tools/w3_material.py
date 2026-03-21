@@ -60,6 +60,19 @@ def _sanitize_xml_attr(value, fallback: str = "") -> str:
     clean = _strip_invalid_xml_chars(value).strip()
     return clean if clean else fallback
 
+
+def _apply_image_texture_metadata(image: Optional[Image], source_path: str) -> None:
+    if image is None or not source_path:
+        return
+
+    try:
+        from .ui.ui_texture_export import apply_texture_image_metadata
+
+        apply_texture_image_metadata(bpy.context, image, source_path)
+    except Exception:
+        log.exception("Failed to seed image metadata from texture source: %s", source_path)
+
+
 def repo_file_mat(filepath: str):
     if filepath.endswith(get_tex_ext(bpy.context)):
         modded_texture = os.path.join(get_modded_texture_path(bpy.context), filepath)
@@ -1566,6 +1579,8 @@ def load_texture(
 
     if tex_path.lower().endswith('.dds'):
         img.alpha_mode = 'CHANNEL_PACKED'
+
+    _apply_image_texture_metadata(img, tex_path)
 
     return img
 

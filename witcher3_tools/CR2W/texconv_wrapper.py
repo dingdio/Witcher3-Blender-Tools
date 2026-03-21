@@ -97,13 +97,57 @@ def convert_dds_to_png(dds_path, output_dir=None, verbose=False):
                         input_path=dds_path, output_ext='png')
 
 
-def _run_texconv(dll, args, verbose=False, output_dir='.', input_path='', output_ext='tga'):
+def convert_to_dds(
+    input_path,
+    dds_fmt,
+    output_dir=None,
+    *,
+    no_mip=False,
+    image_filter="LINEAR",
+    verbose=False,
+    allow_slow_codec=False,
+):
+    """Convert an image or DDS file to a DDS with the requested DXGI format."""
+    dll = _load_dll()
+
+    if output_dir is None:
+        output_dir = os.path.dirname(input_path)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    args = ['-f', str(dds_fmt)]
+    if no_mip:
+        args += ['-m', '1']
+    if image_filter and image_filter != "LINEAR":
+        args += ['-if', str(image_filter)]
+    args += ['-y', '-o', output_dir, '--', os.path.normpath(input_path)]
+
+    return _run_texconv(
+        dll,
+        args,
+        verbose=verbose,
+        output_dir=output_dir,
+        input_path=input_path,
+        output_ext='dds',
+        allow_slow_codec=allow_slow_codec,
+    )
+
+
+def _run_texconv(
+    dll,
+    args,
+    verbose=False,
+    output_dir='.',
+    input_path='',
+    output_ext='tga',
+    allow_slow_codec=False,
+):
     """Execute texconv with the given arguments."""
     args_p = [ctypes.c_wchar_p(arg) for arg in args]
     args_p = (ctypes.c_wchar_p * len(args_p))(*args_p)
     err_buf = ctypes.create_unicode_buffer(512)
 
-    result = dll.texconv(len(args), args_p, verbose, False, False, err_buf, 512)
+    result = dll.texconv(len(args), args_p, verbose, False, allow_slow_codec, err_buf, 512)
     if result != 0:
         raise RuntimeError(f"texconv failed: {err_buf.value}")
 

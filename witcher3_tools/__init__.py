@@ -342,6 +342,7 @@ from .ui import ui_voice
 from .ui import ui_mimics
 from .ui import ui_re_anims
 from .ui import ui_anims_list
+from .ui import ui_texture_export
 from .ui import ui_import_menu
 from .ui import ui_scene
 from .ui import armature_context
@@ -3004,6 +3005,7 @@ def register():
     ui_entity.register()
     ui_material.register()
     ui_morphs.register()
+    ui_texture_export.register()
     ui_import_menu.register()
     #ui_map.register()
     ui_anims.register()
@@ -3076,6 +3078,7 @@ def unregister():
     for cls in _classes:
         unregister_class(cls)
     ui_import_menu.unregister()
+    ui_texture_export.unregister()
     #ui_map.unregister()
     ui_scene.unregister()
     ui_speech.unregister()

@@ -175,7 +175,7 @@ class WITCH_MT_MenuExport(bpy.types.Menu):
         layout.operator(WITCH_OT_ExportW2AnimJson.bl_idname, text="Animation (.w2anims)", icon='ARMATURE_DATA')
         layout.separator()
         layout.operator(WITCH_OT_xbm_export.bl_idname, text="Texture (.xbm)", icon='IMAGE_DATA')
-        layout.operator(WITCH_OT_dds_convert.bl_idname, text="Convert DDS to Editable", icon='FILE_REFRESH')
+        layout.operator(WITCH_OT_dds_convert.bl_idname, text="Convert DDS to TGA", icon='FILE_REFRESH')
 
 def menu_export(self, context):
     self.layout.menu(WITCH_MT_MenuExport.bl_idname, **_witcher_menu_icon_kwargs())
@@ -198,8 +198,6 @@ classes = (
     WITCH_OT_apx,
     WITCH_OT_nxs,
     WITCH_OT_srt,
-    WITCH_OT_xbm_export,
-    WITCH_OT_dds_convert,
     WITCH_MT_Menu,
     WITCH_MT_MenuExport,
     WITCH_MT_Menu_witcher_2
