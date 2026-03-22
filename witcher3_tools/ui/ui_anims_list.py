@@ -28,7 +28,13 @@ def _resolve_main_armature(context, main_arm_obj=None):
         except Exception:
             pass
         return main_arm_obj
-    return get_main_armature(context, prefer_active=True, remember=True, fallback=True)
+    return get_main_armature(
+        context,
+        prefer_active=True,
+        remember=True,
+        fallback=True,
+        allow_auxiliary_active=True,
+    )
 
 
 _QUICK_ANIM_FILTER_CACHE = {}

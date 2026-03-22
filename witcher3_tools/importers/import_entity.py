@@ -512,6 +512,75 @@ def _coerce_engine_transform(value):
         return None
 
 
+def _get_entity_static_mesh_chunks(entity):
+    static_meshes = getattr(entity, "staticMeshes", None)
+    if static_meshes is None:
+        return []
+    if isinstance(static_meshes, dict):
+        return static_meshes.get("chunks", []) or []
+    return getattr(static_meshes, "chunks", []) or []
+
+
+def _get_import_root_objects(objects):
+    imported_objects = [obj for obj in (objects or []) if obj is not None]
+    if not imported_objects:
+        return []
+    imported_ids = {id(obj) for obj in imported_objects}
+    roots = [
+        obj for obj in imported_objects
+        if obj.parent is None or id(obj.parent) not in imported_ids
+    ]
+    return roots or imported_objects
+
+
+def _apply_chunk_transform_to_import_roots(chunk, *, armatures=None, meshes=None):
+    rt = _coerce_engine_transform(chunk.get("transform"))
+    if rt is None:
+        return
+
+    armatures = [obj for obj in (armatures or []) if obj is not None]
+    meshes = [obj for obj in (meshes or []) if obj is not None]
+    target_objects = armatures if armatures else meshes
+    if not target_objects:
+        return
+
+    no_rotation = not bool(armatures)
+    for obj in _get_import_root_objects(target_objects):
+        set_blender_object_transform(obj, rt, rotate_180=False, no_rotation=no_rotation)
+
+
+def import_direct_entity_file(filename, load_face_poses=False, import_apperance=0, parent_transform=None):
+    _, ext = os.path.splitext(str(filename or ""))
+    if ext.lower() == ".json":
+        log.info("Importing entity via common importer (JSON): %s", filename)
+        return import_ent_template(filename, load_face_poses, import_apperance, parent_transform)
+
+    before_objects = set(bpy.data.objects)
+    try:
+        log.info("Importing entity via common importer: %s", filename)
+        result = import_ent_template(filename, load_face_poses, import_apperance, parent_transform)
+    except Exception:
+        if set(bpy.data.objects) != before_objects:
+            raise
+        log.warning("Common importer failed for %s with no imported objects; falling back to legacy importer.", filename, exc_info=True)
+        result = None
+    else:
+        if result is not None:
+            return result
+        if set(bpy.data.objects) != before_objects:
+            log.info("Keeping common-import result for %s despite missing main armature return value.", filename)
+            return result
+        log.info("Common importer produced no objects for %s; falling back to legacy importer.", filename)
+
+    from ..CR2W import CR2W_reader
+    from ..importers import import_w2l
+
+    log.info("Importing entity via legacy importer fallback: %s", filename)
+    legacy_entity = CR2W_reader.load_entity(filename)
+    import_w2l.btn_import_w2ent(legacy_entity)
+    return None
+
+
 def _load_entity_state_from_json(rig_settings):
     raw_json = getattr(rig_settings, "jsonData", "") or ""
     if not raw_json:
@@ -643,7 +712,6 @@ def _try_import_armature_from_item_appearances(entity, parent_transform=None):
 
 def import_ent_template(filename, load_face_poses = False, import_apperance = 0, parent_transform = None):
     clear_template_cache()
-    app_idx = import_apperance - 1
     context = bpy.context
     entity = test_load_entity(filename)
     #entity = fixed_chunk_paths(entity, entity.version)
@@ -673,84 +741,22 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
     set_main_armature(context.scene, main_arm_obj)
     main_arm_obj["_w3_entity_import_in_progress"] = True
     try:
-        source_roots = _build_entity_source_roots(filename)
-        main_arm_obj["_w3_source_roots_json"] = json.dumps(source_roots)
-    except Exception:
-        pass
-    try:
-        rig_settings = main_arm_obj.data.witcherui_RigSettings
-        cache_rig_entity_state(rig_settings, entity, update_json=True)
+        entity_state = _build_entity_armature_state(
+            entity,
+            filename=filename,
+            import_apperance=import_apperance,
+        )
+        rig_settings = initialize_entity_armature_state(
+            main_arm_obj,
+            entity,
+            update_json=True,
+            entity_state=entity_state,
+        )
 
-        # Set entity_name early so equipment/inventory loading can use it
-        rig_settings.entity_name = Path(filename).stem
-        if get_uncook_path(context) in filename:
-            rig_settings.repo_path = filename.replace(get_uncook_path(context)+"\\", '')
-        else:
-            rig_settings.repo_path = filename
-        try:
-            rig_settings.main_entity_skeleton = entity.MovingPhysicalAgentComponent.skeleton
-        except Exception:
-            rig_settings.main_entity_skeleton = ""
-
-        treeList = rig_settings.app_list
-        treeList.clear()
-        base_chunks = []
-        if isinstance(entity.staticMeshes, dict):
-            base_chunks = entity.staticMeshes.get('chunks', []) or []
-        elif entity.staticMeshes is not None:
-            try:
-                base_chunks = entity.staticMeshes.get('chunks', []) or []
-            except Exception:
-                base_chunks = []
-        base_mesh_count = sum(1 for c in base_chunks if c and c.get('mesh'))
-
-        if entity.appearances:
-            if app_idx >= len(entity.appearances):
-                app_idx = len(entity.appearances) - 1
-                log.warning(
-                    f"Requested appearance index out of range; clamped to {app_idx + 1} "
-                    f"(available: {len(entity.appearances)})"
-                )
-            if app_idx == -1 and base_mesh_count == 0:
-                app_idx = 0
-                msg = "[Witcher Tools] No base mesh chunks found; auto-importing first appearance (index 1)."
-                log.info(msg)
-
-            for idx, node in enumerate(entity.appearances):
-                item = NewListItem(treeList, node)
-                if idx == app_idx:
-                    rig_settings.app_list_index = app_idx
-                    import_from_list_item(context, item)
-        if treeList:
-            rig_settings.app_list_index = 0 if app_idx == -1 else app_idx
-        else:
-            rig_settings.app_list_index = -1
-
-        #Find the first (and only?) CMimicComponent and use it to import face animations
-        for ent in entity.appearances:
-            for template in ent.includedTemplates:
-                for chunk in template['chunks']:
-                    if chunk['type'] == "CMimicComponent" and 'mimicFace' in chunk:
-                        rig_settings.main_face_skeleton = chunk['mimicFace']
-                        break
-        animset_list = rig_settings.animset_list
-        animset_list.clear()
-        for animsetset in entity.CAnimAnimsetsParam:
-            NewAnimsetListItem(animset_list, animsetset['name']+":", animsetset['name'])
-            for path in animsetset['animationSets']:
-                NewAnimsetListItem(animset_list, path, animsetset['name'])
-        # CAnimMimicParam: face/mimic animation sets.
-        # Binary parsing gives a flat list [{name, animationSets}].
-        # JSON cache gives a nested list [[{name, animationSets}]]; unwrap first level.
-        mimic_param = getattr(entity, 'CAnimMimicParam', []) or []
-        if mimic_param:
-            mimic_sets = mimic_param[0] if isinstance(mimic_param[0], list) else mimic_param
-            for mimic_set in mimic_sets:
-                if isinstance(mimic_set, dict):
-                    set_name = mimic_set.get('name', 'MimicSets')
-                    NewAnimsetListItem(animset_list, f"{set_name} (Mimic):", set_name)
-                    for path in mimic_set.get('animationSets', []):
-                        NewAnimsetListItem(animset_list, path, set_name)
+        app_idx = -1 if entity_state is None else int(entity_state.get("app_idx", -1))
+        if rig_settings and getattr(entity, "appearances", None) and app_idx >= 0:
+            item = rig_settings.app_list[app_idx]
+            import_from_list_item(context, item)
 
         # Refresh slot constraints after all components are imported
         try:
@@ -819,6 +825,201 @@ def _build_entity_source_roots(filename: str):
         seen.add(norm)
         out.append(root)
     return out
+
+
+def _build_entity_armature_state(entity, *, filename="", import_apperance=0,
+                                 selected_appearance_name="", context=None, source_roots=None):
+    if entity is None:
+        return None
+
+    filename = str(filename or "").strip()
+    appearances = list(getattr(entity, "appearances", None) or [])
+    source_roots = list(source_roots or _build_entity_source_roots(filename))
+    selected_appearance_name = str(selected_appearance_name or "").strip()
+
+    repo_path = ""
+    if filename:
+        if not os.path.isabs(filename):
+            repo_path = filename.replace("/", "\\")
+        else:
+            ctx = context or bpy.context
+            try:
+                uncook_path = str(get_uncook_path(ctx) or "").strip()
+            except Exception:
+                uncook_path = ""
+            if uncook_path:
+                try:
+                    rel_path = os.path.relpath(os.path.normpath(filename), os.path.normpath(uncook_path))
+                    if rel_path and not rel_path.startswith(".."):
+                        repo_path = rel_path.replace("/", "\\")
+                except Exception:
+                    pass
+            if not repo_path:
+                repo_path = os.path.normpath(filename)
+
+    main_entity_skeleton = str(getattr(getattr(entity, "MovingPhysicalAgentComponent", None), "skeleton", "") or "").strip()
+    if not main_entity_skeleton:
+        for chunk in _get_entity_static_mesh_chunks(entity):
+            candidate = str(_get_entry_attr(chunk, "skeleton", "") or "").strip()
+            if candidate:
+                main_entity_skeleton = candidate
+                break
+
+    main_face_skeleton = ""
+    for appearance in appearances:
+        for template in getattr(appearance, "includedTemplates", None) or []:
+            for chunk in _get_entry_attr(template, "chunks", []) or []:
+                if str(_get_entry_attr(chunk, "type", "") or "").strip() != "CMimicComponent":
+                    continue
+                candidate = str(_get_entry_attr(chunk, "mimicFace", "") or "").strip()
+                if candidate:
+                    main_face_skeleton = candidate
+                    break
+            if main_face_skeleton:
+                break
+        if main_face_skeleton:
+            break
+
+    app_idx = -1
+    if appearances:
+        if selected_appearance_name and selected_appearance_name != "__default__":
+            for idx, appearance in enumerate(appearances):
+                if str(getattr(appearance, "name", "") or "") == selected_appearance_name:
+                    app_idx = idx
+                    break
+
+        if app_idx == -1:
+            app_idx = int(import_apperance or 0) - 1
+            if app_idx >= len(appearances):
+                app_idx = len(appearances) - 1
+                log.warning(
+                    f"Requested appearance index out of range; clamped to {app_idx + 1} "
+                    f"(available: {len(appearances)})"
+                )
+
+        base_mesh_count = sum(1 for chunk in _get_entity_static_mesh_chunks(entity) if _get_entry_attr(chunk, "mesh"))
+        if app_idx == -1 and base_mesh_count == 0:
+            app_idx = 0
+            if not selected_appearance_name:
+                log.info("[Witcher Tools] No base mesh chunks found; auto-importing first appearance (index 1).")
+
+        if 0 <= app_idx < len(appearances):
+            selected_appearance_name = str(getattr(appearances[app_idx], "name", "") or "")
+
+    return {
+        "source_roots": source_roots,
+        "entity_name": str(getattr(entity, "name", "") or "").strip() or Path(str(filename or "")).stem,
+        "repo_path": repo_path,
+        "main_entity_skeleton": main_entity_skeleton,
+        "main_face_skeleton": main_face_skeleton,
+        "appearances": appearances,
+        "app_idx": app_idx,
+        "selected_appearance_name": selected_appearance_name,
+    }
+
+
+def initialize_entity_armature_state(armature_obj, entity, *, filename="", import_apperance=0,
+                                     selected_appearance_name="", update_json=True,
+                                     context_role="primary", entity_state=None):
+    if armature_obj is None or entity is None:
+        return None
+    if getattr(armature_obj, "type", "") != "ARMATURE":
+        return None
+
+    if entity_state is None:
+        entity_state = _build_entity_armature_state(
+            entity,
+            filename=filename,
+            import_apperance=import_apperance,
+            selected_appearance_name=selected_appearance_name,
+        )
+    if entity_state is None:
+        return None
+
+    source_roots = list(entity_state.get("source_roots", []) or [])
+    try:
+        armature_obj["_w3_source_roots_json"] = json.dumps(source_roots or [])
+    except Exception:
+        pass
+    try:
+        armature_obj["_w3_entity_context_role"] = str(context_role or "primary")
+    except Exception:
+        pass
+
+    rig_settings = getattr(armature_obj.data, "witcherui_RigSettings", None)
+    if rig_settings is None:
+        return None
+
+    added_import_guard = False
+    if not armature_obj.get("_w3_entity_import_in_progress", False):
+        armature_obj["_w3_entity_import_in_progress"] = True
+        added_import_guard = True
+
+    try:
+        cache_rig_entity_state(rig_settings, entity, update_json=update_json)
+
+        rig_settings.entity_name = entity_state.get("entity_name") or Path(str(filename or armature_obj.name)).stem
+        rig_settings.repo_path = entity_state.get("repo_path", "")
+        rig_settings.main_entity_skeleton = entity_state.get("main_entity_skeleton", "")
+        rig_settings.main_face_skeleton = entity_state.get("main_face_skeleton", "")
+
+        app_idx = int(entity_state.get("app_idx", -1))
+        appearances = entity_state.get("appearances", []) or []
+
+        tree_list = rig_settings.app_list
+        tree_list.clear()
+        for node in appearances:
+            NewListItem(tree_list, node)
+        if tree_list:
+            rig_settings.app_list_index = 0 if app_idx == -1 else app_idx
+        else:
+            rig_settings.app_list_index = -1
+
+        animset_list = rig_settings.animset_list
+        animset_list.clear()
+        for group_name, paths in _collect_armature_animset_groups(entity, armature_obj):
+            NewAnimsetListItem(animset_list, f"{group_name}:", group_name)
+            for path in paths:
+                NewAnimsetListItem(animset_list, path, group_name)
+        return rig_settings
+    finally:
+        if added_import_guard:
+            try:
+                del armature_obj["_w3_entity_import_in_progress"]
+            except Exception:
+                pass
+
+
+def initialize_imported_entity_armatures(objects, entity, *, filename="", import_apperance=0,
+                                         selected_appearance_name="", update_json=True, root_only=True,
+                                         context_role="primary"):
+    imported_objects = [obj for obj in (objects or []) if obj is not None]
+    if not imported_objects or entity is None:
+        return []
+
+    source_objects = _get_import_root_objects(imported_objects) if root_only else imported_objects
+    armatures = [obj for obj in source_objects if getattr(obj, "type", "") == "ARMATURE"]
+    if not armatures and root_only:
+        armatures = [obj for obj in imported_objects if getattr(obj, "type", "") == "ARMATURE"]
+
+    entity_state = _build_entity_armature_state(
+        entity,
+        filename=filename,
+        import_apperance=import_apperance,
+        selected_appearance_name=selected_appearance_name,
+    )
+    initialized = []
+    for armature_obj in armatures:
+        rig_settings = initialize_entity_armature_state(
+            armature_obj,
+            entity,
+            update_json=update_json,
+            context_role=context_role,
+            entity_state=entity_state,
+        )
+        if rig_settings is not None:
+            initialized.append(armature_obj)
+    return initialized
 
 
 def _get_armature_source_roots(armature):
@@ -1113,6 +1314,150 @@ def _get_entry_attr(entry, key, default=None):
     if isinstance(entry, dict):
         return entry.get(key, default)
     return getattr(entry, key, default)
+
+
+def _normalize_animset_paths(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = [value]
+
+    out = []
+    seen = set()
+    for candidate in values:
+        path = ""
+        if isinstance(candidate, str):
+            path = candidate
+        elif isinstance(candidate, dict):
+            path = candidate.get("path") or candidate.get("DepotPath") or candidate.get("depotPath") or candidate.get("_depotPath") or candidate.get("_value") or ""
+        else:
+            path = getattr(candidate, "path", None) or getattr(candidate, "DepotPath", None) or getattr(candidate, "depotPath", None) or ""
+        path = str(path or "").strip().replace("/", "\\")
+        if not path:
+            continue
+        if path.lower().endswith(".json"):
+            path = path[:-5]
+        if not path.lower().endswith(".w2anims"):
+            continue
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _iter_entity_anim_components(entity):
+    moving_component = _get_entry_attr(entity, "MovingPhysicalAgentComponent", None)
+    if moving_component is not None:
+        yield moving_component
+
+    for chunk in _get_entity_static_mesh_chunks(entity):
+        if chunk is not None:
+            yield chunk
+
+    for appearance in _get_entry_attr(entity, "appearances", []) or []:
+        for template in _get_entry_attr(appearance, "includedTemplates", []) or []:
+            for chunk in _get_entry_attr(template, "chunks", []) or []:
+                if chunk is not None:
+                    yield chunk
+
+
+def _find_anim_component_for_armature(entity, armature_obj):
+    component_name = str(getattr(armature_obj, "get", lambda *_args, **_kwargs: "")("witcher_name", "") or "").strip()
+    component_type = str(getattr(armature_obj, "get", lambda *_args, **_kwargs: "")("witcher_type", "") or "").strip()
+    candidates = []
+    for chunk in _iter_entity_anim_components(entity):
+        chunk_type = str(_get_entry_attr(chunk, "type", "") or "").strip()
+        if chunk_type not in {"CMovingPhysicalAgentComponent", "CAnimatedComponent", "CAnimDangleBufferComponent", "CMimicComponent"}:
+            continue
+        candidates.append(chunk)
+
+    if component_name:
+        for chunk in candidates:
+            if str(_get_entry_attr(chunk, "name", "") or "").strip() == component_name:
+                return chunk
+
+    if component_type:
+        for chunk in candidates:
+            if str(_get_entry_attr(chunk, "type", "") or "").strip() == component_type:
+                return chunk
+
+    moving_component = _get_entry_attr(entity, "MovingPhysicalAgentComponent", None)
+    if moving_component is not None:
+        return moving_component
+
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _collect_armature_animset_groups(entity, armature_obj):
+    groups = []
+    group_lookup = {}
+    try:
+        component_name = str(armature_obj.get("witcher_name", "") or "").strip()
+    except Exception:
+        component_name = ""
+    try:
+        component_type = str(armature_obj.get("witcher_type", "") or "").strip()
+    except Exception:
+        component_type = ""
+
+    def _add_group(raw_name, paths):
+        animset_paths = _normalize_animset_paths(paths)
+        if not animset_paths:
+            return
+        group_name = str(raw_name or "").strip() or "AnimSets"
+        group_paths = group_lookup.get(group_name)
+        if group_paths is None:
+            group_paths = []
+            group_lookup[group_name] = group_paths
+            groups.append((group_name, group_paths))
+        seen = {path.lower() for path in group_paths}
+        for path in animset_paths:
+            key = path.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            group_paths.append(path)
+
+    component_chunk = _find_anim_component_for_armature(entity, armature_obj)
+    if component_chunk is not None and component_type != "CMimicComponent":
+        component_group_name = str(_get_entry_attr(component_chunk, "name", "") or "").strip()
+        if not component_group_name:
+            chunk_type = str(_get_entry_attr(component_chunk, "type", "") or "").strip()
+            component_group_name = "Main" if chunk_type == "CMovingPhysicalAgentComponent" else (chunk_type or "AnimSets")
+        _add_group(component_group_name, _get_entry_attr(component_chunk, "animationSets", []))
+
+    matched_param = False
+    saw_scoped_param = False
+    animset_params = getattr(entity, "CAnimAnimsetsParam", []) or []
+    for animset_param in animset_params:
+        param_component_name = str(_get_entry_attr(animset_param, "componentName", "") or "").strip()
+        if param_component_name:
+            saw_scoped_param = True
+        if component_name and param_component_name != component_name:
+            continue
+        if not component_name and param_component_name:
+            continue
+        _add_group(_get_entry_attr(animset_param, "name", "AnimSets"), _get_entry_attr(animset_param, "animationSets", []))
+        matched_param = True
+
+    if not matched_param and not saw_scoped_param and component_type != "CMimicComponent":
+        for animset_param in animset_params:
+            _add_group(_get_entry_attr(animset_param, "name", "AnimSets"), _get_entry_attr(animset_param, "animationSets", []))
+
+    if component_type == "CMimicComponent":
+        for mimic_set in getattr(entity, "CAnimMimicParam", []) or []:
+            _add_group(f"{_get_entry_attr(mimic_set, 'name', 'MimicSets')} (Mimic)", _get_entry_attr(mimic_set, "animationSets", []))
+
+    return [(group_name, paths) for group_name, paths in groups if paths]
+
 
 def _get_inventory_item_name(entry):
     item_raw = _get_entry_attr(entry, "item", "") or ""
@@ -1878,11 +2223,8 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                         chunk_name = chunk.get('name', '')
                         if any(_is_shadowmesh_name(candidate) for candidate in (mesh.name, chunk_name, mesh_path)):
                             _force_shadowmesh_hidden(mesh)
-                        
-                if 'transform' in chunk and chunk['transform']:
-                    rt = _coerce_engine_transform(chunk['transform'])
-                    if rt is not None:
-                        set_blender_object_transform(mesh, rt, rotate_180=False, no_rotation=True)
+
+                _apply_chunk_transform_to_import_roots(chunk, armatures=armatures, meshes=meshes)
 
         # Handle cloth resources
         if "resource" in chunk and not import_redcloth_enabled:
@@ -2041,6 +2383,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 objdict[chunk_ns] = moving_agent
                 root_skeleton = moving_agent
                 has_moving_agent = True
+                _apply_chunk_transform_to_import_roots(chunk, armatures=[moving_agent])
         elif "skeleton" in chunk and chunk['skeleton'] is not None:
             root_bone = import_rig.import_w3_rig(
                 repo_file(chunk['skeleton'], entity.version),
@@ -2050,6 +2393,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             objdict[chunk_ns] = root_bone
             if not has_moving_agent:
                 root_skeleton = root_bone
+            _apply_chunk_transform_to_import_roots(chunk, armatures=[root_bone])
 
         # Handle dynamic rigs
         if "dyng" in chunk and chunk['dyng'] is not None:
@@ -2059,6 +2403,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             )
             add_chunk_metadata(root_bone, chunk, chunk['dyng'])
             objdict[chunk_ns] = root_bone
+            _apply_chunk_transform_to_import_roots(chunk, armatures=[root_bone])
 
         # Handle mimic face
         if "mimicFace" in chunk:
@@ -2070,6 +2415,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             objdict.update({chunk_ns: root_bone})
             objdict[entity.name]['mimicFace'] = root_bone.name
             objdict[entity.name]['mimicFaceFile'] = chunk['mimicFace']
+            _apply_chunk_transform_to_import_roots(chunk, armatures=[root_bone])
 
         # Handle camera
         if chunk['type'] == "CCameraComponent":
@@ -2320,9 +2666,10 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None):
     do_constraints(constrains, objdict, meshdict, HardAttachments)
 
     if parent_transform:
-        root_skeleton.parent = parent_transform
+        if root_skeleton:
+            root_skeleton.parent = parent_transform
         for mesh in list(objdict.values()) + list(meshdict.values()):
-            if mesh.parent == None:
+            if mesh and getattr(mesh, "parent", None) is None:
                 mesh.parent = parent_transform
     return root_skeleton
 

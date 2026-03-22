@@ -27,7 +27,13 @@ import bpy
 
 
 def _find_character_armature(context):
-    return get_main_armature(context, prefer_active=True, remember=True, fallback=True)
+    return get_main_armature(
+        context,
+        prefer_active=True,
+        remember=True,
+        fallback=True,
+        allow_auxiliary_active=True,
+    )
 
 
 def _format_action_source_label(source):
@@ -722,17 +728,20 @@ def apply_root_orientation(armature_obj):
     if action is None:
         return False
 
+    pose_bones = armature_obj.pose.bones
+    if "Root" not in pose_bones:
+        log.warning("Auto Orient Root skipped: no 'Root' bone found in armature")
+        return False
+    if "Reference" not in pose_bones:
+        log.info("Auto Orient Root skipped: no 'Reference' bone found in armature")
+        return False
+
     # Check if already applied - don't apply twice
     if action.get("root_orientation_applied", False):
         log.info(f"Root orientation already applied to {action.name}")
         return True
 
-    # Find the Root bone
-    if "Root" not in armature_obj.pose.bones:
-        log.warning("No 'Root' bone found in armature")
-        return False
-
-    root_bone = armature_obj.pose.bones["Root"]
+    root_bone = pose_bones["Root"]
 
     # Step 1: Remove ALL fcurves for Root bone (rotation, location, scale)
     root_data_paths = [
@@ -825,6 +834,9 @@ class WITCH_OT_ApplyRootOrientation(bpy.types.Operator):
     def poll(cls, context):
         obj = context.active_object
         if not obj or obj.type != 'ARMATURE' or not obj.animation_data:
+            return False
+        pose_bones = getattr(getattr(obj, "pose", None), "bones", None)
+        if pose_bones is None or "Root" not in pose_bones or "Reference" not in pose_bones:
             return False
         # Allow if there's an active action OR NLA tracks with strips
         if obj.animation_data.action:

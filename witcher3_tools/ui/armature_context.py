@@ -38,9 +38,24 @@ def get_rig_settings(armature_obj):
     return getattr(armature_obj.data, "witcherui_RigSettings", None)
 
 
-def armature_has_character_data(armature_obj):
+def armature_entity_context_role(armature_obj):
+    if not is_armature_object(armature_obj):
+        return ""
+    try:
+        return str(armature_obj.get("_w3_entity_context_role", "") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def armature_is_auxiliary_entity(armature_obj):
+    return armature_entity_context_role(armature_obj) == "auxiliary"
+
+
+def armature_has_character_data(armature_obj, include_auxiliary=True):
     rig_settings = get_rig_settings(armature_obj)
     if rig_settings is None:
+        return False
+    if not include_auxiliary and armature_is_auxiliary_entity(armature_obj):
         return False
     if getattr(rig_settings, "main_entity_skeleton", ""):
         return True
@@ -152,7 +167,7 @@ def _pick_auto_candidate(scene):
     if not armatures:
         return None
 
-    character_armatures = [obj for obj in armatures if armature_has_character_data(obj)]
+    character_armatures = [obj for obj in armatures if armature_has_character_data(obj, include_auxiliary=False)]
     if len(character_armatures) == 1:
         return character_armatures[0]
     if len(character_armatures) > 1:
@@ -163,7 +178,7 @@ def _pick_auto_candidate(scene):
     return None
 
 
-def get_main_armature(context, prefer_active=True, remember=True, fallback=True):
+def get_main_armature(context, prefer_active=True, remember=True, fallback=True, allow_auxiliary_active=False):
     if context is None:
         return None
     scene = getattr(context, "scene", None)
@@ -174,9 +189,13 @@ def get_main_armature(context, prefer_active=True, remember=True, fallback=True)
 
     active_obj = getattr(context, "object", None) or getattr(context, "active_object", None)
     if prefer_active and is_armature_in_scene(scene, active_obj):
-        if armature_has_character_data(active_obj) or stored is None:
-            if remember:
+        active_has_main_data = armature_has_character_data(active_obj, include_auxiliary=False)
+        active_has_any_data = armature_has_character_data(active_obj, include_auxiliary=True)
+        if active_has_main_data or stored is None:
+            if remember and not armature_is_auxiliary_entity(active_obj):
                 set_main_armature(scene, active_obj)
+            return active_obj
+        if allow_auxiliary_active and active_has_any_data and armature_is_auxiliary_entity(active_obj):
             return active_obj
 
     if stored is not None:
@@ -188,7 +207,7 @@ def get_main_armature(context, prefer_active=True, remember=True, fallback=True)
     selected_objects = getattr(context, "selected_objects", []) or []
     for obj in selected_objects:
         if is_armature_in_scene(scene, obj):
-            if remember:
+            if remember and not armature_is_auxiliary_entity(obj):
                 set_main_armature(scene, obj)
             return obj
 
@@ -301,7 +320,7 @@ def _sync_main_armature_from_active(context=None):
     _last_scene_ptr = scene_ptr
     _last_active_ptr = active_ptr
 
-    if is_armature_in_scene(scene, active_obj) and armature_has_character_data(active_obj):
+    if is_armature_in_scene(scene, active_obj) and armature_has_character_data(active_obj, include_auxiliary=False):
         set_main_armature(scene, active_obj)
 
 

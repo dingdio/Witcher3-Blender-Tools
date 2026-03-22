@@ -973,10 +973,20 @@ class CMimicComponent(JsonChunk):
 
 class CAnimatedComponent(JsonChunk):
     """docstring for CAnimatedComponent."""
-    def __init__(self, name:str, skeleton:str):
+    def __init__(self, *args, name:str = "", skeleton:str = ""):
         super(CAnimatedComponent, self).__init__()
+        self.transform = None #Type="EngineTransform"
+        self.transformParent = None #Type="ptr:CHardAttachment"
+        self.guid = None #Type="CGUID"
         self.name = name
         self.skeleton = skeleton
+        if args:
+            w3_types.loadProps(self, args)
+
+    def convert_for_io(self):
+        self.transformParent = self.transformParent.Value-1 if self.transformParent else None
+        self.transform = self.transform.EngineTransform if self.transform else None
+        return self
 
 class CAnimDangleComponent(JsonChunk):
     """docstring for CAnimDangleComponent."""
@@ -1523,7 +1533,10 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
         if not streamed_component.mesh:
             streamed_component.mesh = _next_mesh_import_path()
         if streamed_component.mesh:
-            return _append_unique_chunk(owner_chunk, streamed_component)
+            appended = _append_unique_chunk(owner_chunk, streamed_component)
+            if appended:
+                new_mesh.chunks[-1].type = streamed_type or new_mesh.chunks[-1].type
+            return appended
 
         log.warning(
             f"Skipping {owner_chunk.Type} with invalid streamed mesh ref: {owner_chunk.ChunkIndex}; "
@@ -1972,14 +1985,17 @@ def create_CEntity(file, _inherit_visited=None):
                 log.info(f"Added inventory definition (direct) with {len(inv_def.entries) if inv_def.entries else 0} entries")
 
     for chunk in CHUNKS:
-        if((chunk.Type == "CEntityTemplate" and chunk.GetVariableByName("appearances")) or chunk.Type == "CEntityExternalAppearance"):
+        if chunk.Type in {"CEntityTemplate", "CEntityExternalAppearance"}:
             slots = chunk.GetVariableByName("slots")
             if slots:
                 for slot in _iter_struct_items(slots):
                     currentSlot = w3_types.EntitySlot(False, slot)
                     currentSlot.transform = currentSlot.transform.EngineTransform if currentSlot.transform else None
                     this_Entity.slots.append(currentSlot)
-            
+
+            if chunk.Type != "CEntityExternalAppearance" and not chunk.GetVariableByName("appearances"):
+                continue
+
             if chunk.Type == "CEntityExternalAppearance":
                 appearances = [chunk.GetVariableByName("appearance")]
             else:
@@ -2128,8 +2144,10 @@ def create_CEntity(file, _inherit_visited=None):
                                 f"props={_chunk_props_summary(chunk)}"
                             )
                     elif (chunk.Type == "CAnimatedComponent"):
+                        animated_component = CAnimatedComponent(chunk).convert_for_io()
                         name = chunk.GetVariableByName("name").ToString()
                         skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig")
+                        animation_sets = _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims")
                         if not skeleton:
                             # Component may be an override chunk that stores only
                             # non-skeleton properties (e.g. transform). Fall back to
@@ -2142,7 +2160,10 @@ def create_CEntity(file, _inherit_visited=None):
                                     f"property; using import-table fallback: {skeleton}"
                                 )
                         entity_animated_component_chunk_index = chunk.ChunkIndex
-                        chunk_append(new_mesh, chunk, CAnimatedComponent(name, skeleton), added_chunks)
+                        animated_component.name = name or animated_component.name
+                        animated_component.skeleton = skeleton
+                        animated_component.animationSets = animation_sets
+                        chunk_append(new_mesh, chunk, animated_component, added_chunks)
                     elif (chunk.Type == "CCameraComponent"):
                         name = chunk.GetVariableByName("name").ToString()
                         chunk_append(new_mesh, chunk, CCameraComponent(name), added_chunks)
@@ -2164,6 +2185,7 @@ def create_CEntity(file, _inherit_visited=None):
                                     mc.mesh = _next_mesh_import_path()
                                 if mc.mesh and mc.mesh not in seen_streamed_mesh_paths:
                                     chunk_append(new_mesh, entity_chunk, mc, added_chunks)
+                                    new_mesh.chunks[-1].type = buf_chunk.Type
                                     seen_streamed_mesh_paths.add(mc.mesh)
                                     log.debug(
                                         'Extracted CMeshComponent from streamingDataBuffer of %s #%s: %s',
@@ -2208,14 +2230,18 @@ def create_CEntity(file, _inherit_visited=None):
         elif(chunk.name == "CMovingPhysicalAgentComponent" and chunk.GetVariableByName("skeleton")):
             name = chunk.GetVariableByName("name").ToString()
             skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig")
-            chunk_append(new_mesh, chunk, w3_types.CMovingPhysicalAgentComponent(skeleton, name))
+            moving_component = w3_types.CMovingPhysicalAgentComponent(skeleton, name)
+            moving_component.animationSets = _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims")
+            chunk_append(new_mesh, chunk, moving_component)
             hasCMovingPhysicalAgentComponent = True;
             this_Entity.MovingPhysicalAgentComponent= new_mesh.chunks[-1]
         elif(chunk.name == "CAnimAnimsetsParam"):
             if chunk.GetVariableByName("animationSets"):
-                this_Entity.CAnimAnimsetsParam.append({ 'name': chunk.GetVariableByName("name").ToString(),
-                                            'animationSets':_resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims")
-                                           })
+                this_Entity.CAnimAnimsetsParam.append({
+                    'name': chunk.GetVariableByName("name").ToString(),
+                    'componentName': chunk.GetVariableByName("componentName").ToString() if chunk.GetVariableByName("componentName") else "",
+                    'animationSets': _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims"),
+                })
         elif(chunk.name == "CAnimMimicParam"):
             if chunk.GetVariableByName("animationSets"):
                 this_Entity.CAnimMimicParam.append({ 'name': "MimicSets",
@@ -2347,10 +2373,23 @@ def create_CEntity(file, _inherit_visited=None):
                         name = sub_chunk.GetVariableByName("name").ToString()
                         skeleton = _resolve_repo_path(sub_chunk, "skeleton", ".w2rig")
                         chunk_append(new_mesh, sub_chunk, CAnimDangleBufferComponent(name, skeleton))
-                    elif sub_chunk.Type == "CAnimatedComponent" and sub_chunk.GetVariableByName("skeleton"):
+                    elif sub_chunk.Type == "CAnimatedComponent":
+                        animated_component = CAnimatedComponent(sub_chunk).convert_for_io()
                         name = sub_chunk.GetVariableByName("name").ToString()
                         skeleton = _resolve_repo_path(sub_chunk, "skeleton", ".w2rig")
-                        chunk_append(new_mesh, sub_chunk, CAnimatedComponent(name, skeleton))
+                        animation_sets = _resolve_repo_paths_from_array(sub_chunk, "animationSets", ".w2anims")
+                        if not skeleton:
+                            rig_paths = _collect_rig_import_paths(file)
+                            if rig_paths:
+                                skeleton = rig_paths[0]
+                                log.debug(
+                                    f"CAnimatedComponent #{sub_chunk.ChunkIndex} has no skeleton "
+                                    f"property; using import-table fallback: {skeleton}"
+                                )
+                        animated_component.name = name or animated_component.name
+                        animated_component.skeleton = skeleton
+                        animated_component.animationSets = animation_sets
+                        chunk_append(new_mesh, sub_chunk, animated_component)
                     elif sub_chunk.Type in _STREAMED_ITEM_CHUNK_TYPES:
                         # Cooked item entities (Crossbow, CWitcherSword, etc.) store their
                         # mesh component inside a SharedDataBuffer (streamingDataBuffer) rather

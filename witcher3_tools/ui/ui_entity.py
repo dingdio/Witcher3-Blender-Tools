@@ -633,24 +633,29 @@ class WITCH_OT_w2ent(bpy.types.Operator, ImportHelper):
     """Load Witcher 3 Entity File"""
     bl_idname = "witcher.import_w2ent"
     bl_label = "Import .w2ent"
-    filename_ext = ".w2ent, flyr"
+    filename_ext = ".w2ent"
+    filter_glob: StringProperty(default='*.w2ent;*.w2ent.json', options={'HIDDEN'})
+
     def execute(self, context):
         log.debug("importing entity")
         fdir = self.filepath
-        if os.path.isdir(fdir):
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        ext = file_helpers.getFilenameType(fdir)
-        if ext == ".flyr":
-            foliage = CR2W.CR2W_reader.load_foliage(fdir)
-            import_w2l.btn_import_w2ent(foliage)
-        elif ext == ".w2ent":
-            entity = CR2W.CR2W_reader.load_entity(fdir)
-            import_w2l.btn_import_w2ent(entity)
-        else:
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        return {'FINISHED'}
+        with mod_loading_context(context):
+            if os.path.isdir(fdir):
+                self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+                return {'CANCELLED'}
+            ext = file_helpers.getFilenameType(fdir)
+            if ext == ".w2ent" or fdir.endswith(".json"):
+                import_entity.import_direct_entity_file(
+                    fdir,
+                    load_face_poses=False,
+                    import_apperance=0,
+                    parent_transform=None,
+                )
+            else:
+                self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+                return {'CANCELLED'}
+            return {'FINISHED'}
+
     def invoke(self, context, event):
         UNCOOK_PATH = os.path.join(get_uncook_path(context),"items\\")
         if os.path.exists(UNCOOK_PATH):
