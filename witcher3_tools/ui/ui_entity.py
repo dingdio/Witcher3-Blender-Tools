@@ -1215,16 +1215,10 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
                         fdir = fdir + '.json'
                     if "_mimic_" in fdir:
                         skel = (rig_settings.main_face_skeleton or "").strip()
-                        if not skel:
-                            self.report({'ERROR'}, "No face skeleton set for this character. Check Character > Info > Face Skeleton.")
-                            return {'CANCELLED'}
-                        import_anims.start_import(context, fdir, rigPath=_repo_file(skel))
+                        import_anims.start_import(context, fdir, rigPath=_repo_file(skel) if skel else None)
                     else:
                         skel = (rig_settings.main_entity_skeleton or "").strip()
-                        if not skel:
-                            self.report({'ERROR'}, "No body skeleton set for this character. Check Character > Info > Entity Skeleton.")
-                            return {'CANCELLED'}
-                        import_anims.start_import(context, fdir, rigPath=_repo_file(skel))
+                        import_anims.start_import(context, fdir, rigPath=_repo_file(skel) if skel else None)
 
             if "load" == action:
                 log.debug("load appearance")

@@ -236,12 +236,15 @@ def _on_item_appearance_changed(self, context):
 
 class EquipmentSlotEntry(bpy.types.PropertyGroup):
     """Persistent equipment slot stored on the armature. Survives Blender restarts."""
+    source_game: StringProperty(name="Source Game", default="w3")
     category: StringProperty(name="Category", default="")
     item_name: StringProperty(name="Item Name", default="")
     equip_template: StringProperty(name="Equip Template", default="")
     base_equip_template: StringProperty(name="Base Equip Template", default="")
+    resolved_repo_path: StringProperty(name="Resolved Repo Path", default="")
     equip_guid: StringProperty(name="Equip GUID", default="")
     is_inventory: BoolProperty(name="Is Inventory", default=False)
+    keep_across_appearances: BoolProperty(name="Keep Across Appearances", default=False)
     equip_slot: StringProperty(name="Equip Slot", default="")
     hold_slot: StringProperty(name="Hold Slot", default="")
     weapon: BoolProperty(name="Weapon", default=False)

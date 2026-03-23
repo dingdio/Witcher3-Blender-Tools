@@ -518,6 +518,33 @@ def _convert_mesh_value(mesh_prop):
         return None
     return _normalize_repo_path_value(mesh_value, ".w2mesh")
 
+def _convert_color_value(color_prop):
+    if not color_prop:
+        return None
+    if isinstance(color_prop, dict):
+        return {
+            key: color_prop.get(key)
+            for key in ("Red", "Green", "Blue", "Alpha")
+            if key in color_prop
+        }
+
+    prop_items = getattr(color_prop, "MoreProps", None) or getattr(color_prop, "More", None) or []
+    color = {}
+    for item in prop_items:
+        key = getattr(item, "theName", None)
+        value = getattr(item, "Value", None)
+        if key in ("Red", "Green", "Blue", "Alpha"):
+            color[key] = value
+
+    if color:
+        return color
+
+    for key in ("Red", "Green", "Blue", "Alpha"):
+        value = getattr(color_prop, key, None)
+        if value is not None:
+            color[key] = value
+    return color or color_prop
+
 def _class_name_from_import(cr2w_file, imp):
     class_name = getattr(imp, "className", None)
     if isinstance(class_name, int):
@@ -1095,6 +1122,33 @@ class CCameraComponent(JsonChunk):
         self.name = name
         self.transformParent = None #<ptr:CHardAttachment>
 
+class CPointLightComponent(JsonChunk):
+    def __init__(self, *args, **kwargs):
+        super(CPointLightComponent, self).__init__()
+        self.transform = None
+        self.transformParent = None
+        self.name = None
+        self.radius = None
+        self.color = None
+        self.brightness = None
+        w3_types.loadProps(self, args)
+
+    def convert_for_io(self):
+        self.transformParent = self.transformParent.Value-1 if self.transformParent else None
+        self.transform = self.transform.EngineTransform if self.transform else None
+        self.color = _convert_color_value(self.color)
+        return self
+
+class CSpotLightComponent(CPointLightComponent):
+    def __init__(self, *args, **kwargs):
+        super(CSpotLightComponent, self).__init__(*args, **kwargs)
+        self.innerAngle = None
+        self.outerAngle = None
+        self.shadowCastingMode = None
+        self.shadowFadeDistance = None
+        self.lightFlickering = None
+        w3_types.loadProps(self, args)
+
 entity_type_dict = {
     "CMeshComponent": CMeshComponent,
     "CClothComponent": CClothComponent,
@@ -1109,7 +1163,9 @@ entity_type_dict = {
     "CAnimatedComponent": CAnimatedComponent,
     "CHardAttachment": CHardAttachment,
     "CSkeletonBoneSlot": CSkeletonBoneSlot,
-    "CCameraComponent": CCameraComponent
+    "CCameraComponent": CCameraComponent,
+    "CPointLightComponent": CPointLightComponent,
+    "CSpotLightComponent": CSpotLightComponent,
 }
 
 CAnimDangleConstraint_types = {
@@ -1130,6 +1186,46 @@ def _mesh_chunk_signature(chunk):
         getattr(chunk, "mesh", None),
         getattr(chunk, "resource", None),
         getattr(chunk, "mimicFace", None),
+        getattr(chunk, "guid", None),
+        getattr(chunk, "transformParent", None),
+        _transform_signature(getattr(chunk, "transform", None)),
+    )
+
+def _transform_signature(transform):
+    if not transform:
+        return None
+    keys = ("X", "Y", "Z", "Yaw", "Pitch", "Roll", "Scale_x", "Scale_y", "Scale_z")
+    if isinstance(transform, dict):
+        return tuple(transform.get(key) for key in keys)
+    return tuple(getattr(transform, key, None) for key in keys)
+
+def _color_signature(color):
+    if not color:
+        return None
+    if isinstance(color, dict):
+        return tuple(color.get(key) for key in ("Red", "Green", "Blue", "Alpha"))
+    return tuple(getattr(color, key, None) for key in ("Red", "Green", "Blue", "Alpha"))
+
+def _light_chunk_signature(chunk):
+    return (
+        getattr(chunk, "type", None),
+        getattr(chunk, "name", None),
+        getattr(chunk, "brightness", None),
+        getattr(chunk, "radius", None),
+        getattr(chunk, "innerAngle", None),
+        getattr(chunk, "outerAngle", None),
+        _color_signature(getattr(chunk, "color", None)),
+        _transform_signature(getattr(chunk, "transform", None)),
+    )
+
+def _animated_chunk_signature(chunk):
+    return (
+        getattr(chunk, "type", None),
+        getattr(chunk, "name", None),
+        getattr(chunk, "skeleton", None),
+        tuple(getattr(chunk, "animationSets", None) or []),
+        getattr(chunk, "transformParent", None),
+        _transform_signature(getattr(chunk, "transform", None)),
     )
 
 
@@ -1468,6 +1564,8 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
     mesh_import_cursor = 0
     streamed_component_cache = {"resolved": False, "chunk": None}
     seen_mesh_signatures = set()
+    seen_light_signatures = set()
+    seen_animated_signatures = set()
 
     def _next_mesh_import_path():
         nonlocal mesh_import_cursor
@@ -1477,12 +1575,34 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
             return path
         return None
 
-    def _append_unique_chunk(source_chunk, converted_chunk):
+    def _append_unique_chunk(source_chunk, converted_chunk, added_chunks=None):
+        converted_chunk.type = getattr(source_chunk, "Type", getattr(converted_chunk, "type", None))
+        converted_chunk.chunkIndex = getattr(source_chunk, "ChunkIndex", getattr(converted_chunk, "chunkIndex", 0))
         signature = _mesh_chunk_signature(converted_chunk)
         if signature in seen_mesh_signatures:
             return False
         seen_mesh_signatures.add(signature)
-        chunk_append(new_mesh, source_chunk, converted_chunk)
+        chunk_append(new_mesh, source_chunk, converted_chunk, added_chunks)
+        return True
+
+    def _append_unique_light_chunk(source_chunk, converted_chunk, added_chunks=None):
+        converted_chunk.type = getattr(source_chunk, "Type", getattr(converted_chunk, "type", None))
+        converted_chunk.chunkIndex = getattr(source_chunk, "ChunkIndex", getattr(converted_chunk, "chunkIndex", 0))
+        signature = _light_chunk_signature(converted_chunk)
+        if signature in seen_light_signatures:
+            return False
+        seen_light_signatures.add(signature)
+        chunk_append(new_mesh, source_chunk, converted_chunk, added_chunks)
+        return True
+
+    def _append_unique_animated_chunk(source_chunk, converted_chunk, added_chunks=None):
+        converted_chunk.type = getattr(source_chunk, "Type", getattr(converted_chunk, "type", None))
+        converted_chunk.chunkIndex = getattr(source_chunk, "ChunkIndex", getattr(converted_chunk, "chunkIndex", 0))
+        signature = _animated_chunk_signature(converted_chunk)
+        if signature in seen_animated_signatures:
+            return False
+        seen_animated_signatures.add(signature)
+        chunk_append(new_mesh, source_chunk, converted_chunk, added_chunks)
         return True
 
     def _get_streamed_component_chunk():
@@ -1686,6 +1806,9 @@ def create_CEntity(file, _inherit_visited=None):
     new_mesh = ModelEnt("staticMeshes", "staticMeshes")
     added_chunks = set()  # Track chunk indices already added to avoid duplicates
     seen_streamed_mesh_paths = set()  # Track mesh paths already added via streamingDataBuffer to avoid duplicates
+    seen_mesh_signatures = set()
+    seen_light_signatures = set()
+    seen_animated_signatures = set()
     this_Entity.CAnimAnimsetsParam = []
     this_Entity.CAnimMimicParam = []
     mesh_import_paths = _collect_mesh_import_paths(file)
@@ -1710,6 +1833,36 @@ def create_CEntity(file, _inherit_visited=None):
             mesh_import_cursor += 1
             return path
         return None
+
+    def _append_unique_chunk(source_chunk, converted_chunk, added_chunks=None):
+        converted_chunk.type = getattr(source_chunk, "Type", getattr(converted_chunk, "type", None))
+        converted_chunk.chunkIndex = getattr(source_chunk, "ChunkIndex", getattr(converted_chunk, "chunkIndex", 0))
+        signature = _mesh_chunk_signature(converted_chunk)
+        if signature in seen_mesh_signatures:
+            return False
+        seen_mesh_signatures.add(signature)
+        chunk_append(new_mesh, source_chunk, converted_chunk, added_chunks)
+        return True
+
+    def _append_unique_light_chunk(source_chunk, converted_chunk, added_chunks=None):
+        converted_chunk.type = getattr(source_chunk, "Type", getattr(converted_chunk, "type", None))
+        converted_chunk.chunkIndex = getattr(source_chunk, "ChunkIndex", getattr(converted_chunk, "chunkIndex", 0))
+        signature = _light_chunk_signature(converted_chunk)
+        if signature in seen_light_signatures:
+            return False
+        seen_light_signatures.add(signature)
+        chunk_append(new_mesh, source_chunk, converted_chunk, added_chunks)
+        return True
+
+    def _append_unique_animated_chunk(source_chunk, converted_chunk, added_chunks=None):
+        converted_chunk.type = getattr(source_chunk, "Type", getattr(converted_chunk, "type", None))
+        converted_chunk.chunkIndex = getattr(source_chunk, "ChunkIndex", getattr(converted_chunk, "chunkIndex", 0))
+        signature = _animated_chunk_signature(converted_chunk)
+        if signature in seen_animated_signatures:
+            return False
+        seen_animated_signatures.add(signature)
+        chunk_append(new_mesh, source_chunk, converted_chunk, added_chunks)
+        return True
 
     def _coloring_entry_key(entry):
         if isinstance(entry, dict):
@@ -2101,7 +2254,7 @@ def create_CEntity(file, _inherit_visited=None):
                         if not static_mesh_component.mesh:
                             static_mesh_component.mesh = _next_mesh_import_path()
                         if static_mesh_component.mesh:
-                            chunk_append(new_mesh, chunk, static_mesh_component, added_chunks)
+                            _append_unique_chunk(chunk, static_mesh_component, added_chunks)
                         else:
                             log.warning(
                                 f"Skipping CStaticMeshComponent with invalid mesh ref: {chunk.ChunkIndex}; "
@@ -2113,7 +2266,7 @@ def create_CEntity(file, _inherit_visited=None):
                         if not mesh_component.mesh:
                             mesh_component.mesh = _next_mesh_import_path()
                         if mesh_component.mesh:
-                            chunk_append(new_mesh, chunk, mesh_component, added_chunks)
+                            _append_unique_chunk(chunk, mesh_component, added_chunks)
                         else:
                             log.warning(
                                 f"Skipping CMeshComponent with invalid mesh ref: {chunk.ChunkIndex}; "
@@ -2125,7 +2278,7 @@ def create_CEntity(file, _inherit_visited=None):
                         if not mesh_component.mesh:
                             mesh_component.mesh = _next_mesh_import_path()
                         if mesh_component.mesh:
-                            chunk_append(new_mesh, chunk, mesh_component, added_chunks)
+                            _append_unique_chunk(chunk, mesh_component, added_chunks)
                         else:
                             log.warning(
                                 f"Skipping {chunk.Type} with invalid mesh ref: {chunk.ChunkIndex}; "
@@ -2137,12 +2290,16 @@ def create_CEntity(file, _inherit_visited=None):
                         if not fur_component.mesh:
                             fur_component.mesh = _next_mesh_import_path()
                         if fur_component.mesh:
-                            chunk_append(new_mesh, chunk, fur_component, added_chunks)
+                            _append_unique_chunk(chunk, fur_component, added_chunks)
                         else:
                             log.warning(
                                 f"Skipping CFurComponent with invalid mesh ref: {chunk.ChunkIndex}; "
                                 f"props={_chunk_props_summary(chunk)}"
                             )
+                    elif chunk.Type == "CPointLightComponent":
+                        _append_unique_light_chunk(chunk, CPointLightComponent(chunk).convert_for_io(), added_chunks)
+                    elif chunk.Type == "CSpotLightComponent":
+                        _append_unique_light_chunk(chunk, CSpotLightComponent(chunk).convert_for_io(), added_chunks)
                     elif (chunk.Type == "CAnimatedComponent"):
                         animated_component = CAnimatedComponent(chunk).convert_for_io()
                         name = chunk.GetVariableByName("name").ToString()
@@ -2163,7 +2320,7 @@ def create_CEntity(file, _inherit_visited=None):
                         animated_component.name = name or animated_component.name
                         animated_component.skeleton = skeleton
                         animated_component.animationSets = animation_sets
-                        chunk_append(new_mesh, chunk, animated_component, added_chunks)
+                        _append_unique_animated_chunk(chunk, animated_component, added_chunks)
                     elif (chunk.Type == "CCameraComponent"):
                         name = chunk.GetVariableByName("name").ToString()
                         chunk_append(new_mesh, chunk, CCameraComponent(name), added_chunks)
@@ -2259,10 +2416,22 @@ def create_CEntity(file, _inherit_visited=None):
             if not mc.mesh:
                 mc.mesh = _next_mesh_import_path()
             if mc.mesh:
-                chunk_append(new_mesh, chunk, mc, added_chunks)
+                _append_unique_chunk(chunk, mc, added_chunks)
             else:
                 log.warning(
                     f"Skipping top-level CMeshComponent with invalid mesh ref at chunk {chunk.ChunkIndex}; "
+                    f"props={_chunk_props_summary(chunk)}"
+                )
+        elif (chunk.Type == "CRigidMeshComponent" or chunk.Type == "CRagdollMeshComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
+            mc = CMeshComponent(chunk).convert_for_io()
+            mc.mesh = _resolve_mesh_path(chunk, mc.mesh)
+            if not mc.mesh:
+                mc.mesh = _next_mesh_import_path()
+            if mc.mesh:
+                _append_unique_chunk(chunk, mc, added_chunks)
+            else:
+                log.warning(
+                    f"Skipping top-level {chunk.Type} with invalid mesh ref at chunk {chunk.ChunkIndex}; "
                     f"props={_chunk_props_summary(chunk)}"
                 )
         elif (chunk.Type == "CClothComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
@@ -2276,12 +2445,33 @@ def create_CEntity(file, _inherit_visited=None):
                 if not fur_component.mesh:
                     fur_component.mesh = _next_mesh_import_path()
                 if fur_component.mesh:
-                    chunk_append(new_mesh, chunk, fur_component, added_chunks)
+                    _append_unique_chunk(chunk, fur_component, added_chunks)
                 else:
                     log.warning(
                         f"Skipping top-level CFurComponent with invalid mesh ref: {chunk.ChunkIndex}; "
                         f"props={_chunk_props_summary(chunk)}"
                     )
+        elif (chunk.Type == "CPointLightComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
+            _append_unique_light_chunk(chunk, CPointLightComponent(chunk).convert_for_io(), added_chunks)
+        elif (chunk.Type == "CSpotLightComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
+            _append_unique_light_chunk(chunk, CSpotLightComponent(chunk).convert_for_io(), added_chunks)
+        elif (chunk.Type == "CAnimatedComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
+            animated_component = CAnimatedComponent(chunk).convert_for_io()
+            name = chunk.GetVariableByName("name").ToString()
+            skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig")
+            animation_sets = _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims")
+            if not skeleton:
+                rig_paths = _collect_rig_import_paths(file)
+                if rig_paths:
+                    skeleton = rig_paths[0]
+                    log.debug(
+                        f"CAnimatedComponent #{chunk.ChunkIndex} has no skeleton "
+                        f"property; using import-table fallback: {skeleton}"
+                    )
+            animated_component.name = name or animated_component.name
+            animated_component.skeleton = skeleton
+            animated_component.animationSets = animation_sets
+            _append_unique_animated_chunk(chunk, animated_component, added_chunks)
         elif (chunk.Type == "CMorphedMeshComponent"):
             morphTarget = _resolve_repo_path(chunk, "morphTarget", ".w2mesh")
             morphSource = _resolve_repo_path(chunk, "morphSource", ".w2mesh")
@@ -2348,10 +2538,22 @@ def create_CEntity(file, _inherit_visited=None):
                         if not mesh_component.mesh:
                             mesh_component.mesh = _next_mesh_import_path()
                         if mesh_component.mesh and mesh_component.mesh not in seen_streamed_mesh_paths:
-                            chunk_append(new_mesh, sub_chunk, mesh_component)
+                            _append_unique_chunk(sub_chunk, mesh_component)
                         elif not mesh_component.mesh:
                             log.warning(
                                 f"Skipping flatCompiledData CMeshComponent with invalid mesh ref: {sub_chunk.ChunkIndex}; "
+                                f"props={_chunk_props_summary(sub_chunk)}"
+                            )
+                    elif sub_chunk.Type == "CRigidMeshComponent" or sub_chunk.Type == "CRagdollMeshComponent":
+                        mesh_component = CMeshComponent(sub_chunk).convert_for_io()
+                        mesh_component.mesh = _resolve_mesh_path(sub_chunk, mesh_component.mesh)
+                        if not mesh_component.mesh:
+                            mesh_component.mesh = _next_mesh_import_path()
+                        if mesh_component.mesh:
+                            _append_unique_chunk(sub_chunk, mesh_component)
+                        else:
+                            log.warning(
+                                f"Skipping flatCompiledData {sub_chunk.Type} with invalid mesh ref: {sub_chunk.ChunkIndex}; "
                                 f"props={_chunk_props_summary(sub_chunk)}"
                             )
                     elif sub_chunk.Type == "CFurComponent" and sub_chunk.GetVariableByName("mesh"):
@@ -2360,7 +2562,7 @@ def create_CEntity(file, _inherit_visited=None):
                         if not fur_component.mesh:
                             fur_component.mesh = _next_mesh_import_path()
                         if fur_component.mesh:
-                            chunk_append(new_mesh, sub_chunk, fur_component)
+                            _append_unique_chunk(sub_chunk, fur_component)
                         else:
                             log.warning(
                                 f"Skipping flatCompiledData CFurComponent with invalid mesh ref: {sub_chunk.ChunkIndex}; "
@@ -2389,7 +2591,11 @@ def create_CEntity(file, _inherit_visited=None):
                         animated_component.name = name or animated_component.name
                         animated_component.skeleton = skeleton
                         animated_component.animationSets = animation_sets
-                        chunk_append(new_mesh, sub_chunk, animated_component)
+                        _append_unique_animated_chunk(sub_chunk, animated_component)
+                    elif sub_chunk.Type == "CPointLightComponent":
+                        _append_unique_light_chunk(sub_chunk, CPointLightComponent(sub_chunk).convert_for_io())
+                    elif sub_chunk.Type == "CSpotLightComponent":
+                        _append_unique_light_chunk(sub_chunk, CSpotLightComponent(sub_chunk).convert_for_io())
                     elif sub_chunk.Type in _STREAMED_ITEM_CHUNK_TYPES:
                         # Cooked item entities (Crossbow, CWitcherSword, etc.) store their
                         # mesh component inside a SharedDataBuffer (streamingDataBuffer) rather

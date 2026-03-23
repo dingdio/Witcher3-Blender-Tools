@@ -524,38 +524,40 @@ def _is_texture_repo_path(filepath: str) -> bool:
     ext = os.path.splitext((filepath or "").replace("/", "\\"))[1].lower()
     return ext in _TEXTURE_REPO_EXTENSIONS
 
+
+def _get_repo_roots_from_prefs(version=999):
+    use_separate_texture_path = False
+    fbx_uncook_path = ""
+    uncook_path = ""
+    texture_path = ""
+
+    prefs = _get_addon_prefs()
+    if not prefs:
+        return fbx_uncook_path, uncook_path, texture_path, use_separate_texture_path
+
+    fbx_uncook_path = prefs.fbx_uncook_path
+    uncook_path = prefs.uncook_path
+    texture_path = uncook_path
+    use_separate_texture_path = bool(getattr(prefs, "use_separate_texture_uncook_path", False))
+    if use_separate_texture_path:
+        separate_texture_path = str(getattr(prefs, "tex_uncook_path", "") or "").strip()
+        if separate_texture_path:
+            texture_path = separate_texture_path
+
+    if version <= 115:
+        fbx_uncook_path = prefs.fbx_uncook_path
+        uncook_path = prefs.witcher2_game_path + '\\data'
+        texture_path = uncook_path
+
+    return fbx_uncook_path, uncook_path, texture_path, use_separate_texture_path
+
 def repo_file(filepath: str, version = 999, is_abs_path = False):
     try:
         version = int(version)
     except Exception:
         version = 999
 
-    use_separate_texture_path = False
-    prefs = _get_addon_prefs()
-    if prefs:
-        fbx_uncook_path = prefs.fbx_uncook_path
-        uncook_path = prefs.uncook_path
-        texture_path = uncook_path
-        use_separate_texture_path = bool(getattr(prefs, "use_separate_texture_uncook_path", False))
-        if use_separate_texture_path:
-            separate_texture_path = str(getattr(prefs, "tex_uncook_path", "") or "").strip()
-            if separate_texture_path:
-                texture_path = separate_texture_path
-        
-        if version <= 115:
-            fbx_uncook_path = prefs.fbx_uncook_path
-            uncook_path = prefs.witcher2_game_path + '\\data'
-            texture_path = uncook_path
-    else:
-        fbx_uncook_path = get_dev_override("fallback_fbx_uncook_path", "")
-        uncook_path = get_dev_override("fallback_uncook_path_w3", "")
-        texture_path = get_dev_override("fallback_texture_path_w3", uncook_path)
-        if not texture_path:
-            texture_path = uncook_path
-        if version <= 115:
-            fbx_uncook_path = get_dev_override("fallback_fbx_uncook_path", fbx_uncook_path)
-            uncook_path = get_dev_override("fallback_w2_data_path", "")
-            texture_path = uncook_path
+    fbx_uncook_path, uncook_path, texture_path, use_separate_texture_path = _get_repo_roots_from_prefs(version)
 
     # Check override roots first (read-only depots/workspaces)
     if _repo_override_roots:
@@ -569,6 +571,9 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                 return candidate
 
     filepath = filepath.replace("/", "\\")
+
+    if os.path.isabs(filepath) and not is_abs_path:
+        return filepath
 
     if is_abs_path:
         for root in (texture_path, uncook_path):
@@ -596,8 +601,14 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
         extract_root = uncook_path
 
     if filepath.endswith('.fbx'):
+        if not fbx_uncook_path:
+            return filepath
         return os.path.join(fbx_uncook_path, filepath)
     else:
+        if not extract_root:
+            if is_texture_repo and texture_path:
+                return os.path.join(texture_path, filepath)
+            return filepath
         abs_filename = os.path.join(extract_root, filepath)
         if version <= 115 and not os.path.exists(win_safe_path(abs_filename)):
             templates_fallback = None
@@ -750,11 +761,7 @@ def extract_missing_buffers(abs_w2anims_path: str, required_index: int | None = 
     pass so the bundle manager is only loaded once.
     """
     extracted = set()
-    prefs = _get_addon_prefs()
-    if prefs:
-        uncook_path = prefs.uncook_path
-    else:
-        uncook_path = get_dev_override("fallback_uncook_path_w3", "")
+    _, uncook_path, _, _ = _get_repo_roots_from_prefs()
     if not uncook_path:
         return extracted
     norm_file = os.path.normcase(os.path.normpath(abs_w2anims_path))
@@ -814,11 +821,9 @@ def repo_collision_file(mesh_filepath: str) -> str:
     """
     from .witcher_cache.CollisionCache.CollisionManager import CollisionManager
 
-    prefs = _get_addon_prefs()
-    if prefs:
-        uncook_path = prefs.uncook_path
-    else:
-        uncook_path = get_dev_override("fallback_uncook_path_w3", "")
+    _, uncook_path, _, _ = _get_repo_roots_from_prefs()
+    if not uncook_path:
+        return None
 
     # Generate collision path from mesh path
     # The collision file typically has the same path but with .nxs extension
@@ -887,11 +892,9 @@ def get_collision_for_mesh(mesh_filepath: str) -> str:
     Returns:
         Path to extracted .nxs collision file, or None if not found
     """
-    prefs = _get_addon_prefs()
-    if prefs:
-        uncook_path = prefs.uncook_path
-    else:
-        uncook_path = get_dev_override("fallback_uncook_path_w3", "")
+    _, uncook_path, _, _ = _get_repo_roots_from_prefs()
+    if os.path.isabs(mesh_filepath) and not uncook_path:
+        return None
 
     # If absolute path, convert to relative
     if os.path.isabs(mesh_filepath):
