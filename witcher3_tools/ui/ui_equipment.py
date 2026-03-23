@@ -4867,32 +4867,58 @@ class EQUIPMENT_OT_InsertDefaultCategories(bpy.types.Operator):
     def execute(self, context):
         wm = context.window_manager
         temp_data = wm.witcherui_temp_data
-        equipment_entries = temp_data.equipment_entries
         source_game = _get_temp_source_game(context)
-        active_category_items, _active_item_attributes = _get_equipment_catalog(source_game)
+        active_category_items, active_item_attributes = _get_equipment_catalog(source_game)
 
-        # Clear existing entries to prevent duplicates
+        armature, rig_settings = _get_armature_and_rig_settings(context)
+        if not rig_settings:
+            self.report({'WARNING'}, "No valid armature selected.")
+            return {'CANCELLED'}
+
         _set_temp_equipment_auto_apply_suspended(context, True)
         try:
-            equipment_entries.clear()
-            
-            # Add a single entry per category
+            temp_data.equipment_entries.clear()
+            rig_settings.equipment_slots.clear()
+
             if source_game == "w2":
                 category_source = active_category_items
             else:
                 category_source = default_categories
             for category, items in category_source.items():
-                entry = equipment_entries.add()
-                entry.source_game = source_game
-                entry.category = category
-                entry.defaultItemName = items[0][0] if len(items) <= 1 else items[1][0]  # Set to "None" or first item in list as default
-                entry.equip_template = "None" if len(items) <= 1 else items[1][2]
-                
-                # Store category-specific items as dropdown options
-                # (Handled in class variable)
+                default_item_name = items[0][0] if len(items) <= 1 else items[1][0]
+                equip_template = "" if len(items) <= 1 else items[1][2]
+
+                slot = rig_settings.equipment_slots.add()
+                slot.source_game = source_game
+                slot.category = category
+                slot.item_name = default_item_name if default_item_name and default_item_name != "None" else ""
+                slot.equip_template = equip_template
+                slot.base_equip_template = equip_template
+                slot.resolved_repo_path = ""
+                slot.keep_across_appearances = False
+                try:
+                    attrs = active_item_attributes.get(default_item_name, {})
+                    if attrs:
+                        slot.equip_slot = attrs.get('equip_slot', slot.equip_slot)
+                        slot.hold_slot = attrs.get('hold_slot', slot.hold_slot)
+                        slot.weapon = attrs.get('weapon', slot.weapon)
+                        slot.attachment_type = attrs.get('attachment_type', '')
+                        try:
+                            slot.variants_json = json.dumps(attrs.get('variants', []))
+                        except Exception:
+                            slot.variants_json = ""
+                        try:
+                            slot.bound_items_json = json.dumps(attrs.get('bound_items', []))
+                        except Exception:
+                            slot.bound_items_json = ""
+                except Exception:
+                    pass
         finally:
             _set_temp_equipment_auto_apply_suspended(context, False)
 
+        sync_equipment_slots_to_temp(context, rig_settings)
+        if context.area:
+            context.area.tag_redraw()
         return {'FINISHED'}
 
 # =============================================================================
