@@ -2404,6 +2404,68 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
             op.target_level = target_level
 
 
+_IMPORT_ORIGIN_PROPS = {
+    "origin": "witcher_import_origin",
+    "source_game": "witcher_source_game",
+    "entity_path": "witcher_entity_path",
+    "item_category": "witcher_item_category",
+    "item_name": "witcher_item_name",
+    "equip_template": "witcher_equip_template",
+    "item_appearance": "witcher_item_appearance",
+    "owner_entity_path": "witcher_owner_entity_path",
+}
+
+_IMPORT_ORIGIN_LABELS = {
+    "origin": "Origin",
+    "source_game": "Source Game",
+    "entity_path": "Entity Path",
+    "item_category": "Category",
+    "item_name": "Item",
+    "equip_template": "Equip Template",
+    "item_appearance": "Item Appearance",
+    "owner_entity_path": "Owner Entity",
+}
+
+_ORIGIN_DISPLAY_NAMES = {
+    "direct_entity": "Direct Entity",
+    "equipment_slot": "Equipment Slot",
+    "template_slot": "Template Slot",
+}
+
+
+def _read_import_origin_info(obj):
+    """Read import origin metadata from an object and its parent (one level up)."""
+    if obj is None or not hasattr(obj, "get"):
+        return {}
+    info = {}
+    for source in (obj, getattr(obj, "parent", None)):
+        if source is None or not hasattr(source, "get"):
+            continue
+        for key, prop_name in _IMPORT_ORIGIN_PROPS.items():
+            if key in info:
+                continue
+            val = str(source.get(prop_name, "") or "").strip()
+            if val:
+                info[key] = val
+    return info
+
+
+def _draw_import_source_section(layout, context, obj):
+    info = _read_import_origin_info(obj)
+    col = layout.column(align=True)
+    if not info:
+        col.label(text="No import metadata found", icon='INFO')
+        return
+    for key in _IMPORT_ORIGIN_PROPS:
+        value = info.get(key, "")
+        if not value:
+            continue
+        label = _IMPORT_ORIGIN_LABELS.get(key, key)
+        if key == "origin":
+            value = _ORIGIN_DISPLAY_NAMES.get(value, value)
+        col.label(text=f"{label}: {value}")
+
+
 class WITCH_PT_Utils(WITCH_PT_Base, bpy.types.Panel):
     bl_label = "Utilities / Settings"
     bl_options = {'DEFAULT_CLOSED'}
@@ -2436,6 +2498,10 @@ class WITCH_PT_Utils(WITCH_PT_Base, bpy.types.Panel):
                     col.label(text=f"template: {template}")
                 if entity_type:
                     col.label(text=f"entity_type: {entity_type}")
+
+            body = section("witcher_utils_import_source", "Import Source", 'IMPORT')
+            if body:
+                _draw_import_source_section(body, context, ob)
 
         if coll:
             has_witcher_data = any(

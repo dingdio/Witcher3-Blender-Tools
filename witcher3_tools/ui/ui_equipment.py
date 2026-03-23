@@ -396,20 +396,11 @@ def _get_active_equipment_source_game(context):
 
 
 def _infer_source_game_from_rig_settings(rig_settings, armature=None):
-    roots = []
-    if armature:
-        try:
-            roots = import_entity._get_armature_source_roots(armature)
-        except Exception:
-            roots = []
-    if not roots and rig_settings:
-        repo_path_hint = getattr(rig_settings, "repo_path", "") or ""
-        if repo_path_hint and os.path.isabs(repo_path_hint):
-            try:
-                roots = import_entity._build_entity_source_roots(repo_path_hint)
-            except Exception:
-                roots = []
-    return "w2" if _is_w2_search(roots) else "w3"
+    if rig_settings is not None:
+        sg = str(getattr(rig_settings, "source_game", "") or "").strip().lower()
+        if sg in {"w2", "w3"}:
+            return sg
+    return "w3"
 
 
 def _get_temp_source_game(context):
@@ -428,6 +419,22 @@ def _get_temp_equipment_data(context):
         return context.window_manager.witcherui_temp_data
     except Exception:
         return None
+
+
+def _make_temp_armature_key(armature):
+    if armature is None:
+        return ""
+    try:
+        arm_ptr = int(armature.as_pointer())
+    except Exception:
+        arm_ptr = id(armature)
+    arm_name = getattr(armature, "name_full", getattr(armature, "name", ""))
+    return f"{arm_name}|{arm_ptr}"
+
+
+def _make_temp_entity_state_token(rig_settings):
+    raw_json = getattr(rig_settings, "jsonData", "") or ""
+    return f"{len(raw_json)}:{hash(raw_json)}"
 
 
 def _set_temp_equipment_auto_apply_suspended(context, suspended):
@@ -582,17 +589,42 @@ def generate_guid():
     """Generate a new UUID4 string."""
     return str(uuid.uuid4())
 
+def _is_internal_inventory_group_object(obj):
+    try:
+        return bool(obj and obj.get("witcher_inventory_group"))
+    except Exception:
+        return False
+
+
+def _clear_internal_inventory_group_state(obj):
+    if obj is None:
+        return
+    for prop_name in ("witcher_equip_guid", "witcher_bound_parent_guid", "witcher_bound_item_name"):
+        try:
+            if prop_name in obj:
+                del obj[prop_name]
+        except Exception:
+            pass
+
+
 def tag_new_objects_with_guid(before_objects, guid, prop_name="witcher_equip_guid"):
     """Find objects added since `before_objects` snapshot and tag them with a GUID."""
     after_objects = set(bpy.data.objects)
     new_objects = after_objects - before_objects
+    tagged_objects = set()
     for obj in new_objects:
+        if _is_internal_inventory_group_object(obj):
+            continue
         obj[prop_name] = guid
-    return new_objects
+        tagged_objects.add(obj)
+    return tagged_objects
 
 def find_objects_by_guid(guid, prop_name="witcher_equip_guid"):
     """Find all scene objects with the given GUID."""
-    return [obj for obj in bpy.data.objects if obj.get(prop_name) == guid]
+    return [
+        obj for obj in bpy.data.objects
+        if obj.get(prop_name) == guid and not _is_internal_inventory_group_object(obj)
+    ]
 
 def _object_parent_depth(obj):
     depth = 0
@@ -624,6 +656,8 @@ def _build_guid_index(prop_name="witcher_equip_guid"):
     """
     index = {}
     for obj in bpy.data.objects:
+        if _is_internal_inventory_group_object(obj):
+            continue
         val = obj.get(prop_name)
         if val is not None:
             index.setdefault(val, []).append(obj)
@@ -663,10 +697,15 @@ def _collect_mount_roots(objects, ignored_objects=None):
     ignored_set = {obj for obj in (ignored_objects or []) if obj is not None}
     roots = []
     for obj in object_set:
-        if obj in ignored_set or obj.get("witcher_mount_anchor"):
+        if obj in ignored_set or obj.get("witcher_mount_anchor") or _is_internal_inventory_group_object(obj):
             continue
         parent = getattr(obj, "parent", None)
-        if parent in ignored_set or parent is None or parent not in object_set:
+        if (
+            parent in ignored_set
+            or _is_internal_inventory_group_object(parent)
+            or parent is None
+            or parent not in object_set
+        ):
             roots.append(obj)
     return roots
 
@@ -774,6 +813,42 @@ def _mount_anchor_to_bone(anchor, armature, bone_name):
     anchor["witcher_mount_target_type"] = "bone"
     anchor["witcher_mount_target_name"] = bone_name
     return mounted
+
+
+def _mount_anchor_to_target(anchor, target_info, fallback_armature=None):
+    if not anchor or not target_info or not target_info.get("is_valid"):
+        return None
+    if target_info.get("target_type") == "slot" and target_info.get("slot_empty") is not None:
+        return _mount_anchor_to_slot(
+            anchor,
+            target_info.get("slot_empty"),
+            parent_armature=target_info.get("armature") or fallback_armature,
+        )
+    return _mount_anchor_to_bone(
+        anchor,
+        target_info.get("armature") or fallback_armature,
+        target_info.get("bone_name"),
+    )
+
+
+def _mount_object_to_target(equipment_obj, target_info, fallback_armature=None):
+    if not equipment_obj or not target_info or not target_info.get("is_valid"):
+        return None
+    if target_info.get("target_type") == "slot" and target_info.get("slot_empty") is not None:
+        return mount_equipment_to_slot(
+            equipment_obj,
+            target_info.get("slot_empty"),
+            target_info.get("armature") or fallback_armature,
+            snap=False,
+            preserve_local_offset=True,
+        )
+    return mount_equipment_to_bone(
+        equipment_obj,
+        target_info.get("armature") or fallback_armature,
+        target_info.get("bone_name"),
+        snap=False,
+        preserve_local_offset=True,
+    )
 
 
 def _mount_animated_roots_with_anchor(roots, guid, kind, parent_hint, *, slot_empty=None, armature=None,
@@ -973,6 +1048,19 @@ def _slot_has_active_selection(slot) -> bool:
         return True
     return False
 
+
+def _slot_persists_across_appearances(slot) -> bool:
+    if slot is None:
+        return False
+    return bool(
+        getattr(slot, "is_inventory", False)
+        or getattr(slot, "keep_across_appearances", False)
+    )
+
+
+def _slot_uses_appearance_drivers(slot) -> bool:
+    return not _slot_persists_across_appearances(slot)
+
 def _get_tags_for_slot(slot, source_game="w3"):
     tags = []
     try:
@@ -1125,8 +1213,8 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None):
         try:
             uncook_root = get_uncook_path(bpy.context)
         except Exception:
-            uncook_root = get_dev_override("fallback_uncook_path_w3", "")
-        roots_to_search = _normalize_unique_roots([uncook_root, get_dev_override("fallback_uncook_path_w3", "")] + search_roots)
+            uncook_root = ""
+        roots_to_search = _normalize_unique_roots([uncook_root] + search_roots)
 
     for rel_path in rel_candidates:
         for root in roots_to_search:
@@ -1214,6 +1302,83 @@ def _resolve_bundle_item_by_template_cached(template_name, search_roots=None, pr
     return cache[cache_key]
 
 
+def _resolve_equipment_paths_for_template(template_name, armature=None, rig_settings=None):
+    template_name = str(template_name or "").strip()
+    if not template_name or template_name.lower() == "none":
+        return "", ""
+
+    source_roots = []
+    if armature is not None:
+        source_roots = _get_armature_source_roots(armature)
+    if not source_roots and rig_settings is not None:
+        repo_path_hint = getattr(rig_settings, "repo_path", "") or ""
+        if repo_path_hint and os.path.isabs(repo_path_hint):
+            try:
+                source_roots = import_entity._build_entity_source_roots(repo_path_hint)
+            except Exception:
+                source_roots = []
+
+    final_item, export_path, _search_pattern = _resolve_bundle_item_by_template_cached(
+        template_name,
+        search_roots=source_roots,
+        prepared_context={},
+    )
+    repo_path = str(getattr(final_item, "name", "") or "").replace("/", "\\").lstrip("\\")
+    if not repo_path and export_path:
+        try:
+            from ..importers.import_mesh import get_repo_from_abs_path
+            repo_path = str(get_repo_from_abs_path(export_path) or "").replace("/", "\\").lstrip("\\")
+        except Exception:
+            repo_path = ""
+    return repo_path, export_path or ""
+
+
+def _update_entry_resolved_repo_path(entry, context=None, armature=None, rig_settings=None):
+    if entry is None:
+        return ""
+
+    if armature is None or rig_settings is None:
+        try:
+            armature, rig_settings = _get_armature_and_rig_settings(context)
+        except Exception:
+            armature, rig_settings = None, None
+
+    template_name = str(getattr(entry, "equip_template", "") or "").strip()
+    slot_repo_path = ""
+    try:
+        slot_index = int(getattr(entry, "slot_index", -1))
+    except Exception:
+        slot_index = -1
+    if rig_settings is not None and 0 <= slot_index < len(rig_settings.equipment_slots):
+        try:
+            slot = rig_settings.equipment_slots[slot_index]
+            template_name = get_effective_equip_template(slot) or template_name
+            slot_repo_path = str(getattr(slot, "resolved_repo_path", "") or "").strip()
+            slot_source_game = str(getattr(slot, "source_game", "") or "").strip()
+            if slot_source_game:
+                entry.source_game = _normalize_source_game(slot_source_game)
+        except Exception:
+            pass
+
+    try:
+        computed_repo_path, resolved_abs_path = _resolve_equipment_paths_for_template(
+            template_name,
+            armature=armature,
+            rig_settings=rig_settings,
+        )
+    except Exception:
+        computed_repo_path, resolved_abs_path = "", ""
+
+    repo_path = slot_repo_path or computed_repo_path
+
+    try:
+        entry.resolved_repo_path = repo_path
+        entry.resolved_abs_path = resolved_abs_path
+    except Exception:
+        pass
+    return repo_path
+
+
 def _get_cached_equipment_item_entity(export_path, prepared_context=None):
     if not export_path or not os.path.exists(export_path):
         return None
@@ -1272,7 +1437,8 @@ def _update_slot_coloring_json(slot, item_entity):
 
 
 def _import_item_entity(export_path, final_item_name, entity, armature, appearance, slot_index, empty_transform,
-                        use_app_drivers=True, prepared_context=None, item_appearance_name=None):
+                        use_app_drivers=True, prepared_context=None, item_appearance_name=None,
+                        attachment_profile=None, bind_root_chunks_to_entity=None):
     """Import a w2ent item (handles includedTemplates)."""
     from ..importers.import_entity import add_app_template
     ent_namespace = entity.name + ":"
@@ -1281,20 +1447,26 @@ def _import_item_entity(export_path, final_item_name, entity, armature, appearan
     imported_template_keys = set()
     imported_template_keys.update(_template_match_keys(final_item_name))
     selected_item_appearance_name = ""
-    selected_item_appearance_index = -1
+    selected_item_appearance = None
     try:
         item_entity = _get_cached_equipment_item_entity(export_path, prepared_context=prepared_context)
     except Exception:
         item_entity = None
+    if attachment_profile is None:
+        attachment_profile = import_entity.classify_equipment_attachment_profile(item_entity)
+    if bind_root_chunks_to_entity is None:
+        bind_root_chunks_to_entity = bool(
+            attachment_profile is None
+            or getattr(attachment_profile, "requires_owner_root_binding", False)
+        )
     if item_entity and hasattr(item_entity, 'appearances') and item_entity.appearances:
         selected_app = item_entity.appearances[0]
-        selected_item_appearance_index = 0
         if item_appearance_name and item_appearance_name != '__default__':
-            for idx, app in enumerate(item_entity.appearances):
+            for app in item_entity.appearances:
                 if getattr(app, 'name', '') == item_appearance_name:
                     selected_app = app
-                    selected_item_appearance_index = idx
                     break
+        selected_item_appearance = selected_app
         selected_item_appearance_name = getattr(selected_app, 'name', '') or ""
         if hasattr(selected_app, 'includedTemplates') and selected_app.includedTemplates:
             included_templates = selected_app.includedTemplates
@@ -1311,73 +1483,49 @@ def _import_item_entity(export_path, final_item_name, entity, armature, appearan
         if template_filename:
             imported_template_keys.update(_template_match_keys(template_filename))
 
-    use_common_import = False
-    if item_entity:
-        moving_component = getattr(item_entity, "MovingPhysicalAgentComponent", None)
-        base_chunks = import_entity._get_entity_static_mesh_chunks(item_entity)
-        has_base_mesh = any(
-            chunk and import_entity._get_entry_attr(chunk, "mesh")
-            for chunk in base_chunks
-        )
-        has_animated_component = any(
-            str(import_entity._get_entry_attr(chunk, "type", "") or "").strip() == "CAnimatedComponent"
-            for chunk in base_chunks
-            if chunk
-        )
-        if moving_component and getattr(moving_component, "skeleton", None):
-            use_common_import = True
-        elif has_animated_component:
-            use_common_import = True
-        elif getattr(item_entity, "appearances", None) and not has_base_mesh:
-            use_common_import = True
+    item_import_context = selected_item_appearance
+    if item_import_context is None:
+        item_import_context = appearance if appearance else type('obj', (), {'includedTemplates': [], 'name': 'equipment'})()
 
-    if use_common_import:
-        saved_active = bpy.context.view_layer.objects.active
-        saved_selection = [obj for obj in bpy.context.selected_objects]
-        try:
-            import_apperance = selected_item_appearance_index + 1 if selected_item_appearance_index >= 0 else 0
-            import_entity.import_ent_template(
-                export_path,
-                load_face_poses=False,
-                import_apperance=import_apperance,
-                parent_transform=None,
-            )
-        finally:
-            try:
-                import_entity.set_main_armature(bpy.context.scene, armature)
-            except Exception:
-                pass
-            _safe_restore_selection(saved_active, saved_selection)
-        return {
-            "template_keys": imported_template_keys,
-            "item_entity": item_entity,
-            "selected_appearance_name": selected_item_appearance_name,
-        }
-
-    if included_templates:
-        for template in included_templates:
-            template_filename = template.get('templateFilename', '') if isinstance(template, dict) else getattr(template, 'templateFilename', '')
-            if template_filename:
-                add_app_template(entity, armature, entity.name, ent_namespace,
-                                 False, slot_index,
-                                 appearance if appearance else type('obj', (), {'includedTemplates': [], 'name': 'equipment'})(),
-                                 True, empty_transform, False, template_filename,
-                                 template_data=template if isinstance(template, dict) else None,
-                                 appearance_indices=None,
-                                 use_app_drivers=use_app_drivers)
-    else:
-        template_source = export_path if export_path and os.path.isabs(export_path) else final_item_name
+    def _import_equipment_template(template_source, *, template_data=None):
+        if not template_source:
+            return
         imported_template_keys.update(_template_match_keys(template_source))
-        add_app_template(entity, armature, entity.name, ent_namespace,
-                         False, slot_index,
-                         appearance if appearance else type('obj', (), {'includedTemplates': [], 'name': 'equipment'})(),
-                         True, empty_transform, False, template_source,
-                         template_data=static_template_data,
-                         appearance_indices=None,
-                         use_app_drivers=use_app_drivers)
+        add_app_template(
+            entity,
+            armature,
+            entity.name,
+            ent_namespace,
+            False,
+            slot_index,
+            item_import_context,
+            True,
+            empty_transform,
+            False,
+            template_source,
+            template_data=template_data,
+            appearance_indices=None,
+            use_app_drivers=use_app_drivers,
+            bind_root_chunks_to_entity=bool(bind_root_chunks_to_entity),
+        )
+
+    base_template_source = export_path if export_path and os.path.isabs(export_path) else final_item_name
+    if static_template_data:
+        _import_equipment_template(base_template_source, template_data=static_template_data)
+    elif not included_templates:
+        _import_equipment_template(base_template_source)
+
+    for template in included_templates:
+        template_filename = template.get('templateFilename', '') if isinstance(template, dict) else getattr(template, 'templateFilename', '')
+        if template_filename:
+            _import_equipment_template(
+                template_filename,
+                template_data=template if isinstance(template, dict) else None,
+            )
     return {
         "template_keys": imported_template_keys,
         "item_entity": item_entity,
+        "attachment_profile": attachment_profile,
         "selected_appearance_name": selected_item_appearance_name,
     }
 
@@ -1402,6 +1550,479 @@ def _get_slot_target_armature(slot_empty, fallback_armature):
         if slot_empty.parent and slot_empty.parent.type == 'ARMATURE':
             return slot_empty.parent
     return fallback_armature
+
+
+def _iter_local_armatures(root_armature):
+    if root_armature is None:
+        return []
+    armatures = []
+    seen = set()
+    candidates = [root_armature]
+    try:
+        candidates.extend(list(root_armature.children_recursive))
+    except Exception:
+        pass
+    for candidate in candidates:
+        if candidate is None or candidate.type != 'ARMATURE':
+            continue
+        try:
+            key = candidate.as_pointer()
+        except Exception:
+            key = getattr(candidate, "name_full", getattr(candidate, "name", id(candidate)))
+        if key in seen:
+            continue
+        seen.add(key)
+        armatures.append(candidate)
+    return armatures
+
+
+def _find_component_target_armature(root_armature, component_name, entity_name=""):
+    component_name = str(component_name or "").strip()
+    if not component_name:
+        return None
+
+    local_armatures = _iter_local_armatures(root_armature)
+    for obj in local_armatures:
+        if str(obj.get('witcher_name', '') or '').strip() == component_name:
+            return obj
+
+    for obj in local_armatures:
+        if obj.name == f"{entity_name}:{component_name}" or obj.name == component_name:
+            return obj
+        if component_name in obj.name and (not entity_name or obj.name.startswith(entity_name)):
+            return obj
+    return None
+
+
+def _resolve_slot_target_armature_from_rig(slot_name, armature, rig_settings):
+    slot_name = str(slot_name or "").strip()
+    if not slot_name or armature is None or rig_settings is None:
+        return armature
+
+    entity_name = getattr(rig_settings, "entity_name", "") or ""
+    slot_entry = _find_slot_entry_for_mount_slot(slot_name, rig_settings)
+    if slot_entry is not None:
+        component_name = getattr(slot_entry, "component_name", "") or ""
+        target_armature = _find_component_target_armature(armature, component_name, entity_name=entity_name)
+        if target_armature is not None:
+            return target_armature
+    return armature
+
+
+def _find_slot_entry_for_mount_slot(slot_name, rig_settings):
+    slot_name = str(slot_name or "").strip()
+    if not slot_name or rig_settings is None:
+        return None
+
+    exact_match = None
+    bone_matches = []
+    fuzzy_matches = []
+    for slot_entry in getattr(rig_settings, "entity_slots", []):
+        entry_slot_name = str(getattr(slot_entry, "slot_name", "") or "").strip()
+        entry_bone_name = str(getattr(slot_entry, "bone_name", "") or "").strip()
+        if entry_slot_name == slot_name:
+            exact_match = slot_entry
+            break
+        if entry_bone_name == slot_name:
+            bone_matches.append(slot_entry)
+            continue
+        if slot_name and entry_slot_name and slot_name in entry_slot_name:
+            fuzzy_matches.append((len(entry_slot_name), slot_entry))
+
+    if exact_match is not None:
+        return exact_match
+    if len(bone_matches) == 1:
+        return bone_matches[0]
+    if fuzzy_matches:
+        fuzzy_matches.sort(key=lambda pair: pair[0])
+        return fuzzy_matches[0][1]
+    return None
+
+
+def _get_root_bone_name(armature):
+    if armature is None or armature.type != 'ARMATURE':
+        return ""
+    try:
+        for bone in armature.data.bones:
+            if bone.parent is None:
+                return bone.name
+    except Exception:
+        pass
+    return ""
+
+
+def _link_object_to_armature_collection(obj, armature):
+    if obj is None:
+        return
+    target_collection = None
+    try:
+        if armature is not None and armature.users_collection:
+            target_collection = armature.users_collection[0]
+    except Exception:
+        target_collection = None
+    if target_collection is None:
+        target_collection = getattr(bpy.context, "collection", None)
+    if target_collection is None:
+        target_collection = bpy.context.scene.collection
+    target_collection.objects.link(obj)
+
+
+def _find_slots_parent_for_armature(armature, entity_name=""):
+    if armature is None:
+        return None
+    arm_name = getattr(armature, "name_full", getattr(armature, "name", ""))
+    candidates = []
+    try:
+        descendants = list(armature.children_recursive)
+    except Exception:
+        descendants = []
+    for obj in descendants:
+        if obj is None or obj.type != 'EMPTY' or not obj.get("witcher_slots_parent"):
+            continue
+        score = 0
+        if obj.parent == armature:
+            score += 4
+        if obj.get("witcher_owner_armature") == arm_name:
+            score += 2
+        if entity_name and obj.get("witcher_entity_name") == entity_name:
+            score += 1
+        candidates.append((score, obj))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    return candidates[0][1]
+
+
+def _ensure_slots_parent_for_armature(armature, entity_name="", rig_settings=None):
+    if armature is None:
+        return None
+    slots_parent = _find_slots_parent_for_armature(armature, entity_name=entity_name)
+    if slots_parent is not None:
+        return slots_parent
+
+    slots_parent_name = f"{entity_name}_slots" if entity_name else "entity_slots"
+    slots_parent = bpy.data.objects.new(slots_parent_name, None)
+    _link_object_to_armature_collection(slots_parent, armature)
+    slots_parent.empty_display_type = 'PLAIN_AXES'
+    slots_parent.empty_display_size = 0.1
+    slots_parent["witcher_slots_parent"] = True
+    slots_parent["witcher_entity_name"] = entity_name or ""
+    slots_parent["witcher_owner_armature"] = getattr(armature, "name_full", getattr(armature, "name", ""))
+    slots_parent.parent = armature
+    if hasattr(slots_parent, "show_relationship_lines"):
+        slots_parent.show_relationship_lines = False
+    slots_parent.hide_set(not getattr(rig_settings, "show_entity_slots", False))
+    return slots_parent
+
+
+def _ensure_slot_empty_from_rig(slot_name, armature, rig_settings):
+    slot_name = str(slot_name or "").strip()
+    if not slot_name or armature is None or armature.type != 'ARMATURE' or rig_settings is None:
+        return None
+
+    entity_name = getattr(rig_settings, "entity_name", "") or ""
+    existing = find_slot_empty(entity_name, slot_name, armature)
+    if existing is not None:
+        return existing
+
+    slot_entry = _find_slot_entry_for_mount_slot(slot_name, rig_settings)
+    if slot_entry is None:
+        return None
+
+    resolved_slot_name = str(getattr(slot_entry, "slot_name", "") or "").strip() or slot_name
+    if resolved_slot_name != slot_name:
+        existing = find_slot_empty(entity_name, resolved_slot_name, armature)
+        if existing is not None:
+            return existing
+
+    component_name = getattr(slot_entry, "component_name", "") or ""
+    target_armature = _find_component_target_armature(armature, component_name, entity_name=entity_name)
+    if target_armature is None:
+        target_armature = armature
+
+    bone_name = str(getattr(slot_entry, "bone_name", "") or "").strip()
+    if bone_name:
+        resolved_armature = _find_armature_with_bone(armature, bone_name, preferred_armature=target_armature)
+        if resolved_armature is not None:
+            target_armature = resolved_armature
+    else:
+        target_armature = armature
+        bone_name = _get_root_bone_name(armature)
+
+    slots_parent = _ensure_slots_parent_for_armature(armature, entity_name=entity_name, rig_settings=rig_settings)
+    if slots_parent is None:
+        return None
+
+    empty_name = f"{entity_name}:{resolved_slot_name}" if entity_name else resolved_slot_name
+    slot_empty = bpy.data.objects.new(empty_name, None)
+    _link_object_to_armature_collection(slot_empty, armature)
+    slot_empty.empty_display_type = 'SPHERE'
+    slot_empty.empty_display_size = 0.02
+    slot_empty["witcher_slot_name"] = resolved_slot_name
+    slot_empty["witcher_entity_name"] = entity_name or ""
+    slot_empty["witcher_owner_armature"] = getattr(armature, "name_full", getattr(armature, "name", ""))
+    slot_empty.parent = slots_parent
+    if hasattr(slot_empty, "show_relationship_lines"):
+        slot_empty.show_relationship_lines = False
+
+    try:
+        transform_data = json.loads(getattr(slot_entry, "transform_json", "") or "") if getattr(slot_entry, "transform_json", "") else None
+    except Exception:
+        transform_data = None
+
+    use_rot90 = get_rig_rot90_enabled(rig_settings, default=False)
+    import_entity.set_empty_bone_offset(
+        slot_empty,
+        target_armature,
+        bone_name,
+        transform_data,
+        rotate_90=use_rot90,
+        rotate_90_dir=1,
+    )
+    slot_empty.hide_set(not getattr(rig_settings, "show_entity_slots", False))
+    return slot_empty
+
+
+def _find_armature_with_bone(root_armature, bone_name, preferred_armature=None):
+    bone_name = str(bone_name or "").strip()
+    if not bone_name:
+        return None
+
+    preferred = preferred_armature if preferred_armature and preferred_armature.type == 'ARMATURE' else None
+    if preferred is not None:
+        try:
+            if bone_name in preferred.pose.bones:
+                return preferred
+        except Exception:
+            pass
+
+    for candidate in _iter_local_armatures(root_armature):
+        if preferred is not None and candidate == preferred:
+            continue
+        try:
+            if bone_name in candidate.pose.bones:
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_equipment_mount_target(slot_name, armature, rig_settings):
+    slot_name = str(slot_name or "").strip()
+    target_info = {
+        "name": slot_name,
+        "is_valid": False,
+        "target_type": "",
+        "slot_empty": None,
+        "armature": None,
+        "bone_name": "",
+    }
+    if not slot_name or armature is None or armature.type != 'ARMATURE':
+        return target_info
+
+    entity_name = getattr(rig_settings, "entity_name", "") or ""
+    slot_empty = find_slot_empty(entity_name, slot_name, armature)
+    if slot_empty is None:
+        slot_empty = _ensure_slot_empty_from_rig(slot_name, armature, rig_settings)
+    if slot_empty is not None:
+        target_info.update({
+            "is_valid": True,
+            "target_type": "slot",
+            "slot_empty": slot_empty,
+            "armature": _get_slot_target_armature(slot_empty, armature),
+        })
+        return target_info
+
+    preferred_armature = _resolve_slot_target_armature_from_rig(slot_name, armature, rig_settings)
+    target_armature = _find_armature_with_bone(armature, slot_name, preferred_armature=preferred_armature)
+    if target_armature is not None:
+        target_info.update({
+            "is_valid": True,
+            "target_type": "bone",
+            "armature": target_armature,
+            "bone_name": slot_name,
+        })
+    return target_info
+
+
+def _item_entity_is_inventory_wrapper(item_entity):
+    if item_entity is None:
+        return False
+    try:
+        return import_entity.classify_equipment_attachment_profile(item_entity).kind == "inventory_wrapper"
+    except Exception:
+        return False
+
+
+def _item_entity_is_visual(item_entity, attachment_profile=None):
+    if attachment_profile is not None:
+        return getattr(attachment_profile, "kind", "") != "inventory_wrapper"
+    if item_entity is None:
+        return True
+    try:
+        attachment_profile = import_entity.classify_equipment_attachment_profile(item_entity)
+    except Exception:
+        return not _item_entity_is_inventory_wrapper(item_entity)
+    return getattr(attachment_profile, "kind", "") != "inventory_wrapper"
+
+
+def _infer_equipment_mount_strategy(attachment_profile, target_info, *, allow_unmounted_visual=False):
+    profile_kind = str(getattr(attachment_profile, "kind", "") or "").strip()
+    target_valid = bool((target_info or {}).get("is_valid"))
+    target_name = str((target_info or {}).get("name", "") or "").strip()
+    has_skinned_mesh_payload = bool(getattr(attachment_profile, "has_skinned_mesh_payload", False))
+
+    if profile_kind == "inventory_wrapper":
+        return "nonvisual"
+    if profile_kind == "owner_graph":
+        return "owner_graph_bound"
+    if target_valid:
+        if profile_kind == "slot_animated":
+            return "slot_mount_animated"
+        return "slot_mount_static"
+    if has_skinned_mesh_payload and not target_name:
+        return "owner_graph_bound"
+    if allow_unmounted_visual:
+        if profile_kind == "slot_animated":
+            return "slot_mount_animated"
+        return "slot_mount_static"
+    return "invalid_target"
+
+
+def _should_bind_root_chunks_to_entity(attachment_profile, mount_strategy):
+    if mount_strategy == "owner_graph_bound":
+        return True
+    if mount_strategy in {"slot_mount_static", "slot_mount_animated", "invalid_target", "nonvisual"}:
+        return False
+    return bool(
+        attachment_profile is None
+        or getattr(attachment_profile, "requires_owner_root_binding", False)
+    )
+
+
+def _resolve_bound_owner_bind_armature(slot, armature, rig_settings, attachment_profile,
+                                       mount_strategy, bound_equip_slot, current_target_armature):
+    bind_armature = current_target_armature or armature
+    if mount_strategy != "owner_graph_bound":
+        return bind_armature
+    if bound_equip_slot:
+        return bind_armature
+    if str(getattr(attachment_profile, "kind", "") or "").strip() == "owner_graph":
+        return bind_armature
+    if not bool(getattr(attachment_profile, "has_skinned_mesh_payload", False)):
+        return bind_armature
+
+    parent_equip_target = _resolve_equipment_mount_target(
+        get_effective_equip_slot(slot),
+        armature,
+        rig_settings,
+    )
+    equip_armature = (parent_equip_target or {}).get("armature")
+    if (parent_equip_target or {}).get("is_valid") and equip_armature is not None:
+        return equip_armature
+    return bind_armature
+
+
+def _should_use_bound_skinning_bridge(attachment_profile, mount_strategy, bound_equip_slot, target_armature):
+    if not target_armature:
+        return False
+    if str(bound_equip_slot or "").strip():
+        return False
+    if mount_strategy != "owner_graph_bound":
+        return False
+    if str(getattr(attachment_profile, "kind", "") or "").strip() == "owner_graph":
+        return False
+    return bool(getattr(attachment_profile, "has_skinned_mesh_payload", False))
+
+
+def _maybe_log_legacy_attachment_type_conflict(item_name, attachment_type, attachment_profile):
+    legacy_type = str(attachment_type or "").strip().lower()
+    if not legacy_type or attachment_profile is None:
+        return
+
+    inferred_kind = str(getattr(attachment_profile, "kind", "") or "").strip()
+    if legacy_type == "skinning" and inferred_kind not in {"owner_graph", "slot_animated"}:
+        log.debug(
+            "Ignoring legacy attachment_type='%s' for '%s'; inferred profile is '%s'.",
+            legacy_type,
+            item_name,
+            inferred_kind or "unknown",
+        )
+
+
+def _describe_mount_target(target_info):
+    target_info = target_info or {}
+    target_type = str(target_info.get("target_type", "") or "").strip()
+    if target_type == "slot":
+        slot_empty = target_info.get("slot_empty")
+        slot_name = getattr(slot_empty, "name", "") if slot_empty is not None else ""
+        return f"slot:{slot_name or 'unknown'}"
+    if target_type == "bone":
+        return f"bone:{str(target_info.get('bone_name', '') or '').strip() or 'unknown'}"
+    return target_type or "none"
+
+
+def _resolve_visual_policy_from_slot_names(equip_slot_name, hold_slot_name, armature, rig_settings, *,
+                                           item_entity=None, attachment_profile=None,
+                                           allow_unmounted_visual=False):
+    if attachment_profile is None and item_entity is not None:
+        attachment_profile = import_entity.classify_equipment_attachment_profile(item_entity)
+    equip_slot_name = str(equip_slot_name or "").strip()
+    hold_slot_name = str(hold_slot_name or "").strip()
+    equip_target = _resolve_equipment_mount_target(equip_slot_name, armature, rig_settings)
+    hold_target = _resolve_equipment_mount_target(hold_slot_name, armature, rig_settings)
+    item_is_visual = _item_entity_is_visual(item_entity, attachment_profile=attachment_profile)
+
+    if not item_is_visual:
+        policy = "nonvisual_on_rig"
+    elif attachment_profile is not None and getattr(attachment_profile, "kind", "") == "owner_graph":
+        policy = "equipable_on_rig"
+    elif equip_target["is_valid"]:
+        policy = "equipable_on_rig"
+    elif hold_target["is_valid"]:
+        policy = "hold_only_on_rig"
+    elif allow_unmounted_visual:
+        policy = "equipable_on_rig"
+    else:
+        policy = "nonvisual_on_rig"
+
+    return {
+        "policy": policy,
+        "item_is_visual": item_is_visual,
+        "equip_target": equip_target,
+        "hold_target": hold_target,
+        "equip_valid": bool(equip_target["is_valid"]),
+        "hold_valid": bool(hold_target["is_valid"]),
+        "attachment_profile": attachment_profile,
+    }
+
+
+def _resolve_slot_visual_policy(slot, armature, rig_settings, *, item_entity=None, attachment_profile=None):
+    if slot is None:
+        return _resolve_visual_policy_from_slot_names(
+            "",
+            "",
+            armature,
+            rig_settings,
+            item_entity=item_entity,
+            attachment_profile=attachment_profile,
+        )
+    equip_slot_name = get_effective_equip_slot(slot)
+    hold_slot_name = get_effective_hold_slot(slot)
+    allow_unmounted_visual = (
+        not bool(getattr(slot, "is_inventory", False))
+        and not str(equip_slot_name or "").strip()
+        and not str(hold_slot_name or "").strip()
+    )
+    return _resolve_visual_policy_from_slot_names(
+        equip_slot_name,
+        hold_slot_name,
+        armature,
+        rig_settings,
+        item_entity=item_entity,
+        attachment_profile=attachment_profile,
+        allow_unmounted_visual=allow_unmounted_visual,
+    )
 
 def _bind_objects_to_armature(objects, target_armature):
     if not target_armature:
@@ -1457,6 +2078,70 @@ def _constrain_bound_armature_to_target(bound_armature, target_armature):
         except Exception:
             pass
         _safe_restore_selection(saved_active, saved_selection)
+
+
+def _armature_has_external_binding(bound_armature, object_set):
+    if not bound_armature or bound_armature.type != 'ARMATURE':
+        return False
+
+    parent_obj = getattr(bound_armature, "parent", None)
+    if (
+        parent_obj is not None
+        and parent_obj not in object_set
+        and (
+            getattr(parent_obj, "type", "") == 'ARMATURE'
+            or getattr(bound_armature, "parent_type", "") == 'BONE'
+        )
+    ):
+        return True
+
+    for constraint in getattr(bound_armature, "constraints", []):
+        if constraint.type in {'COPY_TRANSFORMS', 'CHILD_OF'} and constraint.target and constraint.target not in object_set:
+            return True
+
+    pose_data = getattr(bound_armature, "pose", None)
+    pose_bones = getattr(pose_data, "bones", []) if pose_data is not None else []
+    for pose_bone in pose_bones:
+        for constraint in pose_bone.constraints:
+            if constraint.type in {'COPY_TRANSFORMS', 'CHILD_OF'} and constraint.target and constraint.target not in object_set:
+                return True
+
+    return False
+
+
+def _attach_imported_objects_via_skinning(objects, target_armature):
+    """Legacy/manual recovery path for binding imported equipment to an armature."""
+    if not target_armature:
+        return False
+
+    object_set = {obj for obj in (objects or []) if obj is not None}
+    candidate_root_armatures = [
+        obj for obj in object_set
+        if obj.type == 'ARMATURE' and (obj.parent is None or obj.parent not in object_set)
+    ]
+    root_armatures = [
+        arm for arm in candidate_root_armatures
+        if not _armature_has_external_binding(arm, object_set)
+    ]
+    if root_armatures:
+        for arm in root_armatures:
+            try:
+                arm.data.pose_position = target_armature.data.pose_position
+            except Exception:
+                arm.data.pose_position = "POSE"
+            saved_world = arm.matrix_world.copy()
+            arm.parent = target_armature
+            arm.parent_type = 'OBJECT'
+            arm.matrix_world = saved_world
+            _snap_armature_to_target(arm, target_armature)
+            _constrain_bound_armature_to_target(arm, target_armature)
+        return True
+
+    if candidate_root_armatures:
+        return True
+
+    _bind_objects_to_armature(object_set, target_armature)
+    return bool(object_set)
 
 def _snap_armature_to_target(bound_armature, target_armature):
     """Snap a bound armature object to the target armature's evaluated world matrix."""
@@ -1614,7 +2299,7 @@ def _refresh_variants_and_reload(context, armature, rig_settings):
         _VARIANT_REFRESHING = False
 
 def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_objects, parent_empty, slot_empty,
-                      prepared_context=None, imported_template_keys=None):
+                      target_armature=None, prepared_context=None, imported_template_keys=None):
     bound_items = _safe_json_list(getattr(slot, "bound_items_json", ""))
     if not bound_items:
         return []
@@ -1634,7 +2319,7 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
         if parent_root is None:
             parent_root = list(parent_objects)[0]
 
-    target_armature = _get_slot_target_armature(slot_empty, armature)
+    target_armature = _get_slot_target_armature(slot_empty, target_armature or armature)
     source_roots = prepared.get("source_roots", [])
     source_game = get_equipment_source_game_for_search_roots(source_roots)
 
@@ -1658,25 +2343,24 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
         if seen_template_keys.intersection(current_template_keys):
             continue
 
-        # Bound items follow their own equip slot when defined. Only no-slot
-        # bound items should use the skinning attachment path.
+        # Bound items may provide an explicit slot target, but their attachment
+        # behavior still comes from the parsed entity graph, not attachment_type.
         attrs = {}
-        attachment_type = ""
         bound_equip_slot = ""
         try:
             attrs = _lookup_item_attributes(bound_name, source_game)
             if not attrs and template and template != bound_name:
                 attrs = _lookup_item_attributes(template, source_game)
-            attachment_type = attrs.get("attachment_type", "")
             bound_equip_slot = attrs.get("equip_slot", "")
         except Exception:
             attrs = {}
-            attachment_type = ""
             bound_equip_slot = ""
 
         bound_slot_empty = None
         if bound_equip_slot:
             bound_slot_empty = find_slot_empty(rig_settings.entity_name, bound_equip_slot, armature)
+            if not bound_slot_empty:
+                bound_slot_empty = _ensure_slot_empty_from_rig(bound_equip_slot, armature, rig_settings)
             if not bound_slot_empty and slot_empty and slot_empty.get("witcher_slot_name") == bound_equip_slot:
                 bound_slot_empty = slot_empty
             if not bound_slot_empty:
@@ -1684,13 +2368,65 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
                     f"Bound item '{bound_name}' requested slot '{bound_equip_slot}' but no slot empty was found"
                 )
 
-        use_skinning_attachment = bool(
-            not bound_equip_slot and attachment_type == "skinning" and target_armature
+        bound_item_entity = _get_cached_equipment_item_entity(
+            export_path,
+            prepared_context=prepared,
+        )
+        bound_attachment_profile = import_entity.classify_equipment_attachment_profile(bound_item_entity)
+        _maybe_log_legacy_attachment_type_conflict(
+            bound_name or template,
+            attrs.get("attachment_type", ""),
+            bound_attachment_profile,
+        )
+        if getattr(bound_attachment_profile, "kind", "") == "inventory_wrapper":
+            seen_template_keys.update(current_template_keys)
+            continue
+
+        bound_target_info = {
+            "name": bound_equip_slot,
+            "is_valid": bool(bound_slot_empty),
+            "target_type": "slot" if bound_slot_empty else "",
+            "slot_empty": bound_slot_empty,
+            "armature": target_armature,
+            "bone_name": "",
+        }
+        allow_bound_unmounted_visual = (
+            not bound_slot_empty
+            and getattr(bound_attachment_profile, "kind", "") != "owner_graph"
+        )
+        bound_mount_strategy = _infer_equipment_mount_strategy(
+            bound_attachment_profile,
+            bound_target_info,
+            allow_unmounted_visual=allow_bound_unmounted_visual,
+        )
+        bound_bind_armature = _resolve_bound_owner_bind_armature(
+            slot,
+            armature,
+            rig_settings,
+            bound_attachment_profile,
+            bound_mount_strategy,
+            bound_equip_slot,
+            target_armature,
+        )
+        bound_use_skinning_bridge = _should_use_bound_skinning_bridge(
+            bound_attachment_profile,
+            bound_mount_strategy,
+            bound_equip_slot,
+            bound_bind_armature,
+        )
+        log.debug(
+            "Bound equipment attachment '%s': profile=%s strategy=%s target=%s bind_armature=%s skinning_bridge=%s",
+            bound_name or template,
+            getattr(bound_attachment_profile, "kind", "") or "unknown",
+            bound_mount_strategy,
+            _describe_mount_target(bound_target_info),
+            getattr(bound_bind_armature, "name", ""),
+            bound_use_skinning_bridge,
         )
 
-        # Create a visible group only for generic non-slot, non-skinning bound items.
+        # Create a visible group for non-slot bound visuals that are not owner-bound.
         bound_group = None
-        if not bound_slot_empty and not use_skinning_attachment:
+        if not bound_slot_empty and bound_mount_strategy != "owner_graph_bound":
             bpy.ops.object.empty_add(type="PLAIN_AXES", radius=0.5)
             bound_group = bpy.context.object
             bound_group.name = f"{bound_name}_bound" if bound_name else "bound_item"
@@ -1713,12 +2449,19 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
                 export_path,
                 final_item.name,
                 entity,
-                armature,
+                bound_bind_armature,
                 appearance,
                 slot_index,
                 parent_empty,
-                use_app_drivers=not getattr(slot, "is_inventory", False),
+                use_app_drivers=_slot_uses_appearance_drivers(slot),
                 prepared_context=prepared,
+                attachment_profile=bound_attachment_profile,
+                bind_root_chunks_to_entity=(
+                    False if bound_use_skinning_bridge else _should_bind_root_chunks_to_entity(
+                        bound_attachment_profile,
+                        bound_mount_strategy,
+                    )
+                ),
             )
         finally:
             _restore_pose_all_armatures(changed_poses)
@@ -1748,42 +2491,24 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
 
         # Apply parenting/attachment rules
         roots = _collect_mount_roots(new_objects, ignored_objects={parent_empty, bound_group})
-        if bound_slot_empty:
-            if _mount_roots_are_animated(roots):
-                bound_anchor = _mount_animated_roots_with_anchor(
-                    roots,
-                    slot.equip_guid,
-                    "bound",
-                    parent_empty,
-                    slot_empty=bound_slot_empty,
-                    armature=armature,
-                    bound_parent_guid=slot.equip_guid,
-                    bound_item_name=bound_name,
-                )
-                if bound_anchor is not None:
-                    new_objects.add(bound_anchor)
-            else:
-                for root in roots:
-                    mount_equipment_to_slot(root, bound_slot_empty, armature, snap=True)
-        elif use_skinning_attachment:
-            # Keep bound item hierarchy intact: parent its root armature(s) to target armature
-            root_armatures = [obj for obj in new_objects
-                              if obj.type == 'ARMATURE' and (obj.parent is None or obj.parent not in new_objects)]
-            if root_armatures:
-                for arm in root_armatures:
-                    try:
-                        arm.data.pose_position = target_armature.data.pose_position
-                    except Exception:
-                        arm.data.pose_position = "POSE"
-                    saved_world = arm.matrix_world.copy()
-                    arm.parent = target_armature
-                    arm.parent_type = 'OBJECT'
-                    arm.matrix_world = saved_world
-                    _snap_armature_to_target(arm, target_armature)
-                    _constrain_bound_armature_to_target(arm, target_armature)
-            else:
-                # Fallback: bind meshes directly if no armature was imported
-                _bind_objects_to_armature(new_objects, target_armature)
+        if bound_use_skinning_bridge:
+            _attach_imported_objects_via_skinning(new_objects, bound_bind_armature)
+        elif bound_mount_strategy == "slot_mount_animated" and bound_slot_empty:
+            bound_anchor = _mount_animated_roots_with_anchor(
+                roots,
+                slot.equip_guid,
+                "bound",
+                parent_empty,
+                slot_empty=bound_slot_empty,
+                armature=armature,
+                bound_parent_guid=slot.equip_guid,
+                bound_item_name=bound_name,
+            )
+            if bound_anchor is not None:
+                new_objects.add(bound_anchor)
+        elif bound_mount_strategy == "slot_mount_static" and bound_slot_empty:
+            for root in roots:
+                mount_equipment_to_slot(root, bound_slot_empty, armature, snap=True)
         elif bound_group:
             # Parent root objects under the bound group
             for root in roots:
@@ -1814,13 +2539,18 @@ def find_slot_empty(entity_name, slot_name, armature=None):
     if armature:
         # Prefer slots parented under this armature instance.
         arm_name = getattr(armature, "name_full", getattr(armature, "name", ""))
+        full_name = f"{entity_name}:{slot_name}" if entity_name else slot_name
         candidates = []
         for obj in armature.children_recursive:
             if obj.type != 'EMPTY':
                 continue
-            if obj.get("witcher_slot_name") != slot_name:
+            obj_slot_name = str(obj.get("witcher_slot_name") or "").strip()
+            name_matches = obj.name == full_name or obj.name.startswith(f"{full_name}.")
+            if obj_slot_name != slot_name and not name_matches:
                 continue
             score = 0
+            if obj_slot_name == slot_name:
+                score += 8
             if obj.get("witcher_owner_armature") == arm_name:
                 score += 4
             if obj.parent and obj.parent.get("witcher_slots_parent"):
@@ -1868,7 +2598,29 @@ def find_slot_empty_by_bone(entity_name, bone_name, rig_settings):
     
     return None
 
-def mount_equipment_to_bone(equipment_obj, armature, bone_name, snap=True):
+def _capture_mount_local_offset(equipment_obj):
+    if equipment_obj is None:
+        return None
+    try:
+        parent = equipment_obj.parent
+    except Exception:
+        parent = None
+    try:
+        world_matrix = equipment_obj.matrix_world.copy()
+    except Exception:
+        return None
+    if parent is None:
+        return world_matrix
+    try:
+        return parent.matrix_world.inverted() @ world_matrix
+    except Exception:
+        try:
+            return equipment_obj.matrix_local.copy()
+        except Exception:
+            return world_matrix
+
+
+def mount_equipment_to_bone(equipment_obj, armature, bone_name, snap=True, preserve_local_offset=False):
     """Mount equipment object directly to a bone (no constraint).
     
     This avoids double-transforms and keeps hierarchy under the armature.
@@ -1888,6 +2640,8 @@ def mount_equipment_to_bone(equipment_obj, armature, bone_name, snap=True):
     for c in constraints_to_remove:
         equipment_obj.constraints.remove(c)
 
+    local_offset = _capture_mount_local_offset(equipment_obj) if preserve_local_offset else None
+
     # Parent directly to bone
     equipment_obj.parent = armature
     equipment_obj.parent_type = 'BONE'
@@ -1904,7 +2658,18 @@ def mount_equipment_to_bone(equipment_obj, armature, bone_name, snap=True):
     if hasattr(equipment_obj, "show_relationship_lines"):
         equipment_obj.show_relationship_lines = False
 
-    if snap:
+    if preserve_local_offset:
+        try:
+            dg = bpy.context.evaluated_depsgraph_get()
+            arm_eval = armature.evaluated_get(dg)
+            bone = arm_eval.pose.bones.get(bone_name)
+            if bone and local_offset is not None:
+                equipment_obj.matrix_world = (arm_eval.matrix_world @ bone.matrix) @ local_offset
+        except Exception:
+            bone = armature.pose.bones.get(bone_name)
+            if bone and local_offset is not None:
+                equipment_obj.matrix_world = (armature.matrix_world @ bone.matrix) @ local_offset
+    elif snap:
         # Snap to evaluated bone world matrix (handles moved armature)
         try:
             dg = bpy.context.evaluated_depsgraph_get()
@@ -1920,7 +2685,7 @@ def mount_equipment_to_bone(equipment_obj, armature, bone_name, snap=True):
     return True
 
 
-def mount_equipment_to_slot(equipment_obj, slot_empty, parent_armature=None, snap=True):
+def mount_equipment_to_slot(equipment_obj, slot_empty, parent_armature=None, snap=True, preserve_local_offset=False):
     """Mount equipment object directly under a slot Empty (no constraint)."""
     if not equipment_obj or not slot_empty:
         return None
@@ -1930,6 +2695,8 @@ def mount_equipment_to_slot(equipment_obj, slot_empty, parent_armature=None, sna
                             if c.name.startswith("Mount_") or c.name.startswith("Equip_")]
     for c in constraints_to_remove:
         equipment_obj.constraints.remove(c)
+
+    local_offset = _capture_mount_local_offset(equipment_obj) if preserve_local_offset else None
 
     # Parent under slot empty
     equipment_obj.parent = slot_empty
@@ -1949,7 +2716,9 @@ def mount_equipment_to_slot(equipment_obj, slot_empty, parent_armature=None, sna
     if hasattr(equipment_obj, "show_relationship_lines"):
         equipment_obj.show_relationship_lines = False
 
-    if snap:
+    if preserve_local_offset and local_offset is not None:
+        equipment_obj.matrix_world = slot_matrix @ local_offset
+    elif snap:
         # Snap to evaluated slot world matrix (handles moved armature)
         equipment_obj.matrix_world = slot_matrix
 
@@ -2202,6 +2971,9 @@ class EquipmentDefinitionEntry(bpy.types.PropertyGroup):
 
     def _sync_to_rig(self, context):
         """Sync current entry values to persistent equipment slot on the armature."""
+        temp_data = _get_temp_equipment_data(context)
+        if temp_data is not None and getattr(temp_data, "suspend_auto_apply_updates", False):
+            return
         try:
             _armature, rig_settings = _get_armature_and_rig_settings(context)
             if rig_settings:
@@ -2215,10 +2987,16 @@ class EquipmentDefinitionEntry(bpy.types.PropertyGroup):
                             target_slot = slot
                             break
                 if target_slot:
+                    target_slot.source_game = _normalize_source_game(
+                        getattr(self, "source_game", "") or getattr(target_slot, "source_game", "w3")
+                    )
                     target_slot.category = self.category
                     target_slot.item_name = self.defaultItemName
                     target_slot.equip_template = self.equip_template
                     target_slot.base_equip_template = self.equip_template
+                    target_slot.resolved_repo_path = ""
+                    if slot_index >= 0 and not getattr(target_slot, "is_inventory", False):
+                        target_slot.keep_across_appearances = True
                     target_slot.equip_slot = self.equip_slot
                     target_slot.hold_slot = self.hold_slot
                     target_slot.weapon = self.weapon
@@ -2232,6 +3010,10 @@ class EquipmentDefinitionEntry(bpy.types.PropertyGroup):
         except Exception:
             # Blender may block ID writes in some UI contexts
             pass
+
+    def _sync_template_and_repo(self, context):
+        self._sync_to_rig(context)
+        _update_entry_resolved_repo_path(self, context)
 
     def _auto_apply_selection_change(self, context):
         if not _is_temp_equipment_auto_apply_enabled(context):
@@ -2331,6 +3113,7 @@ class EquipmentDefinitionEntry(bpy.types.PropertyGroup):
 
         # Sync to persistent EquipmentSlotEntry on the armature
         self._sync_to_rig(context)
+        _update_entry_resolved_repo_path(self, context)
         self._auto_apply_selection_change(context)
 
     # Helper to retrieve all known categories for the entry's source game.
@@ -2401,7 +3184,19 @@ class EquipmentDefinitionEntry(bpy.types.PropertyGroup):
     equip_template: bpy.props.StringProperty(
         name="Equip Template",
         description="Equip template associated with the selected item",
-        update=lambda self, context: self._sync_to_rig(context)
+        update=lambda self, context: self._sync_template_and_repo(context)
+    )
+
+    resolved_repo_path: bpy.props.StringProperty(
+        name="Resolved Game Path",
+        description="Resolved game-relative repo path for the currently selected equipment template",
+        default=""
+    )
+
+    resolved_abs_path: bpy.props.StringProperty(
+        name="Resolved Absolute Path",
+        description="Resolved absolute file path for the currently selected equipment template",
+        default=""
     )
 
     # Additional attributes
@@ -2425,7 +3220,7 @@ class EquipmentDefinitionEntry(bpy.types.PropertyGroup):
 
     attachment_type: bpy.props.StringProperty(
         name="Attachment Type",
-        description="Attachment type (e.g. skinning)",
+        description="Legacy/debug attachment metadata; runtime attachment is inferred from the item entity graph",
         default=""
     )
 
@@ -2544,6 +3339,7 @@ class WitcherUITempData(bpy.types.PropertyGroup):
     equipment_entries_index: bpy.props.IntProperty()
     last_app_list_index: bpy.props.IntProperty(default=-1)
     last_armature_name: bpy.props.StringProperty(default="")
+    last_entity_state_token: bpy.props.StringProperty(default="")
     equipment_source_game: bpy.props.StringProperty(default="w3")
     auto_apply_equipment_selection: bpy.props.BoolProperty(
         name="Auto Apply Dropdown Changes",
@@ -3108,8 +3904,6 @@ class EQUIPMENT_OT_ToggleItem(bpy.types.Operator):
             self.report({'WARNING'}, "No valid armature selected")
             return {'CANCELLED'}
 
-        entity_name = rig_settings.entity_name
-
         # Ensure slot constraints are up-to-date before toggling
         try:
             refresh_slot_constraints(ob)
@@ -3122,67 +3916,55 @@ class EQUIPMENT_OT_ToggleItem(bpy.types.Operator):
             return {'CANCELLED'}
             
         slot = rig_settings.equipment_slots[self.slot_index]
-        
+        slot_policy = _resolve_slot_visual_policy(slot, ob, rig_settings)
+
         if not slot.is_loaded or not slot.equip_guid:
-            self.report({'WARNING'}, f"Equipment '{slot.item_name}' is not loaded")
-            return {'CANCELLED'}
-        
-        # Determine target slot (toggle between equip_slot and hold_slot)
-        effective_hold_slot = get_effective_hold_slot(slot)
-        if not effective_hold_slot:
-            self.report({'INFO'}, f"No hold slot defined for '{slot.item_name}'")
-            return {'CANCELLED'}
-        
-        # Get current state and flip it
-        is_in_hold = slot.is_in_hold_slot
-        effective_equip_slot = get_effective_equip_slot(slot)
-        target_slot_name = effective_equip_slot if is_in_hold else effective_hold_slot
-        
-        # Find the target slot empty
-        target_empty = find_slot_empty(entity_name, target_slot_name, ob)
-        if not target_empty:
-            # Fallback: try to find the bone directly in the armature
-            if target_slot_name in ob.pose.bones:
-                self.report({'INFO'}, f"Using bone '{target_slot_name}' directly (no slot empty found)")
-            else:
-                self.report({'WARNING'}, f"Slot '{target_slot_name}' not found")
+            if not slot_policy["hold_valid"]:
+                self.report({'INFO'}, f"No valid hold slot defined for '{slot.item_name}'")
                 return {'CANCELLED'}
-        
-        # Get equipment objects by GUID (exclude bound items)
-        equipment_objects = [obj for obj in find_objects_by_guid(slot.equip_guid, "witcher_equip_guid")
-                             if not obj.get("witcher_bound_parent_guid")]
-        
+            if load_equipment_item(context, ob, self.slot_index, rig_settings, mount_mode="hold"):
+                self.report({'INFO'}, f"'{slot.item_name}' loaded into hold slot")
+                return {'FINISHED'}
+            reason = _get_last_equipment_load_failure(ob, self.slot_index) or "Unknown failure"
+            self.report({'WARNING'}, reason)
+            return {'CANCELLED'}
+
+        is_in_hold = bool(slot.is_in_hold_slot)
+        target_info = slot_policy["equip_target"] if is_in_hold else slot_policy["hold_target"]
+
+        if is_in_hold and not slot_policy["equip_valid"]:
+            unload_equipment_item(slot)
+            self.report({'INFO'}, f"'{slot.item_name}' put away")
+            return {'FINISHED'}
+
+        if not target_info["is_valid"]:
+            target_label = "equip" if is_in_hold else "hold"
+            self.report({'WARNING'}, f"No valid {target_label} target on current rig for '{slot.item_name}'")
+            return {'CANCELLED'}
+
+        equipment_objects = [
+            obj for obj in find_objects_by_guid(slot.equip_guid, "witcher_equip_guid")
+            if not obj.get("witcher_bound_parent_guid")
+        ]
         if not equipment_objects:
             self.report({'WARNING'}, "Equipment objects not found")
             return {'CANCELLED'}
 
         mount_anchor = _find_equipment_mount_anchor(slot.equip_guid, kind="main")
         if mount_anchor:
-            if target_empty:
-                _mount_anchor_to_slot(mount_anchor, target_empty, parent_armature=ob)
-            else:
-                _mount_anchor_to_bone(mount_anchor, ob, target_slot_name)
+            _mount_anchor_to_target(mount_anchor, target_info, fallback_armature=ob)
         else:
-            # Switch constraints on root equipment objects
             for obj in _collect_mount_roots(equipment_objects):
-                # Remove existing mount constraints (both COPY_TRANSFORMS and CHILD_OF)
-                constraints_to_remove = [c for c in obj.constraints
-                                        if c.name.startswith("Mount_") or c.name.startswith("Equip_")]
+                constraints_to_remove = [
+                    c for c in obj.constraints
+                    if c.name.startswith("Mount_") or c.name.startswith("Equip_")
+                ]
                 for c in constraints_to_remove:
                     obj.constraints.remove(c)
+                _mount_object_to_target(obj, target_info, fallback_armature=ob)
 
-                # Add new constraint to target
-                if target_empty:
-                    mount_equipment_to_slot(obj, target_empty, ob, snap=True)
-                else:
-                    # Use bone directly (no constraint)
-                    mount_equipment_to_bone(obj, ob, target_slot_name, snap=True)
-
-        
-        # Update state
         slot.is_in_hold_slot = not is_in_hold
-        
-        state_name = "hold" if not is_in_hold else "mount"
+        state_name = "mount" if is_in_hold else "hold"
         self.report({'INFO'}, f"'{slot.item_name}' moved to {state_name} slot")
         return {'FINISHED'}
 
@@ -3302,6 +4084,72 @@ class EQUIPMENT_OT_ShowBoundItem(bpy.types.Operator):
         slot = rig_settings.equipment_slots[self.slot_index]
         for obj in _iter_bound_item_objects(slot.equip_guid, self.bound_name):
             obj.hide_set(False)
+        return {'FINISHED'}
+
+
+class EQUIPMENT_OT_CopyResolvedGamePath(bpy.types.Operator):
+    bl_idname = "witcher.equipment_copy_resolved_game_path"
+    bl_label = "Copy Resolved Game Path"
+    bl_description = "Copy the selected equipment entry's resolved game-relative path to the clipboard"
+
+    entry_index: bpy.props.IntProperty(default=-1)
+
+    def execute(self, context):
+        temp_data = _get_temp_equipment_data(context)
+        if not temp_data or self.entry_index < 0 or self.entry_index >= len(temp_data.equipment_entries):
+            self.report({'WARNING'}, "No equipment entry selected")
+            return {'CANCELLED'}
+
+        entry = temp_data.equipment_entries[self.entry_index]
+        game_path = str(getattr(entry, "resolved_repo_path", "") or "").strip()
+        if not game_path:
+            _update_entry_resolved_repo_path(entry, context)
+            game_path = str(getattr(entry, "resolved_repo_path", "") or "").strip()
+        if not game_path:
+            self.report({'WARNING'}, "Resolved game path not available")
+            return {'CANCELLED'}
+
+        context.window_manager.clipboard = game_path
+        self.report({'INFO'}, "Copied resolved game path")
+        return {'FINISHED'}
+
+
+class EQUIPMENT_OT_OpenResolvedPathFolder(bpy.types.Operator):
+    bl_idname = "witcher.equipment_open_resolved_path_folder"
+    bl_label = "Open Resolved Path Folder"
+    bl_description = "Open the folder containing the resolved equipment file in Windows Explorer"
+
+    entry_index: bpy.props.IntProperty(default=-1)
+
+    def execute(self, context):
+        temp_data = _get_temp_equipment_data(context)
+        if not temp_data or self.entry_index < 0 or self.entry_index >= len(temp_data.equipment_entries):
+            self.report({'WARNING'}, "No equipment entry selected")
+            return {'CANCELLED'}
+
+        entry = temp_data.equipment_entries[self.entry_index]
+        abs_path = str(getattr(entry, "resolved_abs_path", "") or "").strip()
+        if not abs_path:
+            _update_entry_resolved_repo_path(entry, context)
+            abs_path = str(getattr(entry, "resolved_abs_path", "") or "").strip()
+        if not abs_path:
+            self.report({'WARNING'}, "Resolved absolute path not available")
+            return {'CANCELLED'}
+
+        folder = os.path.dirname(abs_path) if os.path.isfile(abs_path) else abs_path
+        if not os.path.isdir(folder):
+            self.report({'WARNING'}, f"Folder not found: {folder}")
+            return {'CANCELLED'}
+
+        import subprocess
+        try:
+            if os.path.isfile(abs_path):
+                subprocess.Popen(f'explorer /select,"{abs_path}"')
+            else:
+                subprocess.Popen(f'explorer "{folder}"')
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not open folder: {e}")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
 # Define the UI list to display included templates
@@ -3478,11 +4326,17 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
 
         appearances = entity_data.get('appearances', [])
 
-        # Check if selected appearance or armature has changed - sync temp data
-        arm_name = main_arm_obj.name if main_arm_obj else ""
-        if temp_data.last_app_list_index != app_list_index or temp_data.last_armature_name != arm_name:
+        # Check if selected appearance, armature instance, or entity state has changed.
+        arm_name = _make_temp_armature_key(main_arm_obj)
+        entity_state_token = _make_temp_entity_state_token(rig_settings)
+        if (
+            temp_data.last_app_list_index != app_list_index
+            or temp_data.last_armature_name != arm_name
+            or temp_data.last_entity_state_token != entity_state_token
+        ):
             temp_data.last_app_list_index = app_list_index
             temp_data.last_armature_name = arm_name
+            temp_data.last_entity_state_token = entity_state_token
             temp_data.equipment_entries.clear()
             temp_data.included_template_entries.clear()
 
@@ -3534,11 +4388,14 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                         # Also create persistent equipment_slots from appearance data
                         for entry_data in equipment_entries_data:
                             slot = rig_settings.equipment_slots.add()
+                            slot.source_game = temp_data.equipment_source_game
                             slot.category = entry_data.get('category', '')
                             item_name = entry_data.get('defaultItemName', '')
                             slot.item_name = item_name if item_name else ''
                             slot.equip_template = entry_data.get('equip_template', '')
                             slot.base_equip_template = slot.equip_template
+                            slot.resolved_repo_path = ""
+                            slot.keep_across_appearances = False
                             try:
                                 attrs = active_item_attributes.get(item_name, {})
                                 if attrs:
@@ -3681,17 +4538,22 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                     refresh_variant_states(rig_settings)
                 except Exception:
                     pass
-                visible_slots = [
-                    (i, slot)
-                    for i, slot in enumerate(rig_settings.equipment_slots)
-                    if _slot_has_active_selection(slot)
-                ]
-                for i, slot in visible_slots:
+                visible_slots = []
+                for i, slot in enumerate(rig_settings.equipment_slots):
+                    if not _slot_has_active_selection(slot):
+                        continue
+                    slot_policy = _resolve_slot_visual_policy(slot, main_arm_obj, rig_settings)
+                    if getattr(slot, "is_inventory", False) and slot_policy["policy"] == "nonvisual_on_rig":
+                        continue
+                    visible_slots.append((i, slot, slot_policy))
+                for i, slot, slot_policy in visible_slots:
                     row = box.row(align=True)
                     icon = 'CHECKMARK' if slot.is_loaded else 'RADIOBUT_OFF'
                     label_text = f"{slot.category}: {slot.item_name or 'None'}"
                     if getattr(slot, "variant_active", False):
                         label_text += " [VAR]"
+                    if slot_policy["policy"] == "hold_only_on_rig":
+                        label_text += " [Hold Only]"
                     row.label(text=label_text, icon=icon)
 
                     if _safe_json_list(getattr(slot, "variants_json", "")):
@@ -3701,10 +4563,23 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                         if getattr(slot, "variant_active", False):
                             row.label(text="", icon='CHECKMARK')
 
-                    if slot.is_loaded and get_effective_hold_slot(slot):
-                        is_in_hold = slot.is_in_hold_slot
+                    show_toggle = False
+                    toggle_text = ""
+                    toggle_icon = 'ARMATURE_DATA'
+                    if slot.is_loaded and slot_policy["hold_valid"]:
+                        is_in_hold = bool(slot.is_in_hold_slot)
                         toggle_icon = 'ARMATURE_DATA' if is_in_hold else 'FILE_3D'
-                        toggle_text = "->Mount" if is_in_hold else "->Hold"
+                        if slot_policy["policy"] == "hold_only_on_rig":
+                            toggle_text = "Put Away" if is_in_hold else "Hold"
+                        else:
+                            toggle_text = "->Mount" if is_in_hold else "->Hold"
+                        show_toggle = True
+                    elif not slot.is_loaded and slot_policy["policy"] == "hold_only_on_rig" and slot_policy["hold_valid"]:
+                        toggle_text = "Hold"
+                        toggle_icon = 'ARMATURE_DATA'
+                        show_toggle = True
+
+                    if show_toggle:
                         op = row.operator("witcher.equipment_toggle_item", text=toggle_text, icon=toggle_icon)
                         op.slot_index = i
 
@@ -3722,8 +4597,13 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                         op = row.operator("witcher.equipment_unload_equipment", text="", icon='X')
                         op.slot_index = i
                     else:
-                        op = row.operator("witcher.equipment_load_equipment", text="", icon='IMPORT')
-                        op.slot_index = i
+                        if slot_policy["policy"] == "equipable_on_rig":
+                            op = row.operator("witcher.equipment_load_equipment", text="", icon='IMPORT')
+                            op.slot_index = i
+
+                    if slot_policy["policy"] == "hold_only_on_rig":
+                        note_row = box.row(align=True)
+                        note_row.label(text="  No equip slot on current rig; item disappears when not held.", icon='INFO')
 
                     # Appearance dropdown for items with multiple dye/appearance variants
                     item_app_names = _safe_json_list(getattr(slot, 'item_appearances_json', ''))
@@ -3787,6 +4667,10 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
             index = temp_data.equipment_entries_index
             if index >= 0 and index < len(temp_data.equipment_entries):
                 entry = temp_data.equipment_entries[index]
+                try:
+                    _update_entry_resolved_repo_path(entry, context, armature=main_arm_obj, rig_settings=rig_settings)
+                except Exception:
+                    pass
                 row = box.row(align=True)
                 row.label(text="Category:")
                 op = row.operator("witcher.equipment_search_category",
@@ -3805,6 +4689,19 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                 box.label(text=f"Variants: {entry.variants_summary or 'None'}")
                 box.label(text=f"Bound Items: {entry.bound_items_summary or 'None'}")
                 box.label(text=f"Tags: {entry.tags_summary or 'None'}")
+                repo_row = box.row(align=True)
+                repo_value = repo_row.row()
+                repo_value.enabled = False
+                repo_value.prop(entry, "resolved_repo_path", text="Resolved Game Path")
+                repo_actions = repo_row.row(align=True)
+                repo_actions.enabled = bool(
+                    str(getattr(entry, "resolved_repo_path", "") or "").strip()
+                    or str(getattr(entry, "resolved_abs_path", "") or "").strip()
+                )
+                op = repo_actions.operator("witcher.equipment_copy_resolved_game_path", text="", icon='COPYDOWN')
+                op.entry_index = index
+                op = repo_actions.operator("witcher.equipment_open_resolved_path_folder", text="", icon='FILE_FOLDER')
+                op.entry_index = index
 
                 if entry.hold_slot:
                     box.operator("witcher.equipment_toggle_item", text="Toggle Item Manipulation")
@@ -3902,9 +4799,12 @@ class EQUIPMENT_OT_AddCategory(bpy.types.Operator):
             return {'CANCELLED'}
 
         slot = rig_settings.equipment_slots.add()
+        slot.source_game = _get_temp_source_game(context)
         slot.item_name = "None"
         slot.equip_template = ""
         slot.base_equip_template = ""
+        slot.resolved_repo_path = ""
+        slot.keep_across_appearances = True
 
         _set_temp_equipment_auto_apply_suspended(context, True)
         try:
@@ -4027,6 +4927,8 @@ def sync_equipment_slots_to_temp(context, rig_settings):
         armature, _active_rig_settings = _get_armature_and_rig_settings(context)
     except Exception:
         armature = None
+    armature_key = _make_temp_armature_key(armature)
+    entity_state_token = _make_temp_entity_state_token(rig_settings)
     try:
         temp_data.equipment_source_game = _infer_source_game_from_rig_settings(rig_settings, armature)
     except Exception:
@@ -4055,10 +4957,11 @@ def sync_equipment_slots_to_temp(context, rig_settings):
 
             entry = temp_data.equipment_entries.add()
             entry.slot_index = slot_index
-            entry.source_game = temp_data.equipment_source_game
+            entry.source_game = _normalize_source_game(getattr(slot, "source_game", "") or temp_data.equipment_source_game)
             entry.category = slot.category
             entry.defaultItemName = item_name
             entry.equip_template = slot.equip_template or ""
+            entry.resolved_repo_path = slot.resolved_repo_path or ""
             entry.equip_slot = slot.equip_slot or ""
             entry.hold_slot = slot.hold_slot or ""
             entry.weapon = slot.weapon
@@ -4086,14 +4989,15 @@ def sync_equipment_slots_to_temp(context, rig_settings):
                 entry.tags_summary = ", ".join([str(t) for t in tags if t])
             except Exception:
                 entry.tags_summary = ""
+            _update_entry_resolved_repo_path(entry, context, armature=armature, rig_settings=rig_settings)
     finally:
         _set_temp_equipment_auto_apply_suspended(context, False)
 
     # Force the draw sync to recognize current state
     try:
         temp_data.last_app_list_index = rig_settings.app_list_index
-        if armature:
-            temp_data.last_armature_name = armature.name
+        temp_data.last_armature_name = armature_key
+        temp_data.last_entity_state_token = entity_state_token
     except Exception:
         pass
     if len(temp_data.equipment_entries) == 0:
@@ -4157,20 +5061,76 @@ def _prepare_equipment_load_context(armature, rig_settings, prepared_context=Non
     prepared.setdefault("item_entity_cache", {})
     return prepared
 
-def _get_inventory_group(armature, rig_settings):
-    """Find or create a shared inventory empty under the armature."""
-    group_name = f"{rig_settings.entity_name}_inventory"
+def _get_shared_equipment_group(armature, rig_settings, *, suffix, marker_name, hidden):
+    """Find or create a shared equipment empty under the armature."""
+    group_name = f"{rig_settings.entity_name}_{suffix}"
+    owner_armature_name = getattr(armature, "name_full", getattr(armature, "name", ""))
+    inv_group = None
     for child in armature.children:
-        if child.type == 'EMPTY' and child.name == group_name:
-            return child
-    bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-    inv_group = bpy.context.object
+        if child.type != 'EMPTY':
+            continue
+        if child.name == group_name or child.get(marker_name):
+            inv_group = child
+            break
+    if inv_group is None:
+        inv_group = bpy.data.objects.new(group_name, None)
+        linked = False
+        for collection in getattr(armature, "users_collection", []) or []:
+            try:
+                collection.objects.link(inv_group)
+                linked = True
+                break
+            except Exception:
+                continue
+        if not linked:
+            try:
+                bpy.context.collection.objects.link(inv_group)
+            except Exception:
+                bpy.context.scene.collection.objects.link(inv_group)
     inv_group.name = group_name
     inv_group.parent = armature
+    inv_group.parent_type = 'OBJECT'
+    try:
+        inv_group.matrix_parent_inverse = Matrix.Identity(4)
+        inv_group.matrix_local = Matrix.Identity(4)
+    except Exception:
+        pass
+    inv_group.empty_display_type = 'PLAIN_AXES'
+    inv_group.empty_display_size = 0.02
+    inv_group[marker_name] = True
+    inv_group["witcher_owner_armature"] = owner_armature_name
+    _clear_internal_inventory_group_state(inv_group)
+    if hasattr(inv_group, "show_relationship_lines"):
+        inv_group.show_relationship_lines = False
+    inv_group.hide_set(bool(hidden))
+    inv_group.hide_render = bool(hidden)
     return inv_group
 
+
+def _get_inventory_group(armature, rig_settings):
+    """Find or create a shared inventory empty under the armature."""
+    return _get_shared_equipment_group(
+        armature,
+        rig_settings,
+        suffix="inventory",
+        marker_name="witcher_inventory_group",
+        hidden=True,
+    )
+
+
+def _get_persistent_equipment_group(armature, rig_settings):
+    """Find or create a shared manual-equipment empty under the armature."""
+    return _get_shared_equipment_group(
+        armature,
+        rig_settings,
+        suffix="equipment",
+        marker_name="witcher_persistent_equipment_group",
+        hidden=False,
+    )
+
 def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, prepared_context=None,
-                              refresh_variants_before_load=True, post_refresh_variants=True):
+                              refresh_variants_before_load=True, post_refresh_variants=True,
+                              mount_mode=None):
     if rig_settings is None:
         rig_settings = armature.data.witcherui_RigSettings
 
@@ -4186,6 +5146,18 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         except Exception:
             pass
 
+    requested_mount_mode = str(mount_mode or "").strip().lower()
+    if requested_mount_mode not in {"equip", "hold"}:
+        requested_mount_mode = "hold" if (slot.is_loaded and slot.is_in_hold_slot) else "equip"
+    effective_equip_slot_name = str(get_effective_equip_slot(slot) or "").strip()
+    effective_hold_slot_name = str(get_effective_hold_slot(slot) or "").strip()
+    allow_unmounted_visual_load = (
+        requested_mount_mode == "equip"
+        and not bool(getattr(slot, "is_inventory", False))
+        and not effective_equip_slot_name
+        and not effective_hold_slot_name
+    )
+
     effective_template = get_effective_equip_template(slot)
     if not effective_template or effective_template == "None":
         _set_last_equipment_load_failure(
@@ -4194,12 +5166,10 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         )
         return False
 
-    if slot.is_loaded and slot.equip_guid:
-        remove_objects_by_guid(slot.equip_guid, "witcher_equip_guid")
-        slot.equip_guid = ""
-        slot.is_loaded = False
-
     prepared = _prepare_equipment_load_context(armature, rig_settings, prepared_context)
+    target_key = "hold_target" if requested_mount_mode == "hold" else "equip_target"
+    target_label = "hold" if requested_mount_mode == "hold" else "equip"
+
     source_roots = prepared.get("source_roots", [])
     final_item, export_path, _search_pattern = _resolve_bundle_item_by_template_cached(
         effective_template,
@@ -4219,6 +5189,16 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         log.warning(reason)
         return False
 
+    resolved_repo_path = str(getattr(final_item, "name", "") or "").replace("/", "\\").lstrip("\\")
+    if not resolved_repo_path:
+        try:
+            from ..importers.import_mesh import get_repo_from_abs_path
+            resolved_repo_path = str(get_repo_from_abs_path(export_path) or "").replace("/", "\\").lstrip("\\")
+        except Exception:
+            resolved_repo_path = ""
+    slot.source_game = _normalize_source_game(get_equipment_source_game_for_search_roots(source_roots))
+    slot.resolved_repo_path = resolved_repo_path
+
     # Populate item appearance list from entity (runs even if already loaded)
     item_entity_for_apps = _get_cached_equipment_item_entity(export_path, prepared_context=prepared)
     if item_entity_for_apps and getattr(item_entity_for_apps, 'appearances', None):
@@ -4229,6 +5209,45 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         slot.item_appearances_json = ""
         slot.item_coloring_json = ""
 
+    attachment_profile = import_entity.classify_equipment_attachment_profile(item_entity_for_apps)
+    _maybe_log_legacy_attachment_type_conflict(
+        getattr(slot, "item_name", "") or effective_template,
+        getattr(slot, "attachment_type", ""),
+        attachment_profile,
+    )
+    slot_policy = _resolve_slot_visual_policy(
+        slot,
+        armature,
+        rig_settings,
+        item_entity=item_entity_for_apps,
+        attachment_profile=attachment_profile,
+    )
+    target_info = slot_policy[target_key]
+    target_armature = target_info.get("armature") or armature
+    mount_strategy = _infer_equipment_mount_strategy(
+        attachment_profile,
+        target_info,
+        allow_unmounted_visual=allow_unmounted_visual_load,
+    )
+    log.info(
+        "Equipment attachment '%s': profile=%s strategy=%s target=%s",
+        getattr(slot, "item_name", "") or effective_template,
+        getattr(attachment_profile, "kind", "") or "unknown",
+        mount_strategy,
+        _describe_mount_target(target_info),
+    )
+    if mount_strategy == "nonvisual":
+        reason = f"Template '{effective_template}' resolves to inventory data only; no visual entity to load"
+        _set_last_equipment_load_failure(armature, slot_index, reason)
+        return False
+    if mount_strategy == "invalid_target":
+        if requested_mount_mode == "equip" and slot_policy["hold_valid"]:
+            reason = f"No valid equip slot on current rig for '{slot.item_name}'; use Hold instead"
+        else:
+            reason = f"No valid {target_label} target on current rig for '{slot.item_name}'"
+        _set_last_equipment_load_failure(armature, slot_index, reason)
+        return False
+
     entity = prepared.get("entity")
     appearance = prepared.get("appearance")
     if entity is None:
@@ -4237,12 +5256,11 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         log.warning(reason)
         return False
 
-    guid = generate_guid()
-    before = set(bpy.data.objects)
-
     empty_transform = None
     if getattr(slot, "is_inventory", False):
         empty_transform = _get_inventory_group(armature, rig_settings)
+    elif getattr(slot, "keep_across_appearances", False):
+        empty_transform = _get_persistent_equipment_group(armature, rig_settings)
     else:
         if appearance:
             for child in armature.children:
@@ -4255,6 +5273,15 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
             empty_transform.name = "equipment_group"
             empty_transform.parent = armature
 
+    if slot.is_loaded and slot.equip_guid:
+        remove_objects_by_guid(slot.equip_guid, "witcher_equip_guid")
+        slot.equip_guid = ""
+        slot.is_loaded = False
+        slot.is_in_hold_slot = False
+
+    guid = generate_guid()
+    before = set(bpy.data.objects)
+
     saved_world = _temp_reset_armature_world(armature)
     changed_poses = _set_pose_all_armatures(armature, "REST")
     try:
@@ -4266,9 +5293,14 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
             appearance,
             slot_index,
             empty_transform,
-            use_app_drivers=not getattr(slot, "is_inventory", False),
+            use_app_drivers=_slot_uses_appearance_drivers(slot),
             prepared_context=prepared,
             item_appearance_name=getattr(slot, 'item_appearance_name', None) or None,
+            attachment_profile=attachment_profile,
+            bind_root_chunks_to_entity=_should_bind_root_chunks_to_entity(
+                attachment_profile,
+                mount_strategy,
+            ),
         )
     except Exception as e:
         reason = f"Import failed for '{getattr(final_item, 'name', effective_template)}': {e}"
@@ -4281,6 +5313,24 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
     new_objects = tag_new_objects_with_guid(before, guid, "witcher_equip_guid")
     slot.equip_guid = guid
     slot.is_loaded = True
+
+    try:
+        selected_item_appearance = str(import_info.get("selected_appearance_name", "") or "").strip()
+        if selected_item_appearance == "__default__":
+            selected_item_appearance = ""
+        import_entity.stamp_import_origin(
+            new_objects,
+            origin="equipment_slot",
+            entity_path=slot.resolved_repo_path,
+            source_game=slot.source_game,
+            item_category=slot.category,
+            item_name=slot.item_name,
+            equip_template=effective_template or slot.equip_template,
+            item_appearance=selected_item_appearance,
+            owner_entity_path=getattr(rig_settings, "repo_path", ""),
+        )
+    except Exception as e:
+        log.warning("Failed to stamp equipment import origin for '%s': %s", slot.item_name, e)
 
     try:
         import_entity.initialize_imported_entity_armatures(
@@ -4317,26 +5367,27 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
 
     slot_empty = None
     main_mount_anchor = None
-    effective_equip_slot = get_effective_equip_slot(slot)
-    if effective_equip_slot and new_objects:
-        entity_name = rig_settings.entity_name
-        slot_empty = find_slot_empty(entity_name, effective_equip_slot, armature)
-        if slot_empty:
-            mount_roots = _collect_mount_roots(new_objects, ignored_objects={empty_transform})
-            if _mount_roots_are_animated(mount_roots):
-                main_mount_anchor = _mount_animated_roots_with_anchor(
-                    mount_roots,
-                    slot.equip_guid,
-                    "main",
-                    empty_transform,
-                    slot_empty=slot_empty,
-                    armature=armature,
-                )
-                if main_mount_anchor is not None:
-                    new_objects.add(main_mount_anchor)
-            else:
-                for root in mount_roots:
-                    mount_equipment_to_slot(root, slot_empty, armature, snap=True)
+    if target_info.get("target_type") == "slot":
+        slot_empty = target_info.get("slot_empty")
+    if new_objects:
+        mount_roots = _collect_mount_roots(new_objects, ignored_objects={empty_transform})
+        if mount_strategy == "slot_mount_animated" and target_info["is_valid"]:
+            main_mount_anchor = _mount_animated_roots_with_anchor(
+                mount_roots,
+                slot.equip_guid,
+                "main",
+                empty_transform,
+                slot_empty=slot_empty if target_info.get("target_type") == "slot" else None,
+                armature=target_armature,
+                bone_name=target_info.get("bone_name") if target_info.get("target_type") == "bone" else None,
+            )
+            if main_mount_anchor is not None:
+                new_objects.add(main_mount_anchor)
+        elif mount_strategy == "slot_mount_static" and target_info["is_valid"]:
+            for root in mount_roots:
+                _mount_object_to_target(root, target_info, fallback_armature=armature)
+
+    slot.is_in_hold_slot = requested_mount_mode == "hold"
 
     try:
         _load_bound_items(
@@ -4348,6 +5399,7 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
             new_objects,
             empty_transform,
             slot_empty,
+            target_armature=target_armature,
             prepared_context=prepared,
             imported_template_keys=import_info.get("template_keys", []),
         )
@@ -4364,7 +5416,7 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
     return True
 
 
-def load_equipment_item(context, armature, slot_index, rig_settings=None):
+def load_equipment_item(context, armature, slot_index, rig_settings=None, mount_mode=None):
     """Load a single equipment item into the scene, tagged with GUID."""
     return _load_equipment_item_core(
         context,
@@ -4374,11 +5426,12 @@ def load_equipment_item(context, armature, slot_index, rig_settings=None):
         prepared_context=None,
         refresh_variants_before_load=True,
         post_refresh_variants=True,
+        mount_mode=mount_mode,
     )
 
 
 def load_equipment_items_batch(context, armature, slot_indices, rig_settings=None, prepared_context=None,
-                               reload_loaded=False, post_refresh_variants=True):
+                               reload_loaded=False, post_refresh_variants=True, mount_mode="equip"):
     if rig_settings is None:
         rig_settings = armature.data.witcherui_RigSettings
 
@@ -4409,6 +5462,9 @@ def load_equipment_items_batch(context, armature, slot_indices, rig_settings=Non
         slot = slots[idx]
         if slot.is_loaded and slot.equip_guid and not reload_loaded:
             continue
+        slot_policy = _resolve_slot_visual_policy(slot, armature, rig_settings)
+        if mount_mode == "equip" and slot_policy["policy"] != "equipable_on_rig":
+            continue
         if _load_equipment_item_core(
             context,
             armature,
@@ -4417,6 +5473,7 @@ def load_equipment_items_batch(context, armature, slot_indices, rig_settings=Non
             prepared_context=prepared,
             refresh_variants_before_load=False,
             post_refresh_variants=False,
+            mount_mode=mount_mode,
         ):
             loaded += 1
 
@@ -4434,6 +5491,7 @@ def unload_equipment_item(slot):
         count = remove_objects_by_guid(slot.equip_guid, "witcher_equip_guid")
         slot.equip_guid = ""
         slot.is_loaded = False
+        slot.is_in_hold_slot = False
         return count
     return 0
 
@@ -4515,6 +5573,17 @@ def load_template_item(context, armature, slot_index, rig_settings=None):
     new_objects = tag_new_objects_with_guid(before, guid, "witcher_template_guid")
     slot.template_guid = guid
     slot.is_loaded = True
+
+    try:
+        import_entity.stamp_import_origin(
+            new_objects,
+            origin="template_slot",
+            entity_path=slot.template_filename,
+            source_game=getattr(rig_settings, "source_game", "w3"),
+            owner_entity_path=getattr(rig_settings, "repo_path", ""),
+        )
+    except Exception as e:
+        log.warning("Failed to stamp template import origin for '%s': %s", slot.template_filename, e)
     
     # Restore armature as active object (Bug 2 fix)
     bpy.ops.object.select_all(action='DESELECT')
@@ -4567,6 +5636,9 @@ class EQUIPMENT_OT_LoadEquipment(bpy.types.Operator):
         with mod_loading_context(context):
             if self.slot_index == -1:
                 for i in range(len(slots)):
+                    slot_policy = _resolve_slot_visual_policy(slots[i], armature, rig_settings)
+                    if slot_policy["policy"] != "equipable_on_rig":
+                        continue
                     if load_equipment_item(context, armature, i, rig_settings):
                         loaded += 1
                     else:
@@ -5047,6 +6119,8 @@ classes = [
     EQUIPMENT_OT_ShowEquipment,
     EQUIPMENT_OT_HideBoundItem,
     EQUIPMENT_OT_ShowBoundItem,
+    EQUIPMENT_OT_CopyResolvedGamePath,
+    EQUIPMENT_OT_OpenResolvedPathFolder,
     EQUIPMENT_OT_LoadEquipment,
     EQUIPMENT_OT_UnloadEquipment,
     EQUIPMENT_OT_LoadTemplate,

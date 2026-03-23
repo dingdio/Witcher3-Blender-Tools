@@ -489,6 +489,10 @@ class witcherui_RigSettings(bpy.types.PropertyGroup):
                                             name="Main Face Rig",
                                             description="Name of the rig",
                                             default="")
+    source_game : StringProperty(
+                                            name="Source Game",
+                                            description="w2 or w3, set from entity.version at import time",
+                                            default="w3")
     repo_path : StringProperty(
                                             name="Entity File",
                                             description="Entity Location in game files",
