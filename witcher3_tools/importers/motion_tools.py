@@ -854,7 +854,7 @@ def get_root_motion_mode(armature_obj):
 # =============================================================================
 # ROOT MOTION CONTROLLER EMPTY SYSTEM
 # =============================================================================
-# This approach creates a separate Empty object that follows Trajectory/Reference
+# This approach creates a separate Empty object that follows Trajectory
 # bones via constraints. The armature is parented to the empty, so toggling
 # the constraint influence switches between root motion and in-place modes.
 

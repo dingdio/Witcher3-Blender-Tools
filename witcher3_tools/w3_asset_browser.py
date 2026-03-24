@@ -19,7 +19,7 @@ from .CR2W.witcher_cache.Bundles import LoadBundleManager
 from .CR2W.witcher_cache.Bundles.BundleItem import BundleItem
 from .CR2W.witcher_cache.blender_common import get_game_path
 from .CR2W.witcher_cache import cache_meta
-from . import get_uncook_path
+from . import get_uncook_path, get_all_addon_prefs
 from .extension_paths import get_cache_root
 from .CR2W.common_blender import (
     repo_file,
@@ -2234,9 +2234,10 @@ class MyImageActionOperator(bpy.types.Operator):
             self.report({'WARNING'}, f"Could not find/export: {self.repo_path}")
             return {'CANCELLED'}
         if not import_entity.try_apply_inventory_file_to_selected_character(context, abs_path):
-            import_entity.import_ent_template(abs_path, False, 1)
-        # If you still want to use print, uncomment the following line
-        # print(f"Selected image: {self.image_name}, Repo Path: {self.repo_path}")
+            arm_obj = import_entity.import_ent_template(abs_path, False, 1)
+            if arm_obj and get_all_addon_prefs(context).import_idle_animation:
+                from .importers.import_anims import load_idle_animation_for_armature as _load_idle_anim
+                _load_idle_anim(context, arm_obj)
         return {'FINISHED'}
 
 

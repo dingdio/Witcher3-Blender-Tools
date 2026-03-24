@@ -593,6 +593,23 @@ def _collect_rig_import_paths(cr2w_file):
             out.append(candidate)
     return out
 
+def _collect_beh_import_paths(cr2w_file):
+    """Collect CBehaviorGraph depot paths (.w2beh) from a CR2W file's import table."""
+    out = []
+    if not cr2w_file:
+        return out
+    imports = getattr(cr2w_file, "CR2WImport", None) or []
+    for imp in imports:
+        class_name = _class_name_from_import(cr2w_file, imp)
+        if class_name not in (None, "CBehaviorGraph"):
+            continue
+        raw_path = getattr(imp, "path", None) or getattr(imp, "DepotPath", None)
+        candidate = _normalize_repo_path_value(raw_path, ".w2beh")
+        if candidate:
+            out.append(candidate)
+    return out
+
+
 def _mesh_path_from_import_index(chunk, import_index):
     cr2w_file = getattr(chunk, "_W_CLASS__CR2WFILE", None) if chunk else None
     return _resolve_repo_path_from_import_index(cr2w_file, import_index, ".w2mesh")
@@ -2688,6 +2705,7 @@ def create_CEntity(file, _inherit_visited=None):
                 this_Entity.MovingPhysicalAgentComponent = ent
                 break
     this_Entity.staticMeshes = new_mesh
+    this_Entity.beh_paths = _collect_beh_import_paths(file)
     return this_Entity
 
 def load_bin_entity(fileName) -> w3_types.Entity:

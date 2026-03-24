@@ -60,6 +60,15 @@ def _safe_mode_set(mode, obj=None):
         log.debug("Skipping mode_set(%s) on %s: %s", mode, getattr(active, "name", "<unknown>"), exc)
         return False
 
+
+def _find_anim_bone(bones, *names):
+    """Return the first animation bone whose name matches one of the candidates."""
+    for name in names:
+        for bone in bones:
+            if bone.BoneName == name:
+                return bone
+    return None
+
 def shouldIgnoreFrame(bone):
     checkArr = [1,1,1]
     #if bone.BoneName == "lowwer_left_lip":
@@ -369,25 +378,24 @@ class AnimImporter:
         )
 
 
-        use_Reference_as_Root = True
-        if use_Reference_as_Root:
-            root_bone, reference_bone = None, None
-            for bone in anim_desc.bones:
-                if bone.BoneName == "Root":
-                    root_bone = bone
-                elif bone.BoneName == "Reference":
-                    reference_bone = bone
-            if root_bone and reference_bone:
-                root_bone.positionFrames = [[0.0, 0.0, 0.0]] #reference_bone.positionFrames 
-                root_bone.position_dt = reference_bone.position_dt 
-                root_bone.position_numFrames = 1 #reference_bone.position_numFrames 
-                root_bone.rotationFrames = reference_bone.rotationFrames 
-                root_bone.rotationFramesQuat = reference_bone.rotationFramesQuat 
-                root_bone.rotation_dt = reference_bone.rotation_dt 
-                root_bone.rotation_numFrames = reference_bone.rotation_numFrames 
-                root_bone.scaleFrames = [[1.0, 1.0, 1.0]]# reference_bone.scaleFrames 
-                root_bone.scale_dt = reference_bone.scale_dt 
-                root_bone.scale_numFrames = 1# reference_bone.scale_numFrames 
+        use_root_source_bone = True
+        if use_root_source_bone:
+            root_bone = _find_anim_bone(anim_desc.bones, "Root")
+            # Prefer Trajectory
+            source_bone = _find_anim_bone(anim_desc.bones, "Trajectory", "Reference")
+            if root_bone and source_bone:
+                if source_bone.BoneName != "Trajectory":
+                    log.info("Animation '%s': using '%s' as Root fallback", SkeletalAnimation.name, source_bone.BoneName)
+                root_bone.positionFrames = [[0.0, 0.0, 0.0]]
+                root_bone.position_dt = source_bone.position_dt
+                root_bone.position_numFrames = 1
+                root_bone.rotationFrames = source_bone.rotationFrames
+                root_bone.rotationFramesQuat = source_bone.rotationFramesQuat
+                root_bone.rotation_dt = source_bone.rotation_dt
+                root_bone.rotation_numFrames = source_bone.rotation_numFrames
+                root_bone.scaleFrames = [[1.0, 1.0, 1.0]]
+                root_bone.scale_dt = source_bone.scale_dt
+                root_bone.scale_numFrames = 1
         
         #add detected namespace to aniamtion data
         if armature_namespace:
@@ -1299,3 +1307,81 @@ def start_import(context, fileName = False, load_from_data = False, rigPath = No
     # GLOBAL_ANIMSET = animSetTemplate
     for node in animSetTemplate.animations:
         item = NewW2ANIMSListItem(treeList, node)
+
+
+def load_idle_animation_for_armature(context, armature_obj):
+    """Load and apply the idle animation stored on an armature's rig_settings.
+
+    Returns True if the idle animation was applied, False otherwise.
+    """
+    try:
+        rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+        if rig_settings is None:
+            return False
+
+        idle_name = (getattr(rig_settings, "idle_animation_name", "") or "").strip()
+        if not idle_name:
+            return False
+
+        # Collect all real animset paths (skip group header entries that end with ":")
+        anim_paths = []
+        for item in getattr(rig_settings, "animset_list", []) or []:
+            p = (getattr(item, "path", "") or "").strip()
+            if p and not p.endswith(":"):
+                anim_paths.append(p)
+        if not anim_paths:
+            return False
+
+        from ..CR2W.common_blender import repo_file as _repo_file
+        from ..CR2W.dc_anims import load_bin_anims_single
+        import os
+        from .. import get_uncook_path
+
+        skel = (getattr(rig_settings, "main_entity_skeleton", "") or "").strip()
+        rig_path = _repo_file(skel) if skel else None
+
+        for anim_path in anim_paths:
+            # Phase 1: locate animation entry — catch parse/IO errors, skip to next animset
+            animation = None
+            try:
+                _repo_file(anim_path)
+                fdir = os.path.join(get_uncook_path(context), anim_path)
+                if os.path.exists(fdir + ".json"):
+                    fdir += ".json"
+                if not os.path.exists(fdir):
+                    continue
+
+                _, ext = os.path.splitext(fdir)
+                if ext.lower() == ".json":
+                    anim_set = import_w3_animSet(fdir, rig_path)
+                    if not anim_set:
+                        continue
+                    def _ename(e):
+                        return getattr(getattr(e, "animation", None), "name", None) or ""
+                    animation = next((e for e in anim_set.animations if _ename(e) == idle_name), None)
+                    if animation is None:
+                        animation = next((e for e in anim_set.animations if _ename(e).lower() == idle_name.lower()), None)
+                else:
+                    result = load_bin_anims_single(fdir, idle_name, rigPath=rig_path)
+                    if result and result.animations:
+                        animation = result.animations[0]
+            except Exception:
+                log.debug("load_idle_animation_for_armature: parse error in %s", anim_path, exc_info=True)
+                continue
+
+            if animation is None:
+                continue
+
+            # Phase 2: apply to Blender — errors here are real failures, log at WARNING
+            log.debug("load_idle_animation_for_armature: found '%s' in %s, applying…", idle_name, anim_path)
+            import_anim(context, fdir, animation, use_NLA=False, override_select=armature_obj)
+            log.info("Applied idle animation '%s' to %s", idle_name, getattr(armature_obj, "name", "?"))
+            return True
+
+        log.warning("load_idle_animation_for_armature: '%s' not found in any of %d animsets for %s",
+                    idle_name, len(anim_paths), getattr(armature_obj, "name", "?"))
+        return False
+
+    except Exception:
+        log.warning("load_idle_animation_for_armature failed: %s", getattr(armature_obj, "name", "?"), exc_info=True)
+        return False

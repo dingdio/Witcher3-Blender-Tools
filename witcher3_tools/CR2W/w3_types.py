@@ -2197,6 +2197,7 @@ class Entity(base_w3):
                 slots = [],
                 version = 999,
                 inventoryDefinitions = None,
+                beh_paths = None,
                 **kwargs):
         self.name:str = name
         self.MovingPhysicalAgentComponent = MovingPhysicalAgentComponent
@@ -2208,6 +2209,7 @@ class Entity(base_w3):
         self.slots: List[EntitySlot] = slots
         self.version:int = version
         self.inventoryDefinitions = inventoryDefinitions if inventoryDefinitions is not None else []
+        self.beh_paths: list = beh_paths if beh_paths is not None else []
 
     @classmethod
     def from_json(cls, data):

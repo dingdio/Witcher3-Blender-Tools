@@ -636,6 +636,13 @@ class WITCH_OT_w2ent(bpy.types.Operator, ImportHelper):
     filename_ext = ".w2ent"
     filter_glob: StringProperty(default='*.w2ent;*.w2ent.json', options={'HIDDEN'})
 
+    def draw(self, context):
+        layout = self.layout
+        addon_prefs = get_all_addon_prefs(context)
+        box = layout.box()
+        box.label(text="Settings")
+        box.prop(addon_prefs, "import_idle_animation")
+
     def execute(self, context):
         log.debug("importing entity")
         fdir = self.filepath
@@ -645,12 +652,14 @@ class WITCH_OT_w2ent(bpy.types.Operator, ImportHelper):
                 return {'CANCELLED'}
             ext = file_helpers.getFilenameType(fdir)
             if ext == ".w2ent" or fdir.endswith(".json"):
-                import_entity.import_direct_entity_file(
+                arm_obj = import_entity.import_direct_entity_file(
                     fdir,
                     load_face_poses=False,
                     import_apperance=0,
                     parent_transform=None,
                 )
+                if arm_obj and get_all_addon_prefs(context).import_idle_animation:
+                    import_anims.load_idle_animation_for_armature(context, arm_obj)
             else:
                 self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
                 return {'CANCELLED'}
@@ -729,6 +738,9 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
             for prop in section_options[section]:
                 box.prop(self, prop)
         addon_prefs = get_all_addon_prefs(context)
+        anim_box = layout.box()
+        anim_box.label(text="Global Animation Settings", icon='ARMATURE_DATA')
+        anim_box.prop(addon_prefs, "import_idle_animation")
         redcloth_box = layout.box()
         redcloth_box.label(text="Global Redcloth Settings", icon='MATCLOTH')
         redcloth_box.prop(addon_prefs, "do_import_redcloth")
@@ -750,12 +762,14 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
                 from ..ui.ui_equipment import EquipmentDefinitionEntry as _EDE
                 if not getattr(_EDE, "item_attributes", None):
                     bpy.ops.witcher.equipment_refresh_categories()
-                import_entity.import_ent_template(
+                arm_obj = import_entity.import_ent_template(
                     fdir,
                     False,
                     self.import_apperance,
                     parent_transform=None,
                 )
+                if arm_obj and get_all_addon_prefs(context).import_idle_animation:
+                    import_anims.load_idle_animation_for_armature(context, arm_obj)
             else:
                 self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
                 return {'CANCELLED'}

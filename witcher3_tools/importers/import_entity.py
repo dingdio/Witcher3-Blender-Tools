@@ -37,6 +37,7 @@ from ..CR2W.CR2W_types import EngineTransform
 from ..importers.import_helpers import set_blender_object_transform
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
 from ..CR2W.common_blender import repo_file
+from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
 from .. import get_do_fix_tail
 from ..ui.ui_equipment import (
     generate_guid, tag_new_objects_with_guid, remove_objects_by_guid,
@@ -1121,6 +1122,10 @@ def initialize_entity_armature_state(armature_obj, entity, *, filename="", impor
             NewAnimsetListItem(animset_list, f"{group_name}:", group_name)
             for path in paths:
                 NewAnimsetListItem(animset_list, path, group_name)
+
+        # Populate idle animation
+        _populate_idle_animation(rig_settings, entity)
+
         return rig_settings
     finally:
         if added_import_guard:
@@ -1917,6 +1922,41 @@ def _collect_armature_animset_groups(entity, armature_obj):
             _add_group(f"{_get_entry_attr(mimic_set, 'name', 'MimicSets')} (Mimic)", _get_entry_attr(mimic_set, "animationSets", []))
 
     return [(group_name, paths) for group_name, paths in groups if paths]
+
+
+def _populate_idle_animation(rig_settings, entity):
+    """Read all .w2beh files on the entity and store the best idle animation name."""
+    beh_paths = getattr(entity, "beh_paths", None) or []
+    if not beh_paths:
+        return
+
+    candidates = []  # [(anim_name, depot_path)]
+    for depot_path in beh_paths:
+        try:
+            abs_path = repo_file(depot_path)
+        except Exception:
+            continue
+        if not abs_path or not os.path.isfile(abs_path):
+            continue
+        try:
+            info = _read_beh_info(abs_path)
+        except Exception:
+            continue
+        if info.idle_animation:
+            candidates.append((info.idle_animation, depot_path))
+            log.debug("beh idle candidate: %s  (from %s)", info.idle_animation, depot_path)
+
+    if not candidates:
+        return
+
+    # Apply the same heuristic used within a single beh to choose across beh files.
+    # This ensures locomotion_idle beats combat_locomotion_*_idle or man_carry_crate_idle
+    # even when they come from different beh files.
+    chosen_name = _beh_guess_idle([name for name, _ in candidates])
+    chosen_path = next((path for name, path in candidates if name == chosen_name), candidates[0][1])
+
+    rig_settings.idle_animation_name = chosen_name
+    log.debug("beh idle animation: %s  (from %s)", chosen_name, chosen_path)
 
 
 def _get_inventory_item_name(entry):

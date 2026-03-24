@@ -512,6 +512,9 @@ class witcherui_RigSettings(bpy.types.PropertyGroup):
     animset_list_index : IntProperty(name = "Index for Animset list",
                                              default = 0)
 
+    # Behavior graph info (populated by dc_beh.read_beh_info on entity import)
+    idle_animation_name : StringProperty(name="Idle Animation", default="")
+
     jsonData: StringProperty(name="Json Data",
                             description="Json Data of entire character",
                             default="")

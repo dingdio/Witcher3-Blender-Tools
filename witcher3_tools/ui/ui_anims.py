@@ -98,6 +98,34 @@ def _animset_repo_compare_key(context, repo_rel_path):
     return _animset_compare_key(abs_path)
 
 
+def _resolve_root_orientation_action(armature_obj):
+    if not armature_obj or armature_obj.type != 'ARMATURE' or not armature_obj.animation_data:
+        return None
+
+    action = None
+    if armature_obj.animation_data.nla_tracks:
+        anim_import_track = armature_obj.animation_data.nla_tracks.get('anim_import')
+        if anim_import_track and anim_import_track.strips:
+            for strip in reversed(anim_import_track.strips):
+                if strip.action:
+                    action = strip.action
+                    break
+
+    if action is None:
+        action = armature_obj.animation_data.action
+
+    if action is None and armature_obj.animation_data.nla_tracks:
+        for track in armature_obj.animation_data.nla_tracks:
+            for strip in track.strips:
+                if strip.action:
+                    action = strip.action
+                    break
+            if action:
+                break
+
+    return action
+
+
 def _get_loaded_animset_ui_state(context):
     scene = getattr(context, "scene", None)
     if scene is None:
@@ -606,7 +634,7 @@ class WITCH_OT_RemoveRootMotionDrivers(bpy.types.Operator):
 # =============================================================================
 
 class WITCH_OT_SetupRootMotionController(bpy.types.Operator):
-    """Create a controller empty that follows Trajectory/Reference - armature parents to it for root motion control"""
+    """Create a controller empty that follows Trajectory for root motion control"""
     bl_idname = "witcher.setup_root_motion_controller"
     bl_label = "Setup Root Motion Controller"
     bl_options = {'REGISTER', 'UNDO'}
@@ -624,7 +652,7 @@ class WITCH_OT_SetupRootMotionController(bpy.types.Operator):
 
         controller = setup_root_motion_controller(armature)
         if not controller:
-            self.report({'ERROR'}, "Could not create controller - missing Trajectory/Reference bones")
+            self.report({'ERROR'}, "Could not create controller - missing Trajectory bone")
             return {'CANCELLED'}
 
         self.report({'INFO'}, f"Created root motion controller: {controller.name}")
@@ -694,46 +722,13 @@ def apply_root_orientation(armature_obj):
     if not armature_obj or armature_obj.type != 'ARMATURE':
         return False
 
-    if not armature_obj.animation_data:
-        return False
-
-    # Get action from NLA 'anim_import' track first (where newly imported anims go),
-    # then fall back to action slot or other NLA tracks
-    action = None
-
-    # Priority 1: Check the 'anim_import' NLA track (where load_anim_into_scene puts new animations)
-    if armature_obj.animation_data.nla_tracks:
-        anim_import_track = armature_obj.animation_data.nla_tracks.get('anim_import')
-        if anim_import_track and anim_import_track.strips:
-            # Get the most recent strip (last one added)
-            for strip in reversed(anim_import_track.strips):
-                if strip.action:
-                    action = strip.action
-                    break
-
-    # Priority 2: Fall back to action slot if no NLA import track action found
-    if action is None:
-        action = armature_obj.animation_data.action
-
-    # Priority 3: Check other NLA tracks as last resort
-    if action is None and armature_obj.animation_data.nla_tracks:
-        for track in armature_obj.animation_data.nla_tracks:
-            for strip in track.strips:
-                if strip.action:
-                    action = strip.action
-                    break
-            if action:
-                break
-
+    action = _resolve_root_orientation_action(armature_obj)
     if action is None:
         return False
 
     pose_bones = armature_obj.pose.bones
     if "Root" not in pose_bones:
         log.warning("Auto Orient Root skipped: no 'Root' bone found in armature")
-        return False
-    if "Reference" not in pose_bones:
-        log.info("Auto Orient Root skipped: no 'Reference' bone found in armature")
         return False
 
     # Check if already applied - don't apply twice
@@ -836,7 +831,7 @@ class WITCH_OT_ApplyRootOrientation(bpy.types.Operator):
         if not obj or obj.type != 'ARMATURE' or not obj.animation_data:
             return False
         pose_bones = getattr(getattr(obj, "pose", None), "bones", None)
-        if pose_bones is None or "Root" not in pose_bones or "Reference" not in pose_bones:
+        if pose_bones is None or "Root" not in pose_bones:
             return False
         # Allow if there's an active action OR NLA tracks with strips
         if obj.animation_data.action:

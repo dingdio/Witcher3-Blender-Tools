@@ -979,10 +979,14 @@ def draw_addon_status_ui(layout, context) -> None:
 
 
 def draw_import_options_ui(layout, context) -> None:
-    """Global import options: Redcloth and SpeedTree settings."""
+    """Global import options: Entity, Redcloth and SpeedTree settings."""
     prefs = get_all_addon_prefs(context)
     options_box = layout.box()
     options_box.label(text="Import Options", icon='SETTINGS')
+
+    entity_col = options_box.column(align=True)
+    entity_col.label(text="Entity (.w2ent)", icon='ARMATURE_DATA')
+    entity_col.prop(prefs, "import_idle_animation")
 
     redcloth_col = options_box.column(align=True)
     redcloth_col.label(text="Redcloth (.apx)", icon='MATCLOTH')

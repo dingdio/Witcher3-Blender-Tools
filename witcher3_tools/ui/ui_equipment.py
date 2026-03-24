@@ -14,6 +14,7 @@ from ..CR2W.witcher_cache.Bundles import LoadBundleManager
 from ..CR2W.witcher_cache.Bundles.BundleItem import BundleItem
 from ..CR2W.common_blender import repo_file, mod_loading_context
 from ..importers import import_entity
+from ..importers.import_anims import load_idle_animation_for_armature as _load_idle_anim
 from ..CR2W.dc_entity import LoadCEntityTemplateFile  # Import the function as per your setup
 from ..extension_paths import get_cache_root, get_dev_override
 from .. import (
@@ -5409,6 +5410,11 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
             )
             if main_mount_anchor is not None:
                 new_objects.add(main_mount_anchor)
+            # Apply idle animation to any equipment armature that has one recorded
+            if get_all_addon_prefs(context).import_idle_animation:
+                for obj in new_objects:
+                    if obj and obj.type == 'ARMATURE':
+                        _load_idle_anim(context, obj)
         elif mount_strategy == "slot_mount_static" and target_info["is_valid"]:
             for root in mount_roots:
                 _mount_object_to_target(root, target_info, fallback_armature=armature)

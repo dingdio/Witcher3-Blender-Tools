@@ -967,6 +967,17 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         description="JSON list of bookmarked paths"
     )
 
+    # Entity import behaviour
+    import_idle_animation: bpy.props.BoolProperty(
+        name="Import Idle Animation",
+        default=False,
+        description=(
+            "Automatically load default idle animation on this entity.\n"
+            "(resolved from the entity's behaviour graph (.w2beh)"
+            "Has no effect if no w2beh or animation set is found."
+        ),
+    )
+
     # Global helper behavior toggles for Asset Browser imports
     do_import_redcloth: bpy.props.BoolProperty(
         name="Import Redcloth",
@@ -1092,6 +1103,7 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         # Shared/global settings
         common_box, common_col = section("Common Settings", 'TOOL_SETTINGS')
         common_col.prop(self, "tex_ext")
+        common_col.prop(self, "import_idle_animation")
         common_col.prop(self, "verbose_logging")
         width_row = common_col.row(align=True)
         width_row.prop(self, "browser_popup_width")
