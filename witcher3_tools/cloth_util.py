@@ -3,6 +3,7 @@ from pathlib import Path
 import inspect
 import bmesh
 import json
+import hashlib
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ from . import get_uncook_path
 from . import get_fbx_uncook_path
 from . import get_texture_path
 from . import get_DO_WEAR_CLOTH, get_redcloth_simulation_enabled, get_redcloth_wind_velocity
+from .extension_paths import get_temp_root
 
 from . import CR2W
 import bpy
@@ -290,6 +292,160 @@ def _merge_mesh_by_distance_data(mesh_obj: Object, merge_threshold: float = 0.00
             mesh.update()
     finally:
         bm.free()
+
+
+def _apx_find_child(root, tag: str, attr: str | None = None, attr_value: str | None = None):
+    for elem in root:
+        if elem.tag != tag:
+            continue
+        if attr is None or elem.attrib.get(attr) == attr_value:
+            return elem
+    raise LookupError(f"Missing APX element {tag} {attr}={attr_value}")
+
+
+def _apx_try_find_child(root, tag: str, attr: str | None = None, attr_value: str | None = None):
+    try:
+        return _apx_find_child(root, tag, attr, attr_value)
+    except LookupError:
+        return None
+
+
+def _parse_apx_int_array_text(text: str) -> List[int]:
+    raw = str(text or "").replace(",", " ").split()
+    return [int(value) for value in raw]
+
+
+def _format_apx_int_array_text(values: List[int]) -> str:
+    return " ".join(str(value) for value in values)
+
+
+def _sanitize_apx_triangle_indices(indices: List[int], vertex_count: int | None = None) -> Tuple[List[int], Dict[str, int]]:
+    stats = {
+        "removed_total": 0,
+        "removed_degenerate": 0,
+        "removed_out_of_range": 0,
+        "removed_truncated": 0,
+    }
+    if not indices:
+        return indices, stats
+
+    filtered: List[int] = []
+    usable_count = len(indices) - (len(indices) % 3)
+    if usable_count != len(indices):
+        stats["removed_total"] += 1
+        stats["removed_truncated"] += 1
+
+    for start in range(0, usable_count, 3):
+        tri = indices[start:start + 3]
+        a, b, c = tri
+        if len({a, b, c}) < 3:
+            stats["removed_total"] += 1
+            stats["removed_degenerate"] += 1
+            continue
+        if vertex_count is not None and (
+            a < 0 or b < 0 or c < 0 or
+            a >= vertex_count or b >= vertex_count or c >= vertex_count
+        ):
+            stats["removed_total"] += 1
+            stats["removed_out_of_range"] += 1
+            continue
+        filtered.extend(tri)
+
+    return filtered, stats
+
+
+def _sanitize_apx_triangle_array(array_elem, vertex_count: int | None = None) -> Dict[str, int]:
+    indices = _parse_apx_int_array_text(getattr(array_elem, "text", ""))
+    filtered, stats = _sanitize_apx_triangle_indices(indices, vertex_count)
+    if stats["removed_total"]:
+        array_elem.text = _format_apx_int_array_text(filtered)
+    stats["triangle_count"] = len(filtered) // 3
+    return stats
+
+
+def _sanitize_apx_for_import(filepath: str) -> str:
+    """Write a sanitized APX copy when cloth triangle data would crash Blender import."""
+    path = str(filepath or "").strip()
+    if not path.lower().endswith(".apx") or not os.path.isfile(path):
+        return filepath
+
+    try:
+        tree = ElementTree.parse(path)
+        root = tree.getroot()
+        clothing = _apx_find_child(root, "value", "className", "ClothingAssetParameters")[0]
+    except Exception as exc:
+        log.debug("Skipping APX sanitization for %s: %s", path, exc)
+        return filepath
+
+    change_notes: List[str] = []
+
+    graphical_lods = _apx_try_find_child(clothing, "array", "name", "graphicalLods")
+    if graphical_lods is not None:
+        for lod_idx, lod in enumerate(graphical_lods):
+            try:
+                render_mesh = _apx_find_child(lod[0], "value", "name", "renderMeshAsset")[0]
+                submeshes = _apx_find_child(render_mesh, "array", "name", "submeshes")
+            except Exception:
+                continue
+            for sub_idx, submesh_container in enumerate(submeshes):
+                try:
+                    submesh = submesh_container[0][0][0]
+                    vertex_count_elem = _apx_find_child(submesh, "value", "name", "vertexCount")
+                    vertex_count = int(str(vertex_count_elem.text or "0").strip())
+                    index_buffer_elem = _apx_find_child(submesh_container[0], "array", "name", "indexBuffer")
+                except Exception:
+                    continue
+                stats = _sanitize_apx_triangle_array(index_buffer_elem, vertex_count)
+                if stats["removed_total"]:
+                    change_notes.append(
+                        f"graphical lod {lod_idx} submesh {sub_idx}: "
+                        f"degenerate={stats['removed_degenerate']} "
+                        f"out_of_range={stats['removed_out_of_range']} "
+                        f"truncated={stats['removed_truncated']}"
+                    )
+
+    physical_meshes = _apx_try_find_child(clothing, "array", "name", "physicalMeshes")
+    if physical_meshes is not None:
+        for phys_idx, physical_mesh_container in enumerate(physical_meshes):
+            try:
+                physical_mesh = physical_mesh_container[0][0]
+                num_vertices_elem = _apx_find_child(physical_mesh, "value", "name", "numVertices")
+                num_indices_elem = _apx_find_child(physical_mesh, "value", "name", "numIndices")
+                indices_elem = _apx_find_child(physical_mesh, "array", "name", "indices")
+                vertex_count = int(str(num_vertices_elem.text or "0").strip())
+            except Exception:
+                continue
+            stats = _sanitize_apx_triangle_array(indices_elem, vertex_count)
+            if stats["removed_total"]:
+                num_indices_elem.text = str(stats["triangle_count"] * 3)
+                change_notes.append(
+                    f"physical mesh {phys_idx}: "
+                    f"degenerate={stats['removed_degenerate']} "
+                    f"out_of_range={stats['removed_out_of_range']} "
+                    f"truncated={stats['removed_truncated']}"
+                )
+
+    if not change_notes:
+        return filepath
+
+    try:
+        stat = os.stat(path)
+        cache_key = hashlib.sha1(
+            f"{os.path.normcase(path)}|{stat.st_mtime_ns}|{stat.st_size}".encode("utf-8")
+        ).hexdigest()[:12]
+        out_dir = os.path.join(get_temp_root(create=True), "sanitized_apx")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{Path(path).stem}.{cache_key}.apx")
+        tree.write(out_path, encoding="utf-8", xml_declaration=True)
+        log.warning(
+            "Using sanitized APX copy for %s: %s",
+            os.path.basename(path),
+            "; ".join(change_notes),
+        )
+        return out_path
+    except Exception as exc:
+        log.warning("Failed to write sanitized APX copy for %s: %s", path, exc)
+        return filepath
 
 
 def _fix_connection_objects_transform_space(connection_objects):
@@ -1570,6 +1726,7 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
 
     uncook_path = get_texture_path(context)+"\\" # PATH WITH TEXTURES
 
+    filepath = _sanitize_apx_for_import(filepath)
 
     try:
         if addon_installed:
