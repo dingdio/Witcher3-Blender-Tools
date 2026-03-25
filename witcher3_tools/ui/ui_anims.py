@@ -713,11 +713,7 @@ class WITCH_OT_ToggleRootMotionController(bpy.types.Operator):
 
 def apply_root_orientation(armature_obj):
     """
-    Remove all animation from Root bone and set it to a fixed orientation where:
-    - Root bone's Z+ axis faces world Z+ (up)
-    - Root bone's X+ axis points towards world Y- (forward)
-
-    Only applies once per action - uses a custom property to track.
+    Orient Root bone so the character faces the direction of its natural movement.
     """
     if not armature_obj or armature_obj.type != 'ARMATURE':
         return False
@@ -731,14 +727,17 @@ def apply_root_orientation(armature_obj):
         log.warning("Auto Orient Root skipped: no 'Root' bone found in armature")
         return False
 
-    # Check if already applied - don't apply twice
+    # Check if already applied — don't apply twice
     if action.get("root_orientation_applied", False):
         log.info(f"Root orientation already applied to {action.name}")
         return True
 
     root_bone = pose_bones["Root"]
 
-    # Step 1: Remove ALL fcurves for Root bone (rotation, location, scale)
+    # The swap copies the Trajectory bone's rotation onto Root keeping the world-space movement direction identical to the motion extraction.
+    initial_quat = _read_root_first_frame_quat(action, armature_obj)
+
+    # Step 2: Remove ALL fcurves for Root bone (rotation, location, scale)
     root_data_paths = [
         'pose.bones["Root"].rotation_quaternion',
         'pose.bones["Root"].rotation_euler',
@@ -756,67 +755,79 @@ def apply_root_orientation(armature_obj):
 
     log.info(f"Removed {len(fcurves_to_remove)} fcurves from Root bone")
 
-    # Step 2: Calculate the rotation needed to align Root bone axes with world
-    # Target: bone Z+ = world Z+ (0,0,1), bone X+ = world Y- (0,-1,0)
-    target_z = mathutils.Vector((0, 0, 1))
-    target_x = mathutils.Vector((0, -1, 0))
-    target_y = target_z.cross(target_x)  # = (1, 0, 0)
+    # ------------------------------------------------------------------
+    # Step 3: Key Root with the preserved first-frame rotation (static)
+    # ------------------------------------------------------------------
+    root_bone.rotation_mode = 'QUATERNION'
 
-    # Build target orientation matrix (columns are the target axes)
-    target_mat = mathutils.Matrix((
-        (target_x.x, target_y.x, target_z.x),
-        (target_x.y, target_y.y, target_z.y),
-        (target_x.z, target_y.z, target_z.z),
-    ))
-
-    # Rot90 OFF rigs keep raw game rest orientation (90 deg around Z versus display-fix rigs).
-    # Compensate target orientation so Auto Orient Root yields the same world forward in both modes.
-    rig_settings = getattr(armature_obj.data, "witcherui_RigSettings", None)
-    rot90_active = get_rig_rot90_enabled(rig_settings, default=False)
-    if not rot90_active:
-        target_mat = mathutils.Matrix.Rotation(math.radians(90.0), 3, 'Z') @ target_mat
-
-    # Get the bone's rest pose matrix (in armature space)
-    # For root bone, this tells us the bone's default orientation
-    rest_matrix = root_bone.bone.matrix_local.to_3x3()
-
-    # The pose rotation we need: target = pose_rot @ rest
-    # So: pose_rot = target @ rest.inverted()
-    pose_rotation_mat = target_mat @ rest_matrix.inverted()
-    pose_quat = pose_rotation_mat.to_quaternion()
-
-    # Step 3: Create fcurves directly in the action (don't modify pose bone state)
-    # This avoids polluting the armature's pose state for future animations
     quat_path = 'pose.bones["Root"].rotation_quaternion'
     loc_path = 'pose.bones["Root"].location'
 
-    # Create quaternion fcurves with the calculated rotation
-    quat_values = [pose_quat.w, pose_quat.x, pose_quat.y, pose_quat.z]
+    quat_values = [initial_quat.w, initial_quat.x, initial_quat.y, initial_quat.z]
     for i, val in enumerate(quat_values):
         fc = new_action_fcurve(action, armature_obj, data_path=quat_path, index=i, group_name="Root")
         kp = fc.keyframe_points.insert(1, val)
         kp.interpolation = 'LINEAR'
 
-    # Create location fcurves at origin
     for i in range(3):
         fc = new_action_fcurve(action, armature_obj, data_path=loc_path, index=i, group_name="Root")
         kp = fc.keyframe_points.insert(1, 0.0)
         kp.interpolation = 'LINEAR'
 
-    # Update the pose bone to reflect the new keyframes (for visual feedback)
-    # but this is just for display, not persistent
-    root_bone.rotation_mode = 'QUATERNION'
-
     # Mark as applied
     action["root_orientation_applied"] = True
 
-    # Log the result
     log.info(f"Applied root orientation to {action.name}")
-    log.info(f"  Root bone Z+ now points to world Z+")
-    log.info(f"  Root bone X+ now points to world Y-")
-    log.info(f"  Rotation quaternion: {pose_quat}")
+    log.info(f"  Root initial quaternion: {initial_quat}")
 
     return True
+
+
+def _read_root_first_frame_quat(action, armature_obj=None):
+    """Read Root bone's rotation at its first keyframe, returned as a Quaternion.
+
+    Reads fcurve values directly (no frame_set overhead) and handles both
+    quaternion and euler rotation modes.  Returns identity if no Root rotation
+    fcurves exist.
+    """
+    quat_path = 'pose.bones["Root"].rotation_quaternion'
+    euler_path = 'pose.bones["Root"].rotation_euler'
+
+    first_frame = None
+    quat_curves = {}   # array_index → fcurve
+    euler_curves = {}  # array_index → fcurve
+    euler_order = 'XYZ'
+
+    fcurve_iter = (iter_action_fcurves(action, target=armature_obj)
+                   if armature_obj is not None else action.fcurves)
+    for fc in fcurve_iter:
+        if fc.data_path == quat_path and fc.keyframe_points:
+            f = fc.keyframe_points[0].co[0]
+            if first_frame is None or f < first_frame:
+                first_frame = f
+            quat_curves[fc.array_index] = fc
+        elif fc.data_path == euler_path and fc.keyframe_points:
+            f = fc.keyframe_points[0].co[0]
+            if first_frame is None or f < first_frame:
+                first_frame = f
+            euler_curves[fc.array_index] = fc
+
+    if first_frame is None:
+        log.info("_read_root_first_frame_quat: no Root rotation fcurves, returning identity")
+        return mathutils.Quaternion()
+
+    if quat_curves:
+        w = quat_curves[0].evaluate(first_frame) if 0 in quat_curves else 1.0
+        x = quat_curves[1].evaluate(first_frame) if 1 in quat_curves else 0.0
+        y = quat_curves[2].evaluate(first_frame) if 2 in quat_curves else 0.0
+        z = quat_curves[3].evaluate(first_frame) if 3 in quat_curves else 0.0
+        return mathutils.Quaternion((w, x, y, z)).normalized()
+
+    # Euler fallback
+    ex = euler_curves[0].evaluate(first_frame) if 0 in euler_curves else 0.0
+    ey = euler_curves[1].evaluate(first_frame) if 1 in euler_curves else 0.0
+    ez = euler_curves[2].evaluate(first_frame) if 2 in euler_curves else 0.0
+    return mathutils.Euler((ex, ey, ez), euler_order).to_quaternion()
 
 
 class WITCH_OT_ApplyRootOrientation(bpy.types.Operator):

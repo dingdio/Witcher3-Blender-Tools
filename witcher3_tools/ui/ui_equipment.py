@@ -41,6 +41,7 @@ _W2_CATEGORY_ITEMS = {}
 _W2_ITEM_ATTRIBUTES = {}
 _ENTITY_APPEARANCE_CACHE = {}
 _EQUIPMENT_ENTITY_CACHE = {}
+_TEMPLATE_PATH_RESOLVE_CACHE = {}  # (template_key, roots_tuple) -> (repo_path, export_path)
 _XML_DECL_RE = re.compile(r'^\s*<\?xml[^>]*\?>', re.IGNORECASE)
 _XML_DECL_ENCODING_BYTES_RE = re.compile(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', re.IGNORECASE)
 
@@ -525,6 +526,9 @@ def _get_uncook_item_ent_index(uncook_root):
 
     _UNCOOK_ITEM_ENT_INDEX[norm_root] = index
     _clear_cache_if_oversized(_UNCOOK_ITEM_ENT_INDEX, max_entries=16)
+    # A new index means newly extracted files may now be findable via the index
+    # path, so invalidate the template path resolve cache.
+    _TEMPLATE_PATH_RESOLVE_CACHE.clear()
     return index
 
 
@@ -1142,6 +1146,57 @@ def get_effective_hold_slot(slot):
     return slot.hold_slot
 
 
+def _slot_has_explicit_mount_target(slot):
+    if slot is None:
+        return False
+    return bool(
+        str(get_effective_equip_slot(slot) or "").strip()
+        or str(get_effective_hold_slot(slot) or "").strip()
+    )
+
+
+def _slot_matches_unmounted_visual_hint(slot):
+    if slot is None:
+        return False
+    for value in (
+        getattr(slot, "category", ""),
+        getattr(slot, "item_name", ""),
+        get_effective_equip_template(slot),
+    ):
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower())
+        if "tail" in normalized or "hair" in normalized:
+            return True
+    return False
+
+
+def _allow_unmounted_slotless_visual(slot, *, attachment_profile=None, item_entity=None):
+    if slot is None or _slot_has_explicit_mount_target(slot):
+        return False
+
+    if attachment_profile is None and item_entity is not None:
+        try:
+            attachment_profile = import_entity.classify_equipment_attachment_profile(item_entity)
+        except Exception:
+            attachment_profile = None
+
+    if attachment_profile is not None:
+        profile_kind = str(getattr(attachment_profile, "kind", "") or "").strip()
+        if profile_kind == "inventory_wrapper":
+            return False
+        if profile_kind == "owner_graph":
+            return True
+        if bool(getattr(slot, "weapon", False)):
+            return False
+        if profile_kind in {"slot_visual", "slot_animated"}:
+            return True
+
+    if not bool(getattr(slot, "is_inventory", False)):
+        return True
+    if bool(getattr(slot, "weapon", False)):
+        return False
+    return _slot_matches_unmounted_visual_hint(slot)
+
+
 # =============================================================================
 # Bound Item Helpers
 # =============================================================================
@@ -1268,15 +1323,27 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None):
         bundle_manager = LoadBundleManager()
     except Exception:
         return None, None, search_info
-    item = bundle_manager.find_item_by_partial_hash(start="items", end=search_pattern)
-    # Some equipment/body templates resolve outside items (e.g. characters/...).
-    if not item:
-        item = bundle_manager.find_item_by_partial_hash(start="", end=search_pattern)
-    if not item and rel_name:
-        basename = rel_name.rsplit("\\", 1)[-1]
-        if not basename.lower().endswith(".w2ent"):
-            basename += ".w2ent"
-        item = bundle_manager.find_item_by_partial_hash(start="", end=basename)
+    if is_short_template_id:
+        # For short IDs (no path separator in the template name), use basename-only
+        # matching so the search is slash-agnostic.  Bundle keys may use either /
+        # or \ as separators; os.path.basename() handles both, while endswith()
+        # on a pattern that includes a backslash only matches backslash-keyed bundles.
+        basename_end = rel_name
+        if not basename_end.lower().endswith(".w2ent"):
+            basename_end += ".w2ent"
+        item = bundle_manager.find_item_by_partial_hash(start="items", end=basename_end)
+        if not item:
+            item = bundle_manager.find_item_by_partial_hash(start="", end=basename_end)
+    else:
+        item = bundle_manager.find_item_by_partial_hash(start="items", end=search_pattern)
+        # Some equipment/body templates resolve outside items (e.g. characters/...).
+        if not item:
+            item = bundle_manager.find_item_by_partial_hash(start="", end=search_pattern)
+        if not item and rel_name:
+            basename_end = rel_name.rsplit("\\", 1)[-1]
+            if not basename_end.lower().endswith(".w2ent"):
+                basename_end += ".w2ent"
+            item = bundle_manager.find_item_by_partial_hash(start="", end=basename_end)
     if not item:
         return None, None, search_info
     final_item = _select_bundle_item(item, search_pattern)
@@ -1319,10 +1386,20 @@ def _resolve_equipment_paths_for_template(template_name, armature=None, rig_sett
             except Exception:
                 source_roots = []
 
+    # Use a persistent module-level cache to avoid repeated bundle extraction
+    # every time the UI redraws or sync_equipment_slots_to_temp iterates entries.
+    cache_key = (
+        _normalize_template_path(template_name).lower(),
+        tuple(_norm_root_path(r) for r in source_roots),
+    )
+    cached = _TEMPLATE_PATH_RESOLVE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     final_item, export_path, _search_pattern = _resolve_bundle_item_by_template_cached(
         template_name,
         search_roots=source_roots,
-        prepared_context={},
+        prepared_context=None,
     )
     repo_path = str(getattr(final_item, "name", "") or "").replace("/", "\\").lstrip("\\")
     if not repo_path and export_path:
@@ -1331,7 +1408,12 @@ def _resolve_equipment_paths_for_template(template_name, armature=None, rig_sett
             repo_path = str(get_repo_from_abs_path(export_path) or "").replace("/", "\\").lstrip("\\")
         except Exception:
             repo_path = ""
-    return repo_path, export_path or ""
+    result = (repo_path, export_path or "")
+    # Cache misses as well so missing legacy templates do not trigger repeated
+    # bundle extraction attempts on every UI redraw.
+    _TEMPLATE_PATH_RESOLVE_CACHE[cache_key] = result
+    _clear_cache_if_oversized(_TEMPLATE_PATH_RESOLVE_CACHE, max_entries=256)
+    return result
 
 
 def _update_entry_resolved_repo_path(entry, context=None, armature=None, rig_settings=None):
@@ -1488,6 +1570,17 @@ def _import_item_entity(export_path, final_item_name, entity, armature, appearan
     if item_import_context is None:
         item_import_context = appearance if appearance else type('obj', (), {'includedTemplates': [], 'name': 'equipment'})()
 
+    # Determine whether to import redcloth/apex cloth resources.
+    # Mirror the same check used by import_app: user preference + addon availability.
+    import addon_utils as _addon_utils
+    _equip_import_redcloth = get_do_import_redcloth(bpy.context)
+    if _equip_import_redcloth:
+        _apx_exist, _apx_enabled = _addon_utils.check("io_mesh_apx")
+        if not _apx_enabled:
+            _apx_exist, _apx_enabled = _addon_utils.check("io_scene_apx")
+        if not _apx_enabled:
+            _equip_import_redcloth = False
+
     def _import_equipment_template(template_source, *, template_data=None):
         if not template_source:
             return
@@ -1497,7 +1590,7 @@ def _import_item_entity(export_path, final_item_name, entity, armature, appearan
             armature,
             entity.name,
             ent_namespace,
-            False,
+            _equip_import_redcloth,
             slot_index,
             item_import_context,
             True,
@@ -2010,10 +2103,10 @@ def _resolve_slot_visual_policy(slot, armature, rig_settings, *, item_entity=Non
         )
     equip_slot_name = get_effective_equip_slot(slot)
     hold_slot_name = get_effective_hold_slot(slot)
-    allow_unmounted_visual = (
-        not bool(getattr(slot, "is_inventory", False))
-        and not str(equip_slot_name or "").strip()
-        and not str(hold_slot_name or "").strip()
+    allow_unmounted_visual = _allow_unmounted_slotless_visual(
+        slot,
+        attachment_profile=attachment_profile,
+        item_entity=item_entity,
     )
     return _resolve_visual_policy_from_slot_names(
         equip_slot_name,
@@ -3883,6 +3976,8 @@ class EQUIPMENT_OT_RefreshCategories(bpy.types.Operator):
 
         # Save to cache for persistence across reloads
         _save_category_cache()
+        # Clear template path cache so any newly uncoooked files are picked up.
+        _TEMPLATE_PATH_RESOLVE_CACHE.clear()
 
         if context.area:
             context.area.tag_redraw()  # Refresh the UI to reflect changes if necessary
@@ -4598,13 +4693,20 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                         op = row.operator("witcher.equipment_unload_equipment", text="", icon='X')
                         op.slot_index = i
                     else:
+                        # Always show a load/hold button in a consistent position.
+                        # Disabled when the item cannot be loaded on this rig.
+                        btn = row.row(align=True)
                         if slot_policy["policy"] == "equipable_on_rig":
-                            op = row.operator("witcher.equipment_load_equipment", text="", icon='IMPORT')
+                            btn.enabled = True
+                            op = btn.operator("witcher.equipment_load_equipment", text="", icon='IMPORT')
                             op.slot_index = i
-
-                    if slot_policy["policy"] == "hold_only_on_rig":
-                        note_row = box.row(align=True)
-                        note_row.label(text="  No equip slot on current rig; item disappears when not held.", icon='INFO')
+                        elif slot_policy["policy"] == "hold_only_on_rig" and slot_policy["hold_valid"]:
+                            # hold_only items handled by show_toggle above; skip duplicate
+                            pass
+                        else:
+                            btn.enabled = False
+                            op = btn.operator("witcher.equipment_load_equipment", text="", icon='IMPORT')
+                            op.slot_index = i
 
                     # Appearance dropdown for items with multiple dye/appearance variants
                     item_app_names = _safe_json_list(getattr(slot, 'item_appearances_json', ''))
@@ -4876,16 +4978,19 @@ class EQUIPMENT_OT_InsertDefaultCategories(bpy.types.Operator):
             self.report({'WARNING'}, "No valid armature selected.")
             return {'CANCELLED'}
 
+        # Collect categories already present in existing slots
+        existing_categories = {slot.category for slot in rig_settings.equipment_slots}
+
         _set_temp_equipment_auto_apply_suspended(context, True)
         try:
-            temp_data.equipment_entries.clear()
-            rig_settings.equipment_slots.clear()
-
             if source_game == "w2":
                 category_source = active_category_items
             else:
                 category_source = default_categories
             for category, items in category_source.items():
+                if category in existing_categories:
+                    continue  # preserve existing slot (keeps is_loaded, equip_guid, item_name)
+
                 default_item_name = items[0][0] if len(items) <= 1 else items[1][0]
                 equip_template = "" if len(items) <= 1 else items[1][2]
 
@@ -4966,7 +5071,7 @@ def sync_equipment_slots_to_temp(context, rig_settings):
         temp_data.equipment_entries.clear()
 
         for slot_index, slot in enumerate(rig_settings.equipment_slots):
-            if not _slot_has_active_selection(slot):
+            if not _slot_has_active_selection(slot) and not slot.category:
                 continue
 
             # Pre-populate catalog so update callbacks can find the item
@@ -5176,14 +5281,7 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
     requested_mount_mode = str(mount_mode or "").strip().lower()
     if requested_mount_mode not in {"equip", "hold"}:
         requested_mount_mode = "hold" if (slot.is_loaded and slot.is_in_hold_slot) else "equip"
-    effective_equip_slot_name = str(get_effective_equip_slot(slot) or "").strip()
-    effective_hold_slot_name = str(get_effective_hold_slot(slot) or "").strip()
-    allow_unmounted_visual_load = (
-        requested_mount_mode == "equip"
-        and not bool(getattr(slot, "is_inventory", False))
-        and not effective_equip_slot_name
-        and not effective_hold_slot_name
-    )
+    allow_unmounted_visual_load = False
 
     effective_template = get_effective_equip_template(slot)
     if not effective_template or effective_template == "None":
@@ -5237,6 +5335,14 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         slot.item_coloring_json = ""
 
     attachment_profile = import_entity.classify_equipment_attachment_profile(item_entity_for_apps)
+    allow_unmounted_visual_load = (
+        requested_mount_mode == "equip"
+        and _allow_unmounted_slotless_visual(
+            slot,
+            attachment_profile=attachment_profile,
+            item_entity=item_entity_for_apps,
+        )
+    )
     _maybe_log_legacy_attachment_type_conflict(
         getattr(slot, "item_name", "") or effective_template,
         getattr(slot, "attachment_type", ""),
@@ -5278,14 +5384,35 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
     entity = prepared.get("entity")
     appearance = prepared.get("appearance")
     if entity is None:
-        reason = "Could not parse entity/appearance from rig settings JSON"
-        _set_last_equipment_load_failure(armature, slot_index, reason)
-        log.warning(reason)
-        return False
+        if allow_unmounted_visual_load:
+            try:
+                from ..CR2W import w3_types
+                entity = w3_types.Entity()
+                entity.name = armature.name
+                entity.appearances = []
+                entity.slots = []
+                entity.coloringEntries = []
+                log.debug(
+                    "Entity state unavailable for '%s'; using minimal fallback for unmounted visual import",
+                    armature.name,
+                )
+            except Exception:
+                reason = "Could not parse entity/appearance from rig settings JSON (fallback also failed)"
+                _set_last_equipment_load_failure(armature, slot_index, reason)
+                log.warning(reason)
+                return False
+        else:
+            reason = "Could not parse entity/appearance from rig settings JSON"
+            _set_last_equipment_load_failure(armature, slot_index, reason)
+            log.warning(reason)
+            return False
 
     empty_transform = None
     if getattr(slot, "is_inventory", False):
-        empty_transform = _get_inventory_group(armature, rig_settings)
+        if allow_unmounted_visual_load and not target_info.get("is_valid"):
+            empty_transform = _get_persistent_equipment_group(armature, rig_settings)
+        else:
+            empty_transform = _get_inventory_group(armature, rig_settings)
     elif getattr(slot, "keep_across_appearances", False):
         empty_transform = _get_persistent_equipment_group(armature, rig_settings)
     else:
@@ -5308,6 +5435,12 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
 
     guid = generate_guid()
     before = set(bpy.data.objects)
+    import_info = {
+        "template_keys": set(),
+        "item_entity": item_entity_for_apps,
+        "attachment_profile": attachment_profile,
+        "selected_appearance_name": "",
+    }
 
     saved_world = _temp_reset_armature_world(armature)
     changed_poses = _set_pose_all_armatures(armature, "REST")
@@ -5329,6 +5462,20 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
                 mount_strategy,
             ),
         )
+        if not (set(bpy.data.objects) - before):
+            log.info(
+                "Equipment common import produced no objects for '%s'; falling back to direct entity import.",
+                export_path,
+            )
+            import_entity.import_direct_entity_file(export_path, parent_transform=empty_transform)
+            # Bind any armatures produced by the fallback import to the parent armature
+            fallback_new = set(bpy.data.objects) - before
+            for fb_obj in fallback_new:
+                if fb_obj and fb_obj.type == 'ARMATURE' and fb_obj != armature:
+                    try:
+                        _constrain_bound_armature_to_target(fb_obj, armature)
+                    except Exception as _fb_e:
+                        log.warning("Failed to bind fallback armature '%s' to '%s': %s", fb_obj.name, armature.name, _fb_e)
     except Exception as e:
         reason = f"Import failed for '{getattr(final_item, 'name', effective_template)}': {e}"
         _set_last_equipment_load_failure(armature, slot_index, reason)
@@ -5338,6 +5485,11 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         _restore_armature_world(armature, saved_world)
 
     new_objects = tag_new_objects_with_guid(before, guid, "witcher_equip_guid")
+    if not new_objects:
+        reason = f"Import produced no objects for '{getattr(final_item, 'name', effective_template)}'"
+        _set_last_equipment_load_failure(armature, slot_index, reason)
+        log.warning(reason)
+        return False
     slot.equip_guid = guid
     slot.is_loaded = True
 

@@ -2352,6 +2352,7 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
         except Exception:
             pass
 
+        export_path = ""
         item_entity = None
         effective_template = get_effective_equip_template(slot)
         if effective_template and effective_template != "None":
@@ -2362,6 +2363,30 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
             )
             if export_path:
                 item_entity = _get_cached_equipment_item_entity(export_path, prepared_context=prepared)
+
+        if effective_template and effective_template != "None" and not export_path and bool(getattr(slot, "weapon", False)):
+            log.info(
+                "Skipping nonvisual inventory weapon '%s': template '%s' does not resolve to an entity file",
+                item_name,
+                effective_template,
+            )
+            if slot.is_loaded and slot.equip_guid:
+                remove_objects_by_guid(slot.equip_guid, "witcher_equip_guid")
+                slot.equip_guid = ""
+                slot.is_loaded = False
+                slot.is_in_hold_slot = False
+            if slot_was_created or getattr(slot, "is_inventory", False):
+                try:
+                    slots.remove(slot_index)
+                except Exception:
+                    pass
+                slot_by_category = {
+                    existing_slot.category: (idx, existing_slot)
+                    for idx, existing_slot in enumerate(slots)
+                    if existing_slot.category
+                }
+                slot_search_list = slots
+            continue
 
         slot_policy = _resolve_slot_visual_policy(slot, armature, rig_settings, item_entity=item_entity)
 
