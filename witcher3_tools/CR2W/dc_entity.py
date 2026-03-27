@@ -995,9 +995,10 @@ class CStaticMeshComponent(CMeshComponent):
 
 class CClothComponent(JsonChunk):
     """docstring for CClothComponent."""
-    def __init__(self, resource):
+    def __init__(self, resource, name: str = ""):
         super(CClothComponent, self).__init__()
         self.resource = resource
+        self.name = name
 
 class CMorphedMeshComponent(JsonChunk):
     """docstring for CMorphedMeshComponent."""
@@ -1373,7 +1374,9 @@ def _convert_chunk_for_model(chunk):
         return component if component.mesh else None
     if chunk.Type == "CClothComponent":
         resource = _resolve_repo_path(chunk, "resource", ".redcloth")
-        return CClothComponent(resource) if resource else None
+        _cname_prop = chunk.GetVariableByName("name")
+        _cname = str(_prop_to_string(_cname_prop) or "").strip()
+        return CClothComponent(resource, name=_cname) if resource else None
     if chunk.Type == "CMorphedMeshComponent":
         morph_target = _resolve_repo_path(chunk, "morphTarget", ".w2mesh")
         morph_source = _resolve_repo_path(chunk, "morphSource", ".w2mesh")
@@ -1719,7 +1722,9 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
         elif (chunk.Type == "CClothComponent"):
             if chunk.GetVariableByName("resource"): #! sometimes there are no resource in files??
                 cloth = chunk.GetVariableByName("resource").ToString()
-                chunk_append(new_mesh, chunk, CClothComponent(cloth))
+                _cname_prop = chunk.GetVariableByName("name")
+                _cname = str(_prop_to_string(_cname_prop) or "").strip()
+                chunk_append(new_mesh, chunk, CClothComponent(cloth, name=_cname))
         elif (chunk.Type == "CFurComponent"):
             if (chunk.GetVariableByName("mesh")):
                 fur_component = CMeshComponent(chunk).convert_for_io()
@@ -2454,7 +2459,9 @@ def create_CEntity(file, _inherit_visited=None):
         elif (chunk.Type == "CClothComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
             if chunk.GetVariableByName("resource"): #! sometimes there are no resource in files??
                 cloth = chunk.GetVariableByName("resource").ToString()
-                chunk_append(new_mesh, chunk, CClothComponent(cloth), added_chunks)
+                _cname_prop = chunk.GetVariableByName("name")
+                _cname = str(_prop_to_string(_cname_prop) or "").strip()
+                chunk_append(new_mesh, chunk, CClothComponent(cloth, name=_cname), added_chunks)
         elif (chunk.Type == "CFurComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
             if (chunk.GetVariableByName("mesh")):
                 fur_component = CMeshComponent(chunk).convert_for_io()
@@ -2587,7 +2594,9 @@ def create_CEntity(file, _inherit_visited=None):
                             )
                     elif sub_chunk.Type == "CClothComponent" and sub_chunk.GetVariableByName("resource"):
                         cloth = sub_chunk.GetVariableByName("resource").ToString()
-                        chunk_append(new_mesh, sub_chunk, CClothComponent(cloth))
+                        _cname_prop = sub_chunk.GetVariableByName("name")
+                        _cname = str(_prop_to_string(_cname_prop) or "").strip()
+                        chunk_append(new_mesh, sub_chunk, CClothComponent(cloth, name=_cname))
                     elif sub_chunk.Type == "CAnimDangleBufferComponent" and sub_chunk.GetVariableByName("skeleton"):
                         name = sub_chunk.GetVariableByName("name").ToString()
                         skeleton = _resolve_repo_path(sub_chunk, "skeleton", ".w2rig")
