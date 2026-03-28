@@ -78,23 +78,115 @@ def _build_coloring_object_index(context):
 
 def _show_coloring_object_props(layout, objects):
     """Show editable colorShift custom properties for matching objects."""
+    def _ensure_range(obj, prop, min_v, max_v):
+        if prop in obj:
+            try:
+                ui = obj.id_properties_ui(prop)
+                d = ui.as_dict()
+                if d.get('min') != min_v or d.get('max') != max_v:
+                    ui.update(min=min_v, max=max_v, soft_min=min_v, soft_max=max_v)
+            except Exception:
+                pass
+
     for obj in objects:
         has_shift = any(obj.get(k) is not None for k in ('colorShift1_hue', 'colorShift2_hue'))
         if not has_shift:
             continue
+            
+        _ensure_range(obj, 'colorShift1_hue', 0.0, 360.0)
+        _ensure_range(obj, 'colorShift1_saturation', -100.0, 100.0)
+        _ensure_range(obj, 'colorShift1_luminance', -100.0, 100.0)
+        _ensure_range(obj, 'colorShift2_hue', 0.0, 360.0)
+        _ensure_range(obj, 'colorShift2_saturation', -100.0, 100.0)
+        _ensure_range(obj, 'colorShift2_luminance', -100.0, 100.0)
+
         prop_box = layout.box()
-        prop_box.label(text=f"{obj.name}", icon='OBJECT_DATA')
+        header_row = prop_box.row(align=True)
+        header_row.label(text=f"{obj.name}", icon='OBJECT_DATA')
+        component_name = str(obj.get("witcher_name", "") or "").strip()
+        if component_name:
+            op = header_row.operator(
+                WITCH_OT_coloring_select_component.bl_idname,
+                text="",
+                icon='RESTRICT_SELECT_OFF',
+            )
+            op.component_name = component_name
         if obj.get('colorShift1_hue') is not None:
             row = prop_box.row(align=True)
-            row.prop(obj, '["colorShift1_hue"]', text="H1")
-            row.prop(obj, '["colorShift1_saturation"]', text="S1")
-            row.prop(obj, '["colorShift1_luminance"]', text="L1")
+            row.prop(obj, "witcher_color_shift1_hue", text="H1")
+            row.prop(obj, "witcher_color_shift1_saturation", text="S1")
+            row.prop(obj, "witcher_color_shift1_luminance", text="L1")
         if obj.get('colorShift2_hue') is not None:
             row = prop_box.row(align=True)
-            row.prop(obj, '["colorShift2_hue"]', text="H2")
-            row.prop(obj, '["colorShift2_saturation"]', text="S2")
-            row.prop(obj, '["colorShift2_luminance"]', text="L2")
+            row.prop(obj, "witcher_color_shift2_hue", text="H2")
+            row.prop(obj, "witcher_color_shift2_saturation", text="S2")
+            row.prop(obj, "witcher_color_shift2_luminance", text="L2")
 
+
+def _clamp_float(value, min_v, max_v):
+    try:
+        return max(min_v, min(max_v, float(value)))
+    except Exception:
+        return min_v
+
+
+def _make_coloring_proxy_getter(idprop_key, min_v, max_v):
+    def _getter(obj):
+        value = obj.get(idprop_key, min_v)
+        return _clamp_float(value, min_v, max_v)
+    return _getter
+
+
+def _make_coloring_proxy_setter(idprop_key, min_v, max_v):
+    def _setter(obj, value):
+        clamped = _clamp_float(value, min_v, max_v)
+        obj[idprop_key] = clamped
+        try:
+            ui = obj.id_properties_ui(idprop_key)
+            ui.update(min=min_v, max=max_v, soft_min=min_v, soft_max=max_v)
+        except Exception:
+            pass
+        try:
+            obj.update_tag()
+        except Exception:
+            pass
+    return _setter
+
+
+_COLORING_PROXY_SPECS = (
+    ("witcher_color_shift1_hue", "colorShift1_hue", 0.0, 360.0, "Color Shift 1 Hue", "Hue for color shift 1. Range: 0 to 360."),
+    ("witcher_color_shift1_saturation", "colorShift1_saturation", -100.0, 100.0, "Color Shift 1 Saturation", "Saturation for color shift 1. Range: -100 to 100."),
+    ("witcher_color_shift1_luminance", "colorShift1_luminance", -100.0, 100.0, "Color Shift 1 Luminance", "Luminance for color shift 1. Range: -100 to 100."),
+    ("witcher_color_shift2_hue", "colorShift2_hue", 0.0, 360.0, "Color Shift 2 Hue", "Hue for color shift 2. Range: 0 to 360."),
+    ("witcher_color_shift2_saturation", "colorShift2_saturation", -100.0, 100.0, "Color Shift 2 Saturation", "Saturation for color shift 2. Range: -100 to 100."),
+    ("witcher_color_shift2_luminance", "colorShift2_luminance", -100.0, 100.0, "Color Shift 2 Luminance", "Luminance for color shift 2. Range: -100 to 100."),
+)
+
+
+def _register_coloring_proxy_properties():
+    for prop_name, idprop_key, min_v, max_v, label, description in _COLORING_PROXY_SPECS:
+        if hasattr(bpy.types.Object, prop_name):
+            continue
+        setattr(
+            bpy.types.Object,
+            prop_name,
+            bpy.props.FloatProperty(
+                name=label,
+                description=description,
+                min=min_v,
+                max=max_v,
+                soft_min=min_v,
+                soft_max=max_v,
+                get=_make_coloring_proxy_getter(idprop_key, min_v, max_v),
+                set=_make_coloring_proxy_setter(idprop_key, min_v, max_v),
+            ),
+        )
+
+
+def _unregister_coloring_proxy_properties():
+    for prop_name, _idprop_key, _min_v, _max_v, _label, _description in _COLORING_PROXY_SPECS:
+        if hasattr(bpy.types.Object, prop_name):
+            delattr(bpy.types.Object, prop_name)
 
 def _get_character_panel_header_status(context) -> str:
     try:
@@ -901,6 +993,15 @@ class WITCH_OT_ENTITY_import_inventory(bpy.types.Operator, ImportHelper):
             if entity is None:
                 armature = None
                 rig_settings = None
+        saved_active = None
+        saved_selection = []
+        if armature is not None and rig_settings is not None:
+            try:
+                from ..ui.ui_equipment import _capture_selection_state
+                saved_active, saved_selection = _capture_selection_state(context)
+            except Exception:
+                saved_active = None
+                saved_selection = []
 
         # Build list of items to import from preview
         preview_items = []
@@ -938,17 +1039,25 @@ class WITCH_OT_ENTITY_import_inventory(bpy.types.Operator, ImportHelper):
         except Exception:
             pass  # May fail if XML not configured, continue anyway
 
-        with mod_loading_context(context):
-            result = _import_inventory_items(context, armature, rig_settings, preview_items)
+        try:
+            with mod_loading_context(context):
+                result = _import_inventory_items(context, armature, rig_settings, preview_items)
 
-        # Sync persistent equipment slots back to temp UI entries so
-        # category dropdowns reflect the inventory changes
-        if rig_settings and result.get('imported', 0) > 0:
-            try:
-                from ..ui.ui_equipment import sync_equipment_slots_to_temp
-                sync_equipment_slots_to_temp(context, rig_settings)
-            except Exception as e:
-                log.warning(f"Failed to sync equipment slots to temp: {e}")
+            # Sync persistent equipment slots back to temp UI entries so
+            # category dropdowns reflect the inventory changes
+            if rig_settings and result.get('imported', 0) > 0:
+                try:
+                    from ..ui.ui_equipment import sync_equipment_slots_to_temp
+                    sync_equipment_slots_to_temp(context, rig_settings)
+                except Exception as e:
+                    log.warning(f"Failed to sync equipment slots to temp: {e}")
+        finally:
+            if armature is not None and rig_settings is not None:
+                try:
+                    from ..ui.ui_equipment import _safe_restore_selection
+                    _safe_restore_selection(saved_active, saved_selection)
+                except Exception:
+                    pass
 
         imported_count = result.get('imported', 0)
         skipped_count = result.get('skipped', 0)
@@ -1577,6 +1686,7 @@ from . import ui_equipment
 
 
 def register():
+    _register_coloring_proxy_properties()
     bpy.types.Scene.witcher_character_tab = EnumProperty(
         name="Character Tab",
         description="Active sub-section of the Character panel",
@@ -1605,6 +1715,7 @@ def register():
 def unregister():
     ui_equipment.unregister()
     ui_file_browser.unregister()
+    _unregister_coloring_proxy_properties()
     for prop_name in ("witcher_character_tab",):
         if hasattr(bpy.types.Scene, prop_name):
             delattr(bpy.types.Scene, prop_name)

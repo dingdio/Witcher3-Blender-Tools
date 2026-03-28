@@ -17,6 +17,20 @@ from ..importers import import_rig
 from bpy.types import PropertyGroup
 from bpy.props import IntProperty, StringProperty, CollectionProperty, BoolProperty, EnumProperty
 
+_DYNAMIC_ENUM_CACHE = {}
+
+
+def _cache_dynamic_enum_items(cache_key, items):
+    stable_items = []
+    for item in items or [('NONE', 'None', '')]:
+        identifier = str(item[0] or 'NONE')
+        label = str(item[1] or identifier)
+        description = str(item[2] or '')
+        stable_items.append((identifier, label, description))
+    _DYNAMIC_ENUM_CACHE[cache_key] = stable_items
+    return stable_items
+
+
 def update_rot90_comp(self, context):
     """Keep Rot90 state lightweight; explicit refresh is handled by dedicated operators."""
     return
@@ -181,9 +195,15 @@ def _get_item_app_enum_items(self, context):
         names = json.loads(self.item_appearances_json or '[]')
     except Exception:
         names = []
-    if not names:
-        return [('__default__', 'Default', '')]
-    return [(n, n, '') for n in names]
+    items = [('__default__', 'Default', 'Use the item default appearance')]
+    seen = {'__default__'}
+    for name in names:
+        name = str(name or "").strip()
+        if not name or name in seen:
+            continue
+        items.append((name, name, ''))
+        seen.add(name)
+    return _cache_dynamic_enum_items(("item_appearance_name", tuple(items)), items)
 
 
 def _on_item_appearance_changed(self, context):
@@ -213,23 +233,27 @@ def _on_item_appearance_changed(self, context):
         if slot_index is None:
             return
 
-        from ..ui.ui_equipment import load_equipment_item
+        from ..ui.ui_equipment import (
+            _get_temp_equipment_data,
+            load_equipment_item,
+            _safe_restore_selection,
+            try_update_loaded_equipment_appearance_in_place,
+        )
+        temp_data = _get_temp_equipment_data(context)
+        if temp_data is not None and getattr(temp_data, "suspend_auto_apply_updates", False):
+            return
         if self.is_loaded:
             saved_active = context.view_layer.objects.active
             saved_selection = [obj for obj in context.selected_objects]
-            load_equipment_item(context, armature_obj, slot_index, rig_settings)
-            bpy.ops.object.select_all(action='DESELECT')
-            for obj in saved_selection:
-                try:
-                    if obj and obj.name in bpy.data.objects:
-                        obj.select_set(True)
-                except ReferenceError:
-                    continue
-            try:
-                if saved_active and saved_active.name in bpy.data.objects:
-                    context.view_layer.objects.active = saved_active
-            except ReferenceError:
-                pass
+            updated_in_place = try_update_loaded_equipment_appearance_in_place(
+                context,
+                armature_obj,
+                slot_index,
+                rig_settings,
+            )
+            if not updated_in_place:
+                load_equipment_item(context, armature_obj, slot_index, rig_settings)
+            _safe_restore_selection(saved_active, saved_selection)
     except Exception:
         pass
 
@@ -281,10 +305,20 @@ class EquipmentSlotEntry(bpy.types.PropertyGroup):
         update=_on_item_appearance_changed,
         description="Select appearance (dye variant) for this item"
     )
+    show_item_appearance_ui: BoolProperty(
+        name="Show Appearance UI",
+        default=False,
+        description="Show the appearance controls for this slot"
+    )
     item_coloring_json: StringProperty(
         name="Item Coloring JSON",
         default="",
         description="JSON list of coloring entries for the selected appearance"
+    )
+    show_item_coloring_ui: BoolProperty(
+        name="Show Details UI",
+        default=False,
+        description="Show the appearance and coloring controls for this slot"
     )
 
 
@@ -402,6 +436,22 @@ def _phoneme_enabled_update_callback(self, context):
                 pb["phoneme_enabled"] = 1.0 if self.phoneme_enabled else 0.0
             break
 
+def _get_master_equipment_appearances(self, context):
+    import json
+    apps = set()
+    for slot in getattr(self, "equipment_slots", []):
+        try:
+            names = json.loads(slot.item_appearances_json or '[]')
+            for n in names:
+                if n and n != "__default__":
+                    apps.add(n)
+        except Exception:
+            pass
+    items = [("NONE", "Master Appearance...", "Change appearance of all equipped items")]
+    for app in sorted(list(apps)):
+        items.append((app, app, ""))
+    items.append(("__default__", "Default", ""))
+    return _cache_dynamic_enum_items(("master_equipment_appearance", tuple(items)), items)
 
 class witcherui_RigSettings(bpy.types.PropertyGroup):
     model_name: bpy.props.StringProperty(default = "",
@@ -426,6 +476,11 @@ class witcherui_RigSettings(bpy.types.PropertyGroup):
     variants_auto: bpy.props.BoolProperty(default=True,
                         name="Variants Auto",
                         description="Auto-enable variants when their category is equipped")
+    master_equipment_appearance: EnumProperty(
+        name="Master Appearance",
+        items=_get_master_equipment_appearances,
+        description="Select an appearance to apply to all equipment slots that support it"
+    )
     equipment_ui_tab: EnumProperty(
                         name="Equipment Tab",
                         items=[

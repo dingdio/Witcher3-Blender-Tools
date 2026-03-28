@@ -294,13 +294,16 @@ def _tag_redcloth_for_reuse(cloth_armature, reuse_key: str, resource_path: str, 
 
 
 def _build_coloring_entry_lookup(coloring_entries, appearance_name):
-    if not coloring_entries or not appearance_name:
+    if not coloring_entries:
         return {}
 
     lookup = {}
     for entry in coloring_entries:
         try:
-            if entry['appearance'] != appearance_name:
+            entry_app = str(entry['appearance'] or "")
+            # Entries with a specific appearance must match; entries with no
+            # appearance (empty string) apply to all appearances.
+            if entry_app and (not appearance_name or entry_app != appearance_name):
                 continue
             component_name = str(entry['componentName'] or "")
             if component_name:
@@ -2290,6 +2293,19 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
 
         if slot is None:
             continue
+            
+        if not slot.category:
+            fallback = category_raw or resolved_category or _derive_template_from_item(item_raw) or str(item_raw)
+            if not fallback:
+                fallback = f"inventory_{slot_index}"
+            base_fallback = fallback
+            counter = 2
+            while fallback in slot_by_category:
+                fallback = f"{base_fallback}_{counter}"
+                counter += 1
+            slot.category = fallback
+            slot_by_category[fallback] = (slot_index, slot)
+
         slot.source_game = getattr(rig_settings, "source_game", "w3")
         if shared_inventory:
             slot.is_inventory = True
@@ -3826,6 +3842,10 @@ def import_app(context,
             if not equip_template:
                 equip_template = default_item  # Fallback: use item name as template
 
+        if not slot.category:
+            fallback = _derive_template_from_item(default_item) or default_item or f"slot_{slot_index}"
+            slot.category = fallback
+
         slot.equip_template = equip_template
         slot.base_equip_template = equip_template
 
@@ -3897,6 +3917,14 @@ def import_app(context,
     try:
         from ..ui.ui_equipment import refresh_variant_states
         refresh_variant_states(rig_settings)
+    except Exception:
+        pass
+
+    # Sync persistent slots → temp UI entries so the equipment panel
+    # reflects the newly-created slots immediately after import.
+    try:
+        from ..ui.ui_equipment import sync_equipment_slots_to_temp
+        sync_equipment_slots_to_temp(context, rig_settings)
     except Exception:
         pass
 

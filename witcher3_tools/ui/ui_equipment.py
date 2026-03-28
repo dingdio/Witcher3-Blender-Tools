@@ -5,6 +5,8 @@ import uuid
 import logging
 import re
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
+from bpy.app.handlers import persistent
 from mathutils import Matrix
 from types import SimpleNamespace
 
@@ -44,7 +46,6 @@ _EQUIPMENT_ENTITY_CACHE = {}
 _TEMPLATE_PATH_RESOLVE_CACHE = {}  # (template_key, roots_tuple) -> (repo_path, export_path)
 _XML_DECL_RE = re.compile(r'^\s*<\?xml[^>]*\?>', re.IGNORECASE)
 _XML_DECL_ENCODING_BYTES_RE = re.compile(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', re.IGNORECASE)
-
 
 def _clear_cache_if_oversized(cache, max_entries=64):
     if len(cache) > max_entries:
@@ -472,6 +473,63 @@ def _lookup_item_attributes(item_name, source_game="w3"):
     return {}
 
 
+def _apply_catalog_attributes_to_slot(slot, source_game=None):
+    if slot is None:
+        return False
+
+    source_game = _normalize_source_game(source_game or getattr(slot, "source_game", "") or "w3")
+    item_name = str(getattr(slot, "item_name", "") or "").strip()
+    equip_template = str(getattr(slot, "equip_template", "") or "").strip()
+    attrs = _lookup_item_attributes(item_name, source_game) if item_name else {}
+    if not attrs and equip_template:
+        attrs = _lookup_item_attributes(equip_template, source_game)
+    if not attrs and item_name:
+        try:
+            derived_template = import_entity._derive_template_from_item(item_name)
+        except Exception:
+            derived_template = ""
+        if derived_template:
+            attrs = _lookup_item_attributes(derived_template, source_game)
+    if not attrs:
+        return False
+
+    changed = False
+
+    def _assign(prop_name, value):
+        nonlocal changed
+        if getattr(slot, prop_name, None) != value:
+            setattr(slot, prop_name, value)
+            changed = True
+
+    _assign("equip_slot", attrs.get("equip_slot", getattr(slot, "equip_slot", "")))
+    _assign("hold_slot", attrs.get("hold_slot", getattr(slot, "hold_slot", "")))
+    _assign("weapon", bool(attrs.get("weapon", getattr(slot, "weapon", False))))
+    _assign("attachment_type", attrs.get("attachment_type", getattr(slot, "attachment_type", "")))
+    variants = attrs.get("variants", [])
+    bound_items = attrs.get("bound_items", [])
+    tags = attrs.get("tags", [])
+    try:
+        variants_json = json.dumps(variants)
+    except Exception:
+        variants_json = getattr(slot, "variants_json", "")
+    _assign("variants_json", variants_json)
+    try:
+        bound_items_json = json.dumps(bound_items)
+    except Exception:
+        bound_items_json = getattr(slot, "bound_items_json", "")
+    _assign("bound_items_json", bound_items_json)
+    _assign("variants_summary", _format_variant_summary(variants))
+    _assign("bound_items_summary", _format_bound_items_summary(bound_items))
+    if isinstance(tags, str):
+        tags = _split_tags(tags)
+    try:
+        tags_summary = ", ".join([str(tag) for tag in tags if tag])
+    except Exception:
+        tags_summary = getattr(slot, "tags_summary", "")
+    _assign("tags_summary", tags_summary)
+    return changed
+
+
 def _get_armature_source_roots(armature):
     if not armature:
         return []
@@ -645,8 +703,16 @@ def _clear_guid_metadata(obj, guid, prop_name):
             del obj[prop_name]
     except Exception:
         pass
-    if prop_name == "witcher_equip_guid":
-        for extra_prop in ("witcher_bound_parent_guid", "witcher_bound_item_name"):
+    if prop_name in {"witcher_equip_guid", "witcher_template_guid"}:
+        for extra_prop in (
+            "witcher_bound_parent_guid",
+            "witcher_bound_item_name",
+            "witcher_redcloth_reuse_key",
+            "witcher_redcloth_resource",
+            "witcher_redcloth_material",
+            "witcher_redcloth_mesh_name",
+            "witcher_redcloth_mesh_names",
+        ):
             try:
                 if obj.get(extra_prop) and (extra_prop != "witcher_bound_parent_guid" or obj.get(extra_prop) == guid):
                     del obj[extra_prop]
@@ -668,6 +734,7 @@ def _build_guid_index(prop_name="witcher_equip_guid"):
             index.setdefault(val, []).append(obj)
     return index
 
+
 def remove_objects_by_guid(guid, prop_name="witcher_equip_guid"):
     """Delete GUID-tagged scene objects without breaking external child hierarchies."""
     tagged_objects = set(find_objects_by_guid(guid, prop_name))
@@ -688,13 +755,338 @@ def remove_objects_by_guid(guid, prop_name="witcher_equip_guid"):
             continue
 
         try:
+            obj_name = obj.name  # capture before removal
             bpy.data.objects.remove(obj, do_unlink=True)
             removed += 1
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Failed to remove GUID-tagged object '%s': %s", obj_name, e)
+            _clear_guid_metadata(obj, guid, prop_name)
         finally:
             pending.discard(obj)
     return removed
+
+
+# ---------------------------------------------------------------------------
+# GUID validation & repair
+# ---------------------------------------------------------------------------
+
+def _guid_has_objects(guid, prop_name="witcher_equip_guid"):
+    """Fast check: does at least one scene object carry this GUID?"""
+    if not guid:
+        return False
+    for obj in bpy.data.objects:
+        if obj.get(prop_name) == guid and not _is_internal_inventory_group_object(obj):
+            return True
+    return False
+
+
+def _get_slot_item_appearance_names(slot):
+    try:
+        raw_names = json.loads(getattr(slot, "item_appearances_json", "") or "[]")
+    except Exception:
+        raw_names = []
+    result = []
+    for name in raw_names:
+        name = str(name or "").strip()
+        if name and name != "__default__" and name not in result:
+            result.append(name)
+    return result
+
+
+def _slot_supports_item_appearance_ui(slot):
+    return len(_get_slot_item_appearance_names(slot)) > 1
+
+
+def _slot_supports_item_coloring_ui(slot, colorable_meshes=None):
+    if slot is None:
+        return False
+    if not getattr(slot, "is_loaded", False):
+        return False
+    if not getattr(slot, "equip_guid", ""):
+        return False
+    if not getattr(slot, "item_coloring_json", ""):
+        return False
+    if colorable_meshes is not None:
+        return bool(colorable_meshes)
+    return True
+
+
+def _slot_supports_item_details_ui(slot, colorable_meshes=None):
+    return bool(
+        _slot_supports_item_appearance_ui(slot)
+        or _slot_supports_item_coloring_ui(slot, colorable_meshes=colorable_meshes)
+    )
+
+
+def _slot_supports_rune_ui(slot):
+    return bool(
+        slot
+        and getattr(slot, "is_loaded", False)
+        and getattr(slot, "category", "") in {"steelsword", "silversword"}
+    )
+
+
+def _get_slot_colorable_meshes(slot):
+    if not _slot_supports_item_coloring_ui(slot):
+        return []
+    return [
+        obj for obj in find_objects_by_guid(getattr(slot, "equip_guid", ""), "witcher_equip_guid")
+        if getattr(obj, "type", "") == 'MESH'
+        and any(obj.get(k) is not None for k in ("colorShift1_hue", "colorShift2_hue"))
+    ]
+
+
+def _coerce_slot_inline_ui_state(slot):
+    repaired = False
+    if slot is None:
+        return repaired
+    if not _slot_supports_item_appearance_ui(slot) and getattr(slot, "show_item_appearance_ui", False):
+        slot.show_item_appearance_ui = False
+        repaired = True
+    if not _slot_supports_item_details_ui(slot) and getattr(slot, "show_item_coloring_ui", False):
+        slot.show_item_coloring_ui = False
+        repaired = True
+    return repaired
+
+
+def _get_slot_hold_toggle_state(slot, slot_policy):
+    if slot.is_loaded and slot_policy["hold_valid"]:
+        is_in_hold = bool(slot.is_in_hold_slot)
+        toggle_icon = 'ARMATURE_DATA' if is_in_hold else 'FILE_3D'
+        if slot_policy["policy"] == "hold_only_on_rig":
+            toggle_text = "Put Away" if is_in_hold else "Hold"
+        else:
+            toggle_text = "Mount" if is_in_hold else "Hold"
+        return True, toggle_text, toggle_icon
+    if not slot.is_loaded and slot_policy["policy"] == "hold_only_on_rig" and slot_policy["hold_valid"]:
+        return True, "Hold", 'ARMATURE_DATA'
+    return False, "", 'ARMATURE_DATA'
+
+
+def _draw_slot_details_ui(layout, slot, *, has_appearance_ui, has_coloring_ui, colorable_meshes):
+    if not getattr(slot, "show_item_coloring_ui", False):
+        return
+    if has_appearance_ui:
+        app_row = layout.row(align=True)
+        app_row.prop(slot, "item_appearance_name", text="Appearance")
+    if has_coloring_ui:
+        try:
+            from ..ui.ui_entity import _show_coloring_object_props
+            if colorable_meshes:
+                col_box = layout.box()
+                col_box.label(text="Coloring", icon='MOD_HUE_SATURATION')
+                _show_coloring_object_props(col_box, colorable_meshes)
+        except Exception as e:
+            log.warning("Failed to show coloring entries ui: %s", e)
+
+
+def validate_slot_loaded_state(slot, prop_name="witcher_equip_guid"):
+    """Reconcile *slot.is_loaded* with what actually exists in the scene.
+
+    Returns True if the slot was already consistent, False if it was fixed.
+    """
+    repaired = False
+    if not getattr(slot, "is_loaded", False):
+        restored_loaded = False
+        guid = getattr(slot, "equip_guid", "")
+        if guid and _guid_has_objects(guid, prop_name):
+            slot.is_loaded = True
+            repaired = True
+            restored_loaded = True
+        elif guid:
+            slot.equip_guid = ""
+            repaired = True
+        if not restored_loaded and getattr(slot, "is_in_hold_slot", False):
+            slot.is_in_hold_slot = False
+            repaired = True
+        if _coerce_slot_inline_ui_state(slot):
+            repaired = True
+        return not repaired
+
+    guid = getattr(slot, "equip_guid", "")
+    if not guid or not _guid_has_objects(guid, prop_name):
+        # Slot claims to be loaded but nothing in the scene matches its GUID.
+        slot.is_loaded = False
+        slot.equip_guid = ""
+        slot.is_in_hold_slot = False
+        slot.show_item_appearance_ui = False
+        slot.show_item_coloring_ui = False
+        log.debug(
+            "Repaired stale equipment slot '%s/%s': GUID objects missing from scene.",
+            getattr(slot, "category", "?"),
+            getattr(slot, "item_name", "?"),
+        )
+        repaired = True
+    if _coerce_slot_inline_ui_state(slot):
+        repaired = True
+    return not repaired
+
+
+def validate_all_equipment_slots(rig_settings):
+    """Walk every equipment slot and fix stale is_loaded flags.
+
+    Returns the number of slots that were repaired.
+    """
+    repaired = 0
+    for slot in getattr(rig_settings, "equipment_slots", []):
+        if not validate_slot_loaded_state(slot):
+            repaired += 1
+    return repaired
+
+
+def validate_template_slot_loaded_state(slot):
+    repaired = False
+    if not getattr(slot, "is_loaded", False):
+        guid = getattr(slot, "template_guid", "")
+        if guid and _guid_has_objects(guid, "witcher_template_guid"):
+            slot.is_loaded = True
+            repaired = True
+        elif guid:
+            slot.template_guid = ""
+            repaired = True
+        if not getattr(slot, "is_loaded", False) and getattr(slot, "is_hidden", False):
+            slot.is_hidden = False
+            repaired = True
+        return not repaired
+
+    guid = getattr(slot, "template_guid", "")
+    if not guid or not _guid_has_objects(guid, "witcher_template_guid"):
+        slot.is_loaded = False
+        slot.template_guid = ""
+        slot.is_hidden = False
+        repaired = True
+    return not repaired
+
+
+def validate_all_template_slots(rig_settings):
+    repaired = 0
+    for slot in getattr(rig_settings, "template_slots", []):
+        if not validate_template_slot_loaded_state(slot):
+            repaired += 1
+    return repaired
+
+
+def _iter_saved_equipment_armatures():
+    seen_data = set()
+    for obj in bpy.data.objects:
+        if obj is None or getattr(obj, "type", "") != 'ARMATURE':
+            continue
+        if getattr(getattr(obj, "parent", None), "type", "") == 'ARMATURE':
+            continue
+        data = getattr(obj, "data", None)
+        rig_settings = getattr(data, "witcherui_RigSettings", None) if data is not None else None
+        if rig_settings is None:
+            continue
+        try:
+            has_equipment = bool(len(getattr(rig_settings, "equipment_slots", [])))
+        except Exception:
+            has_equipment = False
+        try:
+            has_entity_slots = bool(len(getattr(rig_settings, "entity_slots", [])))
+        except Exception:
+            has_entity_slots = False
+        if not has_equipment and not has_entity_slots:
+            continue
+        try:
+            key = data.as_pointer()
+        except Exception:
+            key = id(data)
+        if key in seen_data:
+            continue
+        seen_data.add(key)
+        yield obj, rig_settings
+
+
+
+def repair_saved_equipment_state(armature, rig_settings=None):
+    if armature is None or getattr(armature, "type", "") != 'ARMATURE':
+        return 0, 0
+    if rig_settings is None:
+        rig_settings = getattr(getattr(armature, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is None:
+        return 0, 0
+
+    refresh_count = 0
+    repaired = 0
+    try:
+        refresh_count = refresh_slot_constraints(armature)
+    except Exception:
+        log.warning("Failed to refresh slot constraints for '%s' during saved-state repair", getattr(armature, "name", "?"), exc_info=True)
+
+    repaired += validate_all_equipment_slots(rig_settings)
+    repaired += validate_all_template_slots(rig_settings)
+
+    source_game = _infer_source_game_from_rig_settings(rig_settings, armature)
+    for slot in getattr(rig_settings, "equipment_slots", []):
+        try:
+            if _apply_catalog_attributes_to_slot(slot, source_game):
+                repaired += 1
+        except Exception:
+            pass
+
+    return refresh_count, repaired
+
+
+def _deferred_repair_saved_equipment_state():
+    try:
+        total_refreshed = 0
+        total_repaired = 0
+        for armature, rig_settings in _iter_saved_equipment_armatures():
+            refreshed, repaired = repair_saved_equipment_state(armature, rig_settings)
+            total_refreshed += refreshed
+            total_repaired += repaired
+        if total_refreshed or total_repaired:
+            log.info(
+                "Restored saved equipment state: refreshed %d slot constraint(s), repaired %d equipment state(s)",
+                total_refreshed,
+                total_repaired,
+            )
+    except Exception:
+        log.warning("Failed to restore saved equipment state after file load", exc_info=True)
+    return None
+
+
+def _schedule_deferred_equipment_repair():
+    try:
+        if hasattr(bpy.app.timers, "is_registered") and bpy.app.timers.is_registered(_deferred_repair_saved_equipment_state):
+            return
+    except Exception:
+        pass
+    try:
+        bpy.app.timers.register(_deferred_repair_saved_equipment_state, first_interval=0.0)
+    except Exception:
+        _deferred_repair_saved_equipment_state()
+
+
+@persistent
+def _repair_equipment_state_on_load(_filepath=""):
+    _schedule_deferred_equipment_repair()
+
+
+def _register_equipment_load_handler():
+    if _repair_equipment_state_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_repair_equipment_state_on_load)
+
+
+def _unregister_equipment_load_handler():
+    if _repair_equipment_state_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_repair_equipment_state_on_load)
+
+
+# Throttled validation — avoid scanning every UI redraw frame.
+_last_equipment_validation_time = 0.0
+_EQUIPMENT_VALIDATION_INTERVAL = 2.0  # seconds
+
+
+def _maybe_validate_equipment_slots(rig_settings):
+    """Run validation at most once every few seconds (called from UI draw)."""
+    import time
+    global _last_equipment_validation_time
+    now = time.monotonic()
+    if now - _last_equipment_validation_time < _EQUIPMENT_VALIDATION_INTERVAL:
+        return 0
+    _last_equipment_validation_time = now
+    return validate_all_equipment_slots(rig_settings)
 
 
 def _collect_mount_roots(objects, ignored_objects=None):
@@ -930,6 +1322,30 @@ def _safe_restore_selection(saved_active, saved_selection):
     except Exception:
         pass
 
+
+def _capture_selection_state(context):
+    """Capture the current active object and selection, tolerating partial contexts."""
+    try:
+        view_layer = getattr(context, "view_layer", None)
+        saved_active = view_layer.objects.active if view_layer and getattr(view_layer, "objects", None) else None
+    except Exception:
+        saved_active = None
+    try:
+        saved_selection = [obj for obj in getattr(context, "selected_objects", [])]
+    except Exception:
+        saved_selection = []
+    return saved_active, saved_selection
+
+
+@contextmanager
+def _preserve_selection(context=None):
+    selection_context = context if context is not None else bpy.context
+    saved_active, saved_selection = _capture_selection_state(selection_context)
+    try:
+        yield
+    finally:
+        _safe_restore_selection(saved_active, saved_selection)
+
 def _set_pose_all_armatures(root_armature, pose_value):
     """Set pose_position for root armature and any child armatures."""
     if not root_armature or root_armature.type != 'ARMATURE':
@@ -1146,6 +1562,23 @@ def get_effective_hold_slot(slot):
     return slot.hold_slot
 
 
+def _get_slot_requested_mount_mode(slot, slot_policy=None):
+    if slot is None:
+        return "equip"
+    if getattr(slot, "is_loaded", False):
+        return "hold" if getattr(slot, "is_in_hold_slot", False) else "equip"
+    if slot_policy and slot_policy.get("policy") == "hold_only_on_rig" and slot_policy.get("hold_valid"):
+        return "hold"
+    return "equip"
+
+
+def _can_load_slot_for_mount_mode(slot_policy, mount_mode):
+    mount_mode = str(mount_mode or "").strip().lower()
+    if mount_mode == "hold":
+        return bool(slot_policy.get("hold_valid"))
+    return slot_policy.get("policy") == "equipable_on_rig"
+
+
 def _slot_has_explicit_mount_target(slot):
     if slot is None:
         return False
@@ -1158,13 +1591,27 @@ def _slot_has_explicit_mount_target(slot):
 def _slot_matches_unmounted_visual_hint(slot):
     if slot is None:
         return False
+        
+    template = get_effective_equip_template(slot)
+    if template and str(template).lower().strip().endswith('.w2ent'):
+        return True
+        
+    if str(getattr(slot, "attachment_type", "")).strip():
+        return True
+
+    keywords = {
+        "tail", "hair", "armor", "gloves", "pants", "boots", 
+        "torso", "legs", "arms", "trousers", "head", "mask", 
+        "cape", "cloak", "beard", "mustache", "helmet", "hood",
+        "shirt", "shoes", "amulet", "accessory", "belt", "medal"
+    }
     for value in (
         getattr(slot, "category", ""),
         getattr(slot, "item_name", ""),
-        get_effective_equip_template(slot),
+        template,
     ):
         normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower())
-        if "tail" in normalized or "hair" in normalized:
+        if any(kw in normalized for kw in keywords):
             return True
     return False
 
@@ -1500,11 +1947,16 @@ def _get_cached_equipment_item_entity(export_path, prepared_context=None):
 def _update_slot_coloring_json(slot, item_entity):
     """Populate slot.item_coloring_json from item_entity.coloringEntries for the selected appearance."""
     coloring_entries = getattr(item_entity, 'coloringEntries', None) or []
-    selected_app = getattr(slot, 'item_appearance_name', '') or '__default__'
+    app_names = _get_slot_item_appearance_names(slot)
+    selected_app = getattr(slot, 'item_appearance_name', '') or ''
+    if not selected_app or selected_app == '__default__' or (app_names and selected_app not in app_names):
+        selected_app = app_names[0] if app_names else ''
+
     result = []
     for entry in coloring_entries:
         entry_app = getattr(entry, 'appearance', '') or ''
-        if selected_app == '__default__' or not entry_app or entry_app == selected_app:
+        # Exact match required, no generic fallback unless entry_app is explicitly empty 
+        if not entry_app or entry_app == selected_app:
             cs1 = getattr(entry, 'colorShift1', None)
             cs2 = getattr(entry, 'colorShift2', None)
             result.append({
@@ -1517,6 +1969,146 @@ def _update_slot_coloring_json(slot, item_entity):
                 'lum2': getattr(cs2, 'luminance', 0) if cs2 else 0,
             })
     slot.item_coloring_json = json.dumps(result)
+
+
+def _resolve_item_entity_selected_appearance(item_entity, item_appearance_name=None):
+    selected_item_appearance = None
+    selected_item_appearance_name = ""
+    if item_entity and getattr(item_entity, 'appearances', None):
+        selected_app = item_entity.appearances[0]
+        target_name = str(item_appearance_name or "").strip()
+        if target_name and target_name != '__default__':
+            for app in item_entity.appearances:
+                if str(getattr(app, 'name', '') or '') == target_name:
+                    selected_app = app
+                    break
+        selected_item_appearance = selected_app
+        selected_item_appearance_name = str(getattr(selected_app, 'name', '') or '').strip()
+    return selected_item_appearance, selected_item_appearance_name
+
+
+def _get_item_entity_appearance_structure_signature(item_entity, item_appearance_name=None):
+    if item_entity is None:
+        return ""
+
+    selected_app, _selected_name = _resolve_item_entity_selected_appearance(item_entity, item_appearance_name)
+    if selected_app is not None:
+        included_templates = getattr(selected_app, 'includedTemplates', None) or []
+        if included_templates:
+            return "included:" + import_entity._to_json_text(included_templates, default_text="[]", indent=None)
+
+    static_meshes = getattr(item_entity, 'staticMeshes', None)
+    if isinstance(static_meshes, dict) and static_meshes.get('chunks'):
+        return "static:" + import_entity._to_json_text({'chunks': static_meshes.get('chunks')}, default_text="{}", indent=None)
+    if hasattr(static_meshes, 'chunks') and getattr(static_meshes, 'chunks', None):
+        return "static:" + import_entity._to_json_text({'chunks': static_meshes.chunks}, default_text="{}", indent=None)
+    return "base"
+
+
+def _get_loaded_slot_item_appearance_name(slot):
+    if slot is None:
+        return ""
+    guid = str(getattr(slot, "equip_guid", "") or "").strip()
+    if not guid:
+        return ""
+    for obj in find_objects_by_guid(guid, "witcher_equip_guid"):
+        appearance_name = str(obj.get("witcher_item_appearance", "") or "").strip()
+        if appearance_name:
+            return appearance_name
+    return ""
+
+
+def try_update_loaded_equipment_appearance_in_place(context, armature, slot_index, rig_settings=None, prepared_context=None):
+    """Recolor a loaded item in place when the selected appearance does not change import structure."""
+    if armature is None:
+        return False
+    if rig_settings is None:
+        rig_settings = getattr(getattr(armature, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is None:
+        return False
+    if slot_index < 0 or slot_index >= len(rig_settings.equipment_slots):
+        return False
+
+    slot = rig_settings.equipment_slots[slot_index]
+    if not getattr(slot, "is_loaded", False) or not getattr(slot, "equip_guid", ""):
+        return False
+
+    prepared = _prepare_equipment_load_context(armature, rig_settings, prepared_context)
+    source_roots = prepared.get("source_roots", [])
+    effective_template = get_effective_equip_template(slot)
+    final_item, export_path, _search_pattern = _resolve_bundle_item_by_template_cached(
+        effective_template,
+        search_roots=source_roots,
+        prepared_context=prepared,
+    )
+    if not final_item or not export_path or not os.path.exists(export_path):
+        return False
+
+    item_entity = _get_cached_equipment_item_entity(export_path, prepared_context=prepared)
+    if item_entity is None:
+        return False
+
+    current_loaded_appearance = _get_loaded_slot_item_appearance_name(slot)
+    requested_appearance = getattr(slot, "item_appearance_name", "") or ""
+    current_signature = _get_item_entity_appearance_structure_signature(item_entity, current_loaded_appearance)
+    requested_signature = _get_item_entity_appearance_structure_signature(item_entity, requested_appearance)
+    if not current_signature or current_signature != requested_signature:
+        return False
+
+    objects = find_objects_by_guid(slot.equip_guid, "witcher_equip_guid")
+    if not objects:
+        return False
+
+    selected_app, resolved_appearance_name = _resolve_item_entity_selected_appearance(item_entity, requested_appearance)
+    item_coloring_entries = getattr(item_entity, 'coloringEntries', None) or []
+    try:
+        import_entity._apply_coloring_entries_to_objects(
+            objects,
+            item_coloring_entries,
+            resolved_appearance_name,
+        )
+    except Exception as e:
+        log.warning("Failed to recolor '%s' in place for appearance '%s': %s", slot.item_name, requested_appearance, e)
+        return False
+
+    try:
+        stamp_appearance = resolved_appearance_name if resolved_appearance_name != "__default__" else ""
+        import_entity.stamp_import_origin(
+            objects,
+            origin="equipment_slot",
+            entity_path=slot.resolved_repo_path,
+            source_game=slot.source_game,
+            item_category=slot.category,
+            item_name=slot.item_name,
+            equip_template=effective_template or slot.equip_template,
+            item_appearance=stamp_appearance,
+            owner_entity_path=getattr(rig_settings, "repo_path", ""),
+        )
+    except Exception as e:
+        log.warning("Failed to restamp in-place appearance metadata for '%s': %s", slot.item_name, e)
+
+    try:
+        import_entity.initialize_imported_entity_armatures(
+            objects,
+            item_entity,
+            filename=export_path,
+            selected_appearance_name=resolved_appearance_name,
+            update_json=True,
+            context_role="auxiliary",
+        )
+    except Exception as e:
+        log.warning("Failed to sync in-place appearance armature state for '%s': %s", slot.item_name, e)
+
+    try:
+        _update_slot_coloring_json(slot, item_entity)
+    except Exception:
+        pass
+
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    return True
 
 
 def _import_item_entity(export_path, final_item_name, entity, armature, appearance, slot_index, empty_transform,
@@ -1542,17 +2134,13 @@ def _import_item_entity(export_path, final_item_name, entity, armature, appearan
             attachment_profile is None
             or getattr(attachment_profile, "requires_owner_root_binding", False)
         )
-    if item_entity and hasattr(item_entity, 'appearances') and item_entity.appearances:
-        selected_app = item_entity.appearances[0]
-        if item_appearance_name and item_appearance_name != '__default__':
-            for app in item_entity.appearances:
-                if getattr(app, 'name', '') == item_appearance_name:
-                    selected_app = app
-                    break
-        selected_item_appearance = selected_app
-        selected_item_appearance_name = getattr(selected_app, 'name', '') or ""
-        if hasattr(selected_app, 'includedTemplates') and selected_app.includedTemplates:
-            included_templates = selected_app.includedTemplates
+    if item_entity is not None:
+        selected_item_appearance, selected_item_appearance_name = _resolve_item_entity_selected_appearance(
+            item_entity,
+            item_appearance_name,
+        )
+        if selected_item_appearance is not None and hasattr(selected_item_appearance, 'includedTemplates') and selected_item_appearance.includedTemplates:
+            included_templates = selected_item_appearance.includedTemplates
 
     static_template_data = None
     static_meshes = getattr(item_entity, 'staticMeshes', None) if item_entity else None
@@ -2067,8 +2655,10 @@ def _resolve_visual_policy_from_slot_names(equip_slot_name, hold_slot_name, arma
     hold_target = _resolve_equipment_mount_target(hold_slot_name, armature, rig_settings)
     item_is_visual = _item_entity_is_visual(item_entity, attachment_profile=attachment_profile)
 
+    reason = ""
     if not item_is_visual:
         policy = "nonvisual_on_rig"
+        reason = "Item has no visual mesh or is an inventory wrapper."
     elif attachment_profile is not None and getattr(attachment_profile, "kind", "") == "owner_graph":
         policy = "equipable_on_rig"
     elif equip_target["is_valid"]:
@@ -2079,9 +2669,11 @@ def _resolve_visual_policy_from_slot_names(equip_slot_name, hold_slot_name, arma
         policy = "equipable_on_rig"
     else:
         policy = "nonvisual_on_rig"
+        reason = f"No valid rig mount found for slots: {equip_slot_name} / {hold_slot_name}."
 
     return {
         "policy": policy,
+        "reason": reason,
         "item_is_visual": item_is_visual,
         "equip_target": equip_target,
         "hold_target": hold_target,
@@ -2148,30 +2740,27 @@ def _constrain_bound_armature_to_target(bound_armature, target_armature):
         return
     _snap_armature_to_target(bound_armature, target_armature)
     _align_bound_armature_pose(bound_armature, target_armature)
-    try:
-        # Preserve selection/active to avoid UI focus loss
-        saved_active = bpy.context.view_layer.objects.active
-        saved_selection = [obj for obj in bpy.context.selected_objects]
-        bpy.ops.object.select_all(action='DESELECT')
-        target_armature.select_set(True)
-        bound_armature.select_set(True)
-        bpy.context.view_layer.objects.active = target_armature
+    with _preserve_selection():
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+            target_armature.select_set(True)
+            bound_armature.select_set(True)
+            bpy.context.view_layer.objects.active = target_armature
 
-        from .. import constrain_util
-        constrain_util.CreateConstraints2(target_armature, bound_armature)
-        _set_child_of_inverse_for_armature(bound_armature)
-        try:
-            bpy.context.view_layer.update()
-        except Exception:
-            pass
-    except Exception as e:
-        log.warning(f"Failed to constrain bound armature: {e}")
-    finally:
-        try:
-            bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
-        except Exception:
-            pass
-        _safe_restore_selection(saved_active, saved_selection)
+            from .. import constrain_util
+            constrain_util.CreateConstraints2(target_armature, bound_armature)
+            _set_child_of_inverse_for_armature(bound_armature)
+            try:
+                bpy.context.view_layer.update()
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning(f"Failed to constrain bound armature: {e}")
+        finally:
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+            except Exception:
+                pass
 
 
 def _armature_has_external_binding(bound_armature, object_set):
@@ -2265,80 +2854,75 @@ def _align_bound_armature_pose(bound_armature, target_armature):
     except Exception:
         file_helpers = None
 
-    try:
-        saved_active = bpy.context.view_layer.objects.active
-        saved_selection = [obj for obj in bpy.context.selected_objects]
-
-        dg = bpy.context.evaluated_depsgraph_get()
-        target_eval = target_armature.evaluated_get(dg)
-        target_world = target_eval.matrix_world
-
-        # Build name -> pose bone map (namespace-stripped)
-        target_map = {}
-        for tp in target_eval.pose.bones:
-            name = tp.name
-            if file_helpers:
-                name = file_helpers.rm_ns(name)
-            target_map[name] = tp
-
-        bpy.ops.object.select_all(action='DESELECT')
-        bound_armature.select_set(True)
-        bpy.context.view_layer.objects.active = bound_armature
-        bpy.ops.object.mode_set(mode='POSE', toggle=False)
-
-        inv_bound_world = bound_armature.matrix_world.inverted()
-        for bp in bound_armature.pose.bones:
-            bname = bp.name
-            if file_helpers:
-                bname = file_helpers.rm_ns(bname)
-            tp = target_map.get(bname)
-            if not tp:
-                continue
-            target_world_matrix = target_world @ tp.matrix
-            try:
-                bp.matrix = inv_bound_world @ target_world_matrix
-            except Exception:
-                pass
-
-        bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
-    except Exception:
-        pass
-    finally:
+    with _preserve_selection():
         try:
+            dg = bpy.context.evaluated_depsgraph_get()
+            target_eval = target_armature.evaluated_get(dg)
+            target_world = target_eval.matrix_world
+
+            # Build name -> pose bone map (namespace-stripped)
+            target_map = {}
+            for tp in target_eval.pose.bones:
+                name = tp.name
+                if file_helpers:
+                    name = file_helpers.rm_ns(name)
+                target_map[name] = tp
+
+            bpy.ops.object.select_all(action='DESELECT')
+            bound_armature.select_set(True)
+            bpy.context.view_layer.objects.active = bound_armature
+            bpy.ops.object.mode_set(mode='POSE', toggle=False)
+
+            inv_bound_world = bound_armature.matrix_world.inverted()
+            for bp in bound_armature.pose.bones:
+                bname = bp.name
+                if file_helpers:
+                    bname = file_helpers.rm_ns(bname)
+                tp = target_map.get(bname)
+                if not tp:
+                    continue
+                target_world_matrix = target_world @ tp.matrix
+                try:
+                    bp.matrix = inv_bound_world @ target_world_matrix
+                except Exception:
+                    pass
+
             bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
         except Exception:
             pass
-        _safe_restore_selection(saved_active, saved_selection)
+        finally:
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+            except Exception:
+                pass
 
 def _set_child_of_inverse_for_armature(bound_armature):
     """Set inverse for CHILD_OF constraints on a bound armature (keeps offsets)."""
     if not bound_armature or bound_armature.type != 'ARMATURE':
         return
-    try:
-        saved_active = bpy.context.view_layer.objects.active
-        saved_selection = [obj for obj in bpy.context.selected_objects]
-        bpy.ops.object.select_all(action='DESELECT')
-        bound_armature.select_set(True)
-        bpy.context.view_layer.objects.active = bound_armature
-        bpy.ops.object.mode_set(mode='POSE', toggle=False)
-
-        for pb in bound_armature.pose.bones:
-            for c in pb.constraints:
-                if c.type == 'CHILD_OF':
-                    try:
-                        bound_armature.data.bones.active = bound_armature.data.bones[pb.name]
-                        bpy.ops.constraint.childof_set_inverse(constraint=c.name, owner='BONE')
-                    except Exception:
-                        pass
-        bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
-    except Exception:
-        pass
-    finally:
+    with _preserve_selection():
         try:
+            bpy.ops.object.select_all(action='DESELECT')
+            bound_armature.select_set(True)
+            bpy.context.view_layer.objects.active = bound_armature
+            bpy.ops.object.mode_set(mode='POSE', toggle=False)
+
+            for pb in bound_armature.pose.bones:
+                for c in pb.constraints:
+                    if c.type == 'CHILD_OF':
+                        try:
+                            bound_armature.data.bones.active = bound_armature.data.bones[pb.name]
+                            bpy.ops.constraint.childof_set_inverse(constraint=c.name, owner='BONE')
+                        except Exception:
+                            pass
             bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
         except Exception:
             pass
-        _safe_restore_selection(saved_active, saved_selection)
+        finally:
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+            except Exception:
+                pass
 
 def _is_guid_hidden(guid, prop_name="witcher_equip_guid"):
     if not guid:
@@ -2381,14 +2965,12 @@ def _refresh_variants_and_reload(context, armature, rig_settings):
 
         refresh_variant_states(rig_settings)
 
-        saved_active = context.view_layer.objects.active
-        saved_selection = [obj for obj in context.selected_objects]
-        for i, slot in enumerate(slots):
-            after_template = get_effective_equip_template(slot)
-            after_active = bool(getattr(slot, "variant_active", False))
-            if slot.is_loaded and (before_templates[i] != after_template or before_active[i] != after_active):
-                load_equipment_item(context, armature, i, rig_settings)
-        _safe_restore_selection(saved_active, saved_selection)
+        with _preserve_selection(context):
+            for i, slot in enumerate(slots):
+                after_template = get_effective_equip_template(slot)
+                after_active = bool(getattr(slot, "variant_active", False))
+                if slot.is_loaded and (before_templates[i] != after_template or before_active[i] != after_active):
+                    load_equipment_item(context, armature, i, rig_settings)
     finally:
         _VARIANT_REFRESHING = False
 
@@ -3127,44 +3709,35 @@ class EquipmentDefinitionEntry(bpy.types.PropertyGroup):
         if slot_index < 0 or slot_index >= len(rig_settings.equipment_slots):
             return
 
-        saved_active = None
-        saved_selection = []
-        try:
-            saved_active = context.view_layer.objects.active
-            saved_selection = [obj for obj in context.selected_objects]
-        except Exception:
-            pass
-
         slot = rig_settings.equipment_slots[slot_index]
-        try:
-            effective_template = get_effective_equip_template(slot)
-            if not self.defaultItemName or self.defaultItemName == "None" or not effective_template or effective_template == "None":
-                unload_equipment_item(slot)
+        with _preserve_selection(context):
+            try:
+                effective_template = get_effective_equip_template(slot)
+                if not self.defaultItemName or self.defaultItemName == "None" or not effective_template or effective_template == "None":
+                    unload_equipment_item(slot)
+                    try:
+                        _refresh_variants_and_reload(context, armature, rig_settings)
+                    except Exception:
+                        pass
+                    return
+
                 try:
-                    _refresh_variants_and_reload(context, armature, rig_settings)
+                    refresh_slot_constraints(armature)
                 except Exception:
                     pass
-                return
 
-            try:
-                refresh_slot_constraints(armature)
+                with mod_loading_context(context):
+                    loaded = load_equipment_item(context, armature, slot_index, rig_settings)
+                if not loaded:
+                    reason = _get_last_equipment_load_failure(armature, slot_index) or "Unknown failure"
+                    log.warning(
+                        "Auto-apply equipment selection failed for slot %d (%s): %s",
+                        slot_index,
+                        getattr(slot, "item_name", "") or "<no item>",
+                        reason,
+                    )
             except Exception:
-                pass
-
-            with mod_loading_context(context):
-                loaded = load_equipment_item(context, armature, slot_index, rig_settings)
-            if not loaded:
-                reason = _get_last_equipment_load_failure(armature, slot_index) or "Unknown failure"
-                log.warning(
-                    "Auto-apply equipment selection failed for slot %d (%s): %s",
-                    slot_index,
-                    getattr(slot, "item_name", "") or "<no item>",
-                    reason,
-                )
-        except Exception:
-            log.warning("Auto-apply equipment selection failed", exc_info=True)
-        finally:
-            _safe_restore_selection(saved_active, saved_selection)
+                log.warning("Auto-apply equipment selection failed", exc_info=True)
 
     # Update the equip_template and other attributes when a new item is selected
     def update_item_attributes(self, context):
@@ -4077,26 +4650,7 @@ class EQUIPMENT_OT_ToggleVariantMode(bpy.types.Operator):
             return {'CANCELLED'}
 
         rig_settings.variants_auto = not rig_settings.variants_auto
-
-        # Refresh variant states and reload changed slots
-        slots = rig_settings.equipment_slots
-        before_templates = []
-        before_active = []
-        for slot in slots:
-            before_templates.append(get_effective_equip_template(slot))
-            before_active.append(bool(getattr(slot, "variant_active", False)))
-
-        saved_active = context.view_layer.objects.active
-        saved_selection = [obj for obj in context.selected_objects]
-        refresh_variant_states(rig_settings)
-
-        for i, slot in enumerate(slots):
-            after_template = get_effective_equip_template(slot)
-            after_active = bool(getattr(slot, "variant_active", False))
-            if slot.is_loaded and (before_templates[i] != after_template or before_active[i] != after_active):
-                load_equipment_item(context, ob, i, rig_settings)
-
-        _safe_restore_selection(saved_active, saved_selection)
+        _refresh_variants_and_reload(context, ob, rig_settings)
 
         mode = "Auto" if rig_settings.variants_auto else "Manual"
         self.report({'INFO'}, f"Variant mode set to {mode}")
@@ -4527,10 +5081,6 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
             except Exception:
                 pass
 
-        info_box = layout.box()
-        info_box.label(text="Character appearance loading moved to parent panel.", icon='INFO')
-        info_box.label(text="Use this panel for templates, equipment items, and entity slots.")
-
         # prop_enum tab buttons can lose their captions when property split is enabled.
         prev_split = layout.use_property_split
         layout.use_property_split = False
@@ -4622,13 +5172,27 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
             # =============================================================
             # EQUIPMENT SECTION (persistent, GUID-tracked)
             # =============================================================
+            # Periodically reconcile is_loaded flags with actual scene state
+            # so the UI never shows stale "loaded" indicators after the user
+            # deletes objects manually.
+            _maybe_validate_equipment_slots(rig_settings)
+
             box = layout.box()
-            box.label(text="Equipment Entries:", icon='ARMATURE_DATA')
+            box.label(text="Currently Equipped", icon='COMMUNITY')
+
+            # Master appearance dropdown
+            mast_row = box.row(align=True)
+            mast_row.prop(rig_settings, "master_equipment_appearance", text="")
+            mast_row.operator("witcher.equipment_set_master_appearance", text="Apply to All", icon='IMPORT')
+
             row = box.row(align=True)
             row.label(text=f"Variants: {'Auto' if rig_settings.variants_auto else 'Manual'}")
             row.operator("witcher.equipment_toggle_variant_mode", text="Switch")
 
-            # Show persistent equipment slots with status
+            # Show persistent equipment slots with status.
+            # Every slot with a category OR an active selection is shown,
+            # even inventory items without a mount target - they get a
+            # disabled load button instead of being hidden entirely.
             if len(rig_settings.equipment_slots) > 0:
                 try:
                     refresh_variant_states(rig_settings)
@@ -4636,96 +5200,97 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                     pass
                 visible_slots = []
                 for i, slot in enumerate(rig_settings.equipment_slots):
-                    if not _slot_has_active_selection(slot):
+                    # Show any slot that has a category OR is loaded/active.
+                    if not slot.category and not _slot_has_active_selection(slot):
                         continue
                     slot_policy = _resolve_slot_visual_policy(slot, main_arm_obj, rig_settings)
-                    if getattr(slot, "is_inventory", False) and slot_policy["policy"] == "nonvisual_on_rig":
+                    # Hide nonvisual inventory items only when they have no
+                    # assigned category AND no item_name — those are noise entries with no
+                    # visual representation. Slots *with* a category or item_name came
+                    # from the entity's equipment data and must stay visible
+                    # even after being unloaded (is_loaded == False), so the
+                    # user can re-load them.
+                    item_name_str = str(getattr(slot, "item_name", "") or "").strip().lower()
+                    has_item = bool(item_name_str and item_name_str != "none")
+                    if (
+                        getattr(slot, "is_inventory", False)
+                        and slot_policy["policy"] == "nonvisual_on_rig"
+                        and not getattr(slot, "is_loaded", False)
+                        and not slot.category
+                        and not has_item
+                    ):
                         continue
                     visible_slots.append((i, slot, slot_policy))
                 for i, slot, slot_policy in visible_slots:
-                    row = box.row(align=True)
+                    has_variants = bool(_safe_json_list(getattr(slot, "variants_json", "")))
+                    has_appearance_ui = _slot_supports_item_appearance_ui(slot)
+                    colorable_meshes = _get_slot_colorable_meshes(slot)
+                    has_coloring_ui = _slot_supports_item_coloring_ui(slot, colorable_meshes=colorable_meshes)
+                    has_details_ui = _slot_supports_item_details_ui(slot, colorable_meshes=colorable_meshes)
+                    has_rune_ui = _slot_supports_rune_ui(slot)
+                    requested_mount_mode = _get_slot_requested_mount_mode(slot, slot_policy)
+                    can_load = _can_load_slot_for_mount_mode(slot_policy, requested_mount_mode)
+
+                    # --- Main slot row (compact, single-line by default) ---
+                    split = box.split(factor=0.50, align=True)
+                    row = split.row(align=True)
                     icon = 'CHECKMARK' if slot.is_loaded else 'RADIOBUT_OFF'
                     label_text = f"{slot.category}: {slot.item_name or 'None'}"
-                    if getattr(slot, "variant_active", False):
-                        label_text += " [VAR]"
-                    if slot_policy["policy"] == "hold_only_on_rig":
-                        label_text += " [Hold Only]"
                     row.label(text=label_text, icon=icon)
+                    if has_rune_ui:
+                        rune_inline = row.row(align=True)
+                        rune_inline.prop(slot, "rune_level", text="Rune")
 
-                    if _safe_json_list(getattr(slot, "variants_json", "")):
-                        toggle = row.row(align=True)
-                        toggle.enabled = not rig_settings.variants_auto
-                        toggle.prop(slot, "variants_enabled", text="Var")
-                        if getattr(slot, "variant_active", False):
-                            row.label(text="", icon='CHECKMARK')
+                    controls = split.row(align=True)
 
-                    show_toggle = False
-                    toggle_text = ""
-                    toggle_icon = 'ARMATURE_DATA'
-                    if slot.is_loaded and slot_policy["hold_valid"]:
-                        is_in_hold = bool(slot.is_in_hold_slot)
-                        toggle_icon = 'ARMATURE_DATA' if is_in_hold else 'FILE_3D'
-                        if slot_policy["policy"] == "hold_only_on_rig":
-                            toggle_text = "Put Away" if is_in_hold else "Hold"
-                        else:
-                            toggle_text = "->Mount" if is_in_hold else "->Hold"
-                        show_toggle = True
-                    elif not slot.is_loaded and slot_policy["policy"] == "hold_only_on_rig" and slot_policy["hold_valid"]:
-                        toggle_text = "Hold"
-                        toggle_icon = 'ARMATURE_DATA'
-                        show_toggle = True
+                    var_sub = controls.row(align=True)
+                    var_sub.enabled = has_variants and not rig_settings.variants_auto
+                    var_sub.prop(slot, "variants_enabled", text="", icon='SHAPEKEY_DATA', toggle=True)
 
-                    if show_toggle:
-                        op = row.operator("witcher.equipment_toggle_item", text=toggle_text, icon=toggle_icon)
-                        op.slot_index = i
+                    color_sub = controls.row(align=True)
+                    color_sub.enabled = has_details_ui
+                    color_sub.prop(slot, "show_item_coloring_ui", text="", icon='MOD_HUE_SATURATION', toggle=True)
+
+                    show_toggle, toggle_text, toggle_icon = _get_slot_hold_toggle_state(slot, slot_policy)
+
+                    tog_sub = controls.row(align=True)
+                    tog_sub.enabled = show_toggle
+                    op = tog_sub.operator("witcher.equipment_toggle_item", text=toggle_text, icon=toggle_icon)
+                    op.slot_index = i if show_toggle else -1
+
+                    vis_sub = controls.row(align=True)
+                    vis_sub.enabled = slot.is_loaded
+                    is_hidden = bool(slot.is_loaded and _is_guid_hidden(slot.equip_guid, "witcher_equip_guid"))
+                    vis_icon = 'HIDE_OFF' if is_hidden else 'HIDE_ON'
+                    vis_op_name = "witcher.equipment_show_equipment" if is_hidden else "witcher.equipment_hide_equipment"
+                    op = vis_sub.operator(vis_op_name, text="", icon=vis_icon)
+                    op.slot_index = i if slot.is_loaded else -1
 
                     if slot.is_loaded:
-                        is_hidden = _is_guid_hidden(slot.equip_guid, "witcher_equip_guid")
-                        if is_hidden:
-                            op = row.operator("witcher.equipment_show_equipment", text="", icon='HIDE_OFF')
-                        else:
-                            op = row.operator("witcher.equipment_hide_equipment", text="", icon='HIDE_ON')
-                        op.slot_index = i
-
-                        if slot.category in ('steelsword', 'silversword'):
-                            row.prop(slot, "rune_level", text="Rune")
-
-                        op = row.operator("witcher.equipment_unload_equipment", text="", icon='X')
+                        op = controls.operator("witcher.equipment_unload_equipment", text="", icon='X')
                         op.slot_index = i
                     else:
-                        # Always show a load/hold button in a consistent position.
-                        # Disabled when the item cannot be loaded on this rig.
-                        btn = row.row(align=True)
-                        if slot_policy["policy"] == "equipable_on_rig":
-                            btn.enabled = True
+                        btn = controls.row(align=True)
+                        btn.enabled = can_load
+                        if can_load:
                             op = btn.operator("witcher.equipment_load_equipment", text="", icon='IMPORT')
                             op.slot_index = i
-                        elif slot_policy["policy"] == "hold_only_on_rig" and slot_policy["hold_valid"]:
-                            # hold_only items handled by show_toggle above; skip duplicate
-                            pass
+                            op.mount_mode = requested_mount_mode
                         else:
-                            btn.enabled = False
-                            op = btn.operator("witcher.equipment_load_equipment", text="", icon='IMPORT')
-                            op.slot_index = i
+                            op = btn.operator("witcher.equipment_load_disabled", text="", icon='IMPORT')
+                            op.reason = slot_policy.get("reason", "Incompatible item/rig.")
 
-                    # Appearance dropdown for items with multiple dye/appearance variants
-                    item_app_names = _safe_json_list(getattr(slot, 'item_appearances_json', ''))
-                    if len(item_app_names) > 1:
-                        app_row = box.row(align=True)
-                        app_row.label(text="  Appearance:")
-                        app_row.prop(slot, "item_appearance_name", text="")
-                        try:
-                            coloring = json.loads(slot.item_coloring_json or '[]')
-                        except Exception:
-                            coloring = []
-                        for col_entry in coloring:
-                            comp = col_entry.get('componentName', '')
-                            h1 = col_entry.get('hue1', 0)
-                            s1 = col_entry.get('sat1', 0)
-                            l1 = col_entry.get('lum1', 0)
-                            col_row = box.row(align=True)
-                            col_row.label(text=f"    {comp}: H{h1:+.0f} S{s1:+.0f} L{l1:+.0f}", icon='COLORSET_01_VEC')
+                    # --- Secondary rows (only when relevant) ---
 
+                    _draw_slot_details_ui(
+                        box,
+                        slot,
+                        has_appearance_ui=has_appearance_ui,
+                        has_coloring_ui=has_coloring_ui,
+                        colorable_meshes=colorable_meshes,
+                    )
+
+                    # Bound items
                     bound_items = _safe_json_list(getattr(slot, "bound_items_json", ""))
                     if bound_items:
                         for bound_name in bound_items:
@@ -4746,6 +5311,7 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
             row = box.row(align=True)
             row.operator("witcher.equipment_load_equipment", text="Load All Equipment", icon='IMPORT').slot_index = -1
             row.operator("witcher.equipment_unload_equipment", text="Unload All", icon='X').slot_index = -1
+            row.operator("witcher.equipment_validate", text="", icon='FILE_REFRESH')
 
             if temp_data.equipment_source_game != "w3":
                 info = box.box()
@@ -4888,6 +5454,37 @@ class EQUIPMENT_OT_RefreshSlotConstraints(bpy.types.Operator):
         self.report({'INFO'}, f"Updated {updated} slot constraint(s)")
         return {'FINISHED'}
 
+
+class EQUIPMENT_OT_ValidateEquipment(bpy.types.Operator):
+    """Scan equipment and template slots and repair stale loaded/runtime states.
+
+    Fixes slots that claim to be loaded but whose GUID-tagged objects no
+    longer exist in the scene (e.g. after manual deletion) and refreshes
+    post-load mount wiring for saved equipment.
+    """
+    bl_idname = "witcher.equipment_validate"
+    bl_label = "Validate Equipment"
+    bl_description = "Detect and fix stale equipment/template states caused by manual object deletion"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        armature, rig_settings = _get_armature_and_rig_settings(context)
+        if not rig_settings:
+            self.report({'WARNING'}, "No valid armature selected.")
+            return {'CANCELLED'}
+
+        refreshed, repaired = repair_saved_equipment_state(armature, rig_settings)
+
+        if refreshed or repaired:
+            msg = f"Repaired {repaired} equipment state(s)"
+            if refreshed:
+                msg += f", refreshed {refreshed} slot constraint(s)"
+            self.report({'INFO'}, msg + ".")
+        else:
+            self.report({'INFO'}, "All equipment/template slots are consistent.")
+        return {'FINISHED'}
+
+
 # Operator to add a new category
 class EQUIPMENT_OT_AddCategory(bpy.types.Operator):
     bl_idname = "witcher.equipment_add_category"
@@ -4901,33 +5498,36 @@ class EQUIPMENT_OT_AddCategory(bpy.types.Operator):
             self.report({'WARNING'}, "No valid armature selected.")
             return {'CANCELLED'}
 
-        slot = rig_settings.equipment_slots.add()
-        slot.source_game = _get_temp_source_game(context)
-        slot.item_name = "None"
-        slot.equip_template = ""
-        slot.base_equip_template = ""
-        slot.resolved_repo_path = ""
-        slot.keep_across_appearances = True
-
         _set_temp_equipment_auto_apply_suspended(context, True)
         try:
+            # Determine the initial category BEFORE creating the slot so
+            # both entry and slot get the same value atomically.
+            source_game = _get_temp_source_game(context)
+            category_items, _item_attrs = _get_equipment_catalog(source_game)
+            initial_category = ""
+            if category_items:
+                initial_category = next(iter(category_items), "")
+
+            slot = rig_settings.equipment_slots.add()
+            slot.source_game = source_game
+            slot.category = initial_category
+            slot.item_name = "None"
+            slot.equip_template = ""
+            slot.base_equip_template = ""
+            slot.resolved_repo_path = ""
+            slot.keep_across_appearances = True
+
             entry = temp_data.equipment_entries.add()
             entry.slot_index = len(rig_settings.equipment_slots) - 1
-            entry.source_game = _get_temp_source_game(context)
-            # Ensure a valid category is always selected on creation
-            try:
-                cat_items = entry.get_category_items(context)
-                if cat_items:
-                    entry.category = cat_items[0][0]
-            except Exception:
-                pass
+            entry.source_game = source_game
+            entry.category = initial_category
             # defaultItemName resets automatically via _on_category_changed, but
             # set it explicitly here in case the update didn't fire yet
             try:
                 item_items = entry.get_default_items(context)
                 entry.defaultItemName = item_items[0][0] if item_items else "None"
             except Exception:
-                pass
+                entry.defaultItemName = "None"
         finally:
             _set_temp_equipment_auto_apply_suspended(context, False)
         temp_data.equipment_entries_index = len(temp_data.equipment_entries) - 1
@@ -5333,6 +5933,7 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
     else:
         slot.item_appearances_json = ""
         slot.item_coloring_json = ""
+    _coerce_slot_inline_ui_state(slot)
 
     attachment_profile = import_entity.classify_equipment_attachment_profile(item_entity_for_apps)
     allow_unmounted_visual_load = (
@@ -5463,19 +6064,18 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
             ),
         )
         if not (set(bpy.data.objects) - before):
-            log.info(
-                "Equipment common import produced no objects for '%s'; falling back to direct entity import.",
+            # Equipment items must go through _import_item_entity only.
+            # Do NOT fall back to import_direct_entity_file — that creates a
+            # standalone entity (armature + rig_settings + appearance groups)
+            # which is the wrong structure for equipment and causes hard-to-
+            # debug issues when world-layer import logic runs inside the
+            # equipment system.
+            log.warning(
+                "Equipment import produced no objects for '%s'. "
+                "No fallback — the item entity route is the only supported "
+                "path for equipment items.",
                 export_path,
             )
-            import_entity.import_direct_entity_file(export_path, parent_transform=empty_transform)
-            # Bind any armatures produced by the fallback import to the parent armature
-            fallback_new = set(bpy.data.objects) - before
-            for fb_obj in fallback_new:
-                if fb_obj and fb_obj.type == 'ARMATURE' and fb_obj != armature:
-                    try:
-                        _constrain_bound_armature_to_target(fb_obj, armature)
-                    except Exception as _fb_e:
-                        log.warning("Failed to bind fallback armature '%s' to '%s': %s", fb_obj.name, armature.name, _fb_e)
     except Exception as e:
         reason = f"Import failed for '{getattr(final_item, 'name', effective_template)}': {e}"
         _set_last_equipment_load_failure(armature, slot_index, reason)
@@ -5526,11 +6126,15 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
     # Apply coloring entries from the item entity to newly imported mesh objects.
     # The character entity's coloringEntries don't cover equipment items, so we
     # apply the item entity's own coloring here using witcher_name for matching.
+    # Use the appearance name that was actually used during import (from import_info)
+    # rather than re-reading the slot EnumProperty, which may be stale for newly
+    # created slots (e.g. from inventory import) before Blender updates its RNA cache.
     try:
         item_coloring_entries = getattr(item_entity_for_apps, 'coloringEntries', None) or []
-        selected_app_name = getattr(slot, 'item_appearance_name', '') or ''
+        selected_app_name = str(import_info.get("selected_appearance_name", "") or "").strip()
         if not selected_app_name or selected_app_name == '__default__':
-            # Use first appearance name as fallback
+            selected_app_name = getattr(slot, 'item_appearance_name', '') or ''
+        if not selected_app_name or selected_app_name == '__default__':
             app_names = json.loads(slot.item_appearances_json or '[]')
             selected_app_name = app_names[0] if app_names else ''
         if item_coloring_entries and selected_app_name:
@@ -5602,82 +6206,113 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
 
 def load_equipment_item(context, armature, slot_index, rig_settings=None, mount_mode=None):
     """Load a single equipment item into the scene, tagged with GUID."""
-    return _load_equipment_item_core(
-        context,
-        armature,
-        slot_index,
-        rig_settings=rig_settings,
-        prepared_context=None,
-        refresh_variants_before_load=True,
-        post_refresh_variants=True,
-        mount_mode=mount_mode,
-    )
+    saved_active, saved_selection = _capture_selection_state(context)
+    try:
+        return _load_equipment_item_core(
+            context,
+            armature,
+            slot_index,
+            rig_settings=rig_settings,
+            prepared_context=None,
+            refresh_variants_before_load=True,
+            post_refresh_variants=True,
+            mount_mode=mount_mode,
+        )
+    finally:
+        _safe_restore_selection(saved_active, saved_selection)
 
 
 def load_equipment_items_batch(context, armature, slot_indices, rig_settings=None, prepared_context=None,
-                               reload_loaded=False, post_refresh_variants=True, mount_mode="equip"):
+                               reload_loaded=False, post_refresh_variants=True, mount_mode="auto"):
     if rig_settings is None:
         rig_settings = armature.data.witcherui_RigSettings
-
-    slots = rig_settings.equipment_slots
-    unique_indices = []
-    seen = set()
-    for slot_index in slot_indices or []:
-        try:
-            idx = int(slot_index)
-        except Exception:
-            continue
-        if idx < 0 or idx >= len(slots) or idx in seen:
-            continue
-        seen.add(idx)
-        unique_indices.append(idx)
-
-    if not unique_indices:
-        return 0
-
+    saved_active, saved_selection = _capture_selection_state(context)
     try:
-        refresh_variant_states(rig_settings)
-    except Exception:
-        pass
+        slots = rig_settings.equipment_slots
+        unique_indices = []
+        seen = set()
+        for slot_index in slot_indices or []:
+            try:
+                idx = int(slot_index)
+            except Exception:
+                continue
+            if idx < 0 or idx >= len(slots) or idx in seen:
+                continue
+            seen.add(idx)
+            unique_indices.append(idx)
 
-    prepared = _prepare_equipment_load_context(armature, rig_settings, prepared_context)
-    loaded = 0
-    for idx in unique_indices:
-        slot = slots[idx]
-        if slot.is_loaded and slot.equip_guid and not reload_loaded:
-            continue
-        slot_policy = _resolve_slot_visual_policy(slot, armature, rig_settings)
-        if mount_mode == "equip" and slot_policy["policy"] != "equipable_on_rig":
-            continue
-        if _load_equipment_item_core(
-            context,
-            armature,
-            idx,
-            rig_settings=rig_settings,
-            prepared_context=prepared,
-            refresh_variants_before_load=False,
-            post_refresh_variants=False,
-            mount_mode=mount_mode,
-        ):
-            loaded += 1
+        if not unique_indices:
+            return 0
 
-    if post_refresh_variants:
         try:
-            _refresh_variants_and_reload(context, armature, rig_settings)
+            refresh_variant_states(rig_settings)
         except Exception:
             pass
-    return loaded
+
+        prepared = _prepare_equipment_load_context(armature, rig_settings, prepared_context)
+        loaded = 0
+        for idx in unique_indices:
+            slot = slots[idx]
+            if slot.is_loaded and slot.equip_guid and not reload_loaded:
+                continue
+            slot_policy = _resolve_slot_visual_policy(slot, armature, rig_settings)
+            requested_mount_mode = _get_slot_requested_mount_mode(slot, slot_policy)
+            mount_mode_resolved = str(mount_mode or "").strip().lower()
+            if mount_mode_resolved not in {"equip", "hold"}:
+                mount_mode_resolved = requested_mount_mode
+            if not _can_load_slot_for_mount_mode(slot_policy, mount_mode_resolved):
+                continue
+            if _load_equipment_item_core(
+                context,
+                armature,
+                idx,
+                rig_settings=rig_settings,
+                prepared_context=prepared,
+                refresh_variants_before_load=False,
+                post_refresh_variants=False,
+                mount_mode=mount_mode_resolved,
+            ):
+                loaded += 1
+
+        if post_refresh_variants:
+            try:
+                _refresh_variants_and_reload(context, armature, rig_settings)
+            except Exception:
+                pass
+        return loaded
+    finally:
+        _safe_restore_selection(saved_active, saved_selection)
 
 
 def unload_equipment_item(slot):
-    """Unload a single equipment item by removing its GUID-tagged objects."""
-    if slot.is_loaded and slot.equip_guid:
-        count = remove_objects_by_guid(slot.equip_guid, "witcher_equip_guid")
-        slot.equip_guid = ""
-        slot.is_loaded = False
-        slot.is_in_hold_slot = False
-        return count
-    return 0
+    """Unload a single equipment item by removing its GUID-tagged objects.
+
+    Handles edge cases:
+    - Slot claims loaded but GUID is empty → just clear the flag.
+    - GUID set but no matching objects in scene → clear stale state.
+    - Normal case → remove objects and clear state.
+    """
+    if not getattr(slot, "is_loaded", False):
+        return 0
+
+    guid = getattr(slot, "equip_guid", "")
+    count = 0
+    if guid:
+        count = remove_objects_by_guid(guid, "witcher_equip_guid")
+        if count == 0:
+            log.debug(
+                "unload_equipment_item: no objects found for GUID '%s' (%s/%s) — clearing stale state.",
+                guid,
+                getattr(slot, "category", "?"),
+                getattr(slot, "item_name", "?"),
+            )
+
+    slot.equip_guid = ""
+    slot.is_loaded = False
+    slot.is_in_hold_slot = False
+    slot.show_item_appearance_ui = False
+    slot.show_item_coloring_ui = False
+    return count
 
 
 def load_template_item(context, armature, slot_index, rig_settings=None):
@@ -5779,17 +6414,42 @@ def load_template_item(context, armature, slot_index, rig_settings=None):
 
 def unload_template_item(slot):
     """Unload a single template item by removing its GUID-tagged objects."""
-    if slot.is_loaded and slot.template_guid:
-        count = remove_objects_by_guid(slot.template_guid, "witcher_template_guid")
-        slot.template_guid = ""
-        slot.is_loaded = False
-        return count
-    return 0
+    if not getattr(slot, "is_loaded", False):
+        return 0
+
+    guid = getattr(slot, "template_guid", "")
+    count = 0
+    if guid:
+        count = remove_objects_by_guid(guid, "witcher_template_guid")
+
+    slot.template_guid = ""
+    slot.is_loaded = False
+    slot.is_hidden = False
+    return count
 
 
 # =============================================================================
 # Equipment Load/Unload Operators
 # =============================================================================
+
+class EQUIPMENT_OT_LoadDisabled(bpy.types.Operator):
+    bl_idname = "witcher.equipment_load_disabled"
+    bl_label = "Load Equipment (Unavailable)"
+    bl_description = "Item cannot be loaded"
+    bl_options = {'INTERNAL'}
+
+    reason: bpy.props.StringProperty(name="Reason", default="")
+
+    @classmethod
+    def description(cls, context, properties):
+        return properties.reason if getattr(properties, "reason", "") else "Cannot load equipment."
+    
+    @classmethod
+    def poll(cls, context):
+        return False
+
+    def execute(self, context):
+        return {'CANCELLED'}
 
 class EQUIPMENT_OT_LoadEquipment(bpy.types.Operator):
     """Load equipment item(s) from bundles and attach to armature"""
@@ -5798,12 +6458,9 @@ class EQUIPMENT_OT_LoadEquipment(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     slot_index: bpy.props.IntProperty(default=-1, description="Slot index (-1 = all)")
+    mount_mode: bpy.props.StringProperty(default="auto", description="Mount mode override: auto, equip, or hold")
 
     def execute(self, context):
-        # Save selection state
-        saved_active = context.view_layer.objects.active
-        saved_selection = [obj for obj in context.selected_objects]
-        
         armature, rig_settings = _get_armature_and_rig_settings(context)
         if not armature:
             self.report({'WARNING'}, "No valid armature selected.")
@@ -5817,37 +6474,42 @@ class EQUIPMENT_OT_LoadEquipment(bpy.types.Operator):
         loaded = 0
         failed = 0
         failed_details = []
-        with mod_loading_context(context):
-            if self.slot_index == -1:
-                for i in range(len(slots)):
-                    slot_policy = _resolve_slot_visual_policy(slots[i], armature, rig_settings)
-                    if slot_policy["policy"] != "equipable_on_rig":
-                        continue
-                    if load_equipment_item(context, armature, i, rig_settings):
-                        loaded += 1
-                    else:
-                        if slots[i].equip_template and slots[i].equip_template != "None":
-                            failed += 1
-                            reason = _get_last_equipment_load_failure(armature, i) or "Unknown failure"
-                            failed_details.append(
-                                f"[{i}] {getattr(slots[i], 'item_name', '') or '<no item>'} | "
-                                f"{get_effective_equip_template(slots[i]) or getattr(slots[i], 'equip_template', '') or '<no template>'}: {reason}"
-                            )
-            else:
-                if self.slot_index < len(slots):
-                    if load_equipment_item(context, armature, self.slot_index, rig_settings):
-                        loaded += 1
-                    else:
-                        failed += 1
+        with _preserve_selection(context):
+            with mod_loading_context(context):
+                if self.slot_index == -1:
+                    for i in range(len(slots)):
+                        slot_policy = _resolve_slot_visual_policy(slots[i], armature, rig_settings)
+                        mount_mode_resolved = str(self.mount_mode or "").strip().lower()
+                        if mount_mode_resolved not in {"equip", "hold"}:
+                            mount_mode_resolved = _get_slot_requested_mount_mode(slots[i], slot_policy)
+                        if not _can_load_slot_for_mount_mode(slot_policy, mount_mode_resolved):
+                            continue
+                        if load_equipment_item(context, armature, i, rig_settings, mount_mode=mount_mode_resolved):
+                            loaded += 1
+                        else:
+                            if slots[i].equip_template and slots[i].equip_template != "None":
+                                failed += 1
+                                reason = _get_last_equipment_load_failure(armature, i) or "Unknown failure"
+                                failed_details.append(
+                                    f"[{i}] {getattr(slots[i], 'item_name', '') or '<no item>'} | "
+                                    f"{get_effective_equip_template(slots[i]) or getattr(slots[i], 'equip_template', '') or '<no template>'}: {reason}"
+                                )
+                else:
+                    if self.slot_index < len(slots):
                         slot = slots[self.slot_index]
-                        reason = _get_last_equipment_load_failure(armature, self.slot_index) or "Unknown failure"
-                        failed_details.append(
-                            f"[{self.slot_index}] {getattr(slot, 'item_name', '') or '<no item>'} | "
-                            f"{get_effective_equip_template(slot) or getattr(slot, 'equip_template', '') or '<no template>'}: {reason}"
-                        )
-
-        # Restore selection state
-        _safe_restore_selection(saved_active, saved_selection)
+                        slot_policy = _resolve_slot_visual_policy(slot, armature, rig_settings)
+                        mount_mode_resolved = str(self.mount_mode or "").strip().lower()
+                        if mount_mode_resolved not in {"equip", "hold"}:
+                            mount_mode_resolved = _get_slot_requested_mount_mode(slot, slot_policy)
+                        if load_equipment_item(context, armature, self.slot_index, rig_settings, mount_mode=mount_mode_resolved):
+                            loaded += 1
+                        else:
+                            failed += 1
+                            reason = _get_last_equipment_load_failure(armature, self.slot_index) or "Unknown failure"
+                            failed_details.append(
+                                f"[{self.slot_index}] {getattr(slot, 'item_name', '') or '<no item>'} | "
+                                f"{get_effective_equip_template(slot) or getattr(slot, 'equip_template', '') or '<no template>'}: {reason}"
+                            )
 
         msg = f"Loaded {loaded} equipment item(s)"
         if failed:
@@ -5870,10 +6532,6 @@ class EQUIPMENT_OT_UnloadEquipment(bpy.types.Operator):
     slot_index: bpy.props.IntProperty(default=-1, description="Slot index (-1 = all)")
 
     def execute(self, context):
-        # Save selection state
-        saved_active = context.view_layer.objects.active
-        saved_selection = [obj for obj in context.selected_objects]
-        
         armature, rig_settings = _get_armature_and_rig_settings(context)
         if not armature:
             self.report({'WARNING'}, "No valid armature selected.")
@@ -5881,20 +6539,18 @@ class EQUIPMENT_OT_UnloadEquipment(bpy.types.Operator):
 
         slots = rig_settings.equipment_slots
         removed = 0
-        if self.slot_index == -1:
-            for slot in slots:
-                removed += unload_equipment_item(slot)
-        else:
-            if self.slot_index < len(slots):
-                removed += unload_equipment_item(slots[self.slot_index])
+        with _preserve_selection(context):
+            if self.slot_index == -1:
+                for slot in slots:
+                    removed += unload_equipment_item(slot)
+            else:
+                if self.slot_index < len(slots):
+                    removed += unload_equipment_item(slots[self.slot_index])
 
-        try:
-            _refresh_variants_and_reload(context, armature, rig_settings)
-        except Exception:
-            pass
-
-        # Restore selection state
-        _safe_restore_selection(saved_active, saved_selection)
+            try:
+                _refresh_variants_and_reload(context, armature, rig_settings)
+            except Exception:
+                pass
 
         self.report({'INFO'}, f"Removed {removed} object(s)")
         return {'FINISHED'}
@@ -6281,6 +6937,64 @@ class EQUIPMENT_OT_SyncTemplatesToAppearance(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class EQUIPMENT_OT_SetMasterAppearance(bpy.types.Operator):
+    """Apply the selected master appearance to all capable equipment slots"""
+    bl_idname = "witcher.equipment_set_master_appearance"
+    bl_label = "Set Master Appearance"
+
+    def execute(self, context):
+        armature, rig_settings = _get_armature_and_rig_settings(context)
+        if not armature:
+            return {'CANCELLED'}
+
+        app_name = rig_settings.master_equipment_appearance
+        if app_name == "NONE" or not app_name:
+            return {'FINISHED'}
+
+        changed_slots = []
+        _set_temp_equipment_auto_apply_suspended(context, True)
+        try:
+            for i, slot in enumerate(rig_settings.equipment_slots):
+                app_names = _get_slot_item_appearance_names(slot)
+                if app_name != "__default__" and app_name not in app_names:
+                    continue
+                if slot.item_appearance_name != app_name:
+                    slot.item_appearance_name = app_name
+                    if slot.is_loaded and app_names:
+                        changed_slots.append(i)
+        finally:
+            _set_temp_equipment_auto_apply_suspended(context, False)
+
+        if changed_slots:
+            with _preserve_selection(context):
+                prepared = _prepare_equipment_load_context(armature, rig_settings, None)
+                reload_slots = []
+                for slot_index in changed_slots:
+                    updated_in_place = try_update_loaded_equipment_appearance_in_place(
+                        context,
+                        armature,
+                        slot_index,
+                        rig_settings,
+                        prepared_context=prepared,
+                    )
+                    if not updated_in_place:
+                        reload_slots.append(slot_index)
+                if reload_slots:
+                    load_equipment_items_batch(
+                        context,
+                        armature,
+                        reload_slots,
+                        rig_settings,
+                        prepared_context=prepared,
+                        reload_loaded=True,
+                        mount_mode="auto",
+                    )
+
+        rig_settings.master_equipment_appearance = "NONE"
+        self.report({'INFO'}, f"Master Appearance set to: {app_name}")
+        return {'FINISHED'}
+
+
 classes = [
     EquipmentDefinitionEntry,
     IncludedTemplateEntry,
@@ -6305,6 +7019,7 @@ classes = [
     EQUIPMENT_OT_ShowBoundItem,
     EQUIPMENT_OT_CopyResolvedGamePath,
     EQUIPMENT_OT_OpenResolvedPathFolder,
+    EQUIPMENT_OT_LoadDisabled,
     EQUIPMENT_OT_LoadEquipment,
     EQUIPMENT_OT_UnloadEquipment,
     EQUIPMENT_OT_LoadTemplate,
@@ -6316,6 +7031,8 @@ classes = [
     EQUIPMENT_OT_SyncTemplatesToAppearance,
     EQUIPMENT_OT_ToggleEntitySlots,
     EQUIPMENT_OT_RefreshSlotConstraints,
+    EQUIPMENT_OT_ValidateEquipment,
+    EQUIPMENT_OT_SetMasterAppearance,
     EQUIPMENT_PT_MainPanel,
 ]
 
@@ -6327,8 +7044,11 @@ def register():
 
     # Load cached categories on startup
     _load_category_cache()
+    _register_equipment_load_handler()
+    _schedule_deferred_equipment_repair()
 
 def unregister():
+    _unregister_equipment_load_handler()
     if hasattr(bpy.types.WindowManager, "witcherui_temp_data"):
         del bpy.types.WindowManager.witcherui_temp_data
     for c in reversed(classes):
