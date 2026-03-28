@@ -1591,17 +1591,17 @@ def _slot_has_explicit_mount_target(slot):
 def _slot_matches_unmounted_visual_hint(slot):
     if slot is None:
         return False
-        
+
     template = get_effective_equip_template(slot)
     if template and str(template).lower().strip().endswith('.w2ent'):
         return True
-        
+
     if str(getattr(slot, "attachment_type", "")).strip():
         return True
 
     keywords = {
-        "tail", "hair", "armor", "gloves", "pants", "boots", 
-        "torso", "legs", "arms", "trousers", "head", "mask", 
+        "tail", "hair", "armor", "gloves", "pants", "boots",
+        "torso", "legs", "arms", "trousers", "head", "mask",
         "cape", "cloak", "beard", "mustache", "helmet", "hood",
         "shirt", "shoes", "amulet", "accessory", "belt", "medal"
     }
@@ -2683,6 +2683,16 @@ def _resolve_visual_policy_from_slot_names(equip_slot_name, hold_slot_name, arma
     }
 
 
+def _slot_name_exists_on_rig(slot_name, armature, rig_settings):
+    """True if slot_name corresponds to a real EntitySlot (empty or entry) on this rig."""
+    if not slot_name or armature is None or rig_settings is None:
+        return False
+    entity_name = getattr(rig_settings, "entity_name", "") or ""
+    if find_slot_empty(entity_name, slot_name, armature) is not None:
+        return True
+    return _find_slot_entry_for_mount_slot(slot_name, rig_settings) is not None
+
+
 def _resolve_slot_visual_policy(slot, armature, rig_settings, *, item_entity=None, attachment_profile=None):
     if slot is None:
         return _resolve_visual_policy_from_slot_names(
@@ -2695,11 +2705,17 @@ def _resolve_slot_visual_policy(slot, armature, rig_settings, *, item_entity=Non
         )
     equip_slot_name = get_effective_equip_slot(slot)
     hold_slot_name = get_effective_hold_slot(slot)
+    # If hold_slot doesn't correspond to a real EntitySlot on this rig treat it as undefined
+    if hold_slot_name and not _slot_name_exists_on_rig(hold_slot_name, armature, rig_settings):
+        hold_slot_name = ""
     allow_unmounted_visual = _allow_unmounted_slotless_visual(
         slot,
         attachment_profile=attachment_profile,
         item_entity=item_entity,
     )
+    # If hold_slot was cleared and equip_slot is also empty, the item is effectively slotless
+    if not allow_unmounted_visual and not equip_slot_name and not hold_slot_name:
+        allow_unmounted_visual = True
     return _resolve_visual_policy_from_slot_names(
         equip_slot_name,
         hold_slot_name,
