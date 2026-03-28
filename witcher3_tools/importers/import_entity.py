@@ -2962,7 +2962,9 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                         cloth_arma = None
             if cloth_arma is not None:
                 clear_external_import_dependency_alert("redcloth")
+                cloth_grp = None
                 if cloth_arma.type == 'EMPTY':
+                    cloth_grp = cloth_arma
                     for child in cloth_arma.children:
                         if child.type == 'ARMATURE':
                             cloth_arma = child
@@ -2970,6 +2972,10 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 _tag_redcloth_for_reuse(cloth_arma, redcloth_reuse_key, redcloth_resource, redcloth_mat_path)
                 add_chunk_metadata(cloth_arma, chunk, chunk['resource'], component_name=component_name)
                 objdict[chunk_ns] = cloth_arma
+                if cloth_grp is not None:
+                    objdict[chunk_ns + ":_grp"] = cloth_grp
+                if not any(c[1] == chunk_ns for c in constrains):
+                    constrains.append([entity.name, chunk_ns])
 
                 cloth_meshes = _collect_redcloth_meshes(cloth_arma)
                 if component_name:
@@ -3508,7 +3514,14 @@ def add_app_template(   entity,
 
     #if grouping the entire appreance together
     if group_parent:
-        group_objects = apperance_level_objects if bind_root_chunks_to_entity else grouped_root_objects
+        if bind_root_chunks_to_entity:
+            group_objects = apperance_level_objects
+        else:
+            group_objects = list(grouped_root_objects)
+            seen = {id(o) for o in group_objects}
+            for obj in apperance_level_objects:
+                if id(obj) not in seen:
+                    group_objects.append(obj)
         for obj in group_objects:
             _set_parent_keep_world(obj, empty_transform)
         if use_app_drivers:
