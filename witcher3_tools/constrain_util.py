@@ -97,7 +97,7 @@ def align_armatures_for_constraints(arm_parent, arm_child):
     saved_selection = []
     try:
         saved_active = bpy.context.view_layer.objects.active
-        saved_selection = [obj for obj in bpy.context.selected_objects]
+        saved_selection = list(bpy.context.selected_objects)
     except Exception:
         saved_selection = []
 
@@ -107,19 +107,22 @@ def align_armatures_for_constraints(arm_parent, arm_child):
         except Exception:
             pass
 
+        # Single depsgraph evaluation shared by all pairs.
         try:
             bpy.context.view_layer.update()
         except Exception:
             pass
 
         dg = None
-        parent_eval = arm_parent
         try:
             dg = bpy.context.evaluated_depsgraph_get()
-            parent_eval = arm_parent.evaluated_get(dg)
+        except Exception:
+            pass
+
+        try:
+            parent_eval = arm_parent.evaluated_get(dg) if dg else arm_parent
         except Exception:
             parent_eval = arm_parent
-
         parent_world = parent_eval.matrix_world.copy()
         parent_eval_map = _build_pose_bone_map(parent_eval)
         if not parent_eval_map:

@@ -8,6 +8,7 @@ import json
 import copy
 import os
 import re
+import time
 import bpy
 import numpy as np
 from pathlib import Path
@@ -17,6 +18,7 @@ import addon_utils
 from .. import (
     clear_external_import_dependency_alert,
     import_rig,
+    get_all_addon_prefs,
     get_uncook_path,
     get_W3_REDCLOTH_PATH,
     get_addon_name,
@@ -60,6 +62,9 @@ from math import radians
 #     #return settings.get().repopath+filepath
 addon_name = get_addon_name()
 _ENTITY_RUNTIME_CACHE = {}
+_BEH_IDLE_BUDGET_MS = 500.0
+_BEH_IDLE_TRANSITION_RE = re.compile(r"_to_idle", re.IGNORECASE)
+_BEH_IDLE_DOWNGRADE_RE = re.compile(r"additive|lookat|look_at|combat", re.IGNORECASE)
 
 
 @persistent
@@ -1929,10 +1934,59 @@ def _collect_armature_animset_groups(entity, armature_obj):
 
 def _populate_idle_animation(rig_settings, entity):
     """Read all .w2beh files on the entity and store the best idle animation name."""
+    try:
+        should_import_idle = bool(get_all_addon_prefs(bpy.context).import_idle_animation)
+    except Exception:
+        should_import_idle = False
+    if not should_import_idle:
+        rig_settings.idle_animation_name = ""
+        return
+
     beh_paths = getattr(entity, "beh_paths", None) or []
     if not beh_paths:
         return
 
+    def _idle_rank(anim_name):
+        lo = str(anim_name or "").lower()
+        if not lo:
+            return 99
+        if "locomotion" in lo and "idle" in lo and not _BEH_IDLE_TRANSITION_RE.search(lo) and not _BEH_IDLE_DOWNGRADE_RE.search(lo):
+            return 1
+        if "standing" in lo and "idle" in lo and not _BEH_IDLE_TRANSITION_RE.search(lo) and not _BEH_IDLE_DOWNGRADE_RE.search(lo):
+            return 2
+        if "idle" in lo and not _BEH_IDLE_TRANSITION_RE.search(lo) and not _BEH_IDLE_DOWNGRADE_RE.search(lo):
+            return 3
+        if "locomotion" in lo and "idle" in lo and not _BEH_IDLE_TRANSITION_RE.search(lo):
+            return 4
+        if "idle" in lo and not _BEH_IDLE_TRANSITION_RE.search(lo):
+            return 5
+        if "idle" in lo:
+            return 6
+        return 7
+
+    def _beh_path_priority(depot_path, abs_path):
+        base = os.path.basename(str(depot_path or "")).lower()
+        priority = 100
+        if "overlay" in base:
+            priority -= 60
+        if "locomotion" in base or "idle" in base:
+            priority -= 20
+        if "main" in base:
+            priority -= 10
+        if "gameplay" in base:
+            priority += 40
+        if "swimming" in base:
+            priority += 60
+        if "constraint" in base:
+            priority += 80
+        try:
+            size = os.path.getsize(abs_path)
+        except Exception:
+            size = 1 << 60
+        return (priority, size, base)
+
+    deadline = time.perf_counter() + (_BEH_IDLE_BUDGET_MS / 1000.0)
+    resolved_entries = []
     candidates = []  # [(anim_name, depot_path)]
     for depot_path in beh_paths:
         try:
@@ -1941,12 +1995,23 @@ def _populate_idle_animation(rig_settings, entity):
             continue
         if not abs_path or not os.path.isfile(abs_path):
             continue
+        resolved_entries.append((depot_path, abs_path))
+
+    resolved_entries.sort(key=lambda item: _beh_path_priority(item[0], item[1]))
+
+    best_rank = 99
+    for item_index, (depot_path, abs_path) in enumerate(resolved_entries):
+        if candidates and best_rank <= 1:
+            break
+        if item_index > 0 and time.perf_counter() >= deadline:
+            break
         try:
             info = _read_beh_info(abs_path)
         except Exception:
             continue
         if info.idle_animation:
             candidates.append((info.idle_animation, depot_path))
+            best_rank = min(best_rank, _idle_rank(info.idle_animation))
             log.debug("beh idle candidate: %s  (from %s)", info.idle_animation, depot_path)
 
     if not candidates:
@@ -3051,25 +3116,36 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         # Handle mimic face
         if "mimicFace" in chunk:
             faceData = import_rig.loadFaceFile(repo_file(chunk['mimicFace'], entity.version))
-            root_bone = import_rig.create_armature(faceData.mimicSkeleton, chunk_ns)
-            mimic_rig_bl = root_bone
-            mimic_rig_bl['mimicFace'] = root_bone.name
-            mimic_rig_bl['mimicFaceFile'] = chunk['mimicFace']
-            add_chunk_metadata(root_bone, chunk, chunk['mimicFace'])
-            objdict.update({chunk_ns: root_bone})
-            if not root_skeleton:
-                root_skeleton = root_bone
-            metadata_targets = []
-            for target_obj in (root_bone, objdict.get(entity.name), root_skeleton):
-                if target_obj is None or getattr(target_obj, "type", "") != 'ARMATURE':
-                    continue
-                if target_obj in metadata_targets:
-                    continue
-                metadata_targets.append(target_obj)
-            for target_obj in metadata_targets:
-                target_obj['mimicFace'] = root_bone.name
-                target_obj['mimicFaceFile'] = chunk['mimicFace']
-            _apply_chunk_transform_to_import_roots(chunk, armatures=[root_bone])
+            if faceData is None:
+                log.warning("Failed to load mimic face: %s", chunk['mimicFace'])
+            else:
+                try:
+                    bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+                except Exception:
+                    pass
+                try:
+                    bpy.ops.object.select_all(action='DESELECT')
+                except Exception:
+                    pass
+                root_bone = import_rig.create_armature(faceData.mimicSkeleton, chunk_ns)
+                mimic_rig_bl = root_bone
+                mimic_rig_bl['mimicFace'] = root_bone.name
+                mimic_rig_bl['mimicFaceFile'] = chunk['mimicFace']
+                add_chunk_metadata(root_bone, chunk, chunk['mimicFace'])
+                objdict.update({chunk_ns: root_bone})
+                if not root_skeleton:
+                    root_skeleton = root_bone
+                metadata_targets = []
+                for target_obj in (root_bone, objdict.get(entity.name), root_skeleton):
+                    if target_obj is None or getattr(target_obj, "type", "") != 'ARMATURE':
+                        continue
+                    if target_obj in metadata_targets:
+                        continue
+                    metadata_targets.append(target_obj)
+                for target_obj in metadata_targets:
+                    target_obj['mimicFace'] = root_bone.name
+                    target_obj['mimicFaceFile'] = chunk['mimicFace']
+                _apply_chunk_transform_to_import_roots(chunk, armatures=[root_bone])
 
         # Handle camera
         if chunk['type'] == "CCameraComponent":

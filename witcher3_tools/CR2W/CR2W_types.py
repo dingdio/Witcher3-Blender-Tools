@@ -75,6 +75,49 @@ Entity_Type_List = ["CEntity",
                     #"CDeniedAreaComponent",
                     ]
 
+def _describe_cr2w_warning_context(cr2w_file=None, *, prop_name="", prop_type="",
+                                   parent=None, offset=None):
+    parts = []
+    file_name = getattr(cr2w_file, "fileName", None)
+    if file_name:
+        parts.append(f"file={file_name}")
+    if prop_name:
+        parts.append(f"prop={prop_name}")
+    if prop_type:
+        parts.append(f"type={prop_type}")
+    if parent is not None:
+        parent_name = (
+            getattr(parent, "theName", None)
+            or getattr(parent, "name", None)
+            or getattr(parent, "Type", None)
+        )
+        parent_type = getattr(parent, "theType", None) or getattr(parent, "type", None)
+        if parent_name:
+            parts.append(f"parent={parent_name}")
+        if parent_type and parent_type != parent_name:
+            parts.append(f"parent_type={parent_type}")
+    if offset is not None:
+        try:
+            parts.append(f"offset=0x{int(offset):X}")
+        except Exception:
+            parts.append(f"offset={offset}")
+    return ", ".join(parts) if parts else "no context"
+
+
+def _should_suppress_cname_warning(cr2w_file=None, *, prop_name="", parent=None):
+    file_name = str(getattr(cr2w_file, "fileName", "") or "").lower()
+    if not file_name.endswith(".w2beh"):
+        return False
+    if str(prop_name or "") != "basedOnEvent":
+        return False
+    parent_name = (
+        getattr(parent, "theName", None)
+        or getattr(parent, "name", None)
+        or getattr(parent, "Type", None)
+        or ""
+    )
+    return str(parent_name) == "CBehaviorGraphAdjustDirectionNode"
+
 v_types = [
     'String',
     'Float',
@@ -1360,8 +1403,23 @@ class PROPERTY:
         if (elementType == "CName"):
             is_cname_array = ("array" in Type.type) or (count > 1)
             if (not is_cname_array and readUShortCheck(f, f.tell()) == 0):
+                missing_offset = f.tell()
                 f.seek(2,1)
-                log.warning('CName missing, skipping')
+                detail = _describe_cr2w_warning_context(
+                    CR2WFILE,
+                    prop_name=Type.name,
+                    prop_type=Type.type,
+                    parent=parent,
+                    offset=missing_offset,
+                )
+                if _should_suppress_cname_warning(
+                    CR2WFILE,
+                    prop_name=Type.name,
+                    parent=parent,
+                ):
+                    log.debug("CName missing, skipping (%s)", detail)
+                else:
+                    log.warning("CName missing, skipping (%s)", detail)
                 return
             if (count == 1 and not is_cname_array):
                 # //if (detectedFloat(FTell()))

@@ -16,6 +16,51 @@ from .CR2W_types import ( Entity_Type_List, getCR2W, W_CLASS )
 
 from .bStream import *
 
+
+def _stream_chunk_props_summary(chunk, limit=8):
+    props = getattr(chunk, "PROPS", None) or []
+    out = []
+    for prop in props[:limit]:
+        out.append(f"{getattr(prop, 'theName', '?')}:{getattr(prop, 'theType', '?')}")
+    return ", ".join(out)
+
+
+def _first_handle_depot_path(prop):
+    handles = getattr(prop, "Handles", None) or []
+    if not handles:
+        return ""
+    return str(getattr(handles[0], "DepotPath", "") or "").strip()
+
+
+def _should_suppress_streaming_name_warning(stream_chunk, resource_path="", mesh_path=""):
+    if resource_path or mesh_path:
+        return False
+    stream_type = getattr(stream_chunk, "Type", getattr(stream_chunk, "name", "")) if stream_chunk else ""
+    return stream_type in {
+        "CEffectDummyComponent",
+    }
+
+
+def _describe_streaming_name_failure(file, entity_chunk, stream_chunk, resource_prop, mesh_prop):
+    parts = []
+    file_name = getattr(file, "fileName", None)
+    if file_name:
+        parts.append(f"file={file_name}")
+    if entity_chunk is not None:
+        parts.append(
+            f"entity_chunk={getattr(entity_chunk, 'ChunkIndex', '?')}:{getattr(entity_chunk, 'name', getattr(entity_chunk, 'Type', '?'))}"
+        )
+    if stream_chunk is not None:
+        parts.append(
+            f"stream_chunk={getattr(stream_chunk, 'ChunkIndex', '?')}:{getattr(stream_chunk, 'Type', getattr(stream_chunk, 'name', '?'))}"
+        )
+        props = _stream_chunk_props_summary(stream_chunk)
+        if props:
+            parts.append(f"props={props}")
+    parts.append(f"resource_handles={len(getattr(resource_prop, 'Handles', None) or [])}")
+    parts.append(f"mesh_handles={len(getattr(mesh_prop, 'Handles', None) or [])}")
+    return ", ".join(parts)
+
 class ReadCompressFloat():
     def __init__(self, f, compression):
         val = 0;
@@ -419,15 +464,38 @@ def create_level(file, filename):
                     entity = create_level(bufferedCR2W, chunk.name)
                     Entity.streamingDataBuffer = entity
                     if Entity.name == Entity.type:
+                        stream_chunk = None
                         try:
-                            if Entity.streamingDataBuffer.CHUNKS.CHUNKS[0].Type == 'CClothComponent':
-                                Entity.name = Path(Entity.streamingDataBuffer.CHUNKS.CHUNKS[0].GetVariableByName('resource').Handles[0].DepotPath).stem
-                                Entity.name += f" ({Entity.type}) (CClothComponent)"
-                            else:
-                                Entity.name = Path(Entity.streamingDataBuffer.CHUNKS.CHUNKS[0].GetVariableByName('mesh').Handles[0].DepotPath).stem
-                                Entity.name += f" ({Entity.type})"
-                        except Exception as e:
-                            log.warn(e)
+                            stream_chunk = Entity.streamingDataBuffer.CHUNKS.CHUNKS[0]
+                        except Exception:
+                            stream_chunk = None
+
+                        resource_prop = stream_chunk.GetVariableByName('resource') if stream_chunk else None
+                        mesh_prop = stream_chunk.GetVariableByName('mesh') if stream_chunk else None
+
+                        resource_path = _first_handle_depot_path(resource_prop)
+                        mesh_path = _first_handle_depot_path(mesh_prop)
+
+                        if getattr(stream_chunk, "Type", None) == 'CClothComponent' and resource_path:
+                            Entity.name = Path(resource_path).stem
+                            Entity.name += f" ({Entity.type}) (CClothComponent)"
+                        elif mesh_path:
+                            Entity.name = Path(mesh_path).stem
+                            Entity.name += f" ({Entity.type})"
+                        else:
+                            if not _should_suppress_streaming_name_warning(
+                                stream_chunk,
+                                resource_path,
+                                mesh_path,
+                            ):
+                                detail = _describe_streaming_name_failure(
+                                    file,
+                                    chunk,
+                                    stream_chunk,
+                                    resource_prop,
+                                    mesh_prop,
+                                )
+                                log.warning("Streaming entity name resolution failed (%s)", detail)
                 try:
                     if hasattr(chunk, 'Components'):
                         for chunk_id in chunk.Components:

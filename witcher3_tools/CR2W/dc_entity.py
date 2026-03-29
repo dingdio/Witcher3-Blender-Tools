@@ -664,6 +664,29 @@ def _chunk_props_summary(chunk, limit=10):
         out.append(f"{getattr(prop, 'theName', '?')}:{getattr(prop, 'theType', '?')}")
     return ", ".join(out)
 
+
+def _describe_unknown_character_chunk(chunk, cr2w_file=None, template_name=""):
+    parts = []
+    file_name = getattr(cr2w_file, "fileName", None)
+    if file_name:
+        parts.append(f"file={file_name}")
+    if template_name:
+        parts.append(f"template={template_name}")
+    parts.append(f"chunk={getattr(chunk, 'ChunkIndex', getattr(chunk, 'chunkIndex', '?'))}")
+    chunk_name = getattr(chunk, "name", None)
+    if chunk_name:
+        parts.append(f"name={chunk_name}")
+    props = _chunk_props_summary(chunk)
+    if props:
+        parts.append(f"props={props}")
+    return ", ".join(parts)
+
+
+def _log_unknown_character_chunk(chunk, cr2w_file=None, template_name=""):
+    detail = _describe_unknown_character_chunk(chunk, cr2w_file=cr2w_file, template_name=template_name)
+    chunk_type = getattr(chunk, "Type", getattr(chunk, "type", "?"))
+    log.warning("Unknown Character Chunk: %s (%s)", chunk_type, detail)
+
 class JsonChunk(object):
     """docstring for JsonChunk."""
     def __init__(self):
@@ -1548,7 +1571,8 @@ def chunk_append(new_mesh, chunk, item, added_chunks=None):
     if added_chunks is not None:
         added_chunks.add(chunk.ChunkIndex)
 
-# Structural/metadata chunk types handled elsewhere (create_CEntity, w3_material, etc.)
+# Structural, metadata, or non-visual chunk types that should not warn when
+# encountered in template parsing.
 _KNOWN_STRUCTURAL_CHUNKS = {
     'CWetnessComponent',
     'CItemEntity', # Handled separately in ReadTemplate (streaming buffer path).
@@ -1566,6 +1590,9 @@ _KNOWN_STRUCTURAL_CHUNKS = {
     "CMovingPhysicalAgentComponent",
     "CExternalProxyComponent",
     "CDropPhysicsSetup",
+    "CDynamicColliderComponent",
+    "CEffectDummyComponent",
+    "CSoundEntityParam",
 }
 
 _STREAMED_ITEM_CHUNK_TYPES = {
@@ -1785,7 +1812,11 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
             if chunk.Type in _KNOWN_STRUCTURAL_CHUNKS:
                 log.debug("Skipping structural chunk in ReadTemplate: %s", chunk.Type)
             else:
-                log.warning("Unknown Character Chunk: %s", chunk.Type)
+                _log_unknown_character_chunk(
+                    chunk,
+                    cr2w_file=CR2W_FILE,
+                    template_name=getattr(new_mesh, "name", ""),
+                )
     return new_mesh, this_Entity
 
 def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:

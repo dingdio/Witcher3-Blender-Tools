@@ -748,13 +748,36 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
         bpy.ops.object.mode_set(mode='OBJECT')
         for idx, lod_meshes in enumerate(lods_to_create):
             if lod_meshes:
+                joinable_meshes = [
+                    obj for obj in lod_meshes
+                    if obj is not None
+                    and getattr(obj, "type", "") == 'MESH'
+                    and getattr(obj, "data", None) is not None
+                    and len(getattr(obj.data, "vertices", ())) > 0
+                ]
+                if not joinable_meshes:
+                    log.warning(
+                        "Skipping LOD join for '%s' lod%d: no mesh data in %d candidate objects",
+                        meshName,
+                        idx,
+                        len(lod_meshes),
+                    )
+                    continue
+                if len(joinable_meshes) != len(lod_meshes):
+                    log.warning(
+                        "LOD join filtered empty/non-mesh objects for '%s' lod%d: kept=%d dropped=%d",
+                        meshName,
+                        idx,
+                        len(joinable_meshes),
+                        len(lod_meshes) - len(joinable_meshes),
+                    )
                 bpy.ops.object.select_all(action='DESELECT')
-                bpy.context.view_layer.objects.active = lod_meshes[0]
-                for bl_mesh in lod_meshes:
+                bpy.context.view_layer.objects.active = joinable_meshes[0]
+                for bl_mesh in joinable_meshes:
                     bl_mesh.select_set(True)
-                if len(lod_meshes)> 1:
+                if len(joinable_meshes) > 1:
                     bpy.ops.object.join()
-                joined_obj = bpy.context.selected_objects[:][0]
+                joined_obj = joinable_meshes[0] if len(joinable_meshes) == 1 else bpy.context.selected_objects[:][0]
                 joined_obj.name = meshName+"_lod"+str(idx)
                 
                 ## ROTATE 180

@@ -10,11 +10,14 @@ Extracts the data most useful for the addon from a behavior graph binary:
 """
 
 import logging
+import os
 import re
 from collections import namedtuple
 from .CR2W_types import getCR2W
 
 log = logging.getLogger(__name__)
+_BEH_INFO_CACHE = {}
+_BEH_INFO_CACHE_MAX = 256
 
 # ── Public result type ────────────────────────────────────────────────────────
 
@@ -113,6 +116,29 @@ def _guess_idle(animations):
 guess_idle = _guess_idle
 
 
+def _beh_cache_key(beh_path):
+    try:
+        stat = os.stat(beh_path)
+        return (
+            os.path.normcase(os.path.normpath(beh_path)),
+            stat.st_mtime_ns,
+            stat.st_size,
+        )
+    except Exception:
+        return (os.path.normcase(os.path.normpath(beh_path)),)
+
+
+def _cache_beh_info(cache_key, info):
+    _BEH_INFO_CACHE[cache_key] = info
+    if len(_BEH_INFO_CACHE) <= _BEH_INFO_CACHE_MAX:
+        return
+    try:
+        first_key = next(iter(_BEH_INFO_CACHE))
+    except Exception:
+        return
+    _BEH_INFO_CACHE.pop(first_key, None)
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def read_beh_info(beh_path) -> BehInfo:
@@ -126,6 +152,10 @@ def read_beh_info(beh_path) -> BehInfo:
         BehInfo with extracted data, or an empty BehInfo on failure.
     """
     empty = BehInfo(None, [], [], [], [])
+    cache_key = _beh_cache_key(beh_path)
+    cached = _BEH_INFO_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     try:
         with open(beh_path, "rb") as f:
@@ -168,8 +198,9 @@ def read_beh_info(beh_path) -> BehInfo:
             if state and state not in states:
                 states.append(state)
 
-    idle = _find_idle_from_states(chunks, cr2w) or _guess_idle(animations)
-    return BehInfo(idle, animations, events, variables, states)
+    info = BehInfo(_find_idle_from_states(chunks, cr2w) or _guess_idle(animations), animations, events, variables, states)
+    _cache_beh_info(cache_key, info)
+    return info
 
 
 def _find_idle_from_states(chunks, cr2w):
