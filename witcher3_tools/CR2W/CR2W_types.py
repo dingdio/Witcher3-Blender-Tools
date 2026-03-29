@@ -1526,10 +1526,12 @@ class PROPERTY:
                         f.seek(-4,1)#FSkip(-4);
                         self.ValueAsInt = readInt32(f)#int ValueAsInt;
             elif (count == 1):
-                if (detectedFloat(f, f.tell())):
-                    self.Value = readFloat(f)#float Value;
-                else:
-                    self.Value = readInt32(f)#int32 Value;
+                startofValue = f.tell()
+                self.Value = readFloat(f)#float Value;
+                if (not detectedFloat(f, startofValue)):
+                    # Keep explicitly-typed Float properties as floats
+                    f.seek(-4,1)#FSkip(-4);
+                    self.ValueAsInt = readInt32(f)#int ValueAsInt;
             else:
                 self.value = []
                 for _ in range(0, count):
