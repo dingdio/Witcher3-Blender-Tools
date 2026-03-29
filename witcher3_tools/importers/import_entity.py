@@ -1505,6 +1505,9 @@ _EQUIPMENT_COMPONENT_ATTACHMENT_TYPES = {
 _EQUIPMENT_INTERNAL_ATTACHMENT_TYPES = _EQUIPMENT_COMPONENT_ATTACHMENT_TYPES | {
     "CAnimDangleComponent",
 }
+_ROOT_CONSTRAINT_SKIP_CHUNK_TYPES = _EQUIPMENT_COMPONENT_ATTACHMENT_TYPES | {
+    "CSkeletonBoneSlot",
+}
 _EQUIPMENT_VISUAL_COMPONENT_TYPES = {
     "CMeshComponent",
     "CStaticMeshComponent",
@@ -2788,6 +2791,7 @@ def process_regular_attachment(constraint, objdict, meshdict):
     p_bone_name = constraint['parentSlotName']
     child_name = constraint['child_name']
     relativeTransform = constraint['relativeTransform']
+    rt = _coerce_engine_transform(relativeTransform) if relativeTransform else None
 
     bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
     target_transform = bpy.context.object
@@ -2805,11 +2809,19 @@ def process_regular_attachment(constraint, objdict, meshdict):
             target_transform.parent_type = "BONE"
             target_transform.parent_bone = p_bone_name
 
+            use_rot90 = get_do_fix_tail(bpy.context)
+            rig_settings = getattr(parent_arm.data, "witcherui_RigSettings", None)
+            if rig_settings is not None:
+                if hasattr(rig_settings, "rot90_compensate"):
+                    use_rot90 = bool(rig_settings.rot90_compensate)
+                elif hasattr(rig_settings, "rot90_imported"):
+                    use_rot90 = bool(rig_settings.rot90_imported)
+            if rt is None and use_rot90:
+                target_transform.rotation_euler[2] += radians(90)
+
     # Apply relativeTransform if present
-    if relativeTransform:
-        rt = _coerce_engine_transform(relativeTransform)
-        if rt is not None:
-            set_blender_object_transform(target_transform, rt, rotate_180=False)
+    if rt is not None:
+        set_blender_object_transform(target_transform, rt, rotate_180=False)
 
 def join_as_shape_keys(source_meshes, target_meshes, morphComponentId):
     for source, target in zip(source_meshes, target_meshes):
@@ -2875,6 +2887,8 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         for chunk in cur_chunks:
             chunk_ns = get_chunk_namespace(chunk)
             if not isChildNode(chunk['chunkIndex'], cur_chunks):
+                if chunk['type'] in _ROOT_CONSTRAINT_SKIP_CHUNK_TYPES:
+                    continue
                 # CAnimatedComponent sub-skeletons must NOT be bone-name-matched to the parent entity via CreateConstraints2. Cause problems with crossbows etc.
                 if chunk['type'] == 'CAnimatedComponent' and chunk.get('skeleton'):
                     continue
