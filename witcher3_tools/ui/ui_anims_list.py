@@ -50,9 +50,12 @@ def _is_mimic_component_armature(obj):
     component_type = str(obj.get("witcher_type", "") or "").strip()
     if component_type == "CMimicComponent":
         return True
-    if "cmimiccomponent" in str(getattr(obj, "name", "") or "").lower():
+    object_name = str(getattr(obj, "name", "") or "")
+    if "cmimiccomponent" in object_name.lower():
         return True
-    if str(obj.get("mimicFaceFile", "") or "").strip():
+    mimic_name = str(obj.get("mimicFace", "") or "").strip()
+    mimic_face_file = str(obj.get("mimicFaceFile", "") or "").strip()
+    if mimic_face_file and mimic_name and mimic_name == object_name:
         return True
     return False
 
@@ -66,6 +69,69 @@ def _iter_descendant_armatures(root_obj):
         pending.extend(getattr(child, "children", []) or [])
         if getattr(child, "type", None) == "ARMATURE":
             yield child
+
+
+def _find_named_mimic_armature(root_obj):
+    if not root_obj:
+        return None
+    mimic_name = str(root_obj.get("mimicFace", "") or "").strip()
+    if not mimic_name:
+        return None
+    candidate = bpy.data.objects.get(mimic_name)
+    if _is_mimic_component_armature(candidate):
+        return candidate
+    return None
+
+
+def _iter_related_scene_mimic_armatures(root_obj):
+    if not root_obj:
+        return
+    root_actor_name = str(root_obj.get("cutscene_actor_name", "") or "").strip()
+    root_entity_name = str(root_obj.get("witcher_entity_name", "") or "").strip()
+    for obj in getattr(bpy.context.scene, "objects", []):
+        if obj is root_obj or getattr(obj, "type", None) != "ARMATURE":
+            continue
+        if not _is_mimic_component_armature(obj):
+            continue
+        if root_actor_name and str(obj.get("cutscene_actor_name", "") or "").strip() == root_actor_name:
+            yield obj
+            continue
+        if root_entity_name and str(obj.get("witcher_entity_name", "") or "").strip() == root_entity_name:
+            yield obj
+
+
+def _iter_related_scene_armatures(root_obj):
+    if not root_obj:
+        return
+    root_name = str(getattr(root_obj, "name", "") or "").strip()
+    root_actor_name = str(root_obj.get("cutscene_actor_name", "") or "").strip()
+    root_entity_name = str(root_obj.get("witcher_entity_name", "") or "").strip()
+    for obj in getattr(bpy.context.scene, "objects", []):
+        if obj is root_obj or getattr(obj, "type", None) != "ARMATURE":
+            continue
+        if root_name and str(obj.get("mimicFace", "") or "").strip() == root_name:
+            yield obj
+            continue
+        if root_actor_name and str(obj.get("cutscene_actor_name", "") or "").strip() == root_actor_name:
+            yield obj
+            continue
+        if root_entity_name and str(obj.get("witcher_entity_name", "") or "").strip() == root_entity_name:
+            yield obj
+
+
+def _iter_parent_related_armatures(root_obj):
+    if not root_obj:
+        return
+    parent_obj = getattr(root_obj, "parent", None)
+    if parent_obj is None:
+        return
+    pending = list(getattr(parent_obj, "children", []) or [])
+    while pending:
+        child = pending.pop(0)
+        pending.extend(getattr(child, "children", []) or [])
+        if child is root_obj or getattr(child, "type", None) != "ARMATURE":
+            continue
+        yield child
 
 
 def _unique_armatures(armatures):
@@ -84,12 +150,157 @@ def _unique_armatures(armatures):
 def _resolve_face_animation_targets(main_arm_obj):
     if _is_mimic_component_armature(main_arm_obj):
         return [main_arm_obj]
-    mimic_targets = [
+    mimic_targets = []
+    named_mimic = _find_named_mimic_armature(main_arm_obj)
+    if named_mimic is not None:
+        mimic_targets.append(named_mimic)
+    mimic_targets.extend(
         armature_obj
         for armature_obj in _iter_descendant_armatures(main_arm_obj)
         if _is_mimic_component_armature(armature_obj)
-    ]
+    )
+    mimic_targets.extend(
+        armature_obj
+        for armature_obj in _iter_parent_related_armatures(main_arm_obj)
+        if _is_mimic_component_armature(armature_obj)
+    )
+    mimic_targets.extend(_iter_related_scene_mimic_armatures(main_arm_obj))
     return _unique_armatures(mimic_targets)
+
+
+def _iter_animation_buffers(animation):
+    if animation is None:
+        return
+    anim_buffer = getattr(animation, "animBuffer", None)
+    if anim_buffer is None:
+        return
+    parts = getattr(anim_buffer, "parts", None)
+    if parts:
+        for part in parts:
+            if part is not None:
+                yield part
+        return
+    yield anim_buffer
+
+
+def _animation_has_float_tracks(animation):
+    for anim_buffer in _iter_animation_buffers(animation):
+        if len(getattr(anim_buffer, "tracks", []) or []):
+            return True
+    return False
+
+
+def _resolve_face_track_target_armature(main_arm_obj, target_armatures):
+    candidates = []
+    if main_arm_obj and getattr(main_arm_obj, "type", None) == "ARMATURE":
+        candidates.append(main_arm_obj)
+    candidates.extend(target_armatures or [])
+    candidates.extend(_iter_parent_related_armatures(main_arm_obj))
+    candidates.extend(_iter_descendant_armatures(main_arm_obj))
+    candidates.extend(_iter_related_scene_armatures(main_arm_obj))
+
+    for armature_obj in _unique_armatures(candidates):
+        if not _is_mimic_component_armature(armature_obj):
+            return armature_obj
+    return None
+
+
+def _iter_owner_armatures_for_mimic(mimic_arm_obj):
+    if not mimic_arm_obj or getattr(mimic_arm_obj, "type", None) != "ARMATURE":
+        return
+    mimic_name = str(getattr(mimic_arm_obj, "name", "") or "").strip()
+    if not mimic_name:
+        return
+
+    mimic_actor_name = str(mimic_arm_obj.get("cutscene_actor_name", "") or "").strip()
+    mimic_entity_name = str(mimic_arm_obj.get("witcher_entity_name", "") or "").strip()
+    actor_matches = []
+    entity_matches = []
+    fallback_matches = []
+
+    for obj in getattr(bpy.context.scene, "objects", []):
+        if obj is mimic_arm_obj or getattr(obj, "type", None) != "ARMATURE":
+            continue
+        if _is_mimic_component_armature(obj):
+            continue
+        if str(obj.get("mimicFace", "") or "").strip() != mimic_name:
+            continue
+        if mimic_actor_name and str(obj.get("cutscene_actor_name", "") or "").strip() == mimic_actor_name:
+            actor_matches.append(obj)
+            continue
+        if mimic_entity_name and str(obj.get("witcher_entity_name", "") or "").strip() == mimic_entity_name:
+            entity_matches.append(obj)
+            continue
+        fallback_matches.append(obj)
+
+    for owner_group in (actor_matches, entity_matches, fallback_matches):
+        for owner_armature in _unique_armatures(owner_group):
+            yield owner_armature
+
+
+def _resolve_owner_face_target_armature(main_arm_obj):
+    if not main_arm_obj or getattr(main_arm_obj, "type", None) != "ARMATURE":
+        return None
+    if not _is_mimic_component_armature(main_arm_obj):
+        return main_arm_obj
+    for owner_armature in _iter_owner_armatures_for_mimic(main_arm_obj):
+        return owner_armature
+    return main_arm_obj
+
+
+def resolve_owner_face_animation_context(context, main_arm_obj=None):
+    resolved_main_arm_obj = _resolve_main_armature(context, main_arm_obj)
+    if not resolved_main_arm_obj:
+        raise RuntimeError("No armature found. Select or import a rig first.")
+
+    owner_armature = _resolve_owner_face_target_armature(resolved_main_arm_obj) or resolved_main_arm_obj
+    try:
+        set_main_armature(context.scene, owner_armature)
+    except Exception:
+        pass
+
+    rig_path = _resolve_face_rig_path(owner_armature, [owner_armature])
+    if rig_path is None and owner_armature is not resolved_main_arm_obj:
+        rig_path = _resolve_face_rig_path(resolved_main_arm_obj, [resolved_main_arm_obj])
+    if rig_path is None:
+        log.warning("No face rig path found for '%s', will use default skeleton.", owner_armature.name)
+
+    return resolved_main_arm_obj, owner_armature, rig_path
+
+
+def ensure_face_animation_setup(context, main_arm_obj, target_armatures=None):
+    track_target_armature = _resolve_face_track_target_armature(main_arm_obj, target_armatures or [])
+    if track_target_armature is None:
+        return False, None
+    if _is_mimic_component_armature(track_target_armature):
+        return False, track_target_armature
+
+    try:
+        from .ui_mimics import _ensure_face_morphs_loaded
+
+        return bool(_ensure_face_morphs_loaded(context, track_target_armature)), track_target_armature
+    except Exception:
+        log.warning(
+            "Failed to ensure face morph setup on '%s'.",
+            getattr(track_target_armature, "name", "<unknown>"),
+            exc_info=True,
+        )
+        return False, track_target_armature
+
+
+def ensure_owner_face_animation_setup(context, main_arm_obj=None):
+    _resolved_main_arm_obj, owner_armature, _rig_path = resolve_owner_face_animation_context(context, main_arm_obj)
+    try:
+        from .ui_mimics import _ensure_face_morphs_loaded
+
+        return bool(_ensure_face_morphs_loaded(context, owner_armature)), owner_armature
+    except Exception:
+        log.warning(
+            "Failed to ensure face morph setup on '%s'.",
+            getattr(owner_armature, "name", "<unknown>"),
+            exc_info=True,
+        )
+        return False, owner_armature
 
 
 def _resolve_entity_rig_path(main_arm_obj):
@@ -509,19 +720,60 @@ def FilterData(context):
         _set_quick_anim_cache(cache_key, cached_items)
         _apply_cached_items_to_scene(scene, cached_items)
 
-def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0):
-    main_arm_obj, target_armatures, rig_path, _face_animation = resolve_animation_load_context(
-        context,
-        anim_name,
-        fdir=fdir,
-        main_arm_obj=main_arm_obj,
-    )
+def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0,
+                         face_target_mode="auto"):
+    face_animation = is_face_animation(anim_name, fdir)
+    if face_target_mode == "owner" and face_animation:
+        main_arm_obj, owner_armature, rig_path = resolve_owner_face_animation_context(
+            context,
+            main_arm_obj=main_arm_obj,
+        )
+        target_armatures = [owner_armature]
+    else:
+        main_arm_obj, target_armatures, rig_path, face_animation = resolve_animation_load_context(
+            context,
+            anim_name,
+            fdir=fdir,
+            main_arm_obj=main_arm_obj,
+        )
+    effective_track = NLA_track
+    if face_target_mode != "owner" and face_animation and NLA_track == 'anim_import':
+        effective_track = 'mimic_import'
 
-    result = load_bin_anims_single(fdir, anim_name, rigPath=rig_path)
+    result = load_bin_anims_single(
+        fdir,
+        anim_name,
+        rigPath=rig_path,
+    )
     if not result or not result.animations:
         raise RuntimeError(f"Animation '{anim_name}' was not found in {fdir}")
     animation = result.animations[0]
-    
+
+    actual_target_armatures = target_armatures
+    if face_target_mode == "owner" and face_animation:
+        face_setup_loaded, owner_armature = ensure_owner_face_animation_setup(
+            context,
+            main_arm_obj,
+        )
+        if owner_armature is not None:
+            actual_target_armatures = [owner_armature]
+        if not face_setup_loaded:
+            target_name = getattr(owner_armature, "name", getattr(main_arm_obj, "name", "<unknown>"))
+            raise RuntimeError(f"Face morphs not loaded on '{target_name}'. Ensure the entity was imported with its face component, then load face morphs before importing face animations.")
+    elif face_animation and _animation_has_float_tracks(animation):
+        _face_setup_loaded, track_target_armature = ensure_face_animation_setup(
+            context,
+            main_arm_obj,
+            target_armatures,
+        )
+        if track_target_armature is not None:
+            actual_target_armatures = [track_target_armature]
+            log.info(
+                "Routing face track animation '%s' to '%s' instead of mimic armature.",
+                anim_name,
+                track_target_armature.name,
+            )
+     
     #!REMOVE
     #import json
     # with open("anim_debug_example.json", "w") as file:
@@ -532,10 +784,11 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
         fdir,
         animation,
         use_NLA=True,
-        NLA_track=NLA_track,
-        override_select=target_armatures if len(target_armatures) > 1 else target_armatures[0],
+        NLA_track=effective_track,
+        override_select=actual_target_armatures if len(actual_target_armatures) > 1 else actual_target_armatures[0],
         at_frame=at_frame,
     )
+    return actual_target_armatures
     # print(fdir)
     # print(anim_name)
 

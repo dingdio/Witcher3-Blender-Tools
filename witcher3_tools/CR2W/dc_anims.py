@@ -1087,14 +1087,13 @@ def load_base_skeleton(rigPath):
             return None
 
 def load_bin_anims_info(fileName, anim_name = None, rigPath = None) -> w3_types.CSkeletalAnimationSet:
-    if not rigPath:
-        rigPath = repo_file(r"characters\models\geralt\head\model\h_01_mg__geralt.w3fac")
-    
-    rig = load_base_skeleton(rigPath)
+    """Load animation-set metadata without decoding per-clip animation buffers.
+
+    This path is used for quick animset listing in the UI.
+    """
     with open(fileName, "rb") as f:
-        theFile = getCR2W(f, "cake")
-    anim_set = create_anim_set(theFile, rig)
-    return anim_set
+        theFile = getCR2W(f, do_read_anim_buffer=True)
+    return create_anim_set_info_only(theFile)
 
 
 def _is_w2_cr2w_version_file(file_name):
@@ -1457,9 +1456,8 @@ def create_CCutscene(file):
         anim_entry = CHUNKS[anim_ptr-1]
         anim = CHUNKS[anim_entry.GetVariableByName('animation').Value-1]
         anim_name = anim.GetVariableByName('name').Index.String
-        (act, comp, anim_n) = anim_name.split(':')
-        
-        chosen_actor =actorsdict[act]
+        actor_name = anim_name.split(':', 1)[0] if ':' in anim_name else anim_name
+        chosen_actor = actorsdict.get(actor_name)
         
         ##
         #characters\\base_entities\\man_base\\man_base.w2rig

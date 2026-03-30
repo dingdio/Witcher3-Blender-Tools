@@ -69,18 +69,43 @@ def _find_anim_bone(bones, *names):
                 return bone
     return None
 
+def _get_quaternion_components(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) >= 4:
+            return (
+                float(value[0]),
+                float(value[1]),
+                float(value[2]),
+                float(value[3]),
+            )
+        return None
+    if isinstance(value, dict):
+        return (
+            float(value.get("X", value.get("x", 0.0))),
+            float(value.get("Y", value.get("y", 0.0))),
+            float(value.get("Z", value.get("z", 0.0))),
+            float(value.get("W", value.get("w", 0.0))),
+        )
+
+    x = getattr(value, "X", getattr(value, "x", None))
+    y = getattr(value, "Y", getattr(value, "y", None))
+    z = getattr(value, "Z", getattr(value, "z", None))
+    w = getattr(value, "W", getattr(value, "w", None))
+    if None not in (x, y, z, w):
+        return (float(x), float(y), float(z), float(w))
+    return None
+
 def shouldIgnoreFrame(bone):
-    checkArr = [1,1,1]
-    #if bone.BoneName == "lowwer_left_lip":
-    if abs(bone.rotationFrames[0][0]) < 0.5:
-        checkArr[0] = 0
-    if abs(bone.rotationFrames[0][1]) < 0.5:
-        checkArr[1] = 0
-    if abs(bone.rotationFrames[0][2]) < 0.5:
-        checkArr[2] = 0
-    if checkArr.count(0.0) == 3:
-        return True
-    return False
+    rotation_frames = list(getattr(bone, "rotationFrames", []) or [])
+    if not rotation_frames:
+        return False
+    components = _get_quaternion_components(rotation_frames[0])
+    if components is None:
+        return False
+    x, y, z, _w = components
+    return abs(x) < 0.5 and abs(y) < 0.5 and abs(z) < 0.5
 
 def slerp_quaternion(q1, q2, t):
     """Spherical linear interpolation between two Quaternion objects"""
@@ -347,7 +372,8 @@ class AnimImporter:
             target_strip.blend_type = 'REPLACE'
             
             if self.__NLA_track:
-                if self.__NLA_track == 'mimic_import' or self.__NLA_track == 'voice_import' or self.__NLA_track == 'anim_import':
+                track_name = str(self.__NLA_track or "")
+                if track_name in {'mimic_import', 'voice_import', 'anim_import'} or track_name.startswith('cutscene_import'):
                     target_strip.blend_type = 'COMBINE'
             # try:
             #     __frame_start = self.__NLA_frame_margin + self.__frame_current #TODO exact float start
@@ -669,14 +695,30 @@ class AnimImporter:
         if camera_animation:
             control_bone_name = "Camera_Node"
         AnimTracks = SkeletalAnimationData.tracks
+        morph_action_target = None
         if AnimTracks and len(AnimTracks) > 1:
             log.info('---- morph animations:%5d  target: %s', len(AnimTracks), armObj.name)
 
-            if control_bone_name not in armObj.pose.bones:
-                log.warning('No shape key control bone. Add shape keys to '+armObj.name)
+            control_arm_obj = armObj
+            control_bone = control_arm_obj.pose.bones.get(control_bone_name)
+            if control_bone is None:
+                log.warning('No shape key control bone "%s" on "%s". Attempting to load face morphs.', control_bone_name, armObj.name)
+                try:
+                    from ..ui.ui_anims_list import ensure_owner_face_animation_setup
+
+                    _loaded, ensured_arm_obj = ensure_owner_face_animation_setup(bpy.context, armObj)
+                    if ensured_arm_obj and getattr(ensured_arm_obj, "type", None) == 'ARMATURE':
+                        control_arm_obj = ensured_arm_obj
+                    control_bone = control_arm_obj.pose.bones.get(control_bone_name)
+                except Exception as exc:
+                    log.warning('Failed to auto-load face morphs on "%s": %s', armObj.name, exc)
+            if control_bone is None:
+                log.warning('Shape key control bone "%s" still missing on "%s" after face morph attempt. Skipping morph tracks.', control_bone_name, armObj.name)
             else:
+                if control_arm_obj != armObj:
+                    morph_action_target = control_arm_obj
                 mirror_map = {}#_MirrorMapper(meshObj.data.shape_keys.key_blocks) if self.__mirror else {}
-                shapeKeyDict = {k:mirror_map.get(k, v) for k, v in armObj.pose.bones[control_bone_name].items()}
+                shapeKeyDict = {k:mirror_map.get(k, v) for k, v in control_bone.items()}
 
 
                 for track in AnimTracks:
@@ -699,7 +741,7 @@ class AnimImporter:
 
                     log.info('(mesh) frames:%5d  name: %s', len(keyFrames), name)
                     shapeKey = shapeKeyDict[name]
-                    fcurve = new_action_fcurve(action, armObj, data_path='pose.bones["%s"]["%s"]'% (control_bone_name, name))#  (data_path='key_blocks["%s"].value'%shapeKey.name)
+                    fcurve = new_action_fcurve(action, control_arm_obj, data_path='pose.bones["%s"]["%s"]'% (control_bone_name, name))#  (data_path='key_blocks["%s"].value'%shapeKey.name)
                     fcurve.keyframe_points.add(len(keyFrames))
                     #keyFrames.sort(key=lambda x:x.frame_number)
 
@@ -718,10 +760,12 @@ class AnimImporter:
                     # weights = tuple(i for i in keyFrames)
                     # shapeKey.slider_min = min(shapeKey.slider_min, floor(min(weights)))
                     # shapeKey.slider_max = max(shapeKey.slider_max, ceil(max(weights)))
-        
+
         
         
         self.__assign_action(armObj, action)
+        if morph_action_target is not None and morph_action_target != armObj:
+            self.__assign_action(morph_action_target, action)
         
     def __assignToArmature(self, armObj, action_name=None):
 
@@ -1255,7 +1299,7 @@ def import_w3_animSet(filename, rigPath = False)->w3_types.CSkeletalAnimationSet
     elif ext.lower().endswith('.w2anims'):
         if _is_w2_cr2w_version(filename):
             return load_w2_anims_info(filename)
-        return load_bin_anims(filename, rigPath)
+        return load_bin_anims_info(filename, rigPath=rigPath)
     else:
         anim = None
     return anim

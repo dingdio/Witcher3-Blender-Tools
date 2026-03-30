@@ -797,9 +797,32 @@ def get_face_meshs(mimicFace: str) -> Tuple:
     return (face_meshes, face_arms)
 
 
+def _get_mimic_skeleton_bone_names(faceData) -> set[str]:
+    if faceData is None:
+        return set()
+
+    mimic_skeleton = getattr(faceData, "mimicSkeleton", None)
+    if mimic_skeleton is None:
+        return set()
+
+    bones = getattr(mimic_skeleton, "bones", None)
+    if bones is None:
+        if isinstance(mimic_skeleton, (list, tuple, set)):
+            bones = mimic_skeleton
+        else:
+            return set()
+
+    bone_names = set()
+    for bone in bones:
+        bone_name = getattr(bone, "name", None) or getattr(bone, "BoneName", None)
+        if bone_name:
+            bone_names.add(bone_name)
+    return bone_names
+
+
 def _get_face_meshs_merged(main_obj, faceData) -> Tuple:
     """Find face meshes when face rig has been merged into the main armature."""
-    face_bone_names = {b.name for b in faceData.mimicSkeleton} if faceData.mimicSkeleton else set()
+    face_bone_names = _get_mimic_skeleton_bone_names(faceData)
     face_meshes = []
     for mesh_obj in bpy.data.objects:
         if mesh_obj.type != 'MESH':
@@ -1039,7 +1062,7 @@ class WITCH_OT_morphs(bpy.types.Operator):
             face_rig = scene.objects.get(main_obj['mimicFace'])
             if not face_rig:
                 # Check if face bones were merged into the main armature
-                face_bone_names = {b.name for b in faceData.mimicSkeleton} if faceData.mimicSkeleton else set()
+                face_bone_names = _get_mimic_skeleton_bone_names(faceData)
                 if face_bone_names and any(main_obj.pose.bones.get(bn) for bn in face_bone_names):
                     face_rig = main_obj
                 else:
@@ -1203,7 +1226,7 @@ class WITCH_OT_phonemes(bpy.types.Operator):
         face_rig_name = main_obj['mimicFace']
         face_rig = scene.objects.get(face_rig_name)
         if not face_rig:
-            face_bone_names = {b.name for b in faceData.mimicSkeleton} if faceData and faceData.mimicSkeleton else set()
+            face_bone_names = _get_mimic_skeleton_bone_names(faceData)
             if face_bone_names and any(main_obj.pose.bones.get(bn) for bn in face_bone_names):
                 face_rig = main_obj
             elif face_rig_name == main_obj.name:

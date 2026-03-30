@@ -413,9 +413,20 @@ class TOOL_OT_List_LoadAnim(Operator):
                         animset = import_anims.import_w3_animSet(fdir_abs, rig_path)
                         #import json by name
                         target_obj = target_armatures if len(target_armatures) > 1 else target_armatures[0]
-                        import_anims.import_from_list_item(context, item, animset, target_obj=target_obj)
+                        import_anims.import_from_list_item(
+                            context,
+                            item,
+                            animset,
+                            target_obj=target_obj,
+                        )
                     else:
-                        load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj)
+                        load_anim_into_scene(
+                            context,
+                            anim_name,
+                            fdir_abs,
+                            main_arm_obj,
+                            face_target_mode="owner" if action == "load_cutscene" else "auto",
+                        )
                 except FileNotFoundError as e:
                     self.report({'ERROR'}, str(e))
                     return {'CANCELLED'}

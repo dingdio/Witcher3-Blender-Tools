@@ -3041,7 +3041,7 @@ class CR2W:
             jsonCR2W._chunks[_cmap._key] = _cmap
         return jsonCR2W
 
-def getCR2W(f, anim_name = None, do_read_chunks = True):
-    return CR2W(f, anim_name, do_read_chunks)
+def getCR2W(f, anim_name = None, do_read_chunks = True, **kwargs):
+    return CR2W(f, anim_name, do_read_chunks, **kwargs)
 
 
