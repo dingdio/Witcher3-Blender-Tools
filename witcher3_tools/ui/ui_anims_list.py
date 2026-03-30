@@ -37,6 +37,113 @@ def _resolve_main_armature(context, main_arm_obj=None):
     )
 
 
+def is_face_animation(anim_name, fdir=""):
+    anim_text = str(anim_name or "").strip().lower()
+    if ":face" in anim_text:
+        return True
+    return "_mimic_" in str(fdir or "").strip().lower()
+
+
+def _is_mimic_component_armature(obj):
+    if not obj or getattr(obj, "type", None) != "ARMATURE":
+        return False
+    component_type = str(obj.get("witcher_type", "") or "").strip()
+    if component_type == "CMimicComponent":
+        return True
+    if "cmimiccomponent" in str(getattr(obj, "name", "") or "").lower():
+        return True
+    if str(obj.get("mimicFaceFile", "") or "").strip():
+        return True
+    return False
+
+
+def _iter_descendant_armatures(root_obj):
+    if not root_obj:
+        return
+    pending = list(getattr(root_obj, "children", []) or [])
+    while pending:
+        child = pending.pop(0)
+        pending.extend(getattr(child, "children", []) or [])
+        if getattr(child, "type", None) == "ARMATURE":
+            yield child
+
+
+def _unique_armatures(armatures):
+    unique = []
+    seen_names = set()
+    for armature_obj in armatures or []:
+        if not armature_obj or getattr(armature_obj, "type", None) != "ARMATURE":
+            continue
+        if armature_obj.name in seen_names:
+            continue
+        seen_names.add(armature_obj.name)
+        unique.append(armature_obj)
+    return unique
+
+
+def _resolve_face_animation_targets(main_arm_obj):
+    if _is_mimic_component_armature(main_arm_obj):
+        return [main_arm_obj]
+    mimic_targets = [
+        armature_obj
+        for armature_obj in _iter_descendant_armatures(main_arm_obj)
+        if _is_mimic_component_armature(armature_obj)
+    ]
+    return _unique_armatures(mimic_targets)
+
+
+def _resolve_entity_rig_path(main_arm_obj):
+    if not main_arm_obj or getattr(main_arm_obj, "type", None) != "ARMATURE":
+        return None
+    rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
+    skeleton_path = str(getattr(rig_settings, "main_entity_skeleton", "") or "").strip() if rig_settings else ""
+    if not skeleton_path:
+        return None
+    try:
+        return repo_file(skeleton_path)
+    except Exception:
+        return None
+
+
+def _resolve_face_rig_path(main_arm_obj, target_armatures):
+    candidates = []
+    if main_arm_obj:
+        candidates.append(main_arm_obj)
+    candidates.extend(target_armatures or [])
+    for armature_obj in _unique_armatures(candidates):
+        mimic_face_file = str(armature_obj.get("mimicFaceFile", "") or "").strip()
+        if mimic_face_file:
+            try:
+                return repo_file(mimic_face_file)
+            except Exception:
+                pass
+        rig_settings = getattr(armature_obj.data, "witcherui_RigSettings", None)
+        skeleton_path = str(getattr(rig_settings, "main_face_skeleton", "") or "").strip() if rig_settings else ""
+        if skeleton_path:
+            try:
+                return repo_file(skeleton_path)
+            except Exception:
+                pass
+    return None
+
+
+def resolve_animation_load_context(context, anim_name, fdir="", main_arm_obj=None):
+    main_arm_obj = _resolve_main_armature(context, main_arm_obj)
+    if not main_arm_obj:
+        raise RuntimeError("No armature found. Select or import a rig first.")
+
+    face_animation = is_face_animation(anim_name, fdir)
+    if face_animation:
+        target_armatures = _resolve_face_animation_targets(main_arm_obj)
+        if not target_armatures:
+            raise RuntimeError("No CMimicComponent armature found for face animation.")
+        rig_path = _resolve_face_rig_path(main_arm_obj, target_armatures)
+    else:
+        target_armatures = [main_arm_obj]
+        rig_path = _resolve_entity_rig_path(main_arm_obj)
+    return main_arm_obj, target_armatures, rig_path, face_animation
+
+
 _QUICK_ANIM_FILTER_CACHE = {}
 _ACTIVE_SOURCE_KEY_BY_SCENE = {}
 _LAST_QUICK_ANIM_SEARCH_BY_SCENE = {}
@@ -403,19 +510,12 @@ def FilterData(context):
         _apply_cached_items_to_scene(scene, cached_items)
 
 def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0):
-    main_arm_obj = _resolve_main_armature(context, main_arm_obj)
-    if not main_arm_obj:
-        raise RuntimeError("No armature found. Select or import a rig first.")
-
-    rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
-    rig_path = None
-    if rig_settings:
-        if "_mimic_" in fdir:
-            skeleton_path = getattr(rig_settings, "main_face_skeleton", "")
-        else:
-            skeleton_path = getattr(rig_settings, "main_entity_skeleton", "")
-        if skeleton_path:
-            rig_path = repo_file(skeleton_path)
+    main_arm_obj, target_armatures, rig_path, _face_animation = resolve_animation_load_context(
+        context,
+        anim_name,
+        fdir=fdir,
+        main_arm_obj=main_arm_obj,
+    )
 
     result = load_bin_anims_single(fdir, anim_name, rigPath=rig_path)
     if not result or not result.animations:
@@ -433,7 +533,7 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
         animation,
         use_NLA=True,
         NLA_track=NLA_track,
-        override_select=main_arm_obj,
+        override_select=target_armatures if len(target_armatures) > 1 else target_armatures[0],
         at_frame=at_frame,
     )
     # print(fdir)

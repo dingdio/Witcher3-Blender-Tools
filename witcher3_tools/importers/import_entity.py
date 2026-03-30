@@ -743,7 +743,7 @@ def test_load_entity(filename) ->  w3_types.Entity:
         entity = None
     return entity
 
-def _try_import_armature_from_item_appearances(entity, parent_transform=None, source_game=""):
+def _try_import_armature_from_item_appearances(entity, parent_transform=None, source_game="", target_collection=None):
     """For CItemEntity (no MovingPhysicalAgentComponent), try to find a skeleton
     inside the first appearance's included templates.  Returns an armature object
     if one is found, otherwise None."""
@@ -768,6 +768,7 @@ def _try_import_armature_from_item_appearances(entity, parent_transform=None, so
                 parent_transform,
                 direct_entity_path=tmpl_filename,
                 source_game=source_game,
+                target_collection=target_collection,
             )
             if arm:
                 return arm
@@ -787,10 +788,67 @@ def _should_create_direct_entity_root(entity, parent_transform=None) -> bool:
     return bool(component_type and component_type != "CMovingPhysicalAgentComponent")
 
 
-def _create_entity_root_object(name: str):
+def _find_layer_collection_for_collection(layer_collection, target_collection):
+    if layer_collection is None or target_collection is None:
+        return None
+    if getattr(layer_collection, "collection", None) == target_collection:
+        return layer_collection
+    for child in getattr(layer_collection, "children", []):
+        found = _find_layer_collection_for_collection(child, target_collection)
+        if found is not None:
+            return found
+    return None
+
+
+def _get_import_target_collection(context=None):
+    ctx = context or bpy.context
+    view_layer = getattr(ctx, "view_layer", None)
+    active_layer_collection = getattr(view_layer, "active_layer_collection", None) if view_layer else None
+    target_collection = getattr(active_layer_collection, "collection", None)
+    if target_collection is not None:
+        return target_collection
+    target_collection = getattr(ctx, "collection", None)
+    if target_collection is not None:
+        return target_collection
+    scene = getattr(ctx, "scene", None)
+    return getattr(scene, "collection", None)
+
+
+def _activate_target_collection(context, target_collection) -> bool:
+    if target_collection is None:
+        return False
+    ctx = context or bpy.context
+    view_layer = getattr(ctx, "view_layer", None)
+    if view_layer is None:
+        return False
+    active_layer_collection = getattr(view_layer, "active_layer_collection", None)
+    if getattr(active_layer_collection, "collection", None) == target_collection:
+        return True
+    target_layer_collection = _find_layer_collection_for_collection(
+        getattr(view_layer, "layer_collection", None),
+        target_collection,
+    )
+    if target_layer_collection is None:
+        return False
+    view_layer.active_layer_collection = target_layer_collection
+    return True
+
+
+def _link_object_to_collection(obj, target_collection):
+    if obj is None:
+        return
+    if target_collection is None:
+        target_collection = _get_import_target_collection(bpy.context)
+    if target_collection is None:
+        return
+    if obj.name not in target_collection.objects:
+        target_collection.objects.link(obj)
+
+
+def _create_entity_root_object(name: str, target_collection=None):
     root_name = str(name or "").strip() or "Entity"
     root_obj = bpy.data.objects.new(root_name, None)
-    bpy.context.collection.objects.link(root_obj)
+    _link_object_to_collection(root_obj, target_collection or _get_import_target_collection(bpy.context))
     root_obj.empty_display_type = 'PLAIN_AXES'
     root_obj.empty_display_size = 0.1
     root_obj["witcher_entity_root"] = True
@@ -816,14 +874,18 @@ def _focus_main_armature(context, armature_obj):
         pass
 
 
-def import_ent_template(filename, load_face_poses = False, import_apperance = 0, parent_transform = None):
+def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
+                        parent_transform = None, selected_appearance_name = ""):
     clear_template_cache()
     context = bpy.context
+    target_collection = _get_import_target_collection(context)
+    _activate_target_collection(context, target_collection)
     entity = test_load_entity(filename)
     entity_state = _build_entity_armature_state(
         entity,
         filename=filename,
         import_apperance=import_apperance,
+        selected_appearance_name=selected_appearance_name,
     )
     entity_repo_path = entity_state.get("repo_path", "") if entity_state else ""
     entity_source_game = _source_game_from_version(entity)
@@ -831,7 +893,10 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
     entity_root = parent_transform
     created_entity_root = None
     if _should_create_direct_entity_root(entity, parent_transform):
-        entity_root = _create_entity_root_object(getattr(entity, "name", "") or Path(filename).stem)
+        entity_root = _create_entity_root_object(
+            getattr(entity, "name", "") or Path(filename).stem,
+            target_collection=target_collection,
+        )
         created_entity_root = entity_root
 
     base_animation_skeleton = import_MovingPhysicalAgentComponent(
@@ -839,6 +904,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
         entity_root,
         direct_entity_path=entity_repo_path,
         source_game=entity_source_game,
+        target_collection=target_collection,
     )
     main_arm_obj = base_animation_skeleton
 
@@ -852,6 +918,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                 entity,
                 entity_root,
                 source_game=entity_source_game,
+                target_collection=target_collection,
             )
             if arm_from_tmpl:
                 main_arm_obj = arm_from_tmpl
@@ -2842,9 +2909,12 @@ def join_as_shape_keys(source_meshes, target_meshes, morphComponentId):
 def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdict,
                  HardAttachments, hide_shadowmesh, root_skeleton, i,
                  selectedAppearance=None, import_redcloth_enabled=True, morphs_todo=None,
-                 bind_root_chunks_to_entity=True, direct_entity_path="", source_game=""):
+                 bind_root_chunks_to_entity=True, direct_entity_path="", source_game="",
+                 target_collection=None):
     if morphs_todo is None:
         morphs_todo = []
+    if target_collection is None:
+        target_collection = _get_import_target_collection(bpy.context)
     selected_appearance_name = str(_get_entry_attr(selectedAppearance, "name", "") or "")
     coloring_entry_lookup = _build_coloring_entry_lookup(
         getattr(entity, "coloringEntries", None),
@@ -2896,6 +2966,8 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
 
     for chunk in cur_chunks:
         chunk_ns = get_chunk_namespace(chunk)
+        if target_collection is not None:
+            _activate_target_collection(bpy.context, target_collection)
         
         # Handle attachments
         if chunk['type'] in ["CMeshSkinningAttachment", "CAnimatedAttachment"]:
@@ -3015,6 +3087,8 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                             f"{chunk['type']}{i}{chunk['chunkIndex']}",
                             entity.name,
                         )
+                        if target_collection is not None:
+                            _activate_target_collection(bpy.context, target_collection)
                         if cloth_arma is None:
                             legacy_exists, legacy_enabled = addon_utils.check("io_scene_apx")
                             apx_status = get_apx_addon_status(bpy.context)
@@ -3165,7 +3239,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         if chunk['type'] == "CCameraComponent":
             camera_data = bpy.data.cameras.new(name='Camera')
             camera_object = bpy.data.objects.new('Camera', camera_data)
-            bpy.context.collection.objects.link(camera_object)
+            _link_object_to_collection(camera_object, target_collection)
             camera_object.rotation_euler[0] = np.pi/2
             add_chunk_metadata(camera_object, chunk)
             objdict[chunk_ns] = camera_object
@@ -3333,9 +3407,12 @@ def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_
 
 
 
-def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_entity_path="", source_game=""):
+def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_entity_path="", source_game="", target_collection=None):
     #entity = fixed_chunk_paths(entity, entity.version)
     ent_namespace = entity.name+":"
+    if target_collection is None:
+        target_collection = _get_import_target_collection(bpy.context)
+    _activate_target_collection(bpy.context, target_collection)
 
     #OPTIONS
     hide_shadowmesh = True
@@ -3368,6 +3445,7 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
             i='',
             direct_entity_path=direct_entity_path,
             source_game=source_game,
+            target_collection=target_collection,
         )
 
     if not root_skeleton:
@@ -3400,7 +3478,7 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
         # same entity stay isolated and never reuse another instance's slots.
         slots_parent_name = f"{entity.name}_slots" if entity.name else "entity_slots"
         slots_parent = bpy.data.objects.new(slots_parent_name, None)
-        bpy.context.collection.objects.link(slots_parent)
+        _link_object_to_collection(slots_parent, target_collection)
         slots_parent.empty_display_type = 'PLAIN_AXES'
         slots_parent.empty_display_size = 0.1
         slots_parent["witcher_slots_parent"] = True
@@ -3473,7 +3551,7 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
 
             # Create an empty object for this slot
             empty_obj = bpy.data.objects.new(name, None)
-            bpy.context.collection.objects.link(empty_obj)
+            _link_object_to_collection(empty_obj, target_collection)
             empty_obj.empty_display_type = 'SPHERE'
             empty_obj.empty_display_size = 0.02
             empty_obj["witcher_slot_name"] = this_slot.name or ""
@@ -3538,7 +3616,8 @@ def add_app_template(   entity,
                                 appearance_indices=None,
                                 use_app_drivers=True,
                                 morphs_todo_accum=None,
-                                bind_root_chunks_to_entity=True):
+                                bind_root_chunks_to_entity=True,
+                                target_collection=None):
     constrains = []
     HardAttachments = []
 
@@ -3583,6 +3662,7 @@ def add_app_template(   entity,
         bind_root_chunks_to_entity=bind_root_chunks_to_entity,
         direct_entity_path=templateFilename,
         source_game=template_source_game,
+        target_collection=target_collection,
     )
     if morphs_todo_accum is not None and local_morphs_todo:
         morphs_todo_accum.extend(local_morphs_todo)
@@ -3641,6 +3721,8 @@ def import_app(context,
                selectedAppearance,
                entity,
                base_animation_skeleton):
+    target_collection = _get_import_target_collection(context)
+    _activate_target_collection(context, target_collection)
     import_redcloth_enabled = get_do_import_redcloth(context)
     (exist, enabled) = addon_utils.check("io_mesh_apx")
     if not enabled:
@@ -3785,7 +3867,8 @@ def import_app(context,
                              templateFilename,
                              selectedAppearance.includedTemplates[i],
                              template_appearances,
-                             morphs_todo_accum=morphs_todo)
+                             morphs_todo_accum=morphs_todo,
+                             target_collection=target_collection)
 
             new_objects = tag_new_objects_with_guid(before, guid, "witcher_template_guid")
             guid_index[guid] = list(new_objects)  # Update index with new objects
@@ -3824,7 +3907,8 @@ def import_app(context,
                          templateFilename,
                          selectedAppearance.includedTemplates[i],
                          template_appearances,
-                         morphs_todo_accum=morphs_todo)
+                         morphs_todo_accum=morphs_todo,
+                         target_collection=target_collection)
 
         new_objects = tag_new_objects_with_guid(before, guid, "witcher_template_guid")
         guid_index[guid] = list(new_objects)  # Update index with new objects

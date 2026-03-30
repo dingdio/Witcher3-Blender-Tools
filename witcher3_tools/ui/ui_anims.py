@@ -16,7 +16,7 @@ from ..action_compat import iter_action_fcurves, new_action_fcurve, remove_actio
 # from io_import_w2l.importers import import_cutscene
 # from io_import_w2l.importers import import_scene
 from ..ui.ui_utils import WITCH_PT_Base
-from ..ui.ui_anims_list import load_anim_into_scene
+from ..ui.ui_anims_list import load_anim_into_scene, resolve_animation_load_context
 from ..ui.armature_context import (
     get_main_armature,
     set_main_armature,
@@ -390,7 +390,6 @@ class TOOL_OT_List_LoadAnim(Operator):
                 working_list = scene.witcher_w2anims_list
             log.debug("load anim")
             main_arm_obj = _find_character_armature(context)
-            rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None) if main_arm_obj else None
             if working_list_index >= 0 and working_list:
                 item = working_list[working_list_index]
                 anim_name = item.name 
@@ -401,16 +400,20 @@ class TOOL_OT_List_LoadAnim(Operator):
                     self.report({'ERROR'}, "No armature found. Select or import a rig first.")
                     return {'CANCELLED'}
                 
-                dirpath, file = os.path.split(fdir_abs)
-                basename, ext = os.path.splitext(file)
+                _dirpath, file = os.path.split(fdir_abs)
+                _basename, ext = os.path.splitext(file)
                 try:
-                    if ext.lower() in ('.json'):
-                        rig_path = None
-                        if rig_settings and getattr(rig_settings, "main_entity_skeleton", ""):
-                            rig_path = repo_file(rig_settings.main_entity_skeleton)
+                    if ext.lower() == '.json':
+                        _resolved_main_arm_obj, target_armatures, rig_path, _face_animation = resolve_animation_load_context(
+                            context,
+                            anim_name,
+                            fdir=fdir_abs,
+                            main_arm_obj=main_arm_obj,
+                        )
                         animset = import_anims.import_w3_animSet(fdir_abs, rig_path)
                         #import json by name
-                        import_anims.import_from_list_item(context, item, animset, target_obj=main_arm_obj)
+                        target_obj = target_armatures if len(target_armatures) > 1 else target_armatures[0]
+                        import_anims.import_from_list_item(context, item, animset, target_obj=target_obj)
                     else:
                         load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj)
                 except FileNotFoundError as e:

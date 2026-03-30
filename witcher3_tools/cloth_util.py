@@ -30,28 +30,71 @@ import bpy
 
 log = logging.getLogger(__name__)
 
+def _resolve_collection_ref(collection_ref):
+    if collection_ref is None:
+        return None
+    if hasattr(collection_ref, "collection") and getattr(collection_ref, "collection", None) is not None:
+        return collection_ref.collection
+    if hasattr(collection_ref, "objects") and hasattr(collection_ref, "children"):
+        return collection_ref
+    if collection_ref == "Scene Collection":
+        return bpy.context.scene.collection
+    return bpy.data.collections.get(str(collection_ref))
+
+
+def _find_layer_collection_for_collection(layer_collection, target_collection):
+    if layer_collection is None or target_collection is None:
+        return None
+    if getattr(layer_collection, "collection", None) == target_collection:
+        return layer_collection
+    for child in getattr(layer_collection, "children", []):
+        found = _find_layer_collection_for_collection(child, target_collection)
+        if found is not None:
+            return found
+    return None
+
+
+def _restore_active_layer_collection_for_collection(context, target_collection):
+    if target_collection is None:
+        return False
+    ctx = context or bpy.context
+    view_layer = getattr(ctx, "view_layer", None)
+    if view_layer is None:
+        return False
+    target_layer = _find_layer_collection_for_collection(
+        getattr(view_layer, "layer_collection", None),
+        target_collection,
+    )
+    if target_layer is None:
+        return False
+    view_layer.active_layer_collection = target_layer
+    return True
+
+
 def move_objects_between_collections(old_collection_name, new_collection_name):
     # Get the master collection (Scene Collection)
     master_collection = bpy.context.scene.collection
 
-    # Determine the old collection
-    if old_collection_name == "Scene Collection":
-        old_collection = master_collection
-    else:
-        old_collection = bpy.data.collections.get(old_collection_name)
-        if old_collection is None:
-            log.warning("Old collection '%s' not found.", old_collection_name)
-            return
+    old_collection = _resolve_collection_ref(old_collection_name)
+    if old_collection is None:
+        log.warning("Old collection '%s' not found.", old_collection_name)
+        return
 
-    # Determine the new collection
-    if new_collection_name == "Scene Collection":
-        new_collection = master_collection
-    else:
-        new_collection = bpy.data.collections.get(new_collection_name)
-        if new_collection is None:
-            log.debug("New collection '%s' not found. Creating it.", new_collection_name)
-            new_collection = bpy.data.collections.new(new_collection_name)
-            master_collection.children.link(new_collection)
+    new_collection = _resolve_collection_ref(new_collection_name)
+    if new_collection is None:
+        new_collection_label = str(new_collection_name or "").strip()
+        if not new_collection_label:
+            log.warning("New collection '%s' not found.", new_collection_name)
+            return
+        log.debug("New collection '%s' not found. Creating it.", new_collection_label)
+        new_collection = bpy.data.collections.new(new_collection_label)
+        master_collection.children.link(new_collection)
+
+    if old_collection == new_collection:
+        return
+
+    old_collection_name = getattr(old_collection, "name", str(old_collection_name))
+    new_collection_name = getattr(new_collection, "name", str(new_collection_name))
 
     # Move all objects from old collection to new collection
     objects_to_move = list(old_collection.objects)
@@ -363,6 +406,10 @@ def _sanitize_apx_triangle_array(array_elem, vertex_count: int | None = None) ->
     return stats
 
 
+def _clone_apx_xml_element(elem):
+    return ElementTree.fromstring(ElementTree.tostring(elem, encoding="utf-8"))
+
+
 def _sanitize_apx_for_import(filepath: str) -> str:
     """Write a sanitized APX copy when cloth triangle data would crash Blender import."""
     path = str(filepath or "").strip()
@@ -380,6 +427,31 @@ def _sanitize_apx_for_import(filepath: str) -> str:
     change_notes: List[str] = []
 
     graphical_lods = _apx_try_find_child(clothing, "array", "name", "graphicalLods")
+    physical_meshes = _apx_try_find_child(clothing, "array", "name", "physicalMeshes")
+    required_sim_materials = max(
+        len(graphical_lods) if graphical_lods is not None else 0,
+        len(physical_meshes) if physical_meshes is not None else 0,
+    )
+
+    material_library = _apx_try_find_child(clothing, "value", "name", "materialLibrary")
+    if material_library is not None and len(material_library):
+        materials_array = _apx_try_find_child(material_library[0], "array", "name", "materials")
+        if materials_array is not None:
+            existing_sim_materials = len(materials_array)
+            if required_sim_materials and 0 < existing_sim_materials < required_sim_materials:
+                template_material = materials_array[-1]
+                for _idx in range(existing_sim_materials, required_sim_materials):
+                    materials_array.append(_clone_apx_xml_element(template_material))
+                materials_array.attrib["size"] = str(required_sim_materials)
+                change_notes.append(
+                    f"duplicated simulation materials {existing_sim_materials}->{required_sim_materials}"
+                )
+            elif existing_sim_materials and str(materials_array.attrib.get("size", "")).strip() != str(existing_sim_materials):
+                materials_array.attrib["size"] = str(existing_sim_materials)
+                change_notes.append(
+                    f"normalized simulation material array size to {existing_sim_materials}"
+                )
+
     if graphical_lods is not None:
         for lod_idx, lod in enumerate(graphical_lods):
             try:
@@ -404,7 +476,6 @@ def _sanitize_apx_for_import(filepath: str) -> str:
                         f"truncated={stats['removed_truncated']}"
                     )
 
-    physical_meshes = _apx_try_find_child(clothing, "array", "name", "physicalMeshes")
     if physical_meshes is not None:
         for phys_idx, physical_mesh_container in enumerate(physical_meshes):
             try:
@@ -446,6 +517,124 @@ def _sanitize_apx_for_import(filepath: str) -> str:
     except Exception as exc:
         log.warning("Failed to write sanitized APX copy for %s: %s", path, exc)
         return filepath
+
+
+def _bpy_data_block_identity(data_block):
+    if data_block is None:
+        return None
+    try:
+        return int(data_block.as_pointer())
+    except Exception:
+        return id(data_block)
+
+
+def _snapshot_blender_import_state():
+    return {
+        "objects": {_bpy_data_block_identity(obj) for obj in bpy.data.objects},
+        "collections": {_bpy_data_block_identity(coll) for coll in bpy.data.collections},
+        "meshes": {_bpy_data_block_identity(mesh) for mesh in bpy.data.meshes},
+        "armatures": {_bpy_data_block_identity(arm) for arm in bpy.data.armatures},
+        "materials": {_bpy_data_block_identity(mat) for mat in bpy.data.materials},
+        "node_groups": {_bpy_data_block_identity(group) for group in bpy.data.node_groups},
+    }
+
+
+def _object_parent_depth(obj):
+    depth = 0
+    current = getattr(obj, "parent", None)
+    while current is not None:
+        depth += 1
+        current = getattr(current, "parent", None)
+    return depth
+
+
+def _iter_collection_parents(collection):
+    if collection is None:
+        return
+    scene = getattr(bpy.context, "scene", None)
+    scene_collection = getattr(scene, "collection", None)
+    if scene_collection is not None:
+        try:
+            if collection.name in scene_collection.children.keys():
+                yield scene_collection
+        except Exception:
+            pass
+    for parent in bpy.data.collections:
+        try:
+            if collection.name in parent.children.keys():
+                yield parent
+        except Exception:
+            continue
+
+
+def _collection_parent_depth(collection, _memo=None):
+    if collection is None:
+        return 0
+    if _memo is None:
+        _memo = {}
+    coll_id = _bpy_data_block_identity(collection)
+    if coll_id in _memo:
+        return _memo[coll_id]
+    parents = list(_iter_collection_parents(collection))
+    if not parents:
+        _memo[coll_id] = 0
+        return 0
+    depth = 1 + max(_collection_parent_depth(parent, _memo) for parent in parents)
+    _memo[coll_id] = depth
+    return depth
+
+
+def _cleanup_failed_cloth_import(snapshot_state):
+    if not snapshot_state:
+        return
+
+    new_objects = [
+        obj for obj in bpy.data.objects
+        if _bpy_data_block_identity(obj) not in snapshot_state["objects"]
+    ]
+    new_objects.sort(key=_object_parent_depth, reverse=True)
+    for obj in new_objects:
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception as exc:
+            log.debug("Failed removing partial cloth import object %s: %s", getattr(obj, "name", "<unknown>"), exc)
+
+    depth_cache = {}
+    new_collections = [
+        coll for coll in bpy.data.collections
+        if _bpy_data_block_identity(coll) not in snapshot_state["collections"]
+    ]
+    new_collections.sort(key=lambda coll: _collection_parent_depth(coll, depth_cache), reverse=True)
+    for coll in new_collections:
+        try:
+            for parent in list(_iter_collection_parents(coll)):
+                try:
+                    parent.children.unlink(coll)
+                except Exception:
+                    pass
+            bpy.data.collections.remove(coll)
+        except Exception as exc:
+            log.debug("Failed removing partial cloth import collection %s: %s", getattr(coll, "name", "<unknown>"), exc)
+
+    orphan_specs = [
+        (bpy.data.node_groups, "node_groups"),
+        (bpy.data.materials, "materials"),
+        (bpy.data.meshes, "meshes"),
+        (bpy.data.armatures, "armatures"),
+    ]
+    for datablocks, snapshot_key in orphan_specs:
+        for datablock in list(datablocks):
+            if _bpy_data_block_identity(datablock) in snapshot_state[snapshot_key]:
+                continue
+            try:
+                if getattr(datablock, "users", 0) == 0:
+                    datablocks.remove(datablock)
+            except Exception as exc:
+                log.debug(
+                    "Failed removing partial cloth import data block %s: %s",
+                    getattr(datablock, "name", "<unknown>"),
+                    exc,
+                )
 
 
 def _fix_connection_objects_transform_space(connection_objects):
@@ -1712,10 +1901,36 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
 
     save_selected = bpy.context.selected_objects[:]
     save_active = bpy.context.view_layer.objects.active
-    save_collection = bpy.context.view_layer.active_layer_collection
+    save_layer_collection = getattr(bpy.context.view_layer, "active_layer_collection", None)
+    save_collection = getattr(save_layer_collection, "collection", None)
     
     if not context:
         context = bpy.context
+
+    def _restore_import_context():
+        try:
+            bpy.context.view_layer.objects.active = None
+        except Exception:
+            pass
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+        except Exception:
+            pass
+        try:
+            bpy.context.view_layer.objects.active = save_active
+        except Exception:
+            pass
+        for ob in save_selected:
+            try:
+                ob.select_set(True)
+            except Exception:
+                pass
+        try:
+            _restore_active_layer_collection_for_collection(context, save_collection)
+        except Exception:
+            pass
+
+    import_snapshot = _snapshot_blender_import_state()
 
     # Global addon preference is the single source of truth.
     DO_WEAR_CLOTH = bool(get_DO_WEAR_CLOTH(context))
@@ -1731,227 +1946,220 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
     try:
         if addon_installed:
             from io_mesh_apx.importer.import_clothing import read_clothing
-            
             args_count = len(inspect.signature(read_clothing).parameters)
             if args_count == 4:
                 read_clothing(context, filepath, rotate_180, rm_ph_me)
+            else:
+                raise RuntimeError(f"Unsupported io_mesh_apx.read_clothing signature: {args_count}")
         elif older_addon_installed:
-            try:
-                from io_scene_apx.importer.import_clothing import read_clothing
-                read_clothing(context, filepath, use_mat, rotate_180, rm_ph_me)
-            except Exception as e:
-                log.critical(f'Cloth plugin problem {e}')
-                return None
+            from io_scene_apx.importer.import_clothing import read_clothing
+            read_clothing(context, filepath, use_mat, rotate_180, rm_ph_me)
         else:
             log.warning("Cloth plugin unavailable: enable io_mesh_apx (or legacy io_scene_apx)")
             return None
-    except Exception as e:
-        log.critical(f'Cloth plugin problem {e}')
-        return None
+        # objs = bpy.context.objects[:]
+        # for obj in objs:
+        #     print (obj.name)
 
-
-
-    # objs = bpy.context.objects[:]
-    # for obj in objs:
-    #     print (obj.name)
-    
-    #get the cloth mesh and select it
-    bpy.context.view_layer.objects.active = None
-    bpy.ops.object.select_all(action='DESELECT')
-    active_coll = bpy.context.view_layer.active_layer_collection.collection
-    arma = None
-    arma_objs = []
-    for ob in active_coll.all_objects:
-        if ob.type == "ARMATURE" and "Armature" in ob.name:
-            arma_objs.append(ob)
-    arma_objs.sort(key=lambda x: x.name, reverse=True)
-    arma = arma_objs[0]
-    filename = Path(filepath).stem
-    
-    do_fix_tail = get_do_fix_tail(bpy.context) #True
-    if do_fix_tail: #!
-        #ROTATE BONES
+        #get the cloth mesh and select it
         bpy.context.view_layer.objects.active = None
         bpy.ops.object.select_all(action='DESELECT')
-        bpy.context.view_layer.objects.active = arma
-        arma.select_set(True)
-        bpy.ops.object.mode_set(mode='EDIT')
-        rotate_and_connect_bones(arma)
-        bpy.ops.object.mode_set(mode='OBJECT')
+        active_layer_collection = getattr(bpy.context.view_layer, "active_layer_collection", None)
+        active_coll = getattr(active_layer_collection, "collection", None) or save_collection
+        if active_coll is None:
+            raise RuntimeError(f"No active collection available after APX import for {filepath}")
+        arma = None
+        arma_objs = []
+        for ob in active_coll.all_objects:
+            if ob.type == "ARMATURE" and "Armature" in ob.name:
+                arma_objs.append(ob)
+        arma_objs.sort(key=lambda x: x.name, reverse=True)
+        if not arma_objs:
+            raise RuntimeError(f"No APX armature found after import for {filepath}")
+        arma = arma_objs[0]
+        filename = Path(filepath).stem
 
-    collision_proxy_objects = {
-        "spheres": None,
-        "connections": None,
-        "capsules": None,
-    }
+        do_fix_tail = get_do_fix_tail(bpy.context) #True
+        if do_fix_tail: #!
+            #ROTATE BONES
+            bpy.context.view_layer.objects.active = None
+            bpy.ops.object.select_all(action='DESELECT')
+            bpy.context.view_layer.objects.active = arma
+            arma.select_set(True)
+            bpy.ops.object.mode_set(mode='EDIT')
+            rotate_and_connect_bones(arma)
+            bpy.ops.object.mode_set(mode='OBJECT')
 
-    if DO_WEAR_CLOTH:
-        cloth_group = createEmpty(filename,"_grp")
-        collision_transform = createEmpty(filename, "Collision Spheres", cloth_group)
-        connections_transform = createEmpty(filename, "Collision Connections", cloth_group)
-        proxy_transform = createEmpty(filename, "Collision Proxies", cloth_group)
-        arma.parent = cloth_group
-        
-        arma.name = filename
-        arma.data.name = filename+"_ARM"
-        arma.select_set(True)
-        bpy.context.view_layer.objects.active = arma
-        
-        spheres_coll = bpy.data.collections.get("Collision Spheres")
-        connect_coll = bpy.data.collections.get("Collision Connections")
-        capsules_coll = bpy.data.collections.get("Collision Capsules")
+        collision_proxy_objects = {
+            "spheres": None,
+            "connections": None,
+            "capsules": None,
+        }
 
-        all_spheres_coll = list(spheres_coll.all_objects) if spheres_coll else []
-        all_connect_coll = list(connect_coll.all_objects) if connect_coll else []
-        all_capsules_coll = list(capsules_coll.all_objects) if capsules_coll else []
-        if spheres_coll:
-            _link_objects_to_collection(active_coll, all_spheres_coll)
-            _unlink_objects_from_collection(spheres_coll, all_spheres_coll)
-            _remove_collection_if_exists(spheres_coll)
-        if connect_coll:
-            _link_objects_to_collection(active_coll, all_connect_coll)
-            _unlink_objects_from_collection(connect_coll, all_connect_coll)
-            _remove_collection_if_exists(connect_coll)
-        if capsules_coll:
-            _link_objects_to_collection(active_coll, all_capsules_coll)
-            _unlink_objects_from_collection(capsules_coll, all_capsules_coll)
-            _remove_collection_if_exists(capsules_coll)
-
-        _fix_connection_objects_transform_space(all_connect_coll)
-        _parent_and_namespace_collision_objects(filename, collision_transform, all_spheres_coll, keep_transform=False)
-        _parent_and_namespace_collision_objects(filename, connections_transform, all_connect_coll, keep_transform=False)
-        if all_capsules_coll:
-            capsules_transform = createEmpty(filename, "Collision Capsules", cloth_group)
-            _parent_and_namespace_collision_objects(filename, capsules_transform, all_capsules_coll, keep_transform=False)
-
-        collision_proxy_objects["spheres"] = _create_collision_proxy_object(
-            _namespaced_name(filename, "Collision Spheres Proxy"),
-            proxy_transform,
-            active_coll,
-            all_spheres_coll,
-        )
-        collision_proxy_objects["connections"] = _create_collision_proxy_object(
-            _namespaced_name(filename, "Collision Connections Proxy"),
-            proxy_transform,
-            active_coll,
-            all_connect_coll,
-        )
-        collision_proxy_objects["capsules"] = _create_collision_proxy_object(
-            _namespaced_name(filename, "Collision Capsules Proxy"),
-            proxy_transform,
-            active_coll,
-            all_capsules_coll,
-        )
-
-
-    bpy.context.view_layer.objects.active = None
-    bpy.ops.object.select_all(action='DESELECT')
-    GMesh_objs = []
-    for ob in active_coll.all_objects:
-        if ob.type == "MESH" and ob.name.startswith("GMesh_lod"):
-            GMesh_objs.append(ob)
-    GMesh_objs.sort(key=lambda x: x.name, reverse=False)
-    if not GMesh_objs:
-        log.warning("Redcloth import: no GMesh_lod mesh found after APX import for %s", filepath)
-        bpy.context.view_layer.objects.active = None
-        bpy.ops.object.select_all(action='DESELECT')
-        bpy.context.view_layer.objects.active = save_active
-        for ob in save_selected:
-            try:
-                ob.select_set(True)
-            except Exception:
-                pass
-        try:
-            bpy.context.view_layer.active_layer_collection = save_collection
-        except Exception:
-            pass
         if DO_WEAR_CLOTH:
-            return cloth_group if 'cloth_group' in locals() else arma
-        return arma
-    gmesh = GMesh_objs[0]
-    if DO_WEAR_CLOTH:
-        gmesh.name = filename+":"+gmesh.name
-    mesh_name_payload = json.dumps([gmesh.name])
-    try:
-        arma["witcher_redcloth_mesh_name"] = gmesh.name
-        arma["witcher_redcloth_mesh_names"] = mesh_name_payload
-        if DO_WEAR_CLOTH and 'cloth_group' in locals():
-            cloth_group["witcher_redcloth_mesh_name"] = gmesh.name
-            cloth_group["witcher_redcloth_mesh_names"] = mesh_name_payload
-    except Exception:
-        pass
-    
-    for o in reversed(GMesh_objs):
-        if "lod1" in o.name or \
-            "lod2" in o.name or \
-            "lod3" in o.name or \
-            "lod4" in o.name:
-            bpy.data.objects.remove(o)
+            cloth_group = createEmpty(filename,"_grp")
+            collision_transform = createEmpty(filename, "Collision Spheres", cloth_group)
+            connections_transform = createEmpty(filename, "Collision Connections", cloth_group)
+            proxy_transform = createEmpty(filename, "Collision Proxies", cloth_group)
+            arma.parent = cloth_group
 
-    gmesh.select_set(True)
-    bpy.context.view_layer.objects.active = gmesh
+            arma.name = filename
+            arma.data.name = filename+"_ARM"
+            arma.select_set(True)
+            bpy.context.view_layer.objects.active = arma
 
-    redcloth_material = CR2W.CR2W_reader.load_material(mat_filename)
+            spheres_coll = bpy.data.collections.get("Collision Spheres")
+            connect_coll = bpy.data.collections.get("Collision Connections")
+            capsules_coll = bpy.data.collections.get("Collision Capsules")
 
-    for chunk in redcloth_material:
-        if chunk.name == "CApexClothResource":
-            log.info(chunk.name)
-            materials = [redcloth_material[o.Reference] for o in chunk.GetVariableByName('materials').Handles] 
-            material_names = [os.path.splitext(os.path.basename(filepath))[0]+o.String.split('::')[1] for o in chunk.GetVariableByName('apexMaterialNames').elements]
+            all_spheres_coll = list(spheres_coll.all_objects) if spheres_coll else []
+            all_connect_coll = list(connect_coll.all_objects) if connect_coll else []
+            all_capsules_coll = list(capsules_coll.all_objects) if capsules_coll else []
+            if spheres_coll:
+                _link_objects_to_collection(active_coll, all_spheres_coll)
+                _unlink_objects_from_collection(spheres_coll, all_spheres_coll)
+                _remove_collection_if_exists(spheres_coll)
+            if connect_coll:
+                _link_objects_to_collection(active_coll, all_connect_coll)
+                _unlink_objects_from_collection(connect_coll, all_connect_coll)
+                _remove_collection_if_exists(connect_coll)
+            if capsules_coll:
+                _link_objects_to_collection(active_coll, all_capsules_coll)
+                _unlink_objects_from_collection(capsules_coll, all_capsules_coll)
+                _remove_collection_if_exists(capsules_coll)
 
-    target_mat = False
-    for idx, mat in enumerate(materials):
-        xml_mat_name = material_names[idx]
-        target_mat = _find_matching_material_on_object(gmesh, xml_mat_name)
-        if target_mat:
-            break
+            _fix_connection_objects_transform_space(all_connect_coll)
+            _parent_and_namespace_collision_objects(filename, collision_transform, all_spheres_coll, keep_transform=False)
+            _parent_and_namespace_collision_objects(filename, connections_transform, all_connect_coll, keep_transform=False)
+            if all_capsules_coll:
+                capsules_transform = createEmpty(filename, "Collision Capsules", cloth_group)
+                _parent_and_namespace_collision_objects(filename, capsules_transform, all_capsules_coll, keep_transform=False)
 
-    if not target_mat:
-        for idx, m in enumerate(gmesh.data.materials):
-            m.name = material_names[idx]
-
-    if redcloth_material:
-        load_w3_materials_CR2W(gmesh, uncook_path, materials, material_names, mat_filename=mat_filename)
-
-    _apply_redcloth_runtime_defaults(gmesh, context)
-    
-    if DO_WEAR_CLOTH:
-        patched_collision_mode = _patch_clothsim_nodegroup_to_object_proxies(
-            gmesh,
-            collision_proxy_objects,
-        )
-        if not patched_collision_mode:
-            log.warning(
-                "Redcloth import: could not patch ClothSimulation to object proxies for %s. "
-                "Collision may remain static or disabled without APX collections.",
-                gmesh.name,
+            collision_proxy_objects["spheres"] = _create_collision_proxy_object(
+                _namespaced_name(filename, "Collision Spheres Proxy"),
+                proxy_transform,
+                active_coll,
+                all_spheres_coll,
+            )
+            collision_proxy_objects["connections"] = _create_collision_proxy_object(
+                _namespaced_name(filename, "Collision Connections Proxy"),
+                proxy_transform,
+                active_coll,
+                all_connect_coll,
+            )
+            collision_proxy_objects["capsules"] = _create_collision_proxy_object(
+                _namespaced_name(filename, "Collision Capsules Proxy"),
+                proxy_transform,
+                active_coll,
+                all_capsules_coll,
             )
 
-        if 'MaximumDistance' in gmesh.data.color_attributes:
-            vcol = gmesh.data.color_attributes['MaximumDistance']
-            vgroup_id = 'SimplyPin'
-            vgroup = gmesh.vertex_groups.new(name=vgroup_id)
-            gmesh.vertex_groups.active_index = vgroup.index
-
-            color_to_weights(gmesh, vcol, 0, vgroup.index)
-
-        try:
-            _merge_mesh_by_distance_data(gmesh, merge_threshold=0.0001)
-        except Exception as e:
-            log.warning("Redcloth import: merge-by-distance failed for %s: %s", gmesh.name, e)
 
         bpy.context.view_layer.objects.active = None
         bpy.ops.object.select_all(action='DESELECT')
-        bpy.context.view_layer.objects.active = save_active
-        for ob in save_selected:
-            ob.select_set(True)
+        GMesh_objs = []
+        for ob in active_coll.all_objects:
+            if ob.type == "MESH" and ob.name.startswith("GMesh_lod"):
+                GMesh_objs.append(ob)
+        GMesh_objs.sort(key=lambda x: x.name, reverse=False)
+        if not GMesh_objs:
+            raise RuntimeError(f"No GMesh_lod mesh found after APX import for {filepath}")
+        gmesh = GMesh_objs[0]
+        if DO_WEAR_CLOTH:
+            gmesh.name = filename+":"+gmesh.name
+        mesh_name_payload = json.dumps([gmesh.name])
+        try:
+            arma["witcher_redcloth_mesh_name"] = gmesh.name
+            arma["witcher_redcloth_mesh_names"] = mesh_name_payload
+            if DO_WEAR_CLOTH and 'cloth_group' in locals():
+                cloth_group["witcher_redcloth_mesh_name"] = gmesh.name
+                cloth_group["witcher_redcloth_mesh_names"] = mesh_name_payload
+        except Exception:
+            pass
 
+        for o in reversed(GMesh_objs):
+            if "lod1" in o.name or \
+                "lod2" in o.name or \
+                "lod3" in o.name or \
+                "lod4" in o.name:
+                bpy.data.objects.remove(o)
 
-        # Delete the coth too collection
-        move_objects_between_collections(active_coll.name, save_collection.name)
-        bpy.context.view_layer.active_layer_collection = save_collection
-        
-    if DO_WEAR_CLOTH:
-        return cloth_group
-    else:
-        return arma
+        gmesh.select_set(True)
+        bpy.context.view_layer.objects.active = gmesh
+
+        redcloth_material = CR2W.CR2W_reader.load_material(mat_filename)
+        materials = []
+        material_names = []
+        if redcloth_material:
+            for chunk in redcloth_material:
+                if chunk.name == "CApexClothResource":
+                    log.info(chunk.name)
+                    materials = [redcloth_material[o.Reference] for o in chunk.GetVariableByName('materials').Handles]
+                    material_names = [
+                        os.path.splitext(os.path.basename(filepath))[0] + o.String.split('::')[1]
+                        for o in chunk.GetVariableByName('apexMaterialNames').elements
+                    ]
+                    break
+
+        target_mat = False
+        for idx, mat in enumerate(materials):
+            if idx >= len(material_names):
+                break
+            xml_mat_name = material_names[idx]
+            target_mat = _find_matching_material_on_object(gmesh, xml_mat_name)
+            if target_mat:
+                break
+
+        if not target_mat and material_names:
+            for idx, m in enumerate(gmesh.data.materials):
+                if idx >= len(material_names):
+                    break
+                m.name = material_names[idx]
+
+        if redcloth_material and materials and material_names:
+            load_w3_materials_CR2W(gmesh, uncook_path, materials, material_names, mat_filename=mat_filename)
+
+        _apply_redcloth_runtime_defaults(gmesh, context)
+
+        if DO_WEAR_CLOTH:
+            patched_collision_mode = _patch_clothsim_nodegroup_to_object_proxies(
+                gmesh,
+                collision_proxy_objects,
+            )
+            if not patched_collision_mode:
+                log.warning(
+                    "Redcloth import: could not patch ClothSimulation to object proxies for %s. "
+                    "Collision may remain static or disabled without APX collections.",
+                    gmesh.name,
+                )
+
+            if 'MaximumDistance' in gmesh.data.color_attributes:
+                vcol = gmesh.data.color_attributes['MaximumDistance']
+                vgroup_id = 'SimplyPin'
+                vgroup = gmesh.vertex_groups.new(name=vgroup_id)
+                gmesh.vertex_groups.active_index = vgroup.index
+
+                color_to_weights(gmesh, vcol, 0, vgroup.index)
+
+            try:
+                _merge_mesh_by_distance_data(gmesh, merge_threshold=0.0001)
+            except Exception as e:
+                log.warning("Redcloth import: merge-by-distance failed for %s: %s", gmesh.name, e)
+
+            # Move imported APX objects back into the collection the user started from.
+            move_objects_between_collections(active_coll, save_collection)
+
+        _restore_import_context()
+
+        if DO_WEAR_CLOTH:
+            return cloth_group
+        else:
+            return arma
+    except Exception as e:
+        log.critical("Cloth import failed for %s: %s", os.path.basename(filepath), e)
+        try:
+            _cleanup_failed_cloth_import(import_snapshot)
+        except Exception as cleanup_exc:
+            log.debug("Failed cleaning up partial cloth import for %s: %s", filepath, cleanup_exc)
+        _restore_import_context()
+        return None

@@ -1215,7 +1215,7 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
 def import_from_list_item(context, item, ANIMSET, target_obj=None):
     for anim_set_entry in ANIMSET.animations:
         if anim_set_entry.animation.name == item.name:
-            if ':face:' in anim_set_entry.animation.name:
+            if ':face' in str(anim_set_entry.animation.name or "").lower():
                 import_anim(
                     context,
                     "lipsync_from_list",
