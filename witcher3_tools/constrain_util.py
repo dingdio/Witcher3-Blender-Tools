@@ -6,6 +6,16 @@ from . import file_helpers
 
 log = logging.getLogger(__name__)
 
+
+_MESH_COMPONENT_ARMATURE_TYPES = {
+    "CMeshComponent",
+    "CStaticMeshComponent",
+    "CFurComponent",
+    "CRigidMeshComponent",
+    "CRagdollMeshComponent",
+}
+
+
 def _normalized_bone_name(name):
     return file_helpers.rm_ns(name or "")
 
@@ -26,6 +36,43 @@ def _build_pose_bone_map(armature_obj):
     for pose_bone in armature_obj.pose.bones:
         bone_map[_normalized_bone_name(pose_bone.name)] = pose_bone
     return bone_map
+
+
+def _is_mimic_component_armature(obj):
+    if not obj or obj.type != 'ARMATURE':
+        return False
+    component_type = str(obj.get("witcher_type", "") or "").strip()
+    if component_type == "CMimicComponent":
+        return True
+    object_name = str(getattr(obj, "name", "") or "")
+    if "cmimiccomponent" in object_name.lower():
+        return True
+    mimic_name = str(obj.get("mimicFace", "") or "").strip()
+    mimic_face_file = str(obj.get("mimicFaceFile", "") or "").strip()
+    if mimic_face_file and mimic_name and mimic_name == object_name:
+        return True
+    return False
+
+
+def _is_mesh_component_armature(obj):
+    if not obj or obj.type != 'ARMATURE':
+        return False
+    component_type = str(obj.get("witcher_type", "") or "").strip()
+    if component_type in _MESH_COMPONENT_ARMATURE_TYPES:
+        return True
+    object_path = _normalized_object_path(obj)
+    if object_path.endswith((".w2mesh", ".w3mesh", ".fbx")):
+        return True
+    return False
+
+
+def _should_preserve_mimic_mesh_offset(arm_parent, arm_child):
+    # We need this for face morph baking because some characters won't auto-align properly due to the orignal data being wrong. This will cause the bones in the face to look missaligned but allow the morphs to be created properly.
+    if not _is_mimic_component_armature(arm_parent):
+        return False
+    if not _is_mesh_component_armature(arm_child):
+        return False
+    return True
 
 
 def _should_copy_root_for_child_armature(arm_child):
@@ -62,6 +109,8 @@ def should_auto_align_armatures(arm_parent, arm_child):
     if not arm_parent or not arm_child:
         return False
     if arm_parent.type != 'ARMATURE' or arm_child.type != 'ARMATURE':
+        return False
+    if _should_preserve_mimic_mesh_offset(arm_parent, arm_child):
         return False
 
     matches = get_matching_pose_bone_pairs(arm_parent, arm_child)

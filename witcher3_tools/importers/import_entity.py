@@ -2865,8 +2865,8 @@ def process_regular_attachment(constraint, objdict, meshdict):
     target_transform.name = "CHardAttachment"
 
     target_name = f"{child_name}_lod0"
-    if parent_arm_name in objdict and target_name in meshdict:
-        target_mesh_obj = meshdict[target_name]
+    target_mesh_obj = meshdict.get(target_name) or meshdict.get(child_name)
+    if parent_arm_name in objdict and target_mesh_obj is not None:
         target_mesh_obj.parent = target_transform
 
         parent_arm = objdict[parent_arm_name]
