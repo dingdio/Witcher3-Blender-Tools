@@ -389,7 +389,7 @@ def set_blender_pose_bone_transform(obj, EngineTransform, rotate_180 = False):
         obj.scale[1] = _transform_real(EngineTransform, "Scale_y", 1.0)
         obj.scale[2] = _transform_real(EngineTransform, "Scale_z", 1.0)
 
-def set_blender_object_transform(obj, EngineTransform, rotate_180 = False, from_this_object= False, pose_bone = None, no_rotation=False):
+def set_blender_object_transform(obj, EngineTransform, rotate_180 = False, from_this_object= False, pose_bone = None):
     """Sets blender object to RED Engine Transform
 
     Args:
@@ -412,8 +412,6 @@ def set_blender_object_transform(obj, EngineTransform, rotate_180 = False, from_
     yaw = _transform_real(EngineTransform, "Yaw", 0.0)
     pitch = _transform_real(EngineTransform, "Pitch", 0.0)
     roll = _transform_real(EngineTransform, "Roll", 0.0)
-    if no_rotation:
-        yaw = pitch = roll = 0.0
     loc_x = _transform_real(EngineTransform, "X", 0.0)
     loc_y = _transform_real(EngineTransform, "Y", 0.0)
     loc_z = _transform_real(EngineTransform, "Z", 0.0)

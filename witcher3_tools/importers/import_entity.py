@@ -605,9 +605,8 @@ def _apply_chunk_transform_to_import_roots(chunk, *, armatures=None, meshes=None
     if not target_objects:
         return
 
-    no_rotation = not bool(armatures)
     for obj in _get_import_root_objects(target_objects):
-        set_blender_object_transform(obj, rt, rotate_180=False, no_rotation=no_rotation)
+        set_blender_object_transform(obj, rt, rotate_180=False)
 
 
 def import_direct_entity_file(filename, load_face_poses=False, import_apperance=0, parent_transform=None):
