@@ -231,6 +231,7 @@ def read_uncooked_anim_buffer(embedded_data, CAnimationBufferBitwiseCompressed, 
     log.info(f"Uncooked animation: version={version}, dt={dt:.6f}, duration={duration}, frames={buffer_numFrames}, data size={len(embedded_data)} bytes")
 
     bones = []
+    tracks = []
     bones_prop = CAnimationBufferBitwiseCompressed.GetVariableByName('bones')
     if bones_prop is None or not hasattr(bones_prop, 'More'):
         log.warning("No bone metadata found in animation buffer")
@@ -517,12 +518,81 @@ def read_uncooked_anim_buffer(embedded_data, CAnimationBufferBitwiseCompressed, 
 
         bones.append(this_bone)
 
-    log.info(f"Uncooked animation parsed: {len(bones)} bones, final offset {curr_off}/{len(embedded_data)}")
-    buffer = w3_types.CAnimationBufferBitwiseCompressed(bones, [], duration=duration, numFrames=buffer_numFrames, dt=dt)
+    tracks_prop = CAnimationBufferBitwiseCompressed.GetVariableByName('tracks')
+    if tracks_prop is not None and hasattr(tracks_prop, 'More'):
+        for (idx, track_meta) in enumerate(tracks_prop.More):
+            chunk_track_nf = track_meta.GetVariableByName('numFrames').Value if track_meta.GetVariableByName('numFrames') else 1
+            track_nf = buffer_numFrames if chunk_track_nf > 1 else 1
+            temp_track_frames, curr_off, actual_track_nf, track_ok = read_track_values(
+                embedded_data,
+                curr_off,
+                track_nf,
+                1,
+                f"Track {idx}",
+                default_values=[0.0],
+            )
+            this_track = Track(
+                idx,
+                trackName=_safe_track_name(Skeleton_file, idx),
+                numFrames=len(temp_track_frames),
+                dt=dt,
+                trackFrames=[frame[0] for frame in temp_track_frames],
+            )
+            tracks.append(this_track)
+            if idx < 5 or not track_ok:
+                status = "OK" if track_ok else "ISSUES"
+                log.info(f"Track {idx}: values={actual_track_nf}/{track_nf} [{status}]")
+
+    log.info(f"Uncooked animation parsed: {len(bones)} bones, {len(tracks)} tracks, final offset {curr_off}/{len(embedded_data)}")
+    buffer = w3_types.CAnimationBufferBitwiseCompressed(bones, tracks, duration=duration, numFrames=buffer_numFrames, dt=dt)
     # Metadata: uncooked files use embedded uncompressed animation data
     buffer._source = "uncompressed"
     buffer._source_detail = "embeddedAnimData"
     return buffer
+
+
+def _read_anim_tracks(chunk, data_stream, Skeleton_file, use_fallback=False):
+    tracks = []
+    if data_stream is None:
+        return tracks
+
+    tracks_prop = chunk.GetVariableByName('tracks')
+    if tracks_prop is None or not hasattr(tracks_prop, 'More'):
+        return tracks
+
+    for (idx, track) in enumerate(tracks_prop.More):
+        this_track = Track(
+            idx,
+            trackName=_safe_track_name(Skeleton_file, idx),
+            numFrames="",
+            dt="",
+            trackFrames=[],
+        )
+        trackData = track
+        this_track.dt = trackData.GetVariableByName('dt').Value
+        this_track.numFrames = trackData.GetVariableByName('numFrames').Value
+        compression = trackData.GetVariableByName('compression')
+        if compression is not None:
+            compression = compression.Value
+        else:
+            compression = 0
+        dataAddr = trackData.GetVariableByName('dataAddr')
+        dataAddrFallback = trackData.GetVariableByName('dataAddrFallback')
+        if dataAddr is not None:
+            dataAddr = dataAddr.Value
+        else:
+            dataAddr = 0
+        if dataAddrFallback is not None:
+            dataAddrFallback = dataAddrFallback.Value
+        else:
+            dataAddrFallback = 0
+        actual_addr = dataAddrFallback if use_fallback else dataAddr
+        data_stream.seek(actual_addr)
+        for _ in range(0, this_track.numFrames):
+            this_track.trackFrames.append(ReadCompressFloat(data_stream, compression).val)
+        tracks.append(this_track)
+
+    return tracks
 
 def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton_file, embedded_data=None) -> w3_types.CAnimationBufferBitwiseCompressed:
     # Check if animation buffer chunk has no properties at all (edge case)
@@ -540,6 +610,9 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
     else:
         buffer_duration = duration
     buffer_numFrames = chunk.GetVariableByName('numFrames').Value
+    has_valid_embedded_anim_data = _has_valid_embedded_anim_data(embedded_data)
+    file_name = str(getattr(file, 'fileName', '') or '')
+    prefer_embedded_anim_data = has_valid_embedded_anim_data and file_name.lower().endswith('.w2cutscene')
     
     #some addatives don't have this?
     buffer_dt = chunk.GetVariableByName('dt').Value if chunk.GetVariableByName('dt') else None
@@ -612,7 +685,6 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
             embedded_buffer = file.BufferData[buffer_index]
         has_embedded_buffer = embedded_buffer is not None
         has_raw_embedded_buffer = _is_raw_embedded_buffer(embedded_buffer)
-        has_valid_embedded_anim_data = _has_valid_embedded_anim_data(embedded_data)
 
         def _raise_missing_buffer(reason: str):
             raise FileNotFoundError(f"Missing required animation buffer {def_path}; {reason}")
@@ -769,6 +841,14 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
     f = the_fallback_data if use_fallback else the_data
     bones_prop = chunk.GetVariableByName('bones')
 
+    if prefer_embedded_anim_data:
+        log.info(f"Using embedded uncompressed animation data for cutscene ({len(embedded_data)} bytes)")
+        buffer = read_uncooked_anim_buffer(embedded_data, chunk, duration, Skeleton_file)
+        if not getattr(buffer, 'tracks', None):
+            buffer.tracks = _read_anim_tracks(chunk, f, Skeleton_file, use_fallback=use_fallback)
+        buffer._source_detail = "embeddedAnimData:preferred_cutscene"
+        return buffer
+
     # Check if bones exist (they won't in uncooked files)
     if bones_prop is None or not hasattr(bones_prop, 'More') or len(bones_prop.More) == 0:
         log.warning('No bone data found in animation buffer')
@@ -913,38 +993,7 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
             this_bone.scaleFrames.append(CVector3D(f, compression).getList())
         this_bone.rotationFramesQuat = this_bone.rotationFrames
         bones.append(this_bone)
-    tracks_prop = chunk.GetVariableByName('tracks')
-    if tracks_prop is not None and hasattr(tracks_prop, 'More'):
-        for (idx, track) in enumerate(tracks_prop.More):
-            this_track = Track(idx,
-                trackName = _safe_track_name(Skeleton_file, idx),
-                numFrames = "",
-                dt = "",
-                trackFrames = [])
-            trackData = track
-            this_track.dt = trackData.GetVariableByName('dt').Value
-            this_track.numFrames = trackData.GetVariableByName('numFrames').Value
-            compression = trackData.GetVariableByName('compression')
-            if compression is not None:
-                compression = compression.Value
-            else:
-                compression = 0
-            dataAddr = trackData.GetVariableByName('dataAddr')
-            dataAddrFallback = trackData.GetVariableByName('dataAddrFallback')
-            if dataAddr is not None:
-                dataAddr = dataAddr.Value
-            else:
-                dataAddr = 0
-            if dataAddrFallback is not None:
-                dataAddrFallback = dataAddrFallback.Value
-            else:
-                dataAddrFallback = 0
-            # Use fallback address when in fallback mode
-            actual_addr = dataAddrFallback if use_fallback else dataAddr
-            f.seek(actual_addr)
-            for _ in range(0, this_track.numFrames):
-                this_track.trackFrames.append(ReadCompressFloat(f, compression).val)
-            tracks.append(this_track)
+    tracks = _read_anim_tracks(chunk, f, Skeleton_file, use_fallback=use_fallback)
     buffer = w3_types.CAnimationBufferBitwiseCompressed(bones, tracks, duration=buffer_duration, numFrames=buffer_numFrames, dt=buffer_dt)
     buffer._source = source_kind
     buffer._source_detail = source_detail

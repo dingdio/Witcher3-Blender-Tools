@@ -264,7 +264,9 @@ class DATA:
                             chunk_uncompressed.ChunkIndex = current_chunk
                             self.CHUNKS.append(chunk_uncompressed)
                             current_chunk += 1
-                        self.CHUNKS[0].PROPS[0].value = [2]
+                        animations_prop = self.CHUNKS[0].GetVariableByName('animations')
+                        if animations_prop is not None:
+                            animations_prop.value = [2]
 
                         if chunk_buffer.Type == "CAnimationBufferMultipart":
                             parts = chunk_buffer.GetVariableByName('parts')
