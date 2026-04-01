@@ -1,6 +1,7 @@
 import logging
 import bpy
 from typing import Tuple
+from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
 from bpy.props import StringProperty, BoolProperty
@@ -9,11 +10,9 @@ from mathutils import Vector
 from ..CR2W.common_blender import repo_file, mod_loading_context
 from ..ui.ui_utils import WITCH_PT_Base
 from ..ui.armature_context import get_main_armature_and_rig_settings, set_main_armature
-from ..CR2W.CR2W_types import dotdict
-from ..CR2W.w3_types import CSkeletalAnimationSetEntry
-from ..CR2W.dc_anims import load_lipsync_file
 from ..importers import import_anims
 from ..importers import import_rig
+from ..CR2W.w3_types import CSkeletalAnimationSetEntry
 from bpy.types import PropertyGroup
 from bpy.props import IntProperty, StringProperty, CollectionProperty, BoolProperty, EnumProperty
 
@@ -514,10 +513,6 @@ class witcherui_RigSettings(bpy.types.PropertyGroup):
     witcher_face_morphs: bpy.props.BoolProperty(default = True,
                         name = "Morphs from mimic poses",
                         description = "Search for witcher Body morphs")
-    keep_face_morph_pose_actions: bpy.props.BoolProperty(
-                        default = False,
-                        name = "Keep Imported Pose Actions",
-                        description = "Keep the temporary pose actions generated while baking face morphs")
     witcher_morphs_collapse: bpy.props.BoolProperty(default = True)
     witcher_morphs_collapse2: bpy.props.BoolProperty(default = True)
     phoneme_enabled: bpy.props.BoolProperty(default = True,
@@ -643,8 +638,6 @@ class WITCH_PT_WitcherMorphs(WITCH_PT_Base, bpy.types.Panel):
         if main_arm_obj and rig_settings:
             layout = self.layout
 
-            layout.prop(rig_settings, "keep_face_morph_pose_actions", text="Keep Imported Pose Actions")
-
             row = layout.row()
             row.prop(rig_settings, "morph_search_filter", icon = "VIEWZOOM")
 
@@ -721,28 +714,7 @@ class WITCH_PT_WitcherMorphs(WITCH_PT_Base, bpy.types.Panel):
                             box.prop(the_data, '[\"' + morph.path + '\"]', text = morph.name)
                         else:
                             pass
-#import bpy
-
-import io
-from contextlib import redirect_stdout, redirect_stderr
-import os
-import sys
-
-
-def create_morph_and_driver(self, obj, mesh_bl_o, this_POSE_name, control_bone_name='w3_face_poses'):
-    bpy.context.view_layer.objects.active = mesh_bl_o
-
-    shape_keys = mesh_bl_o.data.shape_keys
-    if shape_keys and this_POSE_name in shape_keys.key_blocks:
-        new_morph = shape_keys.key_blocks[this_POSE_name]
-    else:
-        apply_ret = bpy.ops.object.modifier_apply_as_shapekey(keep_modifier=True, modifier="Armature", report=False)
-        if 'FINISHED' not in apply_ret:
-            self.report({'ERROR'}, "Error applying modifier, Object: {0}, ShapeKey: {1}, apply modifier: {2}".format(mesh_bl_o.name, this_POSE_name, apply_ret))
-            return False
-        new_morph = mesh_bl_o.data.shape_keys.key_blocks[-1]
-        new_morph.name = this_POSE_name  # rename
-
+def _ensure_morph_driver(obj, new_morph, this_POSE_name, control_bone_name='w3_face_poses'):
     driver_curve = new_morph.driver_add("value")
     driver = driver_curve.driver
     channel = this_POSE_name
@@ -756,7 +728,318 @@ def create_morph_and_driver(self, obj, mesh_bl_o, this_POSE_name, control_bone_n
     target.id_type = "OBJECT"
     target.data_path = 'pose.bones["%s"]["%s"]' % (control_bone_name, channel)
     target.id = obj
+    return driver_curve
+
+
+def _resolve_blender_context(candidate=None):
+    if candidate is not None and hasattr(candidate, "evaluated_depsgraph_get"):
+        return candidate
+    return bpy.context
+
+
+def _ensure_basis_shape_key(mesh_bl_o):
+    shape_keys = getattr(mesh_bl_o.data, "shape_keys", None)
+    if shape_keys is not None and getattr(shape_keys, "key_blocks", None):
+        return shape_keys
+    try:
+        mesh_bl_o.shape_key_add(name="Basis", from_mix=False)
+    except TypeError:
+        mesh_bl_o.shape_key_add(name="Basis")
+    return mesh_bl_o.data.shape_keys
+
+
+def _remove_shape_key(mesh_bl_o, key_block) -> bool:
+    if mesh_bl_o is None or key_block is None:
+        return True
+    try:
+        mesh_bl_o.shape_key_remove(key_block)
+        return True
+    except Exception:
+        pass
+
+    if _activate_object(mesh_bl_o):
+        _safe_mode_set('OBJECT', mesh_bl_o)
+        try:
+            mesh_bl_o.shape_key_remove(key_block)
+            return True
+        except Exception as exc:
+            log.warning(
+                "Could not remove existing face morph '%s' on %s before rebuilding: %s",
+                getattr(key_block, "name", "<unknown>"),
+                mesh_bl_o.name,
+                exc,
+            )
+    return False
+
+
+def _extract_shape_key_name_from_data_path(data_path):
+    prefix = 'key_blocks["'
+    suffix = '"].value'
+    if not isinstance(data_path, str):
+        return None
+    if not data_path.startswith(prefix) or not data_path.endswith(suffix):
+        return None
+    return data_path[len(prefix):-len(suffix)]
+
+
+def _collect_face_reload_shape_key_names(faceData, morph_entries):
+    key_names = set()
+
+    for pose in getattr(faceData, "mimicPoses", []) or []:
+        pose_name = getattr(pose, "name", None)
+        if pose_name:
+            key_names.add(pose_name)
+
+    for entry in morph_entries or []:
+        if getattr(entry, "type", None) not in {4, 5}:
+            continue
+        entry_name = getattr(entry, "name", None)
+        entry_path = getattr(entry, "path", None)
+        if entry_name:
+            key_names.add(entry_name)
+        if entry_path:
+            key_names.add(entry_path)
+
+    key_names.discard("Basis")
+    return key_names
+
+
+def _remove_face_reload_shape_keys(mesh_objs, key_names):
+    removed_shape_keys = 0
+    removed_drivers = 0
+    key_names = {name for name in (key_names or set()) if name and name != "Basis"}
+    if not key_names:
+        return removed_shape_keys, removed_drivers
+
+    for mesh_obj in mesh_objs or []:
+        if mesh_obj is None or getattr(mesh_obj, "type", None) != 'MESH' or getattr(mesh_obj, "data", None) is None:
+            continue
+
+        shape_keys = getattr(mesh_obj.data, "shape_keys", None)
+        if shape_keys is None:
+            continue
+
+        animation_data = getattr(shape_keys, "animation_data", None)
+        drivers = getattr(animation_data, "drivers", None) if animation_data is not None else None
+        if drivers:
+            for driver_curve in list(drivers):
+                key_name = _extract_shape_key_name_from_data_path(getattr(driver_curve, "data_path", ""))
+                if key_name not in key_names:
+                    continue
+                try:
+                    animation_data.drivers.remove(driver_curve)
+                    removed_drivers += 1
+                except Exception:
+                    continue
+
+        for key_block in reversed(list(shape_keys.key_blocks)):
+            if getattr(key_block, "name", None) not in key_names:
+                continue
+            if _remove_shape_key(mesh_obj, key_block):
+                removed_shape_keys += 1
+
+    return removed_shape_keys, removed_drivers
+
+
+def _bake_morph_via_modifier_apply(obj, mesh_bl_o, this_POSE_name, control_bone_name='w3_face_poses', ensure_driver=True):
+    if not _activate_object(mesh_bl_o):
+        log.warning("Could not activate mesh '%s' for face morph baking.", mesh_bl_o.name)
+        return False
+    _safe_mode_set('OBJECT', mesh_bl_o)
+
+    apply_ret = bpy.ops.object.modifier_apply_as_shapekey(keep_modifier=True, modifier="Armature", report=False)
+    if 'FINISHED' not in apply_ret:
+        log.warning(
+            "Failed to bake face morph '%s' on %s via Armature modifier: %s",
+            this_POSE_name,
+            mesh_bl_o.name,
+            apply_ret,
+        )
+        return False
+
+    if mesh_bl_o.data.shape_keys is None or not mesh_bl_o.data.shape_keys.key_blocks:
+        log.warning(
+            "Face morph bake for '%s' on %s did not produce a shape key.",
+            this_POSE_name,
+            mesh_bl_o.name,
+        )
+        return False
+
+    new_morph = mesh_bl_o.data.shape_keys.key_blocks[-1]
+    new_morph.name = this_POSE_name
+    new_morph.value = 0.0
+    if ensure_driver:
+        _ensure_morph_driver(obj, new_morph, this_POSE_name, control_bone_name=control_bone_name)
     return True
+
+
+def _capture_evaluated_mesh_vertices(context, mesh_bl_o):
+    depsgraph = context.evaluated_depsgraph_get()
+    eval_obj = mesh_bl_o.evaluated_get(depsgraph)
+
+    eval_mesh = getattr(eval_obj, "data", None)
+    if eval_mesh is not None and hasattr(eval_mesh, "vertices"):
+        return eval_mesh, None, None
+
+    temp_mesh = None
+    try:
+        temp_mesh = eval_obj.to_mesh()
+        return temp_mesh, eval_obj, "TO_MESH_CLEAR"
+    except Exception:
+        try:
+            temp_mesh = bpy.data.meshes.new_from_object(
+                eval_obj,
+                preserve_all_data_layers=False,
+                depsgraph=depsgraph,
+            )
+        except TypeError:
+            temp_mesh = bpy.data.meshes.new_from_object(eval_obj)
+        return temp_mesh, temp_mesh, "REMOVE"
+
+
+def _release_evaluated_mesh_snapshot(cleanup_owner, cleanup_mode):
+    if cleanup_mode == "TO_MESH_CLEAR" and cleanup_owner is not None:
+        try:
+            cleanup_owner.to_mesh_clear()
+        except Exception:
+            pass
+    elif cleanup_mode == "REMOVE" and cleanup_owner is not None:
+        try:
+            bpy.data.meshes.remove(cleanup_owner)
+        except Exception:
+            pass
+
+
+def _capture_evaluated_mesh_coords(context, mesh_bl_o):
+    capture_mesh = None
+    cleanup_owner = None
+    cleanup_mode = None
+    try:
+        capture_mesh, cleanup_owner, cleanup_mode = _capture_evaluated_mesh_vertices(context, mesh_bl_o)
+        if capture_mesh is None:
+            raise RuntimeError("evaluated mesh snapshot was not created")
+        coords = [0.0] * (len(capture_mesh.vertices) * 3)
+        capture_mesh.vertices.foreach_get("co", coords)
+        return coords
+    finally:
+        _release_evaluated_mesh_snapshot(cleanup_owner, cleanup_mode)
+
+
+def _ensure_morph_shape_key(mesh_bl_o, this_POSE_name):
+    shape_keys = _ensure_basis_shape_key(mesh_bl_o)
+    new_morph = shape_keys.key_blocks.get(this_POSE_name) if shape_keys else None
+    if new_morph is None:
+        try:
+            new_morph = mesh_bl_o.shape_key_add(name=this_POSE_name, from_mix=False)
+        except TypeError:
+            new_morph = mesh_bl_o.shape_key_add(name=this_POSE_name)
+    return new_morph
+
+
+def _write_morph_shape_key_coords(obj, mesh_bl_o, this_POSE_name, coords, control_bone_name='w3_face_poses', ensure_driver=True):
+    if mesh_bl_o is None or getattr(mesh_bl_o, "type", None) != 'MESH' or getattr(mesh_bl_o, "data", None) is None:
+        return False
+    new_morph = _ensure_morph_shape_key(mesh_bl_o, this_POSE_name)
+    expected_coord_count = len(new_morph.data) * 3
+    if len(coords or []) != expected_coord_count:
+        log.warning(
+            "Could not write face morph '%s' on %s due to coord-count mismatch (%d != %d).",
+            this_POSE_name,
+            mesh_bl_o.name,
+            len(coords or []),
+            expected_coord_count,
+        )
+        return False
+    new_morph.data.foreach_set("co", coords)
+    new_morph.value = 0.0
+    if ensure_driver:
+        _ensure_morph_driver(obj, new_morph, this_POSE_name, control_bone_name=control_bone_name)
+    return True
+
+
+def create_morph_and_driver(self, obj, mesh_bl_o, this_POSE_name, control_bone_name='w3_face_poses', ensure_driver=True):
+    if mesh_bl_o is None or mesh_bl_o.type != 'MESH' or getattr(mesh_bl_o, "data", None) is None:
+        return False
+
+    context = _resolve_blender_context(self)
+    shape_keys = _ensure_basis_shape_key(mesh_bl_o)
+    new_morph = shape_keys.key_blocks.get(this_POSE_name) if shape_keys else None
+    reused_existing_morph = new_morph is not None
+    if new_morph is None:
+        try:
+            new_morph = mesh_bl_o.shape_key_add(name=this_POSE_name, from_mix=False)
+        except TypeError:
+            new_morph = mesh_bl_o.shape_key_add(name=this_POSE_name)
+
+    capture_mesh = None
+    cleanup_owner = None
+    cleanup_mode = None
+    try:
+        capture_mesh, cleanup_owner, cleanup_mode = _capture_evaluated_mesh_vertices(context, mesh_bl_o)
+        if capture_mesh is None:
+            raise RuntimeError("evaluated mesh snapshot was not created")
+
+        if len(capture_mesh.vertices) != len(new_morph.data):
+            log.info(
+                "Falling back to Armature modifier bake for '%s' on %s due to vertex-count mismatch (%d != %d).",
+                this_POSE_name,
+                mesh_bl_o.name,
+                len(capture_mesh.vertices),
+                len(new_morph.data),
+            )
+            if reused_existing_morph:
+                _remove_shape_key(mesh_bl_o, new_morph)
+            return _bake_morph_via_modifier_apply(
+                obj,
+                mesh_bl_o,
+                this_POSE_name,
+                control_bone_name=control_bone_name,
+                ensure_driver=ensure_driver,
+            )
+
+        coords = [0.0] * (len(capture_mesh.vertices) * 3)
+        capture_mesh.vertices.foreach_get("co", coords)
+        return _write_morph_shape_key_coords(
+            obj,
+            mesh_bl_o,
+            this_POSE_name,
+            coords,
+            control_bone_name=control_bone_name,
+            ensure_driver=ensure_driver,
+        )
+    except Exception as exc:
+        log.warning(
+            "Direct evaluated bake failed for '%s' on %s. Falling back to Armature modifier apply: %s",
+            this_POSE_name,
+            mesh_bl_o.name,
+            exc,
+        )
+        if reused_existing_morph:
+            _remove_shape_key(mesh_bl_o, new_morph)
+        return _bake_morph_via_modifier_apply(
+            obj,
+            mesh_bl_o,
+            this_POSE_name,
+            control_bone_name=control_bone_name,
+            ensure_driver=ensure_driver,
+        )
+    finally:
+        _release_evaluated_mesh_snapshot(cleanup_owner, cleanup_mode)
+
+
+def ensure_morph_driver(obj, mesh_bl_o, this_POSE_name, control_bone_name='w3_face_poses'):
+    if obj is None or mesh_bl_o is None or getattr(mesh_bl_o, "type", None) != 'MESH' or getattr(mesh_bl_o, "data", None) is None:
+        return False
+    shape_keys = getattr(mesh_bl_o.data, "shape_keys", None)
+    key_blocks = getattr(shape_keys, "key_blocks", None) if shape_keys is not None else None
+    if not key_blocks:
+        return False
+    morph_key = key_blocks.get(this_POSE_name)
+    if morph_key is None:
+        return False
+    _ensure_morph_driver(obj, morph_key, this_POSE_name, control_bone_name=control_bone_name)
+    return True
+
 
 def witcherui_add_redmorph(collection, item, value = 0.0, existing_keys=None):
     key = (item[0], item[1], item[2])
@@ -907,6 +1190,582 @@ def _refresh_driver_expression(driver):
     driver.expression = expr
 
 
+def _collect_other_face_rigs(scene, current_face_rig):
+    """Return {obj: saved_pose_position} for every face rig in the scene except current_face_rig."""
+    other = {}
+    for obj in scene.objects:
+        if obj.type != 'ARMATURE' or obj is current_face_rig:
+            continue
+        face_rig_name = obj.get('mimicFace', None)
+        if not face_rig_name:
+            continue
+        face_rig_obj = scene.objects.get(face_rig_name)
+        if face_rig_obj and face_rig_obj.type == 'ARMATURE' and face_rig_obj is not current_face_rig:
+            if face_rig_obj not in other:
+                other[face_rig_obj] = face_rig_obj.data.pose_position
+                face_rig_obj.data.pose_position = "REST"
+    return other
+
+
+def _restore_other_face_rigs(other_face_rigs):
+    for obj, saved_pos in (other_face_rigs or {}).items():
+        try:
+            if obj and obj.name in bpy.data.objects:
+                obj.data.pose_position = saved_pos
+        except Exception:
+            pass
+
+
+def _snapshot_pose_bone_custom_props(pose_bone) -> dict:
+    prop_values = {}
+    if pose_bone is None:
+        return prop_values
+
+    for key in pose_bone.keys():
+        if key == "_RNA_UI":
+            continue
+        value = pose_bone.get(key)
+        if isinstance(value, (int, float)):
+            prop_values[key] = float(value)
+    return prop_values
+
+
+def _restore_pose_bone_custom_props(pose_bone, prop_values):
+    if pose_bone is None:
+        return
+    for key, value in (prop_values or {}).items():
+        pose_bone[key] = value
+
+
+def _zero_pose_bone_custom_props(pose_bone):
+    if pose_bone is None:
+        return
+    for key in list(pose_bone.keys()):
+        if key == "_RNA_UI":
+            continue
+        value = pose_bone.get(key)
+        if isinstance(value, (int, float)):
+            pose_bone[key] = 0.0
+
+
+def _snapshot_shape_key_values(mesh_objs) -> dict:
+    key_values = {}
+    for mesh_obj in mesh_objs or []:
+        if mesh_obj is None or mesh_obj.type != 'MESH' or getattr(mesh_obj, "data", None) is None:
+            continue
+        shape_keys = getattr(mesh_obj.data, "shape_keys", None)
+        if shape_keys is None:
+            continue
+        mesh_key_values = {}
+        for key_block in shape_keys.key_blocks:
+            try:
+                mesh_key_values[key_block.name] = float(key_block.value)
+                key_block.value = 0.0
+            except Exception:
+                continue
+        if mesh_key_values:
+            key_values[mesh_obj.name] = mesh_key_values
+    return key_values
+
+
+def _restore_shape_key_values(key_values):
+    for mesh_name, mesh_key_values in (key_values or {}).items():
+        mesh_obj = bpy.data.objects.get(mesh_name)
+        if mesh_obj is None or mesh_obj.type != 'MESH' or getattr(mesh_obj, "data", None) is None:
+            continue
+        shape_keys = getattr(mesh_obj.data, "shape_keys", None)
+        if shape_keys is None:
+            continue
+        for key_name, value in mesh_key_values.items():
+            key_block = shape_keys.key_blocks.get(key_name)
+            if key_block is None:
+                continue
+            try:
+                key_block.value = value
+            except Exception:
+                continue
+
+
+def _collect_unique_mesh_objects(*mesh_obj_groups):
+    unique_meshes = []
+    seen = set()
+    for mesh_objs in mesh_obj_groups:
+        for mesh_obj in mesh_objs or []:
+            if mesh_obj is None or getattr(mesh_obj, "type", None) != 'MESH' or getattr(mesh_obj, "data", None) is None:
+                continue
+            mesh_name = str(getattr(mesh_obj, "name", "") or "")
+            if not mesh_name or mesh_name in seen:
+                continue
+            seen.add(mesh_name)
+            unique_meshes.append(mesh_obj)
+    return unique_meshes
+
+
+def _collect_scene_meshes_with_shape_key_drivers(scene):
+    mesh_objs = []
+    if scene is None:
+        return mesh_objs
+
+    for obj in scene.objects:
+        if obj is None or getattr(obj, "type", None) != 'MESH' or getattr(obj, "data", None) is None:
+            continue
+        shape_keys = getattr(obj.data, "shape_keys", None)
+        animation_data = getattr(shape_keys, "animation_data", None) if shape_keys is not None else None
+        drivers = getattr(animation_data, "drivers", None) if animation_data is not None else None
+        if drivers:
+            mesh_objs.append(obj)
+    return mesh_objs
+
+
+def _snapshot_and_mute_shape_key_drivers(mesh_objs):
+    driver_state = []
+    for mesh_obj in mesh_objs or []:
+        if mesh_obj is None or getattr(mesh_obj, "type", None) != 'MESH' or getattr(mesh_obj, "data", None) is None:
+            continue
+        shape_keys = getattr(mesh_obj.data, "shape_keys", None)
+        animation_data = getattr(shape_keys, "animation_data", None) if shape_keys is not None else None
+        drivers = getattr(animation_data, "drivers", None) if animation_data is not None else None
+        if not drivers:
+            continue
+        for driver_curve in drivers:
+            try:
+                driver_state.append((driver_curve, bool(driver_curve.mute)))
+                driver_curve.mute = True
+            except Exception:
+                continue
+    return driver_state
+
+
+def _restore_shape_key_driver_mute_state(driver_state):
+    for driver_curve, was_muted in driver_state or []:
+        try:
+            driver_curve.mute = was_muted
+        except Exception:
+            continue
+
+
+def _clear_pose_bones(pose_bones):
+    for pose_bone in pose_bones or []:
+        if pose_bone is None:
+            continue
+        pose_bone.matrix_basis.identity()
+
+
+def _clear_armature_pose_state(armatures):
+    for arm_obj in armatures or []:
+        if arm_obj is None or getattr(arm_obj, "type", None) != 'ARMATURE':
+            continue
+        _clear_pose_bones(getattr(getattr(arm_obj, "pose", None), "bones", None))
+        animation_data = getattr(arm_obj, "animation_data", None)
+        if animation_data is not None:
+            try:
+                animation_data.action = None
+            except Exception:
+                pass
+
+
+def _reset_duplicate_mesh_shape_key_state(mesh_objs):
+    for mesh_obj in mesh_objs or []:
+        if mesh_obj is None or getattr(mesh_obj, "type", None) != 'MESH' or getattr(mesh_obj, "data", None) is None:
+            continue
+        shape_keys = getattr(mesh_obj.data, "shape_keys", None)
+        if shape_keys is None:
+            continue
+        try:
+            if getattr(shape_keys, "animation_data", None) is not None and hasattr(shape_keys, "animation_data_clear"):
+                shape_keys.animation_data_clear()
+        except Exception:
+            pass
+        for key_block in getattr(shape_keys, "key_blocks", []) or []:
+            try:
+                key_block.value = 0.0
+            except Exception:
+                continue
+
+
+def _update_view_layer(context):
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is None:
+        return
+    try:
+        view_layer.update()
+    except Exception:
+        pass
+
+
+def _force_depsgraph_evaluate(context, objects=None):
+    for obj in objects or []:
+        if obj is None or getattr(obj, "name", None) not in bpy.data.objects:
+            continue
+        try:
+            obj.update_tag()
+        except Exception:
+            pass
+        data = getattr(obj, "data", None)
+        if data is not None:
+            try:
+                data.update_tag()
+            except Exception:
+                pass
+
+    _update_view_layer(context)
+    depsgraph_getter = getattr(context, "evaluated_depsgraph_get", None)
+    if callable(depsgraph_getter):
+        try:
+            depsgraph = context.evaluated_depsgraph_get()
+            depsgraph.update()
+        except Exception:
+            pass
+    _update_view_layer(context)
+
+
+def _iter_direct_dependency_objects(obj):
+    dependency_objects = []
+    seen = set()
+
+    def _add(candidate):
+        if candidate is None or candidate is obj:
+            return
+        candidate_name = str(getattr(candidate, "name", "") or "")
+        if not candidate_name or candidate_name in seen:
+            return
+        seen.add(candidate_name)
+        dependency_objects.append(candidate)
+
+    _add(getattr(obj, "parent", None))
+
+    for constraint in getattr(obj, "constraints", []) or []:
+        _add(getattr(constraint, "target", None))
+        for target_slot in getattr(constraint, "targets", []) or []:
+            _add(getattr(target_slot, "target", None))
+
+    for modifier in getattr(obj, "modifiers", []) or []:
+        for attr_name in ("object", "mirror_object", "offset_object", "start_cap", "end_cap"):
+            _add(getattr(modifier, attr_name, None))
+        for target_slot in getattr(modifier, "targets", []) or []:
+            _add(getattr(target_slot, "target", None))
+
+    if getattr(obj, "type", None) == 'ARMATURE':
+        for pose_bone in getattr(getattr(obj, "pose", None), "bones", []) or []:
+            _add(getattr(pose_bone, "custom_shape", None))
+            for constraint in getattr(pose_bone, "constraints", []) or []:
+                _add(getattr(constraint, "target", None))
+                for target_slot in getattr(constraint, "targets", []) or []:
+                    _add(getattr(target_slot, "target", None))
+
+    return dependency_objects
+
+
+def _gather_isolated_morph_bake_objects(main_obj, face_rig, face_arm_objs, face_mesh_objs):
+    ordered = []
+    seen = set()
+    pending = [main_obj, face_rig] + list(face_arm_objs or []) + list(face_mesh_objs or [])
+
+    while pending:
+        candidate = pending.pop(0)
+        if candidate is None or getattr(candidate, "name", None) not in bpy.data.objects:
+            continue
+        candidate_name = candidate.name
+        if candidate_name in seen:
+            continue
+        seen.add(candidate_name)
+        ordered.append(candidate)
+        pending.extend(_iter_direct_dependency_objects(candidate))
+
+    return ordered
+
+
+def _find_layer_collection_for_collection(layer_collection, target_collection):
+    if layer_collection is None or target_collection is None:
+        return None
+    if getattr(layer_collection, "collection", None) == target_collection:
+        return layer_collection
+    for child in getattr(layer_collection, "children", []) or []:
+        found = _find_layer_collection_for_collection(child, target_collection)
+        if found is not None:
+            return found
+    return None
+
+
+def _duplicate_object_for_morph_bake(obj):
+    duplicate = obj.copy()
+    duplicate.name = f"{obj.name}__W3MorphBake"
+    copied_data = None
+    data = getattr(obj, "data", None)
+    if data is not None and getattr(obj, "type", None) in {'MESH', 'ARMATURE'} and hasattr(data, "copy"):
+        copied_data = data.copy()
+        duplicate.data = copied_data
+    try:
+        if duplicate.animation_data is not None:
+            duplicate.animation_data_clear()
+    except Exception:
+        pass
+    return duplicate, copied_data
+
+
+def _remap_object_reference(owner, attr_name, object_map):
+    try:
+        target = getattr(owner, attr_name, None)
+    except Exception:
+        return
+    if target is None:
+        return
+    mapped_target = object_map.get(getattr(target, "name", ""))
+    if mapped_target is None:
+        return
+    try:
+        setattr(owner, attr_name, mapped_target)
+    except Exception:
+        pass
+
+
+def _remap_constraint_targets(constraints, object_map):
+    for constraint in constraints or []:
+        _remap_object_reference(constraint, "target", object_map)
+        _remap_object_reference(constraint, "space_object", object_map)
+        for target_slot in getattr(constraint, "targets", []) or []:
+            _remap_object_reference(target_slot, "target", object_map)
+
+
+def _remap_modifier_targets(modifiers, object_map):
+    for modifier in modifiers or []:
+        for attr_name in (
+            "object",
+            "mirror_object",
+            "offset_object",
+            "start_cap",
+            "end_cap",
+            "target",
+            "origin",
+            "object_from",
+            "object_to",
+        ):
+            _remap_object_reference(modifier, attr_name, object_map)
+        for projector in getattr(modifier, "projectors", []) or []:
+            _remap_object_reference(projector, "object", object_map)
+        for target_slot in getattr(modifier, "targets", []) or []:
+            _remap_object_reference(target_slot, "target", object_map)
+
+
+def _remap_duplicate_morph_bake_object(original_obj, duplicate_obj, object_map):
+    original_parent = getattr(original_obj, "parent", None)
+    duplicate_parent = object_map.get(getattr(original_parent, "name", "")) if original_parent is not None else None
+    try:
+        duplicate_obj.parent = duplicate_parent
+        duplicate_obj.parent_type = getattr(original_obj, "parent_type", 'OBJECT')
+        duplicate_obj.parent_bone = getattr(original_obj, "parent_bone", "")
+        duplicate_obj.matrix_parent_inverse = original_obj.matrix_parent_inverse.copy()
+    except Exception:
+        pass
+
+    _remap_constraint_targets(getattr(duplicate_obj, "constraints", None), object_map)
+    _remap_modifier_targets(getattr(duplicate_obj, "modifiers", None), object_map)
+
+    if getattr(duplicate_obj, "type", None) == 'ARMATURE':
+        for pose_bone in getattr(getattr(duplicate_obj, "pose", None), "bones", []) or []:
+            original_pose_bone = getattr(getattr(original_obj, "pose", None), "bones", {}).get(pose_bone.name)
+            if original_pose_bone is not None:
+                _remap_object_reference(pose_bone, "custom_shape", object_map)
+            _remap_constraint_targets(getattr(pose_bone, "constraints", None), object_map)
+
+
+@contextmanager
+def _duplicated_morph_bake_session(context, main_obj, face_rig, evaluation_armatures, face_mesh_objs, bake_objects):
+    temp_collection = None
+    temp_view_layer = None
+    duplicate_objects = []
+    duplicate_mesh_data = []
+    duplicate_armature_data = []
+    object_map = {}
+
+    if context is None or not bake_objects:
+        yield None
+        return
+
+    window = getattr(context, "window", None)
+    scene = getattr(context, "scene", None)
+    if window is None or scene is None:
+        yield None
+        return
+
+    previous_view_layer = getattr(window, "view_layer", None)
+    try:
+        temp_collection = bpy.data.collections.new(f"_W3_MORPH_BAKE_{main_obj.name}")
+        scene.collection.children.link(temp_collection)
+
+        for original_obj in bake_objects:
+            if original_obj is None or getattr(original_obj, "name", None) not in bpy.data.objects:
+                continue
+            duplicate_obj, copied_data = _duplicate_object_for_morph_bake(original_obj)
+            object_map[original_obj.name] = duplicate_obj
+            duplicate_objects.append(duplicate_obj)
+            temp_collection.objects.link(duplicate_obj)
+            if copied_data is not None:
+                if getattr(duplicate_obj, "type", None) == 'MESH':
+                    duplicate_mesh_data.append(copied_data)
+                elif getattr(duplicate_obj, "type", None) == 'ARMATURE':
+                    duplicate_armature_data.append(copied_data)
+
+        for original_obj in bake_objects:
+            duplicate_obj = object_map.get(getattr(original_obj, "name", ""))
+            if duplicate_obj is None:
+                continue
+            _remap_duplicate_morph_bake_object(original_obj, duplicate_obj, object_map)
+
+        temp_view_layer = scene.view_layers.new(f"_W3_MORPH_BAKE_{main_obj.name}")
+        target_layer_collection = _find_layer_collection_for_collection(
+            getattr(temp_view_layer, "layer_collection", None),
+            temp_collection,
+        )
+        if target_layer_collection is None:
+            raise RuntimeError(f"Could not find temp layer collection for '{temp_collection.name}'")
+
+        for child_layer_collection in getattr(temp_view_layer.layer_collection, "children", []) or []:
+            child_layer_collection.exclude = (child_layer_collection.collection != temp_collection)
+        temp_view_layer.active_layer_collection = target_layer_collection
+
+        for obj in scene.objects:
+            hide_object = obj.name not in object_map
+            try:
+                obj.hide_set(hide_object, view_layer=temp_view_layer)
+            except TypeError:
+                obj.hide_set(hide_object)
+            except Exception:
+                pass
+
+        window.view_layer = temp_view_layer
+        bake_context = bpy.context
+
+        bake_mesh_pairs = []
+        for mesh_obj in face_mesh_objs or []:
+            duplicate_mesh = object_map.get(getattr(mesh_obj, "name", ""))
+            if duplicate_mesh is not None:
+                bake_mesh_pairs.append((mesh_obj, duplicate_mesh))
+
+        bake_evaluation_armatures = []
+        for arm_obj in evaluation_armatures or []:
+            duplicate_arm_obj = object_map.get(getattr(arm_obj, "name", ""))
+            if duplicate_arm_obj is not None:
+                bake_evaluation_armatures.append(duplicate_arm_obj)
+
+        duplicate_face_mesh_objs = [source_mesh for _target_mesh, source_mesh in bake_mesh_pairs]
+        _clear_armature_pose_state(bake_evaluation_armatures)
+        _reset_duplicate_mesh_shape_key_state(duplicate_face_mesh_objs)
+
+        log.debug(
+            "Using duplicated face morph bake view layer '%s' for %s with %d object(s).",
+            temp_view_layer.name,
+            getattr(main_obj, "name", "<unknown>"),
+            len(duplicate_objects),
+        )
+        _update_view_layer(bake_context)
+        yield {
+            "context": bake_context,
+            "main_obj": object_map.get(getattr(main_obj, "name", ""), None),
+            "face_rig": object_map.get(getattr(face_rig, "name", ""), None),
+            "evaluation_armatures": bake_evaluation_armatures,
+            "mesh_pairs": bake_mesh_pairs,
+        }
+    except Exception as exc:
+        log.warning(
+            "Could not build duplicated face morph bake session for %s: %s",
+            getattr(main_obj, "name", "<unknown>"),
+            exc,
+        )
+        yield None
+    finally:
+        try:
+            if previous_view_layer is not None and getattr(window, "view_layer", None) != previous_view_layer:
+                window.view_layer = previous_view_layer
+        except Exception:
+            pass
+        if temp_view_layer is not None:
+            try:
+                if temp_view_layer.name in [vl.name for vl in scene.view_layers]:
+                    scene.view_layers.remove(temp_view_layer)
+            except Exception:
+                pass
+        for duplicate_obj in duplicate_objects:
+            try:
+                if duplicate_obj.name in bpy.data.objects:
+                    bpy.data.objects.remove(duplicate_obj, do_unlink=True)
+            except Exception:
+                pass
+        for mesh_data in duplicate_mesh_data:
+            try:
+                if mesh_data.users == 0:
+                    bpy.data.meshes.remove(mesh_data)
+            except Exception:
+                pass
+        for armature_data in duplicate_armature_data:
+            try:
+                if armature_data.users == 0:
+                    bpy.data.armatures.remove(armature_data)
+            except Exception:
+                pass
+        if temp_collection is not None and temp_collection.name in bpy.data.collections:
+            try:
+                for parent_collection in bpy.data.collections:
+                    if temp_collection.name in parent_collection.children.keys():
+                        parent_collection.children.unlink(temp_collection)
+                bpy.data.collections.remove(temp_collection)
+            except Exception:
+                pass
+
+
+def _collect_face_evaluation_armatures(face_rig, face_arm_objs, face_mesh_objs):
+    armatures = []
+    seen = set()
+
+    def _add_armature(candidate):
+        if candidate is None or getattr(candidate, "type", None) != 'ARMATURE':
+            return
+        candidate_name = str(getattr(candidate, "name", "") or "")
+        if not candidate_name or candidate_name in seen:
+            return
+        seen.add(candidate_name)
+        armatures.append(candidate)
+
+    _add_armature(face_rig)
+    for arm_obj in face_arm_objs or []:
+        _add_armature(arm_obj)
+    for mesh_obj in face_mesh_objs or []:
+        for modifier in getattr(mesh_obj, "modifiers", []) or []:
+            if modifier.type == 'ARMATURE':
+                _add_armature(getattr(modifier, "object", None))
+    return armatures
+
+
+def _snapshot_armature_pose_positions(armatures):
+    pose_positions = {}
+    for arm_obj in armatures or []:
+        if arm_obj is None or getattr(arm_obj, "type", None) != 'ARMATURE':
+            continue
+        pose_positions[str(arm_obj.name)] = arm_obj.data.pose_position
+    return pose_positions
+
+
+def _set_armature_pose_positions(armatures, pose_position):
+    for arm_obj in armatures or []:
+        if arm_obj is None or getattr(arm_obj, "type", None) != 'ARMATURE':
+            continue
+        try:
+            arm_obj.data.pose_position = pose_position
+        except Exception:
+            pass
+
+
+def _restore_armature_pose_positions(pose_positions):
+    for arm_name, pose_position in (pose_positions or {}).items():
+        arm_obj = bpy.data.objects.get(arm_name)
+        if arm_obj is None or getattr(arm_obj, "type", None) != 'ARMATURE':
+            continue
+        try:
+            arm_obj.data.pose_position = pose_position
+        except Exception:
+            pass
+
+
 def _resolve_target_armature(context):
     main_obj, _rig_settings = get_main_armature_and_rig_settings(
         context,
@@ -1040,6 +1899,9 @@ class WITCH_OT_morphs(bpy.types.Operator):
         if getattr(context, "scene", None):
             set_main_armature(context.scene, main_obj)
         control_bone_name = 'w3_face_poses'
+        scene = getattr(context, "scene", None)
+        saved_frame_current = getattr(scene, "frame_current", None) if scene is not None else None
+        saved_frame_subframe = getattr(scene, "frame_subframe", 0.0) if scene is not None else 0.0
         save_world = main_obj.matrix_world.copy()
         save_local = main_obj.matrix_local.copy()
         save_basis = main_obj.matrix_basis.copy()
@@ -1059,9 +1921,7 @@ class WITCH_OT_morphs(bpy.types.Operator):
             rig_settings.model_armature_object = main_obj
 
             import time
-            start_time = time.time()
-            
-            suppress = False
+            start_time = time.perf_counter()
 
             scene = context.scene
 
@@ -1086,89 +1946,214 @@ class WITCH_OT_morphs(bpy.types.Operator):
                 if mesh_obj:
                     face_mesh_objs.append(mesh_obj)
 
+            face_arm_objs = []
+            for arm_name in face_arms:
+                arm_obj = scene.objects.get(arm_name)
+                if arm_obj and arm_obj.type == 'ARMATURE':
+                    face_arm_objs.append(arm_obj)
+
             bl_ctrl_bone_pose = main_obj.pose.bones[control_bone_name]
             morph_list = rig_settings.witcher_morphs_list
+            reload_shape_key_names = _collect_face_reload_shape_key_names(faceData, morph_list)
+            removed_reload_shape_keys, removed_reload_drivers = _remove_face_reload_shape_keys(
+                face_mesh_objs,
+                reload_shape_key_names,
+            )
             existing_morph_keys = {(el.name, el.path, el.type) for el in morph_list}
-            keep_pose_actions = bool(getattr(rig_settings, "keep_face_morph_pose_actions", False))
             face_anim_data = getattr(face_rig, "animation_data", None)
             previous_face_action = getattr(face_anim_data, "action", None) if face_anim_data else None
-            generated_pose_actions = []
+            evaluation_armatures = _collect_face_evaluation_armatures(face_rig, face_arm_objs, face_mesh_objs)
+            evaluation_pose_snapshot = _snapshot_armature_pose_positions(evaluation_armatures)
+            bake_context_objects = _gather_isolated_morph_bake_objects(
+                main_obj,
+                face_rig,
+                face_arm_objs,
+                face_mesh_objs,
+            )
 
-            prev_bake_every_frame = getattr(scene, 'witcher_bake_every_frame', None)
-            if prev_bake_every_frame is not None:
-                scene.witcher_bake_every_frame = False
-            
-            #!suppress
-            if suppress:
-                old = os.dup(sys.stdout.fileno())
-                devnull = open(os.devnull, 'w')
-                os.dup2(devnull.fileno(), sys.stdout.fileno())
+            control_prop_snapshot = _snapshot_pose_bone_custom_props(bl_ctrl_bone_pose)
+            shape_key_value_snapshot = {}
+            muted_shape_key_driver_state = []
+            wm = getattr(context, "window_manager", None)
+            workspace = getattr(context, "workspace", None)
+            progress_started = False
+            bakeable_face_mesh_objs = list(face_mesh_objs)
+            scene_driver_mesh_objs = _collect_scene_meshes_with_shape_key_drivers(scene)
+            shape_key_state_mesh_objs = _collect_unique_mesh_objects(bakeable_face_mesh_objs, scene_driver_mesh_objs)
+            other_face_rigs = {}
+            evaluation_objects = bake_context_objects or (list(evaluation_armatures) + list(bakeable_face_mesh_objs))
+            bake_scene = scene
+            saved_bake_every_frame = None
+            using_duplicate_bake = False
 
             try:
-                for pose in faceData.mimicPoses:
-                    # if pose.name != "default":
-                    #     continue
-                    bl_ctrl_bone_pose[pose.name] = 0.0
-                    property_manager = bl_ctrl_bone_pose.id_properties_ui(pose.name)
-                    property_manager.update(min = 0., max = 1)
-                    witcherui_add_redmorph(morph_list, [pose.name, pose.name, 4], existing_keys=existing_morph_keys)
+                with _duplicated_morph_bake_session(
+                    context,
+                    main_obj,
+                    face_rig,
+                    evaluation_armatures,
+                    bakeable_face_mesh_objs,
+                    bake_context_objects,
+                ) as bake_session:
+                    if bake_session and bake_session.get("face_rig") is not None and bake_session.get("mesh_pairs"):
+                        bake_context = bake_session["context"]
+                        bake_scene = getattr(bake_context, "scene", scene)
+                        bake_face_rig = bake_session["face_rig"]
+                        bake_evaluation_armatures = list(bake_session.get("evaluation_armatures", []) or [])
+                        bake_mesh_pairs = list(bake_session.get("mesh_pairs", []) or [])
+                        bake_evaluation_objects = list(bake_evaluation_armatures) + [source_mesh for _target_mesh, source_mesh in bake_mesh_pairs]
+                        using_duplicate_bake = True
+                    else:
+                        bake_context = context
+                        bake_scene = scene
+                        bake_face_rig = face_rig
+                        bake_evaluation_armatures = list(evaluation_armatures)
+                        bake_mesh_pairs = [(the_mesh, the_mesh) for the_mesh in bakeable_face_mesh_objs]
+                        bake_evaluation_objects = list(evaluation_armatures) + list(bakeable_face_mesh_objs)
+                        other_face_rigs = _collect_other_face_rigs(scene, face_rig)
 
-                    pose.SkeletalAnimationType = "SAT_Additive"
-                    set_entry = CSkeletalAnimationSetEntry()
-                    set_entry.animation = pose
-                    if not _activate_object(face_rig):
-                        self.report({'WARNING'}, f"Could not activate face rig '{face_rig.name}'.")
+                    saved_bake_every_frame = getattr(bake_scene, 'witcher_bake_every_frame', None)
+                    if saved_bake_every_frame is not None:
+                        bake_scene.witcher_bake_every_frame = False
+
+                    _set_armature_pose_positions(bake_evaluation_armatures, "POSE")
+
+                    if not using_duplicate_bake and face_anim_data is not None:
+                        face_anim_data.action = None
+
+                    _zero_pose_bone_custom_props(bl_ctrl_bone_pose)
+                    muted_shape_key_driver_state = _snapshot_and_mute_shape_key_drivers(shape_key_state_mesh_objs)
+                    shape_key_value_snapshot = _snapshot_shape_key_values(shape_key_state_mesh_objs)
+                    if using_duplicate_bake:
+                        _clear_armature_pose_state(bake_evaluation_armatures)
+                    _force_depsgraph_evaluate(bake_context, bake_evaluation_objects)
+
+                    # Register all pose names on the control bone before baking.
+                    for pose in faceData.mimicPoses:
+                        bl_ctrl_bone_pose[pose.name] = 0.0
+                        bl_ctrl_bone_pose.id_properties_ui(pose.name).update(min=0., max=1.)
+                        witcherui_add_redmorph(morph_list, [pose.name, pose.name, 4], existing_keys=existing_morph_keys)
+
+                    total_poses = len(faceData.mimicPoses)
+                    if wm is not None:
+                        wm.progress_begin(0, max(1, total_poses))
+                        progress_started = True
+
+                    if not _activate_object(bake_face_rig):
+                        self.report({'WARNING'}, f"Could not activate face rig '{bake_face_rig.name}'.")
                         return {'CANCELLED'}
-                    for pb in face_rig.pose.bones:
-                        pb.matrix_basis.identity()
-                    #bpy.ops.object.mode_set(mode='POSE', toggle=False)
-                    #bpy.ops.pose.transforms_clear()
-                    import_anims.import_anim(context, "imported", set_entry, facePose=True, override_select=[face_rig], update_scene_settings=False , at_frame=0)
-                    generated_action = getattr(getattr(face_rig, "animation_data", None), "action", None)
-                    if generated_action is not None and not keep_pose_actions and generated_action not in generated_pose_actions:
-                        generated_pose_actions.append(generated_action)
 
-                    #!GET MESH OBJECTS FOR THIS AND APPLY SHAPE KEYS
-                    for the_mesh in face_mesh_objs:
-                        create_morph_and_driver(self, main_obj, the_mesh, pose.name)
+                    for pose_index, pose in enumerate(faceData.mimicPoses):
+                        if wm is not None:
+                            wm.progress_update(pose_index + 1)
+                        if workspace is not None:
+                            workspace.status_text_set(
+                                f"Baking face morph {pose_index + 1}/{total_poses}: {pose.name}"
+                            )
 
-                    #! RETURN ACTIVE OBJECT
-                    _activate_object(face_rig)
-                    for pb in face_rig.pose.bones:
-                        pb.matrix_basis.identity()
-                    if face_rig.animation_data:
-                        face_rig.animation_data.action = None
+                        _clear_armature_pose_state(bake_evaluation_armatures if using_duplicate_bake else [bake_face_rig])
+
+                        pose.SkeletalAnimationType = "SAT_Additive"
+                        set_entry = CSkeletalAnimationSetEntry()
+                        set_entry.animation = pose
+                        import_anims.import_anim(
+                            bake_context,
+                            "imported",
+                            set_entry,
+                            facePose=True,
+                            override_select=[bake_face_rig],
+                            update_scene_settings=False,
+                            at_frame=0,
+                        )
+                        generated_action = getattr(getattr(bake_face_rig, "animation_data", None), "action", None)
+                        _update_view_layer(bake_context)
+
+                        for target_mesh, source_mesh in bake_mesh_pairs:
+                            if using_duplicate_bake:
+                                coords = _capture_evaluated_mesh_coords(bake_context, source_mesh)
+                                _write_morph_shape_key_coords(
+                                    main_obj,
+                                    target_mesh,
+                                    pose.name,
+                                    coords,
+                                    control_bone_name=control_bone_name,
+                                    ensure_driver=False,
+                                )
+                            else:
+                                create_morph_and_driver(
+                                    bake_context,
+                                    main_obj,
+                                    target_mesh,
+                                    pose.name,
+                                    control_bone_name=control_bone_name,
+                                    ensure_driver=False,
+                                )
+
+                        _activate_object(bake_face_rig)
+                        _clear_armature_pose_state(bake_evaluation_armatures if using_duplicate_bake else [bake_face_rig])
+                        if generated_action is not None:
+                            try:
+                                if generated_action.users == 0:
+                                    bpy.data.actions.remove(generated_action)
+                            except Exception:
+                                pass
+
+                    for pose in faceData.mimicPoses:
+                        for the_mesh in bakeable_face_mesh_objs:
+                            ensure_morph_driver(
+                                main_obj,
+                                the_mesh,
+                                pose.name,
+                                control_bone_name=control_bone_name,
+                            )
+
             finally:
-                if prev_bake_every_frame is not None:
-                    scene.witcher_bake_every_frame = prev_bake_every_frame
-                if face_rig and getattr(face_rig, "animation_data", None):
-                    face_rig.animation_data.action = previous_face_action
-
-            #!stop suppress
-            if suppress:
-                sys.stdout.flush()
-                os.dup2(old, sys.stdout.fileno())
-                os.close(old)
-            removed_pose_actions = 0
-            if not keep_pose_actions:
-                for action in generated_pose_actions:
+                if progress_started and wm is not None:
                     try:
-                        if action and action.users == 0:
-                            bpy.data.actions.remove(action)
-                            removed_pose_actions += 1
+                        wm.progress_end()
                     except Exception:
                         pass
-            time_taken = time.time() - start_time
-            log.info("Loaded morphs in %.2f seconds.", time_taken)
-            if removed_pose_actions:
-                log.info("Removed %d temporary face pose action(s).", removed_pose_actions)
+                if workspace is not None:
+                    try:
+                        workspace.status_text_set(None)
+                    except Exception:
+                        pass
+                if face_rig and getattr(face_rig, "pose", None):
+                    for pb in face_rig.pose.bones:
+                        pb.matrix_basis.identity()
+                if face_anim_data is not None:
+                    try:
+                        face_anim_data.action = previous_face_action
+                    except Exception:
+                        pass
+                elif face_rig.animation_data is not None:
+                    face_rig.animation_data.action = None
+                _restore_armature_pose_positions(evaluation_pose_snapshot)
+                if saved_bake_every_frame is not None and getattr(bake_scene, "name", None) in bpy.data.scenes:
+                    bake_scene.witcher_bake_every_frame = saved_bake_every_frame
+                _restore_other_face_rigs(other_face_rigs)
+                _restore_pose_bone_custom_props(bl_ctrl_bone_pose, control_prop_snapshot)
+                _restore_shape_key_values(shape_key_value_snapshot)
+                _restore_shape_key_driver_mute_state(muted_shape_key_driver_state)
+                _force_depsgraph_evaluate(context, evaluation_objects)
+
+            time_taken = time.perf_counter() - start_time
+            log.info(
+                "Loaded %d face morphs across %d mesh(es) in %.2f seconds.",
+                len(faceData.mimicPoses),
+                len(bakeable_face_mesh_objs),
+                time_taken,
+            )
+            if removed_reload_shape_keys or removed_reload_drivers:
+                log.debug(
+                    "Rebuilt face morph stack for %s by clearing %d shape key(s) and %d driver(s) first.",
+                    main_obj.name,
+                    removed_reload_shape_keys,
+                    removed_reload_drivers,
+                )
             self.report(
                 {'INFO'},
-                (
-                    f"Loaded face morphs in {time_taken:.2f}s and removed {removed_pose_actions} temporary pose action(s)."
-                    if not keep_pose_actions
-                    else f"Loaded face morphs in {time_taken:.2f}s and kept generated pose actions."
-                ),
+                f"Loaded {len(faceData.mimicPoses)} face morphs across {len(bakeable_face_mesh_objs)} mesh(es) in {time_taken:.2f}s.",
             )
 
             #! RETURN MAIN OBJECT
@@ -1186,16 +2171,15 @@ class WITCH_OT_morphs(bpy.types.Operator):
 
             _safe_mode_set('OBJECT', main_obj)
 
-            # Create phoneme setup automatically the first time morphs are loaded.
-            has_phoneme_entries = any(el.type == 5 for el in morph_list)
-            if not has_phoneme_entries:
-                try:
-                    _activate_object(main_obj)
-                    op_result = bpy.ops.witcher.load_face_phonemes()
-                    if 'FINISHED' not in op_result:
-                        log.warning("Auto phoneme creation returned %s", op_result)
-                except Exception as exc:
-                    log.warning("Auto phoneme creation failed: %s", exc)
+            # Refresh phoneme setup after every morph rebuild so phoneme drivers
+            # always relink to the newly rebuilt morph shape keys.
+            try:
+                _activate_object(main_obj)
+                op_result = bpy.ops.witcher.load_face_phonemes()
+                if 'FINISHED' not in op_result:
+                    log.warning("Auto phoneme refresh returned %s", op_result)
+            except Exception as exc:
+                log.warning("Auto phoneme refresh failed: %s", exc)
 
             #bpy.context.view_layer.objects.active = main_obj
             return {'FINISHED'}
@@ -1207,6 +2191,13 @@ class WITCH_OT_morphs(bpy.types.Operator):
                 main_obj.location = save_location
                 main_obj.scale = save_scale
                 main_obj.data.pose_position = current_pose_position
+            if scene is not None and saved_frame_current is not None:
+                try:
+                    scene.frame_set(saved_frame_current, subframe=saved_frame_subframe)
+                except TypeError:
+                    scene.frame_set(saved_frame_current)
+                except Exception:
+                    pass
 
     def __del__(self):
         pass
