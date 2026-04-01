@@ -2010,17 +2010,128 @@ class CStoryScene(base_w3): # CResource
     def from_json(cls, data):
         return cls(data)
 
+class CExtAnimEventData:
+    """Lightweight container for a single parsed CExtAnimEvent* from a w2cutscene."""
+
+    # Event type categories
+    DIALOG_TYPES = {
+        "CExtAnimCutsceneDialogEvent",
+        "CExtAnimDisableDialogLookatEvent",
+    }
+    EFFECT_TYPES = {
+        "CExtAnimEffectEvent",
+        "CExtAnimEffectDurationEvent",
+        "CExtAnimCutsceneEffectEvent",
+        "CExtAnimCutsceneActorEffect",
+        "CExtAnimMaterialBasedFxEvent",
+    }
+
+    def __init__(self, type_name="", event_name="", start_time=0.0, duration=0.0,
+                 animation_name="", track_name="", **extra_fields):
+        self.type_name = type_name          # e.g. "CExtAnimCutsceneDialogEvent"
+        self.event_name = event_name        # m_eventName
+        self.start_time = start_time        # m_startTime (seconds)
+        self.duration = duration            # m_duration (seconds, 0 for instant events)
+        self.animation_name = animation_name  # m_animationName (which anim track owns it)
+        self.track_name = track_name        # m_trackName (editor track label)
+        for k, v in extra_fields.items():
+            setattr(self, k, v)
+
+    @property
+    def is_dialog(self):
+        return self.type_name in self.DIALOG_TYPES
+
+    @property
+    def is_effect(self):
+        return self.type_name in self.EFFECT_TYPES
+
+    @property
+    def is_duration(self):
+        return self.duration > 0.0
+
+    def __repr__(self):
+        return (f"<CExtAnimEventData type={self.type_name!r} name={self.event_name!r} "
+                f"t={self.start_time:.3f} anim={self.animation_name!r}>")
+
+
+def _clone_schema_default(value):
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, set):
+        return set(value)
+    return value
+
+
+CUTSCENE_CLASS_FIELD_SCHEMA = (
+    ("CResource", (
+        ("importFile", ""),
+        ("importFileTimeStamp", ""),
+    )),
+    ("CExtAnimEventsFile", (
+        ("requiredSfxTag", ""),
+    )),
+    ("CSkeletalAnimationSet", (
+        ("animations", []),
+        ("extAnimEvents", []),
+        ("skeleton", ""),
+        ("compressedPoses", []),
+        ("compressedPoseInfos", []),
+        ("Streaming option", ""),
+        ("Number of non-streamable bones", 0),
+        ("forceUncompressedImport", False),
+        ("overrideBitwiseCompressionSettingsOnImport", False),
+        ("bitwiseCompressionPreset", ""),
+        ("bitwiseCompressionSettings", {}),
+    )),
+    ("CCutsceneTemplate", (
+        ("modifiers", []),
+        ("point", []),
+        ("lastLevelLoaded", ""),
+        ("actorsDef", []),
+        ("isValid", False),
+        ("fadeBefore", 0.0),
+        ("fadeAfter", 0.0),
+        ("cameraBlendInTime", 0.0),
+        ("cameraBlendOutTime", 0.0),
+        ("blackscreenWhenLoading", False),
+        ("checkActorsPosition", False),
+        ("entToHideTags", []),
+        ("usedInFiles", []),
+        ("resourcesToPreloadManually", []),
+        ("resourcesToPreloadManuallyPaths", []),
+        ("reverbName", ""),
+        ("burnedAudioTrackName", ""),
+        ("banksDependency", []),
+        ("streamable", False),
+        ("effects", []),
+    )),
+)
+
+CUTSCENE_CLASS_FIELD_ORDER = tuple(
+    field_name
+    for _class_name, fields in CUTSCENE_CLASS_FIELD_SCHEMA
+    for field_name, _default in fields
+)
+
+
 class CCutsceneTemplate(base_w3):
     def __init__(self, animations=[], SCutsceneActorDefs=[], *args, **kwargs):
-
         self.animevents = []
-        self.effects = []
+        self.importedClassFieldSchema = CUTSCENE_CLASS_FIELD_SCHEMA
+        self.presentPropertyNames = set()
+        self.presentTemplateProps = self.presentPropertyNames
+        for _class_name, fields in CUTSCENE_CLASS_FIELD_SCHEMA:
+            for field_name, default_value in fields:
+                setattr(self, field_name, _clone_schema_default(default_value))
         if kwargs or args:
             for arg in args[0].items():
                 if hasattr(self, arg[0]):
                     setattr(self, arg[0], arg[1])
         self.animations = animations
         self.SCutsceneActorDefs = SCutsceneActorDefs
+        self.actorsDef = self.SCutsceneActorDefs
 
 
         # <property Name="requiredSfxTag" Type="CName" />
@@ -2055,7 +2166,6 @@ class CCutsceneTemplate(base_w3):
     def from_json(cls, data):
         SCutsceneActorDefs = list(map(SCutsceneActorDef.from_json, data["SCutsceneActorDefs"]['Content']))
         animations = list(map(CSkeletalAnimationSetEntry.from_json, data["animations"]))
-
         return cls(animations, SCutsceneActorDefs, data)
 
 class CSkeletalAnimationSetEntry(base_w3):

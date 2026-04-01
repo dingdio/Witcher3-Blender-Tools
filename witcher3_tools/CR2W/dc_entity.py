@@ -1,6 +1,7 @@
 import copy
 import logging
 import re
+from functools import partial
 from typing import List
 log = logging.getLogger(__name__)
 
@@ -11,12 +12,14 @@ from .common_blender import repo_file
 from .CR2W_file import create_level, read_CR2W
 from .CR2W_types import Entity_Type_List, getCR2W
 from .bStream import bStream
+from .prop_utils import prop_to_string
 from .read_json_w3 import readCSkeletonData
 from . import w3_types
 
 # Session-scoped cache for LoadCEntityTemplateFile results.
 # Cleared between imports via clear_template_cache().
 _template_file_cache = {}
+_prop_to_string = partial(prop_to_string, default=None)
 
 _DEPOT_PATH_ROOTS = (
     "templates",
@@ -262,36 +265,6 @@ def _repair_w2_component_mesh_path(chunk, repo_path: str):
     if _repo_path_exists(chunk, candidate):
         return candidate
     return repo_path
-
-
-def _prop_to_string(prop):
-    if not prop:
-        return None
-    try:
-        value = prop.ToString()
-    except Exception:
-        value = None
-    if hasattr(value, "value"):
-        value = value.value
-    if isinstance(value, str):
-        value = value.strip()
-        return value or None
-
-    if hasattr(prop, "String"):
-        value = getattr(prop, "String", None)
-        if isinstance(value, str):
-            value = value.strip()
-            return value or None
-
-    index = getattr(prop, "Index", None)
-    if index is not None and not isinstance(index, list):
-        value = getattr(index, "String", None) or getattr(index, "value", None)
-        if isinstance(value, str):
-            value = value.strip()
-            return value or None
-    return None
-
-
 def _resolve_repo_path_from_import_index(cr2w_file, import_index, expected_ext: str):
     if not cr2w_file:
         return None

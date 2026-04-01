@@ -5,11 +5,26 @@ import struct
 import math
 from .dc_skeleton import create_CMimicFace, create_Skeleton
 from .common_blender import repo_file
-from .CR2W_types import getCR2W
+from .CR2W_types import getCR2W, CArray, CBufferUInt32, CVariantSizeType
 from .havok_parser import HavokPackfile
+from .prop_utils import (
+    read_array_string_prop as _read_array_string_prop,
+    read_bool_prop as _read_bool_prop,
+    read_cname_prop as _read_cname_prop,
+    read_datetime_prop as _read_datetime_prop,
+    read_enum_prop as _read_enum_prop,
+    read_float_prop as _read_float_prop,
+    read_handle_labels_prop as _read_handle_labels_prop,
+    read_int_prop as _read_int_prop,
+    read_prop_value as _read_prop_value,
+    read_ptr_chunk_labels_prop as _read_ptr_chunk_labels_prop,
+    read_single_handle_label_prop as _read_single_handle_label_prop,
+    read_string_prop as _read_string_prop,
+    read_taglist_prop as _read_taglist_prop,
+)
 from . import w3_types
 from .w3_types import ( Track, w2AnimsFrames, Quaternion, Vector3D )
-from .bin_helpers import (ReadUlong40, ReadUlong48, ReadVLQInt32, readUShort, ReadBit6,
+from .bin_helpers import (ReadUlong40, ReadUlong48, ReadVLQInt32, readU32, readUShort, ReadBit6,
                         readFloat,
                         ReadFloat24,
                         ReadFloat16,
@@ -1091,7 +1106,7 @@ def create_anim_set(file, Skeleton_file):
         anim_buffer = CHUNKS[anim.GetVariableByName('animBuffer').Value-1]
         log.info(str(idx)+" "+anim.GetVariableByName('name').Index.String)
         animation = create_anim(file, anim, anim_buffer, Skeleton_file)
-        entries = []
+        entries = _read_cutscene_entry_events(anim_entry, file)
         final_entry = w3_types.CSkeletalAnimationSetEntry(animation, entries)
         animations.append(final_entry)
 
@@ -1486,6 +1501,258 @@ def load_w2_anims_full(fileName, rigPath=None, anim_name=None) -> w3_types.CSkel
     return anim_set
 
 
+def _read_cutscene_field_from_prop(field_name, prop, chunks):
+    """Read one root cutscene/set field into a UI-friendly Python value."""
+    if prop is None:
+        return None
+
+    if field_name in {"animations", "actorsDef", "effects"}:
+        return None
+    if field_name in {"modifiers", "compressedPoses"}:
+        return _read_ptr_chunk_labels_prop(prop, chunks)
+    if field_name in {"point"}:
+        return _read_taglist_prop(prop)
+    if field_name in {"importFile", "lastLevelLoaded", "reverbName", "burnedAudioTrackName"}:
+        return _read_string_prop(prop)
+    if field_name in {"requiredSfxTag"}:
+        return _read_cname_prop(prop)
+    if field_name in {"importFileTimeStamp"}:
+        return _read_datetime_prop(prop)
+    if field_name in {"isValid", "blackscreenWhenLoading", "checkActorsPosition", "streamable",
+                      "forceUncompressedImport", "overrideBitwiseCompressionSettingsOnImport"}:
+        return _read_bool_prop(prop)
+    if field_name in {"fadeBefore", "fadeAfter", "cameraBlendInTime", "cameraBlendOutTime"}:
+        return _read_float_prop(prop)
+    if field_name in {"entToHideTags", "usedInFiles", "resourcesToPreloadManuallyPaths", "banksDependency"}:
+        return _read_array_string_prop(prop)
+    if field_name in {"resourcesToPreloadManually"}:
+        return _read_handle_labels_prop(prop, chunks)
+    if field_name in {"extAnimEvents"}:
+        return _read_prop_value(prop, chunks)
+    if field_name in {"skeleton"}:
+        return _read_single_handle_label_prop(prop, chunks)
+    if field_name in {"Streaming option", "bitwiseCompressionPreset"}:
+        return _read_enum_prop(prop)
+    if field_name in {"Number of non-streamable bones"}:
+        return _read_int_prop(prop)
+
+    return _read_prop_value(prop, chunks)
+
+
+def _parse_event_chunk(chunk):
+    """
+    Build a CExtAnimEventData from a parsed CExtAnimEvent* chunk.
+    Returns None if the chunk can't be read.
+    """
+    if chunk is None:
+        return None
+    type_name = str(getattr(chunk, 'name', None) or getattr(chunk, 'theType', '') or '')
+    if not type_name:
+        return None
+
+    event_name    = _read_cname_prop(chunk.GetVariableByName('eventName'))
+    start_time    = _read_float_prop(chunk.GetVariableByName('startTime'))
+    anim_name     = _read_cname_prop(chunk.GetVariableByName('animationName'))
+    track_name    = _read_string_prop(chunk.GetVariableByName('trackName'))
+
+    # duration events (CExtAnimDurationEvent subclasses)
+    duration_prop = chunk.GetVariableByName('duration')
+    duration = _read_float_prop(duration_prop) if duration_prop else 0.0
+
+    # effect-specific fields
+    extra = {}
+    effect_name_prop = chunk.GetVariableByName('effectName')
+    if effect_name_prop is None:
+        effect_name_prop = chunk.GetVariableByName('effect')
+    if effect_name_prop is not None:
+        extra['effect_name'] = _read_cname_prop(effect_name_prop)
+    appearance_prop = chunk.GetVariableByName('appearance')
+    if appearance_prop is not None:
+        extra['appearance'] = _read_cname_prop(appearance_prop)
+
+    return w3_types.CExtAnimEventData(
+        type_name=type_name,
+        event_name=event_name,
+        start_time=start_time,
+        duration=duration,
+        animation_name=anim_name,
+        track_name=track_name,
+        **extra,
+    )
+
+
+def _read_buffered_cutscene_events(chunk_set, cr2w_file):
+    """
+    Read cutscene events from the buffered Animevents tail used by some
+    CCutsceneTemplate files.
+    """
+    if chunk_set is None or cr2w_file is None:
+        return []
+
+    props = list(getattr(chunk_set, 'PROPS', None) or [])
+    file_name = str(getattr(cr2w_file, 'fileName', '') or '')
+    if not props or not file_name:
+        return []
+
+    last_prop_end = int(getattr(props[-1], 'dataEnd', 0) or 0)
+    class_end = int(getattr(chunk_set, 'classEnd', 0) or 0)
+    if last_prop_end <= 0 or class_end <= last_prop_end:
+        return []
+
+    try:
+        with open(file_name, "rb") as f:
+            f.seek(last_prop_end)
+            if f.tell() + 2 > class_end:
+                return []
+
+            # Standard CVariable chunks end their property list with a zero ushort.
+            terminator = readUShort(f)
+            if terminator != 0:
+                return []
+
+            if f.tell() + 4 > class_end:
+                return []
+            _unk11 = readU32(f)
+
+            if f.tell() + 4 > class_end:
+                return []
+            animevents = CBufferUInt32(cr2w_file, CVariantSizeType)
+            animevents.Read(f, 0)
+    except Exception:
+        log.debug("Failed reading buffered cutscene animevents", exc_info=True)
+        return []
+
+    events = []
+    for variant in getattr(animevents, 'elements', None) or []:
+        prop = getattr(variant, 'PROP', None)
+        ev = _parse_event_chunk(prop)
+        if ev is not None:
+            events.append(ev)
+
+    if events:
+        log.info("Parsed %d buffered cutscene animevents", len(events))
+
+    return events
+
+
+def _read_cutscene_entry_events(entry_chunk, cr2w_file):
+    """
+    Read per-entry buffered events from a CSkeletalAnimationSetEntry chunk.
+
+    Layout after the normal property list:
+      [uint16 zero terminator]
+      [CArray<CVariantSizeType> Entries]
+    """
+    if entry_chunk is None or cr2w_file is None:
+        return []
+
+    props = list(getattr(entry_chunk, 'PROPS', None) or [])
+    file_name = str(getattr(cr2w_file, 'fileName', '') or '')
+    if not props or not file_name:
+        return []
+
+    last_prop_end = int(getattr(props[-1], 'dataEnd', 0) or 0)
+    class_end = int(getattr(entry_chunk, 'classEnd', 0) or 0)
+    if last_prop_end <= 0 or class_end <= last_prop_end:
+        return []
+
+    try:
+        with open(file_name, "rb") as f:
+            f.seek(last_prop_end)
+            if f.tell() + 2 > class_end:
+                return []
+
+            terminator = readUShort(f)
+            if terminator != 0:
+                return []
+
+            if f.tell() + 4 > class_end:
+                return []
+            entries = CArray(cr2w_file, CVariantSizeType)
+            entries.Read(f, 0)
+    except Exception:
+        log.debug("Failed reading cutscene entry events", exc_info=True)
+        return []
+
+    events = []
+    for variant in getattr(entries, 'elements', None) or []:
+        prop = getattr(variant, 'PROP', None)
+        ev = _parse_event_chunk(prop)
+        if ev is not None:
+            events.append(ev)
+
+    if events:
+        log.info("Parsed %d cutscene entry events", len(events))
+
+    return events
+
+
+def _read_cutscene_events(chunk_set, CHUNKS, cr2w_file=None):
+    """
+    Read all CExtAnimEvent* chunks referenced by a CCutsceneTemplate chunk.
+
+    Supported layouts:
+    - extAnimEvents as an array of ptr:CExtAnimEvent chunk references
+    - extAnimEvents as handles to CExtAnimEventsFile resources
+    - buffered Animevents stored after the chunk's normal property list
+    Returns a list of CExtAnimEventData.
+    """
+    events = []
+
+    events_prop = chunk_set.GetVariableByName('extAnimEvents')
+    if events_prop is not None:
+
+        # ptr: array -> .value is a list of 1-based chunk indices
+        ptr_list = getattr(events_prop, 'value', None)
+        if ptr_list:
+            for ptr in ptr_list:
+                try:
+                    idx = int(ptr)
+                    if idx < 1 or idx > len(CHUNKS):
+                        continue
+                    ev = _parse_event_chunk(CHUNKS[idx - 1])
+                    if ev is not None:
+                        events.append(ev)
+                except Exception as e:
+                    log.debug("Failed reading event chunk ptr=%s: %s", ptr, e)
+
+        # handle: array -> .Handles is a list of HANDLE objects (CExtAnimEventsFile)
+        if not events:
+            handles = getattr(events_prop, 'Handles', None)
+            if handles:
+                for handle in handles:
+                    val = getattr(handle, 'val', None)
+                    if val is None:
+                        val = getattr(handle, 'Value', None)
+                    if val is None:
+                        continue
+                    try:
+                        idx = int(val)
+                        if idx < 1 or idx > len(CHUNKS):
+                            continue
+                        # This chunk is a CExtAnimEventsFile - it may have its own events array
+                        events_file_chunk = CHUNKS[idx - 1]
+                        sub_prop = events_file_chunk.GetVariableByName('events')
+                        if sub_prop and hasattr(sub_prop, 'value'):
+                            for sub_ptr in sub_prop.value:
+                                try:
+                                    sub_idx = int(sub_ptr)
+                                    if sub_idx < 1 or sub_idx > len(CHUNKS):
+                                        continue
+                                    ev = _parse_event_chunk(CHUNKS[sub_idx - 1])
+                                    if ev is not None:
+                                        events.append(ev)
+                                except Exception as e2:
+                                    log.debug("Failed reading sub-event chunk: %s", e2)
+                    except Exception as e:
+                        log.debug("Failed reading events file handle val=%s: %s", val, e)
+
+    if not events and cr2w_file is not None:
+        events = _read_buffered_cutscene_events(chunk_set, cr2w_file)
+
+    return events
+
+
 def create_CCutscene(file):
     CHUNKS = file.CHUNKS.CHUNKS
     for chunk in CHUNKS:
@@ -1543,11 +1810,46 @@ def create_CCutscene(file):
         anim_buffer = CHUNKS[anim.GetVariableByName('animBuffer').Value-1]
         log.info(str(idx)+" "+anim.GetVariableByName('name').Index.String)
         animation = create_anim(file, anim, anim_buffer, None)
-        entries = []
+        entries = _read_cutscene_entry_events(anim_entry, file)
         final_entry = w3_types.CSkeletalAnimationSetEntry(animation, entries)
         animations.append(final_entry)
 
+    events = _read_cutscene_events(set, CHUNKS, file)
+    log.info("Parsed %d cutscene events", len(events))
+
     final_set = w3_types.CCutsceneTemplate(animations = animations, SCutsceneActorDefs = actors)
+    final_set.animevents = events
+    present_fields = {
+        str(getattr(prop, 'theName', '') or '').strip()
+        for prop in getattr(set, 'PROPS', None) or []
+        if str(getattr(prop, 'theName', '') or '').strip()
+    }
+    final_set.presentPropertyNames = present_fields
+    final_set.presentTemplateProps = present_fields
+
+    for _class_name, fields in getattr(w3_types, "CUTSCENE_CLASS_FIELD_SCHEMA", ()):
+        for field_name, _default in fields:
+            if field_name in {"animations", "actorsDef", "effects"}:
+                continue
+            prop = set.GetVariableByName(field_name)
+            if prop is None:
+                continue
+            setattr(final_set, field_name, _read_cutscene_field_from_prop(field_name, prop, CHUNKS))
+
+    final_set.actorsDef = list(actors)
+
+    effects_prop = set.GetVariableByName('effects')
+    if effects_prop is not None:
+        for fx_ptr in (effects_prop.value or []):
+            try:
+                fx_chunk = CHUNKS[fx_ptr - 1]
+                name_var = fx_chunk.GetVariableByName('name')
+                name = name_var.Index.String if name_var is not None else ""
+                final_set.effects.append({"name": name or "CFXDefinition"})
+            except Exception:
+                log.warning("Failed to read CFXDefinition at ptr %s", fx_ptr)
+                final_set.effects.append({"name": "CFXDefinition"})
+
     return final_set
 
 def load_bin_cutscene(fileName) -> w3_types.CCutsceneTemplate:

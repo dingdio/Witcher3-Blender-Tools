@@ -1,10 +1,9 @@
 import logging
 import os
-import json
 from collections import Counter
-from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..importers import import_entity
+from ..action_compat import iter_action_fcurves, remove_action_fcurve
 from ..CR2W.dc_anims import load_bin_cutscene
 from ..CR2W.common_blender import repo_file
 
@@ -17,17 +16,13 @@ CUTSCENE_SOURCE_PATH_PROP = "witcher_cutscene_source_path"
 CUTSCENE_SOURCE_INDEX_PROP = "witcher_cutscene_source_index"
 CUTSCENE_ANIMATION_NAME_PROP = "witcher_cutscene_animation_name"
 CUTSCENE_ACTOR_IMPORTED_PROP = "cutscene_actor_imported"
+CUTSCENE_APPEARANCE_DATA_PATH = "witcherui_RigSettings.app_list_index"
 
 def loadCutsceneFile(filename):
-    dirpath, file = os.path.split(filename)
-    basename, ext = os.path.splitext(file)
-    if ext.lower() in ('.json'):
-        with open(filename) as file:
-            return read_json_w3.Read_CCutsceneTemplate(json.loads(file.read()))
-    elif ext.lower().endswith('.w2cutscene'):
+    ext = os.path.splitext(filename)[1]
+    if ext.lower().endswith('.w2cutscene'):
         return load_bin_cutscene(filename)
-    else:
-        return None
+    return None
 
 import bpy
 from .import_anims import NewW2ANIMSListItem#, set_global_set #!USE NEW METHOD
@@ -268,6 +263,8 @@ def clear_cutscene_actor_animation_tracks(actor_obj, track_name=None):
         action = bpy.data.actions.get(action_name)
         if action and action.users == 0:
             bpy.data.actions.remove(action)
+    if not track_name:
+        clear_cutscene_actor_appearance_keys(actor_obj)
     return removed_tracks
 
 def unload_cutscene_actor(actor_obj):
@@ -515,14 +512,125 @@ def apply_cutscene_animation_sequence(filename, animation_indices, actor_obj, ac
         selected_animation_indices = set()
     if not selected_animation_indices:
         return (set(), {}) if return_errors else set()
+    return _apply_cutscene_animation_sequence_template(
+        cutscene_template,
+        filename,
+        selected_animation_indices,
+        actor_obj,
+        actor_name=actor_name,
+        track_name=track_name,
+        return_errors=return_errors,
+    )
 
-    from ..ui.ui_anims_list import load_anim_into_scene
+def _auto_apply_cutscene_animations(filename, cutscene_template, actor_objects_by_name,
+                                     selected_animation_indices=None, actor_repo_paths_by_name=None):
+    selected_animation_indices = None if selected_animation_indices is None else {int(idx) for idx in selected_animation_indices}
+    actor_repo_paths_by_name = dict(actor_repo_paths_by_name or {})
+    actor_animation_indices = {}
+
+    for idx, node in enumerate(getattr(cutscene_template, "animations", None) or []):
+        if selected_animation_indices is not None and idx not in selected_animation_indices:
+            continue
+
+        anim_name = str(getattr(getattr(node, "animation", None), "name", "") or "")
+        actor_name, _component_name, _display_name = split_cutscene_animation_name(anim_name)
+
+        actor_obj = None
+        if actor_name:
+            actor_obj = (
+                actor_objects_by_name.get(actor_name)
+                or _find_cutscene_actor_by_name(actor_name)
+                or _find_actor_by_repo_path(actor_repo_paths_by_name.get(actor_name, ""))
+            )
+        elif len(actor_objects_by_name) == 1:
+            actor_obj = next(iter(actor_objects_by_name.values()))
+
+        if actor_obj is None:
+            log.info("Skipping cutscene animation '%s': no matching actor found in scene.", anim_name or idx)
+            continue
+
+        actor_animation_indices.setdefault(actor_obj.name, {
+            "actor_obj": actor_obj,
+            "actor_name": actor_name,
+            "indices": [],
+        })
+        actor_animation_indices[actor_obj.name]["indices"].append(idx)
 
     applied_indices = set()
-    error_messages = {}
+    for actor_info in actor_animation_indices.values():
+        actor_obj = actor_info["actor_obj"]
+        actor_name = actor_info["actor_name"]
+        try:
+            actor_applied, _actor_errors = _apply_cutscene_animation_sequence_template(
+                cutscene_template,
+                filename,
+                actor_info["indices"],
+                actor_obj,
+                actor_name=actor_name,
+                return_errors=True,
+            )
+            applied_indices.update(actor_applied)
+        except Exception:
+            log.exception(
+                "Failed to auto-apply cutscene animations on actor '%s'.",
+                getattr(actor_obj, "name", "<unknown>"),
+            )
+
+    return len(applied_indices), applied_indices
+
+def _safe_actor_type_str(type_value):
+    """Safely extract a clean string from an ECutsceneActorType value."""
+    if type_value is None:
+        return ""
+    if isinstance(type_value, str):
+        return type_value
+    # Binary PROPERTY object: try .Value then .String.String
+    val = getattr(type_value, "Value", None)
+    if isinstance(val, str):
+        return val
+    s = getattr(type_value, "String", None)
+    if s is not None:
+        ss = getattr(s, "String", None)
+        if isinstance(ss, str):
+            return ss
+    result = str(type_value)
+    return "" if result.startswith("<") else result
+
+
+def _cutscene_event_value(event, field_name, default=None):
+    if event is None:
+        return default
+    return getattr(event, field_name, default)
+
+
+def _append_cutscene_preview_event(event_items, ev, event_scope, source_index=-1):
+    event_items.append({
+        "event_type": str(_cutscene_event_value(ev, "type_name", "") or ""),
+        "event_name": str(_cutscene_event_value(ev, "event_name", "") or ""),
+        "start_time": float(_cutscene_event_value(ev, "start_time", 0.0) or 0.0),
+        "duration": float(_cutscene_event_value(ev, "duration", 0.0) or 0.0),
+        "animation_name": str(_cutscene_event_value(ev, "animation_name", "") or ""),
+        "track_name": str(_cutscene_event_value(ev, "track_name", "") or ""),
+        "effect_name": str(_cutscene_event_value(ev, "effect_name", "") or ""),
+        "appearance": str(_cutscene_event_value(ev, "appearance", "") or ""),
+        "event_scope": event_scope,
+        "source_index": int(source_index),
+    })
+
+
+def _build_cutscene_animation_contexts(cutscene_template, animation_indices, actor_name="", actor_key=""):
+    try:
+        selected_animation_indices = {int(idx) for idx in (animation_indices or [])}
+    except Exception:
+        selected_animation_indices = set()
+    if not selected_animation_indices:
+        return []
+
     actor_name = str(actor_name or "").strip()
-    actor_key = actor_name or str(getattr(actor_obj, "name", "") or "<unknown>")
+    actor_key = str(actor_key or actor_name or "<unknown>")
     sequence_state = {}
+    contexts = []
+
     for idx, node in enumerate(getattr(cutscene_template, "animations", None) or []):
         if idx not in selected_animation_indices:
             continue
@@ -534,6 +642,264 @@ def apply_cutscene_animation_sequence(filename, animation_indices, actor_obj, ac
 
         duration = _estimate_animation_frame_count(node)
         at_frame = _schedule_cutscene_animation_frame(sequence_state, actor_key, component_name, duration)
+        contexts.append({
+            "source_index": idx,
+            "node": node,
+            "anim_name": anim_name,
+            "actor_name": node_actor_name,
+            "component_name": component_name,
+            "duration_frames": duration,
+            "at_frame": float(at_frame),
+            "frames_per_second": float(getattr(getattr(node, "animation", None), "framesPerSecond", 0.0) or 0.0),
+        })
+
+    return contexts
+
+
+def _find_animation_context_by_name(animation_contexts, anim_name):
+    anim_name = str(anim_name or "").strip()
+    if not anim_name:
+        return None
+    for context in animation_contexts or []:
+        if str(context.get("anim_name", "") or "").strip() == anim_name:
+            return context
+    return None
+
+
+def _resolve_cutscene_event_fps(event, animation_contexts, fallback_fps):
+    animation_name = str(_cutscene_event_value(event, "animation_name", "") or "").strip()
+    context = _find_animation_context_by_name(animation_contexts, animation_name)
+    if context is not None:
+        fps = float(context.get("frames_per_second", 0.0) or 0.0)
+        if fps > 0.0:
+            return fps
+    return float(fallback_fps or 30.0)
+
+
+def _iter_cutscene_body_part_events(cutscene_template, animation_contexts, actor_name=""):
+    actor_name = str(actor_name or "").strip()
+    animation_contexts = list(animation_contexts or [])
+    if not animation_contexts:
+        return []
+
+    _render = getattr(getattr(bpy.context, "scene", None), "render", None)
+    fallback_fps = next(
+        (float(ctx.get("frames_per_second", 0.0) or 0.0) for ctx in animation_contexts
+         if float(ctx.get("frames_per_second", 0.0) or 0.0) > 0.0),
+        float(_render.fps if _render else 30.0),
+    )
+
+    body_part_events = []
+    order = 0
+
+    for context in animation_contexts:
+        for event in getattr(context.get("node"), "entries", None) or []:
+            if str(_cutscene_event_value(event, "type_name", "") or "") != "CExtAnimCutsceneBodyPartEvent":
+                continue
+
+            appearance = str(_cutscene_event_value(event, "appearance", "") or "").strip()
+            if not appearance:
+                continue
+
+            start_time = float(_cutscene_event_value(event, "start_time", 0.0) or 0.0)
+            fps = float(context.get("frames_per_second", 0.0) or fallback_fps or 30.0)
+            body_part_events.append({
+                "appearance": appearance,
+                "frame": float(context.get("at_frame", 0.0) or 0.0) + (start_time * fps),
+                "order": order,
+            })
+            order += 1
+
+    for event in getattr(cutscene_template, "animevents", None) or []:
+        if str(_cutscene_event_value(event, "type_name", "") or "") != "CExtAnimCutsceneBodyPartEvent":
+            continue
+
+        appearance = str(_cutscene_event_value(event, "appearance", "") or "").strip()
+        if not appearance:
+            continue
+
+        animation_name = str(_cutscene_event_value(event, "animation_name", "") or "").strip()
+        event_actor_name, _component_name, _display_name = split_cutscene_animation_name(animation_name)
+        if actor_name and event_actor_name and event_actor_name != actor_name:
+            continue
+        if actor_name and not event_actor_name:
+            continue
+
+        fps = _resolve_cutscene_event_fps(event, animation_contexts, fallback_fps)
+        start_time = float(_cutscene_event_value(event, "start_time", 0.0) or 0.0)
+        body_part_events.append({
+            "appearance": appearance,
+            "frame": start_time * fps,
+            "order": order,
+        })
+        order += 1
+
+    return body_part_events
+
+
+def clear_cutscene_actor_appearance_keys(actor_obj):
+    if actor_obj is None or getattr(actor_obj, "type", None) != 'ARMATURE':
+        return 0
+
+    armature_data = getattr(actor_obj, "data", None)
+    anim_data = getattr(armature_data, "animation_data", None)
+    action = getattr(anim_data, "action", None)
+    if action is None:
+        return 0
+
+    removed = 0
+    for fcurve in list(iter_action_fcurves(action, target=armature_data)):
+        if str(getattr(fcurve, "data_path", "") or "") != CUTSCENE_APPEARANCE_DATA_PATH:
+            continue
+        remove_action_fcurve(action, fcurve, target=armature_data)
+        removed += 1
+
+    remaining_fcurves = tuple(iter_action_fcurves(action, target=armature_data))
+    if removed and not remaining_fcurves and action.users == 0:
+        bpy.data.actions.remove(action)
+    return removed
+
+
+def _set_cutscene_actor_appearance_key_interpolation(actor_obj):
+    if actor_obj is None or getattr(actor_obj, "type", None) != 'ARMATURE':
+        return
+    armature_data = getattr(actor_obj, "data", None)
+    action = getattr(getattr(armature_data, "animation_data", None), "action", None)
+    if action is None:
+        return
+    for fcurve in iter_action_fcurves(action, target=armature_data):
+        if str(getattr(fcurve, "data_path", "") or "") != CUTSCENE_APPEARANCE_DATA_PATH:
+            continue
+        for keyframe in fcurve.keyframe_points:
+            keyframe.interpolation = 'CONSTANT'
+        try:
+            fcurve.update()
+        except Exception:
+            pass
+
+
+def _bake_cutscene_body_part_events(cutscene_template, animation_contexts, actor_obj, actor_name=""):
+    if actor_obj is None or getattr(actor_obj, "type", None) != 'ARMATURE':
+        return 0
+
+    animation_contexts = list(animation_contexts or [])
+    clear_cutscene_actor_appearance_keys(actor_obj)
+    if not animation_contexts:
+        return 0
+
+    body_part_events = _iter_cutscene_body_part_events(cutscene_template, animation_contexts, actor_name=actor_name)
+    if not body_part_events:
+        return 0
+
+    rig_settings = getattr(getattr(actor_obj, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is None:
+        return 0
+
+    entity, _entity_data = import_entity.get_rig_entity_state(rig_settings)
+    if entity is None:
+        return 0
+
+    default_app_idx = int(getattr(rig_settings, "app_list_index", -1) or -1)
+    if default_app_idx < 0:
+        _selected_appearance, default_app_idx, _resolved_name = _resolve_cutscene_actor_appearance(
+            entity,
+            str(actor_obj.get("cutscene_actor_appearance", "") or "").strip(),
+        )
+    if default_app_idx < 0:
+        return 0
+
+    scene = getattr(bpy.context, "scene", None)
+    restore_auto_load = None
+    if scene is not None and hasattr(scene, "witcher_load_app_on_select"):
+        restore_auto_load = bool(getattr(scene, "witcher_load_app_on_select", False))
+        try:
+            scene.witcher_load_app_on_select = False
+        except Exception:
+            restore_auto_load = None
+
+    baked_events = []
+    try:
+        for event in body_part_events:
+            requested_appearance = str(event.get("appearance", "") or "").strip()
+            if not requested_appearance:
+                continue
+
+            success, resolved_name = _ensure_cutscene_actor_appearance(actor_obj, requested_appearance)
+            if not success:
+                log.warning(
+                    "Cutscene appearance event '%s' could not be resolved for actor '%s'.",
+                    requested_appearance,
+                    getattr(actor_obj, "name", "<unknown>"),
+                )
+                continue
+
+            _selected_appearance, app_idx, _resolved_name = _resolve_cutscene_actor_appearance(entity, resolved_name)
+            if app_idx < 0:
+                log.warning(
+                    "Cutscene appearance event '%s' resolved to '%s' but no app index was found.",
+                    requested_appearance,
+                    resolved_name,
+                )
+                continue
+
+            baked_events.append({
+                "appearance": resolved_name,
+                "app_idx": int(app_idx),
+                "frame": float(event.get("frame", 0.0) or 0.0),
+                "order": int(event.get("order", 0) or 0),
+            })
+
+        rig_settings.app_list_index = int(default_app_idx)
+        if not baked_events:
+            return 0
+
+        actor_obj.data.keyframe_insert(data_path=CUTSCENE_APPEARANCE_DATA_PATH, frame=0.0)
+        for event in sorted(baked_events, key=lambda item: (float(item["frame"]), int(item["order"]))):
+            rig_settings.app_list_index = int(event["app_idx"])
+            actor_obj.data.keyframe_insert(
+                data_path=CUTSCENE_APPEARANCE_DATA_PATH,
+                frame=float(event["frame"]),
+            )
+
+        _set_cutscene_actor_appearance_key_interpolation(actor_obj)
+        return len(baked_events)
+    finally:
+        try:
+            rig_settings.app_list_index = int(default_app_idx)
+        except Exception:
+            pass
+        if restore_auto_load is not None and scene is not None:
+            try:
+                scene.witcher_load_app_on_select = bool(restore_auto_load)
+            except Exception:
+                pass
+
+
+def _apply_cutscene_animation_sequence_template(cutscene_template, filename, animation_indices, actor_obj, actor_name="",
+                                                track_name=CUTSCENE_TRACK_NAME, return_errors=False):
+    if cutscene_template is None or actor_obj is None:
+        return (set(), {}) if return_errors else set()
+
+    actor_name = str(actor_name or "").strip()
+    actor_key = actor_name or str(getattr(actor_obj, "name", "") or "<unknown>")
+    animation_contexts = _build_cutscene_animation_contexts(
+        cutscene_template,
+        animation_indices,
+        actor_name=actor_name,
+        actor_key=actor_key,
+    )
+    if not animation_contexts:
+        return (set(), {}) if return_errors else set()
+
+    from ..ui.ui_anims_list import load_anim_into_scene
+
+    applied_indices = set()
+    error_messages = {}
+    for context in animation_contexts:
+        idx = int(context.get("source_index", -1))
+        anim_name = str(context.get("anim_name", "") or "")
+        component_name = str(context.get("component_name", "") or "")
+        at_frame = float(context.get("at_frame", 0.0) or 0.0)
         animation_track_name = _cutscene_track_name_for_animation(anim_name, base_track=track_name)
 
         try:
@@ -565,81 +931,26 @@ def apply_cutscene_animation_sequence(filename, animation_indices, actor_obj, ac
                 anim_name or idx,
                 getattr(actor_obj, "name", "<unknown>"),
             )
+
+    if applied_indices:
+        try:
+            loaded_contexts = [ctx for ctx in animation_contexts if int(ctx.get("source_index", -1)) in applied_indices]
+            _bake_cutscene_body_part_events(cutscene_template, loaded_contexts, actor_obj, actor_name=actor_name)
+        except Exception:
+            log.exception(
+                "Failed to bake cutscene body-part appearance events on actor '%s'.",
+                getattr(actor_obj, "name", "<unknown>"),
+            )
+
     if return_errors:
         return applied_indices, error_messages
     return applied_indices
 
-def _auto_apply_cutscene_animations(filename, cutscene_template, actor_objects_by_name,
-                                     selected_animation_indices=None, actor_repo_paths_by_name=None):
-    from ..ui.ui_anims_list import load_anim_into_scene
-
-    selected_animation_indices = None if selected_animation_indices is None else {int(idx) for idx in selected_animation_indices}
-    actor_repo_paths_by_name = dict(actor_repo_paths_by_name or {})
-    actor_sequence_state = {}
-    applied_count = 0
-    applied_indices = set()
-
-    for idx, node in enumerate(getattr(cutscene_template, "animations", None) or []):
-        if selected_animation_indices is not None and idx not in selected_animation_indices:
-            continue
-
-        anim_name = str(getattr(getattr(node, "animation", None), "name", "") or "")
-        actor_name, component_name, _display_name = split_cutscene_animation_name(anim_name)
-
-        actor_obj = None
-        if actor_name:
-            actor_obj = (
-                actor_objects_by_name.get(actor_name)
-                or _find_cutscene_actor_by_name(actor_name)
-                or _find_actor_by_repo_path(actor_repo_paths_by_name.get(actor_name, ""))
-            )
-        elif len(actor_objects_by_name) == 1:
-            actor_obj = next(iter(actor_objects_by_name.values()))
-
-        if actor_obj is None:
-            log.info("Skipping cutscene animation '%s': no matching actor found in scene.", anim_name or idx)
-            continue
-
-        frame_key = actor_name or getattr(actor_obj, "name", "")
-        duration = _estimate_animation_frame_count(node)
-        at_frame = _schedule_cutscene_animation_frame(actor_sequence_state, frame_key, component_name, duration)
-        animation_track_name = _cutscene_track_name_for_animation(anim_name)
-        try:
-            if _is_face_cutscene_animation(anim_name):
-                _ensure_cutscene_face_setup(actor_obj)
-            target_armatures = load_anim_into_scene(
-                bpy.context,
-                anim_name,
-                filename,
-                actor_obj,
-                NLA_track=animation_track_name,
-                at_frame=at_frame,
-                face_target_mode="owner",
-            )
-            _tag_cutscene_animation_actions(
-                target_armatures,
-                animation_track_name,
-                anim_name,
-                filename,
-                idx,
-                at_frame,
-            )
-            applied_count += 1
-            applied_indices.add(idx)
-        except Exception:
-            log.exception(
-                "Failed to auto-apply cutscene animation '%s' on actor '%s'",
-                anim_name or idx,
-                getattr(actor_obj, "name", "<unknown>"),
-            )
-            continue
-
-    return applied_count, applied_indices
 
 def collect_cutscene_preview(filename):
     cutscene = loadCutsceneFile(filename)
     if cutscene is None:
-        return None, [], []
+        return None, [], [], []
 
     actor_defs = list(getattr(cutscene, "SCutsceneActorDefs", None) or [])
     template_counts = _actor_template_counts(actor_defs)
@@ -658,9 +969,10 @@ def collect_cutscene_preview(filename):
             "source_index": idx,
             "label": display_name,
             "actor_name": actor_name,
+            "voice_tag": str(getattr(actor, "voiceTag", "") or "").strip(),
             "template_path": template_path,
             "appearance_name": appearance_name,
-            "actor_type": str(getattr(actor, "type", "") or ""),
+            "actor_type": _safe_actor_type_str(getattr(actor, "type", None)),
             "use_mimic": bool(getattr(actor, "useMimic", False)),
             "already_in_scene": bool(existing),
         })
@@ -681,7 +993,72 @@ def collect_cutscene_preview(filename):
             "duration": float(getattr(animation, "duration", 0.0) or 0.0),
         })
 
-    return cutscene, actor_items, animation_items
+    event_items = []
+    for ev in getattr(cutscene, "animevents", None) or []:
+        _append_cutscene_preview_event(event_items, ev, "ROOT")
+
+    for idx, node in enumerate(getattr(cutscene, "animations", None) or []):
+        for ev in getattr(node, "entries", None) or []:
+            _append_cutscene_preview_event(event_items, ev, "ENTRY", source_index=idx)
+
+    return cutscene, actor_items, animation_items, event_items
+
+
+def load_cutscene_dialog_items(cutscene_filepath):
+    """Do the reverse lookup from the linked .w2scene list.
+
+    Returns a list of dicts {actor, voice_file, sound_event, line_index, scene_path}.
+    """
+    from ..CR2W.dc_scene import get_cutscene_dialog_lines
+
+    cutscene = loadCutsceneFile(cutscene_filepath)
+    if cutscene is None:
+        return []
+
+    used_in_files = [
+        str(depot_path or "").strip()
+        for depot_path in (getattr(cutscene, 'usedInFiles', None) or [])
+        if str(depot_path or "").strip()
+    ]
+    if not used_in_files:
+        return []
+
+    # The first linked scene is the primary one for cutscene dialog lookups.
+    ordered_scene_paths = [used_in_files[0], *used_in_files[1:]]
+    dialog_items = []
+
+    for idx, depot_path in enumerate(ordered_scene_paths):
+        try:
+            scene_abs = repo_file(depot_path)
+        except Exception:
+            scene_abs = None
+        if not scene_abs or not os.path.isfile(scene_abs):
+            log.debug("Could not resolve scene file for dialog lookup: %s", depot_path)
+            continue
+
+        try:
+            lines = get_cutscene_dialog_lines(scene_abs, cutscene_filepath)
+        except Exception:
+            log.exception("Dialog lookup failed for %s in %s", cutscene_filepath, scene_abs)
+            continue
+
+        if not lines and idx == 0:
+            continue
+
+        for line in lines:
+            dialog_items.append({
+                "actor":       str(line.get("actor", "") or ""),
+                "voice_file":  str(line.get("voice_file", "") or ""),
+                "sound_event": str(line.get("sound_event", "") or ""),
+                "line_index":  int(line.get("line_index", 0) or 0),
+                "scene_path":  depot_path,
+            })
+
+        if dialog_items and idx == 0:
+            break
+
+    return dialog_items
+
 
 def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation_indices=None,
                        auto_apply_selected_animations=False):

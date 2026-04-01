@@ -1181,7 +1181,7 @@ class PROPERTY:
             return self.Handles
 
     def GetVariableByName(self, str):
-        for item in self.More:
+        for item in getattr(self, 'More', []):
             if item.theName == str:
                 return item
         return None
