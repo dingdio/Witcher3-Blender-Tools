@@ -182,13 +182,34 @@ def _get_loaded_animset_ui_state(context):
     }
 
 
+def _get_selected_collection_item(owner, collection_name, index_name):
+    collection = getattr(owner, collection_name, None)
+    if collection is None:
+        return None, -1
+    try:
+        item_count = len(collection)
+    except Exception:
+        return None, -1
+    if item_count <= 0:
+        return None, -1
+
+    current_index = int(getattr(owner, index_name, -1))
+    safe_index = max(0, min(current_index, item_count - 1))
+    return collection[safe_index], safe_index
+
+
 def on_anim_list_index_changed(self, context):
     """Callback when animation list selection changes. Auto-loads if enabled."""
     if not getattr(context.scene, 'witcher_load_anim_on_select', False):
         return
 
     scene = context.scene
-    if scene.witcher_w2anims_list_index < 0 or not scene.witcher_w2anims_list:
+    item, _safe_index = _get_selected_collection_item(
+        scene,
+        "witcher_w2anims_list",
+        "witcher_w2anims_list_index",
+    )
+    if item is None:
         return
 
     main_arm_obj = _find_character_armature(context)
@@ -196,7 +217,6 @@ def on_anim_list_index_changed(self, context):
     if not main_arm_obj:
         return
 
-    item = scene.witcher_w2anims_list[scene.witcher_w2anims_list_index]
     anim_name = item.name
     fdir_abs = context.scene.witcher_loaded_w2anims_path
 
@@ -381,17 +401,17 @@ class TOOL_OT_List_LoadAnim(Operator):
         action = self.action
         if "load" == action or "load_cutscene" == action:
             if "load_cutscene" == action:
-                working_list_index = scene.witcher_w2cutscene_list_index
+                list_name = "witcher_w2cutscene_list"
+                index_name = "witcher_w2cutscene_list_index"
                 working_list_path = context.scene.witcher_loaded_w2cutscene_path
-                working_list = scene.witcher_w2cutscene_list
             else:
-                working_list_index = scene.witcher_w2anims_list_index
+                list_name = "witcher_w2anims_list"
+                index_name = "witcher_w2anims_list_index"
                 working_list_path = context.scene.witcher_loaded_w2anims_path
-                working_list = scene.witcher_w2anims_list
             log.debug("load anim")
             main_arm_obj = _find_character_armature(context)
-            if working_list_index >= 0 and working_list:
-                item = working_list[working_list_index]
+            item, _safe_index = _get_selected_collection_item(scene, list_name, index_name)
+            if item is not None:
                 anim_name = item.name 
                 fdir_abs = working_list_path  #repo_file(fdir) #!REMOVE !TODO link witcher_loaded_w2anims_path to an object? or keep for cutscene?
                 #!REMOVE TODO load anim on click or highlight instead of having to hit the load button
@@ -439,9 +459,13 @@ class TOOL_OT_List_LoadAnim(Operator):
 
                 #import_anims.import_from_list_item(context, item)
             # context.scene.witcher_w2anims_list.add()
+            else:
+                self.report({'ERROR'}, "No animation selected.")
+                return {'CANCELLED'}
         elif "clear" == action:
             log.debug("Debug Clear")
             bpy.context.scene.witcher_w2anims_list.clear()
+            bpy.context.scene.witcher_w2anims_list_index = -1
         return {'FINISHED'}
 
 class TOOL_OT_List_Add(Operator):
@@ -1192,8 +1216,12 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             orient_row.prop(scene, "witcher_auto_orient_root", text="Auto Orient Root")
             orient_row.operator(WITCH_OT_ApplyRootOrientation.bl_idname, text="", icon='ORIENTATION_GLOBAL')
 
-            if scene.witcher_w2anims_list_index >= 0 and scene.witcher_w2anims_list:
-                item = scene.witcher_w2anims_list[scene.witcher_w2anims_list_index]
+            item, _safe_index = _get_selected_collection_item(
+                scene,
+                "witcher_w2anims_list",
+                "witcher_w2anims_list_index",
+            )
+            if item is not None:
                 info = col_main.box()
                 info.label(text="Selected Clip", icon='INFO')
                 info.label(text=f"Name: {item.name}")

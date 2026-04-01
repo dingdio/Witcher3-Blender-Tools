@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from collections import Counter
 from ..CR2W import w3_types
 from ..importers import import_entity
@@ -26,6 +27,42 @@ def loadCutsceneFile(filename):
 
 import bpy
 from .import_anims import NewW2ANIMSListItem#, set_global_set #!USE NEW METHOD
+
+
+def _cutscene_progress_begin(window_manager):
+    if not window_manager:
+        return
+    try:
+        window_manager.progress_begin(0, 100)
+    except Exception:
+        pass
+
+
+def _cutscene_progress_update(window_manager, workspace, percent, message=""):
+    clamped = max(0, min(100, int(percent or 0)))
+    if window_manager:
+        try:
+            window_manager.progress_update(clamped)
+        except Exception:
+            pass
+    if workspace:
+        try:
+            workspace.status_text_set(str(message or ""))
+        except Exception:
+            pass
+
+
+def _cutscene_progress_end(window_manager, workspace):
+    if window_manager:
+        try:
+            window_manager.progress_end()
+        except Exception:
+            pass
+    if workspace:
+        try:
+            workspace.status_text_set(None)
+        except Exception:
+            pass
 
 def _normalize_repo_path(path):
     return str(path or "").replace("/", "\\").lstrip("\\")
@@ -431,8 +468,8 @@ def is_cutscene_animation_loaded(actor_obj, animation_name, source_path, source_
                     return True
     return False
 
-def load_cutscene_actor(filename, actor_index):
-    cutscene_template = loadCutsceneFile(filename)
+def load_cutscene_actor(filename, actor_index, cutscene_template=None):
+    cutscene_template = cutscene_template if cutscene_template is not None else loadCutsceneFile(filename)
     if cutscene_template is None:
         return {}
 
@@ -523,7 +560,8 @@ def apply_cutscene_animation_sequence(filename, animation_indices, actor_obj, ac
     )
 
 def _auto_apply_cutscene_animations(filename, cutscene_template, actor_objects_by_name,
-                                     selected_animation_indices=None, actor_repo_paths_by_name=None):
+                                     selected_animation_indices=None, actor_repo_paths_by_name=None,
+                                     progress_callback=None):
     selected_animation_indices = None if selected_animation_indices is None else {int(idx) for idx in selected_animation_indices}
     actor_repo_paths_by_name = dict(actor_repo_paths_by_name or {})
     actor_animation_indices = {}
@@ -557,7 +595,8 @@ def _auto_apply_cutscene_animations(filename, cutscene_template, actor_objects_b
         actor_animation_indices[actor_obj.name]["indices"].append(idx)
 
     applied_indices = set()
-    for actor_info in actor_animation_indices.values():
+    total_actor_groups = len(actor_animation_indices)
+    for actor_group_index, actor_info in enumerate(actor_animation_indices.values(), start=1):
         actor_obj = actor_info["actor_obj"]
         actor_name = actor_info["actor_name"]
         try:
@@ -575,6 +614,15 @@ def _auto_apply_cutscene_animations(filename, cutscene_template, actor_objects_b
                 "Failed to auto-apply cutscene animations on actor '%s'.",
                 getattr(actor_obj, "name", "<unknown>"),
             )
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    actor_group_index,
+                    total_actor_groups,
+                    str(getattr(actor_obj, "name", "") or actor_name or ""),
+                )
+            except Exception:
+                pass
 
     return len(applied_indices), applied_indices
 
@@ -947,8 +995,8 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
     return applied_indices
 
 
-def collect_cutscene_preview(filename):
-    cutscene = loadCutsceneFile(filename)
+def collect_cutscene_preview(filename, cutscene_template=None):
+    cutscene = cutscene_template if cutscene_template is not None else loadCutsceneFile(filename)
     if cutscene is None:
         return None, [], [], []
 
@@ -1062,69 +1110,118 @@ def load_cutscene_dialog_items(cutscene_filepath):
 
 def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation_indices=None,
                        auto_apply_selected_animations=False):
-    CCutsceneTemplate = loadCutsceneFile(filename)
-    if CCutsceneTemplate is None:
-        return None
-
     context = bpy.context
-    treeList = context.scene.witcher_w2cutscene_list
-    treeList.clear()
-    context.scene.witcher_loaded_w2cutscene_path = filename
+    scene = context.scene
+    window_manager = getattr(context, "window_manager", None)
+    workspace = getattr(context, "workspace", None)
+    import_started_at = time.perf_counter()
 
-    selected_actor_indices = None if selected_actor_indices is None else {int(idx) for idx in selected_actor_indices}
-    selected_animation_indices = None if selected_animation_indices is None else {int(idx) for idx in selected_animation_indices}
-    actor_defs = list(getattr(CCutsceneTemplate, "SCutsceneActorDefs", None) or [])
-    actor_objects_by_name = {}
-    actor_repo_paths_by_name = {
-        str(getattr(actor, "name", "") or "").strip(): _normalize_repo_path(getattr(actor, "template", "") or "")
-        for actor in actor_defs
-        if str(getattr(actor, "name", "") or "").strip()
-    }
-    loaded_actor_object_names_by_index = {}
-    loaded_actor_imported_flags_by_index = {}
-    loaded_actor_guid_by_index = {}
+    def _set_progress(percent, message):
+        _cutscene_progress_update(window_manager, workspace, percent, message)
 
-    for idx, node in enumerate(getattr(CCutsceneTemplate, "animations", None) or []):
-        if selected_animation_indices is not None and idx not in selected_animation_indices:
-            continue
-        NewW2ANIMSListItem(treeList, node)
+    _cutscene_progress_begin(window_manager)
+    try:
+        _set_progress(2, "Loading cutscene...")
+        CCutsceneTemplate = loadCutsceneFile(filename)
+        if CCutsceneTemplate is None:
+            return None
 
-    actor:w3_types.SCutsceneActorDef
-    for idx, actor in enumerate(actor_defs):
-        if selected_actor_indices is not None and idx not in selected_actor_indices:
-            continue
+        treeList = scene.witcher_w2cutscene_list
+        treeList.clear()
+        scene.witcher_loaded_w2cutscene_path = filename
 
-        actor_info = load_cutscene_actor(filename, idx)
-        actor_obj = actor_info.get("actor_obj")
-        actor_name = str(actor_info.get("actor_name", "") or "").strip()
-        if actor_obj:
-            if actor_name:
-                actor_objects_by_name[actor_name] = actor_obj
-            loaded_actor_object_names_by_index[idx] = str(getattr(actor_obj, "name", "") or "")
-            loaded_actor_imported_flags_by_index[idx] = bool(actor_info.get("imported_new", False))
-            loaded_actor_guid_by_index[idx] = str(actor_info.get("cutscene_guid", "") or "")
+        selected_actor_indices = None if selected_actor_indices is None else {int(idx) for idx in selected_actor_indices}
+        selected_animation_indices = None if selected_animation_indices is None else {int(idx) for idx in selected_animation_indices}
+        actor_defs = list(getattr(CCutsceneTemplate, "SCutsceneActorDefs", None) or [])
+        actor_objects_by_name = {}
+        actor_repo_paths_by_name = {
+            str(getattr(actor, "name", "") or "").strip(): _normalize_repo_path(getattr(actor, "template", "") or "")
+            for actor in actor_defs
+            if str(getattr(actor, "name", "") or "").strip()
+        }
+        loaded_actor_object_names_by_index = {}
+        loaded_actor_imported_flags_by_index = {}
+        loaded_actor_guid_by_index = {}
 
-    auto_applied_animation_count = 0
-    applied_animation_indices = set()
-    if auto_apply_selected_animations:
-        auto_applied_animation_count, applied_animation_indices = _auto_apply_cutscene_animations(
-            filename,
-            CCutsceneTemplate,
-            actor_objects_by_name,
-            selected_animation_indices=selected_animation_indices,
-            actor_repo_paths_by_name=actor_repo_paths_by_name,
+        for idx, node in enumerate(getattr(CCutsceneTemplate, "animations", None) or []):
+            if selected_animation_indices is not None and idx not in selected_animation_indices:
+                continue
+            NewW2ANIMSListItem(treeList, node)
+        scene.witcher_w2cutscene_list_index = 0 if len(treeList) else -1
+        _set_progress(15, "Preparing cutscene import...")
+
+        actor_indices_to_load = [
+            idx for idx, _actor in enumerate(actor_defs)
+            if selected_actor_indices is None or idx in selected_actor_indices
+        ]
+        actor_total = len(actor_indices_to_load)
+        for actor_step_index, idx in enumerate(actor_indices_to_load, start=1):
+            actor_info = load_cutscene_actor(filename, idx, cutscene_template=CCutsceneTemplate)
+            actor_obj = actor_info.get("actor_obj")
+            actor_name = str(actor_info.get("actor_name", "") or "").strip()
+            if actor_obj:
+                if actor_name:
+                    actor_objects_by_name[actor_name] = actor_obj
+                loaded_actor_object_names_by_index[idx] = str(getattr(actor_obj, "name", "") or "")
+                loaded_actor_imported_flags_by_index[idx] = bool(actor_info.get("imported_new", False))
+                loaded_actor_guid_by_index[idx] = str(actor_info.get("cutscene_guid", "") or "")
+            if actor_total:
+                progress = 15 + int(round((actor_step_index / actor_total) * 45))
+                _set_progress(progress, f"Importing cutscene actors... {actor_step_index}/{actor_total}")
+        if not actor_total:
+            _set_progress(60, "No cutscene actors selected for import.")
+
+        auto_applied_animation_count = 0
+        applied_animation_indices = set()
+        if auto_apply_selected_animations:
+            def _auto_apply_progress(done_count, total_count, actor_label):
+                total_count = max(1, int(total_count or 0))
+                progress = 60 + int(round((done_count / total_count) * 35))
+                label = str(actor_label or "").strip()
+                suffix = f" ({label})" if label else ""
+                _set_progress(
+                    progress,
+                    f"Auto-applying cutscene animations... {done_count}/{total_count}{suffix}",
+                )
+
+            auto_applied_animation_count, applied_animation_indices = _auto_apply_cutscene_animations(
+                filename,
+                CCutsceneTemplate,
+                actor_objects_by_name,
+                selected_animation_indices=selected_animation_indices,
+                actor_repo_paths_by_name=actor_repo_paths_by_name,
+                progress_callback=_auto_apply_progress,
+            )
+            _set_progress(95, "Finishing cutscene import...")
+        else:
+            _set_progress(95, "Finishing cutscene import...")
+
+        import_duration_seconds = time.perf_counter() - import_started_at
+
+        try:
+            CCutsceneTemplate.auto_applied_animation_count = int(auto_applied_animation_count)
+            CCutsceneTemplate.import_duration_seconds = float(import_duration_seconds)
+        except Exception:
+            pass
+        try:
+            CCutsceneTemplate.loaded_actor_object_names_by_index = dict(loaded_actor_object_names_by_index)
+            CCutsceneTemplate.loaded_actor_imported_flags_by_index = dict(loaded_actor_imported_flags_by_index)
+            CCutsceneTemplate.loaded_actor_guid_by_index = dict(loaded_actor_guid_by_index)
+            CCutsceneTemplate.applied_animation_indices = sorted(applied_animation_indices)
+        except Exception:
+            pass
+        if hasattr(scene, "witcher_cutscene_last_import_seconds"):
+            scene.witcher_cutscene_last_import_seconds = float(import_duration_seconds)
+
+        _set_progress(100, f"Cutscene import finished in {import_duration_seconds:.2f}s")
+        log.info(
+            "Imported cutscene '%s' in %.2fs (%d actor(s), %d animation(s), auto-applied %d).",
+            os.path.basename(filename),
+            import_duration_seconds,
+            len(actor_indices_to_load),
+            len(treeList),
+            auto_applied_animation_count,
         )
-
-    try:
-        CCutsceneTemplate.auto_applied_animation_count = int(auto_applied_animation_count)
-    except Exception:
-        pass
-    try:
-        CCutsceneTemplate.loaded_actor_object_names_by_index = dict(loaded_actor_object_names_by_index)
-        CCutsceneTemplate.loaded_actor_imported_flags_by_index = dict(loaded_actor_imported_flags_by_index)
-        CCutsceneTemplate.loaded_actor_guid_by_index = dict(loaded_actor_guid_by_index)
-        CCutsceneTemplate.applied_animation_indices = sorted(applied_animation_indices)
-    except Exception:
-        pass
-
-    return CCutsceneTemplate
+        return CCutsceneTemplate
+    finally:
+        _cutscene_progress_end(window_manager, workspace)

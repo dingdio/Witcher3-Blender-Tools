@@ -590,6 +590,8 @@ def _clear_loaded_cutscene_state(scene):
     scene.witcher_cutscene_effect_items.clear()
     scene.witcher_cutscene_dialog_items.clear()
     scene.witcher_loaded_cutscene_name = ""
+    if hasattr(scene, "witcher_cutscene_last_import_seconds"):
+        scene.witcher_cutscene_last_import_seconds = 0.0
     if hasattr(scene, "witcher_loaded_w2cutscene_path"):
         scene.witcher_loaded_w2cutscene_path = ""
 
@@ -757,6 +759,11 @@ def _sync_loaded_cutscene_state(scene, filepath, cutscene_data=None):
     if not filepath:
         _clear_loaded_cutscene_state(scene)
         return
+    if cutscene_data is not None and hasattr(scene, "witcher_cutscene_last_import_seconds"):
+        try:
+            scene.witcher_cutscene_last_import_seconds = float(getattr(cutscene_data, "import_duration_seconds", 0.0) or 0.0)
+        except Exception:
+            pass
 
     same_path = os.path.normcase(os.path.normpath(str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or ""))) == os.path.normcase(os.path.normpath(filepath))
     old_actor_state = {}
@@ -776,7 +783,10 @@ def _sync_loaded_cutscene_state(scene, filepath, cutscene_data=None):
             for item in getattr(scene, "witcher_cutscene_animation_items", [])
         }
 
-    _cutscene, actor_items, animation_items, event_items = import_cutscene.collect_cutscene_preview(filepath)
+    _cutscene, actor_items, animation_items, event_items = import_cutscene.collect_cutscene_preview(
+        filepath,
+        cutscene_template=cutscene_data,
+    )
 
     _sync_cutscene_template_fields(scene, _cutscene)
     scene.witcher_cutscene_effect_items.clear()
@@ -1078,14 +1088,18 @@ class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
 
         auto_loaded_count = int(getattr(cutscene_data, "auto_applied_animation_count", 0) or 0)
+        import_duration_seconds = float(getattr(cutscene_data, "import_duration_seconds", 0.0) or 0.0)
         _sync_loaded_cutscene_state(context.scene, self.filepath, cutscene_data=cutscene_data)
         self.report(
             {'INFO'},
             (
                 f"Imported {len(selected_actor_indices)} actor(s) and auto-loaded "
-                f"{auto_loaded_count}/{len(selected_animation_indices)} animation(s)."
+                f"{auto_loaded_count}/{len(selected_animation_indices)} animation(s) in {import_duration_seconds:.2f}s."
                 if self.auto_apply_animations
-                else f"Imported {len(selected_actor_indices)} actor(s) and listed {len(selected_animation_indices)} animation(s) from cutscene."
+                else (
+                    f"Imported {len(selected_actor_indices)} actor(s) and listed "
+                    f"{len(selected_animation_indices)} animation(s) from cutscene in {import_duration_seconds:.2f}s."
+                )
             ),
         )
         return {'FINISHED'}
@@ -1508,6 +1522,9 @@ class WITCHER_PT_scene_panel(WITCH_PT_Base, Panel):
             cs_name = scene.witcher_loaded_cutscene_name or _get_loaded_cutscene_name(loaded_cutscene_path)
             header.label(text=cs_name, icon='ACTION')
             header.operator(WITCH_OT_ReopenCutsceneImportDialog.bl_idname, text="", icon='FILE_REFRESH')
+            last_import_seconds = float(getattr(scene, "witcher_cutscene_last_import_seconds", 0.0) or 0.0)
+            if last_import_seconds > 0.0:
+                cs_box.label(text=f"Last import: {last_import_seconds:.2f}s", icon='TIME')
 
             prev_split = cs_box.use_property_split
             cs_box.use_property_split = False
@@ -1626,6 +1643,7 @@ def register():
     bpy.types.Scene.witcher_sections_index = bpy.props.IntProperty(default=0)
     bpy.types.Scene.witcher_sections_filepath = bpy.props.StringProperty(default="")
     bpy.types.Scene.witcher_loaded_cutscene_name = bpy.props.StringProperty(default="")
+    bpy.types.Scene.witcher_cutscene_last_import_seconds = bpy.props.FloatProperty(default=0.0)
     bpy.types.Scene.witcher_cutscene_actor_items = bpy.props.CollectionProperty(type=CutsceneLoadedActorItem)
     bpy.types.Scene.witcher_cutscene_animation_items = bpy.props.CollectionProperty(type=CutsceneLoadedAnimationItem)
     bpy.types.Scene.witcher_cutscene_event_items = bpy.props.CollectionProperty(type=CutsceneEventItem)
@@ -1658,6 +1676,8 @@ def unregister():
         del bpy.types.Scene.witcher_sections_filepath
     if hasattr(bpy.types.Scene, "witcher_loaded_cutscene_name"):
         del bpy.types.Scene.witcher_loaded_cutscene_name
+    if hasattr(bpy.types.Scene, "witcher_cutscene_last_import_seconds"):
+        del bpy.types.Scene.witcher_cutscene_last_import_seconds
     if hasattr(bpy.types.Scene, "witcher_cutscene_actor_items"):
         del bpy.types.Scene.witcher_cutscene_actor_items
     if hasattr(bpy.types.Scene, "witcher_cutscene_animation_items"):

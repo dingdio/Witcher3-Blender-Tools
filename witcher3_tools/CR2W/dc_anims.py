@@ -728,7 +728,21 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
                 f = open(def_path,"rb")
                 def_data = f.read()
                 inline_size = len(data_in_file) if data_in_file else 0
-                log.warning(f"[anim_buffer] ABSO_PartiallyStreamable: inline_data={inline_size}B, buffer={len(def_data)}B, path={def_path}")
+                buffer_size = len(def_data)
+                if inline_size == 0 or buffer_size == 0:
+                    log.warning(
+                        "[anim_buffer] ABSO_PartiallyStreamable with empty segment: inline_data=%dB, buffer=%dB, path=%s",
+                        inline_size,
+                        buffer_size,
+                        def_path,
+                    )
+                else:
+                    log.debug(
+                        "[anim_buffer] ABSO_PartiallyStreamable: inline_data=%dB, buffer=%dB, path=%s",
+                        inline_size,
+                        buffer_size,
+                        def_path,
+                    )
                 b = bytearray(data_in_file) + def_data
                 the_data = bStream(data = b)
                 f.close()
@@ -1854,7 +1868,7 @@ def create_CCutscene(file):
 
 def load_bin_cutscene(fileName) -> w3_types.CCutsceneTemplate:
     with open(fileName, "rb") as f:
-        theFile = getCR2W(f)
+        theFile = getCR2W(f, do_read_anim_buffer=True)
         f.close()
     anim_set = create_CCutscene(theFile)
     return anim_set

@@ -514,6 +514,10 @@ class witcherui_RigSettings(bpy.types.PropertyGroup):
     witcher_face_morphs: bpy.props.BoolProperty(default = True,
                         name = "Morphs from mimic poses",
                         description = "Search for witcher Body morphs")
+    keep_face_morph_pose_actions: bpy.props.BoolProperty(
+                        default = False,
+                        name = "Keep Imported Pose Actions",
+                        description = "Keep the temporary pose actions generated while baking face morphs")
     witcher_morphs_collapse: bpy.props.BoolProperty(default = True)
     witcher_morphs_collapse2: bpy.props.BoolProperty(default = True)
     phoneme_enabled: bpy.props.BoolProperty(default = True,
@@ -638,6 +642,8 @@ class WITCH_PT_WitcherMorphs(WITCH_PT_Base, bpy.types.Panel):
         )
         if main_arm_obj and rig_settings:
             layout = self.layout
+
+            layout.prop(rig_settings, "keep_face_morph_pose_actions", text="Keep Imported Pose Actions")
 
             row = layout.row()
             row.prop(rig_settings, "morph_search_filter", icon = "VIEWZOOM")
@@ -1083,6 +1089,10 @@ class WITCH_OT_morphs(bpy.types.Operator):
             bl_ctrl_bone_pose = main_obj.pose.bones[control_bone_name]
             morph_list = rig_settings.witcher_morphs_list
             existing_morph_keys = {(el.name, el.path, el.type) for el in morph_list}
+            keep_pose_actions = bool(getattr(rig_settings, "keep_face_morph_pose_actions", False))
+            face_anim_data = getattr(face_rig, "animation_data", None)
+            previous_face_action = getattr(face_anim_data, "action", None) if face_anim_data else None
+            generated_pose_actions = []
 
             prev_bake_every_frame = getattr(scene, 'witcher_bake_every_frame', None)
             if prev_bake_every_frame is not None:
@@ -1114,6 +1124,9 @@ class WITCH_OT_morphs(bpy.types.Operator):
                     #bpy.ops.object.mode_set(mode='POSE', toggle=False)
                     #bpy.ops.pose.transforms_clear()
                     import_anims.import_anim(context, "imported", set_entry, facePose=True, override_select=[face_rig], update_scene_settings=False , at_frame=0)
+                    generated_action = getattr(getattr(face_rig, "animation_data", None), "action", None)
+                    if generated_action is not None and not keep_pose_actions and generated_action not in generated_pose_actions:
+                        generated_pose_actions.append(generated_action)
 
                     #!GET MESH OBJECTS FOR THIS AND APPLY SHAPE KEYS
                     for the_mesh in face_mesh_objs:
@@ -1128,14 +1141,35 @@ class WITCH_OT_morphs(bpy.types.Operator):
             finally:
                 if prev_bake_every_frame is not None:
                     scene.witcher_bake_every_frame = prev_bake_every_frame
+                if face_rig and getattr(face_rig, "animation_data", None):
+                    face_rig.animation_data.action = previous_face_action
 
             #!stop suppress
             if suppress:
                 sys.stdout.flush()
                 os.dup2(old, sys.stdout.fileno())
                 os.close(old)
+            removed_pose_actions = 0
+            if not keep_pose_actions:
+                for action in generated_pose_actions:
+                    try:
+                        if action and action.users == 0:
+                            bpy.data.actions.remove(action)
+                            removed_pose_actions += 1
+                    except Exception:
+                        pass
             time_taken = time.time() - start_time
             log.info("Loaded morphs in %.2f seconds.", time_taken)
+            if removed_pose_actions:
+                log.info("Removed %d temporary face pose action(s).", removed_pose_actions)
+            self.report(
+                {'INFO'},
+                (
+                    f"Loaded face morphs in {time_taken:.2f}s and removed {removed_pose_actions} temporary pose action(s)."
+                    if not keep_pose_actions
+                    else f"Loaded face morphs in {time_taken:.2f}s and kept generated pose actions."
+                ),
+            )
 
             #! RETURN MAIN OBJECT
             _activate_object(main_obj)

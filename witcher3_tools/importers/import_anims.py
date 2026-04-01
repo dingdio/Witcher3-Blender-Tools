@@ -1351,6 +1351,7 @@ def start_import(context, fileName = False, load_from_data = False, rigPath = No
     # GLOBAL_ANIMSET = animSetTemplate
     for node in animSetTemplate.animations:
         item = NewW2ANIMSListItem(treeList, node)
+    context.scene.witcher_w2anims_list_index = 0 if len(treeList) else -1
 
 
 def load_idle_animation_for_armature(context, armature_obj):
