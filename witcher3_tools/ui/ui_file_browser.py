@@ -4235,7 +4235,7 @@ class TexturePreviewOperator(Operator):
             else:
                 self.report({'WARNING'}, f"Texture not found: {self.file_path}")
                 return {'CANCELLED'}
-        # Try TextureCache first (produces proper DDS), then fall back to bundle extraction
+        # Try TextureCache first (produces proper DDS), then fall back to bundle/disk extraction
         elif self.cache_type == "Texture":
             # Direct texture cache lookup
             manager = LoadTextureManager(loadmods=witcher_file_browser.loadmods)
@@ -4246,6 +4246,23 @@ class TexturePreviewOperator(Operator):
                 temp_path = str(Path(temp_path).with_suffix('.dds'))
                 os.makedirs(os.path.dirname(temp_path), exist_ok=True)
                 final_item.extract_to_file(temp_path)
+
+            # Fallback: XBM not in TextureCache — try bundle/disk (e.g. proxy textures)
+            if not temp_path or not win_path_exists(temp_path):
+                try:
+                    abs_path = repo_file(search_path)
+                    if abs_path and win_path_exists(abs_path):
+                        ext = os.path.splitext(abs_path)[1].lower()
+                        if ext in {'.dds', '.png', '.jpg', '.jpeg', '.tga', '.bmp'}:
+                            temp_path = abs_path
+                        elif ext == '.xbm':
+                            dds_path = os.path.splitext(abs_path)[0] + '.dds'
+                            if not win_path_exists(dds_path):
+                                convert_xbm_to_dds(abs_path)
+                            if win_path_exists(dds_path):
+                                temp_path = dds_path
+                except Exception:
+                    pass
         else:
             # For non-Texture caches, try TextureCache first (it produces viewable DDS)
             try:
@@ -4269,9 +4286,14 @@ class TexturePreviewOperator(Operator):
                     abs_path = repo_file(strip_mod_prefix(search_path, mod_name))
                     if abs_path and win_path_exists(abs_path):
                         ext = os.path.splitext(abs_path)[1].lower()
-                        # Only preview directly loadable image formats
                         if ext in {'.dds', '.png', '.jpg', '.jpeg', '.tga', '.bmp'}:
                             temp_path = abs_path
+                        elif ext == '.xbm':
+                            dds_path = os.path.splitext(abs_path)[0] + '.dds'
+                            if not win_path_exists(dds_path):
+                                convert_xbm_to_dds(abs_path)
+                            if win_path_exists(dds_path):
+                                temp_path = dds_path
                         else:
                             self.report({'WARNING'}, f"Cannot preview {ext} files directly from bundle")
                             return {'CANCELLED'}

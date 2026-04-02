@@ -19,7 +19,7 @@ from .. import get_W3_FOLIAGE_PATH
 from .. import get_fbx_uncook_path
 from .. import get_use_fbx_repo
 from .. import get_do_import_redcloth
-from ..importers import import_mesh
+from ..importers import import_mesh, import_isolation
 from ..external_addon_tools import get_srt_addon_status
 
 from bpy_extras.wm_utils.progress_report import (
@@ -105,8 +105,14 @@ def get_CSectorData(level):
 
 
 def recurLayerCollection(layerColl, collName):
+    if layerColl is None:
+        return None
+    target_collection = collName if hasattr(collName, "name") else None
+    target_name = target_collection.name if target_collection is not None else collName
+    if target_collection is not None and getattr(layerColl, "collection", None) == target_collection:
+        return layerColl
     found = None
-    if (layerColl.name == collName):
+    if layerColl.name == target_name:
         return layerColl
     for layer in layerColl.children:
         found = recurLayerCollection(layer, collName)
@@ -125,6 +131,109 @@ def is_within_distance(mesh_translation, reference_vector, distance_threshold):
         return True
     else:
         return False
+
+
+_REPO_DUPLICATE_CACHE = {
+    "scene_key": None,
+    "object_count": -1,
+    "roots": {},
+}
+
+
+def _scene_identity(scene):
+    if scene is None:
+        return None
+    try:
+        return int(scene.as_pointer())
+    except Exception:
+        return id(scene)
+
+
+def _object_identity(obj):
+    if obj is None:
+        return None
+    try:
+        return int(obj.as_pointer())
+    except Exception:
+        return id(obj)
+
+
+def _get_scene(context=None):
+    ctx = context or bpy.context
+    return getattr(ctx, "scene", None)
+
+
+def _get_active_collection(context=None):
+    ctx = context or bpy.context
+    collection = getattr(ctx, "collection", None)
+    if collection is not None:
+        return collection
+    view_layer = getattr(ctx, "view_layer", None)
+    active_layer_collection = getattr(view_layer, "active_layer_collection", None) if view_layer else None
+    collection = getattr(active_layer_collection, "collection", None)
+    if collection is not None:
+        return collection
+    scene = _get_scene(ctx)
+    return getattr(scene, "collection", None)
+
+
+def _normalize_repo_path(path_value):
+    return str(path_value or "").replace("/", "\\").strip()
+
+
+def _normalize_level_repo_path(level_path, context=None):
+    norm_path = _normalize_repo_path(level_path)
+    uncook_root = _normalize_repo_path(get_uncook_path(context)).rstrip("\\")
+    if uncook_root:
+        prefix = uncook_root + "\\"
+        if norm_path.lower().startswith(prefix.lower()):
+            return norm_path[len(prefix):]
+    return norm_path
+
+
+def _find_level_collection(level_path, context=None):
+    level_repo_path = _normalize_level_repo_path(level_path, context)
+    level_abs_path = _normalize_repo_path(level_path)
+    for collection in bpy.data.collections:
+        stored_repo_path = _normalize_level_repo_path(collection.get("level_path", ""), context)
+        stored_abs_path = _normalize_repo_path(collection.get("level_abs_path", ""))
+        if stored_abs_path and stored_abs_path.lower() == level_abs_path.lower():
+            return collection
+        if stored_repo_path and stored_repo_path.lower() == level_repo_path.lower():
+            return collection
+    return None
+
+
+def _ensure_level_collection(level_path, context=None):
+    collection = _find_level_collection(level_path, context)
+    level_repo_path = _normalize_level_repo_path(level_path, context)
+    level_abs_path = _normalize_repo_path(level_path)
+    if collection is None:
+        level_name = os.path.basename(level_repo_path or level_abs_path) or "Level"
+        collection = bpy.data.collections.new(level_name)
+        scene = _get_scene(context)
+        if scene is not None:
+            scene.collection.children.link(collection)
+    collection["level_path"] = level_repo_path
+    collection["level_abs_path"] = level_abs_path
+    return collection
+
+
+def _activate_collection(context, collection):
+    if collection is None:
+        return False
+    ctx = context or bpy.context
+    view_layer = getattr(ctx, "view_layer", None)
+    if view_layer is None:
+        return False
+    active_layer_collection = getattr(view_layer, "active_layer_collection", None)
+    if getattr(active_layer_collection, "collection", None) == collection:
+        return True
+    layer_collection = recurLayerCollection(getattr(view_layer, "layer_collection", None), collection)
+    if layer_collection is None:
+        return False
+    view_layer.active_layer_collection = layer_collection
+    return True
 
 def import_light(mesh, parent_transform = False):
     block = mesh.block
@@ -208,10 +317,11 @@ def import_light(mesh, parent_transform = False):
 def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs):
     #! profiler = cProfile.Profile()
     #! profiler.enable()
-    
+
+    target_collection = kwargs.pop("_level_target_collection", None)
     #keep_empty_lods = kwargs.get('keep_empty_lods', False)
     #keep_proxy_meshes = kwargs.get('keep_proxy_meshes', False)
-    
+
     do_import_Mesh = kwargs.get('do_import_Mesh', True)
     do_import_Collision = kwargs.get('do_import_Collision', True)
     do_import_RigidBody = kwargs.get('do_import_RigidBody', True)
@@ -223,7 +333,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
     
     reference_vector = (115.789, 44.8168, 0.892988)
     distance_threshold = 100.0
-    
+
     if context == None:
         context = bpy.context
     # global repo_lookup_list
@@ -235,31 +345,31 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
     #     if len(o.name) > 4 and o.name[-4] != "." and 'repo_path' in o:
     #         repo_lookup_list[o['repo_path']].append(o)
     levelFile = levelData.layerNode
+    if target_collection is None:
+        target_collection = _ensure_level_collection(levelFile, context)
+
+    if import_isolation.needs_isolation_session(context):
+        with import_isolation.isolated_import_session(
+            context,
+            target_collection,
+            label=Path(_normalize_level_repo_path(levelFile, context)).stem or Path(levelFile).stem or "Level",
+        ) as session:
+            kwargs["_level_target_collection"] = target_collection
+            result = loadLevel(levelData, session.context, keep_lod_meshes, **kwargs)
+        _activate_collection(context, target_collection)
+        return result
+
     errors = ['======Errors======= '+ levelFile]
 
     ready_to_import = True#checkLevel(levelData)
 
     #create collection lfor this level
     if ready_to_import:
-        collectionFound = False
-        repo_path = levelFile.replace(get_uncook_path(bpy.context)+"\\", "")
-        for myCol in bpy.data.collections:
-            if str(myCol.get("level_path", "")).strip() == repo_path:
-                collectionFound = myCol
-                log.info("Collection found in scene")
-                break
-        if collectionFound:
-            collection = collectionFound
-            layer_collection = bpy.context.view_layer.layer_collection
-            layerColl = recurLayerCollection(layer_collection, collection.name)
-            bpy.context.view_layer.active_layer_collection = layerColl
-        else:
-            level_name = os.path.basename(levelFile)
-            collection = bpy.data.collections.new(os.path.basename(level_name))
-            collection['level_path'] = levelFile
-            bpy.context.scene.collection.children.link(collection)
-            layer_collection = bpy.context.view_layer.layer_collection.children[collection.name]
-            bpy.context.view_layer.active_layer_collection = layer_collection
+        collection = target_collection
+        if not import_isolation.is_isolated_import_context(context):
+            _activate_collection(context, collection)
+        if do_import_Mesh or do_import_Collision or do_import_RigidBody:
+            _get_duplicate_root_index(_get_scene(context))
 
     #start level import
     if ready_to_import:
@@ -405,39 +515,166 @@ def repo_in_scene(dct, path):
     else:
         return False
 
-def check_if_empty_already_in_scene(repo_path):
-    start_time1 = time.time()
-    for o in bpy.context.scene.objects:
-        if o.type != 'EMPTY':
-            continue
-        if len(o.name) > 4 and o.name[-4] != "." and 'repo_path' in o and o['repo_path'] == repo_path:
-    #if repo_path in repo_lookup_list.keys(): repo_in_scene(repo_lookup_list, repo_path):
-        #o = repo_lookup_list[repo_path][0]
-            log.info('Check Mesh found in %f seconds.', time.time() - start_time1)
-            start_time2 = time.time()
-            #log.info("COPYING", o['repo_path'])
-            new_obj = o.copy()
-            for ch_obj in o.children:
-                new_ch_obj = ch_obj.copy()
-                new_ch_obj.parent = new_obj
-                bpy.context.collection.objects.link(new_ch_obj)
-            bpy.context.collection.objects.link(new_obj)
-            x, y, z = (radians(0), radians(0), radians(0))
-            mat = Euler((x, y, z)).to_matrix().to_4x4()
-            new_obj.matrix_world = mat
-            new_obj.matrix_local = mat
-            new_obj.matrix_basis = mat
+def _has_blender_numeric_suffix(name: str) -> bool:
+    return bool(name) and len(name) > 4 and name[-4] == "." and name[-3:].isdigit()
 
-            new_obj.location[0] = 0
-            new_obj.location[1] = 0
-            new_obj.location[2] = 0
-            new_obj.scale[0] = 1
-            new_obj.scale[1] = 1
-            new_obj.scale[2] = 1
-            new_obj.parent = None
-            log.info('Check Mesh Finished importing in %f seconds.', time.time() - start_time2)
-            return new_obj
-    return False
+
+def _is_duplicate_root_candidate(obj, repo_path=None):
+    if obj is None or getattr(obj, "type", "") != 'EMPTY':
+        return False
+    obj_name = getattr(obj, "name", "")
+    if not obj_name or obj_name not in bpy.data.objects:
+        return False
+    obj_repo_path = str(obj.get("repo_path", "") or "").strip()
+    if not obj_repo_path:
+        return False
+    if repo_path is not None and obj_repo_path != repo_path:
+        return False
+    return True
+
+
+def _prefer_duplicate_root(current_obj, candidate_obj):
+    if current_obj is None:
+        return candidate_obj
+    current_primary = not _has_blender_numeric_suffix(getattr(current_obj, "name", ""))
+    candidate_primary = not _has_blender_numeric_suffix(getattr(candidate_obj, "name", ""))
+    if candidate_primary and not current_primary:
+        return candidate_obj
+    return current_obj
+
+
+def _rebuild_duplicate_root_index(scene=None):
+    scene = scene or _get_scene()
+    roots = {}
+    if scene is not None:
+        for obj in scene.objects:
+            if not _is_duplicate_root_candidate(obj):
+                continue
+            repo_path = str(obj.get("repo_path", "") or "").strip()
+            roots[repo_path] = _prefer_duplicate_root(roots.get(repo_path), obj)
+    _REPO_DUPLICATE_CACHE["scene_key"] = _scene_identity(scene)
+    _REPO_DUPLICATE_CACHE["object_count"] = len(scene.objects) if scene is not None else -1
+    _REPO_DUPLICATE_CACHE["roots"] = roots
+    return roots
+
+
+def _get_duplicate_root_index(scene=None):
+    scene = scene or _get_scene()
+    scene_key = _scene_identity(scene)
+    object_count = len(scene.objects) if scene is not None else -1
+    if (
+        _REPO_DUPLICATE_CACHE["scene_key"] != scene_key
+        or _REPO_DUPLICATE_CACHE["object_count"] != object_count
+    ):
+        return _rebuild_duplicate_root_index(scene)
+    return _REPO_DUPLICATE_CACHE["roots"]
+
+
+def _touch_duplicate_root_index(scene=None):
+    scene = scene or _get_scene()
+    if _REPO_DUPLICATE_CACHE["scene_key"] == _scene_identity(scene):
+        _REPO_DUPLICATE_CACHE["object_count"] = len(scene.objects) if scene is not None else -1
+
+
+def _record_duplicate_root(obj, scene=None):
+    scene = scene or _get_scene()
+    if scene is None:
+        return
+    if _REPO_DUPLICATE_CACHE["scene_key"] != _scene_identity(scene):
+        _rebuild_duplicate_root_index(scene)
+        return
+    _REPO_DUPLICATE_CACHE["object_count"] = len(scene.objects)
+    if not _is_duplicate_root_candidate(obj):
+        return
+    repo_path = str(obj.get("repo_path", "") or "").strip()
+    current_obj = _REPO_DUPLICATE_CACHE["roots"].get(repo_path)
+    _REPO_DUPLICATE_CACHE["roots"][repo_path] = _prefer_duplicate_root(current_obj, obj)
+
+
+def _remap_object_reference(owner, attr_name, clone_by_id):
+    if owner is None or not hasattr(owner, attr_name):
+        return
+    try:
+        current_value = getattr(owner, attr_name)
+    except Exception:
+        return
+    clone_value = clone_by_id.get(_object_identity(current_value))
+    if clone_value is None:
+        return
+    try:
+        setattr(owner, attr_name, clone_value)
+    except Exception:
+        return
+
+
+def _clone_duplicate_hierarchy(source_root, target_collection=None):
+    if source_root is None:
+        return None
+    target_collection = target_collection or _get_active_collection()
+    if target_collection is None:
+        return None
+
+    clone_pairs = []
+    clone_by_id = {}
+    source_objects = [source_root] + list(getattr(source_root, "children_recursive", []) or [])
+    for source_obj in source_objects:
+        clone_obj = source_obj.copy()
+        target_collection.objects.link(clone_obj)
+        clone_pairs.append((source_obj, clone_obj))
+        clone_by_id[_object_identity(source_obj)] = clone_obj
+
+    for source_obj, clone_obj in clone_pairs:
+        clone_parent = clone_by_id.get(_object_identity(getattr(source_obj, "parent", None)))
+        clone_obj.parent = clone_parent
+
+    for _source_obj, clone_obj in clone_pairs:
+        for modifier in getattr(clone_obj, "modifiers", []):
+            for attr_name in ("object", "mirror_object", "offset_object"):
+                _remap_object_reference(modifier, attr_name, clone_by_id)
+        for constraint in getattr(clone_obj, "constraints", []):
+            for attr_name in ("target", "space_object"):
+                _remap_object_reference(constraint, attr_name, clone_by_id)
+
+    new_root = clone_by_id.get(_object_identity(source_root))
+    if new_root is None:
+        return None
+
+    identity = Matrix.Identity(4)
+    new_root.parent = None
+    new_root.matrix_world = identity.copy()
+    new_root.matrix_local = identity.copy()
+    new_root.matrix_basis = identity.copy()
+    new_root.location[0] = 0
+    new_root.location[1] = 0
+    new_root.location[2] = 0
+    new_root.scale[0] = 1
+    new_root.scale[1] = 1
+    new_root.scale[2] = 1
+    return new_root
+
+
+def check_if_empty_already_in_scene(repo_path):
+    scene = _get_scene()
+    repo_path = str(repo_path or "").strip()
+    if not repo_path:
+        return False
+
+    start_time1 = time.time()
+    root_index = _get_duplicate_root_index(scene)
+    source_root = root_index.get(repo_path)
+    if not _is_duplicate_root_candidate(source_root, repo_path):
+        source_root = _rebuild_duplicate_root_index(scene).get(repo_path)
+    if source_root is None:
+        return False
+
+    log.info('Check Mesh found in %f seconds.', time.time() - start_time1)
+    start_time2 = time.time()
+    new_obj = _clone_duplicate_hierarchy(source_root, _get_active_collection())
+    if new_obj is None:
+        return False
+    _touch_duplicate_root_index(scene)
+    log.info('Check Mesh Finished importing in %f seconds.', time.time() - start_time2)
+    return new_obj
 
 def check_if_mesh_already_in_scene(repo_path):
 
@@ -576,6 +813,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
             #     obj['repo_path'] = mesh.meshName
             #apply scale
             bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+            _record_duplicate_root(obj)
         except Exception:
             #usually tried to do something with materials and failed
             log.exception("Problem finalizing imported mesh %s", mesh.meshName)

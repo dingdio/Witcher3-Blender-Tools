@@ -300,16 +300,26 @@ def _get_entry_fs_path(path_obj):
     return str(path_obj.get("path", "") or "").strip()
 
 
-def _get_entry_repo_path(path_obj):
-    """Return a depot/repo path stored on a dev-panel entry."""
+def _get_entry_repo_paths(path_obj):
+    """Return all depot/repo paths as a list. repo_path may be a string or list of strings."""
     if not isinstance(path_obj, dict):
-        return ""
-    repo_path = str(path_obj.get("repo_path", "") or "").strip()
-    return repo_path.replace("/", "\\")
+        return []
+    raw = path_obj.get("repo_path", "")
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(p).strip().replace("/", "\\") for p in raw if str(p).strip()]
+    return [str(raw).strip().replace("/", "\\")]
+
+
+def _get_entry_repo_path(path_obj):
+    """Return first depot/repo path (for display and single-path operations)."""
+    paths = _get_entry_repo_paths(path_obj)
+    return paths[0] if paths else ""
 
 
 def _is_repo_path_entry(path_obj):
-    return bool(_get_entry_repo_path(path_obj))
+    return bool(_get_entry_repo_paths(path_obj))
 
 
 def _get_entry_display_path(path_obj):
@@ -342,13 +352,20 @@ def _is_override_value_set(value) -> bool:
     return value is not None
 
 
-def _resolve_entry_import_path(path_obj):
-    """Resolve an entry to a filesystem path suitable for import operators."""
-    repo_path = _get_entry_repo_path(path_obj)
-    if repo_path:
+def _resolve_entry_import_paths(path_obj):
+    """Resolve an entry to a list of filesystem paths suitable for import operators."""
+    repo_paths = _get_entry_repo_paths(path_obj)
+    if repo_paths:
         from ..CR2W.common_blender import repo_file
-        return repo_file(repo_path)
-    return _get_entry_fs_path(path_obj)
+        return [repo_file(rp) for rp in repo_paths]
+    fs_path = _get_entry_fs_path(path_obj)
+    return [fs_path] if fs_path else []
+
+
+def _resolve_entry_import_path(path_obj):
+    """Resolve an entry to a single filesystem path (first path for multi-path entries)."""
+    paths = _resolve_entry_import_paths(path_obj)
+    return paths[0] if paths else ""
 
 
 # =============================================================================
@@ -735,6 +752,53 @@ class DEV_OT_ImportPath(Operator):
     section_index: IntProperty(default=0)
     path_index: IntProperty(default=0)
 
+    def _dispatch_import(self, invoke_mode, filepath):
+        op = self.operator_type
+        if op == 'w2mesh':
+            bpy.ops.witcher.import_w2mesh(invoke_mode, filepath=filepath)
+        elif op == 'nxs':
+            bpy.ops.witcher.import_nxs(invoke_mode, filepath=filepath)
+        elif op == 'apx':
+            bpy.ops.witcher.import_apx_materials(invoke_mode, filepath=filepath)
+        elif op == 'w2ent_chara':
+            bpy.ops.witcher.import_w2ent_character(invoke_mode, filepath=filepath)
+        elif op == 'w2ent':
+            bpy.ops.witcher.import_w2ent(invoke_mode, filepath=filepath)
+        elif op == 'w2anims':
+            bpy.ops.witcher.import_w2_anims_json(invoke_mode, filepath=filepath)
+        elif op == 'w2rig':
+            bpy.ops.witcher.import_w2_rig(invoke_mode, filepath=filepath)
+        elif op == 'w2l':
+            bpy.ops.witcher.import_w2l(invoke_mode, filepath=filepath)
+        elif op == 'w2w':
+            bpy.ops.witcher.import_w2w(invoke_mode, filepath=filepath)
+        elif op == 'w2scene':
+            bpy.ops.witcher.import_w2_scene(invoke_mode, filepath=filepath)
+        elif op == 'w2cutscene':
+            bpy.ops.witcher.import_w2_cutscene(invoke_mode, filepath=filepath)
+        elif op == 'w2mi':
+            bpy.ops.witcher.import_w2mi(invoke_mode, filepath=filepath)
+        elif op == 'w2mg':
+            bpy.ops.witcher.import_w2mg(invoke_mode, filepath=filepath)
+        elif op == 'xbm':
+            bpy.ops.witcher.import_xbm(invoke_mode, filepath=filepath)
+        elif op == 'w2cube':
+            bpy.ops.witcher.import_w2cube(invoke_mode, filepath=filepath)
+        elif op == 'inventory':
+            bpy.ops.witcher.import_w2ent_inventory(invoke_mode, filepath=filepath)
+        elif op == 'w3app':
+            bpy.ops.witcher.import_w3app(invoke_mode, filepath=filepath)
+        elif op == 'fbx':
+            bpy.ops.witcher.import_witcher3_fbx(invoke_mode, filepath=filepath)
+        elif op == 'voice':
+            bpy.ops.witcher.import_w2_voice(invoke_mode, filepath=filepath)
+        elif op == 'flyr':
+            bpy.ops.witcher.import_flyr(invoke_mode, filepath=filepath)
+        elif op == 'srt':
+            bpy.ops.witcher.import_srt(invoke_mode, filepath=filepath)
+        else:
+            raise ValueError(f"Unknown operator type: {op}")
+
     def execute(self, context):
         config = get_config()
         op_data = config.get(self.operator_type, {})
@@ -744,78 +808,38 @@ class DEV_OT_ImportPath(Operator):
             paths = sections[self.section_index].get("paths", [])
             if 0 <= self.path_index < len(paths):
                 path_obj = paths[self.path_index]
-                display_path = _get_entry_display_path(path_obj)
                 if not _entry_can_import(path_obj):
                     self.report({'ERROR'}, "Empty path entry")
                     return {'CANCELLED'}
 
                 try:
-                    filepath = _resolve_entry_import_path(path_obj)
+                    filepaths = _resolve_entry_import_paths(path_obj)
                 except Exception as e:
-                    self.report({'ERROR'}, f"Path resolve failed: {display_path} ({e})")
+                    self.report({'ERROR'}, f"Path resolve failed: {_get_entry_display_path(path_obj)} ({e})")
                     return {'CANCELLED'}
 
-                if not file_exists(filepath):
-                    if _is_repo_path_entry(path_obj):
-                        self.report({'ERROR'}, f"Repo path not found/extracted: {display_path}")
-                    else:
-                        self.report({'ERROR'}, f"File not found: {filepath}")
+                if not filepaths:
+                    self.report({'ERROR'}, "No paths to import")
                     return {'CANCELLED'}
 
-                # Determine invoke mode based on open_dialog setting
+                is_multi = len(filepaths) > 1
                 open_dialog = context.scene.witcher_dev_open_dialog
-                invoke_mode = 'INVOKE_DEFAULT' if open_dialog else 'EXEC_DEFAULT'
+                # Multi-path batches always run without dialog
+                invoke_mode = 'EXEC_DEFAULT' if is_multi else ('INVOKE_DEFAULT' if open_dialog else 'EXEC_DEFAULT')
 
-                # Call the appropriate import operator
-                try:
-                    if self.operator_type == 'w2mesh':
-                        bpy.ops.witcher.import_w2mesh(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'nxs':
-                        bpy.ops.witcher.import_nxs(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'apx':
-                        bpy.ops.witcher.import_apx_materials(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2ent_chara':
-                        bpy.ops.witcher.import_w2ent_character(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2ent':
-                        bpy.ops.witcher.import_w2ent(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2anims':
-                        bpy.ops.witcher.import_w2_anims_json(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2rig':
-                        bpy.ops.witcher.import_w2_rig(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2l':
-                        bpy.ops.witcher.import_w2l(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2w':
-                        bpy.ops.witcher.import_w2w(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2scene':
-                        bpy.ops.witcher.import_w2_scene(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2cutscene':
-                        bpy.ops.witcher.import_w2_cutscene(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2mi':
-                        bpy.ops.witcher.import_w2mi(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2mg':
-                        bpy.ops.witcher.import_w2mg(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'xbm':
-                        bpy.ops.witcher.import_xbm(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w2cube':
-                        bpy.ops.witcher.import_w2cube(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'inventory':
-                        bpy.ops.witcher.import_w2ent_inventory(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'w3app':
-                        bpy.ops.witcher.import_w3app(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'fbx':
-                        bpy.ops.witcher.import_witcher3_fbx(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'voice':
-                        bpy.ops.witcher.import_w2_voice(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'flyr':
-                        bpy.ops.witcher.import_flyr(invoke_mode, filepath=filepath)
-                    elif self.operator_type == 'srt':
-                        bpy.ops.witcher.import_srt(invoke_mode, filepath=filepath)
-                    else:
-                        self.report({'ERROR'}, f"Unknown operator type: {self.operator_type}")
+                for filepath in filepaths:
+                    if not file_exists(filepath):
+                        msg = f"Repo path not found/extracted: {filepath}" if _is_repo_path_entry(path_obj) else f"File not found: {filepath}"
+                        if is_multi:
+                            self.report({'WARNING'}, msg)
+                            continue
+                        self.report({'ERROR'}, msg)
                         return {'CANCELLED'}
-                except Exception as e:
-                    self.report({'ERROR'}, f"Import failed: {e}")
-                    return {'CANCELLED'}
+                    try:
+                        self._dispatch_import(invoke_mode, filepath)
+                    except Exception as e:
+                        self.report({'ERROR'}, f"Import failed: {filepath} ({e})")
+                        return {'CANCELLED'}
 
                 return {'FINISHED'}
 
@@ -994,7 +1018,13 @@ class VIEW3D_PT_witcher_dev(Panel):
             op.path_index = path_idx
 
             # Path basename and note
-            label = get_basename(display_path) if display_path else "(empty)"
+            repo_paths = _get_entry_repo_paths(path_obj)
+            if len(repo_paths) > 1:
+                label = f"[{len(repo_paths)} files]"
+            elif display_path:
+                label = get_basename(display_path)
+            else:
+                label = "(empty)"
             if is_repo_path:
                 label = f"[repo] {label}"
             if note:

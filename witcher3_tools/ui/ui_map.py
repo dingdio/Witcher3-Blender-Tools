@@ -149,9 +149,10 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
         start_time = time.time()
         if fdir.endswith(".w2l"):
             cur_dir = Path(self.filepath).parent
-            
-            for file in files:
-                filepath = str(cur_dir / file.name)
+
+            file_list = [f.name for f in files if f.name] or [Path(self.filepath).name]
+            for fname in file_list:
+                filepath = str(cur_dir / fname)
                 log.info("Importing file: %s", filepath)
                 levelFile = CR2W.CR2W_reader.load_w2l(filepath)
                 import_w2l.btn_import_W2L(levelFile, context, self.keep_lod_meshes,

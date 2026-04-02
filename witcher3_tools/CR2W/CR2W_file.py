@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from .third_party_libs import yaml
 from .common_blender import repo_file
+from .prop_utils import prop_to_string
 from ..extension_paths import get_dev_override
 log = logging.getLogger(__name__)
 import io
@@ -32,12 +33,28 @@ def _first_handle_depot_path(prop):
     return str(getattr(handles[0], "DepotPath", "") or "").strip()
 
 
+def _stream_chunk_string_prop(stream_chunk, *prop_names):
+    if stream_chunk is None:
+        return ""
+    stream_type = str(getattr(stream_chunk, "Type", getattr(stream_chunk, "name", "")) or "").strip()
+    for prop_name in prop_names:
+        prop = stream_chunk.GetVariableByName(prop_name) if hasattr(stream_chunk, "GetVariableByName") else None
+        value = str(prop_to_string(prop) or "").strip()
+        if not value:
+            continue
+        if value == stream_type:
+            continue
+        return value
+    return ""
+
+
 def _should_suppress_streaming_name_warning(stream_chunk, resource_path="", mesh_path=""):
     if resource_path or mesh_path:
         return False
     stream_type = getattr(stream_chunk, "Type", getattr(stream_chunk, "name", "")) if stream_chunk else ""
     return stream_type in {
         "CEffectDummyComponent",
+        "CInteractionComponent",
     }
 
 
@@ -483,19 +500,24 @@ def create_level(file, filename):
                             Entity.name = Path(mesh_path).stem
                             Entity.name += f" ({Entity.type})"
                         else:
-                            if not _should_suppress_streaming_name_warning(
-                                stream_chunk,
-                                resource_path,
-                                mesh_path,
-                            ):
-                                detail = _describe_streaming_name_failure(
-                                    file,
-                                    chunk,
+                            stream_label = _stream_chunk_string_prop(stream_chunk, "name", "actionName")
+                            if stream_label:
+                                Entity.name = stream_label
+                                Entity.name += f" ({Entity.type})"
+                            else:
+                                if not _should_suppress_streaming_name_warning(
                                     stream_chunk,
-                                    resource_prop,
-                                    mesh_prop,
-                                )
-                                log.warning("Streaming entity name resolution failed (%s)", detail)
+                                    resource_path,
+                                    mesh_path,
+                                ):
+                                    detail = _describe_streaming_name_failure(
+                                        file,
+                                        chunk,
+                                        stream_chunk,
+                                        resource_prop,
+                                        mesh_prop,
+                                    )
+                                    log.warning("Streaming entity name resolution failed (%s)", detail)
                 try:
                     if hasattr(chunk, 'Components'):
                         for chunk_id in chunk.Components:

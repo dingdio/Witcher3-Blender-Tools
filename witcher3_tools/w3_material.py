@@ -1315,11 +1315,6 @@ def create_node_texture(
     tex_path = os.path.abspath( final_texture )
     
             
-    if not os.path.exists(win_safe_path(tex_path)) and '_proxy' in os.path.basename(tex_path):
-        bundle_texture = repo_file(par_value) #os.path.join(get_uncook_path(bpy.context), par_value)
-        bundle_texture_xbm = bundle_texture.rsplit('.', 1)[0] + '.xbm'
-        tex_path = bundle_texture
-    
     ## didn't find the texture, try find and convert xbm
     if not os.path.exists(win_safe_path(tex_path)):
         
