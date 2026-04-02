@@ -16,6 +16,7 @@ from ..ui.ui_utils import WITCH_PT_Base
 from ..ui.armature_context import (
     draw_main_armature_selector,
     get_main_armature_and_rig_settings,
+    set_main_armature,
 )
 from bpy.types import Panel, Operator, UIList
 from bpy.props import IntProperty, StringProperty, BoolProperty, EnumProperty
@@ -37,6 +38,7 @@ from ..CR2W.common_blender import (
     repo_file,
     mod_loading_context,
 )
+from ..duplication import duplicate_character_hierarchy as _duplicate_character_hierarchy
 
 from . import ui_file_browser
 
@@ -1184,6 +1186,52 @@ class WITCH_OT_ENTITY_import_ciri(bpy.types.Operator):
             return {'FINISHED'}
 
 
+class WITCH_OT_ENTITY_duplicate_linked(bpy.types.Operator):
+    """Duplicate the selected character hierarchy without re-importing assets"""
+    bl_idname = "witcher.duplicate_character_linked"
+    bl_label = "Duplicate Linked"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        source_armature, _rig_settings = get_main_armature_and_rig_settings(
+            context, prefer_active=True, remember=True, fallback=True,
+        )
+        if not source_armature or getattr(source_armature, "type", "") != 'ARMATURE':
+            self.report({'WARNING'}, "No character armature selected.")
+            return {'CANCELLED'}
+
+        duplicate_armature = _duplicate_character_hierarchy(context, source_armature)
+        if duplicate_armature is None:
+            self.report({'ERROR'}, f"Failed to duplicate '{source_armature.name}'.")
+            return {'CANCELLED'}
+
+        try:
+            from .ui_equipment import refresh_slot_constraints
+            refresh_slot_constraints(duplicate_armature)
+        except Exception:
+            pass
+
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+        except Exception:
+            pass
+        try:
+            duplicate_armature.select_set(True)
+            context.view_layer.objects.active = duplicate_armature
+        except Exception:
+            pass
+        if getattr(context, "scene", None):
+            set_main_armature(context.scene, duplicate_armature)
+
+        message = (
+            f"Created linked duplicate '{duplicate_armature.name}' from '{source_armature.name}'. "
+            "Mesh data is reused except for shape-key meshes."
+        )
+        log.info(message)
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
 class WITCH_OT_RevealAnimInExplorer(Operator):
     """Open the file's containing folder in Windows Explorer"""
     bl_idname = "witcher.reveal_anim_in_explorer"
@@ -1510,6 +1558,12 @@ class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
         target_box.label(text="Character Target", icon='ARMATURE_DATA')
         target_col = target_box.column(align=True)
         draw_main_armature_selector(target_col, context, label="Character", fallback=True)
+        if main_arm_obj and rig_settings:
+            target_col.operator(
+                WITCH_OT_ENTITY_duplicate_linked.bl_idname,
+                text="Duplicate Linked",
+                icon='DUPLICATE',
+            )
         if not (main_arm_obj and rig_settings):
             target_col.label(text="Import a character from Asset Browser, then set/select its armature", icon='INFO')
 
@@ -1661,6 +1715,7 @@ classes = [
     WITCH_OT_ENTITY_import_inventory,
     WITCH_OT_ENTITY_import_geralt,
     WITCH_OT_ENTITY_import_ciri,
+    WITCH_OT_ENTITY_duplicate_linked,
     WITCH_OT_ENTITY_list_loadapp,
     WITCH_OT_ENTITY_lod_toggle,
 

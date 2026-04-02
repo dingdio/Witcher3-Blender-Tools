@@ -37,6 +37,7 @@ from ..CR2W.dc_entity import LoadCEntityTemplateFile, clear_template_cache
 from ..CR2W.dc_entity import is_valid_mesh_path
 from ..CR2W.CR2W_types import EngineTransform
 from ..importers.import_helpers import set_blender_object_transform
+from ..importers import import_isolation
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
 from ..CR2W.common_blender import repo_file
 from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
@@ -875,6 +876,27 @@ def _focus_main_armature(context, armature_obj):
 
 def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                         parent_transform = None, selected_appearance_name = ""):
+    base_context = bpy.context
+    # Keep isolation at the public entry point.  The existing entity import
+    # implementation below should stay unaware of the temporary session.
+    if import_isolation.needs_isolation_session(base_context):
+        target_collection = _get_import_target_collection(base_context)
+        with import_isolation.isolated_import_session(
+            base_context,
+            target_collection,
+            label=Path(filename).stem,
+        ):
+            result = import_ent_template(
+                filename,
+                load_face_poses,
+                import_apperance,
+                parent_transform,
+                selected_appearance_name,
+            )
+        if result is not None:
+            _focus_main_armature(base_context, result)
+        return result
+
     clear_template_cache()
     context = bpy.context
     target_collection = _get_import_target_collection(context)
@@ -3720,6 +3742,22 @@ def import_app(context,
                selectedAppearance,
                entity,
                base_animation_skeleton):
+    base_context = context or bpy.context
+    # Appearance import is another public boundary.  Wrap once here instead of
+    # threading isolation-specific parameters down through template/chunk code.
+    if import_isolation.needs_isolation_session(base_context):
+        target_collection = _get_import_target_collection(base_context)
+        visible_objects = import_isolation.collect_related_hierarchy_objects(base_animation_skeleton)
+        with import_isolation.isolated_import_session(
+            base_context,
+            target_collection,
+            label=f"{getattr(base_animation_skeleton, 'name', 'Character')}_{getattr(selectedAppearance, 'name', 'Appearance')}",
+            visible_objects=visible_objects,
+        ) as session:
+            result = import_app(session.context, selectedAppearance, entity, base_animation_skeleton)
+        _focus_main_armature(base_context, base_animation_skeleton)
+        return result
+
     target_collection = _get_import_target_collection(context)
     _activate_target_collection(context, target_collection)
     import_redcloth_enabled = get_do_import_redcloth(context)

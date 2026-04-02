@@ -16,6 +16,7 @@ from ..CR2W.witcher_cache.Bundles import LoadBundleManager
 from ..CR2W.witcher_cache.Bundles.BundleItem import BundleItem
 from ..CR2W.common_blender import repo_file, mod_loading_context
 from ..importers import import_entity
+from ..importers import import_isolation
 from ..importers.import_anims import load_idle_animation_for_armature as _load_idle_anim
 from ..CR2W.dc_entity import LoadCEntityTemplateFile  # Import the function as per your setup
 from ..extension_paths import get_cache_root, get_dev_override
@@ -6222,6 +6223,27 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
 
 def load_equipment_item(context, armature, slot_index, rig_settings=None, mount_mode=None):
     """Load a single equipment item into the scene, tagged with GUID."""
+    base_context = context or bpy.context
+    # Keep isolation at the outer equipment API.  The core loader continues to
+    # run through the legacy code path and does not need isolation parameters.
+    if import_isolation.needs_isolation_session(base_context):
+        target_collection = import_entity._get_import_target_collection(base_context)
+        visible_objects = import_isolation.collect_related_hierarchy_objects(armature)
+        with _preserve_selection(base_context):
+            with import_isolation.isolated_import_session(
+                base_context,
+                target_collection,
+                label=f"{getattr(armature, 'name', 'Character')}_Equipment",
+                visible_objects=visible_objects,
+            ) as session:
+                return load_equipment_item(
+                    session.context,
+                    armature,
+                    slot_index,
+                    rig_settings=rig_settings,
+                    mount_mode=mount_mode,
+                )
+
     saved_active, saved_selection = _capture_selection_state(context)
     try:
         return _load_equipment_item_core(
@@ -6240,6 +6262,28 @@ def load_equipment_item(context, armature, slot_index, rig_settings=None, mount_
 
 def load_equipment_items_batch(context, armature, slot_indices, rig_settings=None, prepared_context=None,
                                reload_loaded=False, post_refresh_variants=True, mount_mode="auto"):
+    base_context = context or bpy.context
+    if import_isolation.needs_isolation_session(base_context):
+        target_collection = import_entity._get_import_target_collection(base_context)
+        visible_objects = import_isolation.collect_related_hierarchy_objects(armature)
+        with _preserve_selection(base_context):
+            with import_isolation.isolated_import_session(
+                base_context,
+                target_collection,
+                label=f"{getattr(armature, 'name', 'Character')}_EquipmentBatch",
+                visible_objects=visible_objects,
+            ) as session:
+                return load_equipment_items_batch(
+                    session.context,
+                    armature,
+                    slot_indices,
+                    rig_settings=rig_settings,
+                    prepared_context=prepared_context,
+                    reload_loaded=reload_loaded,
+                    post_refresh_variants=post_refresh_variants,
+                    mount_mode=mount_mode,
+                )
+
     if rig_settings is None:
         rig_settings = armature.data.witcherui_RigSettings
     saved_active, saved_selection = _capture_selection_state(context)
@@ -6343,6 +6387,19 @@ def load_template_item(context, armature, slot_index, rig_settings=None):
     Returns:
         True if template was loaded successfully, False otherwise
     """
+    base_context = context or bpy.context
+    if import_isolation.needs_isolation_session(base_context):
+        target_collection = import_entity._get_import_target_collection(base_context)
+        visible_objects = import_isolation.collect_related_hierarchy_objects(armature)
+        with _preserve_selection(base_context):
+            with import_isolation.isolated_import_session(
+                base_context,
+                target_collection,
+                label=f"{getattr(armature, 'name', 'Character')}_Template",
+                visible_objects=visible_objects,
+            ) as session:
+                return load_template_item(session.context, armature, slot_index, rig_settings=rig_settings)
+
     if rig_settings is None:
         rig_settings = armature.data.witcherui_RigSettings
 

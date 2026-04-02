@@ -7,6 +7,7 @@ from ..importers import import_entity
 from ..action_compat import iter_action_fcurves, remove_action_fcurve
 from ..CR2W.dc_anims import load_bin_cutscene
 from ..CR2W.common_blender import repo_file
+from ..duplication import duplicate_character_hierarchy
 
 log = logging.getLogger(__name__)
 
@@ -263,12 +264,61 @@ def _iter_cutscene_related_armatures(actor_obj):
     for extra_obj in _iter_additional_cutscene_armatures(actor_obj):
         yield from _yield_once(extra_obj)
 
-def _tag_new_cutscene_objects(before_objects, guid):
-    if not guid:
-        return set()
-    from ..ui.ui_equipment import tag_new_objects_with_guid
+def _tag_cutscene_object_hierarchy(actor_obj, guid):
+    if actor_obj is None or not guid:
+        return
+    seen = set()
 
-    return tag_new_objects_with_guid(before_objects, guid, CUTSCENE_GUID_PROP)
+    def _iter_related_objects(root_obj):
+        if root_obj is None:
+            return
+        yield root_obj
+        for obj in _iter_object_descendants(root_obj):
+            yield obj
+
+    related_roots = [actor_obj, *list(_iter_additional_cutscene_armatures(actor_obj))]
+    for root_obj in related_roots:
+        for obj in _iter_related_objects(root_obj):
+            obj_name = getattr(obj, "name", None)
+            if not obj_name or obj_name not in bpy.data.objects or obj_name in seen:
+                continue
+            seen.add(obj_name)
+            try:
+                obj[CUTSCENE_GUID_PROP] = str(guid)
+            except Exception:
+                pass
+
+
+def _duplicate_cutscene_actor_from_source(source_actor, actor_name="", repo_path="", appearance_name=""):
+    if source_actor is None or getattr(source_actor, "type", None) != 'ARMATURE':
+        return None, ""
+    try:
+        duplicate_actor = duplicate_character_hierarchy(bpy.context, source_actor)
+    except Exception:
+        log.exception(
+            "Failed to duplicate cached cutscene actor '%s'",
+            getattr(source_actor, "name", "<unknown>"),
+        )
+        return None, ""
+
+    if duplicate_actor is None:
+        return None, ""
+
+    cutscene_guid = _generate_cutscene_guid()
+    _tag_cutscene_object_hierarchy(duplicate_actor, cutscene_guid)
+    _clear_cutscene_actor_tags(duplicate_actor)
+    try:
+        duplicate_actor[CUTSCENE_ACTOR_IMPORTED_PROP] = True
+        duplicate_actor[CUTSCENE_GUID_PROP] = str(cutscene_guid)
+        if actor_name:
+            duplicate_actor["cutscene_actor_name"] = str(actor_name)
+        if repo_path:
+            duplicate_actor["cutscene_actor_template"] = _normalize_repo_path(repo_path)
+        if appearance_name:
+            duplicate_actor["cutscene_actor_appearance"] = str(appearance_name)
+    except Exception:
+        pass
+    return duplicate_actor, cutscene_guid
 
 def _generate_cutscene_guid():
     from ..ui.ui_equipment import generate_guid
@@ -364,9 +414,15 @@ def _ensure_cutscene_actor_appearance(actor_obj, preferred_name=""):
         return False, ""
 
     try:
+        actor_obj["_w3_entity_import_in_progress"] = True
         rig_settings.app_list_index = app_idx
     except Exception:
         pass
+    finally:
+        try:
+            del actor_obj["_w3_entity_import_in_progress"]
+        except Exception:
+            pass
 
     if _has_loaded_appearance_group(actor_obj, resolved_name):
         return True, resolved_name
@@ -468,7 +524,7 @@ def is_cutscene_animation_loaded(actor_obj, animation_name, source_path, source_
                     return True
     return False
 
-def load_cutscene_actor(filename, actor_index, cutscene_template=None):
+def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cache=None):
     cutscene_template = cutscene_template if cutscene_template is not None else loadCutsceneFile(filename)
     if cutscene_template is None:
         return {}
@@ -486,16 +542,26 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None):
     actor_name = str(getattr(actor, "name", "") or "").strip()
     template_path = _normalize_repo_path(getattr(actor, "template", "") or "")
     preferred_appearance_name = str(getattr(actor, "appearance", "") or "").strip()
+    duplicate_count = template_counts.get(template_path, 0)
 
     actor_obj = find_existing_cutscene_actor(
         actor_name=actor_name,
         repo_path=template_path,
-        duplicate_count=template_counts.get(template_path, 0),
+        duplicate_count=duplicate_count,
     )
     imported_new = bool(getattr(actor_obj, "get", lambda *_args, **_kwargs: False)(CUTSCENE_ACTOR_IMPORTED_PROP, False)) if actor_obj else False
     cutscene_guid = str(getattr(actor_obj, "get", lambda *_args, **_kwargs: "")(CUTSCENE_GUID_PROP, "") or "").strip() if actor_obj else ""
+    if not actor_obj and template_path and int(duplicate_count or 0) > 1 and actor_cache is not None:
+        cached_actor = actor_cache.get(template_path)
+        if cached_actor is not None and getattr(cached_actor, "name", None) in bpy.data.objects:
+            actor_obj, cutscene_guid = _duplicate_cutscene_actor_from_source(
+                cached_actor,
+                actor_name=actor_name,
+                repo_path=template_path,
+                appearance_name=preferred_appearance_name,
+            )
+            imported_new = actor_obj is not None
     if not actor_obj and template_path:
-        before_objects = set(bpy.data.objects)
         try:
             actor_obj = import_entity.import_ent_template(
                 repo_file(template_path),
@@ -509,10 +575,13 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None):
         if actor_obj is not None:
             imported_new = True
             cutscene_guid = _generate_cutscene_guid()
-            _tag_new_cutscene_objects(before_objects, cutscene_guid)
+            _tag_cutscene_object_hierarchy(actor_obj, cutscene_guid)
 
     if actor_obj is None:
         return {}
+
+    if actor_cache is not None and template_path and template_path not in actor_cache:
+        actor_cache[template_path] = actor_obj
 
     _ensure_cutscene_actor_appearance(actor_obj, preferred_appearance_name)
     _ensure_cutscene_face_setup(actor_obj)
@@ -1139,6 +1208,7 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
             for actor in actor_defs
             if str(getattr(actor, "name", "") or "").strip()
         }
+        actor_cache_by_template = {}
         loaded_actor_object_names_by_index = {}
         loaded_actor_imported_flags_by_index = {}
         loaded_actor_guid_by_index = {}
@@ -1156,7 +1226,12 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
         ]
         actor_total = len(actor_indices_to_load)
         for actor_step_index, idx in enumerate(actor_indices_to_load, start=1):
-            actor_info = load_cutscene_actor(filename, idx, cutscene_template=CCutsceneTemplate)
+            actor_info = load_cutscene_actor(
+                filename,
+                idx,
+                cutscene_template=CCutsceneTemplate,
+                actor_cache=actor_cache_by_template,
+            )
             actor_obj = actor_info.get("actor_obj")
             actor_name = str(actor_info.get("actor_name", "") or "").strip()
             if actor_obj:

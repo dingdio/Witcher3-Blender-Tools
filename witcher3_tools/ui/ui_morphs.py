@@ -13,6 +13,10 @@ from ..ui.armature_context import get_main_armature_and_rig_settings, set_main_a
 from ..importers import import_anims
 from ..importers import import_rig
 from ..CR2W.w3_types import CSkeletalAnimationSetEntry
+from ..duplication import (
+    duplicate_object_for_morph_bake as _duplicate_object_for_morph_bake,
+    remap_duplicated_object_links as _remap_duplicate_morph_bake_object,
+)
 from bpy.types import PropertyGroup
 from bpy.props import IntProperty, StringProperty, CollectionProperty, BoolProperty, EnumProperty
 
@@ -1485,88 +1489,6 @@ def _find_layer_collection_for_collection(layer_collection, target_collection):
         if found is not None:
             return found
     return None
-
-
-def _duplicate_object_for_morph_bake(obj):
-    duplicate = obj.copy()
-    duplicate.name = f"{obj.name}__W3MorphBake"
-    copied_data = None
-    data = getattr(obj, "data", None)
-    if data is not None and getattr(obj, "type", None) in {'MESH', 'ARMATURE'} and hasattr(data, "copy"):
-        copied_data = data.copy()
-        duplicate.data = copied_data
-    try:
-        if duplicate.animation_data is not None:
-            duplicate.animation_data_clear()
-    except Exception:
-        pass
-    return duplicate, copied_data
-
-
-def _remap_object_reference(owner, attr_name, object_map):
-    try:
-        target = getattr(owner, attr_name, None)
-    except Exception:
-        return
-    if target is None:
-        return
-    mapped_target = object_map.get(getattr(target, "name", ""))
-    if mapped_target is None:
-        return
-    try:
-        setattr(owner, attr_name, mapped_target)
-    except Exception:
-        pass
-
-
-def _remap_constraint_targets(constraints, object_map):
-    for constraint in constraints or []:
-        _remap_object_reference(constraint, "target", object_map)
-        _remap_object_reference(constraint, "space_object", object_map)
-        for target_slot in getattr(constraint, "targets", []) or []:
-            _remap_object_reference(target_slot, "target", object_map)
-
-
-def _remap_modifier_targets(modifiers, object_map):
-    for modifier in modifiers or []:
-        for attr_name in (
-            "object",
-            "mirror_object",
-            "offset_object",
-            "start_cap",
-            "end_cap",
-            "target",
-            "origin",
-            "object_from",
-            "object_to",
-        ):
-            _remap_object_reference(modifier, attr_name, object_map)
-        for projector in getattr(modifier, "projectors", []) or []:
-            _remap_object_reference(projector, "object", object_map)
-        for target_slot in getattr(modifier, "targets", []) or []:
-            _remap_object_reference(target_slot, "target", object_map)
-
-
-def _remap_duplicate_morph_bake_object(original_obj, duplicate_obj, object_map):
-    original_parent = getattr(original_obj, "parent", None)
-    duplicate_parent = object_map.get(getattr(original_parent, "name", "")) if original_parent is not None else None
-    try:
-        duplicate_obj.parent = duplicate_parent
-        duplicate_obj.parent_type = getattr(original_obj, "parent_type", 'OBJECT')
-        duplicate_obj.parent_bone = getattr(original_obj, "parent_bone", "")
-        duplicate_obj.matrix_parent_inverse = original_obj.matrix_parent_inverse.copy()
-    except Exception:
-        pass
-
-    _remap_constraint_targets(getattr(duplicate_obj, "constraints", None), object_map)
-    _remap_modifier_targets(getattr(duplicate_obj, "modifiers", None), object_map)
-
-    if getattr(duplicate_obj, "type", None) == 'ARMATURE':
-        for pose_bone in getattr(getattr(duplicate_obj, "pose", None), "bones", []) or []:
-            original_pose_bone = getattr(getattr(original_obj, "pose", None), "bones", {}).get(pose_bone.name)
-            if original_pose_bone is not None:
-                _remap_object_reference(pose_bone, "custom_shape", object_map)
-            _remap_constraint_targets(getattr(pose_bone, "constraints", None), object_map)
 
 
 @contextmanager
