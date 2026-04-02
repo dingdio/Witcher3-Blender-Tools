@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from .bin_helpers import ReadBit6, ReadVLQInt32
+from .common_blender import extract_missing_buffers, win_safe_path
 from .helper_function import flip_v
 
 from .Types import CMesh
@@ -375,7 +376,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
     # with open(filename,"rb") as meshFileReader:
     #     meshFile = getCR2W(meshFileReader)
     #     #f.close()
-    f = open(filename,"rb")
+    f = open(win_safe_path(filename),"rb")
     meshFile = getCR2W(f)
     meshName = Path(meshFile.fileName).stem
     if "proxy" in meshName and keep_proxy_meshes:
@@ -941,13 +942,18 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
         #                                                                     #
         #=====================================================================#
 
-        try:
-            def_path = meshFile.fileName + ".1.buffer"
-            f = open(def_path,"rb")
-            br = bStream(data = f.read())
-            f.close()
-        except Exception as e:
-            raise e
+        def_path = meshFile.fileName + ".1.buffer"
+        safe_def_path = win_safe_path(def_path)
+        if not os.path.exists(safe_def_path):
+            extract_missing_buffers(meshFile.fileName, required_index=1)
+            safe_def_path = win_safe_path(def_path)
+        if not os.path.exists(safe_def_path):
+            raise FileNotFoundError(
+                f"Missing required mesh buffer {def_path}; buffer index 1 could not be found or extracted."
+            )
+        f = open(safe_def_path,"rb")
+        br = bStream(data = f.read())
+        f.close()
         lastVertOffset = 0
         lastIOffset = 0
 

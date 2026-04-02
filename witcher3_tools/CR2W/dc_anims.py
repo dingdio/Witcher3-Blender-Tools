@@ -4,7 +4,7 @@ import os
 import struct
 import math
 from .dc_skeleton import create_CMimicFace, create_Skeleton
-from .common_blender import repo_file
+from .common_blender import repo_file, win_safe_path
 from .CR2W_types import getCR2W, CArray, CBufferUInt32, CVariantSizeType
 from .havok_parser import HavokPackfile
 from .prop_utils import (
@@ -119,7 +119,7 @@ def read_lipsync_track(file):
     return TrackPointer(dt, compression, zero, numFrames, dataAddr, dataAddrFallback)
 
 def read_lipsync_file(filename):
-    with open(filename, "rb") as file:
+    with open(win_safe_path(filename), "rb") as file:
         # Read the initial part of the file
         frames_per_second = struct.unpack("f", file.read(4))[0]
         duration = struct.unpack("f", file.read(4))[0]
@@ -721,11 +721,11 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
             )
 
         # Load from buffer file if it exists (cooked path)
-        if os.path.exists(def_path):
+        if os.path.exists(win_safe_path(def_path)):
             # Cooked animation - load from buffer file
             if (streamingOption is not None and streamingOption.Index.String == "ABSO_PartiallyStreamable"):
                 # Partial streaming: combine inline data + buffer file
-                f = open(def_path,"rb")
+                f = open(win_safe_path(def_path),"rb")
                 def_data = f.read()
                 inline_size = len(data_in_file) if data_in_file else 0
                 buffer_size = len(def_data)
@@ -749,7 +749,7 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
                 source_detail = f"buffer_file+inline:{def_path}"
             else:
                 # Full streaming: all data from buffer file
-                f = open(def_path,"rb")
+                f = open(win_safe_path(def_path),"rb")
                 b = f.read()
                 the_data = bStream(data = b)
                 f.close()

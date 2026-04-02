@@ -560,9 +560,9 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
                     principled.inputs['Base Color'].default_value = (0,0,1,1)
                     objs[0].data.materials.append(err_mat)
 
-        except Exception as e:
-            log.error("#1 Problem with FBX importer "+mesh.fbxPath())
-            raise e
+        except Exception:
+            log.exception("Problem importing mesh %s", mesh.meshName)
+            raise
         try:
             
             objs = bpy.context.selected_objects[:]
@@ -578,7 +578,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
             bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
         except Exception:
             #usually tried to do something with materials and failed
-            log.error("#2 Problem with FBX importer "+mesh.fbxPath())
+            log.exception("Problem finalizing imported mesh %s", mesh.meshName)
             return
     if parent_transform:
         obj.parent = parent_transform

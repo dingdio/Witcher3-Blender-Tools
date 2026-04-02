@@ -7,7 +7,7 @@ from typing import List, Tuple
 from mathutils import Vector, Matrix
 import numpy as np
 import array
-from ..CR2W.common_blender import repo_file, get_collision_for_mesh
+from ..CR2W.common_blender import repo_file, get_collision_for_mesh, win_safe_path
 from ..importers.import_rig import rotate_and_connect_bones
 
 from ..cloth_util import setup_w3_material_CR2W
@@ -237,7 +237,7 @@ def import_mesh(filename:str,
     dirpath, file = os.path.split(filename)
     basename, ext = os.path.splitext(file)
     if ext.lower() in ('.w2mesh', '.w2ent'):
-        with open(filename) as file:
+        with open(win_safe_path(filename), "rb") as _mesh_file:
             try:
                 (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile) = dc_mesh.load_bin_mesh(filename, keep_lod_meshes, keep_proxy_meshes)
                 mesh_chunks = getattr(CData, "meshDataAllMeshes", None) or []
