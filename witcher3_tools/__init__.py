@@ -1433,6 +1433,18 @@ CACHE_ITEMS = (
         "description": "Mod/DLC collision cache index.",
     },
     {
+        "name": "sound_cache.pkl",
+        "relative_path": os.path.join("SoundCache", "sound_cache.pkl"),
+        "label": "sound_cache.pkl",
+        "description": "Vanilla sound cache index from game archives.",
+    },
+    {
+        "name": "sound_cache_mods.pkl",
+        "relative_path": os.path.join("SoundCache", "sound_cache_mods.pkl"),
+        "label": "sound_cache_mods.pkl",
+        "description": "Mod/DLC sound cache index.",
+    },
+    {
         "name": "speech_cache.pkl",
         "relative_path": os.path.join("Speech", "speech_cache.pkl"),
         "label": "speech_cache.pkl",
@@ -1571,6 +1583,10 @@ def _get_cache_signature_builder(cache_name: str):
         return lambda: CollisionManager.BuildSourceSignature()
     if cache_name == "collision_cache_mods.pkl":
         return lambda: CollisionManager.BuildSourceSignature(loadmods=True)
+    if cache_name == "sound_cache.pkl":
+        return lambda: SoundManager.BuildSourceSignature()
+    if cache_name == "sound_cache_mods.pkl":
+        return lambda: SoundManager.BuildSourceSignature(loadmods=True)
     if cache_name == "speech_cache.pkl":
         return lambda: SpeechManager.BuildSourceSignature()
     if cache_name == "bundle_cache.pkl":
@@ -1682,6 +1698,8 @@ def _refresh_cache_by_name(cache_name: str) -> bool:
         "texture_cache_mods.pkl": lambda: TextureManager.Get(do_reload=True, loadmods=True),
         "collision_cache.pkl": lambda: CollisionManager.Get(do_reload=True),
         "collision_cache_mods.pkl": lambda: CollisionManager.Get(do_reload=True, loadmods=True),
+        "sound_cache.pkl": lambda: SoundManager.Get(do_reload=True),
+        "sound_cache_mods.pkl": lambda: SoundManager.Get(do_reload=True, loadmods=True),
         "speech_cache.pkl": lambda: SpeechManager.Get(do_reload=True),
         "bundle_cache.pkl": lambda: BundleManager.Get(loadmods=False, reset_cache=True),
         "bundle_cache_mods.pkl": lambda: BundleManager.Get(loadmods=True, reset_cache=True),
@@ -2980,6 +2998,7 @@ class WITCHER_OT_delete_cache(bpy.types.Operator):
 
 from .CR2W.witcher_cache.CollisionCache import CollisionManager
 from .CR2W.witcher_cache.Bundles import BundleManager
+from .CR2W.witcher_cache.SoundCache import SoundManager
 from .CR2W.witcher_cache.Speech import SpeechManager
 from .CR2W.witcher_cache.TextureCache import TextureManager
 from .CR2W.witcher_cache.W3Strings import W3StringManager

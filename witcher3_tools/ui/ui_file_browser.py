@@ -29,6 +29,8 @@ from .. import (
     clear_external_import_dependency_alert,
     get_all_addon_prefs,
     get_texture_path,
+    get_W3_OGG_PATH,
+    get_vgmstream_path,
     set_external_import_dependency_alert,
     get_uncook_path,
     get_witcher2_game_path,
@@ -59,6 +61,7 @@ from ..CR2W.witcher_cache.Bundles.Bundle import Bundle
 from ..CR2W.witcher_cache.TextureCache import LoadTextureManager
 from ..CR2W.witcher_cache.CollisionCache import LoadCollisionManager
 from ..CR2W.witcher_cache.CollisionCache.Collision_Cache import CollisionCache
+from ..CR2W.witcher_cache.SoundCache import LoadSoundManager
 from ..CR2W.witcher_cache.Speech import LoadSpeechManager
 from ..external_addon_tools import ensure_apx_from_apb, get_apx_addon_status, get_srt_addon_status
 
@@ -163,7 +166,7 @@ def _sync_path_to_address_bar(self, context):
 class MySettings(PropertyGroup):
     current_folder: StringProperty(update=_sync_path_to_address_bar)
     search_query: StringProperty()
-    active_cache_type: StringProperty(default="")  # "", "Bundle", "Collision", "Texture", "Speech"
+    active_cache_type: StringProperty(default="")  # "", "Bundle", "Collision", "Texture", "Sound", "Speech"
     loadmods: BoolProperty(default=False)  # Persist loadmods from browser invocation
     use_mods_priority: BoolProperty(
         default=False,
@@ -256,6 +259,14 @@ def get_effective_cache_type(cache_type: str) -> str:
     if cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
         return "Collision"
     return cache_type
+
+
+def cache_supports_scene_import(cache_type: str) -> bool:
+    return True
+
+
+def cache_supports_sound_preview(cache_type: str) -> bool:
+    return get_effective_cache_type(cache_type) == "Sound"
 
 def get_external_archive_session(cache_type: str):
     if not is_external_cache(cache_type):
@@ -1167,6 +1178,231 @@ def get_uncook_abs_path(context, item_path, loadmods=False) -> str:
     except Exception:
         return ""
 
+
+def get_browser_item_output_path(context, cache_type, item_path, loadmods=False) -> str:
+    if is_disk_cache(cache_type):
+        return get_disk_abs_path(cache_type, item_path) or ""
+
+    effective_cache_type = get_effective_cache_type(cache_type)
+    if effective_cache_type == "Collision":
+        addon_prefs = get_all_addon_prefs(context)
+        check_path = get_collision_output_rel_path(item_path, loadmods=loadmods)
+        if not addon_prefs or not check_path:
+            return ""
+        return os.path.join(addon_prefs.uncook_path, check_path)
+
+    rel_path = get_vanilla_path(item_path, loadmods)
+    if not rel_path:
+        return ""
+
+    abs_path = repo_file(rel_path)
+    if effective_cache_type == "Texture":
+        dds_path = os.path.splitext(abs_path)[0] + ".dds"
+        if win_path_exists(dds_path):
+            return dds_path
+    return abs_path
+
+
+_sound_preview_state = {
+    "cache_type": "",
+    "item_path": "",
+    "wav_path": "",
+    "sound_name": "",
+}
+_sound_preview_handle = None
+_sound_preview_device = None
+
+
+def _tag_browser_redraw(context) -> None:
+    try:
+        if context and getattr(context, "screen", None):
+            for area in context.screen.areas:
+                area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _sound_preview_matches(cache_type: str, item_path: str) -> bool:
+    return (
+        _sound_preview_state.get("cache_type") == (cache_type or "")
+        and _sound_preview_state.get("item_path") == (item_path or "").replace("/", "\\")
+    )
+
+
+def _clear_sound_preview(context=None) -> None:
+    global _sound_preview_handle, _sound_preview_state
+
+    try:
+        if _sound_preview_handle is not None:
+            _sound_preview_handle.stop()
+    except Exception:
+        pass
+    _sound_preview_handle = None
+
+    sound_name = _sound_preview_state.get("sound_name") or ""
+    if sound_name:
+        try:
+            sound_data = bpy.data.sounds.get(sound_name)
+            if sound_data is not None and getattr(sound_data, "users", 0) == 0:
+                bpy.data.sounds.remove(sound_data)
+        except Exception:
+            pass
+
+    _sound_preview_state = {
+        "cache_type": "",
+        "item_path": "",
+        "wav_path": "",
+        "sound_name": "",
+    }
+    _tag_browser_redraw(context)
+
+
+def _get_sound_item_and_export_path(context, item_path: str, loadmods: bool = False):
+    full_path_norm = (item_path or "").replace("/", "\\")
+    manager = LoadSoundManager(loadmods=loadmods)
+    items = manager.find_item_by_path_name(full_path_norm)
+    if not items:
+        return None, ""
+
+    final_item = items[-1] if isinstance(items, list) else items
+    mod_name = ""
+    if loadmods and "\\" in full_path_norm:
+        mod_name = full_path_norm.split("\\", 1)[0]
+
+    item_name = getattr(final_item, 'name', None) or getattr(final_item, 'Name', full_path_norm)
+    vanilla_name = strip_mod_prefix(item_name, mod_name)
+    if vanilla_name == item_name and mod_name:
+        vanilla_name = strip_mod_prefix(full_path_norm, mod_name)
+
+    export_path = repo_file(vanilla_name)
+    return final_item, export_path
+
+
+def ensure_sound_item_extracted(context, item_path: str, loadmods: bool = False) -> str:
+    final_item, export_path = _get_sound_item_and_export_path(context, item_path, loadmods=loadmods)
+    if final_item is None or not export_path:
+        return ""
+
+    if not win_path_exists(export_path):
+        addon_prefs = get_all_addon_prefs(context)
+        uncook_path = addon_prefs.uncook_path if addon_prefs else ""
+        if prepare_extraction_target(export_path, uncook_path):
+            written_path = final_item.extract_to_file(export_path)
+            if written_path:
+                export_path = written_path
+    return export_path if win_path_exists(export_path) else ""
+
+
+def _sound_wav_output_path(context, item_path: str) -> str:
+    output_root = get_W3_OGG_PATH(context) or bpy.app.tempdir or ""
+    if not output_root:
+        output_root = os.path.join(Path.home(), "AppData", "Local", "Temp")
+    rel_path = (item_path or "").replace("/", os.sep).replace("\\", os.sep).lstrip(os.sep)
+    if not rel_path:
+        rel_path = "sound_preview"
+    return win_safe_path(
+        os.path.join(output_root, "asset_browser_sound_cache", os.path.splitext(rel_path)[0] + ".wav")
+    )
+
+
+def ensure_sound_wav(context, sound_abs_path: str, item_path: str) -> str:
+    sound_abs_path = win_safe_path(sound_abs_path or "")
+    if not sound_abs_path or not win_path_exists(sound_abs_path):
+        raise RuntimeError("Sound file is not available on disk.")
+
+    vgmstream_path = get_vgmstream_path(context)
+    if not os.path.isfile(vgmstream_path):
+        raise RuntimeError(f"vgmstream executable not found: {vgmstream_path}")
+
+    output_wav = _sound_wav_output_path(context, item_path)
+    os.makedirs(os.path.dirname(output_wav), exist_ok=True)
+
+    try:
+        src_mtime = os.path.getmtime(sound_abs_path)
+        wav_mtime = os.path.getmtime(output_wav) if os.path.exists(output_wav) else -1
+    except Exception:
+        src_mtime = -1
+        wav_mtime = -1
+
+    if wav_mtime >= src_mtime and win_path_exists(output_wav):
+        return output_wav
+
+    import subprocess
+
+    command = [vgmstream_path, "-i"]
+    if sound_abs_path.lower().endswith(".bnk"):
+        command.extend(["-s", "1"])
+    command.extend(["-o", output_wav, sound_abs_path])
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0 or not win_path_exists(output_wav):
+        details = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(details or f"vgmstream conversion failed with exit code {completed.returncode}")
+    return output_wav
+
+
+def import_sound_to_timeline(context, item_path: str, loadmods: bool = False):
+    sound_abs_path = ensure_sound_item_extracted(context, item_path, loadmods=loadmods)
+    if not sound_abs_path:
+        raise RuntimeError(f"Sound item not found: {item_path}")
+
+    wav_path = ensure_sound_wav(context, sound_abs_path, item_path)
+
+    from .ui_voice import _get_next_sound_channel, _get_sequence_editor_strips
+
+    scene = context.scene
+    if not scene.sequence_editor:
+        scene.sequence_editor_create()
+    strips = _get_sequence_editor_strips(scene.sequence_editor)
+    if strips is None:
+        raise RuntimeError("Blender sequence editor strips API is unavailable")
+
+    if getattr(scene, "witcher_voice_replace_audio", False):
+        sound_strips = [strip for strip in strips if strip.type == 'SOUND']
+        for strip in sound_strips:
+            strips.remove(strip)
+
+    channel = 1 if getattr(scene, "witcher_voice_replace_audio", False) else _get_next_sound_channel(scene)
+    frame_start = int(getattr(scene, "frame_current", 0))
+    strip_name = Path(item_path.replace("\\", "/")).stem or Path(wav_path).stem
+    soundstrip = strips.new_sound(strip_name, wav_path, channel=channel, frame_start=frame_start)
+    soundstrip.frame_start = frame_start
+    strip_end = int(getattr(soundstrip, "frame_final_end", frame_start))
+    if strip_end > scene.frame_end:
+        scene.frame_end = strip_end
+    return soundstrip, wav_path
+
+
+def play_sound_preview(context, cache_type: str, item_path: str, loadmods: bool = False) -> str:
+    global _sound_preview_device, _sound_preview_handle, _sound_preview_state
+
+    sound_abs_path = ensure_sound_item_extracted(context, item_path, loadmods=loadmods)
+    if not sound_abs_path:
+        raise RuntimeError(f"Sound item not found: {item_path}")
+
+    wav_path = ensure_sound_wav(context, sound_abs_path, item_path)
+
+    try:
+        import aud
+    except Exception as exc:
+        raise RuntimeError(f"Blender aud module is unavailable: {exc}") from exc
+
+    _clear_sound_preview(context)
+
+    if _sound_preview_device is None:
+        _sound_preview_device = aud.Device()
+
+    sound_data = bpy.data.sounds.load(wav_path, check_existing=False)
+    sound_factory = aud.Sound(wav_path)
+    _sound_preview_handle = _sound_preview_device.play(sound_factory)
+    _sound_preview_state = {
+        "cache_type": cache_type or "",
+        "item_path": (item_path or "").replace("/", "\\"),
+        "wav_path": wav_path,
+        "sound_name": getattr(sound_data, "name", ""),
+    }
+    _tag_browser_redraw(context)
+    return wav_path
+
 def ensure_bundle_item_extracted(context, full_path, loadmods=False) -> str:
     manager = LoadBundleManager(loadmods=loadmods)
     full_path_norm = full_path.replace("/", "\\")
@@ -1335,6 +1571,12 @@ def get_bundle_item_size(cache_type, item_path, loadmods=False):
             if items:
                 final_item = items[-1] if isinstance(items, list) else items
                 return getattr(final_item, 'Size', 0) or getattr(final_item, 'size', 0) or 0
+        elif cache_type == "Sound":
+            manager = LoadSoundManager(loadmods=loadmods)
+            items = manager.find_item_by_path_name(item_path)
+            if items:
+                final_item = items[-1] if isinstance(items, list) else items
+                return getattr(final_item, 'Size', 0) or getattr(final_item, 'size', 0) or 0
     except Exception:
         pass
     return 0
@@ -1394,6 +1636,11 @@ def _resolve_item_for_stats(cache_type: str, item_path: str, loadmods: bool = Fa
 
     if cache_type == "Texture":
         manager = LoadTextureManager(loadmods=loadmods)
+        items = manager.find_item_by_path_name(item_key)
+        return items[-1] if isinstance(items, list) and items else items
+
+    if cache_type == "Sound":
+        manager = LoadSoundManager(loadmods=loadmods)
         items = manager.find_item_by_path_name(item_key)
         return items[-1] if isinstance(items, list) and items else items
 
@@ -1565,6 +1812,7 @@ def get_cached_search_results(query, cache_type, folder_struct, loadmods=False):
             ("Bundle", lambda: LoadBundleManager(loadmods=loadmods)),
             ("Collision", lambda: LoadCollisionManager(loadmods=loadmods)),
             ("Texture", lambda: LoadTextureManager(loadmods=loadmods)),
+            ("Sound", lambda: LoadSoundManager(loadmods=loadmods)),
         ]:
             try:
                 manager = loader()
@@ -1607,6 +1855,10 @@ def refresh_mod_cache_managers():
         LoadTextureManager(loadmods=True, do_reload=True)
     except Exception as e:
         log.error("Failed to refresh mod texture cache: %s", e)
+    try:
+        LoadSoundManager(loadmods=True, do_reload=True)
+    except Exception as e:
+        log.error("Failed to refresh mod sound cache: %s", e)
 
 # Navigation history for back/forward
 _nav_history = []  # List of (cache_type, folder) tuples
@@ -2391,6 +2643,7 @@ class SimpleFileBrowser(Operator):
                     ("Bundle", "PACKAGE", "Game asset bundles (.w2mesh, .w2ent, etc.)"),
                     ("Collision", "MESH_CUBE", "Collision meshes (.nxs)"),
                     ("Texture", "IMAGE_DATA", "Texture cache (.xbm, .dds)"),
+                    ("Sound", "SPEAKER", "Sound cache (.wem, .bnk)"),
                     ("Speech", "SPEAKER", "Speech/audio files"),
                     ("REDkit Depot", "FILE_FOLDER", "REDkit r4data depot (read-only)"),
                     ("REDkit Uncooked", "FILE_FOLDER", "REDkit uncooked depot (read-only)"),
@@ -2549,6 +2802,7 @@ class SimpleFileBrowser(Operator):
                     loc_sub.enabled = file_exists
                     op_loc = loc_sub.operator("witcher.open_file_location", text="", icon="FILEBROWSER")
                     op_loc.file_path = item
+                    op_loc.cache_type = witcher_file_browser.active_cache_type
                     # Texture preview for texture files
                     if is_texture_file(item):
                         op_preview = btns.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
@@ -2558,8 +2812,19 @@ class SimpleFileBrowser(Operator):
                         op_preview = btns.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
                         op_preview.file_path = item
                         op_preview.cache_type = witcher_file_browser.active_cache_type
-                    # Import button
-                    op = btns.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
+                    if cache_supports_sound_preview(witcher_file_browser.active_cache_type):
+                        is_playing = _sound_preview_matches(witcher_file_browser.active_cache_type, item)
+                        op_sound = btns.operator(
+                            "witcher.sound_preview_toggle",
+                            text="",
+                            icon='CANCEL' if is_playing else 'PLAY',
+                        )
+                        op_sound.file_path = item
+                        op_sound.cache_type = witcher_file_browser.active_cache_type
+                    if cache_supports_scene_import(witcher_file_browser.active_cache_type):
+                        op = btns.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
+                    else:
+                        op = btns.operator("witcher.file_action", text="", icon='EXPORT')
                     op.file_path = item
                     # Item stats popup (cache metadata)
                     stats_op = btns.operator("witcher.file_item_stats", text="", icon='INFO')
@@ -2689,9 +2954,10 @@ class SimpleFileBrowser(Operator):
                     loc_sub.enabled = file_exists
                     op_loc = loc_sub.operator("witcher.open_file_location", text="", icon="FILEBROWSER")
                     op_loc.file_path = full_item_path
+                    op_loc.cache_type = witcher_file_browser.active_cache_type
 
                     # Import button (only show in non-batch mode)
-                    if not witcher_file_browser.batch_select_mode:
+                    if not witcher_file_browser.batch_select_mode and cache_supports_scene_import(witcher_file_browser.active_cache_type):
                         op1 = row.operator("witcher.file_action_import_to_scene",
                                             text="", icon='IMPORT')
                         op1.file_path = item['name']
@@ -2707,6 +2973,16 @@ class SimpleFileBrowser(Operator):
                         op_preview = row.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
                         op_preview.file_path = full_item_path
                         op_preview.cache_type = witcher_file_browser.active_cache_type
+
+                    if cache_supports_sound_preview(witcher_file_browser.active_cache_type):
+                        is_playing = _sound_preview_matches(witcher_file_browser.active_cache_type, full_item_path)
+                        op_sound = row.operator(
+                            "witcher.sound_preview_toggle",
+                            text="",
+                            icon='CANCEL' if is_playing else 'PLAY',
+                        )
+                        op_sound.file_path = full_item_path
+                        op_sound.cache_type = witcher_file_browser.active_cache_type
 
                     # Export button (for non-texture-cache items)
                     if witcher_file_browser.active_cache_type != "Texture" and not is_disk_cache(witcher_file_browser.active_cache_type):
@@ -2789,6 +3065,7 @@ class SimpleFileBrowser(Operator):
             loc_sub.enabled = file_exists
             op_loc = loc_sub.operator("witcher.open_file_location", text="", icon="FILEBROWSER")
             op_loc.file_path = path
+            op_loc.cache_type = cache_type
             # Texture preview for texture files
             if is_texture_file(path):
                 op_preview = btns.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
@@ -2798,8 +3075,19 @@ class SimpleFileBrowser(Operator):
                 op_preview = btns.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
                 op_preview.file_path = path
                 op_preview.cache_type = cache_type
-            # Import button
-            op = btns.operator("witcher.file_action_global_import", text="", icon='IMPORT')
+            if cache_supports_sound_preview(cache_type):
+                is_playing = _sound_preview_matches(cache_type, path)
+                op_sound = btns.operator(
+                    "witcher.sound_preview_toggle",
+                    text="",
+                    icon='CANCEL' if is_playing else 'PLAY',
+                )
+                op_sound.file_path = path
+                op_sound.cache_type = cache_type
+            if cache_supports_scene_import(cache_type):
+                op = btns.operator("witcher.file_action_global_import", text="", icon='IMPORT')
+            else:
+                op = btns.operator("witcher.file_action_global_export", text="", icon='EXPORT')
             op.file_path = path
             op.cache_type = cache_type
             # Item stats popup (cache metadata)
@@ -3293,11 +3581,12 @@ class OpenFileLocationOperator(Operator):
     bl_idname = "witcher.open_file_location"
     bl_label = "Open File Location"
     file_path: StringProperty()
+    cache_type: StringProperty(default="")
 
     def execute(self, context):
         try:
             witcher_file_browser = context.scene.witcher_file_browser
-            cache_type = witcher_file_browser.active_cache_type
+            cache_type = self.cache_type or witcher_file_browser.active_cache_type
 
             if is_disk_cache(cache_type):
                 abs_path = get_disk_abs_path(cache_type, self.file_path)
@@ -3305,13 +3594,12 @@ class OpenFileLocationOperator(Operator):
                     self.report({'WARNING'}, f"File not found: {self.file_path}")
                     return {'CANCELLED'}
             else:
-                addon_prefs = get_all_addon_prefs(context)
-                if get_effective_cache_type(cache_type) == "Collision":
-                    check_path = get_collision_output_rel_path(self.file_path, witcher_file_browser.loadmods)
-                else:
-                    # Strip mod prefix when browsing mods
-                    check_path = get_vanilla_path(self.file_path, witcher_file_browser.loadmods)
-                abs_path = os.path.join(addon_prefs.uncook_path, check_path)
+                abs_path = get_browser_item_output_path(
+                    context,
+                    cache_type,
+                    self.file_path,
+                    witcher_file_browser.loadmods,
+                )
 
             parent_dir = os.path.dirname(abs_path)
             if os.path.isdir(parent_dir):
@@ -3602,6 +3890,8 @@ class SelectCacheTypeOperator(Operator):
                 manager = LoadCollisionManager(loadmods=loadmods, do_reload=loadmods)
             elif cache_type == "Texture":
                 manager = LoadTextureManager(loadmods=loadmods, do_reload=loadmods)
+            elif cache_type == "Sound":
+                manager = LoadSoundManager(loadmods=loadmods, do_reload=loadmods)
             elif cache_type == "Speech":
                 if loadmods:
                     return  # Speech doesn't support mod loading
@@ -3666,6 +3956,18 @@ class FileActionOperatorImportToScene(Operator):
         mod_name = ""
         if loadmods and "\\" in full_path_norm:
             mod_name = full_path_norm.split("\\", 1)[0]
+        if effective_cache_type == "Sound":
+            try:
+                soundstrip, wav_path = import_sound_to_timeline(context, full_path_norm, loadmods=loadmods)
+            except Exception as exc:
+                self.report({'ERROR'}, f"Sound import failed: {exc}")
+                return {'CANCELLED'}
+            add_recent_import(context, full_path, cache_type)
+            self.report(
+                {'INFO'},
+                f"Imported sound strip: {getattr(soundstrip, 'name', os.path.basename(wav_path))}"
+            )
+            return {'FINISHED'}
         abs_file_path = None
         override_roots = []
         try:
@@ -4147,6 +4449,48 @@ class FileActionOperatorImportToScene(Operator):
         self.report({'INFO'}, f"Successfully imported: {filename}")
         return {'FINISHED'}
 
+
+class SoundPreviewToggleOperator(Operator):
+    """Play or stop a sound preview for Sound cache items."""
+    bl_idname = "witcher.sound_preview_toggle"
+    bl_label = "Toggle Sound Preview"
+
+    file_path: StringProperty()
+    cache_type: StringProperty(default="")
+
+    def execute(self, context):
+        witcher_file_browser = context.scene.witcher_file_browser
+        cache_type = self.cache_type or witcher_file_browser.active_cache_type
+        effective_cache_type = get_effective_cache_type(cache_type)
+        if effective_cache_type != "Sound":
+            self.report({'WARNING'}, "Sound preview is only available for Sound cache items.")
+            return {'CANCELLED'}
+
+        full_path = self.file_path
+        if "\\" not in full_path and witcher_file_browser.current_folder:
+            full_path = witcher_file_browser.current_folder + "\\" + self.file_path
+        full_path = full_path.replace("/", "\\")
+
+        if _sound_preview_matches(cache_type, full_path):
+            _clear_sound_preview(context)
+            self.report({'INFO'}, f"Stopped preview: {os.path.basename(full_path)}")
+            return {'FINISHED'}
+
+        try:
+            wav_path = play_sound_preview(
+                context,
+                cache_type,
+                full_path,
+                loadmods=witcher_file_browser.loadmods,
+            )
+        except Exception as exc:
+            self.report({'ERROR'}, f"Sound preview failed: {exc}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Playing preview: {os.path.basename(wav_path)}")
+        return {'FINISHED'}
+
+
 class GlobalImportOperator(Operator):
     """Import file from global search result"""
     bl_idname = "witcher.file_action_global_import"
@@ -4156,17 +4500,37 @@ class GlobalImportOperator(Operator):
     cache_type: StringProperty()
 
     def execute(self, context):
+        if not cache_supports_scene_import(self.cache_type):
+            self.report({'WARNING'}, "Sound cache items are export-only. Use Export to extract them to disk.")
+            return {'CANCELLED'}
         # Set the cache type temporarily for import
         witcher_file_browser = context.scene.witcher_file_browser
         original_cache_type = witcher_file_browser.active_cache_type
         witcher_file_browser.active_cache_type = self.cache_type
 
-        # Use existing import operator logic
-        bpy.ops.witcher.file_action_import_to_scene(file_path=self.file_path)
+        try:
+            return bpy.ops.witcher.file_action_import_to_scene(file_path=self.file_path)
+        finally:
+            witcher_file_browser.active_cache_type = original_cache_type
 
-        # Restore original state
-        witcher_file_browser.active_cache_type = original_cache_type
-        return {'FINISHED'}
+
+class GlobalExportOperator(Operator):
+    """Export file from global search result"""
+    bl_idname = "witcher.file_action_global_export"
+    bl_label = "Global Export"
+
+    file_path: StringProperty()
+    cache_type: StringProperty()
+
+    def execute(self, context):
+        witcher_file_browser = context.scene.witcher_file_browser
+        original_cache_type = witcher_file_browser.active_cache_type
+        witcher_file_browser.active_cache_type = self.cache_type
+
+        try:
+            return bpy.ops.witcher.file_action(file_path=self.file_path)
+        finally:
+            witcher_file_browser.active_cache_type = original_cache_type
 
 
 class TexturePreviewOperator(Operator):
@@ -4561,6 +4925,9 @@ class FileActionOperator(Operator):
             elif cache_type == "Texture":
                 manager = LoadTextureManager(loadmods=loadmods)
                 items = manager.find_item_by_path_name(full_path_norm)
+            elif cache_type == "Sound":
+                manager = LoadSoundManager(loadmods=loadmods)
+                items = manager.find_item_by_path_name(full_path_norm)
             elif cache_type == "Speech":
                 manager = LoadSpeechManager()
                 items = manager.find_item_by_hash(full_path_norm)
@@ -4738,7 +5105,9 @@ def register():
     bpy.utils.register_class(AdjustTileMultiresOperator)
     bpy.utils.register_class(FileActionOperator)
     bpy.utils.register_class(FileActionOperatorImportToScene)
+    bpy.utils.register_class(SoundPreviewToggleOperator)
     bpy.utils.register_class(GlobalImportOperator)
+    bpy.utils.register_class(GlobalExportOperator)
     bpy.utils.register_class(TexturePreviewOperator)
     bpy.utils.register_class(WITCHER_PT_AssetBrowser)
 
@@ -4747,6 +5116,7 @@ def register():
 
 
 def unregister():
+    _clear_sound_preview()
     if hasattr(bpy.types.Scene, "witcher_file_browser"):
         delattr(bpy.types.Scene, "witcher_file_browser")
     if hasattr(bpy.types.Scene, "witcher_file_items"):
@@ -4754,7 +5124,9 @@ def unregister():
 
     bpy.utils.unregister_class(WITCHER_PT_AssetBrowser)
     bpy.utils.unregister_class(TexturePreviewOperator)
+    bpy.utils.unregister_class(GlobalExportOperator)
     bpy.utils.unregister_class(GlobalImportOperator)
+    bpy.utils.unregister_class(SoundPreviewToggleOperator)
     bpy.utils.unregister_class(OpenExternalBundleOperator)
     bpy.utils.unregister_class(OpenExternalCollisionCacheOperator)
     bpy.utils.unregister_class(SimpleFileBrowser)

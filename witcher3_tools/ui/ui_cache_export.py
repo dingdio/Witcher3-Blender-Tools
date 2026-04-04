@@ -33,6 +33,7 @@ _CACHE_STATS: dict = {
     "Bundle":    {"cached": -1, "on_disk": -1, "output_path": ""},
     "Texture":   {"cached": -1, "on_disk": -1, "output_path": ""},
     "Collision": {"cached": -1, "on_disk": -1, "output_path": "", "apb_on_disk": -1, "apx_on_disk": -1},
+    "Sound":     {"cached": -1, "on_disk": -1, "output_path": ""},
     "Speech":    {"cached": -1, "on_disk": -1, "on_disk_cr2w": -1, "on_disk_wem": -1, "output_path": ""},
 }
 
@@ -198,6 +199,7 @@ def _refresh_ondisk_for(cache_type: str, output_root: str) -> None:
         "Bundle":    None,
         "Texture":   {".dds"},
         "Collision": {".nxs", ".apb", ".apx", ".bin"},
+        "Sound":     {".wem", ".bnk"},
     }
     if cache_type not in ext_map:
         return
@@ -215,6 +217,7 @@ def refresh_cache_stats(context) -> None:
     from ..CR2W.witcher_cache.Bundles import LoadBundleManager
     from ..CR2W.witcher_cache.TextureCache import LoadTextureManager
     from ..CR2W.witcher_cache.CollisionCache import LoadCollisionManager
+    from ..CR2W.witcher_cache.SoundCache import LoadSoundManager
     from ..CR2W.witcher_cache.Speech import LoadSpeechManager
 
     uncook = get_uncook_path(context) or ""
@@ -279,6 +282,22 @@ def refresh_cache_stats(context) -> None:
     except Exception as e:
         log.warning("Collision stats error: %s", e)
 
+    # ── Sound (unbundle to uncook path) ──────────────────────────────────────
+    try:
+        som = LoadSoundManager(do_reload=False, loadmods=False)
+        cached = len(som.FileList)
+        estimated_bytes, estimated_zbytes = _sum_item_sizes(som.Items, "Size", "ZSize")
+        on_disk = _count_dir_files(uncook, {".wem", ".bnk"})
+        _CACHE_STATS["Sound"] = {
+            "cached": cached,
+            "on_disk": on_disk,
+            "output_path": uncook,
+            "estimated_bytes": estimated_bytes,
+            "estimated_compressed_bytes": estimated_zbytes,
+        }
+    except Exception as e:
+        log.warning("Sound stats error: %s", e)
+
     # ── Speech (unbundle to voice path) ─────────────────────────────────────
     try:
         from ..CR2W.witcher_cache.Speech import LoadSpeechManager
@@ -306,7 +325,7 @@ def _build_export_items(context, cache_type: str) -> list:
     uncook = get_uncook_path(context) or ""
     texture_root = get_texture_path(context) or ""
     voice_path = get_W3_VOICE_PATH(context) or ""
-    if cache_type in {"Bundle", "Collision"} and not uncook:
+    if cache_type in {"Bundle", "Collision", "Sound"} and not uncook:
         raise ValueError("Uncook Path is not configured in addon preferences.")
     if cache_type == "Texture" and not texture_root:
         raise ValueError("Texture Path is not configured in addon preferences.")
@@ -354,6 +373,17 @@ def _build_export_items(context, cache_type: str) -> list:
             out = os.path.join(uncook, out_name.replace("/", os.sep).lstrip(os.sep))
             items.append((item, out))
 
+    elif cache_type == "Sound":
+        from ..CR2W.witcher_cache.SoundCache import LoadSoundManager
+        som = LoadSoundManager(do_reload=False, loadmods=False)
+        for path, item_list in som.Items.items():
+            item = item_list[-1] if isinstance(item_list, list) else item_list
+            name = getattr(item, 'Name', '') or getattr(item, 'name', '') or str(path)
+            if not name:
+                continue
+            out = os.path.join(uncook, name.replace("/", os.sep).lstrip(os.sep))
+            items.append((item, out))
+
     elif cache_type == "Speech":
         from ..CR2W.witcher_cache.Speech import LoadSpeechManager
         from ..CR2W.witcher_cache.Speech.W3Speech import pad_filename
@@ -384,6 +414,10 @@ _WARNINGS = {
         "~10,000+ collision and physics mesh files.",
         "This will take a few minutes.",
     ),
+    "Sound": (
+        "~10,000+ sound bank and streamed audio files (.bnk + .wem).",
+        "This can take a long time and requires substantial disk space.",
+    ),
     "Speech": (
         "~60,000+ speech pairs (.cr2w + .wem).",
         "This can take a long time and requires substantial disk space.",
@@ -398,7 +432,7 @@ class WITCHER_OT_RefreshCacheStats(Operator):
     bl_label = "Refresh Cache Stats"
     bl_description = (
         "Count cached items and on-disk files for Bundle, Texture, Collision, "
-        "and Speech caches.  May be slow on very large uncook directories."
+        "Sound, and Speech caches.  May be slow on very large uncook directories."
     )
 
     def execute(self, context):
@@ -559,7 +593,7 @@ class WITCHER_OT_ExportAllCache(Operator):
         for line in lines:
             col.label(text=f"   {line}")
 
-        if self.cache_type in ("Bundle", "Texture"):
+        if self.cache_type in ("Bundle", "Texture", "Sound", "Speech"):
             layout.separator(factor=0.3)
             time_box = layout.box()
             time_box.alert = True
@@ -821,6 +855,7 @@ def draw_export_stats_ui(layout, context) -> None:
         ("Bundle", "PACKAGE"),
         ("Texture", "IMAGE_DATA"),
         ("Collision", "MESH_DATA"),
+        ("Sound", "SPEAKER"),
         ("Speech", "SPEAKER"),
     ):
         stats = _CACHE_STATS.get(ctype, {})
@@ -867,8 +902,8 @@ def draw_export_stats_ui(layout, context) -> None:
     texture_free = _disk_free_bytes(texture_path)
     voice_free = _disk_free_bytes(voice_path)
 
-    uncook_est = sum(_cache_estimate_bytes(name) for name in ("Bundle", "Collision"))
-    uncook_est_z = sum(_cache_estimate_compressed_bytes(name) for name in ("Bundle", "Collision"))
+    uncook_est = sum(_cache_estimate_bytes(name) for name in ("Bundle", "Collision", "Sound"))
+    uncook_est_z = sum(_cache_estimate_compressed_bytes(name) for name in ("Bundle", "Collision", "Sound"))
     texture_est = _cache_estimate_bytes("Texture")
     texture_est_z = _cache_estimate_compressed_bytes("Texture")
     speech_est = _cache_estimate_bytes("Speech")
