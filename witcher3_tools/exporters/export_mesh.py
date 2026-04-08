@@ -16,7 +16,7 @@ from ..CR2W import cr2w_writer
 from ..CR2W.Types.VariousTypes import CMatrix4x4
 from ..CR2W.Types.SBufferInfos import BoneData
 from ..importers.import_rig import get_ordered_bones
-from ..importers.import_mesh import get_mesh_info
+from ..importers.import_mesh import get_mesh_info, ZERO_WEIGHT_MASK_GROUP_NAME
 from ..CR2W.dc_entity import (
     CCollisionShapeConvex, CCollisionShapeTriMesh,
     CCollisionShapeBox, CCollisionShapeSphere, CCollisionShapeCapsule
@@ -775,7 +775,11 @@ class MeshExporter(object):
             self.bone_data = extract_bone_data(self.__armature, rotate_bones_90=rot90)
             vert_group_info = get_vertex_group_info(self.__armature, self.__meshes[0])
             self.bone_data.Block3 = vert_group_info
-            group_names = [group.name for group in self.__meshes[0].vertex_groups]
+            group_names = [
+                group.name
+                for group in self.__meshes[0].vertex_groups
+                if group.name != ZERO_WEIGHT_MASK_GROUP_NAME
+            ]
             self.bone_data.BoneIndecesMappingBoneIndex = convert_to_index_values(group_names, self.bone_data.jointNames)
             # Block3:[]
             # BoneIndecesMappingBoneIndex:[]

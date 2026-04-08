@@ -28,11 +28,65 @@ from .. import get_do_fix_tail, set_rig_rot90_enabled
 
 log = logging.getLogger(__name__)
 
+ZERO_WEIGHT_MASK_GROUP_NAME = "_w3_zero_weight_hidden"
+ZERO_WEIGHT_MASK_MODIFIER_NAME = "W3 Zero Weight Mask"
+
 def _warn_missing_physical_material(shape_type, mesh_name):
     log.warning(
         f"{shape_type} collision in '{mesh_name}' has no physical material. "
         "Assign one before export to avoid REDkit issues."
     )
+
+
+def _collect_zero_weight_vertex_indices(mesh_obj, weight_epsilon: float = 1e-8) -> List[int]:
+    mesh = getattr(mesh_obj, "data", None)
+    if getattr(mesh_obj, "type", None) != 'MESH' or mesh is None:
+        return []
+
+    group_names = {group.index: group.name for group in mesh_obj.vertex_groups}
+    zero_weight_indices = []
+    for vertex in mesh.vertices:
+        if not any(
+            group.weight > weight_epsilon
+            and group_names.get(group.group) != ZERO_WEIGHT_MASK_GROUP_NAME
+            for group in vertex.groups
+        ):
+            zero_weight_indices.append(vertex.index)
+    return zero_weight_indices
+
+
+def _hide_zero_weight_faces(mesh_obj, weight_epsilon: float = 1e-8) -> Tuple[int, int]:
+    mesh = getattr(mesh_obj, "data", None)
+    if getattr(mesh_obj, "type", None) != 'MESH' or mesh is None:
+        return (0, 0)
+
+    zero_weight_indices = _collect_zero_weight_vertex_indices(mesh_obj, weight_epsilon)
+    if not zero_weight_indices:
+        return (0, 0)
+
+    zero_weight_set = set(zero_weight_indices)
+    hidden_face_count = 0
+
+    for polygon in mesh.polygons:
+        if any(vertex_index in zero_weight_set for vertex_index in polygon.vertices):
+            hidden_face_count += 1
+
+    existing_group = mesh_obj.vertex_groups.get(ZERO_WEIGHT_MASK_GROUP_NAME)
+    if existing_group is not None:
+        mesh_obj.vertex_groups.remove(existing_group)
+    zero_weight_group = mesh_obj.vertex_groups.new(name=ZERO_WEIGHT_MASK_GROUP_NAME)
+    zero_weight_group.add(zero_weight_indices, 1.0, 'REPLACE')
+
+    existing_modifier = mesh_obj.modifiers.get(ZERO_WEIGHT_MASK_MODIFIER_NAME)
+    if existing_modifier is not None:
+        mesh_obj.modifiers.remove(existing_modifier)
+    mask_modifier = mesh_obj.modifiers.new(name=ZERO_WEIGHT_MASK_MODIFIER_NAME, type='MASK')
+    mask_modifier.vertex_group = zero_weight_group.name
+    mask_modifier.invert_vertex_group = True
+    mask_modifier.show_in_editmode = True
+
+    mesh.update()
+    return (len(zero_weight_indices), hidden_face_count)
 
 
 def _mesh_data_debug_summary(mesh_data):
@@ -233,7 +287,8 @@ def import_mesh(filename:str,
                 rotate_180:bool = False,
                 keep_empty_lods:bool = False,
                 keep_proxy_meshes:bool = False,
-                do_import_cache_collision:bool = False) -> w3_types.CSkeletalAnimationSet:
+                do_import_cache_collision:bool = False,
+                hide_zero_weight_faces:bool = True) -> w3_types.CSkeletalAnimationSet:
     dirpath, file = os.path.split(filename)
     basename, ext = os.path.splitext(file)
     if ext.lower() in ('.w2mesh', '.w2ent'):
@@ -263,7 +318,8 @@ def import_mesh(filename:str,
                     do_merge_normals,
                     rotate_180,
                     keep_empty_lods,
-                    keep_proxy_meshes)
+                    keep_proxy_meshes,
+                    hide_zero_weight_faces)
                 
                 if rotate_180:
                     if armatures:
@@ -470,7 +526,8 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                 do_merge_normals,
                 rotate_180,
                 keep_empty_lods,
-                keep_proxy_meshes):
+                keep_proxy_meshes,
+                hide_zero_weight_faces):
     #TODO proxy meshes don't have lod0 they start at lod1, should import proxy anyway if requested
     #meshData = meshFile
     created_mesh_bl = []
@@ -800,6 +857,21 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                     break
                         # if bl_mesh != lod_meshes[0]:
                         #     lod_meshes[0].append(bl_mesh)
+
+    is_skinned_mesh = bool(
+        getattr(CData, "meshInfos", None)
+        and CData.meshInfos[0].vertexType == EMeshVertexType.EMVT_SKINNED
+    )
+    if hide_zero_weight_faces and is_skinned_mesh:
+        for mesh_obj in final_bl_meshes:
+            zero_weight_vert_count, hidden_face_count = _hide_zero_weight_faces(mesh_obj)
+            if hidden_face_count:
+                log.info(
+                    "Hidden %d faces touching %d zero-weight vertices on skinned mesh '%s'",
+                    hidden_face_count,
+                    zero_weight_vert_count,
+                    mesh_obj.name,
+                )
         # override = bpy.context.copy()
         # override["area.type"] = ['OUTLINER']
         # override["display_mode"] = ['ORPHAN_DATA']
@@ -1296,7 +1368,11 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
     if me.color_attributes.active_color_index != -1 and me.color_attributes.active:
         color_attribute = me.color_attributes.active
 
-    vertex_group_names = {group.index: group.name for group in mesh_ob.vertex_groups}
+    vertex_group_names = {
+        group.index: group.name
+        for group in mesh_ob.vertex_groups
+        if group.name != ZERO_WEIGHT_MASK_GROUP_NAME
+    }
     source_vertex_weights = {}
     for vert in me.vertices:
         weights = []

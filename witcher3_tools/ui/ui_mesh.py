@@ -216,9 +216,14 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
     #     default=False,
     #     description="If enabled, normals will be merged. Can cause blender to hang."
     # )
+    hide_zero_weight_faces: BoolProperty(
+        name="Hide Zero-Weight Faces",
+        description="Hides faces without bones on skinned meshes. The default game behaviour",
+        default=True,
+    )
     rotate_180: BoolProperty(
         name="Rotate 180°",
-        description="Rotate both the mesh and the armature on the Z-axis by 180°",
+        description="Rotate both the mesh and the armature on the Z-axis by 180°. Default is False",
         default=False
     )
     def invoke(self, context, event):
@@ -238,7 +243,8 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
                         "keep_lod_meshes",
                         "keep_empty_lods",
                         #"do_merge_normals",
-                        "rotate_180"]
+                        "rotate_180",
+                        "hide_zero_weight_faces"]
         }
         for section in sections:
             row = layout.row()
@@ -256,13 +262,16 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
         if ext == ".w2mesh":
             s = time.time()
             self.do_merge_normals = False
-            import_mesh.import_mesh(fdir,
-                                    self.do_import_mats,
-                                    self.do_import_armature,
-                                    self.keep_lod_meshes,
-                                    self.do_merge_normals,
-                                    self.rotate_180,
-                                    self.keep_empty_lods)
+            import_mesh.import_mesh(
+                fdir,
+                self.do_import_mats,
+                self.do_import_armature,
+                self.keep_lod_meshes,
+                self.do_merge_normals,
+                self.rotate_180,
+                self.keep_empty_lods,
+                hide_zero_weight_faces=self.hide_zero_weight_faces,
+            )
             message = f'Imported .w2mesh file in {time.time() - s} seconds.'
             log.info(message)
             self.report({'INFO'}, message)

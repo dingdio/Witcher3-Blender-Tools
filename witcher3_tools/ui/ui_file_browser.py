@@ -4376,13 +4376,16 @@ class FileActionOperatorImportToScene(Operator):
                         ", ".join(tex_stats["missing"][:8]) + ("..." if len(tex_stats["missing"]) > 8 else ""),
                     )
             elif ext == ".w2mesh":
-                import_mesh.import_mesh(abs_file_path,
-                                        True,   # do_import_mats
-                                        True,   # do_import_armature
-                                        False,  # keep_lod_meshes
-                                        False,  # do_merge_normals
-                                        False,  # rotate_180
-                                        False)  # keep_empty_lods
+                import_mesh.import_mesh(
+                    abs_file_path,
+                    True,   # do_import_mats
+                    True,   # do_import_armature
+                    False,  # keep_lod_meshes
+                    False,  # do_merge_normals
+                    False,  # rotate_180
+                    False,  # keep_empty_lods
+                    hide_zero_weight_faces=True,
+                )
             elif ext == ".w2cube":
                 result = bpy.ops.witcher.import_w2cube('EXEC_DEFAULT', filepath=abs_file_path)
                 if 'FINISHED' not in result:
