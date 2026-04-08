@@ -18,7 +18,9 @@ from .w3_material_constants import *
 from .w3_vector_param import (
     VECTOR_PARAM_KIND,
     VECTOR_SOURCE_XYZ,
+    get_mapping_vector_input,
     get_legacy_w_value,
+    get_vector_node_values,
     get_vector_w,
     mark_vector_param_node,
 )
@@ -1072,6 +1074,103 @@ def mat_load_params_into_nodes(
             node.witcher_include = True
 
 
+def _is_uv_mapping_vector_param(param_name: str) -> bool:
+    if not param_name:
+        return False
+    return (
+        'Tile' in param_name
+        or 'Rotation' in param_name
+        or 'Offset' in param_name
+        or param_name == 'SpecularShiftUVScale'
+    )
+
+
+def _find_texture_mapping_node(nodes, mat: Material, vector_param_name: str, target_node_name: str):
+    target_node = nodes.get(target_node_name)
+    if not target_node:
+        return None
+    if len(target_node.inputs[0].links) == 0:
+        log.warning(
+            "Warning: Node %s in material %s was expected to have a Mapping node plugged into it!",
+            target_node.name,
+            mat.name,
+        )
+        return None
+    mapping_node = target_node.inputs[0].links[0].from_node
+    if mapping_node.type != 'MAPPING':
+        log.warning("Expected a mapping node for %s, got %s instead!", vector_param_name, mapping_node.type)
+        return None
+    return mapping_node
+
+
+def _get_uv_mapping_targets(mat: Material, param_name: str):
+    nodes = mat.node_tree.nodes
+    mapping_targets = []
+    replace_token = None
+
+    if 'Rotation' in param_name:
+        replace_token = 'Rotation'
+    elif 'Offset' in param_name:
+        replace_token = 'Offset'
+    elif 'Tile' in param_name:
+        replace_token = 'Tile'
+
+    if replace_token == 'Tile':
+        for name in ['Diffuse', 'Normal']:
+            target_name = param_name.replace(replace_token, name)
+            mapping_node = _find_texture_mapping_node(nodes, mat, param_name, target_name)
+            if mapping_node and mapping_node not in mapping_targets:
+                mapping_targets.append(mapping_node)
+        if param_name == 'DetailTile':
+            pattern_mapping = nodes.get(_internal_helper_node_name("Mapping", "Pattern_Array"))
+            if pattern_mapping and pattern_mapping.type == 'MAPPING' and pattern_mapping not in mapping_targets:
+                mapping_targets.append(pattern_mapping)
+    elif replace_token in {'Rotation', 'Offset'}:
+        for name in ['Diffuse', 'Normal']:
+            target_name = param_name.replace(replace_token, name)
+            mapping_node = _find_texture_mapping_node(nodes, mat, param_name, target_name)
+            if mapping_node and mapping_node not in mapping_targets:
+                mapping_targets.append(mapping_node)
+    elif param_name == 'SpecularShiftUVScale':
+        mapping_node = _find_texture_mapping_node(nodes, mat, param_name, 'SpecularShiftTexture')
+        if mapping_node:
+            mapping_targets.append(mapping_node)
+
+    return mapping_targets
+
+
+def _apply_uv_mapping_vector_links(mat: Material, param_name: str, vector_node: Optional[Node]) -> None:
+    if mat is None or vector_node is None or not _is_uv_mapping_vector_param(param_name):
+        return
+
+    links = mat.node_tree.links
+    values = get_vector_node_values(vector_node, param_name)
+    for mapping_node in _get_uv_mapping_targets(mat, param_name):
+        mapping_input = get_mapping_vector_input(mapping_node, param_name)
+        if mapping_input is None:
+            continue
+        mapping_node.label = f"{param_name} Mapping"
+        for idx in range(min(3, len(mapping_input.default_value))):
+            mapping_input.default_value[idx] = values[idx]
+        if mapping_input.is_linked and mapping_input.links[0].from_socket.node == vector_node:
+            continue
+        if not mapping_input.is_linked:
+            links.new(vector_node.outputs[0], mapping_input)
+
+
+def reconcile_uv_mapping_vector_links(mat: Material) -> None:
+    if mat is None or mat.node_tree is None:
+        return
+
+    for node in mat.node_tree.nodes:
+        if node.type != 'COMBXYZ':
+            continue
+        param_name = str(getattr(node, "witcher_param_name", "") or node.name or "")
+        if not _is_uv_mapping_vector_param(param_name):
+            continue
+        _apply_uv_mapping_vector_links(mat, param_name, node)
+
+
 def fix_texture_node(par_name, node):
     if node and node.image:
         if par_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse','diffuse','diffusemap','diff', 'tex_Diffuse'] or 'DiffuseArray' in par_name:
@@ -1223,6 +1322,11 @@ def create_node_for_param(
                     links.new(node.outputs[1], alpha_pin)
         except Exception as e:
             log.critical(f'PIN LINKING ERROR {e}')
+    try:
+        if input_pin and input_pin.is_linked and input_pin.links[0].from_socket.node == node:
+            reconcile_uv_mapping_vector_links(mat)
+    except Exception:
+        pass
     return node
 
 
@@ -1613,7 +1717,6 @@ def create_node_color(mat, param, node_ng):
 
 def create_node_vector(mat, param, node_ng, do_vec_4 = False):
     nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
     par_name = param.get('name')
     par_value = param.get('value')
 
@@ -1629,71 +1732,7 @@ def create_node_vector(mat, param, node_ng, do_vec_4 = False):
         values[3] if len(values) > 3 else 1.0,
         VECTOR_SOURCE_XYZ,
     )
-
-    def find_texture_mapping_node(target_node_name):
-        target_node = nodes.get(target_node_name)
-        if not target_node:
-            return None
-        if len(target_node.inputs[0].links) == 0:
-            log.warning(f"Warning: Node {target_node.name} in material {mat.name} was expected to have a Mapping node plugged into it!")
-            return None
-        mapping_node = target_node.inputs[0].links[0].from_node
-        if mapping_node.type != 'MAPPING':
-            log.warning(f"Expected a mapping node for {par_name}, got {mapping_node.type} instead!")
-            return None
-        return mapping_node
-
-    def get_mapping_targets():
-        mapping_targets = []
-        mapping_input_idx = None
-
-        if 'Rotation' in par_name:
-            mapping_input_idx = 2
-            replace_token = 'Rotation'
-        elif 'Offset' in par_name:
-            mapping_input_idx = 1
-            replace_token = 'Offset'
-        elif 'Tile' in par_name:
-            mapping_input_idx = 3
-            replace_token = 'Tile'
-        elif par_name == 'SpecularShiftUVScale':
-            mapping_input_idx = 3
-            replace_token = None
-        else:
-            replace_token = None
-
-        if replace_token == 'Tile':
-            for name in ['Diffuse', 'Normal']:
-                target_name = par_name.replace(replace_token, name)
-                mapping_node = find_texture_mapping_node(target_name)
-                if mapping_node and mapping_node not in mapping_targets:
-                    mapping_targets.append(mapping_node)
-            if par_name == 'DetailTile':
-                pattern_mapping = nodes.get(_internal_helper_node_name("Mapping", "Pattern_Array"))
-                if pattern_mapping and pattern_mapping.type == 'MAPPING' and pattern_mapping not in mapping_targets:
-                    mapping_targets.append(pattern_mapping)
-        elif replace_token in {'Rotation', 'Offset'}:
-            for name in ['Diffuse', 'Normal']:
-                target_name = par_name.replace(replace_token, name)
-                mapping_node = find_texture_mapping_node(target_name)
-                if mapping_node and mapping_node not in mapping_targets:
-                    mapping_targets.append(mapping_node)
-        elif par_name == 'SpecularShiftUVScale':
-            mapping_node = find_texture_mapping_node('SpecularShiftTexture')
-            if mapping_node:
-                mapping_targets.append(mapping_node)
-
-        return mapping_input_idx, mapping_targets
-
-    mapping_input_idx, mapping_targets = get_mapping_targets()
-    if mapping_input_idx is not None:
-        for mapping_node in mapping_targets:
-            mapping_input = mapping_node.inputs[mapping_input_idx]
-            mapping_node.label = f"{par_name} Mapping"
-            for idx in range(min(3, len(mapping_input.default_value))):
-                mapping_input.default_value[idx] = values[idx]
-            if not mapping_input.is_linked:
-                links.new(node.outputs[0], mapping_input)
+    _apply_uv_mapping_vector_links(mat, par_name, node)
 
     if do_vec_4:
         return node
