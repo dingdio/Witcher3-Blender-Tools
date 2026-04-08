@@ -105,6 +105,13 @@ class CutsceneDialogItem(PropertyGroup):
     scene_path: StringProperty(default="")
 
 
+def _set_cutscene_burned_audio_scene_state(scene, event_name="", item_path=""):
+    if hasattr(scene, "witcher_cutscene_burned_audio_event"):
+        scene.witcher_cutscene_burned_audio_event = str(event_name or "")
+    if hasattr(scene, "witcher_cutscene_burned_audio_item_path"):
+        scene.witcher_cutscene_burned_audio_item_path = str(item_path or "")
+
+
 _IMPORTED_FIELD_LIST_LIMIT = 6
 
 
@@ -220,6 +227,27 @@ def _sync_cutscene_template_fields(scene, cutscene):
                 item.value_text = _format_imported_field_value(value)
             else:
                 item.value_text = "<unset>"
+
+
+def _sync_cutscene_burned_audio_state(scene, filepath, cutscene, cutscene_data=None):
+    event_name = ""
+    item_path = ""
+    if cutscene is not None:
+        has_burned_audio_prop, burned_audio_name = import_cutscene.get_cutscene_burned_audio_property(cutscene)
+        if has_burned_audio_prop:
+            event_name = str(burned_audio_name or "").strip()
+
+    burned_audio_info = dict(getattr(cutscene_data, "burned_audio_info", {}) or {})
+    item_path = str(burned_audio_info.get("item_path", "") or "").strip()
+    if event_name and not item_path:
+        try:
+            resolved_audio = import_cutscene.resolve_cutscene_burned_audio_item(cutscene, filename=filepath)
+        except Exception:
+            resolved_audio = None
+        if resolved_audio:
+            item_path = str(resolved_audio.get("item_path", "") or "").strip()
+
+    _set_cutscene_burned_audio_scene_state(scene, event_name=event_name, item_path=item_path)
 
 class WITCH_UL_CutsceneActorPreview(UIList):
     bl_idname = "WITCH_UL_CutsceneActorPreview"
@@ -359,6 +387,69 @@ def _find_actor_obj_by_voicetag(scene, voicetag):
     return None
 
 
+def _load_cutscene_dialogs_into_scene(context):
+    from ..ui.ui_voice import load_voice_and_lipsync
+
+    scene = context.scene
+    filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+    if not filepath:
+        raise RuntimeError("No cutscene loaded.")
+
+    scene.witcher_cutscene_dialog_items.clear()
+    dialog_items = import_cutscene.load_cutscene_dialog_items(filepath)
+
+    for dialog_data in dialog_items:
+        item = scene.witcher_cutscene_dialog_items.add()
+        item.actor = str(dialog_data.get("actor", "") or "")
+        item.voice_file = str(dialog_data.get("voice_file", "") or "")
+        item.sound_event = str(dialog_data.get("sound_event", "") or "")
+        item.line_index = int(dialog_data.get("line_index", 0) or 0)
+        item.scene_path = str(dialog_data.get("scene_path", "") or "")
+
+    if not dialog_items:
+        return {"loaded": 0, "skipped": 0, "total": 0}
+
+    dialog_events = sorted(
+        [
+            event
+            for event in list(getattr(scene, "witcher_cutscene_event_items", []))
+            if "DialogEvent" in str(getattr(event, "event_type", "") or "")
+            and str(getattr(event, "event_scope", "") or "").upper() == "ROOT"
+        ],
+        key=lambda event: float(getattr(event, "start_time", 0.0) or 0.0),
+    )
+
+    fps = float(scene.render.fps)
+    loaded = 0
+    skipped = 0
+    for idx, dialog_data in enumerate(dialog_items):
+        line_index = int(dialog_data.get("line_index", 0) or 0)
+        if not line_index:
+            skipped += 1
+            continue
+
+        voicetag = str(dialog_data.get("actor", "") or "")
+        actor_obj = _find_actor_obj_by_voicetag(scene, voicetag)
+
+        at_frame = 0.0
+        if idx < len(dialog_events):
+            at_frame = float(getattr(dialog_events[idx], "start_time", 0.0) or 0.0) * fps
+
+        try:
+            load_voice_and_lipsync(
+                str(line_index),
+                actor=actor_obj,
+                context=context,
+                at_frame=at_frame,
+            )
+            loaded += 1
+        except Exception as exc:
+            log.warning("Failed to load voice line %s for actor %s: %s", line_index, voicetag, exc)
+            skipped += 1
+
+    return {"loaded": loaded, "skipped": skipped, "total": len(dialog_items)}
+
+
 class WITCH_OT_LoadCutsceneDialogs(bpy.types.Operator):
     bl_idname = "witcher.load_cutscene_dialogs"
     bl_label = "Load Dialogs"
@@ -369,76 +460,25 @@ class WITCH_OT_LoadCutsceneDialogs(bpy.types.Operator):
     )
 
     def execute(self, context):
-        from ..ui.ui_voice import load_voice_and_lipsync
-
         scene = context.scene
         filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
         if not filepath:
             self.report({'WARNING'}, "No cutscene loaded.")
             return {'CANCELLED'}
 
-        # --- 1. Load dialog lines from the linked .w2scene --------------------
-        scene.witcher_cutscene_dialog_items.clear()
         try:
-            dialog_items = import_cutscene.load_cutscene_dialog_items(filepath)
+            stats = _load_cutscene_dialogs_into_scene(context)
         except Exception as exc:
             log.exception("Failed to load dialog items for %s", filepath)
             self.report({'ERROR'}, f"Dialog load failed: {exc}")
             return {'CANCELLED'}
 
-        for d in dialog_items:
-            item = scene.witcher_cutscene_dialog_items.add()
-            item.actor = str(d.get("actor", "") or "")
-            item.voice_file = str(d.get("voice_file", "") or "")
-            item.sound_event = str(d.get("sound_event", "") or "")
-            item.line_index = int(d.get("line_index", 0) or 0)
-            item.scene_path = str(d.get("scene_path", "") or "")
-
-        if not dialog_items:
+        loaded = int(stats.get("loaded", 0) or 0)
+        skipped = int(stats.get("skipped", 0) or 0)
+        total = int(stats.get("total", 0) or 0)
+        if total <= 0:
             self.report({'INFO'}, "No dialog lines found in linked .w2scene.")
             return {'FINISHED'}
-
-        # --- 2. Get ordered dialog events for timing --------------------------
-        # CExtAnimCutsceneDialogEvent root events, sorted by start_time.
-        # The nth event gives the start_time for the nth dialog line (engine rule).
-        all_events = list(getattr(scene, "witcher_cutscene_event_items", []))
-        dialog_events = sorted(
-            [e for e in all_events
-             if "DialogEvent" in str(getattr(e, "event_type", "") or "")
-             and str(getattr(e, "event_scope", "") or "").upper() == "ROOT"],
-            key=lambda e: float(getattr(e, "start_time", 0.0) or 0.0),
-        )
-
-        fps = float(scene.render.fps)
-
-        # --- 3. Load each line ------------------------------------------------
-        loaded = 0
-        skipped = 0
-        for idx, d in enumerate(dialog_items):
-            line_index = int(d.get("line_index", 0) or 0)
-            if not line_index:
-                skipped += 1
-                continue
-
-            voicetag = str(d.get("actor", "") or "")
-            actor_obj = _find_actor_obj_by_voicetag(scene, voicetag)
-
-            # Timing: use nth dialog event's start_time; fall back to 0 if fewer events than lines
-            at_frame = 0.0
-            if idx < len(dialog_events):
-                at_frame = float(getattr(dialog_events[idx], "start_time", 0.0) or 0.0) * fps
-
-            try:
-                load_voice_and_lipsync(
-                    str(line_index),
-                    actor=actor_obj,
-                    context=context,
-                    at_frame=at_frame,
-                )
-                loaded += 1
-            except Exception as exc:
-                log.warning("Failed to load voice line %s for actor %s: %s", line_index, voicetag, exc)
-                skipped += 1
 
         msg = f"Loaded {loaded} voice line(s)"
         if skipped:
@@ -590,6 +630,7 @@ def _clear_loaded_cutscene_state(scene):
     scene.witcher_cutscene_effect_items.clear()
     scene.witcher_cutscene_dialog_items.clear()
     scene.witcher_loaded_cutscene_name = ""
+    _set_cutscene_burned_audio_scene_state(scene, event_name="", item_path="")
     if hasattr(scene, "witcher_cutscene_last_import_seconds"):
         scene.witcher_cutscene_last_import_seconds = 0.0
     if hasattr(scene, "witcher_loaded_w2cutscene_path"):
@@ -626,6 +667,13 @@ def _get_loaded_cutscene_name(filepath):
     if not filepath:
         return ""
     return os.path.basename(filepath)
+
+
+def _get_loaded_cutscene_burned_audio_strip(scene):
+    filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+    if not filepath:
+        return None
+    return import_cutscene.find_cutscene_burned_audio_strip(scene, source_path=filepath)
 
 def _find_loaded_cutscene_actor_entry(scene, source_index):
     try:
@@ -789,6 +837,7 @@ def _sync_loaded_cutscene_state(scene, filepath, cutscene_data=None):
     )
 
     _sync_cutscene_template_fields(scene, _cutscene)
+    _sync_cutscene_burned_audio_state(scene, filepath, _cutscene, cutscene_data=cutscene_data)
     scene.witcher_cutscene_effect_items.clear()
     if _cutscene is not None:
         for eff in (getattr(_cutscene, "effects", None) or []):
@@ -964,6 +1013,16 @@ class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
         default=True,
         description="Load selected cutscene animations onto their matching actors after import",
     )
+    auto_apply_dialog: BoolProperty(
+        name="Auto Apply Dialog",
+        default=True,
+        description="Load linked dialog voice strips and lipsync onto matching actors after import",
+    )
+    import_burned_audio: BoolProperty(
+        name="Import Burned Track",
+        default=True,
+        description="Import the cutscene burned-track audio strip into the Blender sequencer",
+    )
 
     cutscene_actor_items: CollectionProperty(type=CutsceneActorPreviewItem)
     cutscene_actor_index: IntProperty(default=0)
@@ -978,7 +1037,11 @@ class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
 
         settings_box = layout.box()
         settings_box.label(text="Import Settings")
-        settings_box.prop(self, "auto_apply_animations")
+        auto_box = settings_box.box()
+        auto_box.label(text="Auto Apply", icon='PREFERENCES')
+        auto_box.prop(self, "auto_apply_animations")
+        auto_box.prop(self, "auto_apply_dialog")
+        auto_box.prop(self, "import_burned_audio")
 
         status_box = layout.box()
         status_box.label(text="Cutscene Preview")
@@ -1078,6 +1141,7 @@ class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
                 selected_actor_indices=selected_actor_indices if self.cutscene_actor_items else None,
                 selected_animation_indices=selected_animation_indices if self.cutscene_animation_items else None,
                 auto_apply_selected_animations=self.auto_apply_animations,
+                import_burned_audio=self.import_burned_audio,
             )
         except Exception as exc:
             log.exception("Failed to import cutscene %s", self.filepath)
@@ -1090,6 +1154,30 @@ class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
         auto_loaded_count = int(getattr(cutscene_data, "auto_applied_animation_count", 0) or 0)
         import_duration_seconds = float(getattr(cutscene_data, "import_duration_seconds", 0.0) or 0.0)
         _sync_loaded_cutscene_state(context.scene, self.filepath, cutscene_data=cutscene_data)
+        dialog_loaded_count = 0
+        dialog_skipped_count = 0
+        dialog_total_count = 0
+        if self.auto_apply_dialog:
+            try:
+                dialog_stats = _load_cutscene_dialogs_into_scene(context)
+                dialog_loaded_count = int(dialog_stats.get("loaded", 0) or 0)
+                dialog_skipped_count = int(dialog_stats.get("skipped", 0) or 0)
+                dialog_total_count = int(dialog_stats.get("total", 0) or 0)
+            except Exception as exc:
+                log.exception("Failed to auto-apply cutscene dialog for %s", self.filepath)
+                self.report({'WARNING'}, f"Cutscene imported, but dialog auto-apply failed: {exc}")
+        burned_audio_info = dict(getattr(cutscene_data, "burned_audio_info", {}) or {})
+        status_parts = []
+        if self.auto_apply_dialog:
+            if dialog_total_count > 0:
+                dialog_text = f"loaded {dialog_loaded_count} dialog line(s)"
+                if dialog_skipped_count:
+                    dialog_text += f" ({dialog_skipped_count} skipped)"
+                status_parts.append(dialog_text)
+            else:
+                status_parts.append("no dialog lines found")
+        if self.import_burned_audio and burned_audio_info:
+            status_parts.append("burned track imported")
         self.report(
             {'INFO'},
             (
@@ -1100,7 +1188,7 @@ class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
                     f"Imported {len(selected_actor_indices)} actor(s) and listed "
                     f"{len(selected_animation_indices)} animation(s) from cutscene in {import_duration_seconds:.2f}s."
                 )
-            ),
+            ) + (f" {'; '.join(status_parts)}." if status_parts else ""),
         )
         return {'FINISHED'}
     def invoke(self, context, event):
@@ -1120,6 +1208,59 @@ class WITCH_OT_ReopenCutsceneImportDialog(bpy.types.Operator):
             bpy.ops.witcher.import_w2_cutscene('INVOKE_DEFAULT', filepath=filepath)
         else:
             bpy.ops.witcher.import_w2_cutscene('INVOKE_DEFAULT')
+        return {'FINISHED'}
+
+
+class WITCH_OT_ImportCutsceneBurnedAudio(bpy.types.Operator):
+    bl_idname = "witcher.import_cutscene_burned_audio"
+    bl_label = "Import Burned Track"
+    bl_description = "Import the cutscene burned-track audio strip into the Blender sequencer"
+
+    def execute(self, context):
+        scene = context.scene
+        filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+        if not filepath:
+            self.report({'WARNING'}, "No cutscene loaded.")
+            return {'CANCELLED'}
+
+        try:
+            burned_audio_info = import_cutscene.import_cutscene_burned_audio_track(context, filepath=filepath)
+        except Exception as exc:
+            log.exception("Failed to import cutscene burned audio for %s", filepath)
+            self.report({'ERROR'}, f"Failed to import burned track: {exc}")
+            return {'CANCELLED'}
+
+        if not burned_audio_info:
+            self.report({'WARNING'}, "No burned track is defined for this cutscene.")
+            return {'CANCELLED'}
+
+        _set_cutscene_burned_audio_scene_state(
+            scene,
+            event_name=burned_audio_info.get("event_name", ""),
+            item_path=burned_audio_info.get("item_path", ""),
+        )
+        self.report({'INFO'}, f"Imported burned track '{burned_audio_info.get('event_name', '')}'.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_RemoveCutsceneBurnedAudio(bpy.types.Operator):
+    bl_idname = "witcher.remove_cutscene_burned_audio"
+    bl_label = "Remove Burned Track"
+    bl_description = "Remove the imported cutscene burned-track audio strip from the Blender sequencer"
+
+    def execute(self, context):
+        scene = context.scene
+        filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+        if not filepath:
+            self.report({'WARNING'}, "No cutscene loaded.")
+            return {'CANCELLED'}
+
+        removed_count = int(import_cutscene.remove_cutscene_burned_audio_strips(scene, source_path=filepath) or 0)
+        if removed_count <= 0:
+            self.report({'WARNING'}, "No imported burned track found for this cutscene.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Removed {removed_count} burned track strip(s).")
         return {'FINISHED'}
 
 class WITCH_OT_SetCutsceneActorLoaded(bpy.types.Operator):
@@ -1311,6 +1452,32 @@ def _draw_cutscene_template_tab(layout, scene):
 
     path_row = layout.row()
     path_row.label(text=str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or ""), icon='FILE')
+
+    burned_box = layout.box()
+    burned_header = burned_box.row(align=True)
+    burned_header.label(text="Burned Track", icon='SOUND')
+    burned_strip = _get_loaded_cutscene_burned_audio_strip(scene)
+    burned_event = str(getattr(scene, "witcher_cutscene_burned_audio_event", "") or "").strip()
+    burned_item_path = str(getattr(scene, "witcher_cutscene_burned_audio_item_path", "") or "").strip()
+    if burned_strip is not None:
+        burned_header.label(text="Loaded", icon='CHECKMARK')
+        burned_header.operator(WITCH_OT_ImportCutsceneBurnedAudio.bl_idname, text="", icon='FILE_REFRESH')
+        burned_header.operator(WITCH_OT_RemoveCutsceneBurnedAudio.bl_idname, text="", icon='X')
+    elif burned_event:
+        burned_header.label(text="Not Loaded", icon='INFO')
+        burned_header.operator(WITCH_OT_ImportCutsceneBurnedAudio.bl_idname, text="Import", icon='IMPORT')
+    else:
+        burned_header.label(text="None", icon='INFO')
+
+    burned_box.prop(scene, "witcher_cutscene_burned_audio_default_volume", text="Default Import Volume", slider=True)
+    if burned_event:
+        burned_box.label(text=f"Event: {burned_event}", icon='OUTLINER_OB_SPEAKER')
+    else:
+        burned_box.label(text="No burned track defined in this cutscene.", icon='INFO')
+    if burned_item_path:
+        burned_box.label(text=burned_item_path, icon='FILE')
+    if burned_strip is not None and hasattr(burned_strip, "volume"):
+        burned_box.prop(burned_strip, "volume", text="Sequencer Volume", slider=True)
 
     template_box = layout.box()
     header = template_box.row(align=True)
@@ -1623,6 +1790,8 @@ classes = [
     WITCH_UL_EntryEventList,
     ButtonOperatorImportW2cutscene,
     WITCH_OT_ReopenCutsceneImportDialog,
+    WITCH_OT_ImportCutsceneBurnedAudio,
+    WITCH_OT_RemoveCutsceneBurnedAudio,
     WITCH_OT_SetCutsceneActorLoaded,
     WITCH_OT_SetCutsceneAnimationLoaded,
     WITCH_OT_LoadCutsceneDialogs,
@@ -1663,6 +1832,15 @@ def register():
     bpy.types.Scene.witcher_cutscene_loaded_anim_index = bpy.props.IntProperty(default=0)
     bpy.types.Scene.witcher_cutscene_template_fields = bpy.props.CollectionProperty(type=CutsceneTemplateFieldItem)
     bpy.types.Scene.witcher_cutscene_show_unset_template_fields = bpy.props.BoolProperty(name="Show Unset", default=False)
+    bpy.types.Scene.witcher_cutscene_burned_audio_event = bpy.props.StringProperty(default="")
+    bpy.types.Scene.witcher_cutscene_burned_audio_item_path = bpy.props.StringProperty(default="")
+    bpy.types.Scene.witcher_cutscene_burned_audio_default_volume = bpy.props.FloatProperty(
+        name="Burned Track Default Volume",
+        default=import_cutscene.CUTSCENE_BURNED_AUDIO_DEFAULT_VOLUME,
+        min=0.0,
+        soft_max=2.0,
+        description="Default sequencer volume for imported cutscene burned-track strips",
+    )
     bpy.types.Scene.witcher_cutscene_effect_items = bpy.props.CollectionProperty(type=CutsceneEffectItem)
     bpy.types.Scene.witcher_cutscene_dialog_items = bpy.props.CollectionProperty(type=CutsceneDialogItem)
     bpy.types.Scene.witcher_cutscene_dialog_index = bpy.props.IntProperty(default=0)
@@ -1687,10 +1865,13 @@ def unregister():
     if hasattr(bpy.types.Scene, "witcher_cutscene_event_index"):
         del bpy.types.Scene.witcher_cutscene_event_index
     for prop in ("witcher_cs_tab", "witcher_cutscene_loaded_actor_index", "witcher_cutscene_loaded_anim_index",
-                 "witcher_cutscene_show_unset_template_fields",
-                 "witcher_cs_entry_event_idx",
-                 # legacy props removed in this version:
-                 "witcher_cs_fade_before", "witcher_cs_fade_after", "witcher_cs_cam_blend_in", "witcher_cs_cam_blend_out",
+                  "witcher_cutscene_show_unset_template_fields",
+                  "witcher_cutscene_burned_audio_event",
+                  "witcher_cutscene_burned_audio_item_path",
+                  "witcher_cutscene_burned_audio_default_volume",
+                  "witcher_cs_entry_event_idx",
+                  # legacy props removed in this version:
+                  "witcher_cs_fade_before", "witcher_cs_fade_after", "witcher_cs_cam_blend_in", "witcher_cs_cam_blend_out",
                  "witcher_cs_blackscreen", "witcher_cs_check_actors_pos", "witcher_cs_reverb_name",
                  "witcher_cs_audio_track", "witcher_cs_ent_to_hide_tags",
                  "witcher_cutscene_info_tab", "witcher_cutscene_event_scope_tab", "witcher_cutscene_events_tab",
