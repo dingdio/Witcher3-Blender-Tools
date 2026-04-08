@@ -19,6 +19,10 @@ CUTSCENE_SOURCE_INDEX_PROP = "witcher_cutscene_source_index"
 CUTSCENE_ANIMATION_NAME_PROP = "witcher_cutscene_animation_name"
 CUTSCENE_ACTOR_IMPORTED_PROP = "cutscene_actor_imported"
 CUTSCENE_APPEARANCE_DATA_PATH = "witcherui_RigSettings.app_list_index"
+CUTSCENE_BURNED_AUDIO_PROP = "witcher_cutscene_burned_audio"
+CUTSCENE_BURNED_AUDIO_EVENT_PROP = "witcher_cutscene_burned_audio_event"
+CUTSCENE_BURNED_AUDIO_ITEM_PATH_PROP = "witcher_cutscene_burned_audio_item_path"
+CUTSCENE_BURNED_AUDIO_SOURCE_PATH_PROP = "witcher_cutscene_burned_audio_source_path"
 
 def loadCutsceneFile(filename):
     ext = os.path.splitext(filename)[1]
@@ -68,6 +72,16 @@ def _cutscene_progress_end(window_manager, workspace):
 def _normalize_repo_path(path):
     return str(path or "").replace("/", "\\").lstrip("\\")
 
+
+def _normalize_filesystem_path(path):
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(text))
+    except Exception:
+        return text
+
 def split_cutscene_animation_name(anim_name):
     full_name = str(anim_name or "").strip()
     parts = full_name.split(":", 2)
@@ -102,6 +116,162 @@ def _is_cutscene_track_name(track_name, base_track=CUTSCENE_TRACK_NAME):
     if not track_text or not base_text:
         return False
     return track_text == base_text or track_text.startswith(f"{base_text}_")
+
+
+def _get_cutscene_burned_audio_property(cutscene_template):
+    present_fields = getattr(cutscene_template, "presentPropertyNames", None)
+    if present_fields is None:
+        has_burned_audio_prop = False
+    else:
+        has_burned_audio_prop = "burnedAudioTrackName" in set(present_fields)
+    burned_audio_name = str(getattr(cutscene_template, "burnedAudioTrackName", "") or "")
+    burned_audio_name = burned_audio_name.strip()
+    return has_burned_audio_prop, burned_audio_name
+
+
+def _resolve_cutscene_burned_audio_item(cutscene_template, filename="", loadmods=False):
+    from ..CR2W.witcher_cache.SoundCache import LoadSoundManager
+
+    def _resolve_paths(soundbanks_info, event_name):
+        if soundbanks_info is None or not hasattr(soundbanks_info, "resolve_event_name"):
+            return []
+        resolved = [str(path or "").replace("/", "\\") for path in (soundbanks_info.resolve_event_name(event_name) or [])]
+        return [path for path in resolved if path]
+
+    manager = LoadSoundManager(loadmods=loadmods)
+    soundbanks_info = getattr(manager, "soundBanksInfo", None)
+    if soundbanks_info is None or not hasattr(soundbanks_info, "resolve_event_name"):
+        return None
+
+    has_burned_audio_prop, burned_audio_name = _get_cutscene_burned_audio_property(cutscene_template)
+    if not has_burned_audio_prop or not burned_audio_name:
+        return None
+
+    resolved_paths = _resolve_paths(soundbanks_info, burned_audio_name)
+    if not resolved_paths:
+        metadata_path = str(getattr(soundbanks_info, "filename", "") or "").strip()
+        if metadata_path and os.path.exists(metadata_path):
+            try:
+                refreshed_info = soundbanks_info.__class__(metadata_path)
+                manager.soundBanksInfo = refreshed_info
+                soundbanks_info = refreshed_info
+                resolved_paths = _resolve_paths(soundbanks_info, burned_audio_name)
+            except Exception:
+                log.debug(
+                    "Failed to refresh soundbanks metadata before resolving burned audio '%s'.",
+                    burned_audio_name,
+                    exc_info=True,
+                )
+
+    if not resolved_paths:
+        log.info(
+            "Cutscene burned audio event '%s' did not resolve in soundbanks metadata '%s' for '%s'.",
+            burned_audio_name,
+            getattr(soundbanks_info, "filename", ""),
+            filename,
+        )
+        return None
+
+    preferred_path = next((path for path in resolved_paths if path.lower().endswith(".wem")), resolved_paths[0])
+    return {
+        "event_name": burned_audio_name,
+        "item_path": preferred_path,
+        "candidate_paths": resolved_paths,
+    }
+    return None
+
+
+def _remove_existing_cutscene_burned_audio_strips(scene, source_path=""):
+    from ..ui.ui_voice import _get_sequence_editor_strips
+
+    strips = _get_sequence_editor_strips(getattr(scene, "sequence_editor", None))
+    if strips is None:
+        return 0
+
+    normalized_source_path = _normalize_filesystem_path(source_path)
+    strips_to_remove = []
+    for strip in list(strips):
+        if getattr(strip, "type", None) != 'SOUND':
+            continue
+        try:
+            is_burned_audio = bool(strip.get(CUTSCENE_BURNED_AUDIO_PROP, False))
+        except Exception:
+            is_burned_audio = False
+        if not is_burned_audio:
+            continue
+        strip_source_path = ""
+        try:
+            strip_source_path = _normalize_filesystem_path(strip.get(CUTSCENE_BURNED_AUDIO_SOURCE_PATH_PROP, ""))
+        except Exception:
+            strip_source_path = ""
+        if normalized_source_path and strip_source_path and strip_source_path != normalized_source_path:
+            continue
+        strips_to_remove.append(strip)
+
+    for strip in strips_to_remove:
+        strips.remove(strip)
+    return len(strips_to_remove)
+
+
+def _import_cutscene_burned_audio_track(context, cutscene_template, source_path=""):
+    from ..ui.ui_file_browser import ensure_sound_item_extracted, ensure_sound_wav
+    from ..ui.ui_voice import _get_next_sound_channel, _get_sequence_editor_strips
+
+    resolved_audio = _resolve_cutscene_burned_audio_item(
+        cutscene_template,
+        filename=source_path,
+        loadmods=False,
+    )
+    if not resolved_audio:
+        return None
+
+    item_path = str(resolved_audio.get("item_path", "") or "").replace("/", "\\").lstrip("\\")
+    if not item_path:
+        return None
+
+    sound_abs_path = ensure_sound_item_extracted(context, item_path, loadmods=False)
+    if not sound_abs_path:
+        raise RuntimeError(f"Sound cache item not found: {item_path}")
+
+    wav_path = ensure_sound_wav(context, sound_abs_path, item_path)
+    scene = context.scene
+    if not scene.sequence_editor:
+        scene.sequence_editor_create()
+    strips = _get_sequence_editor_strips(scene.sequence_editor)
+    if strips is None:
+        raise RuntimeError("Blender sequence editor strips API is unavailable")
+
+    removed_count = _remove_existing_cutscene_burned_audio_strips(scene, source_path=source_path)
+    channel = _get_next_sound_channel(scene)
+    frame_start = 0
+    strip_name = (
+        str(resolved_audio.get("event_name", "") or "").strip()
+        or os.path.splitext(os.path.basename(item_path))[0]
+        or "cutscene_burned_audio"
+    )
+
+    soundstrip = strips.new_sound(strip_name, wav_path, channel=channel, frame_start=frame_start)
+    soundstrip.frame_start = frame_start
+    strip_end = int(getattr(soundstrip, "frame_final_end", frame_start))
+    if strip_end > scene.frame_end:
+        scene.frame_end = strip_end
+
+    try:
+        soundstrip[CUTSCENE_BURNED_AUDIO_PROP] = True
+        soundstrip[CUTSCENE_BURNED_AUDIO_EVENT_PROP] = str(resolved_audio.get("event_name", "") or "")
+        soundstrip[CUTSCENE_BURNED_AUDIO_ITEM_PATH_PROP] = item_path
+        soundstrip[CUTSCENE_BURNED_AUDIO_SOURCE_PATH_PROP] = str(source_path or "")
+    except Exception:
+        pass
+
+    return {
+        "event_name": str(resolved_audio.get("event_name", "") or ""),
+        "item_path": item_path,
+        "wav_path": wav_path,
+        "strip_name": getattr(soundstrip, "name", strip_name),
+        "channel": int(getattr(soundstrip, "channel", channel) or channel),
+        "removed_count": int(removed_count),
+    }
 
 def _schedule_cutscene_animation_frame(sequence_state, actor_key, component_name, duration):
     actor_key = str(actor_key or "<unknown>")
@@ -1248,6 +1418,7 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
 
         auto_applied_animation_count = 0
         applied_animation_indices = set()
+        burned_audio_info = None
         if auto_apply_selected_animations:
             def _auto_apply_progress(done_count, total_count, actor_label):
                 total_count = max(1, int(total_count or 0))
@@ -1271,6 +1442,19 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
         else:
             _set_progress(95, "Finishing cutscene import...")
 
+        has_burned_audio_prop, burned_audio_name = _get_cutscene_burned_audio_property(CCutsceneTemplate)
+        if has_burned_audio_prop and burned_audio_name:
+            _set_progress(97, "Importing burned audio track...")
+            try:
+                burned_audio_info = _import_cutscene_burned_audio_track(context, CCutsceneTemplate, source_path=filename)
+            except Exception as exc:
+                log.warning(
+                    "Failed to import burned audio track '%s' for cutscene %s: %s",
+                    burned_audio_name,
+                    os.path.basename(filename),
+                    exc,
+                )
+
         import_duration_seconds = time.perf_counter() - import_started_at
 
         try:
@@ -1283,6 +1467,7 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
             CCutsceneTemplate.loaded_actor_imported_flags_by_index = dict(loaded_actor_imported_flags_by_index)
             CCutsceneTemplate.loaded_actor_guid_by_index = dict(loaded_actor_guid_by_index)
             CCutsceneTemplate.applied_animation_indices = sorted(applied_animation_indices)
+            CCutsceneTemplate.burned_audio_info = dict(burned_audio_info or {})
         except Exception:
             pass
         if hasattr(scene, "witcher_cutscene_last_import_seconds"):
@@ -1297,6 +1482,13 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
             len(treeList),
             auto_applied_animation_count,
         )
+        if burned_audio_info:
+            log.info(
+                "Imported burned audio '%s' for cutscene '%s' from %s.",
+                burned_audio_info.get("event_name", ""),
+                os.path.basename(filename),
+                burned_audio_info.get("item_path", ""),
+            )
         return CCutsceneTemplate
     finally:
         _cutscene_progress_end(window_manager, workspace)

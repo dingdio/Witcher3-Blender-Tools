@@ -991,7 +991,7 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     )
     redcloth_simulation_enabled: bpy.props.BoolProperty(
         name="Redcloth Cloth Simulation Enabled",
-        default=True,
+        default=False,
         description="Enable the imported ClothSimulation modifier by default"
     )
     redcloth_wind_velocity: bpy.props.FloatProperty(

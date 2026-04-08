@@ -304,7 +304,12 @@ class SoundManager(WitcherArchiveManager):
                         with open(filename, "rb") as handle:
                             manager = pickle.load(handle)
                         manager.base_path = current_base_path
-                        if getattr(manager, "soundBanksInfo", None) is None:
+                        soundbanks_info = getattr(manager, "soundBanksInfo", None)
+                        if (
+                            soundbanks_info is None
+                            or not hasattr(soundbanks_info, "resolve_event_name")
+                            or not hasattr(soundbanks_info, "EventsByName")
+                        ):
                             manager.soundBanksInfo = SoundBanksInfoXML(_soundbanks_metadata_path())
                     except Exception as exc:
                         log.warning("Failed to load cached sound data, rebuilding: %s", exc)

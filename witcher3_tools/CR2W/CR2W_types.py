@@ -490,6 +490,7 @@ class CSTRING:
             self.String = read_bytes.decode('utf-16le')
         else:
             self.String = read_bytes.decode('ISO-8859-1')
+        self.String = self.String.rstrip("\x00")
 
     # def Read(self, f):
     #     startofString = f.tell()
