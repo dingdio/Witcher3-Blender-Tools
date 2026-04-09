@@ -19,6 +19,29 @@ def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
 
 
+def _normalize_game_path(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        return os.path.normpath(os.path.abspath(path))
+    except Exception:
+        return os.path.normpath(path)
+
+
+def _refresh_texture_configuration_path() -> str:
+    base_path = _normalize_game_path(get_game_path())
+    Configuration.ExecutablePath = base_path
+    Configuration.GameModDir = os.path.join(base_path, "mods") if base_path else ""
+    Configuration.GameDlcDir = os.path.join(base_path, "dlc") if base_path else ""
+    return base_path
+
+
+def _has_texture_source_root(base_path: str) -> bool:
+    if not base_path:
+        return False
+    return os.path.isdir(os.path.join(base_path, "content"))
+
+
 class TextureManager():
     InstanceManager = None
     InstanceManagerMods = None
@@ -61,14 +84,18 @@ class TextureManager():
         return self.Items.get(filePath, None)
     
     def LoadModBundle(self, filename):
-        if self.cache_files is None:
-            self.cache_files = []
-        self.cache_files.append(filename)
-
         if filename in self.Archives:
             return
 
-        bundle = TextureCache(filename)
+        try:
+            bundle = TextureCache(filename)
+        except Exception as exc:
+            log.warning("Failed to load texture cache %s: %s", filename, exc)
+            return
+
+        if self.cache_files is None:
+            self.cache_files = []
+        self.cache_files.append(filename)
         for item in bundle.Files:
             mod_folder = WitcherArchiveManager.GetModFolder(filename) + "\\" + item.Name
             if mod_folder not in self.Items:
@@ -82,6 +109,9 @@ class TextureManager():
 
     def LoadModsBundles(self, mods_path, dlc_path):
         """Load texture caches from mod directories."""
+        self.base_path = _normalize_game_path(Configuration.ExecutablePath)
+        if not mods_path:
+            return
         if not os.path.exists(mods_path):
             os.makedirs(mods_path, exist_ok=True)
 
@@ -113,7 +143,12 @@ class TextureManager():
         if filename in self.Archives:
             return
 
-        bundle = TextureCache(filename)  # Assuming TextureCache is defined elsewhere
+        try:
+            bundle = TextureCache(filename)
+        except Exception as exc:
+            log.warning("Failed to load texture cache %s: %s", filename, exc)
+            return
+
         for item in bundle.Files:
             if item.Name not in self.Items:
                 self.Items[item.Name] = []
@@ -125,11 +160,15 @@ class TextureManager():
         self.Archives[filename] = bundle
 
     def LoadAll(self, base_path):
-        self.base_path = base_path
+        self.base_path = _normalize_game_path(base_path)
         self.cache_files = []
-        
-        content = os.path.join(base_path, "content")
-        dlc = os.path.join(base_path, "dlc")
+
+        if not _has_texture_source_root(self.base_path):
+            log.info("Texture cache skipped: Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
+            return
+
+        content = os.path.join(self.base_path, "content")
+        dlc = os.path.join(self.base_path, "dlc")
         content_dirs = [d for d in os.listdir(content) if os.path.isdir(os.path.join(content, d)) and d.startswith("content")]
         content_dirs.sort(key=natural_sort_key)
         patch_dirs = [d for d in os.listdir(content) if os.path.isdir(os.path.join(content, d)) and d.startswith("patch")]
@@ -143,13 +182,15 @@ class TextureManager():
                         self.LoadBundle(os.path.join(root, file))
 
 
-        VanillaDlClist = ["dlc1", "dlc2", "dlc3", "dlc4", "dlc5", "dlc6", "dlc7", "dlc8", "dlc9", "dlc10", "dlc11", "dlc12", "dlc13", "dlc14", "dlc15", "dlc16", "dlc17", "dlc18", "dlc20", "bob", "ep1"]
         if os.path.exists(dlc):
             dlc_dirs = [os.path.join(dlc, d) for d in os.listdir(dlc) if os.path.isdir(os.path.join(dlc, d))]
             dlc_dirs.sort(key=natural_sort_key)
+            vanilla_dlc_names = {name.lower() for name in self.VANILLA_DLC_LIST}
 
             for dir_path in dlc_dirs:
-                #if os.path.basename(dir_path) in VanillaDlClist:
+                dlc_name = os.path.basename(dir_path).lower()
+                if dlc_name not in vanilla_dlc_names:
+                    continue
                 for root, dirs, files in os.walk(dir_path):
                     for file in sorted(files):
                         if file.endswith('.cache') and Cache.GetCacheTypeOfFile(os.path.join(root, file)) == Cache.Cachetype.Texture:
@@ -176,8 +217,15 @@ class TextureManager():
         pass
     @staticmethod
     def Get(do_reload=False, loadmods=False):
+        current_base_path = _refresh_texture_configuration_path()
         instance_manager = TextureManager.InstanceManagerMods if loadmods else TextureManager.InstanceManager
         cache_name = "texture_cache_mods.pkl" if loadmods else "texture_cache.pkl"
+
+        if (
+            instance_manager is not None
+            and getattr(instance_manager, "base_path", None) != current_base_path
+        ):
+            do_reload = True
 
         if instance_manager is None or do_reload:
             cache_root = get_cache_root(create=True)
@@ -192,7 +240,7 @@ class TextureManager():
                 if loadmods:
                     tm.LoadModsBundles(Configuration.GameModDir, Configuration.GameDlcDir)
                 else:
-                    tm.LoadAll(Configuration.ExecutablePath)
+                    tm.LoadAll(current_base_path)
                 try:
                     with open(filename, 'wb') as f:
                         pickle.dump(tm, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -230,7 +278,7 @@ class TextureManager():
 
     @staticmethod
     def BuildSourceSignature(loadmods=False):
-        base_path = Configuration.ExecutablePath
+        base_path = _refresh_texture_configuration_path()
         if loadmods:
             roots = cache_meta.get_mod_dirs(os.path.join(base_path, "mods"))
             dlc_dirs = cache_meta.get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=TextureManager.VANILLA_DLC_LIST)
@@ -239,7 +287,13 @@ class TextureManager():
             roots.extend(mod_dlc_dirs)
         else:
             roots = cache_meta.get_content_patch_dirs(base_path)
-            roots.extend(cache_meta.get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=[]))
+            roots.extend(
+                cache_meta.get_dlc_dirs(
+                    base_path,
+                    vanilla_only=True,
+                    vanilla_list=TextureManager.VANILLA_DLC_LIST,
+                )
+            )
 
         def _predicate(path: str) -> bool:
             if not path.lower().endswith(".cache"):

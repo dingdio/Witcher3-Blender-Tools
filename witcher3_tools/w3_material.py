@@ -33,8 +33,13 @@ from .w3_material_reader import (
     resolve_w2mg,
 )
 from . import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext, get_texture_path
-from .ui.blender_fun import convert_xbm_to_dds, load_w2cube_image, load_w2cube_blick_equirect_image
-from .CR2W.common_blender import repo_file, win_safe_path, bpy_image_load_safe, win_path_key, win_unprefix_path
+from .ui.blender_fun import (
+    convert_xbm_to_dds,
+    load_image_with_dds_repair,
+    load_w2cube_image,
+    load_w2cube_blick_equirect_image,
+)
+from .CR2W.common_blender import repo_file, win_safe_path, bpy_image_load_safe, win_path_key, win_unprefix_path, overwrite_existing_enabled
 
 possible_folders = [
     'files\\Raw\\Mod',
@@ -481,6 +486,80 @@ def get_all_w2mi(w2mi_path, all_instances):
     else:
         return mat_base
 
+
+def _iter_material_node_trees(material: Material):
+    if material is None:
+        return
+    seen = set()
+    stack = [getattr(material, "node_tree", None)]
+    while stack:
+        node_tree = stack.pop()
+        if node_tree is None:
+            continue
+        try:
+            tree_id = int(node_tree.as_pointer())
+        except Exception:
+            tree_id = id(node_tree)
+        if tree_id in seen:
+            continue
+        seen.add(tree_id)
+        yield node_tree
+        for node in getattr(node_tree, "nodes", []):
+            child_tree = getattr(node, "node_tree", None)
+            if child_tree is not None:
+                stack.append(child_tree)
+
+
+def _image_looks_broken(image) -> bool:
+    if image is None:
+        return False
+    try:
+        size = tuple(getattr(image, "size", (0, 0)))
+    except Exception:
+        size = (0, 0)
+    if len(size) < 2 or size[0] <= 0 or size[1] <= 0:
+        return True
+    has_data = getattr(image, "has_data", None)
+    if has_data is False:
+        return True
+    return False
+
+
+def repair_broken_dds_images_in_material(material: Material, *, allow_dds_repair: bool = False) -> bool:
+    if material is None or not allow_dds_repair:
+        return False
+
+    repaired_any = False
+    checked_paths = set()
+    for node_tree in _iter_material_node_trees(material):
+        for node in getattr(node_tree, "nodes", []):
+            if getattr(node, "type", "") != 'TEX_IMAGE':
+                continue
+            image = getattr(node, "image", None)
+            if image is None or not _image_looks_broken(image):
+                continue
+
+            image_path = win_unprefix_path(getattr(image, "filepath", "") or "")
+            if not image_path or not image_path.lower().endswith(".dds"):
+                continue
+            path_key = win_path_key(image_path)
+            if path_key in checked_paths:
+                continue
+            checked_paths.add(path_key)
+
+            repaired_img, load_error = load_image_with_dds_repair(
+                image_path,
+                image=image,
+                check_existing=True,
+                allow_dds_repair=True,
+            )
+            if repaired_img is not None:
+                node.image = repaired_img
+                repaired_any = True
+            else:
+                log.warning("Failed to repair broken DDS image %s on material %s: %s", image_path, material.name, load_error)
+    return repaired_any
+
 def setup_w3_material(
         uncook_path: str
         ,material: Material
@@ -544,6 +623,8 @@ def setup_w3_material(
     # that we create on imported materials.
     existing_mat = find_material(mat_base, params)
     if existing_mat:
+        if overwrite_existing_enabled():
+            repair_broken_dds_images_in_material(existing_mat, allow_dds_repair=True)
         if not force_update:
             return existing_mat
 
@@ -1645,6 +1726,7 @@ def load_texture(
     ) -> Image:
     tex_path = win_unprefix_path(tex_path)
     img_filename = os.path.basename(tex_path)	# Filename with extension.
+    overwrite_existing = overwrite_existing_enabled()
 
     # Check if an image with this filepath is already loaded.
     img = None
@@ -1654,6 +1736,17 @@ def load_texture(
         if win_path_key(i.filepath) == tex_key:
             img = i
             break
+    if img and tex_path.lower().endswith('.dds') and overwrite_existing:
+        repaired_img, load_error = load_image_with_dds_repair(
+            tex_path,
+            image=img,
+            check_existing=True,
+            allow_dds_repair=True,
+        )
+        if repaired_img is not None:
+            img = repaired_img
+        else:
+            log.warning("Failed to refresh cached DDS image %s: %s", tex_path, load_error)
     # Check if the file exists
     if not img and not os.path.isfile(win_safe_path(tex_path)):
         log.info("Image not found: " + tex_path + " (Usually unimportant)")
@@ -1663,7 +1756,19 @@ def load_texture(
         img.source = 'FILE'
         #return
     elif not img:
-        img = bpy_image_load_safe(tex_path, check_existing=True)
+        if tex_path.lower().endswith('.dds'):
+            img, load_error = load_image_with_dds_repair(
+                tex_path,
+                check_existing=True,
+                allow_dds_repair=overwrite_existing,
+            )
+            if img is None:
+                log.warning("Failed to load image %s: %s", tex_path, load_error)
+                img = bpy.data.images.new(img_filename, width=1024, height=1024)
+                img.filepath = tex_path
+                img.source = 'FILE'
+        else:
+            img = bpy_image_load_safe(tex_path, check_existing=True)
 
     # Correct the image name.
     filepath = img.filepath.replace(os.sep, "/")

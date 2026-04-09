@@ -90,7 +90,7 @@ def _swizzle_rgba8_bytes_to_bgra(raw_bytes: bytes) -> bytes:
         out[i + 3] = src[i + 3]
     return bytes(out)
 
-def convert_xbm_to_dds(fdir):
+def convert_xbm_to_dds(fdir, force=False, out_path=None):
     import os
     f = open(fdir,"rb")
     xbmFile = getCR2W(f)
@@ -160,8 +160,8 @@ def convert_xbm_to_dds(fdir):
                 dxt = b'\x44\x58\x54\x35'
             else:
                 raise('Unknown dxt')
-            dds_path = fdir.replace('.xbm', '.dds')
-            if os.path.exists(dds_path):
+            dds_path = os.path.splitext(out_path or fdir)[0] + '.dds'
+            if os.path.exists(dds_path) and not force:
                 return dds_path
             br.seek(chunk.PROPS[-1].dataEnd)
             
@@ -195,8 +195,9 @@ def convert_xbm_to_dds(fdir):
                     if texture_item:
                         import os
                         import bpy
-                        extractPath = os.path.join(get_texture_path(bpy.context), texture_item.Name)
+                        extractPath = out_path or os.path.join(get_texture_path(bpy.context), texture_item.Name)
                         texture_item.extract_to_file(extractPath)
+                        dds_path = os.path.splitext(extractPath)[0] + '.dds'
                     else:
                         log.debug("Uncooked Texture not found in cache, using cooked file. %s", fdir)
                         #!REMOVE REPEATED CODE CLEAN UP
@@ -263,6 +264,263 @@ def convert_xbm_to_dds(fdir):
 
             break
     return dds_path
+
+
+def _dds_format_name_from_header(data: bytes):
+    if len(data) < 128 or data[:4] != b"DDS ":
+        raise ValueError("Invalid DDS file")
+
+    header_size = struct.unpack_from("<I", data, 4)[0]
+    if header_size != 124:
+        raise ValueError("Invalid DDS header size")
+
+    height = struct.unpack_from("<I", data, 12)[0]
+    width = struct.unpack_from("<I", data, 16)[0]
+    mip_count = struct.unpack_from("<I", data, 28)[0]
+    pf_size = struct.unpack_from("<I", data, 76)[0]
+    fourcc = data[84:88]
+    rgb_bit_count = struct.unpack_from("<I", data, 88)[0]
+    rmask = struct.unpack_from("<I", data, 92)[0]
+    gmask = struct.unpack_from("<I", data, 96)[0]
+    bmask = struct.unpack_from("<I", data, 100)[0]
+    amask = struct.unpack_from("<I", data, 104)[0]
+
+    if pf_size != 32:
+        raise ValueError("Invalid DDS pixel format size")
+    if width <= 0 or height <= 0:
+        raise ValueError("Invalid DDS dimensions")
+
+    if fourcc == b"DX10":
+        if len(data) < 148:
+            raise ValueError("Invalid DX10 DDS header")
+        dxgi_format = struct.unpack_from("<I", data, 128)[0]
+        if dxgi_format in (71, 72):
+            format_name = "BC1_UNORM"
+        elif dxgi_format in (74, 75):
+            format_name = "BC2_UNORM"
+        elif dxgi_format in (77, 78):
+            format_name = "BC3_UNORM"
+        elif dxgi_format == 80:
+            format_name = "BC4_UNORM"
+        elif dxgi_format == 83:
+            format_name = "BC5_UNORM"
+        elif dxgi_format in (28, 29, 87, 91):
+            format_name = "R8G8B8A8_UNORM"
+        elif dxgi_format in (98, 99):
+            format_name = "BC7_UNORM"
+        else:
+            raise ValueError(f"Unsupported DXGI format in DDS: {dxgi_format}")
+        data_offset = 148
+    elif fourcc == b"DXT1":
+        format_name = "BC1_UNORM"
+        data_offset = 128
+    elif fourcc == b"DXT3":
+        format_name = "BC2_UNORM"
+        data_offset = 128
+    elif fourcc == b"DXT5":
+        format_name = "BC3_UNORM"
+        data_offset = 128
+    elif fourcc == b"BC4U":
+        format_name = "BC4_UNORM"
+        data_offset = 128
+    elif fourcc == b"BC5U":
+        format_name = "BC5_UNORM"
+        data_offset = 128
+    elif fourcc == b"\x00\x00\x00\x00" and rgb_bit_count == 32:
+        if (rmask, gmask, bmask, amask) in (
+            (0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000),
+            (0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000),
+        ):
+            format_name = "R8G8B8A8_UNORM"
+            data_offset = 128
+        else:
+            raise ValueError("Unsupported uncompressed DDS pixel masks")
+    else:
+        raise ValueError(f"Unsupported DDS format: fourcc={fourcc!r}")
+
+    return format_name, width, height, max(1, mip_count), data_offset
+
+
+def _dds_top_mip_size(format_name: str, width: int, height: int) -> int:
+    width = int(width)
+    height = int(height)
+    if format_name == "R8G8B8A8_UNORM":
+        return width * height * 4
+
+    block_width = max(1, (width + 3) // 4)
+    block_height = max(1, (height + 3) // 4)
+    if format_name in ("BC1_UNORM", "BC4_UNORM"):
+        return block_width * block_height * 8
+    if format_name in ("BC2_UNORM", "BC3_UNORM", "BC5_UNORM", "BC7_UNORM"):
+        return block_width * block_height * 16
+    raise ValueError(f"Unsupported DDS format: {format_name}")
+
+
+def is_valid_dds_file(dds_path: str) -> bool:
+    import os
+
+    try:
+        if not dds_path or not os.path.exists(dds_path):
+            return False
+        with open(dds_path, "rb") as handle:
+            header_data = handle.read(148)
+        format_name, width, height, _mip_count, data_offset = _dds_format_name_from_header(header_data)
+        file_size = os.path.getsize(dds_path)
+        min_payload = _dds_top_mip_size(format_name, width, height)
+        return file_size >= (data_offset + min_payload)
+    except Exception:
+        return False
+
+
+def _blender_image_has_data(image) -> bool:
+    if image is None:
+        return False
+    try:
+        size = tuple(getattr(image, "size", (0, 0)))
+    except Exception:
+        return False
+    if len(size) < 2 or size[0] <= 0 or size[1] <= 0:
+        return False
+    has_data = getattr(image, "has_data", None)
+    if has_data is not None and not has_data:
+        return False
+    return True
+
+
+def _normalize_texture_repo_path(repo_path: str) -> str:
+    import os
+
+    normalized = str(repo_path or "").replace("/", "\\").lstrip("\\")
+    if not normalized:
+        return ""
+
+    base, ext = os.path.splitext(normalized)
+    if ext.lower() in {".dds", ".png", ".jpg", ".jpeg", ".tga", ".bmp"}:
+        return base + ".xbm"
+    return normalized
+
+
+def _resolve_texture_repo_path_for_repair(image_path: str, image=None) -> str:
+    repo_path = ""
+
+    if image is not None:
+        try:
+            settings = getattr(image, "witcherui_TextureSettings", None)
+            repo_path = getattr(settings, "repo_path", "") or ""
+        except Exception:
+            repo_path = ""
+
+    repo_path = _normalize_texture_repo_path(repo_path)
+    if repo_path:
+        return repo_path
+
+    try:
+        from .ui_texture_export import resolve_texture_image_metadata
+
+        repo_path, _texture_group = resolve_texture_image_metadata(
+            bpy.context,
+            image_path,
+            repo_path=repo_path,
+        )
+    except Exception:
+        repo_path = ""
+
+    return _normalize_texture_repo_path(repo_path)
+
+
+def _refresh_local_xbm_for_repair(image_path: str, image=None):
+    import os
+    from ..CR2W.common_blender import repo_file, win_safe_path, win_unprefix_path
+
+    sibling_xbm_path = os.path.splitext(image_path)[0] + ".xbm"
+    repo_path = _resolve_texture_repo_path_for_repair(image_path, image=image)
+    last_error = None
+
+    if repo_path:
+        try:
+            refreshed_xbm_path = win_unprefix_path(repo_file(repo_path))
+            if refreshed_xbm_path and os.path.isfile(win_safe_path(refreshed_xbm_path)):
+                return refreshed_xbm_path, None
+        except Exception as exc:
+            last_error = exc
+
+    if os.path.isfile(win_safe_path(sibling_xbm_path)):
+        return sibling_xbm_path, last_error
+
+    return "", last_error
+
+
+def _repair_dds_from_local_xbm(image_path: str, xbm_path: str = ""):
+    import os
+    from ..CR2W.common_blender import win_safe_path, win_unprefix_path
+
+    xbm_path = win_unprefix_path(xbm_path or "")
+    if not xbm_path:
+        xbm_path = os.path.splitext(image_path)[0] + ".xbm"
+    if not os.path.isfile(win_safe_path(xbm_path)):
+        return False, None
+
+    try:
+        convert_xbm_to_dds(xbm_path, force=True, out_path=image_path)
+    except Exception as exc:
+        return False, exc
+
+    return is_valid_dds_file(image_path), None
+
+
+def load_image_with_dds_repair(image_path: str, *, image=None, check_existing=True, allow_dds_repair=False):
+    import os
+    from ..CR2W.common_blender import bpy_image_load_safe, win_unprefix_path
+
+    image_path = win_unprefix_path(image_path or "")
+    is_dds = image_path.lower().endswith(".dds")
+    last_error = None
+    source_image = image
+
+    def _repair_dds() -> bool:
+        nonlocal last_error
+        if not (allow_dds_repair and is_dds):
+            return False
+        refreshed_xbm_path, refresh_error = _refresh_local_xbm_for_repair(image_path, image=source_image)
+        if refresh_error is not None:
+            last_error = refresh_error
+
+        if refreshed_xbm_path:
+            try:
+                repaired, error = _repair_dds_from_local_xbm(image_path, xbm_path=refreshed_xbm_path)
+            except Exception as exc:
+                repaired, error = False, exc
+            if repaired:
+                return True
+            if error is not None:
+                last_error = error
+        return False
+
+    if is_dds and not is_valid_dds_file(image_path):
+        _repair_dds()
+
+    for attempt in range(2):
+        loaded_image = None
+        try:
+            loaded_image = bpy_image_load_safe(image_path, check_existing=check_existing)
+            try:
+                loaded_image.reload()
+            except Exception as exc:
+                last_error = exc
+            if _blender_image_has_data(loaded_image):
+                return loaded_image, None
+            if last_error is None:
+                last_error = RuntimeError(
+                    f"Blender failed to decode image data for {os.path.basename(image_path)}"
+                )
+        except Exception as exc:
+            last_error = exc
+
+        if attempt == 0 and _repair_dds():
+            continue
+        break
+
+    return None, last_error
 
 
 def _flip_rgba8_cubemap_faces_hv(raw_bytes: bytes, edge: int, mip_count: int) -> bytes:

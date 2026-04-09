@@ -36,7 +36,7 @@ from .. import (
     get_witcher2_game_path,
 )
 from ..importers import import_entity
-from ..ui.blender_fun import convert_xbm_to_dds, convert_w2cube_to_dds
+from ..ui.blender_fun import convert_xbm_to_dds, convert_w2cube_to_dds, load_image_with_dds_repair
 from bpy.props import IntProperty, StringProperty
 from ..importers.import_entity import test_load_entity, fixed_chunk_paths
 import os
@@ -4212,6 +4212,25 @@ class FileActionOperatorImportToScene(Operator):
             log.error("File not found: %s", abs_file_path)
             return {'CANCELLED'}
 
+        # Texture imports should always resolve cooked .xbm sources to a viewable/importable DDS first.
+        if abs_file_path.lower().endswith(".xbm"):
+            dds_path = os.path.splitext(abs_file_path)[0] + ".dds"
+            if not win_path_exists(dds_path):
+                try:
+                    converted_path = convert_xbm_to_dds(abs_file_path)
+                    if converted_path:
+                        dds_path = converted_path
+                except Exception as exc:
+                    self.report({'ERROR'}, f"Failed to convert XBM to DDS: {exc}")
+                    log.error("Failed to convert XBM to DDS for import: %s", abs_file_path, exc_info=True)
+                    return {'CANCELLED'}
+            if win_path_exists(dds_path):
+                abs_file_path = dds_path
+            else:
+                self.report({'ERROR'}, f"Could not resolve DDS for texture: {os.path.basename(abs_file_path)}")
+                log.error("Could not resolve DDS for texture import: %s", abs_file_path)
+                return {'CANCELLED'}
+
         # Import based on file extension and cache type
         ext = file_helpers.getFilenameType(abs_file_path)
 
@@ -4375,6 +4394,26 @@ class FileActionOperatorImportToScene(Operator):
                         os.path.basename(abs_file_path),
                         ", ".join(tex_stats["missing"][:8]) + ("..." if len(tex_stats["missing"]) > 8 else ""),
                     )
+            elif ext in {".dds", ".png", ".jpg", ".jpeg", ".tga", ".bmp"}:
+                if ext == ".dds":
+                    img, load_error = load_image_with_dds_repair(
+                        abs_file_path,
+                        check_existing=True,
+                        allow_dds_repair=overwrite_existing,
+                    )
+                else:
+                    load_error = None
+                    img = None
+                    try:
+                        img = bpy_image_load_safe(abs_file_path, check_existing=True)
+                    except Exception as exc:
+                        load_error = exc
+                if img is None:
+                    if load_error is not None:
+                        self.report({'ERROR'}, f"Texture import failed: {load_error}")
+                    else:
+                        self.report({'ERROR'}, f"Texture import failed: {os.path.basename(abs_file_path)}")
+                    return {'CANCELLED'}
             elif ext == ".w2mesh":
                 import_mesh.import_mesh(
                     abs_file_path,
@@ -4440,7 +4479,9 @@ class FileActionOperatorImportToScene(Operator):
                 face_data = import_rig.loadFaceFile(abs_file_path)
                 import_rig.create_armature(face_data.mimicSkeleton, "yes", context=context)
             else:
+                self.report({'ERROR'}, f"Import not implemented for {ext} files from {cache_type} cache")
                 log.info("Import not implemented for %s files from %s cache", ext, cache_type)
+                return {'CANCELLED'}
         finally:
             if override_roots:
                 clear_repo_override_roots()

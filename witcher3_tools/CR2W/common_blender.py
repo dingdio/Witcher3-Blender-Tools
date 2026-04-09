@@ -242,6 +242,10 @@ def clear_overwrite_existing():
     global _overwrite_existing
     _overwrite_existing = False
 
+
+def overwrite_existing_enabled() -> bool:
+    return bool(_overwrite_existing)
+
 @contextmanager
 def mod_loading_context(context=None, prefer_mods=None, overwrite=None):
     """Context manager that configures mod loading for all repo_file calls within the block.
