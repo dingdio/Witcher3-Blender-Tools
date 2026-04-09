@@ -7,8 +7,13 @@ import re
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
-from ..blender_common import get_game_path
-from ..common_cache.WitcherArchiveManager import Configuration, WitcherArchiveManager
+from ..common_cache.WitcherArchiveManager import (
+    Configuration,
+    WitcherArchiveManager,
+    has_game_content_root,
+    normalize_game_path,
+    refresh_game_configuration_path,
+)
 from ..Cache import Cache
 from .. import cache_meta
 from ....extension_paths import get_cache_root
@@ -22,29 +27,6 @@ log = logging.getLogger(__name__)
 
 def natural_sort_key(value: str):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", value)]
-
-
-def _normalize_game_path(path: str) -> str:
-    if not path:
-        return ""
-    try:
-        return os.path.normpath(os.path.abspath(path))
-    except Exception:
-        return os.path.normpath(path)
-
-
-def _refresh_configuration_paths() -> str:
-    base_path = _normalize_game_path(get_game_path())
-    Configuration.ExecutablePath = base_path
-    Configuration.GameModDir = os.path.join(base_path, "mods")
-    Configuration.GameDlcDir = os.path.join(base_path, "dlc")
-    return base_path
-
-
-def _has_sound_source_root(base_path: str) -> bool:
-    if not base_path:
-        return False
-    return os.path.isdir(os.path.join(base_path, "content"))
 
 
 def _soundbanks_xml_path() -> str:
@@ -92,11 +74,6 @@ class SoundManager(WitcherArchiveManager):
     InstanceManagerMods = None
     CACHE_FILENAME = "sound_cache.pkl"
     CACHE_FILENAME_MODS = "sound_cache_mods.pkl"
-    VANILLA_DLC_LIST = [
-        "dlc1", "dlc2", "dlc3", "dlc4", "dlc5", "dlc6", "dlc7", "dlc8",
-        "dlc9", "dlc10", "dlc11", "dlc12", "dlc13", "dlc14", "dlc15",
-        "dlc16", "dlc17", "dlc18", "dlc20", "bob", "ep1",
-    ]
 
     def __init__(self):
         self.base_path: Optional[str] = None
@@ -156,10 +133,10 @@ class SoundManager(WitcherArchiveManager):
         self.cache_files.append(filename)
 
     def LoadAll(self, base_path: str):
-        self.base_path = _normalize_game_path(base_path)
+        self.base_path = normalize_game_path(base_path)
         self.cache_files = []
 
-        if not _has_sound_source_root(self.base_path):
+        if not has_game_content_root(self.base_path):
             log.info("Sound cache skipped: Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
             return
 
@@ -204,6 +181,14 @@ class SoundManager(WitcherArchiveManager):
                             self.LoadBundle(filepath)
 
     def LoadModsBundles(self, mods_path: str, dlc_path: str):
+        self.base_path = normalize_game_path(Configuration.ExecutablePath)
+        self.cache_files = []
+
+        if not has_game_content_root(self.base_path):
+            log.info("Sound cache skipped (mods): Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
+            return
+        if not mods_path:
+            return
         if not os.path.exists(mods_path):
             os.makedirs(mods_path, exist_ok=True)
 
@@ -249,7 +234,7 @@ class SoundManager(WitcherArchiveManager):
 
     @staticmethod
     def Get(do_reload: bool = False, loadmods: bool = False) -> "SoundManager":
-        current_base_path = _refresh_configuration_paths()
+        current_base_path = refresh_game_configuration_path()
         instance_manager = SoundManager.InstanceManagerMods if loadmods else SoundManager.InstanceManager
         cache_name = SoundManager.CACHE_FILENAME_MODS if loadmods else SoundManager.CACHE_FILENAME
 
@@ -275,7 +260,7 @@ class SoundManager(WitcherArchiveManager):
                 else:
                     manager.LoadAll(current_base_path)
 
-                if not _has_sound_source_root(current_base_path):
+                if not has_game_content_root(current_base_path):
                     return manager
 
                 try:
@@ -289,7 +274,7 @@ class SoundManager(WitcherArchiveManager):
                 cache_meta.save_meta(meta_path, meta)
                 return manager
 
-            if not _has_sound_source_root(current_base_path):
+            if not has_game_content_root(current_base_path):
                 manager = load_from_game(filename)
             elif not os.path.exists(filename) or do_reload:
                 manager = load_from_game(filename)
@@ -327,15 +312,15 @@ class SoundManager(WitcherArchiveManager):
 
     @staticmethod
     def BuildSourceSignature(loadmods: bool = False):
-        base_path = _refresh_configuration_paths()
+        base_path = refresh_game_configuration_path()
         if loadmods:
             roots = cache_meta.get_mod_dirs(os.path.join(base_path, "mods"))
-            dlc_dirs = cache_meta.get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=SoundManager.VANILLA_DLC_LIST)
-            vanilla_set = {value.lower() for value in SoundManager.VANILLA_DLC_LIST}
+            dlc_dirs = cache_meta.get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=WitcherArchiveManager.VANILLA_DLC_LIST)
+            vanilla_set = {value.lower() for value in WitcherArchiveManager.VANILLA_DLC_LIST}
             roots.extend([path for path in dlc_dirs if os.path.basename(path).lower() not in vanilla_set])
         else:
             roots = cache_meta.get_content_patch_dirs(base_path)
-            roots.extend(cache_meta.get_dlc_dirs(base_path, vanilla_only=True, vanilla_list=SoundManager.VANILLA_DLC_LIST))
+            roots.extend(cache_meta.get_dlc_dirs(base_path, vanilla_only=True, vanilla_list=WitcherArchiveManager.VANILLA_DLC_LIST))
 
         def _predicate(path: str) -> bool:
             if not path.lower().endswith(".cache"):

@@ -4,9 +4,14 @@ import json
 import re
 import glob
 from pathlib import Path
-from ..blender_common import get_game_path
 from ..Cache import Cache
-from ..common_cache.WitcherArchiveManager import WitcherArchiveManager, Configuration
+from ..common_cache.WitcherArchiveManager import (
+    WitcherArchiveManager,
+    Configuration,
+    has_game_content_root,
+    normalize_game_path,
+    refresh_game_configuration_path,
+)
 from .. import cache_meta
 from ....extension_paths import get_cache_root
 from .TextureCache import TextureCache
@@ -19,37 +24,9 @@ def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
 
 
-def _normalize_game_path(path: str) -> str:
-    if not path:
-        return ""
-    try:
-        return os.path.normpath(os.path.abspath(path))
-    except Exception:
-        return os.path.normpath(path)
-
-
-def _refresh_texture_configuration_path() -> str:
-    base_path = _normalize_game_path(get_game_path())
-    Configuration.ExecutablePath = base_path
-    Configuration.GameModDir = os.path.join(base_path, "mods") if base_path else ""
-    Configuration.GameDlcDir = os.path.join(base_path, "dlc") if base_path else ""
-    return base_path
-
-
-def _has_texture_source_root(base_path: str) -> bool:
-    if not base_path:
-        return False
-    return os.path.isdir(os.path.join(base_path, "content"))
-
-
 class TextureManager():
     InstanceManager = None
     InstanceManagerMods = None
-    VANILLA_DLC_LIST = [
-        "dlc1", "dlc2", "dlc3", "dlc4", "dlc5", "dlc6", "dlc7", "dlc8",
-        "dlc9", "dlc10", "dlc11", "dlc12", "dlc13", "dlc14", "dlc15",
-        "dlc16", "dlc17", "dlc18", "dlc20", "bob", "ep1"
-    ]
     def __init__(self):
         self.base_path = None
         self.cache_files = None
@@ -109,7 +86,10 @@ class TextureManager():
 
     def LoadModsBundles(self, mods_path, dlc_path):
         """Load texture caches from mod directories."""
-        self.base_path = _normalize_game_path(Configuration.ExecutablePath)
+        self.base_path = normalize_game_path(Configuration.ExecutablePath)
+        if not has_game_content_root(self.base_path):
+            log.info("Texture cache skipped (mods): Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
+            return
         if not mods_path:
             return
         if not os.path.exists(mods_path):
@@ -132,7 +112,7 @@ class TextureManager():
                 if not os.path.isdir(dir_path):
                     continue
                 dlc_name = os.path.basename(dir_path).lower()
-                if dlc_name not in self.VANILLA_DLC_LIST:
+                if dlc_name not in WitcherArchiveManager.VANILLA_DLC_LIST:
                     for root, dirs, files in os.walk(dir_path):
                         for file in sorted(files):
                             filepath = os.path.join(root, file)
@@ -160,10 +140,10 @@ class TextureManager():
         self.Archives[filename] = bundle
 
     def LoadAll(self, base_path):
-        self.base_path = _normalize_game_path(base_path)
+        self.base_path = normalize_game_path(base_path)
         self.cache_files = []
 
-        if not _has_texture_source_root(self.base_path):
+        if not has_game_content_root(self.base_path):
             log.info("Texture cache skipped: Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
             return
 
@@ -185,7 +165,7 @@ class TextureManager():
         if os.path.exists(dlc):
             dlc_dirs = [os.path.join(dlc, d) for d in os.listdir(dlc) if os.path.isdir(os.path.join(dlc, d))]
             dlc_dirs.sort(key=natural_sort_key)
-            vanilla_dlc_names = {name.lower() for name in self.VANILLA_DLC_LIST}
+            vanilla_dlc_names = {name.lower() for name in WitcherArchiveManager.VANILLA_DLC_LIST}
 
             for dir_path in dlc_dirs:
                 dlc_name = os.path.basename(dir_path).lower()
@@ -217,7 +197,7 @@ class TextureManager():
         pass
     @staticmethod
     def Get(do_reload=False, loadmods=False):
-        current_base_path = _refresh_texture_configuration_path()
+        current_base_path = refresh_game_configuration_path()
         instance_manager = TextureManager.InstanceManagerMods if loadmods else TextureManager.InstanceManager
         cache_name = "texture_cache_mods.pkl" if loadmods else "texture_cache.pkl"
 
@@ -278,11 +258,11 @@ class TextureManager():
 
     @staticmethod
     def BuildSourceSignature(loadmods=False):
-        base_path = _refresh_texture_configuration_path()
+        base_path = refresh_game_configuration_path()
         if loadmods:
             roots = cache_meta.get_mod_dirs(os.path.join(base_path, "mods"))
-            dlc_dirs = cache_meta.get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=TextureManager.VANILLA_DLC_LIST)
-            vanilla_set = {v.lower() for v in TextureManager.VANILLA_DLC_LIST}
+            dlc_dirs = cache_meta.get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=WitcherArchiveManager.VANILLA_DLC_LIST)
+            vanilla_set = {v.lower() for v in WitcherArchiveManager.VANILLA_DLC_LIST}
             mod_dlc_dirs = [d for d in dlc_dirs if os.path.basename(d).lower() not in vanilla_set]
             roots.extend(mod_dlc_dirs)
         else:
@@ -291,7 +271,7 @@ class TextureManager():
                 cache_meta.get_dlc_dirs(
                     base_path,
                     vanilla_only=True,
-                    vanilla_list=TextureManager.VANILLA_DLC_LIST,
+                    vanilla_list=WitcherArchiveManager.VANILLA_DLC_LIST,
                 )
             )
 

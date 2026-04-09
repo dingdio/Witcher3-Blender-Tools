@@ -6,6 +6,7 @@ from pathlib import Path
 from ...bStream import *
 from .W3StringFile import W3StringFile
 from ..blender_common import get_game_path
+from ..common_cache.WitcherArchiveManager import has_game_content_or_dlc_root, normalize_game_path
 from .. import cache_meta
 from ....extension_paths import get_cache_root
 import logging
@@ -18,25 +19,14 @@ class Configuration:
     ExecutablePath = get_game_path()
 
 
-def _normalize_game_path(path: str) -> str:
-    if not path:
-        return ""
-    try:
-        return os.path.normpath(os.path.abspath(path))
-    except Exception:
-        return os.path.normpath(path)
-
-
 def _refresh_strings_configuration_path() -> str:
-    current_path = _normalize_game_path(get_game_path())
+    current_path = normalize_game_path(get_game_path())
     Configuration.ExecutablePath = current_path
     return current_path
 
 
 def _has_string_source_root(base_path: str) -> bool:
-    if not base_path:
-        return False
-    return os.path.isdir(os.path.join(base_path, "content")) or os.path.isdir(os.path.join(base_path, "dlc"))
+    return has_game_content_or_dlc_root(base_path)
 
 class W3StringManager():
     InstanceManager = None
@@ -68,7 +58,7 @@ class W3StringManager():
             return
 
         self.Language = newlanguage
-        self.base_path = _normalize_game_path(path)
+        self.base_path = normalize_game_path(path)
         self.Lines:dict = {}
         self.Keys:dict = {}
 
@@ -111,7 +101,7 @@ class W3StringManager():
     def from_json(cls, data):
         t_class = cls()
         t_class.Language = data['Language']
-        t_class.base_path = _normalize_game_path(data.get('base_path', ""))
+        t_class.base_path = normalize_game_path(data.get('base_path', ""))
         for key, val in data['Lines'].items():
             t_class.Lines[int(key)] = val
         for line in data['Keys'].items():

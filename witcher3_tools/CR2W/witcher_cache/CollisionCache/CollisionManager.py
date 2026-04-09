@@ -10,8 +10,13 @@ import gzip
 
 log = logging.getLogger(__name__)
 
-from ..blender_common import get_game_path
-from ..common_cache.WitcherArchiveManager import WitcherArchiveManager, Configuration
+from ..common_cache.WitcherArchiveManager import (
+    WitcherArchiveManager,
+    Configuration,
+    has_game_content_root,
+    normalize_game_path,
+    refresh_game_configuration_path,
+)
 from ..Cache import Cache
 from .. import cache_meta
 from ....extension_paths import get_cache_root
@@ -36,11 +41,6 @@ class CollisionManager(WitcherArchiveManager):
     InstanceManagerMods = None
     CACHE_FILENAME = "collision_cache.pkl"
     CACHE_FILENAME_MODS = "collision_cache_mods.pkl"
-    VANILLA_DLC_LIST = [
-        "dlc1", "dlc2", "dlc3", "dlc4", "dlc5", "dlc6", "dlc7", "dlc8",
-        "dlc9", "dlc10", "dlc11", "dlc12", "dlc13", "dlc14", "dlc15",
-        "dlc16", "dlc17", "dlc18", "dlc20", "bob", "ep1"
-    ]
 
     def __init__(self):
         self.base_path: Optional[str] = None
@@ -157,11 +157,15 @@ class CollisionManager(WitcherArchiveManager):
         Args:
             base_path: Path to the game's executable directory
         """
-        self.base_path = base_path
+        self.base_path = normalize_game_path(base_path)
         self.cache_files = []
 
-        content = os.path.join(base_path, "content")
-        dlc = os.path.join(base_path, "dlc")
+        if not has_game_content_root(self.base_path):
+            log.info("Collision cache skipped: Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
+            return
+
+        content = os.path.join(self.base_path, "content")
+        dlc = os.path.join(self.base_path, "dlc")
 
         # Load content directories
         if os.path.exists(content):
@@ -210,6 +214,14 @@ class CollisionManager(WitcherArchiveManager):
             mods_path: Path to the Mods directory
             dlc_path: Path to the DLC directory
         """
+        self.base_path = normalize_game_path(Configuration.ExecutablePath)
+        self.cache_files = []
+
+        if not has_game_content_root(self.base_path):
+            log.info("Collision cache skipped (mods): Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
+            return
+        if not mods_path:
+            return
         if not os.path.exists(mods_path):
             os.makedirs(mods_path, exist_ok=True)
 
@@ -267,8 +279,24 @@ class CollisionManager(WitcherArchiveManager):
         Returns:
             CollisionManager instance
         """
+        current_base_path = refresh_game_configuration_path()
         instance_manager = CollisionManager.InstanceManagerMods if loadmods else CollisionManager.InstanceManager
         cache_name = CollisionManager.CACHE_FILENAME_MODS if loadmods else CollisionManager.CACHE_FILENAME
+
+        if (
+            instance_manager is not None
+            and getattr(instance_manager, "base_path", None) != current_base_path
+        ):
+            do_reload = True
+
+        if not has_game_content_root(current_base_path):
+            tm = CollisionManager()
+            tm.base_path = current_base_path
+            if loadmods:
+                CollisionManager.InstanceManagerMods = tm
+            else:
+                CollisionManager.InstanceManager = tm
+            return tm
 
         if instance_manager is None or do_reload:
             cache_root = get_cache_root(create=True)
@@ -281,10 +309,14 @@ class CollisionManager(WitcherArchiveManager):
             def load_from_game(cache_filename: str) -> CollisionManager:
                 """Load from game files and save to pickle cache."""
                 tm = CollisionManager()
+                tm.base_path = current_base_path
                 if loadmods:
                     tm.LoadModsBundles(Configuration.GameModDir, Configuration.GameDlcDir)
                 else:
-                    tm.LoadAll(Configuration.ExecutablePath)
+                    tm.LoadAll(current_base_path)
+
+                if not has_game_content_root(current_base_path):
+                    return tm
 
                 # Save to pickle cache
                 try:
@@ -314,6 +346,8 @@ class CollisionManager(WitcherArchiveManager):
                     try:
                         with open(filename, 'rb') as f:
                             tm = pickle.load(f)
+                        if getattr(tm, "base_path", None) != current_base_path:
+                            tm = load_from_game(filename)
                     except Exception as e:
                         log.warning("Failed to load cached collision data, rebuilding: %s", e)
                         tm = load_from_game(filename)
@@ -330,16 +364,16 @@ class CollisionManager(WitcherArchiveManager):
 
     @staticmethod
     def BuildSourceSignature(loadmods: bool = False):
-        base_path = Configuration.ExecutablePath
+        base_path = refresh_game_configuration_path()
         if loadmods:
             roots = cache_meta.get_mod_dirs(os.path.join(base_path, "mods"))
-            dlc_dirs = cache_meta.get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=WitcherArchiveManager.VanillaDLClist)
-            vanilla_set = {v.lower() for v in WitcherArchiveManager.VanillaDLClist}
+            dlc_dirs = cache_meta.get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=WitcherArchiveManager.VANILLA_DLC_LIST)
+            vanilla_set = {v.lower() for v in WitcherArchiveManager.VANILLA_DLC_LIST}
             mod_dlc_dirs = [d for d in dlc_dirs if os.path.basename(d).lower() not in vanilla_set]
             roots.extend(mod_dlc_dirs)
         else:
             roots = cache_meta.get_content_patch_dirs(base_path)
-            roots.extend(cache_meta.get_dlc_dirs(base_path, vanilla_only=True, vanilla_list=WitcherArchiveManager.VanillaDLClist))
+            roots.extend(cache_meta.get_dlc_dirs(base_path, vanilla_only=True, vanilla_list=WitcherArchiveManager.VANILLA_DLC_LIST))
 
         def _predicate(path: str) -> bool:
             if not path.lower().endswith(".cache"):

@@ -3,8 +3,14 @@ import time
 import json
 import re
 from pathlib import Path
-from ..blender_common import get_game_path
-from ..common_cache.WitcherArchiveManager import WitcherArchiveManager, EBundleType, Configuration
+from ..common_cache.WitcherArchiveManager import (
+    WitcherArchiveManager,
+    EBundleType,
+    Configuration,
+    has_game_content_root,
+    normalize_game_path,
+    refresh_game_configuration_path,
+)
 # from .Cache import Cache
 from .W3Speech import W3Speech
 # from .SpeechCache import SpeechCache
@@ -14,31 +20,6 @@ from .. import cache_meta
 from ....extension_paths import get_cache_root
 import logging
 log = logging.getLogger(__name__)
-
-class Configuration:
-    ExecutablePath = get_game_path()
-
-
-def _normalize_game_path(path: str) -> str:
-    if not path:
-        return ""
-    try:
-        return os.path.normpath(os.path.abspath(path))
-    except Exception:
-        return os.path.normpath(path)
-
-
-def _refresh_speech_configuration_path() -> str:
-    current_path = _normalize_game_path(get_game_path())
-    Configuration.ExecutablePath = current_path
-    return current_path
-
-
-def _has_speech_source_root(base_path: str) -> bool:
-    if not base_path:
-        return False
-    content_dir = os.path.join(base_path, "content")
-    return os.path.isdir(content_dir)
 
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
@@ -82,24 +63,28 @@ class SpeechManager(WitcherArchiveManager):
 
     def LoadBundle(self, filename):
         log.debug("Loading speech bundle: %s", filename)
-        self.cache_files.append(filename)
-        
         if filename in self.Speeches:
             return
-        speech = W3Speech(filename)  # Assuming W3Speech is defined elsewhere
+        try:
+            speech = W3Speech(filename)  # Assuming W3Speech is defined elsewhere
+        except Exception as exc:
+            log.warning("Failed to load speech bundle %s: %s", filename, exc)
+            return
+        self.cache_files.append(filename)
         for item in speech.item_infos:
             if item.name not in self.Items:
                 self.Items[item.name] = []
 
             self.Items[item.name].append(item)
+            self.FileList.append(item)
 
         self.Speeches[filename] = speech
 
     def LoadAll(self, base_path):
-        self.base_path = _normalize_game_path(base_path)
+        self.base_path = normalize_game_path(base_path)
         self.cache_files = []
 
-        if not _has_speech_source_root(self.base_path):
+        if not has_game_content_root(self.base_path):
             log.info("Speech cache skipped: Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
             return
         
@@ -117,14 +102,15 @@ class SpeechManager(WitcherArchiveManager):
                     if file.endswith('enpc.w3speech'):
                         self.LoadBundle(os.path.join(root, file))
 
-
-        VanillaDlClist = ["dlc1", "dlc2", "dlc3", "dlc4", "dlc5", "dlc6", "dlc7", "dlc8", "dlc9", "dlc10", "dlc11", "dlc12", "dlc13", "dlc14", "dlc15", "dlc16", "dlc17", "dlc18", "dlc20", "bob", "ep1"]
         if os.path.exists(dlc):
             dlc_dirs = [os.path.join(dlc, d) for d in os.listdir(dlc) if os.path.isdir(os.path.join(dlc, d))]
             dlc_dirs.sort(key=natural_sort_key)
+            vanilla_dlc_names = {name.lower() for name in self.VANILLA_DLC_LIST}
 
             for dir_path in dlc_dirs:
-                #if os.path.basename(dir_path) in VanillaDlClist:
+                dlc_name = os.path.basename(dir_path).lower()
+                if dlc_name not in vanilla_dlc_names:
+                    continue
                 for root, dirs, files in os.walk(dir_path):
                     for file in sorted(files):
                         if file.endswith('enpc.w3speech'):
@@ -146,7 +132,7 @@ class SpeechManager(WitcherArchiveManager):
         pass
     @staticmethod
     def Get(do_reload = False):
-        current_base_path = _refresh_speech_configuration_path()
+        current_base_path = refresh_game_configuration_path()
 
         if (
             SpeechManager.InstanceManager is not None
@@ -168,35 +154,42 @@ class SpeechManager(WitcherArchiveManager):
                 sm.LoadAll(current_base_path)
 
                 # When no valid game path exists, return an empty manager without writing a misleading cache.
-                if not _has_speech_source_root(current_base_path):
+                if not has_game_content_root(current_base_path):
                     return sm
 
                 with open(filename, 'wb') as f:
                     pickle.dump(sm, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-                signature, source = cache_meta.signature_w3speech(current_base_path, WitcherArchiveManager.VanillaDLClist)
+                signature, source = cache_meta.signature_w3speech(current_base_path, WitcherArchiveManager.VANILLA_DLC_LIST)
                 meta = cache_meta.make_meta("speech_cache.pkl", filename, signature, source)
                 cache_meta.save_meta(meta_path, meta)
                 return sm
             
-            if not _has_speech_source_root(current_base_path):
+            if not has_game_content_root(current_base_path):
                 sm = load_sm(filename)
             elif not os.path.exists(filename) or do_reload:
                 sm = load_sm(filename)
             else:
-                with open(filename, 'rb') as f:
+                meta = cache_meta.load_meta(meta_path)
+                current_sig, _ = SpeechManager.BuildSourceSignature()
+                if not cache_meta.signatures_match(meta.get("signature", {}), current_sig):
+                    log.info("Speech cache stale, rebuilding vanilla...")
+                    sm = load_sm(filename)
+                else:
                     try:
-                        sm = pickle.load(f)
+                        with open(filename, 'rb') as f:
+                            sm = pickle.load(f)
                         if getattr(sm, "base_path", None) != current_base_path:
                             sm = load_sm(filename)
                     except Exception as e:
+                        log.warning("Failed to load cached speech data, rebuilding: %s", e)
                         sm = load_sm(filename)
             time_taken = time.time() - start_time
-            log.info('Loaded Speech Cache in %s seconds.', time_taken)
+            log.info('Loaded Speech Cache in %.2f seconds (%d files)', time_taken, len(sm.FileList))
             SpeechManager.InstanceManager = sm
         return SpeechManager.InstanceManager
 
     @staticmethod
     def BuildSourceSignature():
-        base_path = _refresh_speech_configuration_path()
-        return cache_meta.signature_w3speech(base_path, WitcherArchiveManager.VanillaDLClist)
+        base_path = refresh_game_configuration_path()
+        return cache_meta.signature_w3speech(base_path, WitcherArchiveManager.VANILLA_DLC_LIST)

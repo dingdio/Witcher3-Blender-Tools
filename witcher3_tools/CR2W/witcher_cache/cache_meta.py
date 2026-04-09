@@ -162,7 +162,7 @@ def signature_w3strings(base_path: str, language: str) -> Tuple[Dict, Dict]:
 
 def signature_w3speech(base_path: str, vanilla_dlc_list: List[str]) -> Tuple[Dict, Dict]:
     roots = get_content_patch_dirs(base_path)
-    roots.extend(get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=vanilla_dlc_list))
+    roots.extend(get_dlc_dirs(base_path, vanilla_only=True, vanilla_list=vanilla_dlc_list))
 
     def _predicate(path: str) -> bool:
         return path.lower().endswith("enpc.w3speech")

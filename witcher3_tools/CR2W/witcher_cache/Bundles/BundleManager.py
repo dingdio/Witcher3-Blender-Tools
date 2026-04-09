@@ -6,8 +6,14 @@ import time
 import re
 import pickle
 import gzip
-from ..common_cache.WitcherArchiveManager import WitcherArchiveManager, EBundleType, Configuration
-from ..blender_common import get_game_path
+from ..common_cache.WitcherArchiveManager import (
+    WitcherArchiveManager,
+    EBundleType,
+    Configuration,
+    has_game_content_root,
+    normalize_game_path,
+    refresh_game_configuration_path,
+)
 from .. import cache_meta
 from ....extension_paths import get_cache_root
 import logging
@@ -15,29 +21,6 @@ log = logging.getLogger(__name__)
 
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
-
-
-def _normalize_game_path(path: str) -> str:
-    if not path:
-        return ""
-    try:
-        return os.path.normpath(os.path.abspath(path))
-    except Exception:
-        return os.path.normpath(path)
-
-
-def _refresh_bundle_configuration_path() -> str:
-    base_path = _normalize_game_path(get_game_path())
-    Configuration.ExecutablePath = base_path
-    Configuration.GameModDir = os.path.join(base_path, "mods") if base_path else ""
-    Configuration.GameDlcDir = os.path.join(base_path, "dlc") if base_path else ""
-    return base_path
-
-
-def _has_bundle_source_root(base_path: str) -> bool:
-    if not base_path:
-        return False
-    return os.path.isdir(os.path.join(base_path, "content"))
 
 class BundleManager(WitcherArchiveManager):
     InstanceManager = None
@@ -142,10 +125,10 @@ class BundleManager(WitcherArchiveManager):
         self.Bundles[filename] = bundle
 
     def LoadAll(self, base_path):
-        self.base_path = _normalize_game_path(base_path)
+        self.base_path = normalize_game_path(base_path)
         self.cache_files = []
 
-        if not _has_bundle_source_root(self.base_path):
+        if not has_game_content_root(self.base_path):
             log.info("Bundle cache skipped (vanilla): Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
             return
         
@@ -168,7 +151,7 @@ class BundleManager(WitcherArchiveManager):
             dlc_dirs.sort(key=natural_sort_key)
 
             for dir_path in dlc_dirs:
-                if os.path.basename(dir_path).lower() in self.VanillaDLClist:
+                if os.path.basename(dir_path).lower() in self.VANILLA_DLC_LIST:
                     for root, dirs, files in os.walk(dir_path):
                         for file in sorted(files):
                             if file.endswith('.bundle'):
@@ -176,9 +159,9 @@ class BundleManager(WitcherArchiveManager):
 
     def LoadModsBundles(self, mods, dlc):
         # Mods cache depends on a valid game root for mods/dlc locations.
-        self.base_path = _normalize_game_path(Configuration.ExecutablePath)
+        self.base_path = normalize_game_path(Configuration.ExecutablePath)
         self.cache_files = []
-        if not _has_bundle_source_root(self.base_path):
+        if not has_game_content_root(self.base_path):
             log.info("Bundle cache skipped (mods): Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
             return
         if not mods or not os.path.exists(mods):
@@ -192,7 +175,7 @@ class BundleManager(WitcherArchiveManager):
             dlcdirs = sorted(glob.glob(os.path.join(dlc, '*')))
             dlcfiles = [file
                         for dir in dlcdirs
-                        if os.path.basename(dir) not in self.VanillaDLClist
+                        if os.path.basename(dir) not in self.VANILLA_DLC_LIST
                         for file in glob.glob(os.path.join(dir, '**', '*.bundle'), recursive=True)
                         ]
             
@@ -203,7 +186,7 @@ class BundleManager(WitcherArchiveManager):
     
     @staticmethod
     def Get(loadmods = True, reset_cache = True):
-        current_base_path = _refresh_bundle_configuration_path()
+        current_base_path = refresh_game_configuration_path()
         instance_manager = BundleManager.InstanceManagerMods if loadmods else BundleManager.InstanceManager
         cache_name = "bundle_cache_mods.pkl" if loadmods else "bundle_cache.pkl"
 
@@ -213,7 +196,7 @@ class BundleManager(WitcherArchiveManager):
         ):
             reset_cache = True
 
-        if not _has_bundle_source_root(current_base_path):
+        if not has_game_content_root(current_base_path):
             bm = BundleManager()
             bm.base_path = current_base_path
             if loadmods:
@@ -275,10 +258,10 @@ class BundleManager(WitcherArchiveManager):
 
     @staticmethod
     def BuildSourceSignature(loadmods: bool):
-        base_path = _refresh_bundle_configuration_path()
+        base_path = refresh_game_configuration_path()
         if loadmods:
-            return cache_meta.signature_bundles_mods(base_path, WitcherArchiveManager.VanillaDLClist)
-        return cache_meta.signature_bundles_base(base_path, WitcherArchiveManager.VanillaDLClist)
+            return cache_meta.signature_bundles_mods(base_path, WitcherArchiveManager.VANILLA_DLC_LIST)
+        return cache_meta.signature_bundles_base(base_path, WitcherArchiveManager.VANILLA_DLC_LIST)
 
 def RebuildRootNode(self):
     # Placeholder for implementation
