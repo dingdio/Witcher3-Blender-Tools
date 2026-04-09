@@ -133,23 +133,55 @@ def ensure_voice_list_initialized(context):
         _schedule_deferred_voice_filter()
 
 def _get_active_armature(context):
-    """Resolve the target armature using the character system first, then fallbacks."""
-    from .armature_context import get_main_armature
-    armature = get_main_armature(context, prefer_active=True, remember=False, fallback=True)
-    if armature:
-        return armature
-    obj = context.active_object
-    if obj and obj.type == 'ARMATURE':
-        return obj
-    if obj and obj.type == 'MESH' and obj.parent and obj.parent.type == 'ARMATURE':
-        return obj.parent
-    for obj in context.selected_objects:
-        if obj.type == 'ARMATURE':
-            return obj
-    return None
+    """Resolve the best armature for voice import and phoneme recreation."""
+    return _resolve_voice_target_armature(context)
 
 def _armature_has_face_morphs(armature):
     return bool(armature and armature.pose and "w3_face_poses" in armature.pose.bones)
+
+
+def _object_to_armature(obj):
+    if obj and getattr(obj, "type", None) == 'ARMATURE':
+        return obj
+    if obj and getattr(obj, "type", None) == 'MESH':
+        parent = getattr(obj, "parent", None)
+        if parent and getattr(parent, "type", None) == 'ARMATURE':
+            return parent
+    return None
+
+
+def _resolve_voice_target_armature(context, actor=None):
+    actor_armature = _object_to_armature(actor)
+    if actor_armature:
+        return actor_armature
+
+    from .armature_context import get_main_armature
+
+    armature = get_main_armature(context, prefer_active=True, remember=False, fallback=True)
+    if armature:
+        return armature
+
+    active_obj = getattr(context, "active_object", None)
+    active_armature = _object_to_armature(active_obj)
+    if active_armature:
+        return active_armature
+
+    for obj in getattr(context, "selected_objects", []) or []:
+        selected_armature = _object_to_armature(obj)
+        if selected_armature:
+            return selected_armature
+    return None
+
+
+def _auto_load_face_morphs(context, armature):
+    if not armature or _armature_has_face_morphs(armature):
+        return
+    try:
+        from .ui_mimics import _ensure_face_morphs_loaded
+
+        _ensure_face_morphs_loaded(context, armature)
+    except Exception as exc:
+        log.warning("Auto face morph load failed: %s", exc)
 
 def _find_face_meshes(context, armature):
     scene = context.scene
@@ -350,10 +382,43 @@ def _compress_to_keyframes(values_row, frames, eps=1e-4):
     return pts
 
 
+def _track_name_matches(track, track_name):
+    if track is None:
+        return False
+    current_name = str(getattr(track, "name", "") or "")
+    return current_name == track_name or current_name.startswith(f"{track_name}.")
+
+
+def _remove_nla_tracks(anim_data, track_name):
+    removed_actions = []
+    if anim_data is None:
+        return removed_actions
+
+    for track in list(anim_data.nla_tracks):
+        if not _track_name_matches(track, track_name):
+            continue
+        for strip in list(track.strips):
+            action = getattr(strip, "action", None)
+            if action and action.name not in removed_actions:
+                removed_actions.append(action.name)
+            track.strips.remove(strip)
+        anim_data.nla_tracks.remove(track)
+    return removed_actions
+
+
+def _remove_orphan_actions(action_names):
+    for action_name in action_names or []:
+        action = bpy.data.actions.get(action_name)
+        if action and action.users == 0:
+            bpy.data.actions.remove(action)
+
+
 def _apply_phoneme_action(armature, pose_bone, phoneme_list, frames, phoneme_values, action_name, track_name="voice_import_phoneme"):
     if armature.animation_data is None:
         armature.animation_data_create()
     armature.animation_data.use_nla = True
+
+    old_actions = _remove_nla_tracks(armature.animation_data, track_name)
 
     action = bpy.data.actions.new(name=action_name)
 
@@ -373,13 +438,8 @@ def _apply_phoneme_action(armature, pose_bone, phoneme_list, frames, phoneme_val
             fcurve.keyframe_points[ki].co = (fr, val)
             fcurve.keyframe_points[ki].interpolation = 'LINEAR'
 
-    track = armature.animation_data.nla_tracks.get(track_name)
-    if track is None:
-        track = armature.animation_data.nla_tracks.new()
-        track.name = track_name
-    else:
-        for strip in list(track.strips):
-            track.strips.remove(strip)
+    track = armature.animation_data.nla_tracks.new()
+    track.name = track_name
 
     if frames:
         start_frame = frames[0]
@@ -388,7 +448,9 @@ def _apply_phoneme_action(armature, pose_bone, phoneme_list, frames, phoneme_val
         bind_strip_action_slot(strip, resolve_action_slot(action, target=armature, ensure=True))
         strip.frame_start = start_frame
         strip.frame_end = end_frame
-        strip.blend_type = 'COMBINE'
+        strip.blend_type = 'REPLACE'
+
+    _remove_orphan_actions(old_actions)
 
 def _remove_lipsync_tracks(meshes, armature=None, track_name="voice_import"):
     """Delete the raw lipsync NLA tracks after phoneme solve.
@@ -401,13 +463,11 @@ def _remove_lipsync_tracks(meshes, armature=None, track_name="voice_import"):
         shape_keys = getattr(mesh_obj.data, "shape_keys", None)
         if not shape_keys or not shape_keys.animation_data:
             continue
-        for track in list(shape_keys.animation_data.nla_tracks):
-            if track.name == track_name:
-                shape_keys.animation_data.nla_tracks.remove(track)
+        old_actions = _remove_nla_tracks(shape_keys.animation_data, track_name)
+        _remove_orphan_actions(old_actions)
     if armature and armature.animation_data:
-        for track in list(armature.animation_data.nla_tracks):
-            if track.name == track_name:
-                armature.animation_data.nla_tracks.remove(track)
+        old_actions = _remove_nla_tracks(armature.animation_data, track_name)
+        _remove_orphan_actions(old_actions)
 
 def _recreate_phonemes_from_lipsync(context, armature, voice_id, track_name="voice_import"):
     """Solve phoneme curves from imported lipsync morph animation.
@@ -1012,11 +1072,8 @@ def _on_voice_list_index_update(self, context):
         return
     active_arm = _get_active_armature(context)
     if active_arm and not _armature_has_face_morphs(active_arm):
-        try:
-            bpy.ops.witcher.load_face_morphs()
-        except Exception as exc:
-            log.warning("Auto face morph load failed: %s", exc)
-    load_voice_and_lipsync(item.voiceLineId)
+        _auto_load_face_morphs(context, active_arm)
+    load_voice_and_lipsync(item.voiceLineId, actor=active_arm, context=context)
 
 
 def has_invalid_surrogates(s):
@@ -1284,6 +1341,7 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
         context = bpy.context
     if recreate_phonemes is None:
         recreate_phonemes = getattr(context.scene, "witcher_voice_recreate_phonemes", False)
+    target_armature = _resolve_voice_target_armature(context, actor=actor)
     namelen = len(voiceLineId)
     if namelen != 10:
         zeros = "0000000000"
@@ -1331,21 +1389,21 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
 
     if cr2wPath.is_file():
         log.info('Importing Lipsync')
-        import_anims.import_lipsync(context, str(cr2wPath), use_NLA=True, NLA_track="voice_import", override_select=actor, at_frame=at_frame)
+        import_anims.import_lipsync(
+            context,
+            str(cr2wPath),
+            use_NLA=True,
+            NLA_track="voice_import",
+            override_select=target_armature if target_armature else actor,
+            at_frame=at_frame,
+        )
         # Ensure the newly created NLA track evaluates during morph sampling.
-        _actor_arm = actor if (actor and getattr(actor, 'type', None) == 'ARMATURE') else getattr(actor, 'parent', None)
+        _actor_arm = target_armature
         if _actor_arm and getattr(_actor_arm, 'type', None) == 'ARMATURE':
             if _actor_arm.animation_data:
                 _actor_arm.animation_data.use_nla = True
         if recreate_phonemes:
-            armature = None
-            if actor and isinstance(actor, bpy.types.Object):
-                if actor.type == 'ARMATURE':
-                    armature = actor
-                elif actor.parent and actor.parent.type == 'ARMATURE':
-                    armature = actor.parent
-            if armature is None:
-                armature = _get_active_armature(context)
+            armature = target_armature
             if armature is None:
                 raise RuntimeError(
                     "Recreate Phonemes failed: no character armature found. "
@@ -1431,13 +1489,10 @@ class MyVoiceListItem_Debug(bpy.types.Operator):
                 # Auto-load face morphs if the active armature needs them
                 active_arm = _get_active_armature(context)
                 if active_arm and not _armature_has_face_morphs(active_arm):
-                    try:
-                        bpy.ops.witcher.load_face_morphs()
-                    except Exception as exc:
-                        log.warning("Auto face morph load failed: %s", exc)
+                    _auto_load_face_morphs(context, active_arm)
 
                 filename = item.voiceLineId
-                load_voice_and_lipsync(filename)
+                load_voice_and_lipsync(filename, actor=active_arm, context=context)
                 
         elif "reset3" == action:
             log.debug("=== Debug Reset ====")
