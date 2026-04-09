@@ -14,7 +14,7 @@ class CommonData(object):
         self.boneData = BoneData()
         self.w3_DataCache = W3_DataCache()
         
-        self.autohideDistance:float = 200.0
+        self.autohideDistance:float = 20.0
         self.isTwoSided:bool = False
         self.useExtraStreams:bool = False
         self.generalizedMeshRadius:float = 0.0

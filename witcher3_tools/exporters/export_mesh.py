@@ -335,6 +335,10 @@ def split_mesh_by_material(mesh_obj):
     if not used_material_indices:
         mesh_copy = mesh_obj.copy()
         mesh_copy.data = src_mesh
+        # Should only expose one material (the used one) in slot 0
+        mesh_copy.data.materials[0] = mesh_copy.data.materials[used_material_indices[0]]
+        while len(mesh_copy.data.materials) > 1:
+            mesh_copy.data.materials.pop(index = -1)
         bpy.context.collection.objects.link(mesh_copy)
         return [mesh_copy]
 
