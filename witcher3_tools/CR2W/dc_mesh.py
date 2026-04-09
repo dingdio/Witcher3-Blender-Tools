@@ -834,7 +834,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
             #!  FINISH CODE  #
             #
             ##################
-            CData.autohideDistance = chunk.GetVariableByName("autoHideDistance").Value if chunk.GetVariableByName("autoHideDistance") else 200.0
+            CData.autohideDistance = chunk.GetVariableByName("autoHideDistance").Value if chunk.GetVariableByName("autoHideDistance") else 20.0
             CData.isTwoSided = chunk.GetVariableByName("isTwoSided").Value if chunk.GetVariableByName("isTwoSided") else False
             CData.useExtraStreams = chunk.GetVariableByName("useExtraStreams").Value if chunk.GetVariableByName("useExtraStreams") else False
             CData.generalizedMeshRadius = chunk.GetVariableByName("generalizedMeshRadius").Value if chunk.GetVariableByName("generalizedMeshRadius") else 0.0

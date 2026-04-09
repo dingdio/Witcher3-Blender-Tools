@@ -356,7 +356,7 @@ class witcherui_MeshSettings(bpy.types.PropertyGroup):
     distance: bpy.props.FloatProperty(default = 0)
     mat_id: bpy.props.IntProperty(default = 0)
     
-    autohideDistance: bpy.props.FloatProperty(default = 200.0,
+    autohideDistance: bpy.props.FloatProperty(default = 20.0,
                         name = "Auto Hide Distance",
                         description = "Hide mesh after this distance")
     isTwoSided: bpy.props.BoolProperty(default = False,
