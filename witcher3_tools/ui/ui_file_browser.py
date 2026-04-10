@@ -37,6 +37,7 @@ from .. import (
 )
 from ..importers import import_entity
 from ..ui.blender_fun import convert_xbm_to_dds, convert_w2cube_to_dds, load_image_with_dds_repair
+from . import asset_browser_import_bridge
 from bpy.props import IntProperty, StringProperty
 from ..importers.import_entity import test_load_entity, fixed_chunk_paths
 import os
@@ -175,6 +176,10 @@ class MySettings(PropertyGroup):
     mods_overwrite: BoolProperty(
         default=False,
         description="Overwrite existing extracted files (moves previous to backup)"
+    )
+    open_import_dialog: BoolProperty(
+        default=False,
+        description="Open the matching importer dialog for single-file imports when available"
     )
     preview_texture_path: StringProperty(default="")  # For texture preview popup
     # Phase 1 QoL
@@ -2609,6 +2614,7 @@ class SimpleFileBrowser(Operator):
         mods_row = layout.row(align=True)
         mods_row.prop(witcher_file_browser, "use_mods_priority", text="Load Mods")
         mods_row.prop(witcher_file_browser, "mods_overwrite", text="Overwrite")
+        mods_row.prop(witcher_file_browser, "open_import_dialog", text="Open Dialog")
         layout.separator(factor=0.5)
 
         # Handle Recent view
@@ -3450,11 +3456,12 @@ class ImportRecentOperator(Operator):
         witcher_file_browser = context.scene.witcher_file_browser
         original_cache_type = witcher_file_browser.active_cache_type
         witcher_file_browser.active_cache_type = self.cache_type
+        invoke_mode = 'INVOKE_DEFAULT' if getattr(witcher_file_browser, "open_import_dialog", False) else 'EXEC_DEFAULT'
 
-        bpy.ops.witcher.file_action_import_to_scene(file_path=self.path)
-
-        witcher_file_browser.active_cache_type = original_cache_type
-        return {'FINISHED'}
+        try:
+            return bpy.ops.witcher.file_action_import_to_scene(invoke_mode, file_path=self.path)
+        finally:
+            witcher_file_browser.active_cache_type = original_cache_type
 
 
 class ToggleBatchSelectOperator(Operator):
@@ -3932,11 +3939,44 @@ class FileActionOperatorImportToScene(Operator):
     bl_label = "Import to Scene"
     file_path: StringProperty()
 
-    def execute(self, context):
-        with mod_loading_context(context):
-            return self._execute_inner(context)
+    def invoke(self, context, event):
+        witcher_file_browser = getattr(context.scene, "witcher_file_browser", None)
+        if not witcher_file_browser or not getattr(witcher_file_browser, "open_import_dialog", False):
+            return self.execute(context)
+        if self._build_import_state(context)["effective_cache_type"] == "Sound":
+            return self.execute(context)
 
-    def _execute_inner(self, context):
+        with mod_loading_context(context):
+            resolved = self._resolve_import_target(context)
+
+        if not resolved:
+            return {'CANCELLED'}
+
+        try:
+            dialog_result = asset_browser_import_bridge.invoke_asset_browser_import_dialog(context, resolved)
+        except Exception as exc:
+            log.error("Failed to open asset browser import dialog for %s: %s", resolved.get("abs_file_path"), exc, exc_info=True)
+            self.report({'ERROR'}, f"Failed to open import dialog: {exc}")
+            return {'CANCELLED'}
+
+        if dialog_result is not None:
+            return dialog_result
+
+        with mod_loading_context(context):
+            return self._execute_resolved_import(context, resolved)
+
+    def execute(self, context):
+        request = self._build_import_state(context)
+        if request["effective_cache_type"] == "Sound":
+            with mod_loading_context(context):
+                return self._execute_sound_import(context, request)
+        with mod_loading_context(context):
+            resolved = self._resolve_import_target(context)
+            if not resolved:
+                return {'CANCELLED'}
+            return self._execute_resolved_import(context, resolved)
+
+    def _build_import_state(self, context):
         witcher_file_browser = context.scene.witcher_file_browser
         cache_type = witcher_file_browser.active_cache_type
         overwrite_existing = witcher_file_browser.mods_overwrite
@@ -3949,25 +3989,46 @@ class FileActionOperatorImportToScene(Operator):
         if "\\" in self.file_path:
             full_path = self.file_path
 
-        # Get appropriate manager and extract if needed
         loadmods = witcher_file_browser.loadmods
         effective_cache_type = get_effective_cache_type(cache_type)
         full_path_norm = full_path.replace("/", "\\")
+        return {
+            "cache_type": cache_type,
+            "overwrite_existing": overwrite_existing,
+            "full_path": full_path,
+            "loadmods": loadmods,
+            "effective_cache_type": effective_cache_type,
+            "full_path_norm": full_path_norm,
+        }
+
+    def _execute_sound_import(self, context, request):
+        full_path = request["full_path"]
+        cache_type = request["cache_type"]
+        full_path_norm = request["full_path_norm"]
+        loadmods = request["loadmods"]
+        try:
+            soundstrip, wav_path = import_sound_to_timeline(context, full_path_norm, loadmods=loadmods)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Sound import failed: {exc}")
+            return {'CANCELLED'}
+        add_recent_import(context, full_path, cache_type)
+        self.report(
+            {'INFO'},
+            f"Imported sound strip: {getattr(soundstrip, 'name', os.path.basename(wav_path))}"
+        )
+        return {'FINISHED'}
+
+    def _resolve_import_target(self, context):
+        request = self._build_import_state(context)
+        cache_type = request["cache_type"]
+        overwrite_existing = request["overwrite_existing"]
+        full_path = request["full_path"]
+        loadmods = request["loadmods"]
+        effective_cache_type = request["effective_cache_type"]
+        full_path_norm = request["full_path_norm"]
         mod_name = ""
         if loadmods and "\\" in full_path_norm:
             mod_name = full_path_norm.split("\\", 1)[0]
-        if effective_cache_type == "Sound":
-            try:
-                soundstrip, wav_path = import_sound_to_timeline(context, full_path_norm, loadmods=loadmods)
-            except Exception as exc:
-                self.report({'ERROR'}, f"Sound import failed: {exc}")
-                return {'CANCELLED'}
-            add_recent_import(context, full_path, cache_type)
-            self.report(
-                {'INFO'},
-                f"Imported sound strip: {getattr(soundstrip, 'name', os.path.basename(wav_path))}"
-            )
-            return {'FINISHED'}
         abs_file_path = None
         override_roots = []
         try:
@@ -3978,7 +4039,7 @@ class FileActionOperatorImportToScene(Operator):
                 session = get_external_archive_session(cache_type)
                 if not session:
                     self.report({'ERROR'}, "No external bundle loaded")
-                    return {'CANCELLED'}
+                    return None
 
                 addon_prefs = get_all_addon_prefs(context)
                 uncook_path = addon_prefs.uncook_path
@@ -3996,7 +4057,7 @@ class FileActionOperatorImportToScene(Operator):
 
                 if not item_lists:
                     self.report({'ERROR'}, f"Bundle item not found: {full_path}")
-                    return {'CANCELLED'}
+                    return None
 
                 base_item = None
                 buffer_items = []
@@ -4072,7 +4133,7 @@ class FileActionOperatorImportToScene(Operator):
                         if not item_lists:
                             self.report({'ERROR'}, f"Mod bundle item not found: {full_path}")
                             log.error("Mod bundle item not found: %s", full_path)
-                            return {'CANCELLED'}
+                            return None
                         else:
                             base_item = None
                             buffer_items = []
@@ -4109,19 +4170,19 @@ class FileActionOperatorImportToScene(Operator):
                                 set_source_for_path(uncook_path, base_name, mod_label)
 
                     # If user explicitly wants mod override, do not fall back to vanilla
-                    prefer_mods = witcher_file_browser.use_mods_priority
+                    prefer_mods = bool(getattr(context.scene.witcher_file_browser, "use_mods_priority", False))
                     if prefer_mods and overwrite_existing:
                         if not win_path_exists(abs_file_path):
                             self.report({'ERROR'}, f"Mod extract failed: {base_name}")
-                            return {'CANCELLED'}
+                            return None
                         if mod_label:
                             source_label = get_source_for_path(uncook_path, base_name)
                             if source_label != mod_label:
                                 self.report({'ERROR'}, f"Expected {mod_label} but found {source_label or 'unknown'}: {base_name}")
-                                return {'CANCELLED'}
+                                return None
                         else:
                             self.report({'ERROR'}, f"Could not resolve mod source for: {base_name}")
-                            return {'CANCELLED'}
+                            return None
                 else:
                     abs_file_path = repo_file(full_path)
             elif cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
@@ -4183,9 +4244,6 @@ class FileActionOperatorImportToScene(Operator):
                             pass
                         if prepare_extraction_target(abs_file_path, prep_root):
                             final_item.extract_to_file(abs_file_path)
-                        dds_path = os.path.splitext(abs_file_path)[0] + ".dds"
-                        if win_path_exists(dds_path):
-                            abs_file_path = dds_path
             elif cache_type == "Speech":
                 manager = LoadSpeechManager()
                 items = manager.find_item_by_hash(full_path)
@@ -4203,14 +4261,30 @@ class FileActionOperatorImportToScene(Operator):
                 abs_file_path = repo_file(full_path)
         except Exception as e:
             log.error("Failed to get file: %s", e)
-            return {'CANCELLED'}
+            return None
 
         abs_file_path = win_safe_path(abs_file_path) if abs_file_path else abs_file_path
 
         if not abs_file_path or not win_path_exists(abs_file_path):
             self.report({'ERROR'}, f"File not found: {abs_file_path}")
             log.error("File not found: %s", abs_file_path)
-            return {'CANCELLED'}
+            return None
+
+        request.update({
+            "abs_file_path": abs_file_path,
+            "override_roots": override_roots,
+        })
+        return request
+
+    def _execute_resolved_import(self, context, resolved):
+        cache_type = resolved["cache_type"]
+        overwrite_existing = resolved["overwrite_existing"]
+        full_path = resolved["full_path"]
+        loadmods = resolved["loadmods"]
+        effective_cache_type = resolved["effective_cache_type"]
+        full_path_norm = resolved["full_path_norm"]
+        abs_file_path = resolved["abs_file_path"]
+        override_roots = resolved.get("override_roots") or []
 
         # Texture imports should always resolve cooked .xbm sources to a viewable/importable DDS first.
         if abs_file_path.lower().endswith(".xbm"):
@@ -4551,9 +4625,10 @@ class GlobalImportOperator(Operator):
         witcher_file_browser = context.scene.witcher_file_browser
         original_cache_type = witcher_file_browser.active_cache_type
         witcher_file_browser.active_cache_type = self.cache_type
+        invoke_mode = 'INVOKE_DEFAULT' if getattr(witcher_file_browser, "open_import_dialog", False) else 'EXEC_DEFAULT'
 
         try:
-            return bpy.ops.witcher.file_action_import_to_scene(file_path=self.file_path)
+            return bpy.ops.witcher.file_action_import_to_scene(invoke_mode, file_path=self.file_path)
         finally:
             witcher_file_browser.active_cache_type = original_cache_type
 

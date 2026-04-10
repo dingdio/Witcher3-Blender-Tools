@@ -1781,6 +1781,11 @@ class _JournalBrowserMixin:
     items_per_page: bpy.props.IntProperty(name="Items Per Page", default=16, min=1)
     filter_text: bpy.props.StringProperty(name="Filter", default="")
     group_filter: bpy.props.EnumProperty(name="Group", items=_journal_group_filter_items)
+    open_import_dialog: bpy.props.BoolProperty(
+        name="Open Dialog",
+        default=False,
+        description="Open the matching import dialog instead of importing immediately",
+    )
     sort_mode: bpy.props.EnumProperty(
         name="Sort",
         items=(
@@ -2005,6 +2010,7 @@ class _JournalBrowserMixin:
         next_op.max_page = max_page
         refresh_op = row.operator(MyJournalBrowserRefreshOperator.bl_idname, text="", icon='FILE_REFRESH')
         refresh_op.browser_key = self.journal_browser_key
+        row.prop(self, "open_import_dialog", text="Open Dialog")
         row.label(text=f"Shown {len(filtered_previews)}/{len(all_entries)} | Base {base_count} | DLC {sum(dlc_counts.values())}")
 
         # Fixed header line 3 (group/cache status)
@@ -2075,6 +2081,7 @@ class _JournalBrowserMixin:
             op.image_name = name
             op.repo_path = repo_path
             op.tooltip_text = _build_entry_tooltip(entry)
+            op.open_import_dialog = bool(getattr(self, "open_import_dialog", False))
 
             if can_import:
                 aux = action_row.operator(MyJournalEntryFileOperator.bl_idname, text="", icon='FILE_FOLDER' if exported else 'IMPORT')
@@ -2212,6 +2219,7 @@ class MyImageActionOperator(bpy.types.Operator):
     image_name: bpy.props.StringProperty()
     repo_path: bpy.props.StringProperty()  # Repository path property
     tooltip_text: bpy.props.StringProperty(default="")
+    open_import_dialog: bpy.props.BoolProperty(default=False)
 
     @classmethod
     def description(cls, context, properties):
@@ -2233,6 +2241,27 @@ class MyImageActionOperator(bpy.types.Operator):
         if not abs_path or not win_path_exists(abs_path):
             self.report({'WARNING'}, f"Could not find/export: {self.repo_path}")
             return {'CANCELLED'}
+        if self.open_import_dialog:
+            try:
+                entity = import_entity.test_load_entity(abs_path)
+            except Exception:
+                entity = None
+            if (
+                entity is not None
+                and not import_entity.entity_has_main_skeleton(entity)
+                and import_entity.entity_has_inventory_entries(entity)
+                and import_entity.can_apply_inventory_to_selected_character(context)
+            ):
+                return bpy.ops.witcher.import_w2ent_inventory(
+                    'INVOKE_DEFAULT',
+                    filepath=abs_path,
+                    import_mode='MOUNTS',
+                )
+            return bpy.ops.witcher.import_w2ent_character(
+                'INVOKE_DEFAULT',
+                filepath=abs_path,
+                import_apperance=1,
+            )
         if not import_entity.try_apply_inventory_file_to_selected_character(context, abs_path):
             arm_obj = import_entity.import_ent_template(abs_path, False, 1)
             if arm_obj and get_all_addon_prefs(context).import_idle_animation:

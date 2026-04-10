@@ -233,6 +233,10 @@ def clear_mod_priority_settings():
     _mod_priority_enabled = False
     _mod_priority_high = True
 
+
+def get_mod_priority_state():
+    return bool(_mod_priority_enabled), bool(_mod_priority_high)
+
 def set_overwrite_existing(enabled=False):
     """Allow repo_file to overwrite existing extracted files (with backup)."""
     global _overwrite_existing
@@ -245,6 +249,10 @@ def clear_overwrite_existing():
 
 def overwrite_existing_enabled() -> bool:
     return bool(_overwrite_existing)
+
+
+def get_repo_override_state():
+    return list(_repo_override_roots), bool(_repo_override_read_only)
 
 @contextmanager
 def mod_loading_context(context=None, prefer_mods=None, overwrite=None):

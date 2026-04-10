@@ -32,6 +32,10 @@ from ..ui.ui_map import (WITCH_OT_w2L,
                                      )
 from ..ui.ui_custom_icons import custom_icons
 from ..external_addon_tools import get_srt_addon_status
+from .asset_browser_import_bridge import (
+    get_asset_browser_context_value,
+    patch_operator_group_for_asset_browser,
+)
 from bpy_extras.io_utils import ImportHelper
 import os
 import logging
@@ -83,7 +87,12 @@ class WITCH_OT_srt(bpy.types.Operator, ImportHelper):
         lod0_only = bool(getattr(prefs, "ab_srt_lod0_only", True))
 
         srt_snapshot = _snapshot_srt_import_state(context) if use_custom_grouping else {}
-        tex_stats = _export_srt_textures_for_import(context, fdir, fdir, loadmods=False)
+        tex_stats = _export_srt_textures_for_import(
+            context,
+            fdir,
+            fdir,
+            loadmods=bool(get_asset_browser_context_value(self, "loadmods", False)),
+        )
         import_path = tex_stats.get("import_path") or fdir
         if lod0_only:
             import_path = _prepare_srt_lod0_json(import_path)
@@ -101,6 +110,28 @@ class WITCH_OT_srt(bpy.types.Operator, ImportHelper):
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
+
+
+_ASSET_BROWSER_DIALOG_OPERATORS = (
+    ButtonOperatorImportW2Anims,
+    WITCH_OT_ImportW2Rig,
+    WITCH_OT_w2mesh,
+    WITCH_OT_apx,
+    WITCH_OT_nxs,
+    WITCH_OT_w2ent,
+    WITCH_OT_flyr,
+    ButtonOperatorImportW2scene,
+    ButtonOperatorImportW2cutscene,
+    WITCH_OT_w2mg,
+    WITCH_OT_w2mi,
+    WITCH_OT_xbm,
+    WITCH_OT_w2cube,
+    WITCH_OT_w2L,
+    WITCH_OT_w2w,
+    WITCH_OT_srt,
+)
+
+patch_operator_group_for_asset_browser(_ASSET_BROWSER_DIALOG_OPERATORS)
 
 
 class WITCH_MT_Menu(bpy.types.Menu):
