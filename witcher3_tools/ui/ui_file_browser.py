@@ -4505,7 +4505,18 @@ class FileActionOperatorImportToScene(Operator):
                     self.report({'ERROR'}, f"Cubemap import failed: {os.path.basename(abs_file_path)}")
                     return {'CANCELLED'}
             elif ext == ".w2ent":
-                if not import_entity.try_apply_inventory_file_to_selected_character(context, abs_file_path):
+                metadata = import_entity.get_entity_appearance_metadata(abs_file_path)
+                w2ent_mode = import_entity.classify_entity_import_metadata(metadata, context=context)
+                if w2ent_mode == "character":
+                    default_appearance_name = str(metadata.get("default_name", "") or "").strip()
+                    import_entity.import_direct_entity_file(
+                        abs_file_path,
+                        False,
+                        0 if default_appearance_name else 1,
+                        None,
+                        selected_appearance_name=default_appearance_name,
+                    )
+                elif not import_entity.try_apply_inventory_file_to_selected_character(context, abs_file_path):
                     import_entity.import_direct_entity_file(abs_file_path, False, 0, None)
             elif ext == ".flyr":
                 from ..CR2W import CR2W_reader

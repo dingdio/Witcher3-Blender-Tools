@@ -1274,6 +1274,111 @@ def _extract_cname_array_values(prop):
     return out
 
 
+def read_entity_template_appearance_metadata(template_filename: str):
+    template_filename = str(template_filename or "").strip()
+    empty_result = {
+        "all_names": [],
+        "used_names": [],
+        "default_name": "",
+        "has_armature_root": False,
+        "has_inventory_entries": False,
+    }
+    if not template_filename:
+        return copy.deepcopy(empty_result)
+
+    if os.path.isabs(template_filename):
+        if not os.path.exists(template_filename):
+            return copy.deepcopy(empty_result)
+        resolved_path = template_filename
+    else:
+        resolved_path = repo_file(template_filename)
+        if not resolved_path or not os.path.isabs(resolved_path) or not os.path.exists(resolved_path):
+            return copy.deepcopy(empty_result)
+
+    def _append_name(target, seen, value):
+        name = str(value or "").strip()
+        if not name:
+            return
+        key = name.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        target.append(name)
+
+    def _chunk_has_armature_hint(chunk) -> bool:
+        if not chunk:
+            return False
+        chunk_type = str(getattr(chunk, "Type", "") or getattr(chunk, "name", "") or "").strip()
+        if chunk_type not in {
+            "CMovingPhysicalAgentComponent",
+            "CAnimatedComponent",
+            "CAnimDangleBufferComponent",
+            "CMimicComponent",
+        }:
+            return False
+        for prop_name in ("skeleton", "mimicFace"):
+            prop = _find_prop_by_name(chunk, prop_name)
+            value = _prop_to_string(prop)
+            if isinstance(value, str) and value.strip():
+                return True
+        return False
+
+    try:
+        cr2w_file = read_CR2W(resolved_path)
+    except Exception:
+        log.debug("Failed to read lightweight entity appearance metadata for %s", resolved_path, exc_info=True)
+        return copy.deepcopy(empty_result)
+
+    try:
+        all_names = []
+        used_names = []
+        all_seen = set()
+        used_seen = set()
+        has_armature_root = False
+        has_inventory_entries = False
+
+        for chunk in getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or []:
+            chunk_type = getattr(chunk, "Type", None)
+            if chunk_type == "CInventoryDefinition":
+                has_inventory_entries = True
+            if not has_armature_root and _chunk_has_armature_hint(chunk):
+                has_armature_root = True
+            if chunk_type == "CEntityTemplate":
+                used_prop = chunk.GetVariableByName("usedAppearances")
+                if used_prop:
+                    for name in _extract_cname_array_values(used_prop):
+                        _append_name(used_names, used_seen, name)
+
+                appearances_prop = chunk.GetVariableByName("appearances")
+                for appearance in _iter_struct_items(appearances_prop):
+                    name = _prop_to_string(_find_prop_by_name(appearance, "name"))
+                    _append_name(all_names, all_seen, name)
+
+                flat_compiled = getattr(chunk, "flatCompiledData", None)
+                sub_chunks = getattr(getattr(flat_compiled, "CHUNKS", None), "CHUNKS", None) or []
+                if sub_chunks:
+                    for sub_chunk in sub_chunks:
+                        if not has_armature_root and _chunk_has_armature_hint(sub_chunk):
+                            has_armature_root = True
+            elif chunk_type == "CEntityExternalAppearance":
+                appearance = chunk.GetVariableByName("appearance")
+                name = _prop_to_string(_find_prop_by_name(appearance, "name"))
+                _append_name(all_names, all_seen, name)
+
+        all_keys = {name.lower() for name in all_names}
+        used_names = [name for name in used_names if name.lower() in all_keys]
+        return {
+            "all_names": all_names,
+            "used_names": used_names,
+            "default_name": used_names[0] if used_names else (all_names[0] if all_names else ""),
+            "has_armature_root": has_armature_root,
+            "has_inventory_entries": has_inventory_entries,
+        }
+    except Exception:
+        log.debug("Failed to read lightweight entity appearance metadata for %s", resolved_path, exc_info=True)
+        return copy.deepcopy(empty_result)
+
+
 def _find_prop_by_name(container, prop_name: str):
     if not container:
         return None

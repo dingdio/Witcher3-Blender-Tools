@@ -1,6 +1,7 @@
 import logging
 import time
 import uuid
+import json
 from contextlib import contextmanager
 from functools import wraps
 
@@ -8,6 +9,7 @@ import bpy
 from bpy.props import StringProperty
 
 from .. import file_helpers
+from ..importers import import_entity
 from ..CR2W.common_blender import (
     clear_repo_override_roots,
     get_mod_priority_state,
@@ -203,7 +205,23 @@ def invoke_asset_browser_import_dialog(context, resolved: dict):
         elif ext == ".w2cube":
             result = bpy.ops.witcher.import_w2cube('INVOKE_DEFAULT', **kwargs)
         elif ext == ".w2ent":
-            result = bpy.ops.witcher.import_w2ent('INVOKE_DEFAULT', **kwargs)
+            metadata = import_entity.get_entity_appearance_metadata(abs_file_path)
+            w2ent_mode = import_entity.classify_entity_import_metadata(metadata, context=context)
+            if w2ent_mode == "character":
+                result = bpy.ops.witcher.import_w2ent_character(
+                    'INVOKE_DEFAULT',
+                    appearance_metadata_json=json.dumps(metadata, sort_keys=False),
+                    appearance_metadata_path=abs_file_path,
+                    **kwargs,
+                )
+            elif w2ent_mode == "inventory":
+                result = bpy.ops.witcher.import_w2ent_inventory(
+                    'INVOKE_DEFAULT',
+                    import_mode='MOUNTS',
+                    **kwargs,
+                )
+            else:
+                result = bpy.ops.witcher.import_w2ent('INVOKE_DEFAULT', **kwargs)
         elif ext == ".flyr":
             result = bpy.ops.witcher.import_flyr('INVOKE_DEFAULT', **kwargs)
         elif ext == ".w2l":

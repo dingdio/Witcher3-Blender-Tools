@@ -53,6 +53,50 @@ def _get_attr_or_key(obj, key, default=None):
     return getattr(obj, key, default)
 
 
+_CHARACTER_APPEARANCE_BASE_ID = "__base__"
+
+
+def _normalize_character_appearance_metadata(metadata):
+    return import_entity.normalize_entity_appearance_metadata(metadata)
+
+
+def _character_appearance_metadata_json(metadata):
+    normalized = _normalize_character_appearance_metadata(metadata)
+    return json.dumps(normalized, sort_keys=False)
+
+
+def _load_character_appearance_metadata_json(raw_json):
+    try:
+        data = json.loads(raw_json or "{}")
+    except Exception:
+        data = {}
+    return _normalize_character_appearance_metadata(data)
+
+
+def _get_character_appearance_enum_items(raw_json):
+    metadata = _load_character_appearance_metadata_json(raw_json)
+    items = [
+        (
+            _CHARACTER_APPEARANCE_BASE_ID,
+            "None",
+            "Import the entity without applying an appearance.",
+        )
+    ]
+    used_keys = {name.lower() for name in metadata.get("used_names", []) or []}
+    for name in metadata.get("all_names", []) or []:
+        description = (
+            "Enabled by usedAppearances on this template."
+            if name.lower() in used_keys else
+            "Available appearance on this entity template."
+        )
+        items.append((name, name, description))
+    return items
+
+
+def _enum_character_appearance_items(self, _context):
+    return _get_character_appearance_enum_items(getattr(self, "appearance_metadata_json", "") or "")
+
+
 def _short_panel_header_text(text: str, max_len: int = 28) -> str:
     value = str(text or "").strip()
     if not value:
@@ -806,23 +850,98 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
     import_apperance: IntProperty(
         name="Select Apperance",
         default=0,
-        description="Select index of apperance. 0 will only import character base"
+        description="Select index of apperance. 0 will only import character base",
+        options={'HIDDEN', 'SKIP_SAVE'},
     )
+    selected_appearance_name: EnumProperty(
+        name="Appearance",
+        items=_enum_character_appearance_items,
+        description="Choose which appearance to import",
+    )
+    appearance_selection_initialized: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+    appearance_metadata_json: StringProperty(default="{}", options={'HIDDEN', 'SKIP_SAVE'})
+    appearance_metadata_path: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+
+    def _resolve_legacy_appearance_name(self, metadata):
+        all_names = list(metadata.get("all_names", []) or [])
+        if not all_names:
+            return ""
+        legacy_index = int(getattr(self, "import_apperance", 0) or 0) - 1
+        if legacy_index < 0:
+            return ""
+        if legacy_index >= len(all_names):
+            legacy_index = len(all_names) - 1
+        return str(all_names[legacy_index] or "").strip()
+
+    def _refresh_appearance_metadata(self):
+        filepath = str(self.filepath or "").strip()
+        prev_json = str(getattr(self, "appearance_metadata_json", "") or "")
+        prev_path = str(getattr(self, "appearance_metadata_path", "") or "")
+        prev_selection = str(getattr(self, "selected_appearance_name", "") or "")
+
+        metadata = {"all_names": [], "used_names": [], "default_name": ""}
+        metadata_ready = (
+            filepath
+            and filepath == prev_path
+            and prev_json
+            and prev_json != "{}"
+        )
+        if metadata_ready:
+            metadata = _load_character_appearance_metadata_json(prev_json)
+        elif os.path.isfile(filepath) and (filepath.endswith(".w2ent") or filepath.endswith(".json")):
+            metadata = import_entity.get_entity_appearance_metadata(filepath)
+        metadata = _normalize_character_appearance_metadata(metadata)
+        next_json = _character_appearance_metadata_json(metadata)
+        self.appearance_metadata_json = next_json
+        self.appearance_metadata_path = filepath
+
+        metadata_changed = next_json != prev_json or filepath != prev_path
+        valid_names = {name.lower() for name in metadata.get("all_names", []) or []}
+        next_selection = prev_selection
+        if metadata_changed or not self.appearance_selection_initialized:
+            legacy_name = self._resolve_legacy_appearance_name(metadata)
+            default_name = str(metadata.get("default_name", "") or "").strip()
+            next_selection = legacy_name or default_name or _CHARACTER_APPEARANCE_BASE_ID
+            self.appearance_selection_initialized = True
+        elif next_selection == _CHARACTER_APPEARANCE_BASE_ID:
+            pass
+        elif next_selection and next_selection.lower() in valid_names:
+            pass
+        else:
+            legacy_name = self._resolve_legacy_appearance_name(metadata)
+            if legacy_name:
+                next_selection = legacy_name
+            else:
+                default_name = str(metadata.get("default_name", "") or "").strip()
+                next_selection = default_name or _CHARACTER_APPEARANCE_BASE_ID
+
+        if next_selection != prev_selection:
+            self.selected_appearance_name = next_selection
+
+        return (
+            metadata_changed or
+            next_selection != prev_selection
+        )
+
+    def check(self, _context):
+        return self._refresh_appearance_metadata()
+
     def draw(self, context):
         filepath = self.filepath
         layout = self.layout
+        self._refresh_appearance_metadata()
 
         # check if the file is a file and has the .w2ent extension
-        if os.path.isfile(self.filepath) and self.filepath.endswith('.w2ent'):
+        if os.path.isfile(self.filepath) and (self.filepath.endswith('.w2ent') or self.filepath.endswith('.json')):
             pass
 
         else:
-            layout.label(text="Selected file is not a .w2ent file.")
+            layout.label(text="Selected file is not a character entity file.")
 
         sections = ["Settings"]
         section_options = {
             "Settings" : [
-                        "import_apperance",
+                        "selected_appearance_name",
                         ]
         }
         for section in sections:
@@ -856,11 +975,20 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
                 from ..ui.ui_equipment import EquipmentDefinitionEntry as _EDE
                 if not getattr(_EDE, "item_attributes", None):
                     bpy.ops.witcher.equipment_refresh_categories()
+                self._refresh_appearance_metadata()
+                selected_appearance_name = str(self.selected_appearance_name or "").strip()
+                import_appearance_index = int(self.import_apperance or 0)
+                if selected_appearance_name == _CHARACTER_APPEARANCE_BASE_ID:
+                    selected_appearance_name = ""
+                    import_appearance_index = 0
+                elif selected_appearance_name:
+                    import_appearance_index = 0
                 arm_obj = import_entity.import_ent_template(
                     fdir,
                     False,
-                    self.import_apperance,
+                    import_appearance_index,
                     parent_transform=None,
+                    selected_appearance_name=selected_appearance_name,
                 )
                 if arm_obj and get_all_addon_prefs(context).import_idle_animation:
                     import_anims.load_idle_animation_for_armature(context, arm_obj)
@@ -876,6 +1004,7 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
         UNCOOK_PATH = os.path.join(get_uncook_path(context),"characters\\")
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        self._refresh_appearance_metadata()
         return ImportHelper.invoke(self, context, event)
 
 

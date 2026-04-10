@@ -34,6 +34,7 @@ from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.dc_entity import load_bin_entity
 from ..CR2W.dc_entity import LoadCEntityTemplateFile, clear_template_cache
+from ..CR2W.dc_entity import read_entity_template_appearance_metadata as _read_entity_template_appearance_metadata
 from ..CR2W.dc_entity import is_valid_mesh_path
 from ..CR2W.CR2W_types import EngineTransform
 from ..importers.import_helpers import set_blender_object_transform
@@ -610,16 +611,29 @@ def _apply_chunk_transform_to_import_roots(chunk, *, armatures=None, meshes=None
         set_blender_object_transform(obj, rt, rotate_180=False)
 
 
-def import_direct_entity_file(filename, load_face_poses=False, import_apperance=0, parent_transform=None):
+def import_direct_entity_file(filename, load_face_poses=False, import_apperance=0,
+                              parent_transform=None, selected_appearance_name=""):
     _, ext = os.path.splitext(str(filename or ""))
     if ext.lower() == ".json":
         log.info("Importing entity via common importer (JSON): %s", filename)
-        return import_ent_template(filename, load_face_poses, import_apperance, parent_transform)
+        return import_ent_template(
+            filename,
+            load_face_poses,
+            import_apperance,
+            parent_transform,
+            selected_appearance_name,
+        )
 
     before_objects = set(bpy.data.objects)
     try:
         log.info("Importing entity via common importer: %s", filename)
-        result = import_ent_template(filename, load_face_poses, import_apperance, parent_transform)
+        result = import_ent_template(
+            filename,
+            load_face_poses,
+            import_apperance,
+            parent_transform,
+            selected_appearance_name,
+        )
     except Exception:
         if set(bpy.data.objects) != before_objects:
             raise
@@ -640,6 +654,81 @@ def import_direct_entity_file(filename, load_face_poses=False, import_apperance=
     legacy_entity = CR2W_reader.load_entity(filename)
     import_w2l.btn_import_w2ent(legacy_entity)
     return None
+
+
+def _dedupe_entity_appearance_names(values) -> list[str]:
+    names = []
+    seen = set()
+    for value in values or []:
+        name = str(value or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def normalize_entity_appearance_metadata(metadata: dict | None) -> dict:
+    metadata = dict(metadata or {})
+    all_names = _dedupe_entity_appearance_names(metadata.get("all_names", []))
+    selectable_keys = {name.lower() for name in all_names}
+    used_names = [
+        name
+        for name in _dedupe_entity_appearance_names(metadata.get("used_names", []))
+        if name.lower() in selectable_keys
+    ]
+    default_name = str(metadata.get("default_name", "") or "").strip()
+    if default_name.lower() not in selectable_keys:
+        default_name = used_names[0] if used_names else (all_names[0] if all_names else "")
+    return {
+        "all_names": all_names,
+        "used_names": used_names,
+        "default_name": default_name,
+        "has_armature_root": bool(metadata.get("has_armature_root", False)),
+        "has_inventory_entries": bool(metadata.get("has_inventory_entries", False)),
+    }
+
+
+def get_entity_appearance_metadata(filename: str) -> dict:
+    empty_result = normalize_entity_appearance_metadata(None)
+    filename = str(filename or "").strip()
+    if not filename:
+        return empty_result
+
+    _, ext = os.path.splitext(filename)
+    if ext.lower() == ".json":
+        try:
+            with open(filename, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            log.debug("Failed to read JSON entity appearance metadata for %s", filename, exc_info=True)
+            return empty_result
+
+        return normalize_entity_appearance_metadata({
+            "all_names": [
+                str((appearance or {}).get("name", "") or "").strip()
+                for appearance in data.get("appearances", []) or []
+            ],
+            "used_names": data.get("usedAppearances", []) or [],
+        })
+
+    return normalize_entity_appearance_metadata(_read_entity_template_appearance_metadata(filename))
+
+
+def classify_entity_import_metadata(metadata: dict | None, context=None) -> str:
+    metadata = normalize_entity_appearance_metadata(metadata)
+    if bool(metadata.get("has_armature_root", False)):
+        return "character"
+    if bool(metadata.get("has_inventory_entries", False)):
+        try:
+            if can_apply_inventory_to_selected_character(context):
+                return "inventory"
+        except Exception:
+            pass
+    return "entity"
 
 
 def _load_entity_state_from_json(rig_settings):

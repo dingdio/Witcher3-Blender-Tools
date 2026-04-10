@@ -2054,6 +2054,7 @@ class _JournalBrowserMixin:
         grid = col.grid_flow(columns=4, even_columns=True, even_rows=True, align=True)
         start = current_page * self.items_per_page
         end = start + self.items_per_page
+        visible_entries = filtered_previews[start:end]
         if not filtered_previews:
             empty_row = col.row()
             all_count = len(all_entries)
@@ -2063,7 +2064,7 @@ class _JournalBrowserMixin:
                 empty_row.label(text="No journal entries found for this browser.", icon='INFO')
             return
 
-        for entry in filtered_previews[start:end]:
+        for entry in visible_entries:
             name = _safe_text(entry.get("name"))
             repo_path = _safe_text(entry.get("repo_path"))
             can_import = bool(repo_path)
@@ -2241,17 +2242,10 @@ class MyImageActionOperator(bpy.types.Operator):
         if not abs_path or not win_path_exists(abs_path):
             self.report({'WARNING'}, f"Could not find/export: {self.repo_path}")
             return {'CANCELLED'}
+        metadata = import_entity.get_entity_appearance_metadata(abs_path)
         if self.open_import_dialog:
-            try:
-                entity = import_entity.test_load_entity(abs_path)
-            except Exception:
-                entity = None
-            if (
-                entity is not None
-                and not import_entity.entity_has_main_skeleton(entity)
-                and import_entity.entity_has_inventory_entries(entity)
-                and import_entity.can_apply_inventory_to_selected_character(context)
-            ):
+            import_kind = import_entity.classify_entity_import_metadata(metadata, context=context)
+            if import_kind == "inventory":
                 return bpy.ops.witcher.import_w2ent_inventory(
                     'INVOKE_DEFAULT',
                     filepath=abs_path,
@@ -2260,10 +2254,17 @@ class MyImageActionOperator(bpy.types.Operator):
             return bpy.ops.witcher.import_w2ent_character(
                 'INVOKE_DEFAULT',
                 filepath=abs_path,
-                import_apperance=1,
+                appearance_metadata_json=json.dumps(metadata, sort_keys=False),
+                appearance_metadata_path=abs_path,
             )
         if not import_entity.try_apply_inventory_file_to_selected_character(context, abs_path):
-            arm_obj = import_entity.import_ent_template(abs_path, False, 1)
+            default_appearance_name = str(metadata.get("default_name", "") or "").strip()
+            arm_obj = import_entity.import_ent_template(
+                abs_path,
+                False,
+                0 if default_appearance_name else 1,
+                selected_appearance_name=default_appearance_name,
+            )
             if arm_obj and get_all_addon_prefs(context).import_idle_animation:
                 from .importers.import_anims import load_idle_animation_for_armature as _load_idle_anim
                 _load_idle_anim(context, arm_obj)

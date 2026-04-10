@@ -120,6 +120,8 @@ _ASSET_BROWSER_DIALOG_OPERATORS = (
     WITCH_OT_nxs,
     WITCH_OT_w2ent,
     WITCH_OT_flyr,
+    WITCH_OT_ENTITY_w2ent_chara,
+    WITCH_OT_ENTITY_import_inventory,
     ButtonOperatorImportW2scene,
     ButtonOperatorImportW2cutscene,
     WITCH_OT_w2mg,
