@@ -26,6 +26,7 @@ from .. import get_rig_rot90_enabled
 # Collision suffixes to detect
 COLLISION_SUFFIXES = ("_col", "_tri", "_box", "_sphere", "_capsule")
 DEFAULT_PHYSICAL_MATERIAL = "default"
+SKIN_WEIGHT_EPSILON = 1e-8
 
 
 def _get_collision_material_name(mesh_obj):
@@ -53,6 +54,44 @@ def get_collision_type(obj_name):
         if base_name.endswith(suffix):
             return suffix
     return None
+
+
+def _mesh_has_skin_weights(mesh_obj):
+    valid_group_indices = {
+        group.index
+        for group in getattr(mesh_obj, "vertex_groups", [])
+        if group.name != ZERO_WEIGHT_MASK_GROUP_NAME
+    }
+    if not valid_group_indices:
+        return False
+
+    mesh_data = getattr(mesh_obj, "data", None)
+    for vert in getattr(mesh_data, "vertices", []):
+        for group in getattr(vert, "groups", []):
+            if group.group in valid_group_indices and group.weight > SKIN_WEIGHT_EPSILON:
+                return True
+    return False
+
+
+def _mesh_has_linked_armature(mesh_obj):
+    parent = getattr(mesh_obj, "parent", None)
+    if parent and getattr(parent, "type", None) == 'ARMATURE':
+        bones = getattr(getattr(parent, "data", None), "bones", None)
+        if bones and len(bones) > 0:
+            return True
+
+    for modifier in getattr(mesh_obj, "modifiers", []):
+        armature_obj = getattr(modifier, "object", None)
+        if modifier.type != 'ARMATURE' or not armature_obj or getattr(armature_obj, "type", None) != 'ARMATURE':
+            continue
+        bones = getattr(getattr(armature_obj, "data", None), "bones", None)
+        if bones and len(bones) > 0:
+            return True
+    return False
+
+
+def _mesh_requires_skinning(mesh_obj):
+    return _mesh_has_linked_armature(mesh_obj) and _mesh_has_skin_weights(mesh_obj)
 
 
 class WitcherMaterialInfo(object):
@@ -334,18 +373,22 @@ def split_mesh_by_material(mesh_obj):
     # Empty mesh or no polygon assignments: export a direct copy.
     if not used_material_indices:
         mesh_copy = mesh_obj.copy()
-        mesh_copy.data = src_mesh
-        # Should only expose one material (the used one) in slot 0
-        mesh_copy.data.materials[0] = mesh_copy.data.materials[used_material_indices[0]]
-        while len(mesh_copy.data.materials) > 1:
-            mesh_copy.data.materials.pop(index = -1)
+        mesh_copy.data = src_mesh.copy()
         bpy.context.collection.objects.link(mesh_copy)
         return [mesh_copy]
 
     # Common case: one material slot in use, no split needed.
     if len(used_material_indices) == 1:
+        mat_idx = used_material_indices[0]
         mesh_copy = mesh_obj.copy()
-        mesh_copy.data = src_mesh
+        single_mesh = src_mesh.copy()
+        target_material = single_mesh.materials[mat_idx] if mat_idx < len(single_mesh.materials) else None
+        single_mesh.materials.clear()
+        if target_material is not None:
+            single_mesh.materials.append(target_material)
+        for poly in single_mesh.polygons:
+            poly.material_index = 0
+        mesh_copy.data = single_mesh
         bpy.context.collection.objects.link(mesh_copy)
         return [mesh_copy]
 
@@ -747,7 +790,6 @@ class MeshExporter(object):
 
     def execute(self, filePath, **args):
         self.filePath = filePath
-        self.__armature = args.get('armature', None)
         self.__meshes = sorted(args.get('meshes', []), key=lambda x: x.name)
         export_col_tri = args.get('export_col_tri', False)
         self.col_mesh_data = []
@@ -769,7 +811,52 @@ class MeshExporter(object):
         if not self.__meshes:
             raise ValueError("No meshes provided for export")
 
-        if self.__armature:
+        skinned_meshes = [mesh.name for mesh in self.__meshes if _mesh_requires_skinning(mesh)]
+        static_meshes = [mesh.name for mesh in self.__meshes if not _mesh_requires_skinning(mesh)]
+        if skinned_meshes and static_meshes:
+            raise ValueError(
+                "Selected meshes mix skinned and static export data. "
+                "Export matching mesh types separately."
+            )
+        requires_skinning = bool(skinned_meshes)
+
+        explicit_armature = args.get('armature', None)
+        detected_armature = explicit_armature if explicit_armature and explicit_armature.type == 'ARMATURE' else None
+        if detected_armature is None:
+            linked_armatures = {}
+            for mesh in self.__meshes:
+                parent = getattr(mesh, "parent", None)
+                if parent and getattr(parent, "type", None) == 'ARMATURE':
+                    linked_armatures.setdefault(parent.name_full, parent)
+                for modifier in getattr(mesh, "modifiers", []):
+                    armature_obj = getattr(modifier, "object", None)
+                    if modifier.type == 'ARMATURE' and armature_obj and getattr(armature_obj, "type", None) == 'ARMATURE':
+                        linked_armatures.setdefault(armature_obj.name_full, armature_obj)
+            if requires_skinning and len(linked_armatures) > 1:
+                names = ", ".join(sorted(linked_armatures.keys()))
+                raise ValueError(
+                    f"Selected meshes reference multiple armatures ({names}). "
+                    "Select one armature or export matching meshes separately."
+                )
+            if len(linked_armatures) == 1:
+                detected_armature = next(iter(linked_armatures.values()))
+
+        self.__armature = detected_armature if requires_skinning else None
+        if requires_skinning and self.__armature is None:
+            mesh_list = ", ".join(skinned_meshes[:3])
+            if len(skinned_meshes) > 3:
+                mesh_list += ", ..."
+            raise ValueError(
+                "Selected meshes contain skinning data but no armature was selected or linked. "
+                f"Attach/select the rig before export ({mesh_list})."
+            )
+        if self.__armature and explicit_armature is None:
+            log.info(
+                "Auto-detected armature '%s' from mesh parent/modifier for export.",
+                self.__armature.name,
+            )
+
+        if requires_skinning:
             rot90_override = args.get('rotate_bones_90', None)
             if rot90_override is None:
                 rig_settings = getattr(self.__armature.data, "witcherui_RigSettings", None)
@@ -787,6 +874,9 @@ class MeshExporter(object):
             self.bone_data.BoneIndecesMappingBoneIndex = convert_to_index_values(group_names, self.bone_data.jointNames)
             # Block3:[]
             # BoneIndecesMappingBoneIndex:[]
+        else:
+            self.bone_data = BoneData()
+        is_static = not requires_skinning
         nameMap = [] #self.__exportBones(meshes)
         
         #Note the mesh radius on vanilla w2mesh is calculated for all lods together.
@@ -797,6 +887,7 @@ class MeshExporter(object):
         common_info = {
             'generalizedMeshRadius' : rad_box[0],
             'boundingBox' : rad_box[1],
+            'isStatic' : is_static,
             'lod0_MeshSettings' : lod0_settings
         }
         if lod0_settings.soundInfo_enabled:

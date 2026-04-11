@@ -31,6 +31,18 @@ log = logging.getLogger(__name__)
 ZERO_WEIGHT_MASK_GROUP_NAME = "_w3_zero_weight_hidden"
 ZERO_WEIGHT_MASK_MODIFIER_NAME = "W3 Zero Weight Mask"
 
+
+def _mesh_has_skinned_chunks(CData):
+    mesh_infos = getattr(CData, "meshInfos", None) or []
+    return any(getattr(mesh_info, "vertexType", None) == EMeshVertexType.EMVT_SKINNED for mesh_info in mesh_infos)
+
+
+def _derive_mesh_is_static(CData):
+    mesh_infos = getattr(CData, "meshInfos", None) or []
+    if mesh_infos:
+        return not _mesh_has_skinned_chunks(CData)
+    return bool(getattr(CData, "isStatic", False))
+
 def _warn_missing_physical_material(shape_type, mesh_name):
     log.warning(
         f"{shape_type} collision in '{mesh_name}' has no physical material. "
@@ -531,6 +543,35 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
     #TODO proxy meshes don't have lod0 they start at lod1, should import proxy anyway if requested
     #meshData = meshFile
     created_mesh_bl = []
+    created_mesh_entries = []
+    source_is_skinned = _mesh_has_skinned_chunks(CData)
+    source_lod_levels = []
+    for mesh_entry in getattr(CData, "meshDataAllMeshes", []) or []:
+        try:
+            source_lod_levels.append(int(getattr(getattr(mesh_entry, "meshInfo", None), "lod", 0) or 0))
+        except (TypeError, ValueError):
+            source_lod_levels.append(0)
+    primary_source_lod_level = min(source_lod_levels) if source_lod_levels else 0
+
+    def _apply_common_mesh_settings(settings):
+        settings['autohideDistance'] = CData.autohideDistance
+        settings['isTwoSided'] = CData.isTwoSided
+        settings['useExtraStreams'] = CData.useExtraStreams
+        settings['generalizedMeshRadius'] = CData.generalizedMeshRadius
+        settings['mergeInGlobalShadowMesh'] = CData.mergeInGlobalShadowMesh
+        settings['isOccluder'] = CData.isOccluder
+        settings['smallestHoleOverride'] = CData.smallestHoleOverride
+        settings['source_is_skinned'] = source_is_skinned
+        settings['entityProxy'] = CData.entityProxy
+        if hasattr(CData, 'soundInfo') and CData.soundInfo:
+            settings.soundInfo_enabled = True
+            settings.soundInfo_soundTypeIdentification = CData.soundInfo.get('soundTypeIdentification', '')
+            size_id = CData.soundInfo.get('soundSizeIdentification', '')
+            settings.soundInfo_soundSizeIdentification = size_id if size_id else 'default'
+            bone_mapping = CData.soundInfo.get('soundBoneMappingInfo', '')
+            valid_enums = {'TorsoArmor', 'LegArmor', 'HandArmor', 'HeadArmor'}
+            settings.soundInfo_soundBoneMappingInfo = bone_mapping if bone_mapping in valid_enums else 'NONE'
+
     for idx, meshDataBl in enumerate(CData.meshDataAllMeshes):
         mesh_info = CData.meshDataAllMeshes[idx].meshInfo
         mat_id = getattr(mesh_info, "materialID", 0)
@@ -573,32 +614,14 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                 #obj.witcherui_MeshSettings['witcher_lod_level'] = lod_level
                 #obj.witcherui_MeshSettings['witcher_distance'] = distance
                 #obj.witcherui_MeshSettings['witcher_mat_id'] = mat_id
-                obj.witcherui_MeshSettings['lod_level'] = lod_level
+                obj.witcherui_MeshSettings['source_lod_level'] = lod_level
                 obj.witcherui_MeshSettings['distance'] = distance
                 obj.witcherui_MeshSettings['mat_id'] = mat_id
                 obj.witcherui_MeshSettings['item_repo_path'] = get_repo_from_abs_path(meshFile.fileName)
                 obj.witcherui_MeshSettings['make_export_dir'] = True
-                
-                if lod_level == 0:
-                    obj.witcherui_MeshSettings['autohideDistance'] = CData.autohideDistance
-                    obj.witcherui_MeshSettings['isTwoSided'] = CData.isTwoSided
-                    obj.witcherui_MeshSettings['useExtraStreams'] = CData.useExtraStreams
-                    obj.witcherui_MeshSettings['generalizedMeshRadius'] = CData.generalizedMeshRadius
-                    obj.witcherui_MeshSettings['mergeInGlobalShadowMesh'] = CData.mergeInGlobalShadowMesh
-                    obj.witcherui_MeshSettings['isOccluder'] = CData.isOccluder
-                    obj.witcherui_MeshSettings['smallestHoleOverride'] = CData.smallestHoleOverride
-                    obj.witcherui_MeshSettings['isStatic'] = CData.isStatic
-                    obj.witcherui_MeshSettings['entityProxy'] = CData.entityProxy
-                    if hasattr(CData, 'soundInfo') and CData.soundInfo:
-                        settings = obj.witcherui_MeshSettings
-                        settings.soundInfo_enabled = True
-                        settings.soundInfo_soundTypeIdentification = CData.soundInfo.get('soundTypeIdentification', '')
-                        size_id = CData.soundInfo.get('soundSizeIdentification', '')
-                        settings.soundInfo_soundSizeIdentification = size_id if size_id else 'default'
-                        bone_mapping = CData.soundInfo.get('soundBoneMappingInfo', '')
-                        valid_enums = {'TorsoArmor', 'LegArmor', 'HandArmor', 'HeadArmor'}
-                        settings.soundInfo_soundBoneMappingInfo = bone_mapping if bone_mapping in valid_enums else 'NONE'
+                _apply_common_mesh_settings(obj.witcherui_MeshSettings)
                 created_mesh_bl.append(obj)
+                created_mesh_entries.append((obj, lod_level, mat_id))
                 log.debug(
                     "Created submesh[%d] '%s' as object '%s' (polygons=%d material_slots=%d)",
                     idx,
@@ -633,6 +656,8 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
         try:
             empty_obj.witcherui_MeshSettings['item_repo_path'] = get_repo_from_abs_path(meshFile.fileName)
             empty_obj.witcherui_MeshSettings['make_export_dir'] = True
+            empty_obj.witcherui_MeshSettings['source_lod_level'] = primary_source_lod_level
+            empty_obj.witcherui_MeshSettings['source_is_skinned'] = source_is_skinned
         except Exception:
             pass
         return ([empty_obj], [])
@@ -706,13 +731,7 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
         ]
         log.debug("Material slot mapping for '%s': %s", meshName, " | ".join(debug_mapping))
 
-    for idx, mesh_bl in enumerate(created_mesh_bl):
-        # mat_id = CData.meshDataAllMeshes[idx].meshInfo.materialID
-        # bufferInfos.verticesBuffer[idx].lod
-
-        mat_id = mesh_bl.witcherui_MeshSettings['mat_id']
-        lod_level = mesh_bl.witcherui_MeshSettings['lod_level']
-
+    for mesh_bl, lod_level, mat_id in created_mesh_entries:
         lod0.append(mesh_bl) if lod_level == 0 else 0
         lod1.append(mesh_bl) if lod_level == 1 else 0
         lod2.append(mesh_bl) if lod_level == 2 else 0
@@ -745,7 +764,7 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
             #==========#
             # Armature #
             #==========#
-            if (CData.meshInfos[0].vertexType == EMeshVertexType.EMVT_SKINNED):
+            if _mesh_has_skinned_chunks(CData):
                 scale = 1.0
                 armature = bpy.data.armatures.new(CData.modelName+"_"+f"ARM_DATA")
                 
@@ -836,7 +855,8 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                     bpy.ops.object.join()
                 joined_obj = joinable_meshes[0] if len(joinable_meshes) == 1 else bpy.context.selected_objects[:][0]
                 joined_obj.name = meshName+"_lod"+str(idx)
-                
+                joined_obj.witcherui_MeshSettings['source_lod_level'] = idx
+                 
                 ## ROTATE 180
                 # if rotate_180:
                 #     joined_obj.select_set(True)
@@ -845,7 +865,7 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                     
                 final_bl_meshes.append(joined_obj)
 
-                if (CData.meshInfos[0].vertexType == EMeshVertexType.EMVT_SKINNED and do_import_armature):
+                if (_mesh_has_skinned_chunks(CData) and do_import_armature):
                     bpy.context.view_layer.objects.active = bpy.data.objects[armature_obj.name]
                     #bpy.ops.object.parent_set(type="ARMATURE_NAME", xmirror=False, keep_transform=False)
                     for mesh_obj in final_bl_meshes:
@@ -858,10 +878,7 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                         # if bl_mesh != lod_meshes[0]:
                         #     lod_meshes[0].append(bl_mesh)
 
-    is_skinned_mesh = bool(
-        getattr(CData, "meshInfos", None)
-        and CData.meshInfos[0].vertexType == EMeshVertexType.EMVT_SKINNED
-    )
+    is_skinned_mesh = _mesh_has_skinned_chunks(CData)
     if hide_zero_weight_faces and is_skinned_mesh:
         for mesh_obj in final_bl_meshes:
             zero_weight_vert_count, hidden_face_count = _hide_zero_weight_faces(mesh_obj)
@@ -968,7 +985,7 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
     #===========#
     #select everything just imported
     armatures = []
-    if (CData.meshInfos[0].vertexType == EMeshVertexType.EMVT_SKINNED and do_import_armature):
+    if (_mesh_has_skinned_chunks(CData) and do_import_armature):
         armature_obj.select_set(True)
         bpy.context.view_layer.objects.active = armature_obj
         armatures.append(armature_obj)
@@ -1184,7 +1201,7 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
             try:
                 assignVertexGroup(vert, CData, mesh_ob)
             except Exception as e:
-                if CData.isStatic:
+                if _derive_mesh_is_static(CData):
                     log.critical('found skinning verts on static mesh')
                     break
 

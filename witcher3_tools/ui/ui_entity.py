@@ -7,6 +7,7 @@ import bpy
 import json
 
 log = logging.getLogger(__name__)
+from ..lod_utils import object_lod_level
 
 from .. import CR2W, file_helpers
 from ..importers import import_w2l
@@ -1580,11 +1581,10 @@ class WITCH_OT_ENTITY_lod_toggle(Operator):
             for mesh in scene.objects:
                 # only for meshes
                 if mesh.type == 'MESH':
-                    if 'lod_level' in mesh.witcherui_MeshSettings:
-                        if mesh.witcherui_MeshSettings['lod_level'] == lod_idx:
-                            mesh.hide_set(False)
-                        else:
-                            mesh.hide_set(True)
+                    if object_lod_level(mesh) == lod_idx:
+                        mesh.hide_set(False)
+                    else:
+                        mesh.hide_set(True)
             #         if mesh.name[-5:-1] == "_lod":
             #             mesh.hide_viewport = True
             #             mesh.hide_render = True

@@ -246,8 +246,7 @@ class ReplacePrincipledBSDFOperator(bpy.types.Operator):
         node_tree.nodes.remove(active_node)
 
         # Step 3: Add the new node group
-        # Assuming init_material_nodes(material, "cake", clear=False) creates and returns the node group
-        nodegroup = init_material_nodes(material, "cake", clear=False)
+        nodegroup = init_material_nodes(material, "Witcher3_Main", clear=False)
         if not nodegroup:
             self.report({'ERROR'}, "Failed to create node group")
             return {'CANCELLED'}
@@ -1327,8 +1326,7 @@ class WITCH_OT_read_base_material(bpy.types.Operator):
         counts_box.label(text=f"Unsupported / Export Only: {counts.get('unsupported', 0)}")
 
         note_box = layout.box()
-        note_box.label(text="Existing links are preserved.", icon='CHECKMARK')
-        note_box.label(text="Generated helper nodes start with export disabled.", icon='CHECKMARK')
+        note_box.label(text="Any existing nodes are preserved.", icon='CHECKMARK')
         if not inspection.get("has_active_witcher_group"):
             note_box.label(text="No active Witcher shader group is connected; this read will only load the snapshot.", icon='INFO')
 

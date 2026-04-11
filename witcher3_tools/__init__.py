@@ -11,6 +11,7 @@ from .extension_paths import (
     get_texture_root,
     get_uncook_root,
 )
+from .lod_utils import lod_level_from_name
 
 LEGACY_ADDON_NAME = "io_import_w2l"
 ADDON_NAME = __package__ or __name__
@@ -108,6 +109,40 @@ def _tag_all_areas_redraw():
                     pass
     except Exception:
         pass
+
+
+def _get_mesh_export_material_entries(mesh_ob):
+    """Return used material slot preview rows for the given mesh object."""
+    mesh = getattr(mesh_ob, "data", None)
+    polygons = getattr(mesh, "polygons", None)
+    materials = getattr(mesh, "materials", None)
+    if mesh is None or polygons is None or materials is None:
+        return []
+
+    desired_entries = []
+    for mat_idx in sorted({poly.material_index for poly in polygons}):
+        mat = materials[mat_idx] if 0 <= mat_idx < len(materials) else None
+        desired_entries.append((mat_idx, mat.name if mat else "(empty)"))
+    return desired_entries
+
+
+def _get_mesh_group_export_material_entries(meshes):
+    combined_entries = set()
+    for mesh_ob in meshes or []:
+        combined_entries.update(_get_mesh_export_material_entries(mesh_ob))
+    return sorted(combined_entries, key=lambda entry: (entry[0], (entry[1] or "").lower()))
+
+
+def _draw_mesh_used_material_entries(layout, entries):
+    if not entries:
+        layout.label(text="-")
+        return
+
+    for slot_index, material_name in entries:
+        row = layout.row(align=True)
+        split = row.split(factor=0.12, align=True)
+        split.label(text=str(slot_index))
+        split.label(text=material_name or "(empty)", icon='MATERIAL')
 
 
 def set_external_import_dependency_alert(kind, *, source_path="", status="", reason=""):
@@ -777,6 +812,7 @@ class WITCHER_OT_pref_help_popup(bpy.types.Operator):
 class WITCHER_UL_path_list(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         layout.prop(item, "path", text="", emboss=False)
+
 
 class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     # this must match the addon name, use '__package__'
@@ -1805,16 +1841,38 @@ def _get_collision_type(obj_name):
             return suffix
     return None
 
-def _find_related_meshes(base_name):
+def _strip_blender_copy_suffix(name):
+    return re.sub(r'\.\d{3}$', '', name or "")
+
+
+def _strip_lod_suffix(name):
+    return re.sub(r'_lod\d+$', '', _strip_blender_copy_suffix(name), flags=re.IGNORECASE)
+
+
+def _is_lod_named_object(obj):
+    return bool(re.search(r'_lod\d+$', _strip_blender_copy_suffix(getattr(obj, "name", "")), re.IGNORECASE))
+
+
+def _sort_meshes_by_lod(meshes):
+    return sorted(
+        (mesh for mesh in meshes if mesh and getattr(mesh, "type", None) == 'MESH'),
+        key=lambda mesh: (lod_level_from_name(mesh.name), _strip_blender_copy_suffix(mesh.name).lower()),
+    )
+
+
+def _find_related_meshes(base_name, scene=None):
     lod_meshes = []
     col_tri_meshes = []
-    for obj in bpy.context.scene.objects:
+    scene = scene or getattr(bpy.context, "scene", None)
+    if scene is None:
+        return lod_meshes, col_tri_meshes
+    for obj in scene.objects:
         if obj.name.startswith(base_name) and obj.name[len(base_name):].startswith("_lod"):
             lod_meshes.append(obj)
         elif obj.name.startswith(base_name):
             if _get_collision_type(obj.name):
                 col_tri_meshes.append(obj)
-    return lod_meshes, col_tri_meshes
+    return _sort_meshes_by_lod(lod_meshes), col_tri_meshes
 
 
 def _get_collision_material_status(obj):
@@ -1859,20 +1917,67 @@ def _get_collision_material_status(obj):
         "invalid_count": len(entries) - valid_count,
     }
 
-def _resolve_cmesh_target(context):
-    """Return the target mesh object for the CMesh panel.
-    If an armature is selected, returns the first mesh child (lod0).
-    If a mesh is selected, returns it directly.
-    Returns None if no valid target found."""
-    ob = context.active_object
-    if not ob:
+def _resolve_cmesh_context(context):
+    active_ob = getattr(context, "active_object", None)
+    scene = getattr(context, "scene", None)
+    if not active_ob or active_ob.type not in {'MESH', 'ARMATURE'}:
         return None
-    if ob.type == 'MESH':
-        return ob
-    if ob.type == 'ARMATURE':
-        meshes = [child for child in ob.children if child.type == 'MESH']
-        return meshes[0] if meshes else None
-    return None
+
+    armature_ob = None
+    current_mesh = active_ob if active_ob.type == 'MESH' else None
+    if active_ob.type == 'ARMATURE':
+        armature_ob = active_ob
+    elif current_mesh and getattr(current_mesh, "parent", None) and current_mesh.parent.type == 'ARMATURE':
+        armature_ob = current_mesh.parent
+    elif current_mesh:
+        for modifier in getattr(current_mesh, "modifiers", []):
+            armature_obj = getattr(modifier, "object", None)
+            if modifier.type == 'ARMATURE' and armature_obj and getattr(armature_obj, "type", None) == 'ARMATURE':
+                armature_ob = armature_obj
+                break
+
+    export_meshes = []
+    col_tri_meshes = []
+    base_name = ""
+
+    if armature_ob is not None:
+        armature_meshes = [child for child in armature_ob.children if child.type == 'MESH']
+        lod_named_meshes = [mesh for mesh in armature_meshes if _is_lod_named_object(mesh)]
+        export_meshes = _sort_meshes_by_lod(lod_named_meshes if lod_named_meshes else armature_meshes)
+        if export_meshes:
+            base_name = _strip_lod_suffix(export_meshes[0].name)
+    elif active_ob.type == 'MESH':
+        if _get_collision_type(active_ob.name):
+            export_meshes = [active_ob]
+        else:
+            base_name = _strip_lod_suffix(active_ob.name)
+            lod_meshes, col_tri_meshes = _find_related_meshes(base_name, scene=scene)
+            export_meshes = list(lod_meshes)
+            if active_ob not in export_meshes:
+                export_meshes.append(active_ob)
+            export_meshes = _sort_meshes_by_lod(export_meshes)
+
+    if export_meshes and base_name and not col_tri_meshes:
+        _, col_tri_meshes = _find_related_meshes(base_name, scene=scene)
+
+    main_mesh = export_meshes[0] if export_meshes else current_mesh
+    if main_mesh is None:
+        return None
+
+    return {
+        "active_object": active_ob,
+        "armature": armature_ob,
+        "main_mesh": main_mesh,
+        "current_mesh": current_mesh if current_mesh and current_mesh.type == 'MESH' else None,
+        "export_meshes": export_meshes or [main_mesh],
+        "collision_meshes": col_tri_meshes,
+        "base_name": base_name or _strip_lod_suffix(main_mesh.name),
+    }
+
+
+def _resolve_cmesh_target(context):
+    cmesh_context = _resolve_cmesh_context(context)
+    return cmesh_context["main_mesh"] if cmesh_context else None
 
 
 def _get_cmesh_header_status(context) -> str:
@@ -2054,7 +2159,8 @@ class WITCH_PT_CMesh(WITCH_PT_Base, bpy.types.Panel):
         layout = self.layout
         layout.use_property_split = True
         layout.use_property_decorate = False
-        mesh_ob = _resolve_cmesh_target(context)
+        cmesh_context = _resolve_cmesh_context(context)
+        mesh_ob = cmesh_context["main_mesh"] if cmesh_context else None
         active_ob = getattr(context, "active_object", None)
 
         banner = layout.box()
@@ -2072,6 +2178,11 @@ class WITCH_PT_CMesh(WITCH_PT_Base, bpy.types.Panel):
             banner_col.label(text="Selected mesh has no Witcher mesh settings.", icon='ERROR')
             return
         mesh_settings = mesh_ob.witcherui_MeshSettings
+        armature_ob = cmesh_context["armature"] if cmesh_context else None
+        current_mesh = cmesh_context["current_mesh"] if cmesh_context else None
+        export_meshes = list(cmesh_context["export_meshes"]) if cmesh_context else [mesh_ob]
+        col_tri_meshes = list(cmesh_context["collision_meshes"]) if cmesh_context else []
+        current_mesh_settings = getattr(current_mesh, "witcherui_MeshSettings", None) if current_mesh else None
 
         def section(section_id, label, icon, default_closed=False):
             container = layout.box()
@@ -2079,15 +2190,39 @@ class WITCH_PT_CMesh(WITCH_PT_Base, bpy.types.Panel):
             header.label(text=label, icon=icon)
             return body
 
+        def value_row(col, label, value, icon='NONE'):
+            row = col.row(align=True)
+            split = row.split(factor=0.38, align=True)
+            split.label(text=label)
+            if icon != 'NONE':
+                split.label(text=value or "-", icon=icon)
+            else:
+                split.label(text=value or "-")
+
         # --- Mesh Info ---
         body = section("witcher_cmesh_info", "Mesh Info", 'OBJECT_DATA')
         if body:
             col = body.column(align=True)
             col.prop(mesh_settings, "item_repo_path")
-            row = col.row(align=True)
-            row.prop(mesh_settings, "lod_level")
-            row.prop(mesh_settings, "distance")
-            col.prop(mesh_settings, "mat_id")
+            value_row(col, "Skeleton", armature_ob.name if armature_ob else "-", icon='ARMATURE_DATA' if armature_ob else 'NONE')
+            value_row(col, "LOD Meshes", str(len(export_meshes)))
+            col.label(text="Used Slots")
+            _draw_mesh_used_material_entries(col, _get_mesh_group_export_material_entries(export_meshes))
+
+        if current_mesh_settings is not None:
+            body = section("witcher_cmesh_current_lod", "Current LOD", 'MESH_DATA')
+            if body:
+                col = body.column(align=True)
+                value_row(col, "Object", current_mesh.name, icon='MESH_DATA')
+                row = col.row()
+                row.enabled = False
+                row.prop(current_mesh_settings, "lod_level")
+                col.prop(current_mesh_settings, "distance")
+                row = col.row()
+                row.enabled = False
+                row.prop(current_mesh_settings, "mat_id", text="Imported Mat ID")
+                col.label(text="Used Slots")
+                _draw_mesh_used_material_entries(col, _get_mesh_export_material_entries(current_mesh))
 
         # --- CMesh Properties ---
         body = section("witcher_cmesh_props", "CMesh Properties", 'MESH_DATA')
@@ -2102,7 +2237,9 @@ class WITCH_PT_CMesh(WITCH_PT_Base, bpy.types.Panel):
             col.prop(mesh_settings, "mergeInGlobalShadowMesh")
             col.prop(mesh_settings, "isOccluder")
             col.prop(mesh_settings, "smallestHoleOverride")
-            col.prop(mesh_settings, "isStatic")
+            row = col.row()
+            row.enabled = False
+            row.prop(mesh_settings, "isStatic")
             col.prop(mesh_settings, "entityProxy")
 
         # --- Sound Info ---
@@ -2118,8 +2255,7 @@ class WITCH_PT_CMesh(WITCH_PT_Base, bpy.types.Panel):
                 col.operator("witcher.create_sound_info", text="Create Sound Info", icon='ADD')
 
         # --- LODs ---
-        base_name = mesh_ob.name.rsplit('_lod0', 1)[0]
-        lod_meshes, col_tri_meshes = _find_related_meshes(base_name)
+        lod_meshes = list(export_meshes)
 
         body = section("witcher_cmesh_lods", "LODs", 'MOD_DECIM')
         if body:

@@ -2,6 +2,7 @@ import logging
 import bpy
 from typing import Tuple
 from contextlib import contextmanager
+from ..lod_utils import object_lod_level
 
 log = logging.getLogger(__name__)
 from bpy.props import StringProperty, BoolProperty
@@ -37,6 +38,47 @@ def _cache_dynamic_enum_items(cache_key, items):
 def update_rot90_comp(self, context):
     """Keep Rot90 state lightweight; explicit refresh is handled by dedicated operators."""
     return
+
+
+def _mesh_object_has_linked_armature(obj):
+    if obj is None or getattr(obj, "type", None) != 'MESH':
+        return False
+
+    parent = getattr(obj, "parent", None)
+    if parent and getattr(parent, "type", None) == 'ARMATURE':
+        bones = getattr(getattr(parent, "data", None), "bones", None)
+        if bones and len(bones) > 0:
+            return True
+
+    for modifier in getattr(obj, "modifiers", []):
+        armature_obj = getattr(modifier, "object", None)
+        if modifier.type != 'ARMATURE' or not armature_obj or getattr(armature_obj, "type", None) != 'ARMATURE':
+            continue
+        bones = getattr(getattr(armature_obj, "data", None), "bones", None)
+        if bones and len(bones) > 0:
+            return True
+    return False
+
+
+def _mesh_object_requires_skinning(obj, settings=None):
+    if obj is None or getattr(obj, "type", None) != 'MESH':
+        return False
+
+    return _mesh_object_has_linked_armature(obj)
+
+
+def _mesh_settings_get_is_static(self):
+    obj = getattr(self, "id_data", None)
+    if obj is None or getattr(obj, "type", None) != 'MESH':
+        return True
+    return not _mesh_object_requires_skinning(obj, self)
+
+
+def _mesh_settings_get_lod_level(self):
+    obj = getattr(self, "id_data", None)
+    if obj is None or getattr(obj, "type", None) != 'MESH':
+        return 0
+    return object_lod_level(obj)
 
 def update_variants_enabled(self, context):
     """Refresh variant state and reload equipment when toggle changes."""
@@ -352,9 +394,22 @@ class EntitySlotEntry(bpy.types.PropertyGroup):
 
 
 class witcherui_MeshSettings(bpy.types.PropertyGroup):
-    lod_level: bpy.props.IntProperty(default = 0)
+    lod_level: bpy.props.IntProperty(
+        name = "LOD Level",
+        description = "Derived from the object's _lodN name suffix for export",
+        get = _mesh_settings_get_lod_level,
+        options = {'SKIP_SAVE'},
+    )
     distance: bpy.props.FloatProperty(default = 0)
-    mat_id: bpy.props.IntProperty(default = 0)
+    mat_id: bpy.props.IntProperty(
+        default = 0,
+        name = "Imported Mat ID",
+        description = (
+            "Original CR2W submesh materialID captured on import. "
+            "Export does not use this field directly; export derives chunk materials "
+            "from the mesh's current material slots and face assignments."
+        ),
+    )
     
     autohideDistance: bpy.props.FloatProperty(default = 20.0,
                         name = "Auto Hide Distance",
@@ -377,9 +432,17 @@ class witcherui_MeshSettings(bpy.types.PropertyGroup):
     smallestHoleOverride: bpy.props.FloatProperty(default = -1.0,
                         name = "Smallest Hole Override",
                         description = "Temporary override for the smallest hole parameter for this mesh. (-1 is default)")
-    isStatic: bpy.props.BoolProperty(default = True,
+    isStatic: bpy.props.BoolProperty(
                         name = "Is Static",
-                        description = "Is this mesh static?")
+                        description = "Is this mesh static? (Read only; derived from current armature linkage in the scene)",
+                        get = _mesh_settings_get_is_static,
+                        options = {'SKIP_SAVE'})
+    source_lod_level: bpy.props.IntProperty(
+                        default = 0,
+                        options = {'HIDDEN'})
+    source_is_skinned: bpy.props.BoolProperty(
+                        default = False,
+                        options = {'HIDDEN'})
     entityProxy: bpy.props.BoolProperty(default = False,
                         name = "Entity Proxy",
                         description = "Is this a generated entity proxy")

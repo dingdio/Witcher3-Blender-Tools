@@ -21,6 +21,12 @@ from .Types.BlenderMesh import CommonData
 from .Types.SBufferInfos import MMatrix, SBufferInfos, SVertexBufferInfos, SMeshInfos, EMeshVertexType, VertexSkinningEntry
 log = logging.getLogger(__name__)
 
+
+def _derive_mesh_is_static(mesh_infos):
+    if mesh_infos:
+        return not any(getattr(mesh_info, "vertexType", None) == EMeshVertexType.EMVT_SKINNED for mesh_info in mesh_infos)
+    return False
+
 class MeshData(object):
     """docstring for MeshData."""
     def __init__(self):
@@ -841,7 +847,8 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
             CData.mergeInGlobalShadowMesh = chunk.GetVariableByName("mergeInGlobalShadowMesh").Value if chunk.GetVariableByName("mergeInGlobalShadowMesh") else True
             CData.isOccluder = chunk.GetVariableByName("isOccluder").Value if chunk.GetVariableByName("isOccluder") else True
             CData.smallestHoleOverride = chunk.GetVariableByName("smallestHoleOverride").Value if chunk.GetVariableByName("smallestHoleOverride") else -1.0
-            CData.isStatic = chunk.GetVariableByName("isStatic").Value if chunk.GetVariableByName("isStatic") else False
+            chunk_is_static = chunk.GetVariableByName("isStatic").Value if chunk.GetVariableByName("isStatic") else None
+            CData.isStatic = _derive_mesh_is_static(CData.meshInfos) if CData.meshInfos else bool(chunk_is_static)
             CData.entityProxy = chunk.GetVariableByName("entityProxy").Value if chunk.GetVariableByName("entityProxy") else False
 
             # SMeshSoundInfo

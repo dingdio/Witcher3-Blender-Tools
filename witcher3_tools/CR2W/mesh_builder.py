@@ -278,8 +278,8 @@ def Build_CMesh_Chunk(cr2w, ALL_LODS, bone_data:BoneData = None, common_info = N
         _CMesh_chunk.PROPS.append(PROPERTY(ValueA = 2, theName='rawIndices', theType='DeferredDataBuffer'))
 
     def add_isStatic(common_info):
-        # Default is False in editor; only export if set to True
-        if common_info['lod0_MeshSettings'].isStatic:
+        # Derived from the export context so it always matches chunk vertex types.
+        if common_info['isStatic']:
             _CMesh_chunk.PROPS.append(PROPERTY(Value = True, theName='isStatic', theType='Bool'))
 
     def add_entityProxy(common_info):
@@ -392,7 +392,7 @@ def Build_CMesh_Chunk(cr2w, ALL_LODS, bone_data:BoneData = None, common_info = N
         lod_level = _resolve_lod_level(mesh_settings, lod_idx)
         mesh_data = mesh_data[0]
         for idx, (bl_mesh_info, witcher_mat_info) in enumerate(mesh_data):
-            vertex_type = EMeshVertexType.EMVT_SKINNED if bone_data.jointNames else EMeshVertexType.EMVT_STATIC #EMeshVertexType
+            vertex_type = EMeshVertexType.EMVT_STATIC if common_info['isStatic'] else EMeshVertexType.EMVT_SKINNED #EMeshVertexType
             mat_name = witcher_mat_info[0]['name'] if witcher_mat_info else 'Material0'
             materialID = list(MATERIAL_DICT.keys()).index(mat_name)
             numBonesPerVertex = 4 #Uint8 0

@@ -316,6 +316,52 @@ def _get_main_mesh(context):
         meshes = [ob for ob in context.selected_objects if ob.type == 'MESH']
     return meshes[0] if meshes else None
 
+
+def _sorted_export_meshes(meshes):
+    return sorted((mesh for mesh in meshes if mesh and mesh.type == 'MESH'), key=lambda mesh: mesh.name)
+
+
+def _get_effective_export_mesh_settings(meshes, armature=None):
+    ordered_meshes = _sorted_export_meshes(meshes)
+    if not ordered_meshes:
+        return None, ordered_meshes, None
+
+    effective_armature = armature if armature and armature.type == 'ARMATURE' else None
+    if effective_armature is None:
+        linked_armatures = {}
+        for mesh in ordered_meshes:
+            parent = getattr(mesh, "parent", None)
+            if parent and getattr(parent, "type", None) == 'ARMATURE':
+                linked_armatures.setdefault(parent.name_full, parent)
+            for modifier in getattr(mesh, "modifiers", []):
+                armature_obj = getattr(modifier, "object", None)
+                if modifier.type == 'ARMATURE' and armature_obj and getattr(armature_obj, "type", None) == 'ARMATURE':
+                    linked_armatures.setdefault(armature_obj.name_full, armature_obj)
+        if len(linked_armatures) == 1:
+            effective_armature = next(iter(linked_armatures.values()))
+
+    return getattr(ordered_meshes[0], "witcherui_MeshSettings", None), ordered_meshes, effective_armature
+
+
+def _collect_extra_stream_requirements(meshes):
+    has_uv2 = False
+    has_vertex_color = False
+    for mesh in _sorted_export_meshes(meshes):
+        has_uv2 = has_uv2 or len(mesh.data.uv_layers) > 1
+        has_vertex_color = has_vertex_color or (
+            mesh.data.color_attributes.active_color_index != -1 and mesh.data.color_attributes.active
+        )
+    return has_uv2, has_vertex_color
+
+
+def _has_detached_imported_skinned_meshes(meshes):
+    for mesh in _sorted_export_meshes(meshes):
+        settings = getattr(mesh, "witcherui_MeshSettings", None)
+        if settings and getattr(settings, "source_is_skinned", False):
+            return True
+    return False
+
+
 def _compute_full_export_path(workspace_root, repo_path):
     """Combine workspace root + repo path into a full filesystem path."""
     if not workspace_root or not repo_path:
@@ -525,7 +571,6 @@ class WITCH_OT_generate_lods(bpy.types.Operator):
             source.name = base_name + "_lod0"
 
         # Set lod0 properties
-        source.witcherui_MeshSettings.lod_level = 0
         source.witcherui_MeshSettings.distance = 0.0
 
         created = []
@@ -576,7 +621,6 @@ class WITCH_OT_generate_lods(bpy.types.Operator):
                 bpy.ops.object.modifier_apply(modifier=mod.name)
 
             # Set mesh settings
-            lod_obj.witcherui_MeshSettings.lod_level = i
             lod_obj.witcherui_MeshSettings.distance = self.base_distance * (2 ** (i - 1))
 
             # Copy repo path from source
@@ -2184,6 +2228,10 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         summary_box = layout.box()
         if selected_armatures:
             arm = selected_armatures[0]
+            effective_settings, export_meshes_preview, _ = _get_effective_export_mesh_settings(
+                _arm_lod_named if _arm_lod_named else (_arm_non_lod or []),
+                armature=arm,
+            )
             if not _arm_has_children:
                 row = summary_box.row()
                 row.alert = True
@@ -2198,56 +2246,61 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                 summary_box.label(text=f"Skeletal mesh — rig: {arm.name}", icon='ARMATURE_DATA')
                 summary_box.label(text=f"Will export {len(_arm_lod_named)} LOD(s) from named children", icon='INFO')
 
-            # isStatic warning: skeletal meshes should not have isStatic enabled
-            export_meshes_preview = _arm_lod_named if _arm_lod_named else (_arm_non_lod or [])
-            for _m in export_meshes_preview:
-                if hasattr(_m, 'witcherui_MeshSettings') and _m.witcherui_MeshSettings.isStatic:
-                    row = summary_box.row()
-                    row.alert = True
-                    row.label(text="isStatic is ON — disable it for skeletal meshes", icon='ERROR')
-                    break
+            if effective_settings and effective_settings.isStatic:
+                row = summary_box.row()
+                row.alert = True
+                row.label(text="Selected armature has no skinning data to export.", icon='ERROR')
 
             # UV2 / useExtraStreams tip
-            for _m in export_meshes_preview:
-                if _m.type == 'MESH':
-                    _has_uv2 = len(_m.data.uv_layers) > 1
-                    _has_vcol = _m.data.color_attributes.active_color_index != -1 and _m.data.color_attributes.active
-                    _extra = hasattr(_m, 'witcherui_MeshSettings') and _m.witcherui_MeshSettings.useExtraStreams
-                    if (_has_uv2 or _has_vcol) and not _extra:
-                        parts = []
-                        if _has_uv2:
-                            parts.append("UV2")
-                        if _has_vcol:
-                            parts.append("vertex color")
-                        row = summary_box.row()
-                        row.alert = True
-                        row.label(text=f"{', '.join(parts)} data found — enable 'Use Extra Streams'", icon='INFO')
-                        break
+            _has_uv2, _has_vcol = _collect_extra_stream_requirements(export_meshes_preview)
+            _extra = bool(effective_settings and effective_settings.useExtraStreams)
+            if (_has_uv2 or _has_vcol) and not _extra:
+                parts = []
+                if _has_uv2:
+                    parts.append("UV2")
+                if _has_vcol:
+                    parts.append("vertex color")
+                row = summary_box.row()
+                row.alert = True
+                row.label(text=f"{', '.join(parts)} data found — enable 'Use Extra Streams'", icon='INFO')
         else:
             main_mesh_preview = _get_main_mesh(context)
             if main_mesh_preview:
                 base_name_preview = main_mesh_preview.name.rsplit('_lod0', 1)[0]
                 lod_preview, _ = self.find_related_meshes(base_name_preview)
                 n_lods = len(lod_preview) if lod_preview else 1
-                summary_box.label(text=f"Static mesh — will export {n_lods} LOD(s)", icon='MESH_DATA')
+                preview_meshes = lod_preview if lod_preview else [main_mesh_preview]
+                effective_settings, _check_meshes, preview_armature = _get_effective_export_mesh_settings(preview_meshes)
+                if effective_settings and not effective_settings.isStatic:
+                    rig_name = preview_armature.name if preview_armature else "Missing armature"
+                    if preview_armature is None:
+                        row = summary_box.row()
+                        row.alert = True
+                        row.label(text="Skeletal mesh data found - armature missing for export", icon='ERROR')
+                    summary_box.label(text=f"Skeletal mesh — rig: {rig_name}", icon='ARMATURE_DATA')
+                    summary_box.label(text=f"Will export {n_lods} LOD(s) from selected mesh set", icon='INFO')
+                else:
+                    summary_box.label(text=f"Static mesh — will export {n_lods} LOD(s)", icon='MESH_DATA')
+
+                    if preview_armature is None and _has_detached_imported_skinned_meshes(preview_meshes):
+                        row = summary_box.row()
+                        row.label(text="Mesh was originally imported with a skeleton and is currently detached from any armature", icon='INFO')
 
                 # UV2 / useExtraStreams tip for standalone mesh exports
-                _check_meshes = lod_preview if lod_preview else [main_mesh_preview]
-                for _m in _check_meshes:
-                    if _m.type == 'MESH':
-                        _has_uv2 = len(_m.data.uv_layers) > 1
-                        _has_vcol = _m.data.color_attributes.active_color_index != -1 and _m.data.color_attributes.active
-                        _extra = hasattr(_m, 'witcherui_MeshSettings') and _m.witcherui_MeshSettings.useExtraStreams
-                        if (_has_uv2 or _has_vcol) and not _extra:
-                            parts = []
-                            if _has_uv2:
-                                parts.append("UV2")
-                            if _has_vcol:
-                                parts.append("vertex color")
-                            row = summary_box.row()
-                            row.alert = True
-                            row.label(text=f"{', '.join(parts)} data found — enable 'Use Extra Streams'", icon='INFO')
-                            break
+                effective_settings, _check_meshes, _ = _get_effective_export_mesh_settings(
+                    preview_meshes
+                )
+                _has_uv2, _has_vcol = _collect_extra_stream_requirements(_check_meshes)
+                _extra = bool(effective_settings and effective_settings.useExtraStreams)
+                if (_has_uv2 or _has_vcol) and not _extra:
+                    parts = []
+                    if _has_uv2:
+                        parts.append("UV2")
+                    if _has_vcol:
+                        parts.append("vertex color")
+                    row = summary_box.row()
+                    row.alert = True
+                    row.label(text=f"{', '.join(parts)} data found — enable 'Use Extra Streams'", icon='INFO')
             else:
                 row = summary_box.row()
                 row.alert = True
@@ -2319,11 +2372,21 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         # --- Mesh Settings Section ---
         mesh_ob = _get_main_mesh(context)
         if mesh_ob:
+            selected_armatures = [ob for ob in context.selected_objects if ob.type == 'ARMATURE']
+            if selected_armatures:
+                preview_meshes = [child for child in selected_armatures[0].children if child.type == 'MESH']
+                _get_effective_export_mesh_settings(preview_meshes, armature=selected_armatures[0])
+            else:
+                preview_base_name = mesh_ob.name.rsplit('_lod0', 1)[0]
+                preview_meshes, _ = self.find_related_meshes(preview_base_name)
+                _get_effective_export_mesh_settings(preview_meshes if preview_meshes else [mesh_ob])
             mesh_settings = mesh_ob.witcherui_MeshSettings
 
             box = self._draw_section_header(layout, 'show_mesh_settings', "Mesh Settings", 'MESH_DATA')
             if box:
-                box.prop(mesh_settings, "lod_level")
+                row = box.row()
+                row.enabled = False
+                row.prop(mesh_settings, "lod_level")
                 box.prop(mesh_settings, "distance")
                 box.separator()
                 box.prop(mesh_settings, "autohideDistance")
@@ -2335,7 +2398,9 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                 box.prop(mesh_settings, "mergeInGlobalShadowMesh")
                 box.prop(mesh_settings, "isOccluder")
                 box.prop(mesh_settings, "smallestHoleOverride")
-                box.prop(mesh_settings, "isStatic")
+                row = box.row()
+                row.enabled = False
+                row.prop(mesh_settings, "isStatic")
                 box.prop(mesh_settings, "entityProxy")
 
             # --- Sound Info Section ---
@@ -2512,22 +2577,8 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         if original_mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         
-        # Warn if mesh has SecondUV or vertex color but useExtraStreams is off
         mesh_ob = _get_main_mesh(context)
         if mesh_ob:
-            settings = mesh_ob.witcherui_MeshSettings
-            if not settings.useExtraStreams:
-                me = mesh_ob.data
-                has_second_uv = len(me.uv_layers) > 1
-                has_vertex_color = me.color_attributes.active_color_index != -1 and me.color_attributes.active
-                if has_second_uv or has_vertex_color:
-                    parts = []
-                    if has_second_uv:
-                        parts.append("Second UV")
-                    if has_vertex_color:
-                        parts.append("vertex color")
-                    self.report({'WARNING'}, f"Mesh has {' and '.join(parts)} data but 'Use Extra Streams' is off. Enable it to include this data in the export.")
-
             # Check for unresolved absolute texture paths in materials
             unresolved_mats = []
             for mat_slot in mesh_ob.material_slots:
@@ -2584,6 +2635,16 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                     else:
                         meshes = armature_meshes
 
+                    effective_settings, ordered_meshes, _ = _get_effective_export_mesh_settings(meshes, armature=armature)
+                    has_second_uv, has_vertex_color = _collect_extra_stream_requirements(ordered_meshes)
+                    if effective_settings and not effective_settings.useExtraStreams and (has_second_uv or has_vertex_color):
+                        parts = []
+                        if has_second_uv:
+                            parts.append("Second UV")
+                        if has_vertex_color:
+                            parts.append("vertex color")
+                        self.report({'WARNING'}, f"Mesh has {' and '.join(parts)} data but 'Use Extra Streams' is off. Enable it to include this data in the export.")
+
                     try:
                         mesh_back = do_export_mesh(context, fdir,
                                             armature = armature,
@@ -2607,6 +2668,15 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                     # If no LOD meshes found, use the selected meshes directly
                     if not lod_meshes:
                         lod_meshes = meshes
+                    effective_settings, ordered_meshes, _ = _get_effective_export_mesh_settings(lod_meshes)
+                    has_second_uv, has_vertex_color = _collect_extra_stream_requirements(ordered_meshes)
+                    if effective_settings and not effective_settings.useExtraStreams and (has_second_uv or has_vertex_color):
+                        parts = []
+                        if has_second_uv:
+                            parts.append("Second UV")
+                        if has_vertex_color:
+                            parts.append("vertex color")
+                        self.report({'WARNING'}, f"Mesh has {' and '.join(parts)} data but 'Use Extra Streams' is off. Enable it to include this data in the export.")
                     try:
                         mesh_back = do_export_mesh(context, fdir,
                                             armature = None,
