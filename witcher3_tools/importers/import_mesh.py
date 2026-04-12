@@ -43,6 +43,25 @@ def _derive_mesh_is_static(CData):
         return not _mesh_has_skinned_chunks(CData)
     return bool(getattr(CData, "isStatic", False))
 
+
+def _ensure_armature_binding(mesh_obj, armature_obj):
+    if mesh_obj is None or armature_obj is None:
+        return
+
+    mesh_obj.parent = armature_obj
+
+    existing_modifier = None
+    for modifier in getattr(mesh_obj, "modifiers", []):
+        if modifier.type == 'ARMATURE' and getattr(modifier, "object", None) == armature_obj:
+            existing_modifier = modifier
+            break
+
+    if existing_modifier is None:
+        existing_modifier = mesh_obj.modifiers.new(name="Armature", type='ARMATURE')
+
+    existing_modifier.object = armature_obj
+    existing_modifier.use_vertex_groups = True
+
 def _warn_missing_physical_material(shape_type, mesh_name):
     log.warning(
         f"{shape_type} collision in '{mesh_name}' has no physical material. "
@@ -867,12 +886,7 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
 
                 if (_mesh_has_skinned_chunks(CData) and do_import_armature):
                     bpy.context.view_layer.objects.active = bpy.data.objects[armature_obj.name]
-                    #bpy.ops.object.parent_set(type="ARMATURE_NAME", xmirror=False, keep_transform=False)
-                    for mesh_obj in final_bl_meshes:
-                        mesh_obj.parent = armature_obj
-                        armature_mod = mesh_obj.modifiers.new(name="Armature", type='ARMATURE')
-                        armature_mod.object = armature_obj
-                        armature_mod.use_vertex_groups = True
+                    _ensure_armature_binding(joined_obj, armature_obj)
                 if not keep_lod_meshes and not keep_proxy_meshes:
                     break
                         # if bl_mesh != lod_meshes[0]:

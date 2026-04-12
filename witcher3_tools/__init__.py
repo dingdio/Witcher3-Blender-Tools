@@ -1013,6 +1013,42 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
             "Has no effect if no w2beh or animation set is found."
         ),
     )
+    mesh_import_do_import_mats: bpy.props.BoolProperty(
+        name="Mesh Import: Apply Materials",
+        default=True,
+        description="If enabled, materials will be imported.",
+        options={'HIDDEN'},
+    )
+    mesh_import_do_import_armature: bpy.props.BoolProperty(
+        name="Mesh Import: Import Armature",
+        default=True,
+        description="If enabled, the armature will be imported",
+        options={'HIDDEN'},
+    )
+    mesh_import_keep_lod_meshes: bpy.props.BoolProperty(
+        name="Mesh Import: Keep LODs",
+        default=False,
+        description="If enabled, it will keep low quality meshes and materials",
+        options={'HIDDEN'},
+    )
+    mesh_import_keep_empty_lods: bpy.props.BoolProperty(
+        name="Mesh Import: Keep Empty LODs",
+        default=False,
+        description="If enabled, it will keep empty mesh LODs with zero polygons",
+        options={'HIDDEN'},
+    )
+    mesh_import_rotate_180: bpy.props.BoolProperty(
+        name="Mesh Import: Rotate 180",
+        default=False,
+        description="Rotate both the mesh and the armature on the Z-axis by 180 degrees. Default is False",
+        options={'HIDDEN'},
+    )
+    mesh_import_hide_zero_weight_faces: bpy.props.BoolProperty(
+        name="Mesh Import: Hide Zero-Weight Faces",
+        default=True,
+        description="Hides faces without bones on skinned meshes. The default game behaviour",
+        options={'HIDDEN'},
+    )
 
     # Global helper behavior toggles for Asset Browser imports
     do_import_redcloth: bpy.props.BoolProperty(

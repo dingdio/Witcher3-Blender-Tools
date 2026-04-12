@@ -98,6 +98,18 @@ def _enum_character_appearance_items(self, _context):
     return _get_character_appearance_enum_items(getattr(self, "appearance_metadata_json", "") or "")
 
 
+def _draw_entity_mesh_import_settings(layout, settings_owner):
+    box = layout.box()
+    box.label(text="Mesh Import", icon='MESH_DATA')
+    col = box.column(align=True)
+    col.prop(settings_owner, "do_import_lods")
+    lod_col = col.column(align=True)
+    lod_col.enabled = bool(getattr(settings_owner, "do_import_lods", False))
+    lod_col.prop(settings_owner, "keep_empty_lods")
+    col.prop(settings_owner, "keep_proxy_meshes")
+    col.prop(settings_owner, "hide_zero_weight_faces")
+
+
 def _short_panel_header_text(text: str, max_len: int = 28) -> str:
     value = str(text or "").strip()
     if not value:
@@ -859,6 +871,26 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
         items=_enum_character_appearance_items,
         description="Choose which appearance to import",
     )
+    do_import_lods: BoolProperty(
+        name="Include LODs",
+        description="Include lower-detail mesh LODs for imported character meshes",
+        default=False,
+    )
+    keep_empty_lods: BoolProperty(
+        name="Keep Empty LODs",
+        description="Keep empty mesh LODs with zero polygons when LODs are imported",
+        default=False,
+    )
+    keep_proxy_meshes: BoolProperty(
+        name="Keep Proxy Meshes",
+        description="Keep proxy meshes even when higher LOD meshes are skipped",
+        default=False,
+    )
+    hide_zero_weight_faces: BoolProperty(
+        name="Hide Zero-Weight Faces",
+        description="Hide faces without bone weights on skinned meshes during import",
+        default=True,
+    )
     appearance_selection_initialized: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     appearance_metadata_json: StringProperty(default="{}", options={'HIDDEN', 'SKIP_SAVE'})
     appearance_metadata_path: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
@@ -951,6 +983,7 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
             box.label(text=section)
             for prop in section_options[section]:
                 box.prop(self, prop)
+        _draw_entity_mesh_import_settings(layout, self)
         addon_prefs = get_all_addon_prefs(context)
         anim_box = layout.box()
         anim_box.label(text="Global Animation Settings", icon='ARMATURE_DATA')
@@ -990,6 +1023,7 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
                     import_appearance_index,
                     parent_transform=None,
                     selected_appearance_name=selected_appearance_name,
+                    mesh_import_settings=import_entity.get_entity_mesh_import_settings(self),
                 )
                 if arm_obj and get_all_addon_prefs(context).import_idle_animation:
                     import_anims.load_idle_animation_for_armature(context, arm_obj)
@@ -1806,8 +1840,8 @@ class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
 
             settings_box = layout.box()
             settings_box.label(text="Import Settings", icon='SETTINGS')
+            _draw_entity_mesh_import_settings(settings_box, rig_settings)
             col = settings_box.column(align=True)
-            col.prop(rig_settings, "do_import_lods")
             addon_prefs = get_all_addon_prefs(context)
             cloth_box = col.box()
             cloth_box.label(text="Redcloth", icon='MOD_CLOTH')

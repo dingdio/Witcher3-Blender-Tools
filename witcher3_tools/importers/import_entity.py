@@ -120,6 +120,48 @@ def _mesh_uses_armature(obj, armature_obj) -> bool:
     return False
 
 
+def get_entity_mesh_import_settings(source=None) -> dict:
+    settings = {
+        "keep_lod_meshes": False,
+        "keep_empty_lods": False,
+        "keep_proxy_meshes": False,
+        "hide_zero_weight_faces": True,
+    }
+    if source is None:
+        return settings
+
+    if isinstance(source, dict):
+        getter = lambda name, default=None: source.get(name, default)
+    else:
+        getter = lambda name, default=None: getattr(source, name, default)
+
+    source_names = {
+        "keep_lod_meshes": ("keep_lod_meshes", "do_import_lods"),
+        "keep_empty_lods": ("keep_empty_lods",),
+        "keep_proxy_meshes": ("keep_proxy_meshes",),
+        "hide_zero_weight_faces": ("hide_zero_weight_faces",),
+    }
+    for key, candidate_names in source_names.items():
+        for candidate_name in candidate_names:
+            value = getter(candidate_name, None)
+            if value is not None:
+                settings[key] = bool(value)
+                break
+    return settings
+
+
+def apply_entity_mesh_import_settings(rig_settings, settings=None) -> dict:
+    normalized = get_entity_mesh_import_settings(settings if settings is not None else rig_settings)
+    if rig_settings is None:
+        return normalized
+
+    rig_settings.do_import_lods = normalized["keep_lod_meshes"]
+    rig_settings.keep_empty_lods = normalized["keep_empty_lods"]
+    rig_settings.keep_proxy_meshes = normalized["keep_proxy_meshes"]
+    rig_settings.hide_zero_weight_faces = normalized["hide_zero_weight_faces"]
+    return normalized
+
+
 def _iter_tagged_redcloth_meshes_from_carrier(carrier_obj):
     if carrier_obj is None or not hasattr(carrier_obj, "get"):
         return
@@ -832,7 +874,8 @@ def test_load_entity(filename) ->  w3_types.Entity:
         entity = None
     return entity
 
-def _try_import_armature_from_item_appearances(entity, parent_transform=None, source_game="", target_collection=None):
+def _try_import_armature_from_item_appearances(entity, parent_transform=None, source_game="", target_collection=None,
+                                               mesh_import_settings=None):
     """For CItemEntity (no MovingPhysicalAgentComponent), try to find a skeleton
     inside the first appearance's included templates.  Returns an armature object
     if one is found, otherwise None."""
@@ -858,6 +901,7 @@ def _try_import_armature_from_item_appearances(entity, parent_transform=None, so
                 direct_entity_path=tmpl_filename,
                 source_game=source_game,
                 target_collection=target_collection,
+                mesh_import_settings=mesh_import_settings,
             )
             if arm:
                 return arm
@@ -964,8 +1008,10 @@ def _focus_main_armature(context, armature_obj):
 
 
 def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
-                        parent_transform = None, selected_appearance_name = ""):
+                        parent_transform = None, selected_appearance_name = "",
+                        mesh_import_settings = None):
     base_context = bpy.context
+    mesh_import_settings = get_entity_mesh_import_settings(mesh_import_settings)
     # Keep isolation at the public entry point.  The existing entity import
     # implementation below should stay unaware of the temporary session.
     if import_isolation.needs_isolation_session(base_context):
@@ -981,6 +1027,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                 import_apperance,
                 parent_transform,
                 selected_appearance_name,
+                mesh_import_settings=mesh_import_settings,
             )
         if result is not None:
             _focus_main_armature(base_context, result)
@@ -1015,6 +1062,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
         direct_entity_path=entity_repo_path,
         source_game=entity_source_game,
         target_collection=target_collection,
+        mesh_import_settings=mesh_import_settings,
     )
     main_arm_obj = base_animation_skeleton
 
@@ -1029,6 +1077,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                 entity_root,
                 source_game=entity_source_game,
                 target_collection=target_collection,
+                mesh_import_settings=mesh_import_settings,
             )
             if arm_from_tmpl:
                 main_arm_obj = arm_from_tmpl
@@ -1057,6 +1106,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
             entity,
             update_json=True,
             entity_state=entity_state,
+            mesh_import_settings=mesh_import_settings,
         )
 
         app_idx = -1 if entity_state is None else int(entity_state.get("app_idx", -1))
@@ -1236,7 +1286,8 @@ def _build_entity_armature_state(entity, *, filename="", import_apperance=0,
 
 def initialize_entity_armature_state(armature_obj, entity, *, filename="", import_apperance=0,
                                      selected_appearance_name="", update_json=True,
-                                     context_role="primary", entity_state=None):
+                                     context_role="primary", entity_state=None,
+                                     mesh_import_settings=None):
     if armature_obj is None or entity is None:
         return None
     if getattr(armature_obj, "type", "") != "ARMATURE":
@@ -1280,6 +1331,8 @@ def initialize_entity_armature_state(armature_obj, entity, *, filename="", impor
         rig_settings.repo_path = entity_state.get("repo_path", "")
         version = _coerce_version(getattr(entity, "version", None), 999)
         rig_settings.source_game = "w2" if version <= 115 else "w3"
+        if mesh_import_settings is not None:
+            apply_entity_mesh_import_settings(rig_settings, mesh_import_settings)
         rig_settings.main_entity_skeleton = entity_state.get("main_entity_skeleton", "") or existing_main_entity_skeleton
         rig_settings.main_face_skeleton = entity_state.get("main_face_skeleton", "") or existing_main_face_skeleton
         if not rig_settings.main_entity_skeleton:
@@ -1322,7 +1375,7 @@ def initialize_entity_armature_state(armature_obj, entity, *, filename="", impor
 
 def initialize_imported_entity_armatures(objects, entity, *, filename="", import_apperance=0,
                                          selected_appearance_name="", update_json=True, root_only=True,
-                                         context_role="primary"):
+                                         context_role="primary", mesh_import_settings=None):
     imported_objects = [obj for obj in (objects or []) if obj is not None]
     if not imported_objects or entity is None:
         return []
@@ -1346,6 +1399,7 @@ def initialize_imported_entity_armatures(objects, entity, *, filename="", import
             update_json=update_json,
             context_role=context_role,
             entity_state=entity_state,
+            mesh_import_settings=mesh_import_settings,
         )
         if rig_settings is not None:
             initialized.append(armature_obj)
@@ -3020,11 +3074,12 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                  HardAttachments, hide_shadowmesh, root_skeleton, i,
                  selectedAppearance=None, import_redcloth_enabled=True, morphs_todo=None,
                  bind_root_chunks_to_entity=True, direct_entity_path="", source_game="",
-                 target_collection=None):
+                 target_collection=None, mesh_import_settings=None):
     if morphs_todo is None:
         morphs_todo = []
     if target_collection is None:
         target_collection = _get_import_target_collection(bpy.context)
+    mesh_import_settings = get_entity_mesh_import_settings(mesh_import_settings)
     selected_appearance_name = str(_get_entry_attr(selectedAppearance, "name", "") or "")
     coloring_entry_lookup = _build_coloring_entry_lookup(
         getattr(entity, "coloringEntries", None),
@@ -3095,7 +3150,11 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 component_name = _get_chunk_component_name(chunk)
                 meshes, armatures = fbx_util.import_model(repo_file(mesh_path, entity.version), 
                                                      f"{chunk['type']}{i}{chunk['chunkIndex']}", 
-                                                     entity.name)
+                                                     entity.name,
+                                                     keep_lod_meshes=mesh_import_settings["keep_lod_meshes"],
+                                                     keep_empty_lods=mesh_import_settings["keep_empty_lods"],
+                                                     keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
+                                                     hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"])
              
                 if component_name:
                     for mesh in meshes:
@@ -3254,12 +3313,20 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             morph_source_meshes, morph_source_arms = fbx_util.import_model(
                 repo_file(chunk['morphSource'], entity.version), 
                 f"{chunk['type']}{i}{chunk['chunkIndex']}", 
-                entity.name
+                entity.name,
+                keep_lod_meshes=mesh_import_settings["keep_lod_meshes"],
+                keep_empty_lods=mesh_import_settings["keep_empty_lods"],
+                keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
+                hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
             )
             morph_target_meshes, morph_target_arms = fbx_util.import_model(
                 repo_file(chunk['morphTarget'], entity.version),
                 f"{chunk['type']}{i}{chunk['chunkIndex']}_morphTarget",
-                entity.name
+                entity.name,
+                keep_lod_meshes=mesh_import_settings["keep_lod_meshes"],
+                keep_empty_lods=mesh_import_settings["keep_empty_lods"],
+                keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
+                hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
             )
             
             morphs_todo.append([chunk['morphComponentId'], (morph_source_meshes, morph_source_arms)])
@@ -3517,12 +3584,14 @@ def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_
 
 
 
-def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_entity_path="", source_game="", target_collection=None):
+def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_entity_path="", source_game="", target_collection=None,
+                                        mesh_import_settings=None):
     #entity = fixed_chunk_paths(entity, entity.version)
     ent_namespace = entity.name+":"
     if target_collection is None:
         target_collection = _get_import_target_collection(bpy.context)
     _activate_target_collection(bpy.context, target_collection)
+    mesh_import_settings = get_entity_mesh_import_settings(mesh_import_settings)
 
     #OPTIONS
     hide_shadowmesh = True
@@ -3556,6 +3625,7 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
             direct_entity_path=direct_entity_path,
             source_game=source_game,
             target_collection=target_collection,
+            mesh_import_settings=mesh_import_settings,
         )
 
     if not root_skeleton:
@@ -3753,6 +3823,7 @@ def add_app_template(   entity,
     cur_chunks = templateMesh['chunks']
     _arm_rig = getattr(getattr(base_animation_skeleton, "data", None), "witcherui_RigSettings", None)
     template_source_game = getattr(_arm_rig, "source_game", "w3") if _arm_rig else "w3"
+    mesh_import_settings = get_entity_mesh_import_settings(_arm_rig)
     
     local_morphs_todo = []
     (constrains, objdict, meshdict, HardAttachments, root_skeleton, local_morphs_todo) = import_chunks(
@@ -3773,6 +3844,7 @@ def add_app_template(   entity,
         direct_entity_path=templateFilename,
         source_game=template_source_game,
         target_collection=target_collection,
+        mesh_import_settings=mesh_import_settings,
     )
     if morphs_todo_accum is not None and local_morphs_todo:
         morphs_todo_accum.extend(local_morphs_todo)

@@ -20,6 +20,7 @@ from ..cloth_util import importCloth
 
 from .. import file_helpers
 from ..importers import import_mesh, import_rig
+from ..mesh_import_settings import MeshImportSettings
 from .. import (
     constrain_util,
     get_W3_REDCLOTH_PATH,
@@ -228,6 +229,7 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
     )
     def invoke(self, context, event):
         """Invoke."""
+        MeshImportSettings.from_addon_prefs(get_all_addon_prefs(context)).apply_to(self)
         UNCOOK_PATH = get_uncook_path(context) + "\\"
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
@@ -261,17 +263,13 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
         ext = file_helpers.getFilenameType(fdir)
         if ext == ".w2mesh":
             s = time.time()
-            self.do_merge_normals = False
+            mesh_import_settings = MeshImportSettings.from_source(self)
             import_mesh.import_mesh(
                 fdir,
-                self.do_import_mats,
-                self.do_import_armature,
-                self.keep_lod_meshes,
-                self.do_merge_normals,
-                self.rotate_180,
-                self.keep_empty_lods,
-                hide_zero_weight_faces=self.hide_zero_weight_faces,
+                do_merge_normals=False,
+                **mesh_import_settings.to_import_mesh_kwargs(),
             )
+            mesh_import_settings.save_to_addon_prefs(get_all_addon_prefs(context))
             message = f'Imported .w2mesh file in {time.time() - s} seconds.'
             log.info(message)
             self.report({'INFO'}, message)
@@ -524,6 +522,107 @@ class WITCH_OT_set_repo_path_from_browser(bpy.types.Operator):
 #  LOD Generation
 # ---------------------------------------------------------------------------
 
+def _copy_vertex_group_definitions(source_obj, target_obj):
+    for source_group in source_obj.vertex_groups:
+        target_group = target_obj.vertex_groups.new(name=source_group.name)
+        target_group.lock_weight = source_group.lock_weight
+
+
+def _copy_armature_modifiers(source_obj, target_obj):
+    for source_mod in source_obj.modifiers:
+        if source_mod.type != 'ARMATURE':
+            continue
+
+        target_mod = target_obj.modifiers.new(name=source_mod.name, type='ARMATURE')
+        target_mod.object = source_mod.object
+        target_mod.use_vertex_groups = source_mod.use_vertex_groups
+        target_mod.use_bone_envelopes = source_mod.use_bone_envelopes
+        target_mod.vertex_group = source_mod.vertex_group
+        target_mod.invert_vertex_group = source_mod.invert_vertex_group
+        target_mod.show_viewport = source_mod.show_viewport
+        target_mod.show_render = source_mod.show_render
+        if hasattr(target_mod, "use_deform_preserve_volume"):
+            target_mod.use_deform_preserve_volume = getattr(source_mod, "use_deform_preserve_volume", False)
+
+
+def _build_vertex_weight_signatures(mesh_obj, weight_step=0.001):
+    if not mesh_obj.vertex_groups:
+        return []
+
+    group_names = {group.index: group.name for group in mesh_obj.vertex_groups}
+    signatures = []
+    step = max(float(weight_step), 1e-6)
+
+    for vert in mesh_obj.data.vertices:
+        entries = []
+        for assignment in vert.groups:
+            weight = float(assignment.weight)
+            if weight <= 1e-6:
+                continue
+            group_name = group_names.get(assignment.group)
+            if not group_name:
+                continue
+            quantized_weight = round(weight / step) * step
+            entries.append((group_name, quantized_weight))
+        entries.sort()
+        signatures.append(tuple(entries))
+
+    return signatures
+
+
+def _weld_lod_boundary_seams(mesh_obj, merge_distance, match_vertex_weights=True):
+    if merge_distance <= 0.0:
+        return 0
+
+    import bmesh
+
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh_obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.verts.index_update()
+
+        boundary_verts = [vert for vert in bm.verts if any(edge.is_boundary for edge in vert.link_edges)]
+        if len(boundary_verts) < 2:
+            return 0
+
+        weight_signatures = []
+        if match_vertex_weights and mesh_obj.vertex_groups:
+            weight_signatures = _build_vertex_weight_signatures(mesh_obj)
+
+        result = bmesh.ops.find_doubles(bm, verts=boundary_verts, dist=merge_distance)
+        targetmap = result.get("targetmap", {})
+        if not targetmap:
+            return 0
+
+        if weight_signatures:
+            filtered_targetmap = {}
+            for source_vert, target_vert in targetmap.items():
+                if source_vert == target_vert:
+                    continue
+                if (
+                    source_vert.index >= len(weight_signatures)
+                    or target_vert.index >= len(weight_signatures)
+                ):
+                    continue
+                if weight_signatures[source_vert.index] != weight_signatures[target_vert.index]:
+                    continue
+                filtered_targetmap[source_vert] = target_vert
+            targetmap = filtered_targetmap
+
+        if not targetmap:
+            return 0
+
+        merged_vert_count = len(targetmap)
+        bmesh.ops.weld_verts(bm, targetmap=targetmap)
+        bm.to_mesh(mesh_obj.data)
+        mesh_obj.data.update()
+        return merged_vert_count
+    finally:
+        bm.free()
+
+
 class WITCH_OT_generate_lods(bpy.types.Operator):
     """Generate LOD meshes by decimating the selected mesh"""
     bl_idname = "witcher.generate_lods"
@@ -553,14 +652,30 @@ class WITCH_OT_generate_lods(bpy.types.Operator):
         ],
         default='COLLAPSE'
     )
+    weld_boundary_seams: BoolProperty(
+        name="Weld Boundary Seams",
+        description="Temporarily weld overlapping open-boundary seam vertices before decimation",
+        default=True,
+    )
+    weld_distance: FloatProperty(
+        name="Weld Distance",
+        description="Maximum distance used when welding overlapping seam vertices",
+        default=0.0001,
+        min=0.0,
+        max=0.01,
+        precision=6,
+    )
+    match_vertex_weights: BoolProperty(
+        name="Match Vertex Weights",
+        description="Only weld seam vertices together when their skin weights match",
+        default=True,
+    )
 
     @classmethod
     def poll(cls, context):
         return context.active_object and context.active_object.type == 'MESH'
 
     def execute(self, context):
-        import bmesh
-
         source = context.active_object
         # Determine base name: strip _lod0 if present, or use as-is
         if source.name.endswith("_lod0"):
@@ -574,6 +689,7 @@ class WITCH_OT_generate_lods(bpy.types.Operator):
         source.witcherui_MeshSettings.distance = 0.0
 
         created = []
+        seam_merge_counts = []
         ratio = 1.0
 
         for i in range(1, self.lod_count + 1):
@@ -585,10 +701,11 @@ class WITCH_OT_generate_lods(bpy.types.Operator):
             if existing:
                 bpy.data.objects.remove(existing, do_unlink=True)
 
-            # Duplicate the source mesh data
+            # Duplicate the source mesh data and keep the object-level rig data.
             new_mesh = source.data.copy()
             new_mesh.name = lod_name
             lod_obj = bpy.data.objects.new(lod_name, new_mesh)
+            _copy_vertex_group_definitions(source, lod_obj)
 
             # Link to same collections as source
             for col in source.users_collection:
@@ -603,6 +720,14 @@ class WITCH_OT_generate_lods(bpy.types.Operator):
                 lod_obj.parent_type = source.parent_type
                 if source.parent_type == 'BONE':
                     lod_obj.parent_bone = source.parent_bone
+
+            merged_vert_count = 0
+            if self.weld_boundary_seams:
+                merged_vert_count = _weld_lod_boundary_seams(
+                    lod_obj,
+                    merge_distance=self.weld_distance,
+                    match_vertex_weights=self.match_vertex_weights,
+                )
 
             # Apply decimate modifier
             if self.decimate_type == 'COLLAPSE':
@@ -626,10 +751,17 @@ class WITCH_OT_generate_lods(bpy.types.Operator):
             # Copy repo path from source
             lod_obj.witcherui_MeshSettings.item_repo_path = source.witcherui_MeshSettings.item_repo_path
 
+            _copy_armature_modifiers(source, lod_obj)
+
             created.append(lod_obj)
+            seam_merge_counts.append(merged_vert_count)
 
         face_counts = ", ".join([f"lod{i+1}: {len(obj.data.polygons)}" for i, obj in enumerate(created)])
-        self.report({'INFO'}, f"Generated {len(created)} LODs ({face_counts})")
+        total_seam_merges = sum(seam_merge_counts)
+        if self.weld_boundary_seams:
+            self.report({'INFO'}, f"Generated {len(created)} LODs ({face_counts}; welded {total_seam_merges} seam verts)")
+        else:
+            self.report({'INFO'}, f"Generated {len(created)} LODs ({face_counts})")
         return {'FINISHED'}
 
 

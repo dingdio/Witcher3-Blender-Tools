@@ -184,10 +184,18 @@ def deduplicate_images():
         else:
             img.user_remap(filepaths[img.filepath])
 
-def import_model(filepath, ns="mesh", name=":", uncook_path=False, keep_lod_meshes = False):
+def import_model(filepath, ns="mesh", name=":", uncook_path=False, keep_lod_meshes = False,
+                 keep_empty_lods = False, keep_proxy_meshes = False, hide_zero_weight_faces = True):
     """Import a model file (.w2mesh/.w2ent or .fbx)."""
     if filepath.endswith(".w2mesh") or filepath.endswith(".w2ent"):
-        (meshes, armatures) = import_mesh.import_mesh(filepath, do_merge_normals = True)
+        (meshes, armatures) = import_mesh.import_mesh(
+            filepath,
+            do_merge_normals = True,
+            keep_lod_meshes = keep_lod_meshes,
+            keep_empty_lods = keep_empty_lods,
+            keep_proxy_meshes = keep_proxy_meshes,
+            hide_zero_weight_faces = hide_zero_weight_faces,
+        )
     else:
         context = bpy.context
         if not os.path.exists(filepath):
@@ -205,11 +213,21 @@ def import_model(filepath, ns="mesh", name=":", uncook_path=False, keep_lod_mesh
         )
     return (meshes, armatures)
 
-def importFbx(filepath, ns="mesh", name=":", uncook_path=False, keep_lod_meshes = False):
+def importFbx(filepath, ns="mesh", name=":", uncook_path=False, keep_lod_meshes = False,
+              keep_empty_lods = False, keep_proxy_meshes = False, hide_zero_weight_faces = True):
     """Deprecated: use import_model (or import_w3_fbx for explicit FBX)."""
     global _warned_importFbx
     if not _warned_importFbx:
         log.warning("[Witcher Tools] importFbx is deprecated; use import_model() instead.")
         _warned_importFbx = True
-    return import_model(filepath, ns, name, uncook_path, keep_lod_meshes)
+    return import_model(
+        filepath,
+        ns,
+        name,
+        uncook_path,
+        keep_lod_meshes,
+        keep_empty_lods,
+        keep_proxy_meshes,
+        hide_zero_weight_faces,
+    )
 

@@ -36,6 +36,7 @@ from .. import (
     get_witcher2_game_path,
 )
 from ..importers import import_entity
+from ..mesh_import_settings import MeshImportSettings
 from ..ui.blender_fun import convert_xbm_to_dds, convert_w2cube_to_dds, load_image_with_dds_repair
 from . import asset_browser_import_bridge
 from bpy.props import IntProperty, StringProperty
@@ -4489,15 +4490,11 @@ class FileActionOperatorImportToScene(Operator):
                         self.report({'ERROR'}, f"Texture import failed: {os.path.basename(abs_file_path)}")
                     return {'CANCELLED'}
             elif ext == ".w2mesh":
+                mesh_import_settings = MeshImportSettings.from_addon_prefs(get_all_addon_prefs(context))
                 import_mesh.import_mesh(
                     abs_file_path,
-                    True,   # do_import_mats
-                    True,   # do_import_armature
-                    False,  # keep_lod_meshes
-                    False,  # do_merge_normals
-                    False,  # rotate_180
-                    False,  # keep_empty_lods
-                    hide_zero_weight_faces=True,
+                    do_merge_normals=False,
+                    **mesh_import_settings.to_import_mesh_kwargs(),
                 )
             elif ext == ".w2cube":
                 result = bpy.ops.witcher.import_w2cube('EXEC_DEFAULT', filepath=abs_file_path)

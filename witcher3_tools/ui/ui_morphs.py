@@ -627,6 +627,18 @@ class witcherui_RigSettings(bpy.types.PropertyGroup):
                                             name="Include LODs",
                                             description="Include LODs",
                                             default=0)
+    keep_empty_lods: bpy.props.BoolProperty(
+                                            name="Keep Empty LODs",
+                                            description="Keep empty mesh LODs with zero polygons when LODs are imported",
+                                            default=False)
+    keep_proxy_meshes: bpy.props.BoolProperty(
+                                            name="Keep Proxy Meshes",
+                                            description="Keep proxy meshes even when higher LOD meshes are skipped",
+                                            default=False)
+    hide_zero_weight_faces: bpy.props.BoolProperty(
+                                            name="Hide Zero-Weight Faces",
+                                            description="Hide faces without bone weights on skinned meshes during import",
+                                            default=True)
 
     #animset list
     animset_list : CollectionProperty(type = ListItemAnimset)
