@@ -329,7 +329,11 @@ def _collect_names_and_imports(cr2w):
         if p_type == "CName":
             handle_cname_value(prop)
 
-        if p_type and (p_type.startswith("handle:") or p_type.startswith("ptr:")):
+        if p_type == "TagList":
+            for tag in getattr(prop, "TagList", None) or []:
+                handle_cname_value(tag)
+
+        if p_type and (p_type.startswith("handle:") or p_type.startswith("ptr:") or p_type.startswith("soft:")):
             handles = _get_handles(prop)
             handle_handles(handles)
 
@@ -570,7 +574,13 @@ def _encode_property_value(prop, name_to_index, import_index):
     if p_type is None:
         return b""
 
-    if p_type == "String" or p_type.endswith("StringAnsi"):
+    if p_type.endswith("StringAnsi"):
+        value = getattr(prop, "String", None)
+        if hasattr(value, "String"):
+            value = value.String
+        return _encode_string_ansi(value or "")
+
+    if p_type == "String":
         value = getattr(prop, "String", None)
         if hasattr(value, "String"):
             value = value.String
@@ -579,6 +589,15 @@ def _encode_property_value(prop, name_to_index, import_index):
     if p_type == "CName":
         cname = _get_cname_value(prop)
         return struct.pack("<H", name_to_index.get(cname, 0))
+
+    if p_type == "TagList":
+        tags = list(getattr(prop, "TagList", None) or [])
+        out = io.BytesIO()
+        out.write(_write_vlq_count(len(tags)))
+        for tag in tags:
+            cname = _get_cname_value(tag)
+            out.write(struct.pack("<H", name_to_index.get(cname, 0)))
+        return out.getvalue()
 
     if p_type in Enums.Enum_Types:
         enum_obj = getattr(prop, "Index", None)
@@ -604,6 +623,9 @@ def _encode_property_value(prop, name_to_index, import_index):
 
     if p_type.startswith("handle:"):
         return _encode_handles(prop, import_index, allow_import=True)
+
+    if p_type.startswith("soft:"):
+        return _encode_soft(prop, import_index)
 
     if p_type.startswith("ptr:"):
         return _encode_handles(prop, import_index, allow_import=False)
@@ -674,10 +696,14 @@ def _encode_array(prop, name_to_index, import_index):
 def _encode_array_element(el, elem_type, name_to_index, import_index):
     if elem_type.startswith("handle:"):
         return _encode_handle_value(el, import_index, allow_import=True)
+    if elem_type.startswith("soft:"):
+        return _encode_soft_value(el, import_index)
     if elem_type.startswith("ptr:"):
         return _encode_handle_value(el, import_index, allow_import=False)
 
     if elem_type == "String":
+        if hasattr(el, "String"):
+            el = el.String
         if hasattr(el, "String"):
             el = el.String
         return _encode_cstring(el or "")
@@ -722,6 +748,24 @@ def _encode_handles(prop, import_index, allow_import=True):
     return out.getvalue()
 
 
+def _encode_soft(prop, import_index):
+    handles = _get_handles(prop)
+    if handles:
+        return _encode_soft_value(handles[0], import_index)
+
+    index_obj = getattr(prop, "Index", None)
+    depot_path = getattr(index_obj, "Path", None)
+    if depot_path:
+        handle_like = type("_SoftHandle", (), {
+            "ClassName": getattr(prop, "ClassName", None) or prop.theType.split(":", 1)[-1],
+            "DepotPath": depot_path,
+            "Flags": int(getattr(prop, "Flags", 4) or 4),
+        })()
+        return _encode_soft_value(handle_like, import_index)
+
+    return struct.pack("<H", 0)
+
+
 def _encode_handle_value(handle, import_index, allow_import=True):
     if getattr(handle, "ChunkHandle", False):
         ref = getattr(handle, "Reference", None)
@@ -737,6 +781,18 @@ def _encode_handle_value(handle, import_index, allow_import=True):
     if idx is None:
         return struct.pack("<i", 0)
     return struct.pack("<i", -(idx + 1))
+
+
+def _encode_soft_value(handle, import_index):
+    key = (
+        getattr(handle, "ClassName", None),
+        getattr(handle, "DepotPath", None),
+        int(getattr(handle, "Flags", 4) or 4),
+    )
+    idx = import_index.get(key, None)
+    if idx is None:
+        return struct.pack("<H", 0)
+    return struct.pack("<H", int(idx) + 1)
 
 
 def _encode_cmesh_buffers(cmesh, name_to_index):
@@ -876,6 +932,25 @@ def _encode_matrix4x4(mat):
     for v in values:
         out.write(struct.pack("<f", float(v)))
     return out.getvalue()
+
+
+def _encode_string_ansi(value):
+    if not value:
+        return b"\x00"
+    requires_wide = any(ord(c) > 255 for c in value)
+    if requires_wide:
+        encoded = value.encode("utf-16le")
+        num_wchars = len(value)
+        if num_wchars > 127:
+            num_wchars = 127  # clamp; very long strings unsupported
+        return struct.pack("<B", 0x80 | num_wchars) + encoded
+    else:
+        encoded = value.encode("iso-8859-1")
+        length = len(encoded)
+        if length > 127:
+            length = 127
+            encoded = encoded[:127]
+        return struct.pack("<B", length) + encoded
 
 
 def _encode_cstring(value):

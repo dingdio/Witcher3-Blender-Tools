@@ -6,6 +6,7 @@ log = logging.getLogger(__name__)
 from ..CR2W import w3_types
 from ..importers import import_cutscene
 from ..importers import import_scene
+from ..exporters import export_cutscene
 
 import bpy
 from bpy.types import Panel, Operator, UIList, PropertyGroup
@@ -110,6 +111,43 @@ def _set_cutscene_burned_audio_scene_state(scene, event_name="", item_path=""):
         scene.witcher_cutscene_burned_audio_event = str(event_name or "")
     if hasattr(scene, "witcher_cutscene_burned_audio_item_path"):
         scene.witcher_cutscene_burned_audio_item_path = str(item_path or "")
+
+
+def _join_cutscene_metadata_list(values):
+    items = []
+    for value in values or []:
+        item_text = str(value or "").strip()
+        if item_text:
+            items.append(item_text)
+    return "; ".join(items)
+
+
+def _set_cutscene_export_metadata_scene_state(scene, point_tags=(), last_level_loaded="", used_in_files=(), synced=False):
+    if hasattr(scene, export_cutscene.CUTSCENE_POINT_TAGS_PROP):
+        scene.witcher_cutscene_point_tags = _join_cutscene_metadata_list(point_tags)
+    if hasattr(scene, export_cutscene.CUTSCENE_LAST_LEVEL_LOADED_PROP):
+        scene.witcher_cutscene_last_level_loaded = str(last_level_loaded or "")
+    if hasattr(scene, export_cutscene.CUTSCENE_USED_IN_FILES_PROP):
+        scene.witcher_cutscene_used_in_files = _join_cutscene_metadata_list(used_in_files)
+    if hasattr(scene, export_cutscene.CUTSCENE_EXPORT_METADATA_SYNCED_PROP):
+        scene.witcher_cutscene_export_metadata_synced = bool(synced)
+
+
+def _sync_cutscene_export_metadata_state(scene, cutscene):
+    if cutscene is None:
+        _set_cutscene_export_metadata_scene_state(scene, synced=False)
+        return
+
+    point_tags = getattr(cutscene, "point", None) or []
+    last_level_loaded = getattr(cutscene, "lastLevelLoaded", "")
+    used_in_files = getattr(cutscene, "usedInFiles", None) or []
+    _set_cutscene_export_metadata_scene_state(
+        scene,
+        point_tags=point_tags,
+        last_level_loaded=last_level_loaded,
+        used_in_files=used_in_files,
+        synced=True,
+    )
 
 
 _IMPORTED_FIELD_LIST_LIMIT = 6
@@ -631,6 +669,7 @@ def _clear_loaded_cutscene_state(scene):
     scene.witcher_cutscene_dialog_items.clear()
     scene.witcher_loaded_cutscene_name = ""
     _set_cutscene_burned_audio_scene_state(scene, event_name="", item_path="")
+    _set_cutscene_export_metadata_scene_state(scene, synced=False)
     if hasattr(scene, "witcher_cutscene_last_import_seconds"):
         scene.witcher_cutscene_last_import_seconds = 0.0
     if hasattr(scene, "witcher_loaded_w2cutscene_path"):
@@ -838,6 +877,7 @@ def _sync_loaded_cutscene_state(scene, filepath, cutscene_data=None):
 
     _sync_cutscene_template_fields(scene, _cutscene)
     _sync_cutscene_burned_audio_state(scene, filepath, _cutscene, cutscene_data=cutscene_data)
+    _sync_cutscene_export_metadata_state(scene, _cutscene)
     scene.witcher_cutscene_effect_items.clear()
     if _cutscene is not None:
         for eff in (getattr(_cutscene, "effects", None) or []):
@@ -1479,6 +1519,14 @@ def _draw_cutscene_template_tab(layout, scene):
     if burned_strip is not None and hasattr(burned_strip, "volume"):
         burned_box.prop(burned_strip, "volume", text="Sequencer Volume", slider=True)
 
+    metadata_box = layout.box()
+    metadata_box.label(text="Export Metadata", icon='TOOL_SETTINGS')
+    metadata_box.prop(scene, "witcher_cutscene_point_tags", text="Point Tags")
+    metadata_box.prop(scene, "witcher_cutscene_last_level_loaded", text="Last Level Loaded")
+    metadata_box.prop(scene, "witcher_cutscene_used_in_files", text="Used In Files")
+    metadata_box.prop(scene, "witcher_cutscene_burned_audio_event", text="Burned Audio Event")
+    metadata_box.label(text="Use ';' to separate multiple tags or depot paths.", icon='INFO')
+
     template_box = layout.box()
     header = template_box.row(align=True)
     header.label(text="Imported Classes", icon='PROPERTIES')
@@ -1678,7 +1726,9 @@ class WITCHER_PT_scene_panel(WITCH_PT_Base, Panel):
 
         cs_box = self.layout.box()
         cs_box.label(text="Cutscene (.w2cutscene)", icon='SCENE_DATA')
-        cs_box.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Import CS (.w2cutscene)", icon='IMPORT')
+        action_row = cs_box.row(align=True)
+        action_row.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Import CS (.w2cutscene)", icon='IMPORT')
+        action_row.operator("witcher.export_w2_cutscene", text="Export CS (.w2cutscene)", icon='EXPORT')
 
         loaded_cutscene_path = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
         if loaded_cutscene_path and not scene.witcher_cutscene_actor_items and not scene.witcher_cutscene_animation_items:
@@ -1841,6 +1891,22 @@ def register():
         soft_max=2.0,
         description="Default sequencer volume for imported cutscene burned-track strips",
     )
+    bpy.types.Scene.witcher_cutscene_point_tags = bpy.props.StringProperty(
+        name="Point Tags",
+        default="",
+        description="Semicolon-separated TagList value for exported cutscenes",
+    )
+    bpy.types.Scene.witcher_cutscene_last_level_loaded = bpy.props.StringProperty(
+        name="Last Level Loaded",
+        default="",
+        description="Value written to CCutsceneTemplate.lastLevelLoaded on export",
+    )
+    bpy.types.Scene.witcher_cutscene_used_in_files = bpy.props.StringProperty(
+        name="Used In Files",
+        default="",
+        description="Semicolon-separated depot paths for CCutsceneTemplate.usedInFiles on export",
+    )
+    bpy.types.Scene.witcher_cutscene_export_metadata_synced = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.witcher_cutscene_effect_items = bpy.props.CollectionProperty(type=CutsceneEffectItem)
     bpy.types.Scene.witcher_cutscene_dialog_items = bpy.props.CollectionProperty(type=CutsceneDialogItem)
     bpy.types.Scene.witcher_cutscene_dialog_index = bpy.props.IntProperty(default=0)
@@ -1869,6 +1935,10 @@ def unregister():
                   "witcher_cutscene_burned_audio_event",
                   "witcher_cutscene_burned_audio_item_path",
                   "witcher_cutscene_burned_audio_default_volume",
+                  "witcher_cutscene_point_tags",
+                  "witcher_cutscene_last_level_loaded",
+                  "witcher_cutscene_used_in_files",
+                  "witcher_cutscene_export_metadata_synced",
                   "witcher_cs_entry_event_idx",
                   # legacy props removed in this version:
                   "witcher_cs_fade_before", "witcher_cs_fade_after", "witcher_cs_cam_blend_in", "witcher_cs_cam_blend_out",

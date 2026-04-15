@@ -63,7 +63,28 @@ class ReadCompressFloat():
         self.val = val
 
 def _has_valid_embedded_anim_data(embedded_data) -> bool:
-    return bool(embedded_data and len(embedded_data) > 20)
+    if not embedded_data or len(embedded_data) < 34:
+        return False
+
+    data = bytes(embedded_data)
+    for data_offset in (0, 2, 4, 6, 8):
+        if data_offset + 29 >= len(data):
+            continue
+        try:
+            version = struct.unpack_from('<I', data, data_offset)[0]
+            dt = struct.unpack_from('<f', data, data_offset + 4)[0]
+            num_frames = struct.unpack_from('<I', data, data_offset + 25)[0]
+        except struct.error:
+            continue
+
+        if not (0 < version < 100 and 0.0 < dt <= 1.0 and 0 < num_frames < 100000):
+            continue
+
+        first_marker_offset = data_offset + 29
+        if first_marker_offset < len(data) and data[first_marker_offset] in (0x00, 0x01):
+            return True
+
+    return False
 
 def _is_raw_embedded_buffer(buffer_bytes) -> bool:
     return bool(buffer_bytes) and bytes(buffer_bytes[:4]) != b"CR2W"
@@ -1034,6 +1055,7 @@ def create_anim(file, CSkeletalAnimation, CAnimationBuffer, Skeleton_file):
     AdditiveType = None
     MotionExtraction = None
     UncompressedMotionExtraction = None
+    skeleton_path = ""
 
     for prop in chunk.PROPS:
         if prop.theName == "name":
@@ -1042,6 +1064,8 @@ def create_anim(file, CSkeletalAnimation, CAnimationBuffer, Skeleton_file):
             duration = prop.Value
         elif prop.theName == "framesPerSecond":
             framesPerSecond = prop.Value
+        elif prop.theName == "skeleton":
+            skeleton_path = _read_single_handle_label_prop(prop, file.CHUNKS.CHUNKS)
         elif prop.theName == "Animation type for reimport":
             SkeletalAnimationType = prop.ToString()
         elif prop.theName == "Additive type for reimport":
@@ -1101,6 +1125,7 @@ def create_anim(file, CSkeletalAnimation, CAnimationBuffer, Skeleton_file):
         buffer = read_anim_buffer(file, CAnimationBuffer, duration, Skeleton_file, embedded_data)
 
     anim = w3_types.CSkeletalAnimation(name, duration, framesPerSecond, animBuffer=buffer, SkeletalAnimationType = SkeletalAnimationType, AdditiveType = AdditiveType, motionExtraction=MotionExtraction)
+    anim.skeleton = skeleton_path
     if UncompressedMotionExtraction is not None:
         anim.uncompressedMotionExtraction = UncompressedMotionExtraction
     return anim

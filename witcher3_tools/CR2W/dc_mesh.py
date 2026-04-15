@@ -806,6 +806,24 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
 
             bufferInfos.verticesBuffer = vertexBufferInfos
 
+            # wcclite uses CMesh.boundingBox to calculate quant instead of cookedData, cookedData is more accurate to what the game displays
+            use_bbox_uncook = False
+            
+            if use_bbox_uncook:
+                bbox_var = chunk.GetVariableByName("boundingBox")
+                if bbox_var is not None:
+                    bbox_min = bbox_var.GetVariableByName("Min")
+                    bbox_max = bbox_var.GetVariableByName("Max")
+                    if bbox_min is not None and bbox_max is not None:
+                        min_x = bbox_min.More[0].Value; min_y = bbox_min.More[1].Value; min_z = bbox_min.More[2].Value
+                        max_x = bbox_max.More[0].Value; max_y = bbox_max.More[1].Value; max_z = bbox_max.More[2].Value
+                        bufferInfos.quantizationOffset.x = min_x
+                        bufferInfos.quantizationOffset.y = min_y
+                        bufferInfos.quantizationOffset.z = min_z
+                        bufferInfos.quantizationScale.x = max_x - min_x
+                        bufferInfos.quantizationScale.y = max_y - min_y
+                        bufferInfos.quantizationScale.z = max_z - min_z
+
             meshChunks = chunk.GetVariableByName("chunks")
             if not meshChunks or not getattr(meshChunks, "chunks", None) or not getattr(meshChunks.chunks, "elements", None):
                 # Mesh has no chunks/geometry

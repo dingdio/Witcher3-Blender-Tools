@@ -1,10 +1,11 @@
 import logging
+import os
 import re
 import json
 import math
 import collections
 import struct
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import bpy
 import mathutils
@@ -69,6 +70,14 @@ def get_selected_armature(context):
     if context is None:
         return None
     return get_main_armature(context, prefer_active=True, remember=True, fallback=True)
+
+
+def _get_armature_bone_order(armature) -> List[str]:
+    bone_order = list(human_bone_order)
+    rig_settings = getattr(armature.data, "witcherui_RigSettings", None) if armature else None
+    if rig_settings and len(rig_settings.bone_order_list):
+        bone_order = [bone.name for bone in rig_settings.bone_order_list]
+    return bone_order
 
 
 def get_action_slot(armature):
@@ -347,7 +356,7 @@ class W3AnimationExporter:
         self.__scale = 1
         self.__frame_start = 1
         self.__frame_end = float('inf')
-        self.__bone_order = human_bone_order
+        self.__bone_order = list(human_bone_order)
 
     def __allFrameKeys(self, curves: List[_FCurve], frame_numbers: Optional[List[int]] = None):
         if frame_numbers is None:
@@ -402,7 +411,7 @@ class W3AnimationExporter:
         #t2 = prev_q.rotation_difference(-curr_q).angle
         return -curr_q if t2 < t1 else curr_q
 
-    def __exportBoneAnimation(self, armObj, frame_numbers: Optional[List[int]] = None, action=None):
+    def __exportBoneAnimation(self, armObj, frame_numbers: Optional[List[int]] = None, action=None, face_animation: bool = False):
         if armObj is None:
             return None
         if action is None:
@@ -466,34 +475,41 @@ class W3AnimationExporter:
                 key = BoneFrameKey()
                 key.frame_number = frame_number - self.__frame_start
 
-                #!MOVE THIS TO BONE VECTOR MATRIX METHOD
                 bl_bone = bone
-                if bl_bone.parent:
-                    objectMatrix = bl_bone.parent.bone.matrix_local.inverted()
-                else:
-                    objectMatrix = bl_bone.bone.matrix_local.inverted()
-                the_vec = Vector([x[0], y[0], z[0]])
-                co = objectMatrix @ bl_bone.bone.matrix_local @ the_vec
-                if rot90_active:
-                    co = rot_neg90_mat @ co
-                key.location = Vector([co[0], co[1], co[2]])
                 quat = Quaternion([ rw[0], rx[0], ry[0], rz[0]])
-                if bl_bone.parent:
-                    ro = objectMatrix @ bl_bone.bone.matrix_local @ quat.to_matrix().to_4x4()
+                if face_animation:
+                    co = Vector([x[0], y[0], z[0]])
+                    if rot90_active:
+                        co = rot_neg90_mat @ co
+                    ro = quat.copy()
+                    if rot90_active:
+                        ro = z_neg90 @ ro @ z_pos90
                 else:
-                    # Root: use bone.matrix_local directly to preserve rest orientation
-                    ro = (bl_bone.bone.matrix_local @ quat.to_matrix().to_4x4())
-                ro = ro.to_quaternion()
-                if rot90_active:
                     if bl_bone.parent:
-                        ro = z_neg90 @ ro @ z_pos90  # sandwich for child bones
+                        objectMatrix = bl_bone.parent.bone.matrix_local.inverted()
                     else:
-                        ro = ro @ z_pos90  # post-multiply for root bones
+                        objectMatrix = bl_bone.bone.matrix_local.inverted()
+                    the_vec = Vector([x[0], y[0], z[0]])
+                    co = objectMatrix @ bl_bone.bone.matrix_local @ the_vec
+                    if rot90_active:
+                        co = rot_neg90_mat @ co
+                    if bl_bone.parent:
+                        ro = objectMatrix @ bl_bone.bone.matrix_local @ quat.to_matrix().to_4x4()
+                    else:
+                        # Root: use bone.matrix_local directly to preserve rest orientation
+                        ro = (bl_bone.bone.matrix_local @ quat.to_matrix().to_4x4())
+                    ro = ro.to_quaternion()
+                    if rot90_active:
+                        if bl_bone.parent:
+                            ro = z_neg90 @ ro @ z_pos90  # sandwich for child bones
+                        else:
+                            ro = ro @ z_pos90  # post-multiply for root bones
+                key.location = Vector([co[0], co[1], co[2]])
                 curr_rot = ro
                 if prev_rot is not None:
                     curr_rot = self.__minRotationDiff(prev_rot, curr_rot)
                 prev_rot = curr_rot
-                key.rotation = [ro.x, ro.y, ro.z, ro.w]
+                key.rotation = [curr_rot.x, curr_rot.y, curr_rot.z, curr_rot.w]
                 key.scale = [1.0, 1.0, 1.0]
                 frame_keys.append(key)
             logging.info('(bone) frames:%5d  name: %s', len(frame_keys), key_name)
@@ -606,11 +622,7 @@ class W3AnimationExporter:
 
         # Bone order preserved via bone_order_list stored on rig settings.
         # Refactor target: derive order from skeleton data directly rather than a stored list.
-        rig_settings = getattr(armature.data, "witcherui_RigSettings", None) if armature else None
-        if rig_settings and len(rig_settings.bone_order_list):
-            self.__bone_order.clear()
-            for bone in rig_settings.bone_order_list:
-                self.__bone_order.append(bone.name)
+        self.__bone_order = _get_armature_bone_order(armature)
 
         if not armature:
             return
@@ -745,11 +757,7 @@ class W3AnimationExporter:
 
         # Bone order preserved via bone_order_list stored on rig settings.
         # Refactor target: derive order from skeleton data directly rather than a stored list.
-        rig_settings = getattr(armature.data, "witcherui_RigSettings", None) if armature else None
-        if rig_settings and len(rig_settings.bone_order_list):
-            self.__bone_order.clear()
-            for bone in rig_settings.bone_order_list:
-                self.__bone_order.append(bone.name)
+        self.__bone_order = _get_armature_bone_order(armature)
 
         if armature:
             self.boneAnimation = self.__exportBoneAnimation(armature, action=action)
@@ -797,124 +805,565 @@ def export_w3_anim(context, savePath, use_native_writer=False,
     return {'FINISHED'}
 
 
-def export_w3_cutscene(context, savePath):
-    """Export a .w2cutscene from armatures with cutscene_actor_name custom property."""
-    actors = []
-    animations = []
-    actor_names_seen = set()
+CUTSCENE_DEFAULT_FPS = 30.0
+CUTSCENE_ROOT_COMPONENT = "Root"
+_CUTSCENE_FACE_TRACK_NAME_CACHE: Dict[str, List[str]] = {}
+_CUTSCENE_RIG_BONE_NAME_CACHE: Dict[str, List[str]] = {}
 
-    for obj in bpy.data.objects:
-        if obj.type != 'ARMATURE':
+
+def _strip_text(value) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_repo_path(path: str) -> str:
+    return _strip_text(path).replace("/", "\\").lstrip("\\")
+
+
+def _normalize_cutscene_component(component_name: str) -> str:
+    component_text = _strip_text(component_name)
+    return component_text or CUTSCENE_ROOT_COMPONENT
+
+
+def _is_face_cutscene_component(component_name: str) -> bool:
+    return _normalize_cutscene_component(component_name).lower() == "face"
+
+
+def _safe_int(value, default=-1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _compose_cutscene_animation_name(actor_name: str, component_name: str, action_name: str) -> str:
+    actor_name = _strip_text(actor_name)
+    component_name = _normalize_cutscene_component(component_name)
+    action_name = _strip_text(action_name)
+    if actor_name and action_name:
+        return f"{actor_name}:{component_name}:{action_name}"
+    return action_name or actor_name
+
+
+def _iter_action_bone_names(action, target=None) -> List[str]:
+    if action is None:
+        return []
+    prefix = 'pose.bones["'
+    names = []
+    seen = set()
+    valid_suffixes = {
+        ".location",
+        ".rotation_quaternion",
+        ".rotation_axis_angle",
+        ".rotation_euler",
+    }
+    for fcurve in iter_action_fcurves(action, target=target):
+        data_path = str(getattr(fcurve, "data_path", "") or "")
+        if not data_path.startswith(prefix):
             continue
-        actor_name = obj.get("cutscene_actor_name")
-        if not actor_name:
+        end_idx = data_path.find('"]')
+        if end_idx <= len(prefix):
             continue
-
-        actor_template = obj.get("cutscene_actor_template", "")
-        actor_type = obj.get("cutscene_actor_type", "CAT_Actor")
-        component = obj.get("cutscene_component", "Root")
-
-        if actor_name not in actor_names_seen:
-            actor_names_seen.add(actor_name)
-            actors.append({
-                "name": actor_name,
-                "template": actor_template,
-                "type": actor_type,
-            })
-
-        # Get current action
-        curr_action = (obj.animation_data.action
-            if obj.animation_data is not None and
-            obj.animation_data.action is not None
-            else None)
-        if not curr_action:
-            log.warning(f"Armature {obj.name} has no action, skipping")
+        suffix = data_path[end_idx + 2:]
+        if suffix not in valid_suffixes:
             continue
-
-        action_name = curr_action.name
-
-        # Export bone animation
-        exporter = W3AnimationExporter()
-        rig_settings = getattr(obj.data, "witcherui_RigSettings", None)
-        if rig_settings and len(rig_settings.bone_order_list):
-            exporter._W3AnimationExporter__bone_order.clear()
-            for bone in rig_settings.bone_order_list:
-                exporter._W3AnimationExporter__bone_order.append(bone.name)
-
-        frame_start = bpy.context.scene.frame_start
-        frame_end = bpy.context.scene.frame_end
-        frame_numbers = list(range(int(frame_start), int(frame_end) + 1))
-        exporter._W3AnimationExporter__frame_start = frame_start
-        exporter._W3AnimationExporter__frame_end = frame_end
-
-        bone_anim = exporter._W3AnimationExporter__exportBoneAnimation(obj, frame_numbers=frame_numbers)
-        if bone_anim is None:
-            log.warning(f"No bone animation for {obj.name}, skipping")
+        bone_name = _strip_text(data_path[len(prefix):end_idx])
+        if not bone_name or bone_name in seen:
             continue
+        seen.add(bone_name)
+        names.append(bone_name)
+    return names
 
-        num_frames = max(1, int(frame_end - frame_start + 1))
-        fps_base = bpy.context.scene.render.fps_base if bpy.context.scene.render.fps_base else 1.0
-        fps = float(bpy.context.scene.render.fps) / float(fps_base)
-        dt = 1.0 / fps if fps > 0 else anims_builder.DEFAULT_DT
 
-        bones_data = []
-        for bone_name in exporter._W3AnimationExporter__bone_order:
-            frames = bone_anim.get(bone_name, [])
-            pos_frames = []
-            rot_frames = []
-            scale_frames = []
+def _resolve_cutscene_animation_rig_load_path(rig_repo_path: str) -> str:
+    rig_repo_path = _normalize_repo_path(rig_repo_path)
+    if not rig_repo_path:
+        return ""
+    try:
+        from ..CR2W.common_blender import repo_file
 
-            prev_q = None
-            for idx in range(num_frames):
-                if frames:
-                    frame = frames[idx] if idx < len(frames) else frames[-1]
-                    loc = frame.location
-                    rot = frame.rotation
-                    scl = frame.scale
-                else:
-                    loc = Vector((0.0, 0.0, 0.0))
-                    rot = [0.0, 0.0, 0.0, -1.0]
-                    scl = [1.0, 1.0, 1.0]
+        return repo_file(rig_repo_path)
+    except Exception:
+        log.warning("Failed to resolve rig path '%s' while exporting cutscene.", rig_repo_path, exc_info=True)
+        return ""
 
-                pos_frames.append((float(loc[0]), float(loc[1]), float(loc[2])))
-                scale_frames.append((float(scl[0]), float(scl[1]), float(scl[2])))
 
-                x, y, z, w = rot
-                q = Quaternion((w, x, y, z))
-                if q.dot(q) <= 1e-12:
-                    q = Quaternion((1.0, 0.0, 0.0, 0.0))
-                else:
-                    q.normalize()
-                if prev_q is not None and q.dot(prev_q) < 0.0:
-                    q = -q
-                prev_q = q
-                rot_frames.append((float(q.x), float(q.y), float(q.z), float(q.w)))
+def _load_cutscene_rig_bone_names(rig_path: str) -> List[str]:
+    rig_path = _strip_text(rig_path)
+    if not rig_path:
+        return []
+    cached = _CUTSCENE_RIG_BONE_NAME_CACHE.get(rig_path)
+    if cached is not None:
+        return list(cached)
 
-            bones_data.append({
-                "name": bone_name,
-                "pos_frames": pos_frames,
-                "rot_frames": rot_frames,
-                "scale_frames": scale_frames,
-            })
+    bone_names: List[str] = []
+    try:
+        from ..CR2W.dc_anims import load_base_skeleton
 
-        animations.append({
-            "actor": actor_name,
-            "component": component,
-            "action_name": action_name,
-            "bones": bones_data,
-            "num_frames": num_frames,
-            "dt": dt,
-            "fps": fps,
-            "skeletal_type": "SAT_Normal",
-            "additive_type": None,
-            "motion_extraction": None,
+        skeleton = load_base_skeleton(rig_path)
+        raw_names = getattr(skeleton, "names", None) or []
+        bone_names = [_strip_text(name) for name in raw_names if _strip_text(name)]
+    except Exception:
+        log.warning("Failed to load rig bone names from '%s' while exporting cutscene.", rig_path, exc_info=True)
+        bone_names = []
+
+    _CUTSCENE_RIG_BONE_NAME_CACHE[rig_path] = list(bone_names)
+    return list(bone_names)
+
+
+def _load_source_cutscene_animation(entry, source_cache: Dict[str, object], rig_load_path: str = ""):
+    if not entry or source_cache is None:
+        return None
+    if not _strip_text(rig_load_path):
+        return None
+
+    source_path = _strip_text(entry.get("source_path", ""))
+    if not source_path or not source_path.lower().endswith(".w2cutscene"):
+        return None
+
+    animation_name = _strip_text(entry.get("source_animation_name", ""))
+    if not animation_name:
+        animation_name = _compose_cutscene_animation_name(
+            entry.get("actor_name", ""),
+            entry.get("component", ""),
+            entry.get("action_name", ""),
+        )
+    if not animation_name:
+        return None
+
+    cache_key = ("cutscene_source_animation", source_path, animation_name, _strip_text(rig_load_path))
+    if cache_key in source_cache:
+        return source_cache[cache_key]
+
+    source_animation = None
+    try:
+        from ..CR2W.dc_anims import load_bin_anims_single
+
+        anim_set = load_bin_anims_single(
+            source_path,
+            anim_name=animation_name,
+            rigPath=rig_load_path or None,
+        )
+        animations = getattr(anim_set, "animations", None) or []
+        if animations:
+            source_animation = getattr(animations[0], "animation", None)
+    except Exception:
+        log.warning(
+            "Failed to inspect source cutscene animation '%s' from '%s' while exporting.",
+            animation_name,
+            source_path,
+            exc_info=True,
+        )
+
+    source_cache[cache_key] = source_animation
+    return source_animation
+
+
+def _load_source_cutscene_track_names(entry, source_cache: Dict[str, object], rig_load_path: str = "") -> List[str]:
+    source_animation = _load_source_cutscene_animation(entry, source_cache, rig_load_path=rig_load_path)
+    if source_animation is None:
+        return []
+
+    track_names = []
+    seen = set()
+    for track in getattr(getattr(source_animation, "animBuffer", None), "tracks", None) or []:
+        track_name = _strip_text(getattr(track, "trackName", ""))
+        if not track_name or track_name in seen:
+            continue
+        seen.add(track_name)
+        track_names.append(track_name)
+    return track_names
+
+
+def _resolve_cutscene_export_bone_order(armature_obj, action, component: str, source_entry=None,
+                                        source_cache: Optional[Dict[str, object]] = None,
+                                        rig_repo_path: str = "") -> List[str]:
+    if armature_obj is None:
+        return []
+
+    pose = getattr(armature_obj, "pose", None)
+    pose_bones = getattr(pose, "bones", None)
+    pose_bone_names = set(pose_bones.keys()) if pose_bones is not None else set()
+    armature_order = _get_armature_bone_order(armature_obj)
+
+    rig_load_path = _resolve_cutscene_animation_rig_load_path(rig_repo_path)
+    source_animation = _load_source_cutscene_animation(source_entry, source_cache, rig_load_path=rig_load_path)
+    if source_animation is not None:
+        source_bone_names = []
+        for bone in getattr(getattr(source_animation, "animBuffer", None), "bones", None) or []:
+            bone_name = _strip_text(getattr(bone, "BoneName", ""))
+            if bone_name:
+                source_bone_names.append(bone_name)
+        if source_bone_names:
+            filtered = [name for name in source_bone_names if not pose_bone_names or name in pose_bone_names]
+            if filtered:
+                return filtered
+
+    if _is_face_cutscene_component(component):
+        face_bone_names = [
+            name for name in _load_cutscene_rig_bone_names(rig_load_path)
+            if not pose_bone_names or name in pose_bone_names
+        ]
+        if face_bone_names:
+            return face_bone_names
+
+    animated_bone_names = _iter_action_bone_names(action, target=armature_obj)
+    if animated_bone_names:
+        animated_set = set(animated_bone_names)
+        ordered_names = [name for name in armature_order if name in animated_set]
+        for name in animated_bone_names:
+            if name in ordered_names:
+                continue
+            if pose_bone_names and name not in pose_bone_names:
+                continue
+            ordered_names.append(name)
+        if ordered_names:
+            return ordered_names
+
+    return [name for name in armature_order if not pose_bone_names or name in pose_bone_names]
+
+
+def _pose_bone_custom_prop_names(armature_obj, bone_name: str) -> List[str]:
+    if armature_obj is None or getattr(armature_obj, "type", None) != 'ARMATURE':
+        return []
+    pose = getattr(armature_obj, "pose", None)
+    pose_bone = getattr(pose, "bones", {}).get(bone_name) if pose else None
+    if pose_bone is None:
+        return []
+    names = []
+    for key in pose_bone.keys():
+        key_text = _strip_text(key)
+        if not key_text or key_text == "_RNA_UI":
+            continue
+        names.append(key_text)
+    return names
+
+
+def _pose_bone_custom_prop_value(armature_obj, bone_name: str, prop_name: str, default: float = 0.0) -> float:
+    if armature_obj is None or getattr(armature_obj, "type", None) != 'ARMATURE':
+        return float(default)
+    pose = getattr(armature_obj, "pose", None)
+    pose_bone = getattr(pose, "bones", {}).get(bone_name) if pose else None
+    if pose_bone is None:
+        return float(default)
+    try:
+        return float(pose_bone.get(prop_name, default))
+    except Exception:
+        return float(default)
+
+
+def _iter_action_custom_prop_names(action, bone_name: str, target=None) -> List[str]:
+    if action is None:
+        return []
+    prefix = f'pose.bones["{bone_name}"]["'
+    names = []
+    seen = set()
+    for fcurve in iter_action_fcurves(action, target=target):
+        data_path = str(getattr(fcurve, "data_path", "") or "")
+        if not data_path.startswith(prefix) or not data_path.endswith('"]'):
+            continue
+        prop_name = data_path[len(prefix):-2]
+        if not prop_name or prop_name in seen:
+            continue
+        seen.add(prop_name)
+        names.append(prop_name)
+    return names
+
+
+def _sample_action_custom_prop_frames(action, bone_name: str, prop_name: str, frame_numbers: List[int], target=None, default_value: float = 0.0):
+    curve = _FCurve(float(default_value))
+    data_path = f'pose.bones["{bone_name}"]["{prop_name}"]'
+    has_curve = False
+    for fcurve in iter_action_fcurves(action, target=target):
+        if str(getattr(fcurve, "data_path", "") or "") != data_path:
+            continue
+        curve.setFCurve(fcurve)
+        has_curve = True
+        break
+    sampled = curve.sampleFrames(frame_numbers)
+    values = []
+    for sample in sampled:
+        if isinstance(sample, (list, tuple)) and sample:
+            values.append(float(sample[0]))
+        else:
+            values.append(float(default_value))
+    return values, has_curve
+
+
+def _load_face_track_names(face_file_path: str) -> List[str]:
+    face_file_path = _normalize_repo_path(face_file_path)
+    if not face_file_path:
+        return []
+    cached = _CUTSCENE_FACE_TRACK_NAME_CACHE.get(face_file_path)
+    if cached is not None:
+        return list(cached)
+
+    track_names: List[str] = []
+    try:
+        from ..CR2W.common_blender import repo_file
+        from ..importers.import_rig import loadFaceFile
+
+        face_data = loadFaceFile(repo_file(face_file_path))
+        float_track_skeleton = getattr(face_data, "floatTrackSkeleton", None)
+        raw_track_names = getattr(float_track_skeleton, "tracks", None) or []
+        track_names = [_strip_text(track_name) for track_name in raw_track_names if _strip_text(track_name)]
+    except Exception:
+        log.warning("Failed to load face track names from '%s' while exporting cutscene.", face_file_path, exc_info=True)
+        track_names = []
+
+    _CUTSCENE_FACE_TRACK_NAME_CACHE[face_file_path] = list(track_names)
+    return list(track_names)
+
+
+def _resolve_cutscene_face_track_names(armature_obj, related_armatures=None) -> List[str]:
+    track_names: List[str] = []
+    seen = set()
+    candidate_armatures = list(related_armatures or [])
+    if not candidate_armatures and armature_obj is not None:
+        candidate_armatures = [armature_obj]
+    for candidate in candidate_armatures:
+        _entity_skeleton, face_skeleton = _get_armature_skeleton_paths(candidate)
+        for face_file_path in (face_skeleton, _normalize_repo_path(candidate.get("mimicFaceFile", ""))):
+            for track_name in _load_face_track_names(face_file_path):
+                if track_name in seen:
+                    continue
+                seen.add(track_name)
+                track_names.append(track_name)
+    if track_names:
+        return track_names
+
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    morph_entries = getattr(rig_settings, "witcher_morphs_list", None) if rig_settings else None
+    if morph_entries:
+        for entry in morph_entries:
+            if int(getattr(entry, "type", 0) or 0) not in (4, 5):
+                continue
+            track_name = _strip_text(getattr(entry, "path", "") or getattr(entry, "name", ""))
+            if not track_name or track_name in seen:
+                continue
+            seen.add(track_name)
+            track_names.append(track_name)
+    if track_names:
+        return track_names
+
+    for track_name in _pose_bone_custom_prop_names(armature_obj, "w3_face_poses"):
+        if track_name in seen:
+            continue
+        seen.add(track_name)
+        track_names.append(track_name)
+    return track_names
+
+
+def _resolve_cutscene_camera_track_names(armature_obj) -> List[str]:
+    track_names: List[str] = []
+    seen = set()
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    track_entries = getattr(rig_settings, "witcher_tracks_list", None) if rig_settings else None
+    if track_entries:
+        for entry in track_entries:
+            if int(getattr(entry, "type", 0) or 0) != 0:
+                continue
+            track_name = _strip_text(getattr(entry, "path", "") or getattr(entry, "name", ""))
+            if not track_name or track_name in seen:
+                continue
+            seen.add(track_name)
+            track_names.append(track_name)
+    if track_names:
+        return track_names
+
+    for track_name in _pose_bone_custom_prop_names(armature_obj, "Camera_Node"):
+        if track_name in seen:
+            continue
+        seen.add(track_name)
+        track_names.append(track_name)
+    return track_names
+
+
+def _collect_cutscene_action_tracks(armature_obj, action, component: str, frame_numbers: List[int],
+                                    source_entry=None, source_cache=None, rig_repo_path: str = "",
+                                    related_armatures=None) -> List[Dict[str, object]]:
+    if armature_obj is None or action is None or not frame_numbers:
+        return []
+
+    rig_load_path = _resolve_cutscene_animation_rig_load_path(rig_repo_path)
+    source_track_names = _load_source_cutscene_track_names(source_entry, source_cache, rig_load_path=rig_load_path)
+
+    if _is_face_cutscene_component(component):
+        control_bone_name = "w3_face_poses"
+        ordered_names = source_track_names or _resolve_cutscene_face_track_names(
+            armature_obj,
+            related_armatures=related_armatures,
+        )
+    else:
+        control_bone_name = "Camera_Node"
+        ordered_names = source_track_names or _resolve_cutscene_camera_track_names(armature_obj)
+
+    animated_names = _iter_action_custom_prop_names(action, control_bone_name, target=armature_obj)
+    if not ordered_names and not animated_names:
+        return []
+
+    if source_track_names:
+        source_name_set = set(source_track_names)
+        animated_names = [track_name for track_name in animated_names if _strip_text(track_name) in source_name_set]
+
+    seen = set()
+    track_names = []
+    for track_name in ordered_names + animated_names:
+        track_name = _strip_text(track_name)
+        if not track_name or track_name in seen:
+            continue
+        seen.add(track_name)
+        track_names.append(track_name)
+
+    tracks_data = []
+    for track_name in track_names:
+        default_value = _pose_bone_custom_prop_value(armature_obj, control_bone_name, track_name, default=0.0)
+        values, _has_curve = _sample_action_custom_prop_frames(
+            action,
+            control_bone_name,
+            track_name,
+            frame_numbers,
+            target=armature_obj,
+            default_value=default_value,
+        )
+        if not values:
+            values = [float(default_value)]
+
+        first_value = float(values[0])
+        is_constant = all(abs(float(value) - first_value) <= 1e-6 for value in values[1:])
+        tracks_data.append({
+            "name": track_name,
+            "track_frames": [first_value] if is_constant else [float(value) for value in values],
+            "num_frames": 1 if is_constant else len(values),
+            "compression": 0,
         })
 
-    if not animations:
-        log.error("No armatures with cutscene_actor_name found")
-        return {'CANCELLED'}
+    return tracks_data
 
-    cr2w = anims_builder.build_w2cutscene(actors=actors, animations=animations)
-    cr2w_writer.write_w2cutscene(cr2w, savePath)
-    log.info(f"Finished exporting cutscene with {len(actors)} actors, {len(animations)} animations")
-    return {'FINISHED'}
+
+def _build_cutscene_bones_data(bone_order: List[str], bone_anim, num_frames: int):
+    bones_data = []
+    for bone_name in bone_order:
+        frames = bone_anim.get(bone_name, [])
+        pos_frames = []
+        rot_frames = []
+        scale_frames = []
+
+        prev_q = None
+        for idx in range(num_frames):
+            if frames:
+                frame = frames[idx] if idx < len(frames) else frames[-1]
+                loc = frame.location
+                rot = frame.rotation
+                scl = frame.scale
+            else:
+                loc = Vector((0.0, 0.0, 0.0))
+                rot = [0.0, 0.0, 0.0, -1.0]
+                scl = [1.0, 1.0, 1.0]
+
+            pos_frames.append((float(loc[0]), float(loc[1]), float(loc[2])))
+            scale_frames.append((float(scl[0]), float(scl[1]), float(scl[2])))
+
+            x, y, z, w = rot
+            q = Quaternion((w, x, y, z))
+            if q.dot(q) <= 1e-12:
+                q = Quaternion((1.0, 0.0, 0.0, 0.0))
+            else:
+                q.normalize()
+            if prev_q is not None and q.dot(prev_q) < 0.0:
+                q = -q
+            prev_q = q
+            rot_frames.append((float(q.x), float(q.y), float(q.z), float(q.w)))
+
+        bones_data.append({
+            "name": bone_name,
+            "pos_frames": pos_frames,
+            "rot_frames": rot_frames,
+            "scale_frames": scale_frames,
+        })
+    return bones_data
+
+
+def _build_cutscene_animation_from_action(armature_obj, action, actor_name, component, action_name,
+                                          frame_start, frame_end, fps, skeleton_path="",
+                                          source_entry=None, source_cache=None,
+                                          related_armatures=None):
+    exporter = W3AnimationExporter()
+    rig_repo_path = _normalize_repo_path(skeleton_path)
+    bone_order = _resolve_cutscene_export_bone_order(
+        armature_obj,
+        action,
+        component,
+        source_entry=source_entry,
+        source_cache=source_cache,
+        rig_repo_path=rig_repo_path,
+    )
+    if not bone_order:
+        bone_order = _get_armature_bone_order(armature_obj)
+    exporter._W3AnimationExporter__bone_order = list(bone_order)
+    exporter._W3AnimationExporter__frame_start = int(frame_start)
+    exporter._W3AnimationExporter__frame_end = int(frame_end)
+
+    frame_numbers = list(range(int(frame_start), int(frame_end) + 1))
+    bone_anim = exporter._W3AnimationExporter__exportBoneAnimation(
+        armature_obj,
+        frame_numbers=frame_numbers,
+        action=action,
+        face_animation=_is_face_cutscene_component(component),
+    )
+    if bone_anim is None:
+        return None
+
+    num_frames = max(1, int(frame_end - frame_start + 1))
+    dt = 1.0 / float(fps) if float(fps) > 0.0 else anims_builder.DEFAULT_DT
+    bones_data = _build_cutscene_bones_data(bone_order, bone_anim, num_frames)
+    tracks_data = _collect_cutscene_action_tracks(
+        armature_obj,
+        action,
+        component,
+        frame_numbers,
+        source_entry=source_entry,
+        source_cache=source_cache,
+        rig_repo_path=rig_repo_path,
+        related_armatures=related_armatures,
+    )
+    return {
+        "actor": actor_name,
+        "component": component,
+        "action_name": action_name,
+        "bones": bones_data,
+        "tracks": tracks_data,
+        "num_frames": num_frames,
+        "dt": dt,
+        "fps": float(fps),
+        "skeletal_type": "SAT_Normal",
+        "additive_type": None,
+        "motion_extraction": None,
+        "skeleton_path": rig_repo_path,
+    }
+def _get_armature_skeleton_paths(armature_obj) -> Tuple[str, str]:
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    entity_skeleton = _normalize_repo_path(getattr(rig_settings, "main_entity_skeleton", "") if rig_settings else "")
+    face_skeleton = _normalize_repo_path(getattr(rig_settings, "main_face_skeleton", "") if rig_settings else "")
+
+    if not entity_skeleton:
+        armature_path = _normalize_repo_path(armature_obj.get("witcher_path", ""))
+        if armature_path.lower().endswith((".w2rig", ".w3dyng")):
+            entity_skeleton = armature_path
+
+    if not face_skeleton:
+        face_skeleton = _normalize_repo_path(armature_obj.get("mimicFaceFile", ""))
+
+    return entity_skeleton, face_skeleton
+def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_redkit_csv=False, **kwargs):
+    """Compatibility wrapper for cutscene export."""
+    from . import export_cutscene
+
+    if "export_re_sidecars" in kwargs:
+        export_redkit_re_files = bool(kwargs.pop("export_re_sidecars") or export_redkit_re_files)
+
+    return export_cutscene.export_w3_cutscene(
+        context,
+        savePath,
+        export_redkit_re_files=export_redkit_re_files,
+        export_redkit_csv=export_redkit_csv,
+    )

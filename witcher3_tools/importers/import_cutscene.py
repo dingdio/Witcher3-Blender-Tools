@@ -3,6 +3,7 @@ import os
 import time
 from collections import Counter
 from ..CR2W import w3_types
+from ..CR2W.prop_utils import read_enum_prop
 from ..importers import import_entity
 from ..action_compat import iter_action_fcurves, remove_action_fcurve
 from ..CR2W.dc_anims import load_bin_cutscene
@@ -426,11 +427,15 @@ def _tag_cutscene_actor(actor_obj, actor, source_index=-1, source_path="", impor
     if actor_name:
         actor_obj["cutscene_actor_name"] = actor_name
     actor_obj["cutscene_actor_template"] = _normalize_repo_path(getattr(actor, "template", "") or "")
-    actor_obj["cutscene_actor_type"] = str(getattr(actor, "type", "") or "CAT_Actor")
+    actor_obj["cutscene_actor_type"] = _normalize_cutscene_actor_type(
+        _safe_actor_type_str(getattr(actor, "type", None)),
+        actor_name=actor_name,
+    )
     actor_obj["cutscene_component"] = "Root"
     appearance_name = str(getattr(actor, "appearance", "") or "").strip()
     if appearance_name:
         actor_obj["cutscene_actor_appearance"] = appearance_name
+    actor_obj["cutscene_actor_use_mimic"] = bool(getattr(actor, "useMimic", False))
     if source_path:
         actor_obj[CUTSCENE_SOURCE_PATH_PROP] = str(source_path)
     if int(source_index or -1) >= 0:
@@ -448,6 +453,7 @@ def _clear_cutscene_actor_tags(actor_obj):
         "cutscene_actor_type",
         "cutscene_component",
         "cutscene_actor_appearance",
+        "cutscene_actor_use_mimic",
         CUTSCENE_SOURCE_PATH_PROP,
         CUTSCENE_SOURCE_INDEX_PROP,
         CUTSCENE_ACTOR_IMPORTED_PROP,
@@ -712,7 +718,11 @@ def _estimate_animation_frame_count(node):
     estimated = int(round(duration * fps))
     return max(1, estimated)
 
-def _tag_cutscene_animation_actions(target_armatures, track_name, anim_name, source_path, source_index, at_frame):
+def _tag_cutscene_animation_actions(target_armatures, track_name, anim_name, source_path, source_index, at_frame,
+                                    duration_frames=None):
+    start_frame = float(at_frame or 0.0)
+    duration_frames = max(1.0, float(duration_frames or 0.0))
+    end_frame = start_frame + duration_frames - 0.001
     for armature_obj in target_armatures or []:
         anim_data = getattr(armature_obj, "animation_data", None)
         if not anim_data:
@@ -721,7 +731,8 @@ def _tag_cutscene_animation_actions(target_armatures, track_name, anim_name, sou
         if track is None:
             continue
         for strip in track.strips:
-            if abs(float(getattr(strip, "frame_start", 0.0)) - float(at_frame)) > 0.001:
+            strip_frame_start = float(getattr(strip, "frame_start", 0.0) or 0.0)
+            if strip_frame_start < start_frame - 0.001 or strip_frame_start > end_frame:
                 continue
             action = getattr(strip, "action", None)
             if action is None:
@@ -941,6 +952,9 @@ def _safe_actor_type_str(type_value):
         return ""
     if isinstance(type_value, str):
         return type_value
+    enum_value = str(read_enum_prop(type_value) or "").strip()
+    if enum_value:
+        return enum_value
     # Binary PROPERTY object: try .Value then .String.String
     val = getattr(type_value, "Value", None)
     if isinstance(val, str):
@@ -952,6 +966,16 @@ def _safe_actor_type_str(type_value):
             return ss
     result = str(type_value)
     return "" if result.startswith("<") else result
+
+
+def _normalize_cutscene_actor_type(type_value, actor_name=""):
+    text = str(type_value or "").strip()
+    for candidate in ("CAT_None", "CAT_Actor", "CAT_Prop", "CAT_Camera"):
+        if text == candidate or candidate in text:
+            return candidate
+    if str(actor_name or "").strip().lower() == "camera":
+        return "CAT_Camera"
+    return "CAT_Actor"
 
 
 def _cutscene_event_value(event, field_name, default=None):
@@ -1278,6 +1302,7 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
                 filename,
                 idx,
                 at_frame,
+                duration_frames=context.get("duration_frames", 0),
             )
             applied_indices.add(idx)
         except Exception as exc:
@@ -1329,7 +1354,10 @@ def collect_cutscene_preview(filename, cutscene_template=None):
             "voice_tag": str(getattr(actor, "voiceTag", "") or "").strip(),
             "template_path": template_path,
             "appearance_name": appearance_name,
-            "actor_type": _safe_actor_type_str(getattr(actor, "type", None)),
+            "actor_type": _normalize_cutscene_actor_type(
+                _safe_actor_type_str(getattr(actor, "type", None)),
+                actor_name=actor_name,
+            ),
             "use_mimic": bool(getattr(actor, "useMimic", False)),
             "already_in_scene": bool(existing),
         })

@@ -1181,10 +1181,10 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         width_row.prop(self, "browser_popup_width")
         width_row.operator("witcher.reset_browser_popup_width", text="", icon='LOOP_BACK')
 
-        # External importer add-on status (APX / SRT)
+        # External importer add-on status (APX / SRT / RE)
         ext_addons_box, ext_addons_col = section("External Addons", 'PLUGIN')
         ext_info_row = ext_addons_col.row(align=True)
-        ext_info_row.label(text="Used for Redcloth and SpeedTree imports")
+        ext_info_row.label(text="Used for Redcloth, SpeedTree, mimic, and cutscene .re export")
         help_op = ext_info_row.operator("witcher.pref_help_popup", text="", icon='QUESTION')
         help_op.topic = "external_addons"
         help_op.path = ""
@@ -1222,6 +1222,16 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         )
         if not srt_status["exists"]:
             srt_row.operator("wm.url_open", text="GitHub", icon='URL').url = ui_cache_export.SRT_ADDON_URL
+
+        re_status = ui_cache_export.get_re_addon_status()
+        re_row = deps_box.row(align=True)
+        re_icon = 'CHECKMARK' if re_status["enabled"] else 'ERROR'
+        re_row.label(
+            text=f"blender_re_animations_plugin: {'enabled' if re_status['enabled'] else 'not enabled'}",
+            icon=re_icon,
+        )
+        if not re_status["exists"] and ui_cache_export.RE_ADDON_URL:
+            re_row.operator("wm.url_open", text="Source", icon='URL').url = ui_cache_export.RE_ADDON_URL
 
         # Modding/work project paths
         mod_box, mod_col = section("Mod Paths", 'FILE_FOLDER')

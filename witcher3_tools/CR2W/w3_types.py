@@ -142,7 +142,15 @@ def loadProps(self, args):
                         name_value = None
             setattr(self, arg.theName, name_value)
         elif arg.theType == 'soft:CEntityTemplate':
-            setattr(self, arg.theName, arg.Index.Path)
+            path = ""
+            index_obj = getattr(arg, "Index", None)
+            if index_obj is not None:
+                path = getattr(index_obj, "Path", "") or getattr(index_obj, "DepotPath", "") or ""
+            if not path:
+                handles = list(getattr(arg, "Handles", None) or [])
+                if handles:
+                    path = getattr(handles[0], "DepotPath", "") or ""
+            setattr(self, arg.theName, path)
         elif arg.theType == 'TagList':
             #arg.TagList = arg.list(map(lambda x: x.value, arg.TagList))
             setattr(self, arg.theName, list(map(lambda x: x.value, arg.TagList)))

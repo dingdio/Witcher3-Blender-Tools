@@ -11,9 +11,11 @@ log = logging.getLogger(__name__)
 
 APX_ADDON_ID = "io_mesh_apx"
 SRT_ADDON_ID = "io_mesh_srt"
+RE_ADDON_ID = "blender_re_animations_plugin"
 
 APX_ADDON_URL = "https://github.com/ArdCarraigh/Blender_APX_Addon"
 SRT_ADDON_URL = "https://github.com/ArdCarraigh/Blender_SRT_Addon"
+RE_ADDON_URL = "https://www.gog.com/en/game/the_witcher_3_redkit"
 
 
 def _addon_state(addon_id: str) -> tuple[bool, bool]:
@@ -65,6 +67,16 @@ def get_srt_addon_status() -> Dict[str, Any]:
         "exists": exists,
         "enabled": enabled,
         "url": SRT_ADDON_URL,
+    }
+
+
+def get_re_addon_status() -> Dict[str, Any]:
+    exists, enabled = _addon_state(RE_ADDON_ID)
+    return {
+        "addon_id": RE_ADDON_ID,
+        "exists": exists,
+        "enabled": enabled,
+        "url": RE_ADDON_URL,
     }
 
 

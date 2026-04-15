@@ -3,6 +3,7 @@ import os
 import math
 from pathlib import Path
 from ..CR2W.common_blender import repo_file
+from ..external_addon_tools import get_re_addon_status
 log = logging.getLogger(__name__)
 from .. import fbx_util, file_helpers
 from .. import get_uncook_path
@@ -11,7 +12,7 @@ from .. import get_W3_OGG_PATH
 from .. import get_rig_rot90_enabled
 from .. import get_all_addon_prefs
 from ..importers import import_anims, import_rig
-from ..exporters import export_anims
+from ..exporters import export_anims, export_cutscene
 from ..action_compat import iter_action_fcurves, new_action_fcurve, remove_action_fcurve
 # from io_import_w2l.importers import import_cutscene
 # from io_import_w2l.importers import import_scene
@@ -1943,10 +1944,62 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
     bl_idname = "witcher.export_w2_cutscene"
     bl_label = "Export Cutscene"
     filename_ext = ".w2cutscene"
+    filter_glob: StringProperty(default="*.w2cutscene", options={'HIDDEN'})
+
+    export_redkit_re_files: BoolProperty(
+        name="Export Redkit .re Files",
+        description="Export each cutscene entry as a Redkit-friendly .re file next to the .w2cutscene",
+        default=False,
+    )
+
+    export_redkit_csv: BoolProperty(
+        name="Export Redkit CSV",
+        description="Write an animation;component CSV manifest next to the .w2cutscene. This also exports Redkit .re files.",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        scene = getattr(context, "scene", None)
+        if scene is None:
+            return False
+        return any(
+            getattr(obj, "type", None) == 'ARMATURE'
+            and str(obj.get("cutscene_actor_name", "") or "").strip()
+            for obj in scene.objects
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        re_status = get_re_addon_status()
+
+        layout.prop(self, "export_redkit_re_files")
+        layout.prop(self, "export_redkit_csv")
+        if self.export_redkit_csv and not self.export_redkit_re_files:
+            layout.label(text="CSV export also writes Redkit .re files.", icon='INFO')
+        if self.export_redkit_re_files or self.export_redkit_csv:
+            icon = 'CHECKMARK' if re_status["enabled"] else 'ERROR'
+            status = "enabled" if re_status["enabled"] else "not enabled"
+            layout.label(text=f"RE addon: {status}", icon=icon)
+            if not re_status["enabled"]:
+                warning_row = layout.row()
+                warning_row.alert = True
+                warning_row.label(text="Enable blender_re_animations_plugin before exporting Redkit .re files.", icon='ERROR')
+            layout.label(text="Files write to <cutscene>_redkit/<actor>/*.re", icon='FILE_FOLDER')
 
     def execute(self, context):
-        export_anims.export_w3_cutscene(context, self.filepath)
-        return {'FINISHED'}
+        if self.export_redkit_re_files or self.export_redkit_csv:
+            re_status = get_re_addon_status()
+            if not re_status["enabled"]:
+                self.report({'ERROR'}, "Enable blender_re_animations_plugin to export Redkit .re files")
+                return {'CANCELLED'}
+
+        return export_cutscene.export_w3_cutscene(
+            context,
+            self.filepath,
+            export_redkit_re_files=self.export_redkit_re_files,
+            export_redkit_csv=self.export_redkit_csv,
+        )
 
 
 #-----------------------------------------------------------------------------

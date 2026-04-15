@@ -10,7 +10,14 @@ from bpy.props import (StringProperty,
                        )
 
 
-from ..ui.ui_anims import (ButtonOperatorImportW2Anims, WITCH_OT_import_w3_fbx, WITCH_OT_ImportW2Rig, WITCH_OT_ExportW2AnimJson, WITCH_OT_ExportW2RigJson)
+from ..ui.ui_anims import (
+    ButtonOperatorImportW2Anims,
+    WITCH_OT_import_w3_fbx,
+    WITCH_OT_ImportW2Rig,
+    WITCH_OT_ExportW2AnimJson,
+    WITCH_OT_ExportW2RigJson,
+    WITCH_OT_ExportW2Cutscene,
+)
 from ..ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_w2mesh_export, WITCH_OT_apx, WITCH_OT_nxs,
                           WITCH_OT_export_goto_project_path, WITCH_OT_set_repo_path_from_browser,
                           WITCH_OT_generate_lods,
@@ -206,6 +213,7 @@ class WITCH_MT_MenuExport(bpy.types.Menu):
         layout.separator()
         layout.operator(WITCH_OT_ExportW2RigJson.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
         layout.operator(WITCH_OT_ExportW2AnimJson.bl_idname, text="Animation (.w2anims)", icon='ARMATURE_DATA')
+        layout.operator(WITCH_OT_ExportW2Cutscene.bl_idname, text="Cutscene (.w2cutscene)", icon='SCENE_DATA')
         layout.separator()
         layout.operator(WITCH_OT_xbm_export.bl_idname, text="Texture (.xbm)", icon='IMAGE_DATA')
         layout.operator(WITCH_OT_dds_convert.bl_idname, text="Convert DDS to TGA", icon='FILE_REFRESH')

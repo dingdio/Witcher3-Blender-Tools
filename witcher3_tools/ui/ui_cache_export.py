@@ -18,9 +18,11 @@ from .. import get_all_addon_prefs, get_texture_path, get_uncook_path, get_W3_VO
 from ..CR2W.common_blender import win_path_exists, win_path_isdir
 from ..external_addon_tools import (
     APX_ADDON_URL,
+    RE_ADDON_URL,
     SRT_ADDON_URL,
     ensure_apx_from_apb,
     get_apx_addon_status,
+    get_re_addon_status,
     get_srt_addon_status,
 )
 
@@ -979,7 +981,7 @@ def draw_export_stats_ui(layout, context) -> None:
         warn.label(text="Voice warning: low free disk space.", icon='ERROR')
 
 def draw_addon_status_ui(layout, context) -> None:
-    """APX and SRT external addon install status and SDK validation."""
+    """APX, SRT, and RE external addon install status and SDK validation."""
     deps_box = layout.box()
     deps_box.label(text="External Addons", icon='PLUGIN')
 
@@ -1011,6 +1013,16 @@ def draw_addon_status_ui(layout, context) -> None:
     )
     if not srt_status["exists"]:
         srt_row.operator("wm.url_open", text="GitHub", icon='URL').url = SRT_ADDON_URL
+
+    re_status = get_re_addon_status()
+    re_row = deps_box.row(align=True)
+    re_icon = 'CHECKMARK' if re_status["enabled"] else 'ERROR'
+    re_row.label(
+        text=f"blender_re_animations_plugin: {'enabled' if re_status['enabled'] else 'not enabled'}",
+        icon=re_icon,
+    )
+    if not re_status["exists"] and RE_ADDON_URL:
+        re_row.operator("wm.url_open", text="Source", icon='URL').url = RE_ADDON_URL
 
 
 def draw_import_options_ui(layout, context) -> None:
