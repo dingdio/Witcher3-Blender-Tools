@@ -61,9 +61,13 @@ from ..CR2W.witcher_cache.Bundles import LoadBundleManager
 from ..CR2W.witcher_cache.Bundles.BundleItem import BundleItem
 from ..CR2W.witcher_cache.Bundles.Bundle import Bundle
 from ..CR2W.witcher_cache.TextureCache import LoadTextureManager
+from ..CR2W.witcher_cache.TextureCache.TextureCache import TextureCache
 from ..CR2W.witcher_cache.CollisionCache import LoadCollisionManager
 from ..CR2W.witcher_cache.CollisionCache.Collision_Cache import CollisionCache
 from ..CR2W.witcher_cache.SoundCache import LoadSoundManager
+from ..CR2W.witcher_cache.SoundCache.SoundCache import SoundCache
+from ..CR2W.witcher_cache.SoundCache.SoundBanksInfo import SoundBanksInfoXML
+from ..CR2W.witcher_cache.SoundCache.SoundManager import _soundbanks_metadata_path
 from ..CR2W.witcher_cache.Speech import LoadSpeechManager
 from ..external_addon_tools import ensure_apx_from_apb, get_apx_addon_status, get_srt_addon_status
 
@@ -244,7 +248,15 @@ DISK_CACHE_TYPES = {
 
 EXTERNAL_BUNDLE_CACHE_TYPE = "External Bundle"
 EXTERNAL_COLLISION_CACHE_TYPE = "External Collision"
-EXTERNAL_CACHE_TYPES = {EXTERNAL_BUNDLE_CACHE_TYPE, EXTERNAL_COLLISION_CACHE_TYPE}
+EXTERNAL_TEXTURE_CACHE_TYPE = "External Texture"
+EXTERNAL_SOUND_CACHE_TYPE = "External Sound"
+EXTERNAL_CACHE_EFFECTIVE_TYPES = {
+    EXTERNAL_BUNDLE_CACHE_TYPE: "Bundle",
+    EXTERNAL_COLLISION_CACHE_TYPE: "Collision",
+    EXTERNAL_TEXTURE_CACHE_TYPE: "Texture",
+    EXTERNAL_SOUND_CACHE_TYPE: "Sound",
+}
+EXTERNAL_CACHE_TYPES = set(EXTERNAL_CACHE_EFFECTIVE_TYPES)
 
 # Maps virtual path -> absolute path + metadata for disk caches
 _file_source_map = {}
@@ -254,17 +266,15 @@ _file_source_info = {}
 _external_archive_sessions = {
     EXTERNAL_BUNDLE_CACHE_TYPE: None,
     EXTERNAL_COLLISION_CACHE_TYPE: None,
+    EXTERNAL_TEXTURE_CACHE_TYPE: None,
+    EXTERNAL_SOUND_CACHE_TYPE: None,
 }
 
 def is_external_cache(cache_type: str) -> bool:
     return cache_type in EXTERNAL_CACHE_TYPES
 
 def get_effective_cache_type(cache_type: str) -> str:
-    if cache_type == EXTERNAL_BUNDLE_CACHE_TYPE:
-        return "Bundle"
-    if cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
-        return "Collision"
-    return cache_type
+    return EXTERNAL_CACHE_EFFECTIVE_TYPES.get(cache_type, cache_type)
 
 
 def cache_supports_scene_import(cache_type: str) -> bool:
@@ -279,6 +289,18 @@ def get_external_archive_session(cache_type: str):
         return None
     session = _external_archive_sessions.get(cache_type)
     return session if isinstance(session, dict) else None
+
+
+def _get_external_archive_items(cache_type: str, item_path: str):
+    session = get_external_archive_session(cache_type)
+    if not session:
+        return None
+    return session.get("items", {}).get((item_path or "").replace("/", "\\"))
+
+
+def _get_external_archive_item(cache_type: str, item_path: str):
+    items = _get_external_archive_items(cache_type, item_path)
+    return items[-1] if isinstance(items, list) and items else items
 
 def set_external_archive_session(cache_type: str, archive_path: str, items: dict, collision_exts: Optional[dict] = None):
     if cache_type not in _external_archive_sessions:
@@ -1263,16 +1285,31 @@ def _clear_sound_preview(context=None) -> None:
     _tag_browser_redraw(context)
 
 
-def _get_sound_item_and_export_path(context, item_path: str, loadmods: bool = False):
+def _get_texture_cache_items(item_path: str, cache_type: str = "Texture", loadmods: bool = False):
     full_path_norm = (item_path or "").replace("/", "\\")
+    if cache_type == EXTERNAL_TEXTURE_CACHE_TYPE:
+        return _get_external_archive_items(cache_type, full_path_norm)
+    manager = LoadTextureManager(loadmods=loadmods)
+    return manager.find_item_by_path_name(full_path_norm)
+
+
+def _get_sound_cache_items(item_path: str, cache_type: str = "Sound", loadmods: bool = False):
+    full_path_norm = (item_path or "").replace("/", "\\")
+    if cache_type == EXTERNAL_SOUND_CACHE_TYPE:
+        return _get_external_archive_items(cache_type, full_path_norm)
     manager = LoadSoundManager(loadmods=loadmods)
-    items = manager.find_item_by_path_name(full_path_norm)
+    return manager.find_item_by_path_name(full_path_norm)
+
+
+def _get_sound_item_and_export_path(context, item_path: str, loadmods: bool = False, cache_type: str = "Sound"):
+    full_path_norm = (item_path or "").replace("/", "\\")
+    items = _get_sound_cache_items(full_path_norm, cache_type=cache_type, loadmods=loadmods)
     if not items:
         return None, ""
 
     final_item = items[-1] if isinstance(items, list) else items
     mod_name = ""
-    if loadmods and "\\" in full_path_norm:
+    if cache_type != EXTERNAL_SOUND_CACHE_TYPE and loadmods and "\\" in full_path_norm:
         mod_name = full_path_norm.split("\\", 1)[0]
 
     item_name = getattr(final_item, 'name', None) or getattr(final_item, 'Name', full_path_norm)
@@ -1284,8 +1321,13 @@ def _get_sound_item_and_export_path(context, item_path: str, loadmods: bool = Fa
     return final_item, export_path
 
 
-def ensure_sound_item_extracted(context, item_path: str, loadmods: bool = False) -> str:
-    final_item, export_path = _get_sound_item_and_export_path(context, item_path, loadmods=loadmods)
+def ensure_sound_item_extracted(context, item_path: str, loadmods: bool = False, cache_type: str = "Sound") -> str:
+    final_item, export_path = _get_sound_item_and_export_path(
+        context,
+        item_path,
+        loadmods=loadmods,
+        cache_type=cache_type,
+    )
     if final_item is None or not export_path:
         return ""
 
@@ -1346,8 +1388,13 @@ def ensure_sound_wav(context, sound_abs_path: str, item_path: str) -> str:
     return output_wav
 
 
-def import_sound_to_timeline(context, item_path: str, loadmods: bool = False):
-    sound_abs_path = ensure_sound_item_extracted(context, item_path, loadmods=loadmods)
+def import_sound_to_timeline(context, item_path: str, loadmods: bool = False, cache_type: str = "Sound"):
+    sound_abs_path = ensure_sound_item_extracted(
+        context,
+        item_path,
+        loadmods=loadmods,
+        cache_type=cache_type,
+    )
     if not sound_abs_path:
         raise RuntimeError(f"Sound item not found: {item_path}")
 
@@ -1381,7 +1428,12 @@ def import_sound_to_timeline(context, item_path: str, loadmods: bool = False):
 def play_sound_preview(context, cache_type: str, item_path: str, loadmods: bool = False) -> str:
     global _sound_preview_device, _sound_preview_handle, _sound_preview_state
 
-    sound_abs_path = ensure_sound_item_extracted(context, item_path, loadmods=loadmods)
+    sound_abs_path = ensure_sound_item_extracted(
+        context,
+        item_path,
+        loadmods=loadmods,
+        cache_type=cache_type,
+    )
     if not sound_abs_path:
         raise RuntimeError(f"Sound item not found: {item_path}")
 
@@ -1571,6 +1623,13 @@ def get_bundle_item_size(cache_type, item_path, loadmods=False):
                 if items:
                     final_item = items[-1] if isinstance(items, list) else items
                     return getattr(final_item, 'Size', 0) or getattr(final_item, 'size', 0) or 0
+        elif cache_type == EXTERNAL_SOUND_CACHE_TYPE:
+            session = get_external_archive_session(cache_type)
+            if session:
+                items = session["items"].get(item_path)
+                if items:
+                    final_item = items[-1] if isinstance(items, list) else items
+                    return getattr(final_item, 'Size', 0) or getattr(final_item, 'size', 0) or 0
         elif cache_type == "Collision":
             manager = LoadCollisionManager(loadmods=loadmods)
             items = manager.find_item_by_path_name(item_path)
@@ -1616,6 +1675,20 @@ def _resolve_item_for_stats(cache_type: str, item_path: str, loadmods: bool = Fa
         return None
 
     if cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
+        session = get_external_archive_session(cache_type)
+        if session:
+            items = session.get("items", {}).get(item_key)
+            return items[-1] if isinstance(items, list) and items else items
+        return None
+
+    if cache_type == EXTERNAL_TEXTURE_CACHE_TYPE:
+        session = get_external_archive_session(cache_type)
+        if session:
+            items = session.get("items", {}).get(item_key)
+            return items[-1] if isinstance(items, list) and items else items
+        return None
+
+    if cache_type == EXTERNAL_SOUND_CACHE_TYPE:
         session = get_external_archive_session(cache_type)
         if session:
             items = session.get("items", {}).get(item_key)
@@ -2493,6 +2566,81 @@ class OpenExternalCollisionCacheOperator(Operator, ImportHelper):
         return {'FINISHED'}
 
 
+class OpenExternalTextureCacheOperator(Operator, ImportHelper):
+    """Open a standalone texture.cache file in the asset browser"""
+    bl_idname = "witcher.open_external_texture_cache"
+    bl_label = "Open Texture Cache"
+
+    filename_ext = ".cache"
+    filter_glob: StringProperty(default="*.cache", options={'HIDDEN'})
+
+    def execute(self, context):
+        filepath = bpy.path.abspath(self.filepath or "")
+        if not filepath or not os.path.isfile(filepath):
+            self.report({'ERROR'}, "Texture cache file not found")
+            return {'CANCELLED'}
+
+        try:
+            archive = TextureCache(filepath)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to read texture cache: {e}")
+            return {'CANCELLED'}
+
+        items = {}
+        for item in getattr(archive, "Files", []):
+            key = (getattr(item, "Name", "") or "").replace("/", "\\")
+            if not key or _should_skip_buffer_name(key):
+                continue
+            items.setdefault(key, []).append(item)
+
+        if not items:
+            self.report({'WARNING'}, "No readable entries found in texture cache")
+            return {'CANCELLED'}
+
+        set_external_archive_session(EXTERNAL_TEXTURE_CACHE_TYPE, filepath, items)
+        _activate_external_archive_browser(context, EXTERNAL_TEXTURE_CACHE_TYPE)
+        self.report({'INFO'}, f"Loaded texture cache: {os.path.basename(filepath)} ({len(items)} items)")
+        return {'FINISHED'}
+
+
+class OpenExternalSoundCacheOperator(Operator, ImportHelper):
+    """Open a standalone sound.cache file in the asset browser"""
+    bl_idname = "witcher.open_external_sound_cache"
+    bl_label = "Open Sound Cache"
+
+    filename_ext = ".cache"
+    filter_glob: StringProperty(default="*.cache", options={'HIDDEN'})
+
+    def execute(self, context):
+        filepath = bpy.path.abspath(self.filepath or "")
+        if not filepath or not os.path.isfile(filepath):
+            self.report({'ERROR'}, "Sound cache file not found")
+            return {'CANCELLED'}
+
+        try:
+            soundbanks_info = SoundBanksInfoXML(_soundbanks_metadata_path())
+            archive = SoundCache(filepath, soundbanks_info=soundbanks_info)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to read sound cache: {e}")
+            return {'CANCELLED'}
+
+        items = {}
+        for item in getattr(archive, "Files", []):
+            key = (getattr(item, "Name", "") or "").replace("/", "\\")
+            if not key or _should_skip_buffer_name(key):
+                continue
+            items.setdefault(key, []).append(item)
+
+        if not items:
+            self.report({'WARNING'}, "No readable entries found in sound cache")
+            return {'CANCELLED'}
+
+        set_external_archive_session(EXTERNAL_SOUND_CACHE_TYPE, filepath, items)
+        _activate_external_archive_browser(context, EXTERNAL_SOUND_CACHE_TYPE)
+        self.report({'INFO'}, f"Loaded sound cache: {os.path.basename(filepath)} ({len(items)} items)")
+        return {'FINISHED'}
+
+
 class OpenExternalBundleOperator(Operator, ImportHelper):
     """Open a standalone bundle file in the asset browser"""
     bl_idname = "witcher.open_external_bundle"
@@ -2671,6 +2819,16 @@ class SimpleFileBrowser(Operator):
                     "witcher.open_external_collision_cache",
                     text="Open collision.cache",
                     icon='MESH_CUBE',
+                )
+                ext_box.operator(
+                    "witcher.open_external_texture_cache",
+                    text="Open texture.cache",
+                    icon='IMAGE_DATA',
+                )
+                ext_box.operator(
+                    "witcher.open_external_sound_cache",
+                    text="Open sound.cache",
+                    icon='SPEAKER',
                 )
                 ext_box.operator(
                     "witcher.open_external_bundle",
@@ -4008,7 +4166,12 @@ class FileActionOperatorImportToScene(Operator):
         full_path_norm = request["full_path_norm"]
         loadmods = request["loadmods"]
         try:
-            soundstrip, wav_path = import_sound_to_timeline(context, full_path_norm, loadmods=loadmods)
+            soundstrip, wav_path = import_sound_to_timeline(
+                context,
+                full_path_norm,
+                loadmods=loadmods,
+                cache_type=cache_type,
+            )
         except Exception as exc:
             self.report({'ERROR'}, f"Sound import failed: {exc}")
             return {'CANCELLED'}
@@ -4202,6 +4365,35 @@ class FileActionOperatorImportToScene(Operator):
                         abs_file_path = final_item.extract_to_file(abs_file_path)
                 else:
                     log.warning("External collision item not found: %s", full_path)
+            elif cache_type == EXTERNAL_TEXTURE_CACHE_TYPE:
+                items = _get_texture_cache_items(full_path_norm, cache_type=cache_type)
+                if items:
+                    final_item = items[-1] if isinstance(items, list) else items
+                    item_name = getattr(final_item, 'Name', full_path_norm) or full_path_norm
+                    abs_file_path = repo_file(item_name)
+                    if abs_file_path:
+                        texture_root = get_texture_path(context) or ""
+                        uncook_root = get_uncook_path(context) or ""
+                        prep_root = texture_root or uncook_root
+                        try:
+                            norm_abs = os.path.normcase(os.path.normpath(abs_file_path))
+                            norm_uncook = os.path.normcase(os.path.normpath(uncook_root)) if uncook_root else ""
+                            if norm_uncook and norm_abs.startswith(norm_uncook + os.sep):
+                                prep_root = uncook_root
+                        except Exception:
+                            pass
+                        if prepare_extraction_target(abs_file_path, prep_root):
+                            final_item.extract_to_file(abs_file_path)
+                        dds_path = os.path.splitext(abs_file_path)[0] + ".dds"
+                        if win_path_exists(dds_path):
+                            abs_file_path = dds_path
+            elif cache_type == EXTERNAL_SOUND_CACHE_TYPE:
+                abs_file_path = ensure_sound_item_extracted(
+                    context,
+                    full_path_norm,
+                    loadmods=loadmods,
+                    cache_type=cache_type,
+                )
             elif effective_cache_type == "Collision":
                 # Extract collision file directly from collision cache (NOT via repo_file/BundleManager)
                 manager = LoadCollisionManager(loadmods=loadmods)
@@ -4245,6 +4437,9 @@ class FileActionOperatorImportToScene(Operator):
                             pass
                         if prepare_extraction_target(abs_file_path, prep_root):
                             final_item.extract_to_file(abs_file_path)
+                        dds_path = os.path.splitext(abs_file_path)[0] + ".dds"
+                        if win_path_exists(dds_path):
+                            abs_file_path = dds_path
             elif cache_type == "Speech":
                 manager = LoadSpeechManager()
                 items = manager.find_item_by_hash(full_path)
@@ -4727,10 +4922,13 @@ class TexturePreviewOperator(Operator):
                 self.report({'WARNING'}, f"Texture not found: {self.file_path}")
                 return {'CANCELLED'}
         # Try TextureCache first (produces proper DDS), then fall back to bundle/disk extraction
-        elif self.cache_type == "Texture":
+        elif get_effective_cache_type(self.cache_type) == "Texture":
             # Direct texture cache lookup
-            manager = LoadTextureManager(loadmods=witcher_file_browser.loadmods)
-            items = manager.find_item_by_path_name(search_path)
+            items = _get_texture_cache_items(
+                search_path,
+                cache_type=self.cache_type,
+                loadmods=witcher_file_browser.loadmods,
+            )
             if items:
                 final_item = items[-1] if isinstance(items, list) else items
                 temp_path = os.path.join(temp_dir, "witcher_preview", filename)
@@ -5031,6 +5229,10 @@ class FileActionOperator(Operator):
                     items = session["items"].get(full_path_norm)
                     if items:
                         item_lists = [items]
+            elif cache_type == EXTERNAL_TEXTURE_CACHE_TYPE:
+                items = _get_external_archive_items(cache_type, full_path_norm)
+            elif cache_type == EXTERNAL_SOUND_CACHE_TYPE:
+                items = _get_external_archive_items(cache_type, full_path_norm)
             elif cache_type == "Bundle":
                 manager = LoadBundleManager(loadmods=loadmods)
                 if full_path_norm.lower().endswith(".w2ter"):
@@ -5200,6 +5402,8 @@ def register():
     bpy.utils.register_class(BookmarkItem)
     bpy.utils.register_class(MySettings)
     bpy.utils.register_class(OpenExternalCollisionCacheOperator)
+    bpy.utils.register_class(OpenExternalTextureCacheOperator)
+    bpy.utils.register_class(OpenExternalSoundCacheOperator)
     bpy.utils.register_class(OpenExternalBundleOperator)
     bpy.utils.register_class(SimpleFileBrowser)
     bpy.utils.register_class(ClearSearchOperator)
@@ -5255,6 +5459,8 @@ def unregister():
     bpy.utils.unregister_class(GlobalImportOperator)
     bpy.utils.unregister_class(SoundPreviewToggleOperator)
     bpy.utils.unregister_class(OpenExternalBundleOperator)
+    bpy.utils.unregister_class(OpenExternalSoundCacheOperator)
+    bpy.utils.unregister_class(OpenExternalTextureCacheOperator)
     bpy.utils.unregister_class(OpenExternalCollisionCacheOperator)
     bpy.utils.unregister_class(SimpleFileBrowser)
     bpy.utils.unregister_class(GotoGlobalSearchResultOperator)

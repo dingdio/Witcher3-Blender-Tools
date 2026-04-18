@@ -178,6 +178,8 @@ class WITCH_MT_Menu(bpy.types.Menu):
         layout.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Cutscene (.w2cutscene)", icon='SCENE_DATA')
         layout.separator()
         layout.operator("witcher.open_external_collision_cache", text="Open collision.cache", icon="MESH_CUBE")
+        layout.operator("witcher.open_external_texture_cache", text="Open texture.cache", icon="IMAGE_DATA")
+        layout.operator("witcher.open_external_sound_cache", text="Open sound.cache", icon="SPEAKER")
         layout.operator("witcher.open_external_bundle", text="Open .bundle", icon="PACKAGE")
 
 class WITCH_MT_Menu_witcher_2(bpy.types.Menu):

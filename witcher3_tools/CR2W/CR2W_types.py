@@ -13,6 +13,7 @@ from .Types.CBitmapTexture import CBitmapTexture
 from .Types.CMesh import CMesh
 from .Types.VariousTypes import CPaddedBuffer, CNAME, CNAME_INDEX, CMatrix4x4, NAME, CBufferVLQInt32, CColor, CCompressedBuffer, CByteArray
 from .json_convert.CR2WJsonObject import CR2WJsonData, CR2WJsonChunkMap, CR2WJsonMap, CR2WJsonScalar, CR2WJsonArray
+from .old_version_reader import UPDATED_RESOURCE_FORMAT_VERSION, is_old_version, load_old_version_resource_tables
 from .witcher_cache.W3Strings import LoadStringsManager
 from .bStream import *
 from .witcher_cache import bundle
@@ -168,7 +169,9 @@ def getClass(f, CR2WFILE, self, idx):
     self.currentClass = ""#TODO FIX THIS #CR2WFILE.CNAMES[i].name.value;
     f.seek(CR2WFILE.CR2WExport[idx].dataOffset + CR2WFILE.start)
     zero = readSByte(f)
-    if zero != 0:
+    if is_old_version(CR2WFILE.HEADER.version):
+        f.seek(-1, os.SEEK_CUR)
+    elif zero != 0:
         if (zero == 1):
             _ = readInt32(f)
         elif (zero == -128):
@@ -210,7 +213,9 @@ class DATA:
             self.currentClass = ""#TODO FIX THIS #CR2WFILE.CNAMES[i].name.value;
             f.seek(CR2WFILE.CR2WExport[i].dataOffset + CR2WFILE.start);
             zero = readSByte(f)
-            if zero != 0:
+            if is_old_version(CR2WFILE.HEADER.version):
+                f.seek(-1, os.SEEK_CUR)
+            elif zero != 0:
                 if (zero == 1):
                     _ = readInt32(f)
                 elif (zero == -128):
@@ -2004,6 +2009,8 @@ class W_CLASS:
             #     if parent.exports[idx] == f.tell():
             #         break
         startofthis = f.tell() - 1 # -1 for zero read before start
+        if is_old_version(CR2WFILE.HEADER.version):
+            startofthis = f.tell()
         currentClass = CR2WFILE.CR2WExport[idx].name
         CR2WFILE.currentExport = idx
         self.classEnd = startofthis + CR2WFILE.CR2WExport[idx].dataSize;#local uint64
@@ -2608,6 +2615,15 @@ class CR2W_header:
         if (self.version <= 115):# witcher2
             self.flags: np.uint = readU32(f)
             log.debug("Witcher 2 CR2W header detected.")
+        elif (self.version < UPDATED_RESOURCE_FORMAT_VERSION):
+            self.flags: np.uint = readU32(f)
+            self.timestamp: np.uint64 = 0
+            self.buildVersion: np.uint = 0
+            self.fileSize: np.uint = 0
+            self.bufferSize: np.uint = 0
+            self.CRC32: np.uint = 0
+            self.numChunks: np.uint = 0
+            log.debug("Old-version Witcher 3 CR2W header detected.")
         else:
             self.flags: np.uint = readU32(f)
             self.timestamp: np.uint64 = readU64(f)
@@ -2786,6 +2802,11 @@ class CR2W:
             self.CR2WTable[4] = self.CR2WTable[1]
 
             self.CHUNKS = DATA(f, self, anim_name)
+
+        elif (self.HEADER.version < UPDATED_RESOURCE_FORMAT_VERSION):
+            load_old_version_resource_tables(self, f, start)
+            if self.do_read_chunks:
+                self.CHUNKS = DATA(f, self, anim_name)
 
         else:
 
