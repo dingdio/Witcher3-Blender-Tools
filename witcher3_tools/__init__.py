@@ -600,13 +600,15 @@ class RemoveRedkitProjectOperator(bpy.types.Operator):
 
 
 class WITCHER_OT_reset_browser_popup_width(bpy.types.Operator):
-    """Reset the asset browser popup width to the default (30% of window)"""
+    """Reset the asset browser popup width to the default (50% of window)"""
     bl_idname = "witcher.reset_browser_popup_width"
     bl_label = "Reset to Default"
     bl_options = {'INTERNAL'}
 
     def execute(self, context):
-        get_all_addon_prefs(context).browser_popup_width = 0
+        prefs = get_all_addon_prefs(context)
+        prefs.browser_popup_width = 0
+        prefs.browser_popup_width_percent = 50
         return {'FINISHED'}
 
 
@@ -1095,11 +1097,72 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     )
 
     browser_popup_width: bpy.props.IntProperty(
-        name="Asset Browser Width",
-        description="Width of the asset browser popup in pixels. Set to 0 to use the default (30% of window width)",
+        name="Asset Browser Width (px)",
+        description="Optional fixed width of the asset browser popup in pixels. Set to 0 to use the percentage-based width",
         default=0,
         min=0,
         max=3000,
+    )
+    browser_popup_width_percent: bpy.props.IntProperty(
+        name="Asset Browser Width (%)",
+        description="Default width of the asset browser popup as a percentage of the current monitor width when no pixel override is set",
+        default=50,
+        min=20,
+        max=100,
+        subtype='PERCENTAGE',
+    )
+    browser_file_page_size: bpy.props.IntProperty(
+        name="Asset Browser Files Per Page",
+        description="Optional fixed number of files shown per page in list mode. Set to 0 to auto-size from about 80% of monitor height",
+        default=0,
+        min=0,
+        max=500,
+    )
+    browser_grid_max_rows: bpy.props.IntProperty(
+        name="Asset Browser Grid Rows Per Page",
+        description="Optional fixed number of full grid rows shown before pagination is used. Set to 0 to auto-size from about 80% of monitor height",
+        default=0,
+        min=0,
+        max=12,
+    )
+    browser_grid_columns: bpy.props.IntProperty(
+        name="Asset Browser Grid Columns",
+        description="Number of grid tiles per row. Set to 0 to choose automatically from the browser width",
+        default=0,
+        min=0,
+        max=8,
+    )
+    browser_grid_size_mode: bpy.props.EnumProperty(
+        name="Default Icon Size",
+        description="Default grid tile size preset used by the asset browser",
+        items=[
+            ('SMALL', 'Small', 'Compact grid tiles with more columns'),
+            ('MEDIUM', 'Medium', 'Balanced grid tiles'),
+            ('LARGE', 'Large', 'Larger grid tiles with wider filename rows'),
+        ],
+        default='MEDIUM',
+    )
+    browser_grid_tile_width: bpy.props.IntProperty(
+        name="Asset Browser Grid Tile Width (px)",
+        description="Legacy setting retained for compatibility. Grid sizing now uses the Small/Large preset instead",
+        default=150,
+        min=120,
+        max=320,
+    )
+    browser_folder_panel_width_percent: bpy.props.IntProperty(
+        name="Asset Browser Folder Panel Width (%)",
+        description="Default width of the folder list panel as a percentage of the current monitor width when no pixel override is set",
+        default=15,
+        min=8,
+        max=40,
+        subtype='PERCENTAGE',
+    )
+    browser_folder_panel_width: bpy.props.IntProperty(
+        name="Asset Browser Folder Panel Width (px)",
+        description="Optional fixed width of the folder list panel in pixels. Set to 0 to use the percentage-based width",
+        default=0,
+        min=0,
+        max=640,
     )
 
     #importFacePoses
@@ -1177,9 +1240,108 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         common_col.prop(self, "tex_ext")
         common_col.prop(self, "import_idle_animation")
         common_col.prop(self, "verbose_logging")
-        width_row = common_col.row(align=True)
-        width_row.prop(self, "browser_popup_width")
+
+        # Asset Browser settings — dedicated section
+        try:
+            display_width = int(getattr(getattr(context, "window", None), "width", 0) or 0)
+        except Exception:
+            display_width = 0
+        if os.name == "nt" and getattr(context, "window", None) is not None:
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class _RECT(ctypes.Structure):
+                    _fields_ = [
+                        ("left", wintypes.LONG),
+                        ("top", wintypes.LONG),
+                        ("right", wintypes.LONG),
+                        ("bottom", wintypes.LONG),
+                    ]
+
+                class _MONITORINFO(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.DWORD),
+                        ("rcMonitor", _RECT),
+                        ("rcWork", _RECT),
+                        ("dwFlags", wintypes.DWORD),
+                    ]
+
+                window = context.window
+                win_x = int(getattr(window, "x", 0) or 0)
+                win_y = int(getattr(window, "y", 0) or 0)
+                win_w = int(getattr(window, "width", 0) or 0)
+                win_h = int(getattr(window, "height", 0) or 0)
+                rect = _RECT(win_x, win_y, win_x + max(1, win_w), win_y + max(1, win_h))
+                monitor = ctypes.windll.user32.MonitorFromRect(ctypes.byref(rect), 2)
+                if monitor:
+                    info = _MONITORINFO()
+                    info.cbSize = ctypes.sizeof(_MONITORINFO)
+                    if ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                        monitor_width = int(info.rcMonitor.right - info.rcMonitor.left)
+                        if monitor_width > 0:
+                            display_width = monitor_width
+            except Exception:
+                pass
+
+        browser_box = layout.box()
+        browser_head = browser_box.row(align=True)
+        browser_head.label(text="Asset Browser", icon='FILE_FOLDER')
+        browser_head.label(text="", icon='IMGDISPLAY')
+
+        # --- Popup window sizing ---
+        popup_box = browser_box.box()
+        popup_box.label(text="Popup Window", icon='WINDOW')
+        popup_col = popup_box.column()
+        popup_col.use_property_split = True
+        popup_col.use_property_decorate = False
+        popup_col.prop(self, "browser_popup_width_percent", text="Window Width (%)")
+        if display_width > 0:
+            fixed_width = int(getattr(self, "browser_popup_width", 0) or 0)
+            info_row = popup_col.row()
+            if fixed_width > 0:
+                info_row.label(text=f"Fixed popup width: {fixed_width} px", icon='INFO')
+            else:
+                pct = max(20, min(100, int(getattr(self, "browser_popup_width_percent", 50) or 50)))
+                try:
+                    ui_scale = float(getattr(getattr(context, "preferences", None), "system", None).ui_scale or 1.0)
+                except Exception:
+                    ui_scale = 1.0
+                safe_margin = int(round(48 * ui_scale))
+                approx_width = min(display_width - safe_margin, int(display_width * pct / 100.0))
+                info_row.label(text=f"About {pct}% of monitor (~{approx_width} px)", icon='INFO')
+        width_row = popup_col.row(align=True)
+        width_row.prop(self, "browser_popup_width", text="Override (px)")
         width_row.operator("witcher.reset_browser_popup_width", text="", icon='LOOP_BACK')
+
+        # --- Folder panel ---
+        folder_box = browser_box.box()
+        folder_box.label(text="Folder Panel", icon='FILE_FOLDER')
+        folder_col = folder_box.column()
+        folder_col.use_property_split = True
+        folder_col.use_property_decorate = False
+        folder_col.prop(self, "browser_folder_panel_width_percent", text="Panel Width (%)")
+        if display_width > 0:
+            fixed_folder_width = int(getattr(self, "browser_folder_panel_width", 0) or 0)
+            info_row = folder_col.row()
+            if fixed_folder_width > 0:
+                info_row.label(text=f"Fixed folder panel width: {fixed_folder_width} px", icon='INFO')
+            else:
+                folder_pct = max(8, min(40, int(getattr(self, "browser_folder_panel_width_percent", 15) or 15)))
+                approx_folder_width = min(640, max(180, int(display_width * folder_pct / 100.0)))
+                info_row.label(text=f"About {folder_pct}% of monitor (~{approx_folder_width} px)", icon='INFO')
+        folder_col.prop(self, "browser_folder_panel_width", text="Override (px)")
+
+        # --- Grid / List layout ---
+        layout_box = browser_box.box()
+        layout_box.label(text="Files Layout", icon='IMGDISPLAY')
+        layout_col = layout_box.column()
+        layout_col.use_property_split = True
+        layout_col.use_property_decorate = False
+        layout_col.prop(self, "browser_grid_size_mode", text="Default Icon Size")
+        layout_col.prop(self, "browser_grid_columns", text="Grid Columns")
+        layout_col.prop(self, "browser_grid_max_rows", text="Grid Rows Per Page")
+        layout_col.prop(self, "browser_file_page_size", text="List Files Per Page")
 
         # External importer add-on status (APX / SRT / RE)
         ext_addons_box, ext_addons_col = section("External Addons", 'PLUGIN')

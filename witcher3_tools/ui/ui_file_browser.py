@@ -28,6 +28,7 @@ from .. import (
     file_helpers,
     clear_external_import_dependency_alert,
     get_all_addon_prefs,
+    get_game_path,
     get_texture_path,
     get_W3_OGG_PATH,
     get_vgmstream_path,
@@ -38,11 +39,18 @@ from .. import (
 from ..importers import import_entity
 from ..mesh_import_settings import MeshImportSettings
 from ..ui.blender_fun import convert_xbm_to_dds, convert_w2cube_to_dds, load_image_with_dds_repair
+from .browser_dummy_icons import (
+    clear_browser_dummy_icon_cache,
+    ensure_browser_dummy_icon_path,
+    get_browser_item_type_label,
+)
 from . import asset_browser_import_bridge
 from bpy.props import IntProperty, StringProperty
 from ..importers.import_entity import test_load_entity, fixed_chunk_paths
 import os
 import numpy as np
+import struct
+import zlib
 from typing import Dict, Tuple, Optional
 
 ##############
@@ -50,7 +58,7 @@ from typing import Dict, Tuple, Optional
 
 ###############
 import bpy
-from bpy.props import StringProperty, CollectionProperty, BoolProperty, PointerProperty, FloatProperty
+from bpy.props import StringProperty, CollectionProperty, BoolProperty, PointerProperty, FloatProperty, EnumProperty
 from bpy.types import Operator, Panel, UIList, PropertyGroup, Scene
 from bpy_extras.io_utils import ImportHelper
 from pathlib import Path
@@ -86,7 +94,7 @@ class FileItem(PropertyGroup):
 
 
 class RecentItem(PropertyGroup):
-    """Tracks recently imported files"""
+    """Tracks recent browser activity"""
     path: StringProperty(name="Path")
     cache_type: StringProperty(name="Cache Type")
     timestamp: bpy.props.FloatProperty(name="Timestamp")
@@ -167,11 +175,38 @@ def _sync_path_to_address_bar(self, context):
     """Keep the address bar in sync when folder navigation changes."""
     if self.path_input != self.current_folder:
         self.path_input = self.current_folder
+    self.file_page_index = 0
+
+
+def _on_browser_query_filter_update(self, context):
+    self.file_page_index = 0
+
+
+def _on_browser_grid_layout_update(self, context):
+    self.file_page_index = 0
+
+
+def _on_external_extract_root_update(self, context):
+    cache_type = str(getattr(self, "active_cache_type", "") or "")
+    if not is_external_cache(cache_type):
+        return
+    session = get_external_archive_session(cache_type)
+    if session:
+        archive_path = win_safe_path(bpy.path.abspath(session.get("archive_path", "") or ""))
+        if archive_path:
+            self.external_extract_root_archive_path = archive_path
 
 
 class MySettings(PropertyGroup):
     current_folder: StringProperty(update=_sync_path_to_address_bar)
-    search_query: StringProperty()
+    search_query: StringProperty(
+        name="Search",
+        description=(
+            "Search asset paths. At Home it searches across all cache types; "
+            "inside a cache it searches the current active cache"
+        ),
+        update=_on_browser_query_filter_update,
+    )
     active_cache_type: StringProperty(default="")  # "", "Bundle", "Collision", "Texture", "Sound", "Speech"
     loadmods: BoolProperty(default=False)  # Persist loadmods from browser invocation
     use_mods_priority: BoolProperty(
@@ -186,11 +221,99 @@ class MySettings(PropertyGroup):
         default=False,
         description="Open the matching importer dialog for single-file imports when available"
     )
+    external_extract_root: StringProperty(
+        name="Standalone Export Folder",
+        description="Folder used for extracting and importing files from standalone archives opened in the asset browser",
+        default="",
+        subtype='DIR_PATH',
+        update=_on_external_extract_root_update,
+    )
+    external_extract_root_archive_path: StringProperty(
+        default="",
+        options={'HIDDEN', 'SKIP_SAVE'},
+    )
+    external_texture_export_format: EnumProperty(
+        name="Texture Export Format",
+        description="Output format used when exporting textures from standalone texture archives",
+        items=[
+            ('DDS', 'DDS', 'Extract textures as DDS'),
+            ('PNG', 'PNG', 'Extract textures as PNG'),
+            ('TGA', 'TGA', 'Extract textures as TGA'),
+        ],
+        default='DDS',
+    )
+    external_export_ui_ping: IntProperty(
+        default=0,
+        options={'HIDDEN', 'SKIP_SAVE'},
+    )
     preview_texture_path: StringProperty(default="")  # For texture preview popup
+    revealed_file_path: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
     # Phase 1 QoL
-    extension_filter: StringProperty(default="", description="Filter by file extension (e.g., .w2mesh)")
+    extension_filter: StringProperty(
+        name="View Filter",
+        default="",
+        description="Search/filter items in the current browser view by name or extension",
+        update=_on_browser_query_filter_update,
+    )
     # Phase 2 QoL
     path_input: StringProperty(default="", description="Navigate to path")
+    file_page_index: IntProperty(default=0, min=0, options={'HIDDEN', 'SKIP_SAVE'})
+    file_display_mode: EnumProperty(
+        name="Layout",
+        description="Display files as a list or icon grid",
+        items=[
+            ('LIST', 'List', 'Show files as rows', 'SHORTDISPLAY', 0),
+            ('GRID', 'Grid', 'Show files as icon tiles', 'IMGDISPLAY', 1),
+        ],
+        default='LIST',
+    )
+    grid_size_mode_live: EnumProperty(
+        name="Icon Size",
+        description="Grid tile size preset for the current browser window",
+        items=[
+            ('SMALL', 'Small', 'Compact grid tiles with more columns', 'ALIGN_JUSTIFY', 0),
+            ('MEDIUM', 'Medium', 'Balanced grid tiles', 'IMGDISPLAY', 1),
+            ('LARGE', 'Large', 'Larger grid tiles with wider filename rows', 'FULLSCREEN_ENTER', 2),
+        ],
+        default='MEDIUM',
+        options={'SKIP_SAVE'},
+        update=_on_browser_grid_layout_update,
+    )
+    sort_by: EnumProperty(
+        name="Sort",
+        description="Sort order for files in the browser",
+        items=[
+            ('NAME', 'Name', 'Sort by file name', 'SORTALPHA', 0),
+            ('EXT', 'Extension', 'Sort by file extension then name', 'FILTER', 1),
+        ],
+        default='NAME',
+        update=_on_browser_grid_layout_update,
+    )
+    sort_ascending: BoolProperty(
+        name="Ascending",
+        description="Sort ascending (A→Z). Disable for descending (Z→A)",
+        default=True,
+        update=_on_browser_grid_layout_update,
+    )
+
+    debug_wrap_show: BoolProperty(
+        name="Wrap Tuning",
+        description="Show the filename-wrap debug sliders (dev mode only)",
+        default=False,
+    )
+    debug_small_padding_px: bpy.props.IntProperty(name="Padding", default=80, min=0, max=160, update=_on_browser_grid_layout_update)
+    debug_small_avg_char_px: bpy.props.FloatProperty(name="Avg Char px", default=6.0, min=3.0, max=24.0, precision=1, step=10, update=_on_browser_grid_layout_update)
+    debug_small_chars_min: bpy.props.IntProperty(name="Chars Min", default=9, min=1, max=60, update=_on_browser_grid_layout_update)
+    debug_small_chars_max: bpy.props.IntProperty(name="Chars Max", default=31, min=1, max=60, update=_on_browser_grid_layout_update)
+    debug_medium_padding_px: bpy.props.IntProperty(name="Padding", default=80, min=0, max=160, update=_on_browser_grid_layout_update)
+    debug_medium_avg_char_px: bpy.props.FloatProperty(name="Avg Char px", default=6.0, min=3.0, max=24.0, precision=1, step=10, update=_on_browser_grid_layout_update)
+    debug_medium_chars_min: bpy.props.IntProperty(name="Chars Min", default=1, min=1, max=60, update=_on_browser_grid_layout_update)
+    debug_medium_chars_max: bpy.props.IntProperty(name="Chars Max", default=17, min=1, max=60, update=_on_browser_grid_layout_update)
+    debug_large_padding_px: bpy.props.IntProperty(name="Padding", default=80, min=0, max=160, update=_on_browser_grid_layout_update)
+    debug_large_avg_char_px: bpy.props.FloatProperty(name="Avg Char px", default=6.0, min=3.0, max=24.0, precision=1, step=10, update=_on_browser_grid_layout_update)
+    debug_large_chars_min: bpy.props.IntProperty(name="Chars Min", default=1, min=1, max=60, update=_on_browser_grid_layout_update)
+    debug_large_chars_max: bpy.props.IntProperty(name="Chars Max", default=34, min=1, max=60, update=_on_browser_grid_layout_update)
+
     # Phase 4 QoL - view mode
     browser_view_mode: bpy.props.EnumProperty(
         name="View",
@@ -207,7 +330,7 @@ class MySettings(PropertyGroup):
     terrain_multires_level: IntProperty(
         name="Terrain Multires",
         description="Multires subdivision levels for imported terrain tiles",
-        default=5, min=0, max=10,
+        default=10, min=0, max=10,
     )
     terrain_import_mode: bpy.props.EnumProperty(
         name="Terrain Import",
@@ -270,11 +393,111 @@ _external_archive_sessions = {
     EXTERNAL_SOUND_CACHE_TYPE: None,
 }
 
+_EXTERNAL_BROWSER_EXPORT_JOB = {
+    "running": False,
+    "cache_type": "",
+    "folder_path": "",
+    "output_root": "",
+    "texture_format": "DDS",
+    "overwrite": False,
+    "items": [],
+    "index": 0,
+    "total": 0,
+    "done": 0,
+    "skipped": 0,
+    "errors": 0,
+    "cancel_requested": False,
+    "timer": None,
+    "context": None,
+}
+
+_EXTERNAL_BROWSER_EXPORT_STATUS = {
+    "visible": False,
+    "state": "idle",
+    "cache_type": "",
+    "folder_path": "",
+    "output_root": "",
+    "processed": 0,
+    "total": 0,
+    "done": 0,
+    "skipped": 0,
+    "errors": 0,
+    "message": "",
+}
+
+DEFAULT_BROWSER_FILE_PAGE_SIZE = 0
+MIN_BROWSER_FILE_PAGE_SIZE = 0
+MAX_BROWSER_FILE_PAGE_SIZE = 500
+DEFAULT_BROWSER_GRID_MAX_ROWS = 0
+MIN_BROWSER_GRID_MAX_ROWS = 0
+MAX_BROWSER_GRID_MAX_ROWS = 12
+DEFAULT_BROWSER_GRID_COLUMNS = 0
+MAX_BROWSER_GRID_COLUMNS = 8
+DEFAULT_BROWSER_GRID_SIZE_MODE = "MEDIUM"
+BROWSER_GRID_SIZE_PRESETS = {
+    "SMALL": {
+        "tile_width": 130,
+        "icon_scale_multiplier": 0.85,
+        "name_chars_min": 9,
+        "name_chars_max": 31,
+        "name_padding_px": 80,
+        "avg_char_px": 6.0,
+    },
+    "MEDIUM": {
+        "tile_width": 200,
+        "icon_scale_multiplier": 1.05,
+        "name_chars_min": 1,
+        "name_chars_max": 17,
+        "name_padding_px": 80,
+        "avg_char_px": 6.0,
+    },
+    "LARGE": {
+        "tile_width": 290,
+        "icon_scale_multiplier": 1.25,
+        "name_chars_min": 1,
+        "name_chars_max": 34,
+        "name_padding_px": 80,
+        "avg_char_px": 6.0,
+    },
+}
+DEFAULT_BROWSER_FOLDER_PANEL_WIDTH = 0
+MIN_BROWSER_FOLDER_PANEL_WIDTH = 180
+MAX_BROWSER_FOLDER_PANEL_WIDTH = 640
+DEFAULT_BROWSER_FOLDER_PANEL_WIDTH_PERCENT = 15
+MIN_BROWSER_FOLDER_PANEL_WIDTH_PERCENT = 8
+MAX_BROWSER_FOLDER_PANEL_WIDTH_PERCENT = 40
+DEFAULT_BROWSER_POPUP_WIDTH_PERCENT = 50
+MIN_BROWSER_POPUP_WIDTH_PERCENT = 20
+MAX_BROWSER_POPUP_WIDTH_PERCENT = 100
+BROWSER_POPUP_SAFE_MARGIN_PX = 48
+BROWSER_MONITOR_HEIGHT_USAGE = 0.80
+BROWSER_LIST_PAGE_ROW_HEIGHT_PX = 28
+BROWSER_LIST_PAGE_OVERHEAD_PX = 220
+BROWSER_GRID_PAGE_OVERHEAD_PX = 140
+BROWSER_GRID_TILE_HEIGHT_RATIO = 1.12
+BROWSER_GRID_TILE_HEIGHT_MIN_PX = 164
+
 def is_external_cache(cache_type: str) -> bool:
     return cache_type in EXTERNAL_CACHE_TYPES
 
 def get_effective_cache_type(cache_type: str) -> str:
     return EXTERNAL_CACHE_EFFECTIVE_TYPES.get(cache_type, cache_type)
+
+
+def get_cache_type_icon(cache_type: str) -> str:
+    effective_cache_type = get_effective_cache_type(cache_type)
+    return {
+        "Bundle": "PACKAGE",
+        "Collision": "MESH_CUBE",
+        "Texture": "IMAGE_DATA",
+        "Sound": "SPEAKER",
+        "Speech": "SPEAKER",
+        "REDkit Depot": "FILE_FOLDER",
+        "REDkit Uncooked": "FILE_FOLDER",
+        "Workspace": "FILE_FOLDER",
+        "Cooked": "PACKAGE",
+        "Witcher 2 Data": "FILE_FOLDER",
+    }.get(effective_cache_type, "FILE_FOLDER")
 
 
 def cache_supports_scene_import(cache_type: str) -> bool:
@@ -319,6 +542,639 @@ def clear_external_archive_session(cache_type: Optional[str] = None):
         return
     if cache_type in _external_archive_sessions:
         _external_archive_sessions[cache_type] = None
+
+
+def _normalize_virtual_path(path: str) -> str:
+    return str(path or "").replace("/", "\\").strip("\\")
+
+
+def _normalize_real_path(path: str) -> str:
+    return win_safe_path(bpy.path.abspath(path or ""))
+
+
+def _paths_match(path_a: str, path_b: str) -> bool:
+    norm_a = _normalize_real_path(path_a).lower()
+    norm_b = _normalize_real_path(path_b).lower()
+    return bool(norm_a and norm_b and norm_a == norm_b)
+
+
+def _has_matching_external_archive_session(cache_type: str, archive_path: str = "") -> bool:
+    session = get_external_archive_session(cache_type)
+    if not session:
+        return False
+    if not archive_path:
+        return True
+    return _paths_match(session.get("archive_path", "") or "", archive_path)
+
+
+def _can_restore_external_archive(cache_type: str, archive_path: str = "") -> bool:
+    if not is_external_cache(cache_type):
+        return False
+    if _has_matching_external_archive_session(cache_type, archive_path):
+        return True
+    archive_path = _normalize_real_path(archive_path)
+    return bool(archive_path and os.path.isfile(archive_path))
+
+
+def _clear_browser_reveal(context):
+    if context and hasattr(context.scene, "witcher_file_browser"):
+        context.scene.witcher_file_browser.revealed_file_path = ""
+
+
+def _set_browser_reveal(context, file_path: str):
+    if context and hasattr(context.scene, "witcher_file_browser"):
+        context.scene.witcher_file_browser.revealed_file_path = _normalize_virtual_path(file_path)
+
+
+def _is_revealed_browser_item(browser, file_path: str) -> bool:
+    revealed = _normalize_virtual_path(getattr(browser, "revealed_file_path", "") or "")
+    candidate = _normalize_virtual_path(file_path)
+    return bool(revealed and candidate and revealed.lower() == candidate.lower())
+
+
+def _clamp_browser_file_page_size(value) -> int:
+    try:
+        size = int(value)
+    except Exception:
+        size = DEFAULT_BROWSER_FILE_PAGE_SIZE
+    if size <= 0:
+        return 0
+    return max(10, min(MAX_BROWSER_FILE_PAGE_SIZE, size))
+
+
+def _clamp_browser_grid_max_rows(value) -> int:
+    try:
+        size = int(value)
+    except Exception:
+        size = DEFAULT_BROWSER_GRID_MAX_ROWS
+    if size <= 0:
+        return 0
+    return max(2, min(MAX_BROWSER_GRID_MAX_ROWS, size))
+
+
+def _clamp_browser_grid_columns(value) -> int:
+    try:
+        size = int(value)
+    except Exception:
+        size = DEFAULT_BROWSER_GRID_COLUMNS
+    return max(0, min(MAX_BROWSER_GRID_COLUMNS, size))
+
+
+def _clamp_browser_folder_panel_width(value) -> int:
+    try:
+        size = int(value)
+    except Exception:
+        size = DEFAULT_BROWSER_FOLDER_PANEL_WIDTH
+    return max(MIN_BROWSER_FOLDER_PANEL_WIDTH, min(MAX_BROWSER_FOLDER_PANEL_WIDTH, size))
+
+
+def _clamp_browser_folder_panel_width_percent(value) -> int:
+    try:
+        size = int(value)
+    except Exception:
+        size = DEFAULT_BROWSER_FOLDER_PANEL_WIDTH_PERCENT
+    return max(
+        MIN_BROWSER_FOLDER_PANEL_WIDTH_PERCENT,
+        min(MAX_BROWSER_FOLDER_PANEL_WIDTH_PERCENT, size),
+    )
+
+
+def _get_browser_file_page_size(context, display_mode: str = "LIST") -> int:
+    display_mode = str(display_mode or "LIST").upper()
+    try:
+        addon_prefs = get_all_addon_prefs(context)
+        if addon_prefs is not None:
+            if display_mode == "GRID":
+                rows_override = _clamp_browser_grid_max_rows(
+                    getattr(addon_prefs, "browser_grid_max_rows", DEFAULT_BROWSER_GRID_MAX_ROWS)
+                )
+                rows = rows_override if rows_override > 0 else _estimate_browser_auto_grid_max_rows(context)
+                return max(1, _get_browser_grid_columns(context) * rows)
+            page_size_override = _clamp_browser_file_page_size(
+                getattr(addon_prefs, "browser_file_page_size", DEFAULT_BROWSER_FILE_PAGE_SIZE)
+            )
+            return page_size_override if page_size_override > 0 else _estimate_browser_auto_list_page_size(context)
+    except Exception:
+        pass
+    if display_mode == "GRID":
+        return max(1, _get_browser_grid_columns(context) * _estimate_browser_auto_grid_max_rows(context))
+    return _estimate_browser_auto_list_page_size(context)
+
+
+def _get_browser_ui_scale(context) -> float:
+    try:
+        system_prefs = getattr(getattr(context, "preferences", None), "system", None)
+        ui_scale = float(getattr(system_prefs, "ui_scale", 1.0) or 1.0)
+        pixel_size = float(getattr(system_prefs, "pixel_size", 1.0) or 1.0)
+        scale = ui_scale * pixel_size
+    except Exception:
+        scale = 1.0
+    return max(0.5, min(4.0, scale))
+
+
+def _get_browser_monitor_height_budget_px(context) -> int:
+    _monitor_width, monitor_height = _get_context_monitor_size_px(context)
+    if monitor_height <= 0:
+        monitor_height = 1080
+    return max(320, int(round(float(monitor_height) * BROWSER_MONITOR_HEIGHT_USAGE)))
+
+
+def _estimate_browser_auto_list_page_size(context) -> int:
+    ui_scale = _get_browser_ui_scale(context)
+    budget_height = _get_browser_monitor_height_budget_px(context)
+    usable_height = max(120, budget_height - int(round(BROWSER_LIST_PAGE_OVERHEAD_PX * ui_scale)))
+    row_height = max(18, int(round(BROWSER_LIST_PAGE_ROW_HEIGHT_PX * ui_scale)))
+    rows = max(1, usable_height // row_height)
+    return max(10, min(MAX_BROWSER_FILE_PAGE_SIZE, rows))
+
+
+def _clamp_browser_popup_width_percent(value) -> int:
+    try:
+        size = int(value)
+    except Exception:
+        size = DEFAULT_BROWSER_POPUP_WIDTH_PERCENT
+    return max(MIN_BROWSER_POPUP_WIDTH_PERCENT, min(MAX_BROWSER_POPUP_WIDTH_PERCENT, size))
+
+
+def _get_context_monitor_size_px(context) -> tuple[int, int]:
+    window = getattr(context, "window", None)
+    try:
+        window_width = int(getattr(window, "width", 0) or 0)
+    except Exception:
+        window_width = 0
+    try:
+        window_height = int(getattr(window, "height", 0) or 0)
+    except Exception:
+        window_height = 0
+
+    if os.name == "nt" and window is not None:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            class _MONITORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", _RECT),
+                    ("rcWork", _RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            win_x = int(getattr(window, "x", 0) or 0)
+            win_y = int(getattr(window, "y", 0) or 0)
+            rect = _RECT(win_x, win_y, win_x + max(1, window_width), win_y + max(1, window_height))
+            monitor = ctypes.windll.user32.MonitorFromRect(ctypes.byref(rect), 2)
+            if monitor:
+                info = _MONITORINFO()
+                info.cbSize = ctypes.sizeof(_MONITORINFO)
+                if ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                    monitor_width = int(info.rcMonitor.right - info.rcMonitor.left)
+                    monitor_height = int(info.rcMonitor.bottom - info.rcMonitor.top)
+                    if monitor_width > 0 and monitor_height > 0:
+                        return monitor_width, monitor_height
+        except Exception:
+            pass
+
+    if window_width > 0 and window_height > 0:
+        return window_width, window_height
+    return 1920, 1080
+
+
+def _get_browser_popup_target_width_px(context) -> int:
+    prefs = get_all_addon_prefs(context)
+    monitor_width, _monitor_height = _get_context_monitor_size_px(context)
+    if monitor_width <= 0:
+        monitor_width = 1920
+
+    desired_width = 0
+    if prefs and getattr(prefs, "browser_popup_width", 0) > 0:
+        desired_width = int(getattr(prefs, "browser_popup_width", 0) or 0)
+    else:
+        percent = DEFAULT_BROWSER_POPUP_WIDTH_PERCENT
+        if prefs is not None:
+            percent = _clamp_browser_popup_width_percent(
+                getattr(prefs, "browser_popup_width_percent", DEFAULT_BROWSER_POPUP_WIDTH_PERCENT)
+            )
+        desired_width = int(round((percent / 100.0) * monitor_width))
+
+    safe_margin = int(round(BROWSER_POPUP_SAFE_MARGIN_PX * _get_browser_ui_scale(context)))
+    max_width = max(360, monitor_width - safe_margin)
+    return max(360, min(max_width, desired_width))
+
+
+def _get_browser_popup_layout_width_px(context) -> int:
+    popup_width = 0
+    try:
+        popup_width = int(getattr(getattr(context, "region", None), "width", 0) or 0)
+    except Exception:
+        popup_width = 0
+    if popup_width > 0:
+        return popup_width
+    return _get_browser_popup_target_width_px(context)
+
+
+def _get_browser_folder_panel_width_px(context) -> int:
+    try:
+        addon_prefs = get_all_addon_prefs(context)
+        if addon_prefs is not None:
+            fixed_width = int(getattr(addon_prefs, "browser_folder_panel_width", DEFAULT_BROWSER_FOLDER_PANEL_WIDTH) or 0)
+            if fixed_width > 0:
+                return _clamp_browser_folder_panel_width(fixed_width)
+            monitor_width, _monitor_height = _get_context_monitor_size_px(context)
+            if monitor_width <= 0:
+                monitor_width = 1920
+            percent = _clamp_browser_folder_panel_width_percent(
+                getattr(
+                    addon_prefs,
+                    "browser_folder_panel_width_percent",
+                    DEFAULT_BROWSER_FOLDER_PANEL_WIDTH_PERCENT,
+                )
+            )
+            return _clamp_browser_folder_panel_width(int(round((percent / 100.0) * monitor_width)))
+    except Exception:
+        pass
+    return _clamp_browser_folder_panel_width(
+        int(round((DEFAULT_BROWSER_FOLDER_PANEL_WIDTH_PERCENT / 100.0) * 1920))
+    )
+
+
+def _get_browser_effective_folder_panel_width_px(context, popup_width: int | None = None) -> int:
+    popup_width = int(popup_width or 0)
+    if popup_width <= 0:
+        popup_width = _get_browser_popup_layout_width_px(context)
+    desired_width = _get_browser_folder_panel_width_px(context)
+    max_width = max(MIN_BROWSER_FOLDER_PANEL_WIDTH, popup_width - 220)
+    return max(MIN_BROWSER_FOLDER_PANEL_WIDTH, min(max_width, desired_width))
+
+
+def _get_browser_folder_split_factor(context) -> float:
+    popup_width = _get_browser_popup_layout_width_px(context)
+    if popup_width <= 0:
+        return 0.35
+    folder_width = _get_browser_effective_folder_panel_width_px(context, popup_width)
+    factor = float(folder_width) / float(max(1, popup_width))
+    return max(0.12, min(0.7, factor))
+
+
+def _get_browser_grid_size_mode(context) -> str:
+    try:
+        browser = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+        mode = str(getattr(browser, "grid_size_mode_live", "") or "")
+    except Exception:
+        mode = ""
+    if mode in BROWSER_GRID_SIZE_PRESETS:
+        return mode
+
+    try:
+        addon_prefs = get_all_addon_prefs(context)
+    except Exception:
+        addon_prefs = None
+    if addon_prefs is not None:
+        mode = str(getattr(addon_prefs, "browser_grid_size_mode", DEFAULT_BROWSER_GRID_SIZE_MODE) or "")
+        if mode in BROWSER_GRID_SIZE_PRESETS:
+            return mode
+    return DEFAULT_BROWSER_GRID_SIZE_MODE
+
+
+def _is_browser_dev_mode_enabled() -> bool:
+    try:
+        from ..dev import dev_config
+        return bool(getattr(dev_config, "DEV_MODE_ENABLED", False))
+    except Exception:
+        return False
+
+
+def _get_browser_grid_size_preset(context) -> dict:
+    mode = _get_browser_grid_size_mode(context)
+    preset = dict(BROWSER_GRID_SIZE_PRESETS.get(
+        mode,
+        BROWSER_GRID_SIZE_PRESETS[DEFAULT_BROWSER_GRID_SIZE_MODE],
+    ))
+    if _is_browser_dev_mode_enabled():
+        try:
+            browser = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+        except Exception:
+            browser = None
+        if browser is not None:
+            suffix = mode.lower()
+            padding = getattr(browser, f"debug_{suffix}_padding_px", None)
+            avg_char = getattr(browser, f"debug_{suffix}_avg_char_px", None)
+            chars_min = getattr(browser, f"debug_{suffix}_chars_min", None)
+            chars_max = getattr(browser, f"debug_{suffix}_chars_max", None)
+            if padding is not None:
+                preset["name_padding_px"] = int(padding)
+            if avg_char is not None:
+                preset["avg_char_px"] = float(avg_char)
+            if chars_min is not None:
+                preset["name_chars_min"] = int(chars_min)
+            if chars_max is not None:
+                preset["name_chars_max"] = int(chars_max)
+    return preset
+
+
+def _get_browser_grid_target_tile_width(context) -> int:
+    return int(_get_browser_grid_size_preset(context).get("tile_width", 150))
+
+
+def _estimate_browser_auto_grid_max_rows(context) -> int:
+    ui_scale = _get_browser_ui_scale(context)
+    budget_height = _get_browser_monitor_height_budget_px(context)
+    usable_height = max(120, budget_height - int(round(BROWSER_GRID_PAGE_OVERHEAD_PX * ui_scale)))
+    target_tile_width = _get_browser_grid_target_tile_width(context)
+    row_height = max(
+        int(round(BROWSER_GRID_TILE_HEIGHT_MIN_PX * ui_scale)),
+        int(round(target_tile_width * BROWSER_GRID_TILE_HEIGHT_RATIO * ui_scale)),
+    )
+    rows = max(1, usable_height // max(1, row_height))
+    return max(2, min(MAX_BROWSER_GRID_MAX_ROWS, rows))
+
+
+def _get_browser_grid_columns(context) -> int:
+    try:
+        addon_prefs = get_all_addon_prefs(context)
+    except Exception:
+        addon_prefs = None
+
+    if addon_prefs is not None:
+        fixed_columns = _clamp_browser_grid_columns(getattr(addon_prefs, "browser_grid_columns", DEFAULT_BROWSER_GRID_COLUMNS))
+        if fixed_columns > 0:
+            return fixed_columns
+
+    ui_scale = _get_browser_ui_scale(context)
+    tile_width_physical = max(1, int(round(_get_browser_grid_target_tile_width(context) * ui_scale)))
+
+    file_width = _estimate_browser_file_column_width_px(context)
+    columns = max(1, int(file_width // tile_width_physical))
+    return max(1, min(MAX_BROWSER_GRID_COLUMNS, columns))
+
+
+def _estimate_browser_file_column_width_px(context) -> int:
+    popup_width = _get_browser_popup_layout_width_px(context)
+    usable_popup_width = max(360, popup_width - 24)
+    folder_width = _get_browser_effective_folder_panel_width_px(context, usable_popup_width)
+    file_width = usable_popup_width - folder_width - 16
+    return max(220, file_width)
+
+
+def _get_browser_grid_actual_tile_width_px(context, columns: int = 3) -> int:
+    file_width = _estimate_browser_file_column_width_px(context)
+    return max(120, int(file_width / max(1, int(columns or 1))))
+
+
+def _get_browser_grid_icon_scale(context, columns: int = 3) -> float:
+    preset = _get_browser_grid_size_preset(context)
+    tile_width = _get_browser_grid_actual_tile_width_px(context, columns=columns)
+    base_scale = tile_width / 36.0
+    scale_multiplier = float(preset.get("icon_scale_multiplier", 1.0) or 1.0)
+    return max(3.0, min(6.4, base_scale * scale_multiplier))
+
+
+def _get_browser_grid_name_char_limit(context, columns: int = 3) -> int:
+    preset = _get_browser_grid_size_preset(context)
+    tile_width = _get_browser_grid_actual_tile_width_px(context, columns=columns)
+    ui_scale = _get_browser_ui_scale(context)
+    usable_width = max(48, tile_width - int(round(float(preset.get("name_padding_px", 28) or 28) * ui_scale)))
+    avg_char_px = max(10.0, float(preset.get("avg_char_px", 14.5) or 14.5) * ui_scale)
+    estimated_limit = int(usable_width / avg_char_px)
+    min_chars = int(preset.get("name_chars_min", 6) or 6)
+    max_chars = int(preset.get("name_chars_max", 11) or 11)
+    return max(min_chars, min(max_chars, estimated_limit))
+
+
+def _split_grid_display_name_lines(
+    context,
+    display_name: str,
+    *,
+    columns: int = 3,
+):
+    text = re.sub(r"\s+", " ", str(display_name or "").strip())
+    if not text:
+        return [""]
+    char_limit = max(4, _get_browser_grid_name_char_limit(context, columns=columns))
+    if len(text) <= char_limit:
+        return [text]
+
+    lines = []
+    remaining = text
+    delimiters = (" [", " (", "__", "_", "-", ".", " ")
+    while remaining:
+        if len(remaining) <= char_limit:
+            lines.append(remaining)
+            break
+
+        split_index = 0
+        for delimiter in delimiters:
+            is_open_bracket = delimiter in {" [", " ("}
+            if is_open_bracket:
+                search_end = char_limit + len(delimiter)
+            else:
+                search_end = char_limit
+            candidate_index = remaining.rfind(delimiter, 0, search_end)
+            if candidate_index < 0:
+                continue
+            candidate_end = candidate_index if is_open_bracket else candidate_index + len(delimiter)
+            if candidate_end > char_limit:
+                continue
+            if candidate_end > split_index:
+                split_index = candidate_end
+
+        if split_index <= 0:
+            split_index = char_limit
+
+        line_text = remaining[:split_index].rstrip(" ")
+        if not line_text:
+            split_index = min(len(remaining), char_limit)
+            line_text = remaining[:split_index]
+
+        lines.append(line_text)
+        remaining = remaining[split_index:].lstrip(" ")
+
+    return [line for line in lines if line] or [text]
+
+
+def _get_browser_sort_prefs(browser) -> tuple[str, bool]:
+    sort_by = str(getattr(browser, "sort_by", "NAME") or "NAME")
+    if sort_by not in {"NAME", "EXT"}:
+        sort_by = "NAME"
+    ascending = bool(getattr(browser, "sort_ascending", True))
+    return sort_by, ascending
+
+
+def _sort_browser_items(items, browser):
+    sort_by, ascending = _get_browser_sort_prefs(browser)
+    if sort_by == "EXT":
+        def key_fn(item):
+            name = item.get("name", "")
+            dot = name.rfind(".")
+            ext = name[dot + 1:].lower() if dot >= 0 else ""
+            return (ext, name.lower())
+    else:
+        key_fn = lambda item: item.get("name", "").lower()
+    return sorted(items, key=key_fn, reverse=not ascending)
+
+
+def _sort_browser_search_results(results, browser):
+    """Sort a flat list of path strings (search results)."""
+    sort_by, ascending = _get_browser_sort_prefs(browser)
+    if sort_by == "EXT":
+        def key_fn(path):
+            dot = path.rfind(".")
+            ext = path[dot + 1:].lower() if dot >= 0 else ""
+            return (ext, path.lower())
+    else:
+        key_fn = lambda path: path.lower()
+    return sorted(results, key=key_fn, reverse=not ascending)
+
+
+def _get_browser_page_stats(items, page_index: int, page_size: int):
+    total = len(items)
+    total_pages = max(1, ((total + page_size - 1) // page_size)) if total else 1
+    page_index = max(0, min(int(page_index or 0), total_pages - 1))
+    start = page_index * page_size
+    end = min(start + page_size, total)
+    return {
+        "items": items[start:end],
+        "total": total,
+        "page_index": page_index,
+        "total_pages": total_pages,
+        "visible_start": start + 1 if total else 0,
+        "visible_end": end,
+    }
+
+
+def _ensure_revealed_file_page(context):
+    if not context or not hasattr(context.scene, "witcher_file_browser"):
+        return
+    browser = context.scene.witcher_file_browser
+    revealed = _normalize_virtual_path(getattr(browser, "revealed_file_path", "") or "")
+    if not revealed or browser.search_query:
+        return
+
+    folder_items = folder_structure.get_items(browser.current_folder)
+    filter_text = browser.extension_filter.strip().lower()
+    filtered_items = [
+        item for item in folder_items
+        if item['is_folder'] or not filter_text or filter_text in item['name'].lower()
+    ]
+    filtered_items = _sort_browser_items(
+        [item for item in filtered_items if not item['is_folder']],
+        browser,
+    )
+
+    visible_files = []
+    for item in filtered_items:
+        if item['is_folder']:
+            continue
+        full_item_path = (
+            browser.current_folder + "\\" + item['name']
+            if browser.current_folder else item['name']
+        )
+        visible_files.append(_normalize_virtual_path(full_item_path))
+
+    try:
+        index = next(i for i, item_path in enumerate(visible_files) if item_path.lower() == revealed.lower())
+    except StopIteration:
+        return
+    page_size = _get_browser_file_page_size(context, getattr(browser, "file_display_mode", "LIST"))
+    browser.file_page_index = index // page_size
+
+
+def _default_external_archive_export_root(archive_path: str) -> str:
+    archive_path = win_safe_path(bpy.path.abspath(archive_path or ""))
+    if not archive_path:
+        return ""
+    parent = os.path.dirname(archive_path)
+    stem = Path(archive_path).stem or "archive"
+    return win_safe_path(os.path.join(parent, f"{stem}_extracted"))
+
+
+def _prime_external_archive_export_root(context, archive_path: str) -> str:
+    if not context or not hasattr(context.scene, "witcher_file_browser"):
+        return ""
+    archive_path = _normalize_real_path(archive_path)
+    if not archive_path:
+        return ""
+    browser = context.scene.witcher_file_browser
+    tracked_archive = _normalize_real_path(getattr(browser, "external_extract_root_archive_path", "") or "")
+    configured_root = str(getattr(browser, "external_extract_root", "") or "").strip()
+    if configured_root and tracked_archive and tracked_archive.lower() == archive_path.lower():
+        browser.external_extract_root_archive_path = archive_path
+        return win_safe_path(bpy.path.abspath(configured_root))
+
+    root = _default_external_archive_export_root(archive_path)
+    if root:
+        browser.external_extract_root = root
+        browser.external_extract_root_archive_path = archive_path
+    return root
+
+
+def _get_external_archive_output_root(context, cache_type: str = "", create: bool = False) -> str:
+    if not context or not hasattr(context.scene, "witcher_file_browser"):
+        return ""
+    if cache_type and not is_external_cache(cache_type):
+        return ""
+
+    browser = context.scene.witcher_file_browser
+    configured = str(getattr(browser, "external_extract_root", "") or "").strip()
+    root = win_safe_path(bpy.path.abspath(configured)) if configured else ""
+    if not root:
+        session = get_external_archive_session(cache_type or getattr(browser, "active_cache_type", ""))
+        if session:
+            root = _default_external_archive_export_root(session.get("archive_path", ""))
+            if root:
+                browser.external_extract_root = root
+                browser.external_extract_root_archive_path = win_safe_path(
+                    bpy.path.abspath(session.get("archive_path", "") or "")
+                )
+    if create and root:
+        os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _get_external_texture_export_ext(context, texture_format: str = "") -> str:
+    browser = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+    fmt = str(texture_format or getattr(browser, "external_texture_export_format", "DDS") or "DDS").upper()
+    return {
+        "DDS": ".dds",
+        "PNG": ".png",
+        "TGA": ".tga",
+    }.get(fmt, ".dds")
+
+
+def _get_external_item_output_rel_path(context, cache_type: str, item_path: str, loadmods: bool = False, texture_format: str = "") -> str:
+    rel_path = get_vanilla_path(item_path, loadmods)
+    if not rel_path:
+        return ""
+
+    effective_cache_type = get_effective_cache_type(cache_type)
+    if effective_cache_type == "Collision":
+        return get_collision_output_rel_path(rel_path, loadmods=False)
+    if effective_cache_type == "Texture":
+        base, _ext = os.path.splitext(rel_path)
+        return base + _get_external_texture_export_ext(context, texture_format=texture_format)
+    return rel_path
+
+
+def _get_external_item_output_path(context, cache_type: str, item_path: str, loadmods: bool = False, texture_format: str = "") -> str:
+    root = _get_external_archive_output_root(context, cache_type)
+    rel_path = _get_external_item_output_rel_path(
+        context,
+        cache_type,
+        item_path,
+        loadmods=loadmods,
+        texture_format=texture_format,
+    )
+    if not root or not rel_path:
+        return ""
+    return win_safe_path(os.path.join(root, rel_path.replace("/", os.sep).replace("\\", os.sep)))
 
 def _normalize_dir(path: str) -> str:
     if not path:
@@ -1106,12 +1962,18 @@ def _find_redcloth_material_for_collision_apb(context, collision_item_path: str,
             candidates.append(base + ".redcloth")
 
     seen = set()
+    browser = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+    active_cache_type = str(getattr(browser, "active_cache_type", "") or "")
     for candidate in candidates:
         candidate = (candidate or "").replace("/", "\\")
         key = candidate.lower()
         if not candidate or key in seen:
             continue
         seen.add(key)
+        if active_cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
+            abs_path = _get_external_item_output_path(context, active_cache_type, candidate, loadmods=False)
+            if abs_path and win_path_exists(abs_path):
+                return win_safe_path(abs_path)
         try:
             abs_path = repo_file(candidate)
         except Exception as exc:
@@ -1137,6 +1999,18 @@ def get_uncook_file_info(context, item_path, loadmods=False):
         return (False, 0)
     except Exception:
         return (False, 0)
+
+
+def get_external_file_info(context, cache_type, item_path, loadmods=False):
+    """Check extracted file presence for standalone archive sessions."""
+    try:
+        abs_path = _get_external_item_output_path(context, cache_type, item_path, loadmods=loadmods)
+        if abs_path and win_path_exists(abs_path):
+            return (True, win_path_getsize(abs_path))
+        return (False, 0)
+    except Exception:
+        return (False, 0)
+
 
 def get_collision_file_info(context, item_path, loadmods=False):
     """Check extracted collision file presence using the resolved output extension."""
@@ -1176,6 +2050,8 @@ def get_file_info(context, cache_type, item_path, loadmods=False):
             except Exception:
                 return (True, 0)
         return (False, 0)
+    if is_external_cache(cache_type):
+        return get_external_file_info(context, cache_type, item_path, loadmods=loadmods)
     if cache_type == "Texture":
         return get_texture_file_info(context, item_path, loadmods=loadmods)
     if get_effective_cache_type(cache_type) == "Collision":
@@ -1185,6 +2061,8 @@ def get_file_info(context, cache_type, item_path, loadmods=False):
 def get_source_label(context, item_path, loadmods=False, cache_type=""):
     """Return recorded source label for extracted files (e.g., mod:XYZ or vanilla)."""
     try:
+        if is_external_cache(cache_type):
+            return ""
         effective_cache_type = get_effective_cache_type(cache_type) if cache_type else cache_type
         source_root = get_texture_path(context) if effective_cache_type == "Texture" else get_uncook_path(context)
         source_root = source_root or ""
@@ -1211,6 +2089,9 @@ def get_browser_item_output_path(context, cache_type, item_path, loadmods=False)
     if is_disk_cache(cache_type):
         return get_disk_abs_path(cache_type, item_path) or ""
 
+    if is_external_cache(cache_type):
+        return _get_external_item_output_path(context, cache_type, item_path, loadmods=loadmods)
+
     effective_cache_type = get_effective_cache_type(cache_type)
     if effective_cache_type == "Collision":
         addon_prefs = get_all_addon_prefs(context)
@@ -1231,6 +2112,496 @@ def get_browser_item_output_path(context, cache_type, item_path, loadmods=False)
     return abs_path
 
 
+_browser_asset_preview_collection = None
+_browser_asset_preview_path_cache = {}
+_browser_w2ent_icon_path_cache = {}
+_BROWSER_W2ENT_ICON_CACHE_VERSION = "v5"
+_browser_scaleform_root_cache = {
+    "game_path": "",
+    "roots": (),
+    "scanned": False,
+}
+
+
+def _cache_bounded_store(cache: dict, key, value, max_entries: int = 2048):
+    if len(cache) >= max_entries and key not in cache:
+        cache.clear()
+    cache[key] = value
+
+
+def _get_browser_asset_preview_collection():
+    global _browser_asset_preview_collection
+    if _browser_asset_preview_collection is None:
+        _browser_asset_preview_collection = bpy.utils.previews.new()
+    return _browser_asset_preview_collection
+
+
+def _clear_browser_asset_previews():
+    global _browser_asset_preview_collection
+    _browser_asset_preview_path_cache.clear()
+    _browser_w2ent_icon_path_cache.clear()
+    clear_browser_dummy_icon_cache()
+    _browser_scaleform_root_cache["game_path"] = ""
+    _browser_scaleform_root_cache["roots"] = ()
+    _browser_scaleform_root_cache["scanned"] = False
+    if _browser_asset_preview_collection is not None:
+        try:
+            bpy.utils.previews.remove(_browser_asset_preview_collection)
+        except Exception:
+            pass
+    _browser_asset_preview_collection = None
+
+
+def _make_browser_preview_temp_path(cache_type: str, file_path: str, suffix: str = ".dds") -> str:
+    import hashlib
+    import tempfile
+
+    safe_name = os.path.splitext(os.path.basename(file_path or "preview"))[0] or "preview"
+    digest = hashlib.sha1(
+        f"{cache_type}|{_normalize_virtual_path(file_path)}".encode("utf-8", errors="ignore")
+    ).hexdigest()[:12]
+    preview_dir = os.path.join(tempfile.gettempdir(), "witcher_preview", "browser")
+    os.makedirs(preview_dir, exist_ok=True)
+    return win_safe_path(os.path.join(preview_dir, f"{safe_name}.{digest}{suffix}"))
+
+
+def _collect_strings_from_cr2w_value(value, out_strings: set[str], seen: set[int]):
+    if value is None:
+        return
+
+    obj_id = id(value)
+    if obj_id in seen:
+        return
+
+    if isinstance(value, (list, tuple, set)):
+        seen.add(obj_id)
+        for item in value:
+            _collect_strings_from_cr2w_value(item, out_strings, seen)
+        return
+
+    if isinstance(value, dict):
+        seen.add(obj_id)
+        for item in value.values():
+            _collect_strings_from_cr2w_value(item, out_strings, seen)
+        return
+
+    seen.add(obj_id)
+
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            out_strings.add(text)
+        return
+
+    if hasattr(value, "ToString"):
+        try:
+            text = value.ToString()
+            if isinstance(text, str) and text.strip():
+                out_strings.add(text.strip())
+        except Exception:
+            pass
+
+    for attr_name in ("String", "Value", "value", "DepotPath"):
+        try:
+            attr = getattr(value, attr_name, None)
+        except Exception:
+            attr = None
+        if attr is not None and attr is not value:
+            _collect_strings_from_cr2w_value(attr, out_strings, seen)
+
+    for attr_name in ("PROPS", "More", "elements", "Handles"):
+        try:
+            attr = getattr(value, attr_name, None)
+        except Exception:
+            attr = None
+        if attr:
+            _collect_strings_from_cr2w_value(attr, out_strings, seen)
+
+    try:
+        index_attr = getattr(value, "Index", None)
+    except Exception:
+        index_attr = None
+    if index_attr is not None and index_attr is not value:
+        _collect_strings_from_cr2w_value(index_attr, out_strings, seen)
+
+
+def _extract_scaleform_root_from_path(path_value: str) -> str:
+    normalized = _normalize_virtual_path(path_value)
+    if not normalized:
+        return ""
+
+    lower = normalized.lower()
+    gui_token = "gameplay\\gui_new"
+    idx = lower.find(gui_token)
+    if idx >= 0:
+        return normalized[:idx + len(gui_token)].rstrip("\\")
+    if lower.endswith("\\gui_new"):
+        return normalized.rstrip("\\")
+    if lower.endswith("\\gui_new\\"):
+        return normalized.rstrip("\\")
+    return ""
+
+
+def _extract_scaleform_roots_from_reddlc(reddlc_path: str):
+    roots = set()
+    try:
+        from ..CR2W import CR2W_file
+
+        cr2w_file = CR2W_file.read_CR2W(reddlc_path)
+    except Exception:
+        log.debug("Failed to read DLC scaleform mounter file: %s", reddlc_path, exc_info=True)
+        return roots
+
+    try:
+        scaleform_chunks = cr2w_file.CHUNKS.GetObjectsOfType("CR4ScaleformContentDLCMounter")
+    except Exception:
+        scaleform_chunks = []
+
+    roots_from_strings = set()
+    for chunk in scaleform_chunks:
+        strings = set()
+        _collect_strings_from_cr2w_value(chunk, strings, set())
+        for raw in strings:
+            root = _extract_scaleform_root_from_path(raw)
+            if root:
+                roots.add(root)
+                roots_from_strings.add(root)
+
+    if scaleform_chunks and not roots_from_strings:
+        dlc_name = os.path.basename(os.path.dirname(reddlc_path))
+        if dlc_name:
+            roots.add(_normalize_virtual_path(os.path.join("dlc", dlc_name, "data", "gameplay", "gui_new")))
+    return roots
+
+
+def _get_scaleform_content_roots(context):
+    try:
+        game_path = win_safe_path(bpy.path.abspath(get_game_path(context) or ""))
+    except Exception:
+        game_path = ""
+
+    if (
+        _browser_scaleform_root_cache.get("scanned")
+        and _browser_scaleform_root_cache.get("game_path") == game_path
+    ):
+        return list(_browser_scaleform_root_cache.get("roots") or ())
+
+    extra_roots = set()
+    try:
+        from .. import w3_asset_browser
+
+        reddlc_files = list(w3_asset_browser._iter_top_level_reddlc_files(game_path))
+        for reddlc_path in reddlc_files:
+            extra_roots.update(_extract_scaleform_roots_from_reddlc(reddlc_path))
+    except Exception:
+        log.debug("Failed to scan DLC Scaleform roots for browser icon resolution", exc_info=True)
+
+    ordered_roots = ["gameplay\\gui_new"]
+    ordered_roots.extend(sorted(_normalize_virtual_path(root) for root in extra_roots if root))
+    normalized_roots = tuple(dict.fromkeys(_normalize_virtual_path(root) for root in ordered_roots if root))
+    _browser_scaleform_root_cache["game_path"] = game_path
+    _browser_scaleform_root_cache["roots"] = normalized_roots
+    _browser_scaleform_root_cache["scanned"] = True
+    return list(normalized_roots)
+
+
+def _expand_scaleform_icon_candidates(context, icon_path: str):
+    raw_icon_path = _normalize_virtual_path(icon_path)
+    if not raw_icon_path:
+        return []
+
+    candidates = []
+    seen = set()
+
+    def _add(path_value: str):
+        normalized = _normalize_virtual_path(path_value)
+        if not normalized:
+            return
+        key = normalized.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(normalized)
+
+    for scaleform_root in _get_scaleform_content_roots(context):
+        _add(os.path.join(scaleform_root, raw_icon_path))
+
+    return candidates
+
+
+def _resolve_browser_image_abs_path(abs_path: str) -> str:
+    abs_path = win_safe_path(abs_path or "")
+    if not abs_path or not win_path_exists(abs_path):
+        return ""
+
+    ext = os.path.splitext(abs_path)[1].lower()
+    if ext in {'.dds', '.png', '.jpg', '.jpeg', '.tga', '.bmp'}:
+        return abs_path
+    if ext == '.xbm':
+        dds_path = os.path.splitext(abs_path)[0] + '.dds'
+        if not win_path_exists(dds_path):
+            try:
+                convert_xbm_to_dds(abs_path)
+            except Exception:
+                return ""
+        if win_path_exists(dds_path):
+            return dds_path
+    return ""
+
+
+def _iter_preview_lookup_paths(file_path: str):
+    normalized = _normalize_virtual_path(file_path)
+    if not normalized:
+        return []
+    base, ext = os.path.splitext(normalized)
+    candidates = [normalized]
+    for alt_ext in ('.xbm', '.dds', '.png', '.tga', '.bmp'):
+        candidate = base + alt_ext
+        if candidate.lower() != normalized.lower():
+            candidates.append(candidate)
+    return candidates
+
+
+def _resolve_preview_image_path(context, cache_type: str, file_path: str, loadmods: bool = False) -> str:
+    """Resolve an image file suitable for previewing a browser asset icon."""
+    search_path = _normalize_virtual_path(file_path)
+    if not search_path:
+        return ""
+
+    temp_path = ""
+    override_roots = []
+    if is_disk_cache(cache_type):
+        override_roots = get_repo_override_roots_for_item(context, cache_type, search_path)
+
+    try:
+        if override_roots:
+            set_repo_override_roots(override_roots, read_only=True)
+
+        with mod_loading_context(context, overwrite=False):
+            if os.path.splitext(search_path)[1].lower() == '.w2cube':
+                abs_path = ""
+                try:
+                    abs_path = repo_file(get_vanilla_path(search_path, loadmods))
+                except Exception:
+                    abs_path = ""
+                if not abs_path or not win_path_exists(abs_path):
+                    abs_path = get_uncook_abs_path(context, search_path, loadmods)
+                if not abs_path or not win_path_exists(abs_path):
+                    if is_disk_cache(cache_type):
+                        abs_path = get_disk_abs_path(cache_type, search_path)
+                if abs_path and win_path_exists(abs_path):
+                    return build_w2cube_preview(abs_path) or ""
+                return ""
+
+            if is_w2ter_buffer_file(search_path):
+                return build_w2ter_buffer_preview(context, cache_type, search_path) or ""
+
+            if is_disk_cache(cache_type):
+                for candidate_path in _iter_preview_lookup_paths(search_path):
+                    resolved = _resolve_browser_image_abs_path(get_disk_abs_path(cache_type, candidate_path))
+                    if resolved:
+                        return resolved
+                return ""
+
+            if get_effective_cache_type(cache_type) == "Texture":
+                for candidate_path in _iter_preview_lookup_paths(search_path):
+                    items = _get_texture_cache_items(candidate_path, cache_type=cache_type, loadmods=loadmods)
+                    if items:
+                        final_item = items[-1] if isinstance(items, list) else items
+                        temp_path = _make_browser_preview_temp_path(cache_type, candidate_path, ".dds")
+                        if not win_path_exists(temp_path):
+                            final_item.extract_to_file(temp_path)
+                        if win_path_exists(temp_path):
+                            return temp_path
+
+                for candidate_path in _iter_preview_lookup_paths(search_path):
+                    try:
+                        abs_path = repo_file(candidate_path)
+                    except Exception:
+                        abs_path = ""
+                    resolved = _resolve_browser_image_abs_path(abs_path)
+                    if resolved:
+                        return resolved
+                return ""
+
+            try:
+                manager = LoadTextureManager(loadmods=loadmods)
+                for candidate_path in _iter_preview_lookup_paths(search_path):
+                    items = manager.find_item_by_path_name(candidate_path)
+                    if items:
+                        final_item = items[-1] if isinstance(items, list) else items
+                        temp_path = _make_browser_preview_temp_path(cache_type, candidate_path, ".dds")
+                        if not win_path_exists(temp_path):
+                            final_item.extract_to_file(temp_path)
+                        if win_path_exists(temp_path):
+                            return temp_path
+            except Exception:
+                pass
+
+            for candidate_path in _iter_preview_lookup_paths(search_path):
+                try:
+                    lookup_path = candidate_path
+                    if loadmods and "\\" in candidate_path:
+                        mod_name = candidate_path.split("\\", 1)[0]
+                        lookup_path = strip_mod_prefix(candidate_path, mod_name)
+                    abs_path = repo_file(lookup_path)
+                except Exception:
+                    abs_path = ""
+                resolved = _resolve_browser_image_abs_path(abs_path)
+                if resolved:
+                    return resolved
+            return ""
+    finally:
+        if override_roots:
+            clear_repo_override_roots()
+
+
+def _resolve_w2ent_icon_virtual_path(context, cache_type: str, item_path: str, loadmods: bool = False) -> str:
+    normalized_item = _normalize_virtual_path(get_vanilla_path(item_path, loadmods) or item_path)
+    if not normalized_item.lower().endswith(".w2ent"):
+        return ""
+
+    source_game = "w2" if cache_type == "Witcher 2 Data" else "w3"
+    cache_key = (_BROWSER_W2ENT_ICON_CACHE_VERSION, source_game, normalized_item.lower())
+    if cache_key in _browser_w2ent_icon_path_cache:
+        return _browser_w2ent_icon_path_cache[cache_key]
+
+    icon_path = ""
+    try:
+        from . import ui_equipment
+
+        search_roots = []
+        if source_game == "w2":
+            search_roots = get_repo_override_roots_for_item(context, cache_type, normalized_item)
+        ui_equipment.ensure_equipment_catalog_ready(
+            source_game=source_game,
+            search_roots=search_roots,
+            context=context,
+            require_browser_icon_fields=True,
+        )
+        raw_icon_path = ""
+        identifier_candidates = [
+            normalized_item,
+            os.path.splitext(os.path.basename(normalized_item))[0],
+        ]
+        for identifier in identifier_candidates:
+            raw_icon_path = str(
+                ui_equipment.get_item_icon_path(identifier, source_game=source_game, strict=True) or ""
+            )
+            if raw_icon_path:
+                break
+        for candidate_path in _expand_scaleform_icon_candidates(context, raw_icon_path):
+            preview_path = _resolve_preview_image_path(context, cache_type, candidate_path, loadmods=loadmods)
+            if preview_path and win_path_exists(preview_path):
+                icon_path = candidate_path
+                break
+    except Exception:
+        icon_path = ""
+
+    _cache_bounded_store(_browser_w2ent_icon_path_cache, cache_key, icon_path, max_entries=4096)
+    return icon_path
+
+
+def _get_browser_item_preview_target(context, cache_type: str, item_path: str, loadmods: bool = False):
+    normalized_item = _normalize_virtual_path(item_path)
+    if not normalized_item:
+        return None
+    if is_texture_file(normalized_item) or is_w2ter_buffer_file(normalized_item):
+        return {
+            "kind": "image",
+            "target_path": normalized_item,
+        }
+    if normalized_item.lower().endswith(".w2ent"):
+        icon_path = _resolve_w2ent_icon_virtual_path(context, cache_type, normalized_item, loadmods=loadmods)
+        if icon_path:
+            return {
+                "kind": "entity_icon",
+                "target_path": icon_path,
+            }
+    return None
+
+
+def _add_browser_preview_button(layout, context, cache_type: str, item_path: str, loadmods: bool = False) -> bool:
+    preview_target = _get_browser_item_preview_target(context, cache_type, item_path, loadmods=loadmods)
+    if not preview_target:
+        return False
+    op = layout.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
+    op.file_path = preview_target["target_path"]
+    op.cache_type = cache_type
+    return True
+
+
+def _add_browser_preview_button_slot(layout, context, cache_type: str, item_path: str, loadmods: bool = False) -> bool:
+    slot = layout.row(align=True)
+    if _add_browser_preview_button(slot, context, cache_type, item_path, loadmods=loadmods):
+        return True
+    slot.enabled = False
+    slot.label(text="", icon='IMAGE_DATA')
+    return False
+
+
+def _get_browser_item_icon_info(context, cache_type: str, item_path: str, loadmods: bool = False):
+    type_label = get_browser_item_type_label(item_path, cache_type)
+    preview_target = _get_browser_item_preview_target(context, cache_type, item_path, loadmods=loadmods)
+    preview_path = ""
+    cache_key = ""
+    is_dummy = False
+
+    if preview_target:
+        target_path = preview_target["target_path"]
+        cache_key = f"{cache_type}|{int(bool(loadmods))}|{preview_target['kind']}|{target_path.lower()}"
+        preview_path = _browser_asset_preview_path_cache.get(cache_key, "")
+        if not preview_path or not win_path_exists(preview_path):
+            preview_path = _resolve_preview_image_path(context, cache_type, target_path, loadmods=loadmods)
+            if preview_path and win_path_exists(preview_path):
+                _cache_bounded_store(_browser_asset_preview_path_cache, cache_key, preview_path, max_entries=4096)
+            else:
+                preview_path = ""
+
+    if not preview_path:
+        preview_path = ensure_browser_dummy_icon_path(cache_type, item_path)
+        cache_key = f"dummy|{cache_type}|{type_label}"
+        is_dummy = True
+
+    if not preview_path or not win_path_exists(preview_path):
+        return {
+            "icon_id": 0,
+            "is_dummy": is_dummy,
+            "type_label": type_label,
+            "has_preview_target": bool(preview_target),
+        }
+
+    preview_key = f"{cache_key}|{preview_path.lower()}"
+    pcoll = _get_browser_asset_preview_collection()
+    try:
+        icon = pcoll.get(preview_key)
+    except Exception:
+        icon = None
+    if icon is None:
+        try:
+            icon = pcoll.load(preview_key, win_safe_path(preview_path), 'IMAGE')
+        except Exception:
+            icon = None
+
+    icon_id = 0
+    try:
+        if icon is not None:
+            icon_id = int(icon.icon_id)
+    except Exception:
+        icon_id = 0
+
+    return {
+        "icon_id": icon_id,
+        "is_dummy": is_dummy,
+        "type_label": type_label,
+        "has_preview_target": bool(preview_target),
+    }
+
+
+def _ensure_browser_item_icon_id(context, cache_type: str, item_path: str, loadmods: bool = False) -> int:
+    return int(_get_browser_item_icon_info(context, cache_type, item_path, loadmods=loadmods).get("icon_id", 0) or 0)
+
+
 _sound_preview_state = {
     "cache_type": "",
     "item_path": "",
@@ -1243,11 +2614,60 @@ _sound_preview_device = None
 
 def _tag_browser_redraw(context) -> None:
     try:
+        if context and getattr(context, "region", None) and hasattr(context.region, "tag_redraw"):
+            context.region.tag_redraw()
+        if context and getattr(context, "area", None):
+            context.area.tag_redraw()
+            for region in getattr(context.area, "regions", []):
+                if hasattr(region, "tag_redraw"):
+                    region.tag_redraw()
         if context and getattr(context, "screen", None):
             for area in context.screen.areas:
                 area.tag_redraw()
+                for region in getattr(area, "regions", []):
+                    if hasattr(region, "tag_redraw"):
+                        region.tag_redraw()
     except Exception:
         pass
+
+
+def _touch_external_export_ui(context) -> None:
+    browser = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+    if browser is not None:
+        try:
+            browser.external_export_ui_ping = (int(getattr(browser, "external_export_ui_ping", 0) or 0) + 1) % 1000000
+        except Exception:
+            pass
+    _tag_browser_redraw(context)
+
+
+def _set_external_export_status(
+    *,
+    visible: bool,
+    state: str,
+    cache_type: str = "",
+    folder_path: str = "",
+    output_root: str = "",
+    processed: int = 0,
+    total: int = 0,
+    done: int = 0,
+    skipped: int = 0,
+    errors: int = 0,
+    message: str = "",
+) -> None:
+    _EXTERNAL_BROWSER_EXPORT_STATUS.update({
+        "visible": bool(visible),
+        "state": str(state or "idle"),
+        "cache_type": str(cache_type or ""),
+        "folder_path": str(folder_path or ""),
+        "output_root": str(output_root or ""),
+        "processed": int(processed or 0),
+        "total": int(total or 0),
+        "done": int(done or 0),
+        "skipped": int(skipped or 0),
+        "errors": int(errors or 0),
+        "message": str(message or ""),
+    })
 
 
 def _sound_preview_matches(cache_type: str, item_path: str) -> bool:
@@ -1317,7 +2737,10 @@ def _get_sound_item_and_export_path(context, item_path: str, loadmods: bool = Fa
     if vanilla_name == item_name and mod_name:
         vanilla_name = strip_mod_prefix(full_path_norm, mod_name)
 
-    export_path = repo_file(vanilla_name)
+    if cache_type == EXTERNAL_SOUND_CACHE_TYPE:
+        export_path = _get_external_item_output_path(context, cache_type, vanilla_name, loadmods=False)
+    else:
+        export_path = repo_file(vanilla_name)
     return final_item, export_path
 
 
@@ -1332,9 +2755,12 @@ def ensure_sound_item_extracted(context, item_path: str, loadmods: bool = False,
         return ""
 
     if not win_path_exists(export_path):
-        addon_prefs = get_all_addon_prefs(context)
-        uncook_path = addon_prefs.uncook_path if addon_prefs else ""
-        if prepare_extraction_target(export_path, uncook_path):
+        if cache_type == EXTERNAL_SOUND_CACHE_TYPE:
+            prep_root = _get_external_archive_output_root(context, cache_type, create=True)
+        else:
+            addon_prefs = get_all_addon_prefs(context)
+            prep_root = addon_prefs.uncook_path if addon_prefs else ""
+        if prepare_extraction_target(export_path, prep_root):
             written_path = final_item.extract_to_file(export_path)
             if written_path:
                 export_path = written_path
@@ -1513,18 +2939,44 @@ def resolve_w2ter_buffer_abs_path(context, cache_type, file_path, loadmods=False
 
 def _save_preview_png(path: str, rgba_u8: np.ndarray) -> bool:
     try:
-        height, width, _ = rgba_u8.shape
-        img_name = f"W3_preview_{os.path.basename(path)}"
-        image = bpy.data.images.new(name=img_name, width=width, height=height, alpha=True)
-        rgba = rgba_u8.astype(np.float32) / 255.0
-        rgba = np.flipud(rgba)
-        image.pixels.foreach_set(rgba.ravel())
-        image.filepath_raw = path
-        image.file_format = 'PNG'
-        image.save()
-        bpy.data.images.remove(image)
+        rgba = np.asarray(rgba_u8, dtype=np.uint8)
+        if rgba.ndim != 3 or rgba.shape[2] != 4:
+            raise ValueError(f"Expected RGBA uint8 array, got shape {getattr(rgba, 'shape', None)}")
+
+        height, width, _channels = rgba.shape
+        parent_dir = os.path.dirname(path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+
+        def _png_chunk(chunk_type: bytes, chunk_data: bytes) -> bytes:
+            crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+            return (
+                struct.pack(">I", len(chunk_data))
+                + chunk_type
+                + chunk_data
+                + struct.pack(">I", crc)
+            )
+
+        raw_rows = bytearray()
+        for row_index in range(height):
+            raw_rows.append(0)  # PNG filter type 0
+            raw_rows.extend(rgba[row_index].tobytes())
+
+        png_bytes = bytearray(b"\x89PNG\r\n\x1a\n")
+        png_bytes.extend(
+            _png_chunk(
+                b"IHDR",
+                struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0),
+            )
+        )
+        png_bytes.extend(_png_chunk(b"IDAT", zlib.compress(bytes(raw_rows), level=6)))
+        png_bytes.extend(_png_chunk(b"IEND", b""))
+
+        with open(path, "wb") as handle:
+            handle.write(png_bytes)
         return True
     except Exception:
+        log.debug("Failed to write preview PNG: %s", path, exc_info=True)
         return False
 
 def build_w2ter_buffer_preview(context, cache_type, file_path) -> str:
@@ -2329,43 +3781,114 @@ import json
 import time
 
 MAX_RECENT_ITEMS = 20
+RECENT_KIND_IMPORT = "import"
+RECENT_KIND_EXTERNAL_ARCHIVE = "external_archive"
 
 
-def add_recent_import(context, path, cache_type):
-    """Add an import to the recent files list."""
+def _recent_entry_key(entry):
+    return (
+        entry.get("kind", RECENT_KIND_IMPORT),
+        entry.get("cache_type", ""),
+        entry.get("path", ""),
+        entry.get("archive_path", "") if is_external_cache(entry.get("cache_type", "")) else "",
+    )
+
+
+def _normalize_recent_entry(entry):
+    if not isinstance(entry, dict):
+        return None
+
+    path = str(entry.get("path", "") or "")
+    cache_type = str(entry.get("cache_type", "") or "")
+    if not path or not cache_type:
+        return None
+
+    normalized = {
+        "path": path,
+        "cache_type": cache_type,
+        "timestamp": float(entry.get("timestamp", time.time()) or time.time()),
+        "kind": str(entry.get("kind", RECENT_KIND_IMPORT) or RECENT_KIND_IMPORT),
+    }
+
+    archive_path = str(entry.get("archive_path", "") or "")
+    if archive_path:
+        normalized["archive_path"] = archive_path
+
+    display_name = str(entry.get("display_name", "") or "")
+    if display_name:
+        normalized["display_name"] = display_name
+
+    return normalized
+
+
+def add_recent_entry(context, path, cache_type, kind=RECENT_KIND_IMPORT, archive_path="", display_name=""):
+    """Add a recent browser activity entry."""
     try:
         addon_prefs = get_all_addon_prefs(context)
-        recent = json.loads(addon_prefs.browser_recent_imports or "[]")
+        raw_recent = json.loads(addon_prefs.browser_recent_imports or "[]")
+        recent = [item for item in (_normalize_recent_entry(r) for r in raw_recent) if item]
 
-        # Remove if already exists (will re-add at top)
-        recent = [r for r in recent if r.get('path') != path]
-
-        # Add to front
-        recent.insert(0, {
-            'path': path,
-            'cache_type': cache_type,
-            'timestamp': time.time()
+        entry = _normalize_recent_entry({
+            "path": path,
+            "cache_type": cache_type,
+            "kind": kind,
+            "archive_path": archive_path,
+            "display_name": display_name,
+            "timestamp": time.time(),
         })
+        if not entry:
+            return
 
-        # Limit size
+        entry_key = _recent_entry_key(entry)
+        recent = [r for r in recent if _recent_entry_key(r) != entry_key]
+        recent.insert(0, entry)
         recent = recent[:MAX_RECENT_ITEMS]
 
         addon_prefs.browser_recent_imports = json.dumps(recent)
     except Exception as e:
-        log.error("Failed to save recent import: %s", e)
+        log.error("Failed to save recent browser entry: %s", e)
+
+
+def add_recent_import(context, path, cache_type):
+    """Add an import to the recent files list."""
+    archive_path = ""
+    if is_external_cache(cache_type):
+        session = get_external_archive_session(cache_type)
+        if session:
+            archive_path = session.get("archive_path", "") or ""
+    add_recent_entry(
+        context,
+        path,
+        cache_type,
+        kind=RECENT_KIND_IMPORT,
+        archive_path=archive_path,
+    )
+
+
+def add_recent_external_archive(context, cache_type, archive_path):
+    """Track a standalone archive open/reopen in the recent list."""
+    display_name = os.path.basename(archive_path or "") or archive_path
+    add_recent_entry(
+        context,
+        archive_path,
+        cache_type,
+        kind=RECENT_KIND_EXTERNAL_ARCHIVE,
+        display_name=display_name,
+    )
 
 
 def get_recent_imports(context):
-    """Get list of recent imports."""
+    """Get recent browser activity entries."""
     try:
         addon_prefs = get_all_addon_prefs(context)
-        return json.loads(addon_prefs.browser_recent_imports or "[]")
+        raw_recent = json.loads(addon_prefs.browser_recent_imports or "[]")
+        return [item for item in (_normalize_recent_entry(r) for r in raw_recent) if item]
     except Exception:
         return []
 
 
 def clear_recent_imports(context):
-    """Clear all recent imports."""
+    """Clear all recent browser activity."""
     try:
         addon_prefs = get_all_addon_prefs(context)
         addon_prefs.browser_recent_imports = "[]"
@@ -2373,23 +3896,44 @@ def clear_recent_imports(context):
         pass
 
 
-def add_bookmark(context, path, cache_type, name=None):
+def get_last_recent_external_archive(context):
+    """Return the most recently opened standalone archive, if any."""
+    for item in get_recent_imports(context):
+        if item.get("kind") == RECENT_KIND_EXTERNAL_ARCHIVE and is_external_cache(item.get("cache_type", "")):
+            return item
+    return None
+
+
+def add_bookmark(context, path, cache_type, name=None, archive_path=""):
     """Add a bookmark."""
     try:
         addon_prefs = get_all_addon_prefs(context)
         bookmarks = json.loads(addon_prefs.browser_bookmarks or "[]")
+        archive_path = str(archive_path or "")
+        if is_external_cache(cache_type) and not archive_path:
+            session = get_external_archive_session(cache_type)
+            if session:
+                archive_path = session.get("archive_path", "") or ""
 
         # Check if already exists
-        if any(b.get('path') == path and b.get('cache_type') == cache_type for b in bookmarks):
+        if any(
+            b.get('path') == path
+            and b.get('cache_type') == cache_type
+            and str(b.get('archive_path', '') or '') == archive_path
+            for b in bookmarks
+        ):
             return False
 
         # Add bookmark
         display_name = name or (path.split("\\")[-1] if path else cache_type)
-        bookmarks.append({
+        bookmark = {
             'path': path,
             'cache_type': cache_type,
             'name': display_name
-        })
+        }
+        if archive_path:
+            bookmark['archive_path'] = archive_path
+        bookmarks.append(bookmark)
 
         addon_prefs.browser_bookmarks = json.dumps(bookmarks)
         return True
@@ -2398,12 +3942,20 @@ def add_bookmark(context, path, cache_type, name=None):
         return False
 
 
-def remove_bookmark(context, path, cache_type):
+def remove_bookmark(context, path, cache_type, archive_path=""):
     """Remove a bookmark."""
     try:
         addon_prefs = get_all_addon_prefs(context)
         bookmarks = json.loads(addon_prefs.browser_bookmarks or "[]")
-        bookmarks = [b for b in bookmarks if not (b.get('path') == path and b.get('cache_type') == cache_type)]
+        archive_path = str(archive_path or "")
+        bookmarks = [
+            b for b in bookmarks
+            if not (
+                b.get('path') == path
+                and b.get('cache_type') == cache_type
+                and str(b.get('archive_path', '') or '') == archive_path
+            )
+        ]
         addon_prefs.browser_bookmarks = json.dumps(bookmarks)
         return True
     except Exception:
@@ -2419,10 +3971,16 @@ def get_bookmarks(context):
         return []
 
 
-def is_bookmarked(context, path, cache_type):
+def is_bookmarked(context, path, cache_type, archive_path=""):
     """Check if a path is bookmarked."""
     bookmarks = get_bookmarks(context)
-    return any(b.get('path') == path and b.get('cache_type') == cache_type for b in bookmarks)
+    archive_path = str(archive_path or "")
+    return any(
+        b.get('path') == path
+        and b.get('cache_type') == cache_type
+        and str(b.get('archive_path', '') or '') == archive_path
+        for b in bookmarks
+    )
 
 
 # Batch selection tracking
@@ -2486,10 +4044,11 @@ def get_visible_batch_file_paths(context):
     else:
         filtered_items = folder_items
 
+    file_items = [item for item in filtered_items if not item['is_folder']]
+    page_size = _get_browser_file_page_size(context, getattr(witcher_file_browser, "file_display_mode", "LIST"))
+    file_stats = _get_browser_page_stats(file_items, witcher_file_browser.file_page_index, page_size)
     visible_files = []
-    for item in filtered_items:
-        if item['is_folder']:
-            continue
+    for item in file_stats["items"]:
         full_item_path = (
             witcher_file_browser.current_folder + "\\" + item['name']
             if witcher_file_browser.current_folder else item['name']
@@ -2498,12 +4057,266 @@ def get_visible_batch_file_paths(context):
     return visible_files
 
 
+def get_export_scope_file_paths(context):
+    """Return recursively exportable file paths under the current browser folder."""
+    if not context or not hasattr(context.scene, "witcher_file_browser"):
+        return []
+
+    witcher_file_browser = context.scene.witcher_file_browser
+    cache_type = witcher_file_browser.active_cache_type
+    if not cache_type or witcher_file_browser.search_query:
+        return []
+
+    current_folder = str(witcher_file_browser.current_folder or "").replace("/", "\\").strip("\\")
+    filter_text = witcher_file_browser.extension_filter.strip().lower()
+    prefix = (current_folder + "\\").lower() if current_folder else ""
+    paths = []
+    seen = set()
+    for original_path in folder_structure.index.values():
+        full_path = str(original_path or "").replace("/", "\\")
+        if not full_path:
+            continue
+        full_lower = full_path.lower()
+        if prefix and not full_lower.startswith(prefix):
+            continue
+        if filter_text and filter_text not in os.path.basename(full_path).lower():
+            continue
+        if full_lower in seen:
+            continue
+        seen.add(full_lower)
+        paths.append(full_path)
+    return sorted(paths, key=str.lower)
+
+
+def _export_external_archive_item(
+    context,
+    cache_type: str,
+    item_path: str,
+    *,
+    overwrite: bool = False,
+    output_root: str = "",
+    texture_format: str = "",
+) -> dict:
+    """Extract one file from a standalone archive to the chosen export root."""
+    cache_type = str(cache_type or "")
+    if not is_external_cache(cache_type):
+        raise ValueError(f"Unsupported external cache type: {cache_type}")
+
+    full_path_norm = (item_path or "").replace("/", "\\")
+    if not full_path_norm:
+        raise ValueError("No item path provided")
+
+    output_root = win_safe_path(output_root or _get_external_archive_output_root(context, cache_type, create=True))
+    if not output_root:
+        raise ValueError("No standalone archive export folder is configured")
+
+    result = {
+        "primary_path": "",
+        "all_paths": [],
+        "skipped": False,
+    }
+
+    if cache_type == EXTERNAL_BUNDLE_CACHE_TYPE:
+        session = get_external_archive_session(cache_type)
+        items = session.get("items", {}).get(full_path_norm) if session else None
+        if not items:
+            raise FileNotFoundError(f"Bundle item not found: {full_path_norm}")
+        final_item = items[-1] if isinstance(items, list) else items
+        item_name = getattr(final_item, "name", None) or getattr(final_item, "Name", full_path_norm)
+        rel_path = get_vanilla_path(item_name, False)
+        export_path = win_safe_path(os.path.join(output_root, rel_path.replace("/", os.sep).replace("\\", os.sep)))
+        if not overwrite and win_path_exists(export_path):
+            result["primary_path"] = export_path
+            result["all_paths"] = [export_path]
+            result["skipped"] = True
+            return result
+        if prepare_extraction_target(export_path, output_root):
+            written_path = final_item.extract_to_file(export_path)
+            if written_path:
+                export_path = written_path
+        result["primary_path"] = export_path
+        result["all_paths"] = [export_path]
+        return result
+
+    if cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
+        session = get_external_archive_session(cache_type)
+        items = session.get("items", {}).get(full_path_norm) if session else None
+        if not items:
+            raise FileNotFoundError(f"Collision item not found: {full_path_norm}")
+        final_item = items[-1] if isinstance(items, list) else items
+        rel_path = get_collision_output_rel_path(full_path_norm, loadmods=False)
+        export_path = win_safe_path(os.path.join(output_root, rel_path.replace("/", os.sep).replace("\\", os.sep)))
+        if not overwrite and win_path_exists(export_path):
+            result["primary_path"] = export_path
+            result["all_paths"] = [export_path]
+            result["skipped"] = True
+            return result
+        if prepare_extraction_target(export_path, output_root):
+            written_path = final_item.extract_to_file(export_path)
+            if written_path:
+                export_path = written_path
+        result["primary_path"] = export_path
+        result["all_paths"] = [export_path]
+        return result
+
+    if cache_type == EXTERNAL_SOUND_CACHE_TYPE:
+        final_item, export_path = _get_sound_item_and_export_path(
+            context,
+            full_path_norm,
+            loadmods=False,
+            cache_type=cache_type,
+        )
+        if final_item is None or not export_path:
+            raise FileNotFoundError(f"Sound item not found: {full_path_norm}")
+        if not overwrite and win_path_exists(export_path):
+            result["primary_path"] = export_path
+            result["all_paths"] = [export_path]
+            result["skipped"] = True
+            return result
+        if prepare_extraction_target(export_path, output_root):
+            written_path = final_item.extract_to_file(export_path)
+            if written_path:
+                export_path = written_path
+        result["primary_path"] = export_path
+        result["all_paths"] = [export_path]
+        return result
+
+    if cache_type == EXTERNAL_TEXTURE_CACHE_TYPE:
+        items = _get_texture_cache_items(full_path_norm, cache_type=cache_type)
+        if not items:
+            raise FileNotFoundError(f"Texture item not found: {full_path_norm}")
+
+        final_item = items[-1] if isinstance(items, list) else items
+        item_name = getattr(final_item, "Name", full_path_norm) or full_path_norm
+        rel_name = get_vanilla_path(item_name, False)
+        base_rel = os.path.splitext(rel_name)[0]
+        desired_ext = _get_external_texture_export_ext(context, texture_format=texture_format)
+        target_path = win_safe_path(os.path.join(output_root, (base_rel + desired_ext).replace("/", os.sep).replace("\\", os.sep)))
+        dds_path = win_safe_path(os.path.join(output_root, (base_rel + ".dds").replace("/", os.sep).replace("\\", os.sep)))
+
+        if not overwrite and win_path_exists(target_path):
+            result["primary_path"] = target_path
+            result["all_paths"] = [target_path]
+            result["skipped"] = True
+            return result
+
+        if prepare_extraction_target(dds_path, output_root):
+            final_item.extract_to_file(dds_path)
+
+        final_path = dds_path
+        if desired_ext != ".dds":
+            from ..CR2W import texconv_wrapper
+
+            if desired_ext == ".png":
+                final_path = texconv_wrapper.convert_dds_to_png(dds_path, output_dir=os.path.dirname(target_path))
+            elif desired_ext == ".tga":
+                final_path = texconv_wrapper.convert_dds_to_tga(dds_path, output_dir=os.path.dirname(target_path))
+            else:
+                raise ValueError(f"Unsupported texture export format: {desired_ext}")
+            if win_path_exists(dds_path):
+                try:
+                    os.unlink(dds_path)
+                except OSError:
+                    pass
+
+        result["primary_path"] = win_safe_path(final_path)
+        result["all_paths"] = [win_safe_path(final_path)]
+        return result
+
+    raise ValueError(f"Unsupported external cache type: {cache_type}")
+
+
+def _load_external_archive_session(cache_type: str, archive_path: str):
+    filepath = win_safe_path(bpy.path.abspath(archive_path or ""))
+    if not filepath or not os.path.isfile(filepath):
+        raise FileNotFoundError(f"Archive file not found: {archive_path}")
+
+    if cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
+        archive = CollisionCache(filepath)
+        items = {}
+        collision_exts = {}
+        for item in getattr(archive, "Files", []):
+            key = (getattr(item, "Name", "") or "").replace("/", "\\")
+            if not key or _should_skip_buffer_name(key):
+                continue
+            items.setdefault(key, []).append(item)
+            ext = getattr(item, "Extension", "")
+            if ext:
+                collision_exts[key] = ext
+        if not items:
+            raise ValueError("No readable entries found in collision cache")
+        set_external_archive_session(
+            EXTERNAL_COLLISION_CACHE_TYPE,
+            filepath,
+            items,
+            collision_exts=collision_exts,
+        )
+        return {"archive_path": filepath, "item_count": len(items)}
+
+    if cache_type == EXTERNAL_TEXTURE_CACHE_TYPE:
+        archive = TextureCache(filepath)
+        items = {}
+        for item in getattr(archive, "Files", []):
+            key = (getattr(item, "Name", "") or "").replace("/", "\\")
+            if not key or _should_skip_buffer_name(key):
+                continue
+            items.setdefault(key, []).append(item)
+        if not items:
+            raise ValueError("No readable entries found in texture cache")
+        set_external_archive_session(EXTERNAL_TEXTURE_CACHE_TYPE, filepath, items)
+        return {"archive_path": filepath, "item_count": len(items)}
+
+    if cache_type == EXTERNAL_SOUND_CACHE_TYPE:
+        soundbanks_info = SoundBanksInfoXML(_soundbanks_metadata_path())
+        archive = SoundCache(filepath, soundbanks_info=soundbanks_info)
+        items = {}
+        for item in getattr(archive, "Files", []):
+            key = (getattr(item, "Name", "") or "").replace("/", "\\")
+            if not key or _should_skip_buffer_name(key):
+                continue
+            items.setdefault(key, []).append(item)
+        if not items:
+            raise ValueError("No readable entries found in sound cache")
+        set_external_archive_session(EXTERNAL_SOUND_CACHE_TYPE, filepath, items)
+        return {"archive_path": filepath, "item_count": len(items)}
+
+    if cache_type == EXTERNAL_BUNDLE_CACHE_TYPE:
+        archive = Bundle(filepath)
+        items = {}
+        for key, item in getattr(archive, "Items", {}).items():
+            key_str = str(key).replace("/", "\\")
+            if not key_str or _should_skip_buffer_name(key_str):
+                continue
+            items.setdefault(key_str, []).append(item)
+        if not items:
+            raise ValueError("No readable entries found in bundle")
+        set_external_archive_session(EXTERNAL_BUNDLE_CACHE_TYPE, filepath, items)
+        return {"archive_path": filepath, "item_count": len(items)}
+
+    raise ValueError(f"Unsupported external cache type: {cache_type}")
+
+
+def _ensure_external_archive_session(context, cache_type: str, archive_path: str = ""):
+    session = get_external_archive_session(cache_type)
+    requested_path = _normalize_real_path(archive_path)
+    current_path = _normalize_real_path(session.get("archive_path", "") or "") if session else ""
+    if session and (not requested_path or current_path.lower() == requested_path.lower()):
+        return {
+            "archive_path": current_path,
+            "item_count": len(session.get("items", {})),
+        }
+    if not requested_path:
+        raise ValueError(f"No standalone archive loaded for {cache_type}")
+    return _load_external_archive_session(cache_type, requested_path)
+
+
 def _activate_external_archive_browser(context, cache_type: str):
     """Switch the asset browser to a loaded standalone archive session."""
     if not context or not hasattr(context.scene, "witcher_file_browser"):
         return
 
     witcher_file_browser = context.scene.witcher_file_browser
+    witcher_file_browser.browser_view_mode = 'BROWSE'
     witcher_file_browser.loadmods = False
     witcher_file_browser.active_cache_type = cache_type
     witcher_file_browser.current_folder = ""
@@ -2518,6 +4331,72 @@ def _activate_external_archive_browser(context, cache_type: str):
         log.error("Failed to populate external archive browser: %s", e)
         return
     add_to_nav_history(cache_type, "")
+    save_browser_state(context, cache_type, "")
+
+
+def _prepare_external_archive_browser(context, cache_type: str, archive_path: str):
+    info = _ensure_external_archive_session(context, cache_type, archive_path)
+    archive_path = info.get("archive_path", archive_path)
+    _prime_external_archive_export_root(context, archive_path)
+    _activate_external_archive_browser(context, cache_type)
+    add_recent_external_archive(context, cache_type, archive_path)
+    return info
+
+
+def _navigate_browser_to_location(
+    context,
+    cache_type: str,
+    folder_path: str = "",
+    *,
+    reveal_file: str = "",
+    archive_path: str = "",
+    clear_filter: bool = False,
+):
+    if not context or not hasattr(context.scene, "witcher_file_browser"):
+        return
+
+    browser = context.scene.witcher_file_browser
+    cache_type = str(cache_type or "")
+    folder_path = _normalize_virtual_path(folder_path)
+    reveal_file = _normalize_virtual_path(reveal_file)
+
+    browser.browser_view_mode = 'BROWSE'
+    if is_external_cache(cache_type):
+        info = _ensure_external_archive_session(context, cache_type, archive_path)
+        _prime_external_archive_export_root(context, info.get("archive_path", archive_path))
+        add_recent_external_archive(context, cache_type, info.get("archive_path", archive_path))
+
+    if cache_type != browser.active_cache_type:
+        browser.active_cache_type = cache_type
+        if cache_type:
+            SelectCacheTypeOperator.populate_folder_structure(SelectCacheTypeOperator, cache_type, context)
+
+    browser.current_folder = folder_path
+    browser.search_query = ""
+    if clear_filter:
+        browser.extension_filter = ""
+    if reveal_file:
+        _set_browser_reveal(context, reveal_file)
+        _ensure_revealed_file_page(context)
+    else:
+        _clear_browser_reveal(context)
+    clear_search_cache()
+    add_to_nav_history(cache_type, folder_path)
+    save_browser_state(context, cache_type, folder_path)
+
+
+def _open_external_archive_browser_popup(context, cache_type: str, archive_path: str):
+    info = _prepare_external_archive_browser(context, cache_type, archive_path)
+    try:
+        bpy.ops.witcher.simple_file_browser(
+            'INVOKE_DEFAULT',
+            restore_last_state=False,
+            startup_cache_type=cache_type,
+            startup_folder="",
+        )
+    except Exception as exc:
+        log.error("Failed to open asset browser popup for standalone archive %s: %s", archive_path, exc, exc_info=True)
+    return info
 
 
 class OpenExternalCollisionCacheOperator(Operator, ImportHelper):
@@ -2530,39 +4409,12 @@ class OpenExternalCollisionCacheOperator(Operator, ImportHelper):
 
     def execute(self, context):
         filepath = bpy.path.abspath(self.filepath or "")
-        if not filepath or not os.path.isfile(filepath):
-            self.report({'ERROR'}, "Collision cache file not found")
-            return {'CANCELLED'}
-
         try:
-            archive = CollisionCache(filepath)
+            info = _open_external_archive_browser_popup(context, EXTERNAL_COLLISION_CACHE_TYPE, filepath)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to read collision cache: {e}")
             return {'CANCELLED'}
-
-        items = {}
-        collision_exts = {}
-        for item in getattr(archive, "Files", []):
-            key = (getattr(item, "Name", "") or "").replace("/", "\\")
-            if not key or _should_skip_buffer_name(key):
-                continue
-            items.setdefault(key, []).append(item)
-            ext = getattr(item, "Extension", "")
-            if ext:
-                collision_exts[key] = ext
-
-        if not items:
-            self.report({'WARNING'}, "No readable entries found in collision cache")
-            return {'CANCELLED'}
-
-        set_external_archive_session(
-            EXTERNAL_COLLISION_CACHE_TYPE,
-            filepath,
-            items,
-            collision_exts=collision_exts,
-        )
-        _activate_external_archive_browser(context, EXTERNAL_COLLISION_CACHE_TYPE)
-        self.report({'INFO'}, f"Loaded collision cache: {os.path.basename(filepath)} ({len(items)} items)")
+        self.report({'INFO'}, f"Loaded collision cache: {os.path.basename(info['archive_path'])} ({info['item_count']} items)")
         return {'FINISHED'}
 
 
@@ -2576,30 +4428,12 @@ class OpenExternalTextureCacheOperator(Operator, ImportHelper):
 
     def execute(self, context):
         filepath = bpy.path.abspath(self.filepath or "")
-        if not filepath or not os.path.isfile(filepath):
-            self.report({'ERROR'}, "Texture cache file not found")
-            return {'CANCELLED'}
-
         try:
-            archive = TextureCache(filepath)
+            info = _open_external_archive_browser_popup(context, EXTERNAL_TEXTURE_CACHE_TYPE, filepath)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to read texture cache: {e}")
             return {'CANCELLED'}
-
-        items = {}
-        for item in getattr(archive, "Files", []):
-            key = (getattr(item, "Name", "") or "").replace("/", "\\")
-            if not key or _should_skip_buffer_name(key):
-                continue
-            items.setdefault(key, []).append(item)
-
-        if not items:
-            self.report({'WARNING'}, "No readable entries found in texture cache")
-            return {'CANCELLED'}
-
-        set_external_archive_session(EXTERNAL_TEXTURE_CACHE_TYPE, filepath, items)
-        _activate_external_archive_browser(context, EXTERNAL_TEXTURE_CACHE_TYPE)
-        self.report({'INFO'}, f"Loaded texture cache: {os.path.basename(filepath)} ({len(items)} items)")
+        self.report({'INFO'}, f"Loaded texture cache: {os.path.basename(info['archive_path'])} ({info['item_count']} items)")
         return {'FINISHED'}
 
 
@@ -2613,31 +4447,12 @@ class OpenExternalSoundCacheOperator(Operator, ImportHelper):
 
     def execute(self, context):
         filepath = bpy.path.abspath(self.filepath or "")
-        if not filepath or not os.path.isfile(filepath):
-            self.report({'ERROR'}, "Sound cache file not found")
-            return {'CANCELLED'}
-
         try:
-            soundbanks_info = SoundBanksInfoXML(_soundbanks_metadata_path())
-            archive = SoundCache(filepath, soundbanks_info=soundbanks_info)
+            info = _open_external_archive_browser_popup(context, EXTERNAL_SOUND_CACHE_TYPE, filepath)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to read sound cache: {e}")
             return {'CANCELLED'}
-
-        items = {}
-        for item in getattr(archive, "Files", []):
-            key = (getattr(item, "Name", "") or "").replace("/", "\\")
-            if not key or _should_skip_buffer_name(key):
-                continue
-            items.setdefault(key, []).append(item)
-
-        if not items:
-            self.report({'WARNING'}, "No readable entries found in sound cache")
-            return {'CANCELLED'}
-
-        set_external_archive_session(EXTERNAL_SOUND_CACHE_TYPE, filepath, items)
-        _activate_external_archive_browser(context, EXTERNAL_SOUND_CACHE_TYPE)
-        self.report({'INFO'}, f"Loaded sound cache: {os.path.basename(filepath)} ({len(items)} items)")
+        self.report({'INFO'}, f"Loaded sound cache: {os.path.basename(info['archive_path'])} ({info['item_count']} items)")
         return {'FINISHED'}
 
 
@@ -2651,30 +4466,12 @@ class OpenExternalBundleOperator(Operator, ImportHelper):
 
     def execute(self, context):
         filepath = bpy.path.abspath(self.filepath or "")
-        if not filepath or not os.path.isfile(filepath):
-            self.report({'ERROR'}, "Bundle file not found")
-            return {'CANCELLED'}
-
         try:
-            archive = Bundle(filepath)
+            info = _open_external_archive_browser_popup(context, EXTERNAL_BUNDLE_CACHE_TYPE, filepath)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to read bundle: {e}")
             return {'CANCELLED'}
-
-        items = {}
-        for key, item in getattr(archive, "Items", {}).items():
-            key_str = str(key).replace("/", "\\")
-            if not key_str or _should_skip_buffer_name(key_str):
-                continue
-            items.setdefault(key_str, []).append(item)
-
-        if not items:
-            self.report({'WARNING'}, "No readable entries found in bundle")
-            return {'CANCELLED'}
-
-        set_external_archive_session(EXTERNAL_BUNDLE_CACHE_TYPE, filepath, items)
-        _activate_external_archive_browser(context, EXTERNAL_BUNDLE_CACHE_TYPE)
-        self.report({'INFO'}, f"Loaded bundle: {os.path.basename(filepath)} ({len(items)} items)")
+        self.report({'INFO'}, f"Loaded bundle: {os.path.basename(info['archive_path'])} ({info['item_count']} items)")
         return {'FINISHED'}
 
 class SimpleFileBrowser(Operator):
@@ -2682,44 +4479,92 @@ class SimpleFileBrowser(Operator):
     bl_idname = "witcher.simple_file_browser"
     bl_label = "Witcher Asset Browser"
     loadmods: bpy.props.BoolProperty(name="Load Mods", default=False)
+    startup_cache_type: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    startup_folder: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    restore_last_state: BoolProperty(default=True, options={'HIDDEN', 'SKIP_SAVE'})
+    _ui_refresh_timer = None
 
     def execute(self, context):
+        self._remove_ui_refresh_timer(context)
         return {'FINISHED'}
     
     def get_desired_popup_width_px(self, context: bpy.types.Context) -> int:
-        prefs = get_all_addon_prefs(context)
-        if prefs and prefs.browser_popup_width > 0:
-            return prefs.browser_popup_width
-        return int(0.3 * context.window.width)
+        target_width_px = _get_browser_popup_target_width_px(context)
+        ui_scale = _get_browser_ui_scale(context)
+        return max(320, int(round(target_width_px / max(0.5, ui_scale))))
+
+    def _remove_ui_refresh_timer(self, context):
+        wm = getattr(context, "window_manager", None)
+        timer = getattr(self, "_ui_refresh_timer", None)
+        if wm and timer:
+            try:
+                wm.event_timer_remove(timer)
+            except Exception:
+                pass
+        self._ui_refresh_timer = None
+
+    def cancel(self, context):
+        self._remove_ui_refresh_timer(context)
+
+    def modal(self, context, event):
+        if event.type == 'TIMER' and event.timer == getattr(self, "_ui_refresh_timer", None):
+            _touch_external_export_ui(context)
+            return {'RUNNING_MODAL'}
+        return {'PASS_THROUGH'}
 
     def invoke(self, context, event):
         witcher_file_browser = context.scene.witcher_file_browser
         witcher_file_browser.loadmods = self.loadmods  # Store for SelectCacheTypeOperator
         witcher_file_browser.search_query = ""
+        try:
+            prefs = get_all_addon_prefs(context)
+            if prefs is not None:
+                preset_mode = str(getattr(prefs, "browser_grid_size_mode", DEFAULT_BROWSER_GRID_SIZE_MODE) or "")
+                if preset_mode not in BROWSER_GRID_SIZE_PRESETS:
+                    preset_mode = DEFAULT_BROWSER_GRID_SIZE_MODE
+                witcher_file_browser.grid_size_mode_live = preset_mode
+        except Exception:
+            pass
 
         if self.loadmods:
             refresh_mod_cache_managers()
 
-        # Try to restore last browser state from addon preferences
-        last_cache_type, last_folder = load_browser_state(context)
-        if is_external_cache(last_cache_type) and not get_external_archive_session(last_cache_type):
-            last_cache_type, last_folder = "", ""
+        startup_cache_type = str(getattr(self, "startup_cache_type", "") or "")
+        startup_folder = str(getattr(self, "startup_folder", "") or "")
+        if startup_cache_type:
+            if is_external_cache(startup_cache_type) and not get_external_archive_session(startup_cache_type):
+                startup_cache_type, startup_folder = "", ""
 
-        if last_cache_type:
-            # Restore to last used cache type and folder
-            witcher_file_browser.active_cache_type = last_cache_type
-            witcher_file_browser.current_folder = last_folder
-            # Populate folder structure for this cache type
-            SelectCacheTypeOperator.populate_folder_structure(self, last_cache_type, context)
-            # Initialize navigation history with restored state
-            add_to_nav_history(last_cache_type, last_folder)
-        else:
-            # Reset to root level (cache type selection)
-            witcher_file_browser.current_folder = ""
-            witcher_file_browser.active_cache_type = ""
+        if startup_cache_type:
+            witcher_file_browser.active_cache_type = startup_cache_type
+            witcher_file_browser.current_folder = startup_folder
+            SelectCacheTypeOperator.populate_folder_structure(self, startup_cache_type, context)
             clear_nav_history()
+            add_to_nav_history(startup_cache_type, startup_folder)
+        else:
+            # Try to restore last browser state from addon preferences
+            last_cache_type, last_folder = load_browser_state(context)
+            if is_external_cache(last_cache_type) and not get_external_archive_session(last_cache_type):
+                last_cache_type, last_folder = "", ""
 
-        return context.window_manager.invoke_props_dialog(self, width=self.get_desired_popup_width_px(context))
+            if self.restore_last_state and last_cache_type:
+                # Restore to last used cache type and folder
+                witcher_file_browser.active_cache_type = last_cache_type
+                witcher_file_browser.current_folder = last_folder
+                # Populate folder structure for this cache type
+                SelectCacheTypeOperator.populate_folder_structure(self, last_cache_type, context)
+                # Initialize navigation history with restored state
+                add_to_nav_history(last_cache_type, last_folder)
+            else:
+                # Reset to root level (cache type selection)
+                witcher_file_browser.current_folder = ""
+                witcher_file_browser.active_cache_type = ""
+                clear_nav_history()
+
+        wm = context.window_manager
+        self._remove_ui_refresh_timer(context)
+        self._ui_refresh_timer = wm.event_timer_add(0.1, window=context.window)
+        return wm.invoke_props_dialog(self, width=self.get_desired_popup_width_px(context))
 
     # def initialize_folder_structure(self):
     #     # Initialize folder structure with data
@@ -2749,6 +4594,219 @@ class SimpleFileBrowser(Operator):
                 if not hasattr(bundle_item, 'name'):
                     bundle_item.name = bundle_item.Name
                 folder_structure.add_path(bundle_item.name)
+
+    def _draw_external_archive_tools(self, layout, context, witcher_file_browser):
+        cache_type = witcher_file_browser.active_cache_type
+        job = _EXTERNAL_BROWSER_EXPORT_JOB
+        status = _EXTERNAL_BROWSER_EXPORT_STATUS
+        _ui_ping = int(getattr(witcher_file_browser, "external_export_ui_ping", 0) or 0)
+        if not is_external_cache(cache_type):
+            return
+
+        session = get_external_archive_session(cache_type)
+        if not session:
+            return
+
+        scope_paths = get_export_scope_file_paths(context)
+        scope_label = witcher_file_browser.current_folder or "Entire archive"
+        archive_name = os.path.basename(session.get("archive_path", "")) or "(not loaded)"
+        output_root = _get_external_archive_output_root(context, cache_type)
+        filter_text = witcher_file_browser.extension_filter.strip()
+        is_full_archive_scope = not witcher_file_browser.current_folder and not filter_text
+        export_count = len(scope_paths)
+        if is_full_archive_scope:
+            export_button_text = f"Export All ({export_count:,})"
+        else:
+            export_button_text = f"Export {export_count:,} Files"
+
+        box = layout.box()
+        header = box.row(align=True)
+        header.label(text="Standalone Export", icon='EXPORT')
+        if get_effective_cache_type(cache_type) == "Texture":
+            header.prop(witcher_file_browser, "external_texture_export_format", text="")
+        header.prop(witcher_file_browser, "mods_overwrite", text="Overwrite")
+
+        meta_row = box.row(align=True)
+        meta_row.scale_y = 0.9
+        meta_row.label(text=f"Archive: {archive_name}", icon='FILE')
+        meta_row.separator(factor=1.0)
+        meta_row.label(text=f"Scope: {scope_label} ({len(scope_paths):,})", icon='FILE_FOLDER')
+
+        folder_row = box.row(align=True)
+        folder_row.prop(witcher_file_browser, "external_extract_root", text="Folder")
+        open_folder_sub = folder_row.row(align=True)
+        open_folder_sub.enabled = bool(output_root)
+        open_op = open_folder_sub.operator(
+            "witcher.open_external_archive_folder",
+            text="",
+            icon='FILE_FOLDER',
+        )
+        open_op.cache_type = cache_type
+
+        if get_effective_cache_type(cache_type) == "Texture" and witcher_file_browser.external_texture_export_format != 'DDS':
+            from ..CR2W import texconv_wrapper
+
+            if not texconv_wrapper.is_available():
+                warn = box.row(align=True)
+                warn.alert = True
+                warn.label(text="PNG/TGA export requires texconv.dll.", icon='ERROR')
+
+        action_row = box.row(align=True)
+        action_row.enabled = bool(scope_paths) and not job["running"]
+        export_op = action_row.operator(
+            "witcher.external_archive_export_all",
+            text=export_button_text,
+            icon='EXPORT',
+        )
+        export_op.cache_type = cache_type
+        export_op.folder_path = witcher_file_browser.current_folder
+
+        if job["running"]:
+            progress_box = box.box()
+            progress_box.alert = True
+            total = max(1, int(job.get("total", 0) or 0))
+            pct = (int(job.get("index", 0) or 0) / total) * 100.0
+            progress_row = progress_box.row(align=True)
+            progress_row.label(
+                text=(
+                    f"Exporting... "
+                    f"{int(job.get('index', 0) or 0):,} / {int(job.get('total', 0) or 0):,} ({pct:.1f}%)"
+                ),
+                icon='TIME',
+            )
+            progress_row.operator("witcher.cancel_external_archive_export", text="Cancel", icon='CANCEL')
+            detail_row = progress_box.row(align=True)
+            detail_row.scale_y = 0.9
+            detail_row.label(
+                text=(
+                    f"Extracted: {int(job.get('done', 0) or 0):,}   "
+                    f"Skipped: {int(job.get('skipped', 0) or 0):,}   "
+                    f"Errors: {int(job.get('errors', 0) or 0):,}"
+                )
+            )
+        elif status.get("visible") and status.get("cache_type") == cache_type:
+            state = str(status.get("state", "") or "")
+            processed = int(status.get("processed", 0) or 0)
+            total = max(1, int(status.get("total", 0) or 0))
+            pct = (processed / total) * 100.0
+            result_box = box.box()
+            if state == "completed":
+                result_box.alert = False
+            else:
+                result_box.alert = True
+            title_row = result_box.row(align=True)
+            if state == "completed":
+                title_row.label(text=f"Finished ({pct:.1f}%)", icon='CHECKMARK')
+            elif state == "cancelled":
+                title_row.label(text=f"Cancelled ({pct:.1f}%)", icon='CANCEL')
+            else:
+                title_row.label(text="Finished With Warnings", icon='ERROR')
+            dismiss_row = title_row.row(align=True)
+            dismiss_row.alignment = 'RIGHT'
+            dismiss_row.operator("witcher.dismiss_external_archive_export_status", text="", icon='X')
+            stats_row = result_box.row(align=True)
+            stats_row.scale_y = 0.9
+            stats_row.label(
+                text=(
+                    f"Extracted: {int(status.get('done', 0) or 0):,}   "
+                    f"Skipped: {int(status.get('skipped', 0) or 0):,}   "
+                    f"Errors: {int(status.get('errors', 0) or 0):,}"
+                )
+            )
+        elif not scope_paths:
+            empty = box.row(align=True)
+            empty.alert = True
+            empty.label(text="No files match the current folder/filter.", icon='ERROR')
+
+    def _draw_grid_file_entry(
+        self,
+        grid,
+        context,
+        witcher_file_browser,
+        item,
+        display_name: str,
+        full_item_path: str,
+        *,
+        grid_columns: int,
+        name_lines,
+        reserved_name_lines: int,
+        file_exists: bool,
+        status_icon: str,
+    ):
+        box = grid.box()
+
+        icon_info = _get_browser_item_icon_info(
+            context,
+            witcher_file_browser.active_cache_type,
+            full_item_path,
+            loadmods=witcher_file_browser.loadmods,
+        )
+
+        icon_row = box.row()
+        icon_row.alignment = 'CENTER'
+        icon_id = int(icon_info.get("icon_id", 0) or 0)
+        if icon_id:
+            icon_row.template_icon(icon_value=icon_id, scale=_get_browser_grid_icon_scale(context, columns=grid_columns))
+        else:
+            icon_row.label(text="", icon=status_icon or 'FILE')
+
+        actions_row = box.row(align=True)
+        if witcher_file_browser.batch_select_mode:
+            is_selected = is_batch_selected(witcher_file_browser.active_cache_type, full_item_path)
+            select_icon = "CHECKBOX_HLT" if is_selected else "CHECKBOX_DEHLT"
+            sel_op = actions_row.operator("witcher.toggle_batch_select", text="", icon=select_icon)
+            sel_op.path = full_item_path
+            sel_op.cache_type = witcher_file_browser.active_cache_type
+
+        _add_browser_preview_button(
+            actions_row,
+            context,
+            witcher_file_browser.active_cache_type,
+            full_item_path,
+            loadmods=witcher_file_browser.loadmods,
+        )
+
+        copy_op = actions_row.operator("witcher.copy_path", text="", icon="COPYDOWN")
+        copy_op.path = full_item_path
+
+        loc_row = actions_row.row(align=True)
+        loc_row.enabled = file_exists
+        op_loc = loc_row.operator("witcher.open_file_location", text="", icon="FILEBROWSER")
+        op_loc.file_path = full_item_path
+        op_loc.cache_type = witcher_file_browser.active_cache_type
+
+        if not witcher_file_browser.batch_select_mode and cache_supports_scene_import(witcher_file_browser.active_cache_type):
+            op_import = actions_row.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
+            op_import.file_path = item['name']
+
+        if cache_supports_sound_preview(witcher_file_browser.active_cache_type):
+            is_playing = _sound_preview_matches(witcher_file_browser.active_cache_type, full_item_path)
+            op_sound = actions_row.operator(
+                "witcher.sound_preview_toggle",
+                text="",
+                icon='CANCEL' if is_playing else 'PLAY',
+            )
+            op_sound.file_path = full_item_path
+            op_sound.cache_type = witcher_file_browser.active_cache_type
+
+        if witcher_file_browser.active_cache_type != "Texture" and not is_disk_cache(witcher_file_browser.active_cache_type):
+            op_export = actions_row.operator("witcher.file_action", text="", icon='EXPORT')
+            op_export.file_path = item['name']
+
+        stats_op = actions_row.operator("witcher.file_item_stats", text="", icon='INFO')
+        stats_op.file_path = full_item_path
+        stats_op.cache_type = witcher_file_browser.active_cache_type
+        stats_op.loadmods = witcher_file_browser.loadmods
+
+        is_revealed = _is_revealed_browser_item(witcher_file_browser, full_item_path)
+        draw_name_lines = [str(line or "") for line in (name_lines or [display_name])]
+        target_line_count = max(1, int(reserved_name_lines or len(draw_name_lines)))
+        while len(draw_name_lines) < target_line_count:
+            draw_name_lines.append(" ")
+        name_col = box.column(align=True)
+        name_col.alert = is_revealed
+        for line_text in draw_name_lines[:target_line_count]:
+            name_col.label(text=line_text, translate=False)
 
     def draw(self, context):
         layout = self.layout
@@ -2812,9 +4870,35 @@ class SimpleFileBrowser(Operator):
                     op.cache_type = cache_name
                     row.label(text=desc)
 
+                last_external = get_last_recent_external_archive(context)
+                last_external_path = last_external.get("path", "") if last_external else ""
+                last_external_available = bool(last_external) and _can_restore_external_archive(
+                    last_external.get("cache_type", ""),
+                    last_external_path,
+                )
+                if last_external and last_external_available:
+                    layout.separator(factor=0.4)
+                    resume_box = layout.box()
+                    resume_head = resume_box.row(align=True)
+                    resume_head.label(text="Last External", icon='FILEBROWSER')
+                    resume_head.label(
+                        text=get_effective_cache_type(last_external.get("cache_type", "")),
+                        icon=get_cache_type_icon(last_external.get("cache_type", "")),
+                    )
+                    resume_row = resume_box.row(align=True)
+                    op = resume_row.operator(
+                        "witcher.reopen_external_archive",
+                        text=last_external.get("display_name", "") or os.path.basename(last_external_path) or last_external_path,
+                        icon=get_cache_type_icon(last_external.get("cache_type", "")),
+                    )
+                    op.cache_type = last_external.get("cache_type", "")
+                    op.archive_path = last_external_path
+                    copy_op = resume_row.operator("witcher.copy_path", text="", icon="COPYDOWN")
+                    copy_op.path = last_external_path
+
                 layout.separator(factor=0.5)
                 ext_box = layout.box()
-                ext_box.label(text="Standalone Archives", icon='PACKAGE')
+                ext_box.label(text="Standalone Archives", icon='FILEBROWSER')
                 ext_box.operator(
                     "witcher.open_external_collision_cache",
                     text="Open collision.cache",
@@ -2833,7 +4917,7 @@ class SimpleFileBrowser(Operator):
                 ext_box.operator(
                     "witcher.open_external_bundle",
                     text="Open .bundle",
-                    icon='PACKAGE',
+                    icon='FILEBROWSER',
                 )
             return
 
@@ -2860,7 +4944,9 @@ class SimpleFileBrowser(Operator):
         copy_op.path = witcher_file_browser.current_folder
         addr_row.operator("witcher.navigate_to_path", text="Go")
 
-        # Search + extension filter on one row: search takes left ~60%, filter the rest
+        self._draw_external_archive_tools(layout, context, witcher_file_browser)
+
+        # Search + view filter on one row: search takes left ~60%, filter the rest
         layout.separator(factor=0.3)
         search_filter_row = layout.row(align=False)
         search_split = search_filter_row.split(factor=0.60, align=True)
@@ -2870,7 +4956,7 @@ class SimpleFileBrowser(Operator):
             search_part.operator("witcher.clear_search", text="", icon="X")
         filter_part = search_split.row(align=True)
         filter_part.label(text="", icon='FILTER')
-        filter_part.prop(witcher_file_browser, "extension_filter", text="")
+        filter_part.prop(witcher_file_browser, "extension_filter", text="View Filter")
         if witcher_file_browser.extension_filter:
             filter_part.operator("witcher.clear_extension_filter", text="", icon="X")
 
@@ -2914,6 +5000,7 @@ class SimpleFileBrowser(Operator):
             filter_text = witcher_file_browser.extension_filter.strip().lower()
             if filter_text:
                 search_results = [item for item in search_results if filter_text in item.lower()]
+            search_results = _sort_browser_search_results(search_results, witcher_file_browser)
             if not search_results:
                 col.label(text="No results found", icon='ERROR')
             else:
@@ -2922,7 +5009,7 @@ class SimpleFileBrowser(Operator):
                 results_header.label(text=f"{len(capped)} result(s)", icon='FILE')
                 results_header.operator("witcher.copy_all_search_paths", text="Copy All Paths", icon="COPYDOWN")
                 col.separator(factor=0.3)
-                for item in search_results:
+                for item in capped:
                     # Use split for path / buttons (go to source + import)
                     row_split = col.split(factor=0.70, align=True)
                     # Checkmark indicator (always present for alignment)
@@ -2954,7 +5041,17 @@ class SimpleFileBrowser(Operator):
                         mod_label = get_mod_override_label(item, loadmods=witcher_file_browser.loadmods)
                         if mod_label:
                             display_label = f"{display_label} [ovr:{mod_label}]"
-                    path_row.label(text=display_label, icon='FILE')
+                    icon_info = _get_browser_item_icon_info(
+                        context,
+                        witcher_file_browser.active_cache_type,
+                        item,
+                        loadmods=witcher_file_browser.loadmods,
+                    )
+                    icon_id = int(icon_info.get("icon_id", 0) or 0)
+                    if icon_id:
+                        path_row.label(text=display_label, icon_value=icon_id)
+                    else:
+                        path_row.label(text=display_label, icon='FILE')
                     btns = row_split.row(align=True)
                     # Copy path
                     copy_op = btns.operator("witcher.copy_path", text="", icon="COPYDOWN")
@@ -2968,15 +5065,13 @@ class SimpleFileBrowser(Operator):
                     op_loc = loc_sub.operator("witcher.open_file_location", text="", icon="FILEBROWSER")
                     op_loc.file_path = item
                     op_loc.cache_type = witcher_file_browser.active_cache_type
-                    # Texture preview for texture files
-                    if is_texture_file(item):
-                        op_preview = btns.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
-                        op_preview.file_path = item
-                        op_preview.cache_type = witcher_file_browser.active_cache_type
-                    if is_w2ter_buffer_file(item):
-                        op_preview = btns.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
-                        op_preview.file_path = item
-                        op_preview.cache_type = witcher_file_browser.active_cache_type
+                    _add_browser_preview_button_slot(
+                        btns,
+                        context,
+                        witcher_file_browser.active_cache_type,
+                        item,
+                        loadmods=witcher_file_browser.loadmods,
+                    )
                     if cache_supports_sound_preview(witcher_file_browser.active_cache_type):
                         is_playing = _sound_preview_matches(witcher_file_browser.active_cache_type, item)
                         op_sound = btns.operator(
@@ -2996,24 +5091,12 @@ class SimpleFileBrowser(Operator):
                     stats_op.file_path = item
                     stats_op.cache_type = witcher_file_browser.active_cache_type
                     stats_op.loadmods = witcher_file_browser.loadmods
-                if len(search_results) >= MAX_SEARCH_RESULTS:
+                if len(search_results) > MAX_SEARCH_RESULTS:
                     col.label(text="Showing first 100 results. Refine search for more.", icon='INFO')
         else:
             # Split layout: left = folders, right = files
-            split = layout.split(factor=0.35)
-
-            # --- Folder column ---
-            folder_col = split.column(align=True)
-            folder_col.label(text="Folders", icon="FILE_FOLDER")
-            folder_col.separator(factor=0.3)
-
-            if witcher_file_browser.current_folder:
-                up = folder_col.operator("witcher.navigate_folder", text=".. (Up)", icon='FILE_PARENT')
-                up.target_folder = ""
-
+            split = layout.split(factor=_get_browser_folder_split_factor(context))
             folder_items = folder_structure.get_items(witcher_file_browser.current_folder)
-
-            # Apply filter to files (works on filename OR extension)
             filter_text = witcher_file_browser.extension_filter.strip().lower()
             if filter_text:
                 filtered_items = [
@@ -3023,24 +5106,44 @@ class SimpleFileBrowser(Operator):
             else:
                 filtered_items = folder_items
 
-            # Count folders and files
-            folder_count = sum(1 for i in filtered_items if i['is_folder'])
-            file_count = sum(1 for i in filtered_items if not i['is_folder'])
+            folder_entries = _sort_browser_items(
+                [item for item in filtered_items if item['is_folder']],
+                witcher_file_browser,
+            )
+            file_entries = _sort_browser_items(
+                [item for item in filtered_items if not item['is_folder']],
+                witcher_file_browser,
+            )
+            folder_count = len(folder_entries)
+            file_count = len(file_entries)
+            page_size = _get_browser_file_page_size(context, witcher_file_browser.file_display_mode)
+            file_stats = _get_browser_page_stats(file_entries, witcher_file_browser.file_page_index, page_size)
+            if witcher_file_browser.file_page_index != file_stats["page_index"]:
+                witcher_file_browser.file_page_index = file_stats["page_index"]
 
-            for item in filtered_items:
-                if item['is_folder']:
-                    folder_row = folder_col.row(align=True)
-                    op = folder_row.operator("witcher.navigate_folder",
-                                            text=item['name'],
-                                            icon='FILE_FOLDER',
-                                            emboss=False)
-                    op.target_folder = (witcher_file_browser.current_folder + "\\" + item['name']
-                                        if witcher_file_browser.current_folder else item['name'])
-                    # Copy folder path button
-                    full_folder_path = (witcher_file_browser.current_folder + "\\" + item['name']
-                                       if witcher_file_browser.current_folder else item['name'])
-                    copy_op = folder_row.operator("witcher.copy_path", text="", icon="COPYDOWN")
-                    copy_op.path = full_folder_path
+            # --- Folder column ---
+            folder_col = split.column(align=True)
+            folder_head = folder_col.row(align=True)
+            folder_head.label(text="Folders", icon="FILE_FOLDER")
+            folder_col.separator(factor=0.3)
+
+            if witcher_file_browser.current_folder:
+                up = folder_col.operator("witcher.navigate_folder", text=".. (Up)", icon='FILE_PARENT')
+                up.target_folder = ""
+
+            for item in folder_entries:
+                folder_row = folder_col.row(align=True)
+                op = folder_row.operator("witcher.navigate_folder",
+                                        text=item['name'],
+                                        icon='FILE_FOLDER',
+                                        emboss=False)
+                op.target_folder = (witcher_file_browser.current_folder + "\\" + item['name']
+                                    if witcher_file_browser.current_folder else item['name'])
+                # Copy folder path button
+                full_folder_path = (witcher_file_browser.current_folder + "\\" + item['name']
+                                   if witcher_file_browser.current_folder else item['name'])
+                copy_op = folder_row.operator("witcher.copy_path", text="", icon="COPYDOWN")
+                copy_op.path = full_folder_path
 
             # --- File column ---
             file_col = split.column(align=True)
@@ -3057,10 +5160,142 @@ class SimpleFileBrowser(Operator):
                     batch_row.operator("witcher.import_batch_selected", text=f"Import ({selected_count})", icon='IMPORT')
                     batch_row.operator("witcher.clear_batch_select", text="", icon='X')
 
+            layout_row = file_col.row(align=True)
+            layout_mode = layout_row.row(align=True)
+            layout_mode.prop(witcher_file_browser, "file_display_mode", text="", icon_only=True, expand=True)
+            layout_row.separator_spacer()
+            tools_sub = layout_row.row(align=True)
+            tools_sub.prop(witcher_file_browser, "sort_by", text="", icon_only=True)
+            asc_icon = 'SORT_ASC' if witcher_file_browser.sort_ascending else 'SORT_DESC'
+            tools_sub.prop(witcher_file_browser, "sort_ascending", text="", icon=asc_icon, toggle=True)
+            size_sub = tools_sub.row(align=True)
+            size_sub.enabled = witcher_file_browser.file_display_mode == 'GRID'
+            size_sub.prop(witcher_file_browser, "grid_size_mode_live", text="", icon_only=True)
+            if _is_browser_dev_mode_enabled() and witcher_file_browser.file_display_mode == 'GRID':
+                tools_sub.prop(
+                    witcher_file_browser,
+                    "debug_wrap_show",
+                    text="",
+                    icon='TOOL_SETTINGS',
+                    toggle=True,
+                )
+                if witcher_file_browser.debug_wrap_show:
+                    dev_box = file_col.box()
+                    dev_header = dev_box.row(align=True)
+                    dev_header.label(text="Dev: Filename Wrap Tuning", icon='TOOL_SETTINGS')
+                    current_mode = witcher_file_browser.grid_size_mode_live
+                    dev_header.label(text=f"Active: {current_mode.title()}")
+                    for mode_key, label in (("small", "Small"), ("medium", "Medium"), ("large", "Large")):
+                        sub = dev_box.column(align=True)
+                        sub.label(text=label, icon='CHECKMARK' if current_mode == mode_key.upper() else 'BLANK1')
+                        grid = sub.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
+                        grid.prop(witcher_file_browser, f"debug_{mode_key}_padding_px")
+                        grid.prop(witcher_file_browser, f"debug_{mode_key}_avg_char_px")
+                        grid.prop(witcher_file_browser, f"debug_{mode_key}_chars_min")
+                        grid.prop(witcher_file_browser, f"debug_{mode_key}_chars_max")
+
+            if file_stats["total"] > page_size:
+                file_nav = file_col.row(align=True)
+                file_nav.scale_y = 0.9
+                file_nav.label(text=f"{file_stats['visible_start']}-{file_stats['visible_end']} / {file_stats['total']}")
+                prev_row = file_nav.row(align=True)
+                prev_row.enabled = file_stats["page_index"] > 0
+                prev_row.operator("witcher.browser_page", text="<").action = "prev"
+                next_row = file_nav.row(align=True)
+                next_row.enabled = file_stats["page_index"] < (file_stats["total_pages"] - 1)
+                next_row.operator("witcher.browser_page", text=">").action = "next"
+
             file_col.separator(factor=0.3)
 
-            for item in filtered_items:
-                if not item['is_folder']:
+            if witcher_file_browser.file_display_mode == 'GRID':
+                grid_columns = _get_browser_grid_columns(context)
+                visible_items = list(file_stats["items"])
+                grid_entries = []
+                name_lines_by_path = {}
+                reserved_name_lines = 1
+                grid = file_col.grid_flow(
+                    row_major=True,
+                    columns=grid_columns,
+                    even_columns=True,
+                    even_rows=True,
+                    align=True,
+                )
+                for item in visible_items:
+                    display_name = item['name']
+                    full_item_path = (witcher_file_browser.current_folder + "\\" + item['name']
+                                     if witcher_file_browser.current_folder else item['name'])
+                    if get_effective_cache_type(witcher_file_browser.active_cache_type) == "Collision":
+                        ext = collision_extension_map.get(full_item_path, "")
+                        if ext:
+                            display_name = f"{item['name']} [{ext}]"
+
+                    source_label = get_source_label(
+                        context,
+                        full_item_path,
+                        loadmods=witcher_file_browser.loadmods,
+                        cache_type=witcher_file_browser.active_cache_type,
+                    )
+                    if source_label.startswith("mod:"):
+                        display_name = f"{display_name} [src:{source_label[4:]}]"
+                    elif source_label == "vanilla" and witcher_file_browser.loadmods:
+                        display_name = f"{display_name} [src:vanilla]"
+                    elif witcher_file_browser.use_mods_priority:
+                        mod_label = get_mod_override_label(full_item_path, loadmods=witcher_file_browser.loadmods)
+                        if mod_label:
+                            display_name = f"{display_name} [ovr:{mod_label}]"
+
+                    w2ter_label = get_w2ter_buffer_label(item['name'])
+                    if w2ter_label:
+                        display_name = f"{display_name} [{w2ter_label}]"
+
+                    file_exists, file_size = get_file_info(
+                        context,
+                        witcher_file_browser.active_cache_type,
+                        full_item_path,
+                        loadmods=witcher_file_browser.loadmods,
+                    )
+                    status_icon = get_status_icon(
+                        context,
+                        witcher_file_browser.active_cache_type,
+                        full_item_path,
+                        loadmods=witcher_file_browser.loadmods,
+                    )
+                    wrapped_name_lines = _split_grid_display_name_lines(
+                        context,
+                        display_name,
+                        columns=grid_columns,
+                    )
+                    grid_entries.append({
+                        "item": item,
+                        "display_name": display_name,
+                        "full_item_path": full_item_path,
+                        "file_exists": file_exists,
+                        "status_icon": status_icon,
+                    })
+                    name_lines_by_path[full_item_path] = wrapped_name_lines
+                    reserved_name_lines = max(reserved_name_lines, len(wrapped_name_lines))
+
+                for entry in grid_entries:
+                    self._draw_grid_file_entry(
+                        grid,
+                        context,
+                        witcher_file_browser,
+                        entry["item"],
+                        entry["display_name"],
+                        entry["full_item_path"],
+                        grid_columns=grid_columns,
+                        name_lines=name_lines_by_path.get(entry["full_item_path"], [entry["display_name"]]),
+                        reserved_name_lines=reserved_name_lines,
+                        file_exists=entry["file_exists"],
+                        status_icon=entry["status_icon"],
+                    )
+                placeholder_count = (grid_columns - (len(visible_items) % grid_columns)) % grid_columns
+                for _ in range(placeholder_count):
+                    placeholder = grid.column(align=True)
+                    placeholder.enabled = False
+                    placeholder.label(text="")
+            else:
+                for item in file_stats["items"]:
                     row = file_col.row(align=True)
 
                     # For collision cache, show extension suffix from Comtype
@@ -3110,34 +5345,27 @@ class SimpleFileBrowser(Operator):
                     row.label(text="", icon=status_icon)
 
                     # Action buttons FIRST (before filename)
-                    # Copy path button
                     copy_op = row.operator("witcher.copy_path", text="", icon="COPYDOWN")
                     copy_op.path = full_item_path
 
-                    # Open file location on disk (always present for alignment)
                     loc_sub = row.row(align=True)
                     loc_sub.enabled = file_exists
                     op_loc = loc_sub.operator("witcher.open_file_location", text="", icon="FILEBROWSER")
                     op_loc.file_path = full_item_path
                     op_loc.cache_type = witcher_file_browser.active_cache_type
 
-                    # Import button (only show in non-batch mode)
                     if not witcher_file_browser.batch_select_mode and cache_supports_scene_import(witcher_file_browser.active_cache_type):
                         op1 = row.operator("witcher.file_action_import_to_scene",
                                             text="", icon='IMPORT')
                         op1.file_path = item['name']
 
-                    # Texture preview button for texture files in ANY cache type
-                    if is_texture_file(item['name']):
-                        op_preview = row.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
-                        op_preview.file_path = full_item_path
-                        op_preview.cache_type = witcher_file_browser.active_cache_type
-
-                    # Terrain buffer preview (w2ter.*.buffer)
-                    if is_w2ter_buffer_file(item['name']):
-                        op_preview = row.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
-                        op_preview.file_path = full_item_path
-                        op_preview.cache_type = witcher_file_browser.active_cache_type
+                    _add_browser_preview_button_slot(
+                        row,
+                        context,
+                        witcher_file_browser.active_cache_type,
+                        full_item_path,
+                        loadmods=witcher_file_browser.loadmods,
+                    )
 
                     if cache_supports_sound_preview(witcher_file_browser.active_cache_type):
                         is_playing = _sound_preview_matches(witcher_file_browser.active_cache_type, full_item_path)
@@ -3149,15 +5377,26 @@ class SimpleFileBrowser(Operator):
                         op_sound.file_path = full_item_path
                         op_sound.cache_type = witcher_file_browser.active_cache_type
 
-                    # Export button (for non-texture-cache items)
                     if witcher_file_browser.active_cache_type != "Texture" and not is_disk_cache(witcher_file_browser.active_cache_type):
                         op2 = row.operator("witcher.file_action",
                                             text="", icon='EXPORT')
                         op2.file_path = item['name']
 
-                    # Filename LAST (after buttons)
-                    row.label(text=display_name, icon='FILE')
-                    # Stats icon on far right
+                    is_revealed = _is_revealed_browser_item(witcher_file_browser, full_item_path)
+                    icon_info = _get_browser_item_icon_info(
+                        context,
+                        witcher_file_browser.active_cache_type,
+                        full_item_path,
+                        loadmods=witcher_file_browser.loadmods,
+                    )
+                    icon_id = int(icon_info.get("icon_id", 0) or 0)
+                    name_row = row.row(align=True)
+                    name_row.alert = is_revealed
+                    if icon_id:
+                        name_row.label(text=display_name, icon_value=icon_id)
+                    else:
+                        name_row.label(text=display_name, icon='VIEWZOOM' if is_revealed else 'FILE')
+
                     stats_op = row.operator("witcher.file_item_stats", text="", icon='INFO')
                     stats_op.file_path = full_item_path
                     stats_op.cache_type = witcher_file_browser.active_cache_type
@@ -3179,9 +5418,6 @@ class SimpleFileBrowser(Operator):
 
         # Use cached search results (avoids re-searching on every UI redraw)
         results = get_cached_search_results(query, "", folder_structure, loadmods=loadmods)
-        filter_text = witcher_file_browser.extension_filter.strip().lower()
-        if filter_text:
-            results = [(ct, p) for ct, p in results if filter_text in p.lower()]
 
         # Display results
         col = layout.column(align=True)
@@ -3216,7 +5452,17 @@ class SimpleFileBrowser(Operator):
                 mod_label = get_mod_override_label(path, loadmods=loadmods)
                 if mod_label:
                     display_label = f"{display_label} [ovr:{mod_label}]"
-            path_row.label(text=display_label, icon='FILE')
+            icon_info = _get_browser_item_icon_info(
+                bpy.context,
+                cache_type,
+                path,
+                loadmods=loadmods,
+            )
+            icon_id = int(icon_info.get("icon_id", 0) or 0)
+            if icon_id:
+                path_row.label(text=display_label, icon_value=icon_id)
+            else:
+                path_row.label(text=display_label, icon='FILE')
             btns = path_btn_split.row(align=True)
             # Copy path
             copy_op = btns.operator("witcher.copy_path", text="", icon="COPYDOWN")
@@ -3231,15 +5477,13 @@ class SimpleFileBrowser(Operator):
             op_loc = loc_sub.operator("witcher.open_file_location", text="", icon="FILEBROWSER")
             op_loc.file_path = path
             op_loc.cache_type = cache_type
-            # Texture preview for texture files
-            if is_texture_file(path):
-                op_preview = btns.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
-                op_preview.file_path = path
-                op_preview.cache_type = cache_type
-            if is_w2ter_buffer_file(path):
-                op_preview = btns.operator("witcher.texture_preview", text="", icon='IMAGE_DATA')
-                op_preview.file_path = path
-                op_preview.cache_type = cache_type
+            _add_browser_preview_button_slot(
+                btns,
+                bpy.context,
+                cache_type,
+                path,
+                loadmods=loadmods,
+            )
             if cache_supports_sound_preview(cache_type):
                 is_playing = _sound_preview_matches(cache_type, path)
                 op_sound = btns.operator(
@@ -3265,46 +5509,74 @@ class SimpleFileBrowser(Operator):
             col.label(text=f"... and {len(results) - MAX_RESULTS} more results", icon='INFO')
 
     def draw_recent_view(self, layout, context):
-        """Draw the recent imports view."""
+        """Draw the recent activity view."""
         recent = get_recent_imports(context)
 
         header_row = layout.row()
-        header_row.label(text="Recent Imports", icon='TIME')
+        header_row.label(text="Recent", icon='TIME')
         if recent:
             header_row.operator("witcher.clear_recent_imports", text="Clear", icon='X')
 
         layout.separator(factor=0.5)
 
         if not recent:
-            layout.label(text="No recent imports", icon='INFO')
+            layout.label(text="No recent imports or archives", icon='INFO')
             return
 
         col = layout.column(align=True)
         for item in recent:
             path = item.get('path', '')
             cache_type = item.get('cache_type', '')
-            display_name = path.split("\\")[-1] if "\\" in path else path
+            effective_cache_type = get_effective_cache_type(cache_type)
+            cache_abbrev = effective_cache_type[:3] if effective_cache_type else "?"
+            kind = item.get('kind', RECENT_KIND_IMPORT)
+            archive_available = _can_restore_external_archive(cache_type, path)
 
             row = col.split(factor=0.1, align=True)
-            cache_abbrev = cache_type[:3] if cache_type else "?"
             row.label(text=f"[{cache_abbrev}]")
             path_row = row.split(factor=0.75, align=True)
-            path_row.label(text=display_name, icon='FILE')
+            if kind == RECENT_KIND_EXTERNAL_ARCHIVE:
+                display_name = item.get('display_name', '') or os.path.basename(path) or path
+                path_row.label(text=display_name, icon=get_cache_type_icon(cache_type))
+            else:
+                display_path = path or "(unknown path)"
+                path_row.label(text=display_path, icon='FILE')
             btns = path_row.row(align=True)
 
             # Copy path
             copy_op = btns.operator("witcher.copy_path", text="", icon="COPYDOWN")
             copy_op.path = path
 
-            # Go to source
-            op_goto = btns.operator("witcher.goto_global_search_result", text="", icon='FILE_PARENT')
-            op_goto.file_path = path
-            op_goto.cache_type = cache_type
+            if kind == RECENT_KIND_EXTERNAL_ARCHIVE:
+                action_row = btns.row(align=True)
+                action_row.enabled = archive_available
+                op = action_row.operator("witcher.reopen_external_archive", text="", icon='FILEBROWSER')
+                op.archive_path = path
+                op.cache_type = cache_type
+            else:
+                # Go to source
+                goto_available = True
+                if is_external_cache(cache_type):
+                    archive_path = item.get('archive_path', '')
+                    goto_available = _can_restore_external_archive(cache_type, archive_path)
+                goto_row = btns.row(align=True)
+                goto_row.enabled = goto_available
+                op_goto = goto_row.operator("witcher.goto_global_search_result", text="", icon='FILE_PARENT')
+                op_goto.file_path = path
+                op_goto.cache_type = cache_type
+                op_goto.archive_path = item.get('archive_path', '')
 
-            # Import again
-            op = btns.operator("witcher.import_recent", text="", icon='IMPORT')
-            op.path = path
-            op.cache_type = cache_type
+                # Import again
+                import_available = True
+                if is_external_cache(cache_type):
+                    archive_path = item.get('archive_path', '')
+                    import_available = _can_restore_external_archive(cache_type, archive_path)
+                action_row = btns.row(align=True)
+                action_row.enabled = import_available
+                op = action_row.operator("witcher.import_recent", text="", icon='IMPORT')
+                op.path = path
+                op.cache_type = cache_type
+                op.archive_path = item.get('archive_path', '')
 
     def draw_bookmarks_view(self, layout, context):
         """Draw the bookmarks view."""
@@ -3319,6 +5591,10 @@ class SimpleFileBrowser(Operator):
             add_bm = header_row.operator("witcher.add_bookmark", text="Add Current", icon='ADD')
             add_bm.path = witcher_file_browser.current_folder
             add_bm.cache_type = witcher_file_browser.active_cache_type
+            if is_external_cache(witcher_file_browser.active_cache_type):
+                session = get_external_archive_session(witcher_file_browser.active_cache_type)
+                if session:
+                    add_bm.archive_path = session.get("archive_path", "") or ""
 
         layout.separator(factor=0.5)
 
@@ -3331,13 +5607,18 @@ class SimpleFileBrowser(Operator):
         for bm in bookmarks:
             path = bm.get('path', '')
             cache_type = bm.get('cache_type', '')
-            name = bm.get('name', path.split("\\")[-1] if path else cache_type)
+            archive_path = bm.get('archive_path', '')
+            display_path = path or "Entire archive"
+            effective_cache_type = get_effective_cache_type(cache_type)
+            goto_available = True
+            if is_external_cache(cache_type):
+                goto_available = _can_restore_external_archive(cache_type, archive_path)
 
             row = col.split(factor=0.1, align=True)
-            cache_abbrev = cache_type[:3] if cache_type else "?"
+            cache_abbrev = effective_cache_type[:3] if effective_cache_type else "?"
             row.label(text=f"[{cache_abbrev}]")
             path_row = row.split(factor=0.75, align=True)
-            path_row.label(text=name, icon='BOOKMARKS')
+            path_row.label(text=display_path, icon='BOOKMARKS')
             btns = path_row.row(align=True)
 
             # Copy path
@@ -3345,14 +5626,18 @@ class SimpleFileBrowser(Operator):
             copy_op.path = path
 
             # Go to bookmark
-            op_goto = btns.operator("witcher.goto_bookmark", text="", icon='FILE_PARENT')
+            goto_row = btns.row(align=True)
+            goto_row.enabled = goto_available
+            op_goto = goto_row.operator("witcher.goto_bookmark", text="", icon='FILE_PARENT')
             op_goto.path = path
             op_goto.cache_type = cache_type
+            op_goto.archive_path = archive_path
 
             # Remove bookmark
             op_rm = btns.operator("witcher.remove_bookmark", text="", icon='X')
             op_rm.path = path
             op_rm.cache_type = cache_type
+            op_rm.archive_path = archive_path
 
     def export_and_load_image(self, full_path):
         def export_item(item):
@@ -3506,6 +5791,7 @@ class GoHomeOperator(Operator):
         global folder_structure, _nav_history, _nav_index, _search_cache, _file_source_map, _file_source_info
 
         witcher_file_browser = context.scene.witcher_file_browser
+        _clear_browser_reveal(context)
 
         # Reset all browser state to defaults
         witcher_file_browser.active_cache_type = ""
@@ -3513,6 +5799,7 @@ class GoHomeOperator(Operator):
         witcher_file_browser.search_query = ""
         witcher_file_browser.path_input = ""
         witcher_file_browser.extension_filter = ""
+        witcher_file_browser.file_page_index = 0
 
         # Clear folder structure completely
         folder_structure.items = {}
@@ -3532,9 +5819,9 @@ class GoHomeOperator(Operator):
 
 
 class ClearExtensionFilterOperator(Operator):
-    """Clear the extension filter"""
+    """Clear the current view filter"""
     bl_idname = "witcher.clear_extension_filter"
-    bl_label = "Clear Filter"
+    bl_label = "Clear View Filter"
 
     def execute(self, context):
         witcher_file_browser = context.scene.witcher_file_browser
@@ -3548,9 +5835,10 @@ class AddBookmarkOperator(Operator):
     bl_label = "Add Bookmark"
     path: StringProperty()
     cache_type: StringProperty()
+    archive_path: StringProperty(default="")
 
     def execute(self, context):
-        if add_bookmark(context, self.path, self.cache_type):
+        if add_bookmark(context, self.path, self.cache_type, archive_path=self.archive_path):
             self.report({'INFO'}, f"Bookmarked: {self.path or 'Root'}")
         else:
             self.report({'INFO'}, "Already bookmarked")
@@ -3563,9 +5851,10 @@ class RemoveBookmarkOperator(Operator):
     bl_label = "Remove Bookmark"
     path: StringProperty()
     cache_type: StringProperty()
+    archive_path: StringProperty(default="")
 
     def execute(self, context):
-        remove_bookmark(context, self.path, self.cache_type)
+        remove_bookmark(context, self.path, self.cache_type, archive_path=self.archive_path)
         self.report({'INFO'}, "Bookmark removed")
         return {'FINISHED'}
 
@@ -3576,31 +5865,53 @@ class GotoBookmarkOperator(Operator):
     bl_label = "Go to Bookmark"
     path: StringProperty()
     cache_type: StringProperty()
+    archive_path: StringProperty(default="")
 
     def execute(self, context):
-        witcher_file_browser = context.scene.witcher_file_browser
-
-        # Change cache type if needed
-        if self.cache_type != witcher_file_browser.active_cache_type:
-            witcher_file_browser.active_cache_type = self.cache_type
-            if self.cache_type:
-                SelectCacheTypeOperator.populate_folder_structure(self, self.cache_type, context)
-
-        witcher_file_browser.current_folder = self.path
-        witcher_file_browser.search_query = ""
-        add_to_nav_history(self.cache_type, self.path)
-        save_browser_state(context, self.cache_type, self.path)
+        try:
+            _navigate_browser_to_location(
+                context,
+                self.cache_type,
+                self.path,
+                archive_path=self.archive_path,
+            )
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to open bookmark: {exc}")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
 
 class ClearRecentImportsOperator(Operator):
-    """Clear recent imports list"""
+    """Clear recent activity list"""
     bl_idname = "witcher.clear_recent_imports"
     bl_label = "Clear Recent"
 
     def execute(self, context):
         clear_recent_imports(context)
-        self.report({'INFO'}, "Recent imports cleared")
+        self.report({'INFO'}, "Recent items cleared")
+        return {'FINISHED'}
+
+
+class ReopenExternalArchiveOperator(Operator):
+    """Reopen a standalone archive in the asset browser"""
+    bl_idname = "witcher.reopen_external_archive"
+    bl_label = "Reopen External Archive"
+
+    archive_path: StringProperty()
+    cache_type: StringProperty()
+
+    def execute(self, context):
+        try:
+            info = _prepare_external_archive_browser(context, self.cache_type, self.archive_path)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to reopen external archive: {exc}")
+            return {'CANCELLED'}
+
+        self.report(
+            {'INFO'},
+            f"Loaded {get_effective_cache_type(self.cache_type).lower()} archive: "
+            f"{os.path.basename(info['archive_path'])} ({info['item_count']} items)"
+        )
         return {'FINISHED'}
 
 
@@ -3610,12 +5921,25 @@ class ImportRecentOperator(Operator):
     bl_label = "Import Recent"
     path: StringProperty()
     cache_type: StringProperty()
+    archive_path: StringProperty(default="")
 
     def execute(self, context):
         witcher_file_browser = context.scene.witcher_file_browser
         original_cache_type = witcher_file_browser.active_cache_type
         witcher_file_browser.active_cache_type = self.cache_type
         invoke_mode = 'INVOKE_DEFAULT' if getattr(witcher_file_browser, "open_import_dialog", False) else 'EXEC_DEFAULT'
+
+        if is_external_cache(self.cache_type) and not _has_matching_external_archive_session(self.cache_type, self.archive_path):
+            if not self.archive_path:
+                self.report({'ERROR'}, "This standalone archive is no longer loaded; reopen it from Recent first")
+                return {'CANCELLED'}
+            try:
+                info = _ensure_external_archive_session(context, self.cache_type, self.archive_path)
+                _prime_external_archive_export_root(context, info.get("archive_path", self.archive_path))
+                add_recent_external_archive(context, self.cache_type, self.archive_path)
+            except Exception as exc:
+                self.report({'ERROR'}, f"Failed to reload standalone archive: {exc}")
+                return {'CANCELLED'}
 
         try:
             return bpy.ops.witcher.file_action_import_to_scene(invoke_mode, file_path=self.path)
@@ -3700,6 +6024,44 @@ class ImportBatchSelectedOperator(Operator):
         return {'FINISHED'}
 
 
+class BrowserPageOperator(Operator):
+    """Navigate browser list pages"""
+    bl_idname = "witcher.browser_page"
+    bl_label = "Browser Page"
+
+    action: StringProperty(default="next")
+
+    def execute(self, context):
+        browser = context.scene.witcher_file_browser
+        if browser.search_query:
+            return {'CANCELLED'}
+
+        folder_items = folder_structure.get_items(browser.current_folder)
+        filter_text = browser.extension_filter.strip().lower()
+        if filter_text:
+            filtered_items = [
+                item for item in folder_items
+                if item['is_folder'] or filter_text in item['name'].lower()
+            ]
+        else:
+            filtered_items = folder_items
+
+        items = [item for item in filtered_items if not item['is_folder']]
+        page_size = _get_browser_file_page_size(context, browser.file_display_mode)
+        stats = _get_browser_page_stats(items, browser.file_page_index, page_size)
+        current = stats["page_index"]
+        last = max(0, stats["total_pages"] - 1)
+        if self.action == "prev":
+            target_index = max(0, current - 1)
+        elif self.action == "next":
+            target_index = min(last, current + 1)
+        else:
+            return {'CANCELLED'}
+
+        browser.file_page_index = target_index
+        return {'FINISHED'}
+
+
 class CopyPathOperator(Operator):
     """Copy path to clipboard"""
     bl_idname = "witcher.copy_path"
@@ -3731,7 +6093,7 @@ class CopyAllSearchPathsOperator(Operator):
         if wfb.active_cache_type:
             paths = [item for item in results if not filter_text or filter_text in item.lower()]
         else:
-            paths = [path for _, path in results if not filter_text or filter_text in path.lower()]
+            paths = [path for _, path in results]
 
         if not paths:
             self.report({'WARNING'}, "No results match the current filter")
@@ -3743,7 +6105,7 @@ class CopyAllSearchPathsOperator(Operator):
 
 
 class OpenFileLocationOperator(Operator):
-    """Open the containing folder of an exported file in the OS file browser"""
+    """Reveal an exported file in the OS file browser"""
     bl_idname = "witcher.open_file_location"
     bl_label = "Open File Location"
     file_path: StringProperty()
@@ -3767,7 +6129,17 @@ class OpenFileLocationOperator(Operator):
                     witcher_file_browser.loadmods,
                 )
 
-            parent_dir = os.path.dirname(abs_path)
+            abs_path = win_safe_path(abs_path or "")
+            if os.path.isfile(abs_path):
+                try:
+                    import subprocess
+
+                    subprocess.Popen(["explorer", "/select,", abs_path])
+                    return {'FINISHED'}
+                except Exception:
+                    pass
+
+            parent_dir = abs_path if os.path.isdir(abs_path) else os.path.dirname(abs_path)
             if os.path.isdir(parent_dir):
                 bpy.ops.wm.path_open(filepath=parent_dir)
                 return {'FINISHED'}
@@ -3804,13 +6176,18 @@ class NavigateToPathOperator(Operator):
         if is_likely_file and len(parts) > 1:
             parent_path = "\\".join(parts[:-1])
             if folder_structure.path_exists(parent_path):
-                witcher_file_browser.current_folder = parent_path
-                add_to_nav_history(witcher_file_browser.active_cache_type, parent_path)
-                save_browser_state(context, witcher_file_browser.active_cache_type, parent_path)
+                _navigate_browser_to_location(
+                    context,
+                    witcher_file_browser.active_cache_type,
+                    parent_path,
+                    reveal_file=path,
+                    clear_filter=True,
+                )
                 return {'FINISHED'}
 
         # Check if path exists as a folder
         if folder_structure.path_exists(path):
+            _clear_browser_reveal(context)
             witcher_file_browser.current_folder = path
             add_to_nav_history(witcher_file_browser.active_cache_type, path)
             save_browser_state(context, witcher_file_browser.active_cache_type, path)
@@ -3826,6 +6203,7 @@ class NavigateToPathOperator(Operator):
                 break
 
         if valid_path:
+            _clear_browser_reveal(context)
             witcher_file_browser.current_folder = valid_path
             add_to_nav_history(witcher_file_browser.active_cache_type, valid_path)
             save_browser_state(context, witcher_file_browser.active_cache_type, valid_path)
@@ -3856,6 +6234,7 @@ class NavigateBackOperator(Operator):
         cache_type, folder = _nav_history[_nav_index]
 
         witcher_file_browser = context.scene.witcher_file_browser
+        _clear_browser_reveal(context)
 
         # If cache type changed, need to repopulate folder structure
         if cache_type != witcher_file_browser.active_cache_type:
@@ -3888,6 +6267,7 @@ class NavigateForwardOperator(Operator):
         cache_type, folder = _nav_history[_nav_index]
 
         witcher_file_browser = context.scene.witcher_file_browser
+        _clear_browser_reveal(context)
 
         # If cache type changed, need to repopulate folder structure
         if cache_type != witcher_file_browser.active_cache_type:
@@ -3908,16 +6288,18 @@ class GotoSearchResultOperator(Operator):
     file_path: StringProperty()
 
     def execute(self, context):
-        witcher_file_browser = context.scene.witcher_file_browser
         # Get the parent folder of the file
         if "\\" in self.file_path:
             parent_folder = "\\".join(self.file_path.split("\\")[:-1])
         else:
             parent_folder = ""
-        # Navigate to that folder and clear search
-        witcher_file_browser.current_folder = parent_folder
-        witcher_file_browser.search_query = ""
-        clear_search_cache()
+        _navigate_browser_to_location(
+            context,
+            context.scene.witcher_file_browser.active_cache_type,
+            parent_folder,
+            reveal_file=self.file_path,
+            clear_filter=True,
+        )
         return {'FINISHED'}
 
 
@@ -3927,24 +6309,26 @@ class GotoGlobalSearchResultOperator(Operator):
     bl_label = "Go to Source"
     file_path: StringProperty()
     cache_type: StringProperty()
+    archive_path: StringProperty(default="")
 
     def execute(self, context):
-        witcher_file_browser = context.scene.witcher_file_browser
-
-        # Set the cache type and populate folder structure
-        witcher_file_browser.active_cache_type = self.cache_type
-        SelectCacheTypeOperator.populate_folder_structure(self, self.cache_type, context)
-
         # Get the parent folder of the file
         if "\\" in self.file_path:
             parent_folder = "\\".join(self.file_path.split("\\")[:-1])
         else:
             parent_folder = ""
-
-        # Navigate to that folder and clear search
-        witcher_file_browser.current_folder = parent_folder
-        witcher_file_browser.search_query = ""
-        clear_search_cache()
+        try:
+            _navigate_browser_to_location(
+                context,
+                self.cache_type,
+                parent_folder,
+                reveal_file=self.file_path,
+                archive_path=self.archive_path,
+                clear_filter=True,
+            )
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to open source location: {exc}")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
 
@@ -3960,6 +6344,7 @@ class NavigateFolderOperator(Operator):
 
         # Return to root cache selection
         if self.go_to_root:
+            _clear_browser_reveal(context)
             witcher_file_browser.active_cache_type = ""
             witcher_file_browser.current_folder = ""
             witcher_file_browser.search_query = ""
@@ -3969,6 +6354,7 @@ class NavigateFolderOperator(Operator):
             folder_structure.clear()
             return {'FINISHED'}
 
+        _clear_browser_reveal(context)
         if self.target_folder:
             witcher_file_browser.current_folder = self.target_folder
         else:  # Go up one level
@@ -3991,6 +6377,8 @@ class SelectCacheTypeOperator(Operator):
 
     def execute(self, context):
         witcher_file_browser = context.scene.witcher_file_browser
+        _clear_browser_reveal(context)
+        witcher_file_browser.browser_view_mode = 'BROWSE'
         witcher_file_browser.active_cache_type = self.cache_type
         witcher_file_browser.current_folder = ""
         witcher_file_browser.search_query = ""
@@ -4205,8 +6593,10 @@ class FileActionOperatorImportToScene(Operator):
                     self.report({'ERROR'}, "No external bundle loaded")
                     return None
 
-                addon_prefs = get_all_addon_prefs(context)
-                uncook_path = addon_prefs.uncook_path
+                export_root = _get_external_archive_output_root(context, cache_type, create=True)
+                if not export_root:
+                    self.report({'ERROR'}, "Choose an export folder before importing from a standalone bundle")
+                    return None
                 item_lists = []
                 if full_path_norm.endswith('.w2mesh') or full_path_norm.endswith('.w2anims'):
                     pattern = re.compile(re.escape(full_path_norm) + r"(\.\d+\.buffer)?$", re.IGNORECASE)
@@ -4235,15 +6625,15 @@ class FileActionOperatorImportToScene(Operator):
                         buffer_items.append((inner_name, final_item))
 
                 if base_item:
-                    abs_file_path = os.path.join(uncook_path, base_item[0])
-                    if prepare_extraction_target(abs_file_path, uncook_path):
+                    abs_file_path = os.path.join(export_root, base_item[0])
+                    if prepare_extraction_target(abs_file_path, export_root):
                         base_item[1].extract_to_file(abs_file_path)
                 else:
-                    abs_file_path = os.path.join(uncook_path, full_path_norm)
+                    abs_file_path = os.path.join(export_root, full_path_norm)
 
                 for inner_name, final_item in buffer_items:
-                    out_path = os.path.join(uncook_path, inner_name)
-                    if prepare_extraction_target(out_path, uncook_path):
+                    out_path = os.path.join(export_root, inner_name)
+                    if prepare_extraction_target(out_path, export_root):
                         final_item.extract_to_file(out_path)
 
             elif cache_type == "Bundle":
@@ -4350,43 +6740,21 @@ class FileActionOperatorImportToScene(Operator):
                 else:
                     abs_file_path = repo_file(full_path)
             elif cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
-                session = get_external_archive_session(cache_type)
-                items = session["items"].get(full_path_norm) if session else None
-                if items:
-                    final_item = items[-1] if isinstance(items, list) else items
-                    output_ext = getattr(final_item, 'Extension', '.nxs')
-                    item_name = getattr(final_item, 'Name', full_path_norm)
-                    base_name = os.path.splitext(item_name)[0]
-                    output_name = base_name + output_ext
-                    addon_prefs = get_all_addon_prefs(context)
-                    uncook_path = addon_prefs.uncook_path
-                    abs_file_path = os.path.join(uncook_path, output_name)
-                    if prepare_extraction_target(abs_file_path, uncook_path):
-                        abs_file_path = final_item.extract_to_file(abs_file_path)
-                else:
-                    log.warning("External collision item not found: %s", full_path)
+                export_result = _export_external_archive_item(
+                    context,
+                    cache_type,
+                    full_path_norm,
+                    overwrite=overwrite_existing,
+                )
+                abs_file_path = export_result.get("primary_path", "")
             elif cache_type == EXTERNAL_TEXTURE_CACHE_TYPE:
-                items = _get_texture_cache_items(full_path_norm, cache_type=cache_type)
-                if items:
-                    final_item = items[-1] if isinstance(items, list) else items
-                    item_name = getattr(final_item, 'Name', full_path_norm) or full_path_norm
-                    abs_file_path = repo_file(item_name)
-                    if abs_file_path:
-                        texture_root = get_texture_path(context) or ""
-                        uncook_root = get_uncook_path(context) or ""
-                        prep_root = texture_root or uncook_root
-                        try:
-                            norm_abs = os.path.normcase(os.path.normpath(abs_file_path))
-                            norm_uncook = os.path.normcase(os.path.normpath(uncook_root)) if uncook_root else ""
-                            if norm_uncook and norm_abs.startswith(norm_uncook + os.sep):
-                                prep_root = uncook_root
-                        except Exception:
-                            pass
-                        if prepare_extraction_target(abs_file_path, prep_root):
-                            final_item.extract_to_file(abs_file_path)
-                        dds_path = os.path.splitext(abs_file_path)[0] + ".dds"
-                        if win_path_exists(dds_path):
-                            abs_file_path = dds_path
+                export_result = _export_external_archive_item(
+                    context,
+                    cache_type,
+                    full_path_norm,
+                    overwrite=overwrite_existing,
+                )
+                abs_file_path = export_result.get("primary_path", "")
             elif cache_type == EXTERNAL_SOUND_CACHE_TYPE:
                 abs_file_path = ensure_sound_item_extracted(
                     context,
@@ -4855,13 +7223,250 @@ class GlobalExportOperator(Operator):
             witcher_file_browser.active_cache_type = original_cache_type
 
 
+class OpenExternalArchiveFolderOperator(Operator):
+    """Open the current standalone archive export folder."""
+    bl_idname = "witcher.open_external_archive_folder"
+    bl_label = "Open Standalone Export Folder"
+
+    cache_type: StringProperty(default="")
+
+    def execute(self, context):
+        cache_type = self.cache_type or getattr(context.scene.witcher_file_browser, "active_cache_type", "")
+        output_root = _get_external_archive_output_root(context, cache_type, create=True)
+        if not output_root:
+            self.report({'ERROR'}, "No standalone archive export folder is set")
+            return {'CANCELLED'}
+        try:
+            bpy.ops.wm.path_open(filepath=output_root)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not open folder: {exc}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class CancelExternalArchiveExportOperator(Operator):
+    bl_idname = "witcher.cancel_external_archive_export"
+    bl_label = "Cancel Standalone Export"
+
+    def execute(self, context):
+        if not _EXTERNAL_BROWSER_EXPORT_JOB.get("running"):
+            return {'CANCELLED'}
+        _EXTERNAL_BROWSER_EXPORT_JOB["cancel_requested"] = True
+        _touch_external_export_ui(context)
+        self.report({'INFO'}, "Standalone export cancellation requested")
+        return {'FINISHED'}
+
+
+class DismissExternalArchiveExportStatusOperator(Operator):
+    bl_idname = "witcher.dismiss_external_archive_export_status"
+    bl_label = "Dismiss Standalone Export Status"
+
+    def execute(self, context):
+        _set_external_export_status(visible=False, state="idle")
+        _touch_external_export_ui(context)
+        return {'FINISHED'}
+
+
+class ExternalArchiveExportAllOperator(Operator):
+    """Bulk-extract the current standalone archive scope to the chosen export folder."""
+    bl_idname = "witcher.external_archive_export_all"
+    bl_label = "Export Standalone Archive Scope"
+
+    cache_type: StringProperty(default="")
+    folder_path: StringProperty(default="")
+
+    def execute(self, context):
+        browser = getattr(context.scene, "witcher_file_browser", None)
+        if browser is None:
+            self.report({'ERROR'}, "Asset browser state is unavailable")
+            return {'CANCELLED'}
+
+        if _EXTERNAL_BROWSER_EXPORT_JOB.get("running"):
+            self.report({'WARNING'}, "A standalone archive export is already running")
+            return {'CANCELLED'}
+
+        cache_type = self.cache_type or browser.active_cache_type
+        if not is_external_cache(cache_type):
+            self.report({'ERROR'}, "Standalone archive export is only available for external archive sessions")
+            return {'CANCELLED'}
+
+        session = get_external_archive_session(cache_type)
+        if not session:
+            self.report({'ERROR'}, "No standalone archive is loaded")
+            return {'CANCELLED'}
+
+        output_root = _get_external_archive_output_root(context, cache_type, create=True)
+        if not output_root:
+            self.report({'ERROR'}, "Choose an export folder before starting the standalone export")
+            return {'CANCELLED'}
+
+        if cache_type == EXTERNAL_TEXTURE_CACHE_TYPE and browser.external_texture_export_format != 'DDS':
+            from ..CR2W import texconv_wrapper
+
+            if not texconv_wrapper.is_available():
+                self.report({'ERROR'}, "PNG/TGA export requires texconv.dll in CR2W/third_party_libs")
+                return {'CANCELLED'}
+
+        scope_paths = get_export_scope_file_paths(context)
+        if not scope_paths:
+            self.report({'WARNING'}, "No files match the current folder/filter")
+            return {'CANCELLED'}
+
+        _set_external_export_status(visible=False, state="idle")
+        job = _EXTERNAL_BROWSER_EXPORT_JOB
+        job["running"] = True
+        job["cache_type"] = cache_type
+        job["folder_path"] = self.folder_path or browser.current_folder
+        job["output_root"] = output_root
+        job["texture_format"] = str(getattr(browser, "external_texture_export_format", "DDS") or "DDS")
+        job["overwrite"] = bool(getattr(browser, "mods_overwrite", False))
+        job["items"] = scope_paths
+        job["index"] = 0
+        job["total"] = len(scope_paths)
+        job["done"] = 0
+        job["skipped"] = 0
+        job["errors"] = 0
+        job["cancel_requested"] = False
+        job["context"] = context
+
+        wm = context.window_manager
+        job["timer"] = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+        _touch_external_export_ui(context)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            _EXTERNAL_BROWSER_EXPORT_JOB["cancel_requested"] = True
+            return {'RUNNING_MODAL'}
+
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        job = _EXTERNAL_BROWSER_EXPORT_JOB
+        if not job.get("running"):
+            return self._finish(context)
+        if job.get("cancel_requested"):
+            return self._finish(context, cancelled=True)
+
+        if int(job["index"]) < int(job["total"]) and not job.get("cancel_requested"):
+            item_path = job["items"][int(job["index"])]
+            job["index"] += 1
+            try:
+                export_result = _export_external_archive_item(
+                    context,
+                    job["cache_type"],
+                    item_path,
+                    overwrite=bool(job.get("overwrite", False)),
+                    output_root=job.get("output_root", ""),
+                    texture_format=str(job.get("texture_format", "DDS") or "DDS"),
+                )
+                if export_result.get("skipped"):
+                    job["skipped"] += 1
+                else:
+                    job["done"] += 1
+            except Exception as exc:
+                log.debug("Standalone archive export failed for %s: %s", item_path, exc, exc_info=True)
+                job["errors"] += 1
+
+        _touch_external_export_ui(context)
+
+        if job.get("cancel_requested"):
+            return self._finish(context, cancelled=True)
+        if int(job["index"]) >= int(job["total"]):
+            return self._finish(context)
+        return {'RUNNING_MODAL'}
+
+    def _finish(self, context, cancelled: bool = False):
+        job = _EXTERNAL_BROWSER_EXPORT_JOB
+        timer = job.get("timer")
+        wm = getattr(context, "window_manager", None)
+        if wm and timer:
+            try:
+                wm.event_timer_remove(timer)
+            except Exception:
+                pass
+
+        cache_type = str(job.get("cache_type", "") or "")
+        folder_path = str(job.get("folder_path", "") or "")
+        output_root = str(job.get("output_root", "") or "")
+        done = int(job.get("done", 0) or 0)
+        skipped = int(job.get("skipped", 0) or 0)
+        errors = int(job.get("errors", 0) or 0)
+        processed = int(job.get("index", 0) or 0)
+        total = int(job.get("total", 0) or 0)
+
+        job["running"] = False
+        job["cache_type"] = ""
+        job["folder_path"] = ""
+        job["output_root"] = ""
+        job["texture_format"] = "DDS"
+        job["overwrite"] = False
+        job["items"] = []
+        job["index"] = 0
+        job["total"] = 0
+        job["done"] = 0
+        job["skipped"] = 0
+        job["errors"] = 0
+        job["cancel_requested"] = False
+        job["timer"] = None
+        job["context"] = None
+
+        _tag_browser_redraw(context)
+
+        scope_label = folder_path or "entire archive"
+        if cancelled:
+            message = (
+                f"{cache_type} export cancelled at {processed:,}/{total:,}: {scope_label} -> {output_root} "
+                f"({done:,} extracted, {skipped:,} skipped, {errors:,} errors)"
+            )
+            _set_external_export_status(
+                visible=True,
+                state="cancelled",
+                cache_type=cache_type,
+                folder_path=folder_path,
+                output_root=output_root,
+                processed=processed,
+                total=total,
+                done=done,
+                skipped=skipped,
+                errors=errors,
+                message=message,
+            )
+            _touch_external_export_ui(context)
+            self.report({'WARNING'}, message)
+            return {'CANCELLED'}
+
+        message = (
+            f"{cache_type} export complete: {scope_label} -> {output_root} "
+            f"({done:,} extracted, {skipped:,} skipped, {errors:,} errors)"
+        )
+        _set_external_export_status(
+            visible=True,
+            state="completed" if errors == 0 else "completed_with_errors",
+            cache_type=cache_type,
+            folder_path=folder_path,
+            output_root=output_root,
+            processed=processed,
+            total=total,
+            done=done,
+            skipped=skipped,
+            errors=errors,
+            message=message,
+        )
+        _touch_external_export_ui(context)
+        self.report({'INFO' if errors == 0 else 'WARNING'}, message)
+        return {'FINISHED'}
+
+
 class TexturePreviewOperator(Operator):
-    """Preview a texture from any cache type"""
+    """Preview an image from any cache type"""
     bl_idname = "witcher.texture_preview"
-    bl_label = "Preview Texture"
+    bl_label = "Preview Image"
 
     file_path: StringProperty()
     cache_type: StringProperty(default="Texture")
+    preview_scale: IntProperty(name="Zoom", default=16, min=6, max=32)
 
     # Class-level preview collection
     _preview_collection = None
@@ -4880,6 +7485,21 @@ class TexturePreviewOperator(Operator):
             return self._invoke_inner(context, event)
 
     def _invoke_inner(self, context, event):
+        witcher_file_browser = context.scene.witcher_file_browser
+        temp_path = _resolve_preview_image_path(
+            context,
+            self.cache_type,
+            self.file_path,
+            loadmods=witcher_file_browser.loadmods,
+        )
+        if temp_path and win_path_exists(temp_path):
+            context.scene.witcher_file_browser.preview_texture_path = temp_path
+            pcoll = self.get_preview_collection()
+            if self.file_path in pcoll:
+                del pcoll[self.file_path]
+            pcoll.load(self.file_path, win_safe_path(temp_path), 'IMAGE')
+            return context.window_manager.invoke_popup(self, width=560)
+
         import tempfile
         from pathlib import Path
 
@@ -5005,7 +7625,7 @@ class TexturePreviewOperator(Operator):
         # Load the new preview
         pcoll.load(self.file_path, win_safe_path(temp_path), 'IMAGE')
 
-        return context.window_manager.invoke_popup(self, width=400)
+        return context.window_manager.invoke_popup(self, width=560)
 
     def draw(self, context):
         layout = self.layout
@@ -5018,9 +7638,11 @@ class TexturePreviewOperator(Operator):
             if self.file_path in pcoll:
                 icon_id = pcoll[self.file_path].icon_id
 
+                layout.prop(self, "preview_scale", slider=True)
+
                 # Display the image preview using template_icon
                 col = layout.column(align=True)
-                col.template_icon(icon_value=icon_id, scale=12.0)
+                col.template_icon(icon_value=icon_id, scale=float(self.preview_scale))
 
                 # Show filename
                 img_name = os.path.basename(preview_path)
@@ -5205,6 +7827,31 @@ class FileActionOperator(Operator):
         full_path = (witcher_file_browser.current_folder + "\\" + self.file_path
                      if witcher_file_browser.current_folder else self.file_path)
         log.debug("Action on file [%s]: %s", cache_type, full_path)
+        if is_external_cache(cache_type):
+            output_root = _get_external_archive_output_root(context, cache_type, create=True)
+            if not output_root:
+                self.report({'ERROR'}, "Choose an export folder before extracting from a standalone archive")
+                return {'CANCELLED'}
+            try:
+                export_result = _export_external_archive_item(
+                    context,
+                    cache_type,
+                    full_path,
+                    overwrite=bool(getattr(witcher_file_browser, "mods_overwrite", False)),
+                    output_root=output_root,
+                )
+            except Exception as exc:
+                self.report({'ERROR'}, f"Export failed: {exc}")
+                return {'CANCELLED'}
+
+            export_path = export_result.get("primary_path", "")
+            if not export_path or not win_path_exists(export_path):
+                self.report({'ERROR'}, f"Export failed: {full_path}")
+                return {'CANCELLED'}
+
+            filename = os.path.basename(export_path)
+            self.report({'INFO'}, f"Exported: {filename} -> {export_path}")
+            return {'FINISHED'}
         # Get appropriate manager and find item
         loadmods = witcher_file_browser.loadmods
         full_path_norm = full_path.replace("/", "\\")
@@ -5418,11 +8065,13 @@ def register():
     bpy.utils.register_class(RemoveBookmarkOperator)
     bpy.utils.register_class(GotoBookmarkOperator)
     bpy.utils.register_class(ClearRecentImportsOperator)
+    bpy.utils.register_class(ReopenExternalArchiveOperator)
     bpy.utils.register_class(ImportRecentOperator)
     bpy.utils.register_class(ToggleBatchSelectOperator)
     bpy.utils.register_class(SelectAllBatchVisibleOperator)
     bpy.utils.register_class(ClearBatchSelectOperator)
     bpy.utils.register_class(ImportBatchSelectedOperator)
+    bpy.utils.register_class(BrowserPageOperator)
     bpy.utils.register_class(NavigateToPathOperator)
     bpy.utils.register_class(NavigateBackOperator)
     bpy.utils.register_class(NavigateForwardOperator)
@@ -5439,6 +8088,10 @@ def register():
     bpy.utils.register_class(SoundPreviewToggleOperator)
     bpy.utils.register_class(GlobalImportOperator)
     bpy.utils.register_class(GlobalExportOperator)
+    bpy.utils.register_class(OpenExternalArchiveFolderOperator)
+    bpy.utils.register_class(CancelExternalArchiveExportOperator)
+    bpy.utils.register_class(DismissExternalArchiveExportStatusOperator)
+    bpy.utils.register_class(ExternalArchiveExportAllOperator)
     bpy.utils.register_class(TexturePreviewOperator)
     bpy.utils.register_class(WITCHER_PT_AssetBrowser)
 
@@ -5448,6 +8101,7 @@ def register():
 
 def unregister():
     _clear_sound_preview()
+    _clear_browser_asset_previews()
     if hasattr(bpy.types.Scene, "witcher_file_browser"):
         delattr(bpy.types.Scene, "witcher_file_browser")
     if hasattr(bpy.types.Scene, "witcher_file_items"):
@@ -5455,6 +8109,10 @@ def unregister():
 
     bpy.utils.unregister_class(WITCHER_PT_AssetBrowser)
     bpy.utils.unregister_class(TexturePreviewOperator)
+    bpy.utils.unregister_class(ExternalArchiveExportAllOperator)
+    bpy.utils.unregister_class(DismissExternalArchiveExportStatusOperator)
+    bpy.utils.unregister_class(CancelExternalArchiveExportOperator)
+    bpy.utils.unregister_class(OpenExternalArchiveFolderOperator)
     bpy.utils.unregister_class(GlobalExportOperator)
     bpy.utils.unregister_class(GlobalImportOperator)
     bpy.utils.unregister_class(SoundPreviewToggleOperator)
@@ -5469,8 +8127,10 @@ def unregister():
     bpy.utils.unregister_class(NavigateForwardOperator)
     bpy.utils.unregister_class(NavigateBackOperator)
     bpy.utils.unregister_class(NavigateToPathOperator)
+    bpy.utils.unregister_class(ReopenExternalArchiveOperator)
     bpy.utils.unregister_class(ImportRecentOperator)
     bpy.utils.unregister_class(ImportBatchSelectedOperator)
+    bpy.utils.unregister_class(BrowserPageOperator)
     bpy.utils.unregister_class(ClearBatchSelectOperator)
     bpy.utils.unregister_class(SelectAllBatchVisibleOperator)
     bpy.utils.unregister_class(ToggleBatchSelectOperator)

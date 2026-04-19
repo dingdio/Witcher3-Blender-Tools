@@ -201,7 +201,7 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
     terrain_multires_level: IntProperty(
         name="Terrain Multires",
         description="Multires subdivision levels used by terrain import",
-        default=5,
+        default=10,
         min=0,
         max=10,
     )

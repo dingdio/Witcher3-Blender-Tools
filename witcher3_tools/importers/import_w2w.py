@@ -480,7 +480,7 @@ def _get_scene_terrain_multires_level():
     try:
         return int(bpy.context.scene.witcher_file_browser.terrain_multires_level)
     except Exception:
-        return 5
+        return 10
 
 
 def _get_scene_terrain_import_mode():

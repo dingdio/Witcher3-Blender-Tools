@@ -47,6 +47,15 @@ _EQUIPMENT_ENTITY_CACHE = {}
 _TEMPLATE_PATH_RESOLVE_CACHE = {}  # (template_key, roots_tuple) -> (repo_path, export_path)
 _XML_DECL_RE = re.compile(r'^\s*<\?xml[^>]*\?>', re.IGNORECASE)
 _XML_DECL_ENCODING_BYTES_RE = re.compile(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', re.IGNORECASE)
+_CATEGORY_CACHE_SCHEMA_VERSION = 2
+_CATALOG_CACHE_FLAGS = {
+    "w3": {"schema_version": 0, "icon_path": False, "hold_template": False},
+    "w2": {"schema_version": 0, "icon_path": False, "hold_template": False},
+}
+_ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP = {
+    "w3": None,
+    "w2": None,
+}
 
 def _clear_cache_if_oversized(cache, max_entries=64):
     if len(cache) > max_entries:
@@ -55,6 +64,48 @@ def _clear_cache_if_oversized(cache, max_entries=64):
 
 def _normalize_source_game(source_game):
     return "w2" if str(source_game or "").strip().lower() == "w2" else "w3"
+
+
+def _set_catalog_cache_flags(source_game="w3", *, schema_version=0, icon_path=False, hold_template=False):
+    source_game = _normalize_source_game(source_game)
+    _CATALOG_CACHE_FLAGS[source_game] = {
+        "schema_version": int(schema_version or 0),
+        "icon_path": bool(icon_path),
+        "hold_template": bool(hold_template),
+    }
+
+
+def _infer_catalog_cache_flags(item_attributes):
+    has_icon_path = False
+    has_hold_template = False
+    for attrs in item_attributes.values():
+        if not isinstance(attrs, dict):
+            continue
+        if "icon_path" in attrs:
+            has_icon_path = True
+        if "hold_template" in attrs:
+            has_hold_template = True
+        if has_icon_path and has_hold_template:
+            break
+    return has_icon_path, has_hold_template
+
+
+def _catalog_has_browser_icon_fields(source_game="w3"):
+    source_game = _normalize_source_game(source_game)
+    flags = _CATALOG_CACHE_FLAGS.get(source_game, {})
+    if flags.get("icon_path") and flags.get("hold_template"):
+        return True
+
+    _category_items, item_attributes = _get_equipment_catalog(source_game)
+    has_icon_path, has_hold_template = _infer_catalog_cache_flags(item_attributes)
+    if item_attributes:
+        _set_catalog_cache_flags(
+            source_game,
+            schema_version=flags.get("schema_version", 0),
+            icon_path=has_icon_path,
+            hold_template=has_hold_template,
+        )
+    return has_icon_path and has_hold_template
 
 
 def _get_category_cache_file(source_game="w3"):
@@ -78,6 +129,56 @@ def _get_equipment_catalog(source_game="w3"):
     return (EquipmentDefinitionEntry.category_items, EquipmentDefinitionEntry.item_attributes)
 
 
+def _clear_item_attribute_identifier_lookup(source_game=None):
+    if source_game is None:
+        for key in _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP:
+            _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP[key] = None
+        return
+    _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP[_normalize_source_game(source_game)] = None
+
+
+def _normalize_item_attribute_identifier(value):
+    if value is None:
+        return ""
+    return str(value).replace("/", "\\").strip().strip("\\").lower()
+
+
+def _iter_item_attribute_identifier_aliases(value):
+    normalized = _normalize_item_attribute_identifier(value)
+    if not normalized:
+        return
+    seen = set()
+    for alias in (
+        normalized,
+        os.path.basename(normalized),
+        os.path.splitext(os.path.basename(normalized))[0],
+    ):
+        alias = _normalize_item_attribute_identifier(alias)
+        if not alias or alias in seen:
+            continue
+        seen.add(alias)
+        yield alias
+
+
+def _get_item_attribute_identifier_lookup(source_game="w3"):
+    source_game = _normalize_source_game(source_game)
+    cached = _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP.get(source_game)
+    if cached is not None:
+        return cached
+
+    _category_items, item_attributes = _get_equipment_catalog(source_game)
+    lookup = {}
+    for field_name in ("equip_template", "hold_template", "item_name"):
+        for item_name, attrs in item_attributes.items():
+            if not isinstance(attrs, dict):
+                continue
+            value = attrs.get(field_name, "") if field_name != "item_name" else (item_name or attrs.get("item_name", ""))
+            for alias in _iter_item_attribute_identifier_aliases(value):
+                lookup.setdefault(alias, attrs)
+    _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP[source_game] = lookup
+    return lookup
+
+
 def get_equipment_source_game_for_search_roots(search_roots=None):
     return "w2" if _is_w2_search(search_roots) else "w3"
 
@@ -95,13 +196,25 @@ def _save_category_cache(source_game="w3"):
     try:
         category_items, item_attributes = _get_equipment_catalog(source_game)
         cache_file = _get_category_cache_file(source_game)
+        has_icon_path, has_hold_template = _infer_catalog_cache_flags(item_attributes)
         cache_data = {
+            'schema_version': _CATEGORY_CACHE_SCHEMA_VERSION,
+            'feature_flags': {
+                'icon_path': has_icon_path,
+                'hold_template': has_hold_template,
+            },
             'category_items': category_items,
             'item_attributes': item_attributes,
         }
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump(cache_data, f, indent=2)
+        _set_catalog_cache_flags(
+            source_game,
+            schema_version=_CATEGORY_CACHE_SCHEMA_VERSION,
+            icon_path=has_icon_path,
+            hold_template=has_hold_template,
+        )
         log.debug("Saved %s category cache to %s", _normalize_source_game(source_game), cache_file)
     except Exception as e:
         log.warning("Failed to save category cache: %s", e)
@@ -119,6 +232,8 @@ def _load_category_cache(source_game="w3"):
 
         category_items = cache_data.get('category_items', {})
         item_attributes = cache_data.get('item_attributes', {})
+        feature_flags = cache_data.get('feature_flags', {}) if isinstance(cache_data, dict) else {}
+        schema_version = int(cache_data.get('schema_version', 0) or 0) if isinstance(cache_data, dict) else 0
         target_categories, target_attributes = _get_equipment_catalog(source_game)
 
         for category, items in category_items.items():
@@ -149,6 +264,14 @@ def _load_category_cache(source_game="w3"):
                 continue
             target_attributes[item_name] = attrs
 
+        inferred_icon_path, inferred_hold_template = _infer_catalog_cache_flags(item_attributes)
+        _set_catalog_cache_flags(
+            source_game,
+            schema_version=schema_version,
+            icon_path=feature_flags.get("icon_path", inferred_icon_path),
+            hold_template=feature_flags.get("hold_template", inferred_hold_template),
+        )
+        _clear_item_attribute_identifier_lookup(source_game)
         log.debug("Loaded %d %s categories from cache", len(category_items), source_game)
         return True
     except Exception as e:
@@ -226,6 +349,7 @@ def ensure_equipment_catalog_for_search_roots(search_roots=None):
         _LOADED_EQUIPMENT_XML_DIRS.add(norm)
 
     if merged_any:
+        _clear_item_attribute_identifier_lookup("w2")
         _save_category_cache("w2")
     return merged_any
 
@@ -472,6 +596,51 @@ def _lookup_item_attributes(item_name, source_game="w3"):
     if isinstance(attrs, dict):
         return attrs
     return {}
+
+
+def ensure_equipment_catalog_ready(source_game="w3", search_roots=None, context=None, require_browser_icon_fields=False):
+    """Ensure the equipment catalog is loaded for the requested source game."""
+    source_game = _normalize_source_game(source_game)
+    _category_items, item_attributes = _get_equipment_catalog(source_game)
+    if source_game == "w2":
+        ensure_equipment_catalog_for_search_roots(search_roots)
+        _category_items, item_attributes = _get_equipment_catalog(source_game)
+        return bool(item_attributes)
+    if not item_attributes:
+        _load_category_cache(source_game)
+        _category_items, item_attributes = _get_equipment_catalog(source_game)
+    if source_game == "w3" and context is not None:
+        needs_w3_refresh = not item_attributes
+        if require_browser_icon_fields and not _catalog_has_browser_icon_fields(source_game):
+            needs_w3_refresh = True
+        if needs_w3_refresh and _refresh_w3_catalog_from_xml(context):
+            _category_items, item_attributes = _get_equipment_catalog(source_game)
+    return bool(item_attributes)
+
+
+def get_item_attributes_by_identifier(identifier, source_game="w3", strict: bool = False):
+    """Resolve equipment catalog attributes by item name or template identifier."""
+    _ = strict  # Kept for API compatibility; lookups are exact aliases only.
+    source_game = _normalize_source_game(source_game)
+    raw_value = str(identifier or "").strip()
+    if not raw_value:
+        return {}
+
+    direct = _lookup_item_attributes(raw_value, source_game)
+    if direct:
+        return direct
+
+    lookup = _get_item_attribute_identifier_lookup(source_game)
+    for alias in _iter_item_attribute_identifier_aliases(raw_value):
+        attrs = lookup.get(alias)
+        if attrs:
+            return attrs
+    return {}
+
+
+def get_item_icon_path(identifier, source_game="w3", strict: bool = False):
+    attrs = get_item_attributes_by_identifier(identifier, source_game=source_game, strict=strict)
+    return str(attrs.get("icon_path", "") or "")
 
 
 def _apply_catalog_attributes_to_slot(slot, source_game=None):
@@ -4176,6 +4345,13 @@ def extract_categories_from_xml(folder_path):
                     category = item.get("category")
                     name = item.get("name")
                     equip_template = item.get("equip_template", "")
+                    hold_template = item.get("hold_template", "")
+                    template_name = equip_template or hold_template
+                    icon_path = item.get("icon_path", "") or ""
+                    if not icon_path:
+                        icon_node = item.find("icon_path")
+                        if icon_node is not None and icon_node.text:
+                            icon_path = icon_node.text.strip()
                     # Extract additional attributes
                     equip_slot = item.get("equip_slot", "")
                     hold_slot = item.get("hold_slot", "")
@@ -4224,13 +4400,13 @@ def extract_categories_from_xml(folder_path):
                         _collect_bound_items(player_override.find("bound_items"))
                     # ... extract other attributes as needed
 
-                    if category and name and equip_template:
+                    if category and name and template_name:
                         # Initialize the category if it doesn't exist
                         if category not in category_items:
                             category_items[category] = [("None", "None", "")]
 
                         # Add item as a tuple without modifying names or adding suffixes
-                        item_tuple = (name, name, equip_template)
+                        item_tuple = (name, name, template_name)
 
                         # Only add if item is not already in the list for this category
                         if item_tuple not in category_items[category]:
@@ -4241,6 +4417,9 @@ def extract_categories_from_xml(folder_path):
                             'item_name': name,
                             'category': category,
                             'equip_template': equip_template,
+                            'hold_template': hold_template,
+                            'template_name': template_name,
+                            'icon_path': icon_path,
                             'equip_slot': equip_slot,
                             'hold_slot': hold_slot,
                             'weapon': weapon,
@@ -4390,6 +4569,47 @@ def _get_equipment_xml_sources(context, addon_prefs):
         seen.add(norm)
         result.append((label, path, os.path.isdir(path)))
     return result
+
+
+def _refresh_w3_catalog_from_xml(context):
+    try:
+        addon_prefs = get_all_addon_prefs(context)
+        sources = _get_equipment_xml_sources(context, addon_prefs)
+    except Exception:
+        log.debug("Failed to resolve equipment XML sources for catalog refresh", exc_info=True)
+        return False
+
+    valid_sources = [(label, path) for (label, path, is_valid) in sources if is_valid]
+    if not valid_sources:
+        return False
+
+    merged_category_items = {}
+    merged_item_attributes = {}
+    for _label, folder_path in valid_sources:
+        _all_categories, category_items_from_xml, item_attributes_from_xml = extract_categories_from_xml(folder_path)
+        _merge_equipment_xml_data(
+            merged_category_items,
+            merged_item_attributes,
+            category_items_from_xml,
+            item_attributes_from_xml,
+        )
+
+    if not merged_item_attributes:
+        return False
+
+    target_categories, target_attributes = _get_equipment_catalog("w3")
+    target_categories.clear()
+    target_attributes.clear()
+    _merge_equipment_xml_data(
+        target_categories,
+        target_attributes,
+        merged_category_items,
+        merged_item_attributes,
+    )
+    _clear_item_attribute_identifier_lookup("w3")
+    _save_category_cache("w3")
+    _TEMPLATE_PATH_RESOLVE_CACHE.clear()
+    return True
 
 
 def _merge_equipment_xml_data(target_categories, target_attributes, source_categories, source_attributes):
@@ -4563,6 +4783,7 @@ class EQUIPMENT_OT_RefreshCategories(bpy.types.Operator):
 
         # Update item_attributes (source priority already resolved in merged_item_attributes)
         EquipmentDefinitionEntry.item_attributes.update(merged_item_attributes)
+        _clear_item_attribute_identifier_lookup("w3")
 
         # Save to cache for persistence across reloads
         _save_category_cache()
