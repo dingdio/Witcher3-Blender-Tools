@@ -1,4 +1,4 @@
-# Witcher 3 Tools for Blender
+# Witcher 3 Blender Tools
 
 [![Release](https://img.shields.io/github/v/release/dingdio/Witcher3_Blender_Tools?label=Download&style=flat-square&color=E05D44)](https://github.com/dingdio/Witcher3_Blender_Tools/releases)
 [![Blender 4.5+](https://img.shields.io/badge/Blender-4.5%2B-F5792A?style=flat-square&logo=blender&logoColor=white)](https://www.blender.org/)
