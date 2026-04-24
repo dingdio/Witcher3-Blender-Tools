@@ -181,7 +181,7 @@ Live status for all three shows up in addon preferences under **External Addons*
 
 | Tool | Role |
 |---|---|
-| [REDkit](https://store.steampowered.com/app/1671760/The_Witcher_3_REDkit/) | Official mod editor — depot source and export target |
+| [REDkit](https://store.steampowered.com/app/2684660/The_Witcher_3_REDkit/) | Official mod editor — depot source and export target |
 | [WolvenKit 7](https://github.com/WolvenKit/WolvenKit-7) | Optional JSON CLI functions — nikich340 & WolvenKit team |
 | [Radish Tools](https://www.nexusmods.com/witcher3/mods/3620) | World modding pipeline via `.yml` — rmemr |
 
