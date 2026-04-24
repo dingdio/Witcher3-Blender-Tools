@@ -1,81 +1,194 @@
-# Witcher 3 Blender Tools
-Blender addon for working with Witcher 3 files with some support for Witcher 2 files. Get the latest [Release](https://github.com/dingdio/Witcher3-Blender-Tools/releases)
+# Witcher 3 Tools for Blender
 
-<img src="https://user-images.githubusercontent.com/4729750/227740200-4722f6c0-fce9-43f5-a4c2-68d6b90c706a.jpg" height="200">
+[![Release](https://img.shields.io/github/v/release/dingdio/Witcher3_Blender_Tools?label=Download&style=flat-square&color=E05D44)](https://github.com/dingdio/Witcher3_Blender_Tools/releases)
+[![Blender 4.5+](https://img.shields.io/badge/Blender-4.5%2B-F5792A?style=flat-square&logo=blender&logoColor=white)](https://www.blender.org/)
+[![REDkit](https://img.shields.io/badge/REDkit-companion-CD202C?style=flat-square)](https://store.steampowered.com/app/1671760/The_Witcher_3_REDkit/)
+[![License](https://img.shields.io/github/license/dingdio/Witcher3_Blender_Tools?style=flat-square)](LICENSE)
+[![Wiki](https://img.shields.io/badge/Wiki-usage%20notes-181717?logo=github)](https://github.com/dingdio/Witcher3_Blender_Tools/wiki)
+
+Native import/export of The Witcher 3 game files in Blender. REDkit companion. No FBX required. Including support for reading Witcher 2 files. Get the latest [Release](https://github.com/dingdio/Witcher3_Blender_Tools/releases)
+
+<p align="center">
+  <img src="./clips/hero_hq_02.webp" width="900" alt="Witcher 3 Tools — overview"/>
+</p>
+
+[Watch the trailer on YouTube](https://www.youtube.com/watch?v=v5_taBRObvc)
 
 ## Features
 
-### Witcher 3
-- Mesh importer/export (.w2mesh)
-- Rig import/export (.w2rig, .json)
-- Animation import/export (.w2anims, .json)
-- Map importer (.w2l, .w2w)
-- Basic map layer definition export for [radish tools](https://www.nexusmods.com/witcher3/mods/3620) (.yml)
-- Characters/Entity definition (.w2ent) importer
-- WIP Scene/Cutscene import (.w2scene, .w2cutscene)
-- Lipsync Animation (.cr2w)
+<table>
+<tr>
+<td width="45%" valign="top">
+<img src="./clips/character_import.webp" width="100%" alt="Character import"/>
+</td>
+<td width="55%" valign="top">
 
-### Witcher 2 / REDkit
-- .w2mesh import
-- .w2rig import
-- .w2l import
-- Works best with [REDkit](https://redkitwiki.cdprojektred.com/welcome+to+the+redkit+wiki.htm) files.
+### Character import
 
-Check out the [wiki](https://github.com/dingdio/Witcher3-Blender-Tools/wiki) for info on usage.
+`.w2ent` character templates define all components needed to assemble your character in a single import. Switch appearances and equipment from the side panel without reimporting. Idle animation loads from the behaviour graph. Mounted props (swords, crossbows, shields) come in with the entity. Additional animations can be loaded from the Animation panel.
 
-## Requirements
-- Blender ~3.6
+</td>
+</tr>
+<tr>
+<td width="45%" valign="top">
+<img src="./clips/asset_browser.webp" width="100%" alt="Asset Browser"/>
+</td>
+<td width="55%" valign="top">
 
-- [ArdCarraigh Blender_APX_Addon](https://github.com/ArdCarraigh/Blender_APX_Addon) - The APX addon is needed to load any redcloth items. You will have to export or download all apx from the game and add the Redcloth repo in addon settings. [Download all vanilla apx here.](https://mega.nz/file/CchGVCSb#ahDgIhxvicClEA9VHecPu6S95iT8ih2Q5kRMUHoY5ec)
+### Asset Browser
 
-    ### **Animation**:
-    The current best way to work with the exported animation json is to use this specific version of Wolvenkit 0.6.1 compiled by nikich340 until Wolvenkit-7 is updated. Also the utility tool for modifying the exported files.
-- [0.6.1-YML-W2ANIMS-APRIL04](https://github.com/nikich340/WolvenKit/releases/tag/0.6.1-YML-W2ANIMS-APRIL04)
-- [W3-Maya-AnimUtil](https://github.com/nikich340/W3-Maya-AnimUtil) 
-- [Some Wiki Notes](https://github.com/dingdio/Witcher3_Blender_Tools/wiki/Exporting-Animation-Notes)
+Type-ahead search across every file in the bundles. Texture preview, filter by type, vanilla and mod content side by side. Click to import directly into the scene.
 
-## Recommended 
+</td>
+</tr>
+<tr>
+<td width="45%" valign="top">
+<img src="./clips/character_browser.webp" width="100%" alt="Character Browser"/>
+</td>
+<td width="55%" valign="top">
 
-- [BlenderNormalGroups](https://github.com/theoldben/BlenderNormalGroups) Can switch normal map nodes to a faster custom node for better animation playback.
+### Character Browser
 
-- [Prolog World Terrain Setup](https://mega.nz/file/WNZzCQQR#KICtWteq_OxwU_YKj4LU09kdJlBMqzzwIJd8DVGil4Q) - Not really required but has an example of how I set up basic terrain for the prolog world. It won't match how it looks in game but good enough to place game objects in blender. video - https://www.youtube.com/watch?v=qlRfUGMCyvQ
+Every journal character and bestiary creature with their in-game portrait. One click imports the full entity.
 
-## Installation
-Put "io_import_w2l" folder into your blender addons folder
-Launch Blender and activate the addon in Blender Preferences
+</td>
+</tr>
+<tr>
+<td width="45%" valign="top">
+<img src="./clips/voicelines.webp" width="100%" alt="Speech Browser and lipsync"/>
+</td>
+<td width="55%" valign="top">
 
-#### Settings for Witcher 3
-in the addon settings add your own paths to:
-- uncook_path = main repo where you exported all the game bundles with wcclite.exe .w2mesh files, .w2mi files, .w2ent etc.
-- tex_uncook_path = repo folder with ALL exported .tga/.png/.dds from the game
-- apx_uncook_path = repo folder with ALL exported .apx from the game
+### Speech Browser & lipsync
 
-#### Settings for Witcher 2 / REDKit
-- Witcher 2 Path = This should be the path to your Wither 2 Instalation with REDKit also installed.
+60,000+ in-game voice lines with audio preview. One click loads the matching lipsync onto a face rig. Face morphs arrive as Blender shape keys driven from a control bone — the phoneme driver system wires itself up, no manual setup. Compatible with the .re REDkit addon.
 
-### WolvenKit 7 integration
-- WolvenKit 7 CLI = path to WolvenKit.CLI.exe
-- Your Wolvenkit Project Path = this is the default path meshes will export to. The mesh importer will also check this project first for raw .tga files when loading a new w2mesh
+</td>
+</tr>
+<tr>
+<td width="45%" valign="top">
+<img src="./clips/animation_export.webp" width="100%" alt="Animation export"/>
+</td>
+<td width="55%" valign="top">
 
-## Optional Setup
+### Animation round-trip
 
-### Speech / Lipsync repo settings
-- Extracted Lipsync repo = folder with .cr2w files
-- Converted wem files = folder with (.ogg)s 
-- [Wiki about speech](https://github.com/dingdio/Witcher3-Blender-Tools/wiki/Speech-and-Lipsync-Notes)
+`.w2anims` import lands each clip as an NLA track with root motion extracted. Edit, retarget, or author new actions in Blender. Export writes root motion back into the motion extraction block. Native .w2anims format on both ends. Also compatible with the .re REDkit addon.
 
-### FBX repo settings
->*The tools now import and export w2mesh directly it is not recommended to use FBX*
-- [FBX Import plugin for blender](https://www.nexusmods.com/witcher3/mods/6118) - For working with any fbx files.
-- fbx_uncook_path = repo folder with ALL exported .fbx from the game
+</td>
+</tr>
+<tr>
+<td width="45%" valign="top">
+<img src="./clips/cutscene_workflow.webp" width="100%" alt="Cutscene workflow"/>
+</td>
+<td width="55%" valign="top">
 
-Since wcclite.exe has trouble exporting many fbx from the Witcher 3 game I have uploaded my collection of .fbx files along with Redcloth items in .apx format. Find them in this folder: [Folder Link](https://mega.nz/folder/GIR3AZBY#I4EEwkl4tjgnIv07f10n0A) These files are now optional for map/character loader since .w2mesh is now read directly. There is a toggle in settings to use fbx.
+### Cutscenes
 
-## Links
-- https://github.com/WolvenKit/WolvenKit-7
-- https://github.com/ArdCarraigh/Blender_APX_Addon
-- https://github.com/nikich340/W3-Maya-AnimUtil
-- https://github.com/nikich340/WolvenKit/releases/tag/0.6.1-YML-W2ANIMS-APRIL04
-- https://www.nexusmods.com/witcher3/mods/3620
-- https://jlouisb.users.sourceforge.net/
-- https://github.com/Mets3D/batch_import_witcher3_fbx
+`.w2cutscene` / `.w2scene` places actors, builds cameras, drops animation sequences onto NLA tracks, and loads dialogue audio alongside. The scene plays back on Blender's timeline and can be modified and exported back into REDkit.
+
+</td>
+</tr>
+<tr>
+<td width="45%" valign="top">
+<img src="./clips/mesh_export.webp" width="100%" alt="Mesh export pipeline"/>
+</td>
+<td width="55%" valign="top">
+
+### Mesh pipeline
+
+`.w2mesh` Game assets can be fully completed inside Blender. Export carries the full LOD hierarchy, vertex colours, textures and materials. Built-in LOD generation, collider tools (box / sphere / capsule / convex / trimesh). All embedded in a single export. `.w2mi` / `.w2mg` materials rebuild as Blender shader node graphs. Includes `.xbm` export.
+
+</td>
+</tr>
+<tr>
+<td width="45%" valign="top">
+<img src="./clips/map_import.webp" width="100%" alt="Map and world import"/>
+</td>
+<td width="55%" valign="top">
+
+### Worlds & maps
+
+`.w2l` layers bring mesh placements, lights, collision. `.w2w` imports world terrain heightmaps. Witcher 2 assets use the same workflow.
+
+</td>
+</tr>
+</table>
+
+---
+
+## Install
+
+1. Download the zip from [Releases](https://github.com/dingdio/Witcher3_Blender_Tools/releases).
+2. Drag and drop the zip onto Blender or in the UI go to → `Edit → Preferences → Extensions → Install from Disk` → enable **Witcher 3 Tools**.
+3. Open addon preferences and check these paths are set:
+
+   | Preference | Set to |
+   |---|---|
+   | **Witcher 3 Path** | Root Game install folder (eg. C:\GOG Games\The Witcher 3 Wild Hunt GOTY)  |
+   | **Uncook Path** | Extracted files depot addon will use |
+
+    **Witcher 3 Path** will be automatically found and set if it exists in a standard install location. **Uncook Path** will automatically use blender's Roaming data folder. Change it to a new empty folder if you prefer.
+
+4. Find `Witcher 3` in the n-panel of the 3D viewport. Click on `Geralt` to load Geralt player entity. This will warm up the bundle and texture caches for the first time.
+
+---
+
+## Format support - Witcher 3
+
+| Format | Import | Export |
+|---|:---:|:---:|
+| `.w2mesh` — Meshes | Yes | Yes |
+| `.w2rig` — Skeletons | Yes | Yes |
+| `.w2anims` — Animations | Yes | Yes |
+| `.xbm` — Textures | Yes | Yes |
+| `.w2cutscene` — Cutscenes | Yes | Yes |
+| `.w2ent` — Characters & entities | Yes | — |
+| `.w2scene` — Scenes | Yes | — |
+| `.w2l` / `.w2w` — Layers & Worlds | Yes | — |
+| `.cr2w` — Lipsync & speech | Yes | — |
+| `.w2mi` / `.w2mg` — Materials | Yes | — |
+| `.nxs` — Cooked Collision | Yes | — |
+| `.redcloth` — Cloth physics | Yes | — |
+| `.flyr` — Foliage | Yes | — |
+
+## Format support - Witcher 2
+
+| Format | Import | Export |
+|---|:---:|:---:|
+| `.w2mesh` — Meshes | Yes | — |
+| `.w2rig` — Skeletons | Yes | — |
+| `.w2anims` — Animations | Yes | — |
+| `.w2l` — Map Layers | Yes | — |
+
+---
+
+
+### Optional companion add-ons
+
+| Add-on | Needed for | Source |
+|---|---|---|
+| **[io_mesh_apx](https://github.com/ArdCarraigh/Blender_APX_Addon)** | `.redcloth` / `.apx` cloth imports | GitHub — ArdCarraigh |
+| **[io_mesh_srt](https://github.com/ArdCarraigh/Blender_SRT_Addon)** | SpeedTree `.srt` foliage and trees | GitHub — ArdCarraigh |
+| **`blender_re_animations_plugin`** | `.re` export | Ships inside [REDkit](https://www.gog.com/en/game/the_witcher_3_redkit) |
+
+Live status for all three shows up in addon preferences under **External Addons**.
+
+
+
+
+## Companion tools
+
+| Tool | Role |
+|---|---|
+| [REDkit](https://store.steampowered.com/app/1671760/The_Witcher_3_REDkit/) | Official mod editor — depot source and export target |
+| [WolvenKit 7](https://github.com/WolvenKit/WolvenKit-7) | Optional JSON CLI functions — nikich340 & WolvenKit team |
+| [Radish Tools](https://www.nexusmods.com/witcher3/mods/3620) | World modding pipeline via `.yml` — rmemr |
+
+---
+
+**Requirements:** Blender 4.5+
+
+[Releases](https://github.com/dingdio/Witcher3_Blender_Tools/releases) · [Wiki](https://github.com/dingdio/Witcher3_Blender_Tools/wiki) · [Issues](https://github.com/dingdio/Witcher3_Blender_Tools/issues)
+
+**Author**: dingdio · **License**: GPL-3.0
