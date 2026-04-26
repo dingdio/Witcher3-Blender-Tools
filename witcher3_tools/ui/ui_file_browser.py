@@ -355,6 +355,105 @@ class MySettings(PropertyGroup):
         min=0.0,
         max=1.0,
     )
+    terrain_layer_load_radius: FloatProperty(
+        name="Layer Load Radius",
+        description="Load world layers whose cached bounds intersect this distance around the current viewport camera, measured in imported world/Blender units",
+        default=100.0,
+        min=1.0,
+        soft_max=5000.0,
+    )
+    terrain_layer_max_load_count: IntProperty(
+        name="Layer Load Limit",
+        description="Safety limit for nearby layer imports in one pass; set to 0 to load every matching layer",
+        default=0,
+        min=0,
+        soft_max=512,
+    )
+    terrain_layer_skip_loaded: BoolProperty(
+        name="Skip Complete Layers",
+        description="Skip only layer collections that previously finished importing cleanly; partial or failed imports are still eligible",
+        default=True,
+    )
+    terrain_layer_do_import_mesh: BoolProperty(
+        name="Mesh",
+        description="Import static mesh, foliage, and grass items from nearby layers",
+        default=True,
+    )
+    terrain_layer_do_import_proxy_mesh: BoolProperty(
+        name="Proxy Mesh",
+        description="Import proxy mesh items from nearby layers",
+        default=False,
+    )
+    terrain_layer_do_import_collision: BoolProperty(
+        name="Collision",
+        description="Import collision mesh items from nearby layers",
+        default=True,
+    )
+    terrain_layer_do_import_rigidbody: BoolProperty(
+        name="Rigid Body",
+        description="Import rigid-body mesh items from nearby layers",
+        default=True,
+    )
+    terrain_layer_do_import_entity: BoolProperty(
+        name="Entity",
+        description="Import entity contents from nearby layers",
+        default=True,
+    )
+    terrain_layer_do_import_point_light: BoolProperty(
+        name="Point Lights",
+        description="Import point lights from nearby layers",
+        default=True,
+    )
+    terrain_layer_do_import_spot_light: BoolProperty(
+        name="Spot Lights",
+        description="Import spot lights from nearby layers",
+        default=True,
+    )
+    terrain_layer_do_import_redcloth: BoolProperty(
+        name="Redcloth",
+        description="Import cloth simulation assets",
+        default=False,
+    )
+    terrain_layer_keep_lod_meshes: BoolProperty(
+        name="Keep LODs",
+        description="Keep lower-detail mesh LODs when importing nearby layers",
+        default=False,
+    )
+    terrain_layer_keep_empty_lods: BoolProperty(
+        name="Keep Empty LODs",
+        description="Keep empty mesh LODs with zero polygons when importing nearby layers",
+        default=False,
+    )
+    terrain_layer_keep_proxy_meshes: BoolProperty(
+        name="Keep Proxy Meshes",
+        description="Keep proxy meshes even when higher LOD meshes are skipped",
+        default=True,
+    )
+    terrain_layer_enable_name_filter: BoolProperty(
+        name="Enable Regex Filter",
+        description="Only import nearby layer items whose name or source path matches the regex",
+        default=False,
+    )
+    terrain_layer_name_filter_regex: StringProperty(
+        name="Regex Filter",
+        description="Regex applied to layer item names and source paths",
+        default="_proxy",
+    )
+    terrain_layer_hide_volume_meshes: BoolProperty(
+        name="Hide _volume_ Meshes",
+        description="Hide imported mesh objects with _volume_ in the name",
+        default=False,
+    )
+    terrain_layer_hide_shadow_meshes: BoolProperty(
+        name="Hide _shadow_ Meshes",
+        description="Hide imported mesh objects with _shadow_ or shadowmesh in the name",
+        default=False,
+    )
+    terrain_layer_write_profile_log: BoolProperty(
+        name="Write Profile Log",
+        description="Write a timestamped nearby-layer import profile log to the extension cache log folder",
+        default=False,
+    )
 
 
 from ..CR2W.witcher_cache.CacheController import CacheController

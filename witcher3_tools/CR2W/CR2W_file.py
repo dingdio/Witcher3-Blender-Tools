@@ -55,6 +55,7 @@ def _should_suppress_streaming_name_warning(stream_chunk, resource_path="", mesh
     return stream_type in {
         "CEffectDummyComponent",
         "CInteractionComponent",
+        "CSoundEmitterComponent",
     }
 
 
@@ -77,6 +78,19 @@ def _describe_streaming_name_failure(file, entity_chunk, stream_chunk, resource_
     parts.append(f"resource_handles={len(getattr(resource_prop, 'Handles', None) or [])}")
     parts.append(f"mesh_handles={len(getattr(mesh_prop, 'Handles', None) or [])}")
     return ", ".join(parts)
+
+
+def _extract_streaming_buffer_bytes(cr2w_file, streaming_data_prop):
+    if not streaming_data_prop:
+        return None
+    buffer_data = getattr(streaming_data_prop, "Bufferdata", None)
+    if buffer_data is not None and hasattr(buffer_data, "Bytes"):
+        return buffer_data.Bytes
+    buffer_index = int(getattr(streaming_data_prop, "ValueA", 0) or 0) - 1
+    file_buffers = getattr(cr2w_file, "BufferData", None) or []
+    if 0 <= buffer_index < len(file_buffers):
+        return file_buffers[buffer_index]
+    return None
 
 class ReadCompressFloat():
     def __init__(self, f, compression):
@@ -409,7 +423,34 @@ class CActionPoint(W3LockableEntity):
 
 from . import CR2W_file
 
-def create_level(file, filename):
+
+def _load_level_dependency(resolved_path, dependency_loader=None, dependency_resolver=None):
+    if not resolved_path:
+        return None
+    if dependency_loader is not None:
+        return dependency_loader(resolved_path)
+    cr2w_file = read_CR2W(resolved_path)
+    return create_level(
+        cr2w_file,
+        resolved_path,
+        dependency_loader=dependency_loader,
+        dependency_resolver=dependency_resolver,
+    )
+
+def _resolve_level_dependency_path(depot_path, version, dependency_resolver=None):
+    if not depot_path:
+        return ""
+    if dependency_resolver is not None:
+        try:
+            resolved = dependency_resolver(depot_path, version)
+        except TypeError:
+            resolved = dependency_resolver(depot_path)
+        if resolved:
+            return resolved
+    return repo_file(depot_path, version)
+
+
+def create_level(file, filename, dependency_loader=None, dependency_resolver=None):
     level = LEVEL()
     level.layerNode = filename
     CHUNKS = file.CHUNKS.CHUNKS
@@ -435,9 +476,18 @@ def create_level(file, filename):
                         include_path = getattr(include, "DepotPath", None)
                         if not include_path:
                             continue
-                        fileName = repo_file(include_path, file.HEADER.version)
-                        CR2WFile = read_CR2W(fileName)
-                        entity = create_level(CR2WFile, fileName)
+                        fileName = _resolve_level_dependency_path(
+                            include_path,
+                            file.HEADER.version,
+                            dependency_resolver=dependency_resolver,
+                        )
+                        entity = _load_level_dependency(
+                            fileName,
+                            dependency_loader=dependency_loader,
+                            dependency_resolver=dependency_resolver,
+                        )
+                        if entity is None:
+                            continue
                         level.includes.append(entity)
                     except Exception as e:
                         log.exception("Problem Importing an include")
@@ -464,48 +514,72 @@ def create_level(file, filename):
                 template_path = getattr(chunk.Template.Handles[0], "DepotPath", None)
                 if not template_path:
                     continue
-                fileName = repo_file(template_path, file.HEADER.version)
-                CR2WFile = read_CR2W(fileName)
-                entity = create_level(CR2WFile, fileName)
+                try:
+                    fileName = _resolve_level_dependency_path(
+                        template_path,
+                        file.HEADER.version,
+                        dependency_resolver=dependency_resolver,
+                    )
+                    entity = _load_level_dependency(
+                        fileName,
+                        dependency_loader=dependency_loader,
+                        dependency_resolver=dependency_resolver,
+                    )
+                    if entity is None:
+                        continue
+                except Exception as exc:
+                    log.warning(
+                        "Skipping template entity %s for %s: %s",
+                        template_path,
+                        Entity.name,
+                        exc,
+                    )
+                    continue
                 Entity.template = entity
                 Entity.templatePath = template_path
                 Entities.append(Entity)
             else:
                 # Entity chunk has no Template handle — occurs with inline/streamed entities
                 # (e.g. CWitcherSword, Crossbow). Read from streamingDataBuffer instead.
-                if chunk.GetVariableByName('streamingDataBuffer'):
-                    Bufferdata = chunk.GetVariableByName('streamingDataBuffer').Bufferdata
-                    f = bStream(data = bytearray(Bufferdata.Bytes))
-                    f.name = "DATA_BUFFER"
-                    bufferedCR2W = getCR2W(f)
-                    entity = create_level(bufferedCR2W, chunk.name)
-                    Entity.streamingDataBuffer = entity
-                    if Entity.name == Entity.type:
-                        stream_chunk = None
-                        try:
-                            stream_chunk = Entity.streamingDataBuffer.CHUNKS.CHUNKS[0]
-                        except Exception:
+                streaming_data_prop = chunk.GetVariableByName('streamingDataBuffer')
+                if streaming_data_prop:
+                    buffer_bytes = _extract_streaming_buffer_bytes(file, streaming_data_prop)
+                    if buffer_bytes:
+                        f = bStream(data=bytearray(buffer_bytes))
+                        f.name = "DATA_BUFFER"
+                        bufferedCR2W = getCR2W(f)
+                        entity = create_level(
+                            bufferedCR2W,
+                            chunk.name,
+                            dependency_loader=dependency_loader,
+                            dependency_resolver=dependency_resolver,
+                        )
+                        Entity.streamingDataBuffer = entity
+                        if Entity.name == Entity.type:
                             stream_chunk = None
+                            try:
+                                stream_chunk = Entity.streamingDataBuffer.CHUNKS.CHUNKS[0]
+                            except Exception:
+                                stream_chunk = None
 
-                        resource_prop = stream_chunk.GetVariableByName('resource') if stream_chunk else None
-                        mesh_prop = stream_chunk.GetVariableByName('mesh') if stream_chunk else None
+                            resource_prop = stream_chunk.GetVariableByName('resource') if stream_chunk else None
+                            mesh_prop = stream_chunk.GetVariableByName('mesh') if stream_chunk else None
 
-                        resource_path = _first_handle_depot_path(resource_prop)
-                        mesh_path = _first_handle_depot_path(mesh_prop)
+                            resource_path = _first_handle_depot_path(resource_prop)
+                            mesh_path = _first_handle_depot_path(mesh_prop)
 
-                        if getattr(stream_chunk, "Type", None) == 'CClothComponent' and resource_path:
-                            Entity.name = Path(resource_path).stem
-                            Entity.name += f" ({Entity.type}) (CClothComponent)"
-                        elif mesh_path:
-                            Entity.name = Path(mesh_path).stem
-                            Entity.name += f" ({Entity.type})"
-                        else:
-                            stream_label = _stream_chunk_string_prop(stream_chunk, "name", "actionName")
-                            if stream_label:
-                                Entity.name = stream_label
+                            if getattr(stream_chunk, "Type", None) == 'CClothComponent' and resource_path:
+                                Entity.name = Path(resource_path).stem
+                                Entity.name += f" ({Entity.type}) (CClothComponent)"
+                            elif mesh_path:
+                                Entity.name = Path(mesh_path).stem
                                 Entity.name += f" ({Entity.type})"
                             else:
-                                if not _should_suppress_streaming_name_warning(
+                                stream_label = _stream_chunk_string_prop(stream_chunk, "name", "actionName")
+                                if stream_label:
+                                    Entity.name = stream_label
+                                    Entity.name += f" ({Entity.type})"
+                                elif not _should_suppress_streaming_name_warning(
                                     stream_chunk,
                                     resource_path,
                                     mesh_path,
@@ -518,6 +592,12 @@ def create_level(file, filename):
                                         mesh_prop,
                                     )
                                     log.warning("Streaming entity name resolution failed (%s)", detail)
+                    else:
+                        log.debug(
+                            "Skipping inline entity buffer decode for %s in %s: no embedded streamingDataBuffer bytes.",
+                            Entity.name,
+                            getattr(file, "fileName", "<memory>"),
+                        )
                 try:
                     if hasattr(chunk, 'Components'):
                         for chunk_id in chunk.Components:

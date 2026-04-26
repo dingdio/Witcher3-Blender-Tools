@@ -205,10 +205,12 @@ class Transform_Entity:
         return cls(**data)
 
 class meshPath:
-    def __init__(self, meshName = False, translation = False, matrix = False, fbx_uncook_path = False, transform = False, BlockDataObjectType = Enums.BlockDataObjectType.Mesh):
+    def __init__(self, meshName = False, translation = False, matrix = False, fbx_uncook_path = False, transform = False, BlockDataObjectType = Enums.BlockDataObjectType.Mesh, uncook_path = None):
         if fbx_uncook_path == False:
             fbx_uncook_path = get_fbx_uncook_path(bpy.context)
-        self.uncook_path = get_uncook_path(bpy.context)
+        if uncook_path is None:
+            uncook_path = get_uncook_path(bpy.context)
+        self.uncook_path = uncook_path
         self.name = "Mesh Item"
         if type(meshName) == int:
             raise Exception("wut")
@@ -318,7 +320,7 @@ def _transform_real(transform, name, default=0.0):
 
 def checkLevel(levelData):
     levelFile = levelData.layerNode
-    errors = ['======Errors======= '+ levelFile]
+    errors = []
     ready_to_import = True
 
     if levelData.CSectorData:
@@ -341,13 +343,11 @@ def checkLevel(levelData):
                                     errors.append(error_message)
                                     ready_to_import = False
                                     
-    if len(errors) == 1:
-        errors[0] = '======GREEN======= '+ levelFile
-
     if ready_to_import:
         return True
     else:
         log.warning("Missing %s / %s", len(errors), len(levelData.Entities))
+        log.warning("Layer validation failed: %s", levelFile)
         for error in errors:
             log.warning(error)
         return False

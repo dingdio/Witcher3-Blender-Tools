@@ -1,6 +1,7 @@
 import logging
 import os
 import math
+import time
 import bpy
 from bpy.types import Object
 from typing import List, Tuple
@@ -27,6 +28,16 @@ from ..importers.import_nxs import createCol, createTri, createBox, createCapsul
 from .. import get_do_fix_tail, set_rig_rot90_enabled
 
 log = logging.getLogger(__name__)
+
+_MESH_PROFILE_ENABLED = True
+_MESH_PROFILE_WARN_THRESHOLD = 0.25
+_MESH_PROFILE_MATERIAL_WARN_THRESHOLD = 0.10
+
+
+def _log_mesh_profile_warning(message, *args):
+    if not _MESH_PROFILE_ENABLED:
+        return
+    log.info("[mesh-import-profile] " + str(message), *args)
 
 ZERO_WEIGHT_MASK_GROUP_NAME = "_w3_zero_weight_hidden"
 ZERO_WEIGHT_MASK_MODIFIER_NAME = "W3 Zero Weight Mask"
@@ -320,12 +331,18 @@ def import_mesh(filename:str,
                 keep_proxy_meshes:bool = False,
                 do_import_cache_collision:bool = False,
                 hide_zero_weight_faces:bool = True) -> w3_types.CSkeletalAnimationSet:
+    mesh_started = time.perf_counter()
+    parse_seconds = 0.0
+    prepare_seconds = 0.0
+    collision_seconds = 0.0
     dirpath, file = os.path.split(filename)
     basename, ext = os.path.splitext(file)
     if ext.lower() in ('.w2mesh', '.w2ent'):
         with open(win_safe_path(filename), "rb") as _mesh_file:
             try:
+                parse_started = time.perf_counter()
                 (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile) = dc_mesh.load_bin_mesh(filename, keep_lod_meshes, keep_proxy_meshes)
+                parse_seconds = time.perf_counter() - parse_started
                 mesh_chunks = getattr(CData, "meshDataAllMeshes", None) or []
                 material_names = the_material_names or []
                 material_handles = getattr(the_materials, "Handles", None) or []
@@ -342,6 +359,7 @@ def import_mesh(filename:str,
                 )
                 if material_names:
                     log.debug("Mesh '%s' material names: %s", meshName, material_names)
+                prepare_started = time.perf_counter()
                 (final_bl_meshes, armatures) = prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, meshName, meshFile,
                     do_import_mats,
                     do_import_armature,
@@ -351,6 +369,7 @@ def import_mesh(filename:str,
                     keep_empty_lods,
                     keep_proxy_meshes,
                     hide_zero_weight_faces)
+                prepare_seconds = time.perf_counter() - prepare_started
                 
                 if rotate_180:
                     if armatures:
@@ -383,6 +402,7 @@ def import_mesh(filename:str,
                 #         print(self.polygons)
 
                 from ..CR2W.CR2W_types import W_CLASS
+                collision_started = time.perf_counter()
                 for CHUNK in meshFile.CHUNKS.CHUNKS:
                     CHUNK:W_CLASS
                     if CHUNK.name == 'CCollisionMesh':
@@ -450,6 +470,19 @@ def import_mesh(filename:str,
                     except Exception as e:
                         log.warning(f'Failed to load collision from cache: {e}')
 
+                collision_seconds = time.perf_counter() - collision_started
+                total_seconds = time.perf_counter() - mesh_started
+                if total_seconds >= _MESH_PROFILE_WARN_THRESHOLD:
+                    _log_mesh_profile_warning(
+                        "cr2w mesh %s total %.3fs (parse %.3fs, prepare %.3fs, collision %.3fs, submeshes %d, objects %d)",
+                        meshName,
+                        total_seconds,
+                        parse_seconds,
+                        prepare_seconds,
+                        collision_seconds,
+                        len(mesh_chunks),
+                        len(final_bl_meshes or []),
+                    )
                 return (final_bl_meshes, armatures)
             except Exception as e:
                 raise e
@@ -1232,6 +1265,7 @@ def load_w3_materials_CR2W_Mesh(
         ,force_mat_update = False
         ,mat_filename = str
     ):
+    materials_started = time.perf_counter()
     objs = objs or []
     materials_bin = materials_bin or []
     material_names = material_names or []
@@ -1252,6 +1286,7 @@ def load_w3_materials_CR2W_Mesh(
         )
 
     for idx, mat in enumerate(materials_bin):
+        slot_started = time.perf_counter()
         if mat is None:
             log.warning(f"Skipping unresolved material at slot {idx} ({material_names[idx] if idx < len(material_names) else '?'})")
             continue
@@ -1345,6 +1380,26 @@ def load_w3_materials_CR2W_Mesh(
                 idx,
                 xml_mat_name,
             )
+        slot_seconds = time.perf_counter() - slot_started
+        if slot_seconds >= _MESH_PROFILE_MATERIAL_WARN_THRESHOLD:
+            _log_mesh_profile_warning(
+                "mesh material slot %d '%s' total %.3fs (objects %d, target %s)",
+                idx,
+                xml_mat_name,
+                slot_seconds,
+                len(objs),
+                getattr(target_mat, "name", "<none>") if target_mat else "<none>",
+            )
+    total_seconds = time.perf_counter() - materials_started
+    if total_seconds >= _MESH_PROFILE_WARN_THRESHOLD:
+        _log_mesh_profile_warning(
+            "mesh material batch total %.3fs (objects %d, materials %d, names %d, mat_file %s)",
+            total_seconds,
+            len(objs),
+            len(materials_bin),
+            len(material_names),
+            mat_filename,
+        )
         #finished_mat.name = finished_mat.name +"_"+ target_mat.name
 
 def assignVertexGroup(vert, CData, mesh_ob):

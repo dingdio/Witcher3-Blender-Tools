@@ -338,20 +338,34 @@ class SCENE_PT_mylisttree(bpy.types.Panel):
         grid.operator("witcher.w2w_listtree_debug", text="Print").action = "print"
 
 
-def AddCLayerGroup(groups, parent_collection):
+def _store_world_layer_metadata(target, world_path="", world_root_collection=None):
+    if target is None or not hasattr(target, "__setitem__"):
+        return
+    if world_path:
+        target["world_path"] = str(world_path)
+    if world_root_collection is not None:
+        target["world_root_collection"] = str(getattr(world_root_collection, "name", ""))
+
+
+def AddCLayerGroup(groups, parent_collection, world_path=""):
     this_collection = bpy.data.collections.new(groups.name)
     this_collection['group_type'] = "LayerGroup"
+    if world_path and not parent_collection:
+        this_collection["world_path"] = str(world_path)
     if parent_collection:
         parent_collection.children.link(this_collection)
     if groups.ChildrenGroups:
         for subgroups in groups.ChildrenGroups:
-            AddCLayerGroup(subgroups, this_collection)
+            AddCLayerGroup(subgroups, this_collection, world_path)
     if groups.ChildrenInfos:
         for ChildInfo in groups.ChildrenInfos:
             child_collection = bpy.data.collections.new(os.path.basename(ChildInfo.depotFilePath))
             child_collection['level_path'] = ChildInfo.depotFilePath
             child_collection['layerBuildTag'] = ChildInfo.layerBuildTag
             child_collection['group_type'] = "LayerInfo"
+            child_collection["witcher_layer_import_state"] = "unloaded"
+            child_collection["witcher_layer_import_count"] = 0
+            child_collection["witcher_layer_import_errors"] = 0
             this_collection.children.link(child_collection)
             
             tags = {
@@ -375,12 +389,12 @@ def AddCLayerGroup(groups, parent_collection):
 
 
 def btn_import_w2w(worldFile: WORLD, filePath):
-    collection = AddCLayerGroup(worldFile.groups, False)
+    collection = AddCLayerGroup(worldFile.groups, False, filePath)
     bpy.context.scene.collection.children.link(collection)
     layer_collection = bpy.context.view_layer.layer_collection.children[collection.name]
     bpy.context.view_layer.active_layer_collection = layer_collection
 
-    do_import_map_terrain(worldFile, filePath)
+    do_import_map_terrain(worldFile, filePath, world_root_collection=collection)
 
 
 from pathlib import Path
@@ -853,6 +867,8 @@ def import_combined_terrain_full_map(
     highest_elevation,
     multires_level,
     world_name=None,
+    world_path="",
+    world_root_collection=None,
 ):
     """Import a single full-map terrain mesh using combined PNG maps."""
     if not os.path.isfile(str(heightmap_path)):
@@ -890,10 +906,11 @@ def import_combined_terrain_full_map(
     obj["terrain_multires"] = int(multires_level)
     obj["terrain_heightmap_path"] = str(heightmap_path)
     obj["terrain_colormap_path"] = str(colormap_path)
+    _store_world_layer_metadata(obj, world_path, world_root_collection)
     return obj
 
 
-def _do_import_map_terrain_full_map(worldFile, filePath):
+def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=None):
     ctx = _resolve_terrain_context(worldFile, filePath)
     hub_name = ctx["hub_name"]
     n_tiles = ctx["n_tiles"]
@@ -944,13 +961,15 @@ def _do_import_map_terrain_full_map(worldFile, filePath):
         highest_elevation=worldFile.highestElevation,
         multires_level=multires_level,
         world_name=getattr(worldFile, "worldName", None) or hub_name,
+        world_path=filePath,
+        world_root_collection=world_root_collection,
     )
     if obj:
         log.info("Imported full terrain map: %s", obj.name)
     return obj
 
 
-def _do_import_map_terrain_tiles(worldFile, filePath):
+def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None):
     ctx = _resolve_terrain_context(worldFile, filePath)
     hub_name = ctx["hub_name"]
     n_tiles = ctx["n_tiles"]
@@ -1009,19 +1028,21 @@ def _do_import_map_terrain_tiles(worldFile, filePath):
         highest_elevation=worldFile.highestElevation,
         multires_level=multires_level,
         hub_name=hub_name,
+        world_path=filePath,
+        world_root_collection=world_root_collection,
     )
 
 
-def do_import_map_terrain(worldFile, filePath):
+def do_import_map_terrain(worldFile, filePath, world_root_collection=None):
     mode = _get_scene_terrain_import_mode()
     if mode == TERRAIN_IMPORT_TILES:
-        _do_import_map_terrain_tiles(worldFile, filePath)
+        _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection)
         return
 
-    obj = _do_import_map_terrain_full_map(worldFile, filePath)
+    obj = _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection)
     if obj is None:
         log.info("Falling back to tile terrain import")
-        _do_import_map_terrain_tiles(worldFile, filePath)
+        _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection)
 
 
 def _create_tile_mesh(name, heightmap_buffer_path, tile_res, mesh_res,
@@ -1191,6 +1212,8 @@ def do_import_terrain_tiles(
     highest_elevation,
     multires_level,
     hub_name,
+    world_path="",
+    world_root_collection=None,
 ):
     """Import terrain tiles as individual Blender objects with baked heightmap geometry.
 
@@ -1226,6 +1249,7 @@ def do_import_terrain_tiles(
     empty["multires_level"] = multires_level
     empty["tile_y_inverted"] = False
     empty["z_offset_applied_to_tiles"] = True
+    _store_world_layer_metadata(empty, world_path, world_root_collection)
     bpy.context.collection.objects.link(empty)
 
     # Set viewport clip
@@ -1262,6 +1286,7 @@ def do_import_terrain_tiles(
         obj["tile_size"] = tile_size
         obj["elev_range"] = elev_range
         obj["lowest_elevation"] = lowest_elevation
+        _store_world_layer_metadata(obj, world_path, world_root_collection)
         bpy.context.collection.objects.link(obj)
 
         # Overlay texture as diffuse material

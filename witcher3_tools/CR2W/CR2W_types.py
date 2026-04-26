@@ -107,17 +107,26 @@ def _describe_cr2w_warning_context(cr2w_file=None, *, prop_name="", prop_type=""
 
 def _should_suppress_cname_warning(cr2w_file=None, *, prop_name="", parent=None):
     file_name = str(getattr(cr2w_file, "fileName", "") or "").lower()
-    if not file_name.endswith(".w2beh"):
-        return False
-    if str(prop_name or "") != "basedOnEvent":
-        return False
     parent_name = (
         getattr(parent, "theName", None)
         or getattr(parent, "name", None)
         or getattr(parent, "Type", None)
         or ""
     )
-    return str(parent_name) == "CBehaviorGraphAdjustDirectionNode"
+    prop_name = str(prop_name or "")
+    if file_name.endswith(".w2beh"):
+        return prop_name == "basedOnEvent" and str(parent_name) == "CBehaviorGraphAdjustDirectionNode"
+    if file_name.endswith("location_name_triggers.w2l"):
+        return prop_name == "settlementName" and str(parent_name) == "W3SettlementTrigger"
+    return False
+
+
+def _log_optional_centity_buffer_skip(cr2w_file=None, *, parent=None, buffer_name="", offset=None):
+    detail = _describe_cr2w_warning_context(cr2w_file, parent=parent, offset=offset)
+    if buffer_name:
+        log.debug("Skipping empty optional CEntity %s (%s)", buffer_name, detail)
+    else:
+        log.debug("Skipping empty optional CEntity payload (%s)", detail)
 
 v_types = [
     'String',
@@ -2101,7 +2110,12 @@ class W_CLASS:
                         self.BufferV2.Read(f, 0)
                         self.BufferV2 = self.BufferV2.elements
                     else:
-                        log.warning("unknown CEntity Fileformat.")
+                        _log_optional_centity_buffer_skip(
+                            CR2WFILE,
+                            parent=self,
+                            buffer_name="BufferV2",
+                            offset=f.tell(),
+                        )
                 
 
             elif currentClass == "CMesh": #! for now CMesh is read in dc_mesh
@@ -2284,7 +2298,12 @@ class W_CLASS:
                                     self.BufferV1.append(t_buffer)
                                     idx+=1
                         else:
-                            log.critical("unknown CEntity Fileformat.") #throw new EndOfStreamException("unknown CEntity Fileformat.");
+                            _log_optional_centity_buffer_skip(
+                                CR2WFILE,
+                                parent=self,
+                                buffer_name="BufferV1",
+                                offset=f.tell(),
+                            )
 
                         endPos = f.tell()
                         bytesleft = size - (endPos - startofthis)
@@ -2295,7 +2314,12 @@ class W_CLASS:
                                 self.BufferV2.Read(f, 0)
                                 self.BufferV2 = self.BufferV2.elements
                             else:
-                                log.warning("unknown CEntity Fileformat.")#throw new EndOfStreamException("unknown CEntity Fileformat.");
+                                _log_optional_centity_buffer_skip(
+                                    CR2WFILE,
+                                    parent=self,
+                                    buffer_name="BufferV2",
+                                    offset=f.tell(),
+                                )
                     if self.name == "CSkeletalAnimation":
                         # For uncooked animations, the animation data is embedded directly
                         # after the properties, before classEnd

@@ -6,6 +6,7 @@ log = logging.getLogger(__name__)
 
 from pathlib import Path
 from math import radians
+import time
 from .CR2W import CR2W_reader
 import bpy, os
 from typing import Any, List, Dict, Optional, Set, Tuple
@@ -51,6 +52,16 @@ tex_types = [
     '.dds',
     '.png'
 ]
+
+_MATERIAL_PROFILE_ENABLED = True
+_MATERIAL_PROFILE_WARN_THRESHOLD = 0.25
+_TEXTURE_PROFILE_WARN_THRESHOLD = 0.10
+
+
+def _log_material_profile_warning(message, *args):
+    if not _MATERIAL_PROFILE_ENABLED:
+        return
+    log.info("[material-profile] " + str(message), *args)
 
 
 def _strip_invalid_xml_chars(value) -> str:
@@ -218,11 +229,13 @@ def load_w3_materials_XML(
     This unavoidable requires that the materials were not renamed
     after the FBX import in any way, including any .001 shennanigans.
     """
+    xml_started = time.perf_counter()
     root: Element = readXML(xml_path)
 
     for root_element in root:
         if root_element.tag == 'materials':
             for xml_data in root_element:
+                material_started = time.perf_counter()
                 xml_mat_name = xml_data.get('name')
                 if xml_mat_name == "":
                     log.info("No material name? " + obj.name)
@@ -257,6 +270,23 @@ def load_w3_materials_XML(
                     continue
                 finished_mat = setup_w3_material(uncook_path, target_mat, xml_data, xml_path, force_update=force_mat_update)
                 obj.material_slots[target_mat.name].material = finished_mat
+                material_seconds = time.perf_counter() - material_started
+                if material_seconds >= _MATERIAL_PROFILE_WARN_THRESHOLD:
+                    _log_material_profile_warning(
+                        "xml material %s on %s total %.3fs (xml %s)",
+                        xml_mat_name,
+                        obj.name,
+                        material_seconds,
+                        os.path.basename(xml_path),
+                    )
+    total_seconds = time.perf_counter() - xml_started
+    if total_seconds >= _MATERIAL_PROFILE_WARN_THRESHOLD:
+        _log_material_profile_warning(
+            "xml material batch %s total %.3fs (object %s)",
+            os.path.basename(xml_path),
+            total_seconds,
+            obj.name,
+        )
 
 def find_mapping_nodes(node_tree):
     mapping_nodes = []
@@ -568,6 +598,11 @@ def setup_w3_material(
         ,force_update = False	# Set to True when re-importing stuff to test changes with the latest material set-up code.
         ,is_instance_file = False
         ):
+    material_started = time.perf_counter()
+    resolve_seconds = 0.0
+    duplicate_seconds = 0.0
+    node_seconds = 0.0
+    finalize_seconds = 0.0
 
     is_instance_file = False # This is the multi-group method, still not working
 
@@ -594,6 +629,7 @@ def setup_w3_material(
     nodes = material.node_tree.nodes
     links = material.node_tree.links
 
+    resolve_started = time.perf_counter()
     if mat_base.endswith(".w2mi"):
         # The XML contains little to no info about material instances, but the FBX importer
         # imported some image nodes we can use.
@@ -618,15 +654,30 @@ def setup_w3_material(
         shader_type = resolve_witcher2_shader_type(resolved_mat_base, shader_type)
 
     prune_unsupported_instance_params(xml_data, resolved_mat_base, params=params)
+    resolve_seconds = time.perf_counter() - resolve_started
 
     # Checking if this material was already imported by comparing some custom properties
     # that we create on imported materials.
+    duplicate_started = time.perf_counter()
     existing_mat = find_material(mat_base, params)
     if existing_mat:
         if overwrite_existing_enabled():
             repair_broken_dds_images_in_material(existing_mat, allow_dds_repair=True)
         if not force_update:
+            duplicate_seconds = time.perf_counter() - duplicate_started
+            total_seconds = time.perf_counter() - material_started
+            if total_seconds >= _MATERIAL_PROFILE_WARN_THRESHOLD:
+                _log_material_profile_warning(
+                    "setup material %s total %.3fs (resolve %.3fs, duplicate %.3fs, node %.3fs, finalize %.3fs, reused yes)",
+                    material.name,
+                    total_seconds,
+                    resolve_seconds,
+                    duplicate_seconds,
+                    node_seconds,
+                    finalize_seconds,
+                )
             return existing_mat
+    duplicate_seconds = time.perf_counter() - duplicate_started
 
     # Backing up all the info from the XML into custom properties. This is used for duplicate checking.
     # (See just above)
@@ -637,6 +688,7 @@ def setup_w3_material(
     #TODO Create the material instance NodeGroup
     #TODO instances contained within w2mesh files will be imported as materials.
     if is_instance_file: #! Cange name of this option to "instance_group_mode" or something.
+        node_started = time.perf_counter()
         
         all_instances = [xml_data] # xml data for each instance
 
@@ -705,6 +757,7 @@ def setup_w3_material(
                 material.node_tree.links.new(all_instances_params[0][1].outputs[par_name], nodegroup_node_base_shader.inputs[par_name])
             except Exception as e:
                 log.critical(f"MATERIAL ERROR {e}") #raise e
+        node_seconds = time.perf_counter() - node_started
     else:
         only_basic_maps = True
         # if only_basic_maps:
@@ -714,6 +767,7 @@ def setup_w3_material(
         #             new_xml.append(value)
         #     xml_data = new_xml
 
+        node_started = time.perf_counter()
         #log.warning(ElementTree.tostring(xml_data, encoding='utf8', method='xml'))
         #all_children2 = list(xml_data.iter())
         # Clean existing nodes and create core nodegroup.
@@ -748,7 +802,19 @@ def setup_w3_material(
             #mat_set_name_by_diffuse(material, nodegroup_node, nodes)
         mat_ensure_dummy_transparent_img_node(material, nodegroup_node, shader_type, nodes)
         mat_apply_settings(material, shader_type)
-
+        node_seconds = time.perf_counter() - node_started
+    finalize_seconds = max(0.0, time.perf_counter() - material_started - resolve_seconds - duplicate_seconds - node_seconds)
+    total_seconds = time.perf_counter() - material_started
+    if total_seconds >= _MATERIAL_PROFILE_WARN_THRESHOLD:
+        _log_material_profile_warning(
+            "setup material %s total %.3fs (resolve %.3fs, duplicate %.3fs, node %.3fs, finalize %.3fs, reused no)",
+            material.name,
+            total_seconds,
+            resolve_seconds,
+            duplicate_seconds,
+            node_seconds,
+            finalize_seconds,
+        )
     return material
 
 def find_material(mat_base, params):
@@ -1420,6 +1486,10 @@ def create_node_texture(
         ,texarray_index: str = '0'
         ,using_node_tree:bool = False
     ):
+    texture_started = time.perf_counter()
+    conversion_seconds = 0.0
+    image_load_seconds = 0.0
+    converted_from_xbm = False
     if using_node_tree:
         nodes = node_ng.nodes
         links = node_ng.links
@@ -1537,9 +1607,13 @@ def create_node_texture(
                 tex_path = dds_path
             elif os.path.exists(win_safe_path(xbm_path)):
                 try:
+                    convert_started = time.perf_counter()
                     convert_xbm_to_dds(xbm_path)
+                    conversion_seconds = time.perf_counter() - convert_started
+                    converted_from_xbm = True
                 except Exception as e:
-                    log.warning("Failed to convert xbm_to_dds")
+                    conversion_seconds = time.perf_counter() - convert_started
+                    log.warning("Failed to convert xbm_to_dds: %s (%s)", xbm_path, e)
                 if os.path.exists(win_safe_path(dds_path)):
                     tex_path = dds_path
 
@@ -1548,9 +1622,24 @@ def create_node_texture(
             tex_path = dds_path
 
     
+    image_started = time.perf_counter()
     node.image = load_texture(mat, tex_path, uncook_path)
+    image_load_seconds = time.perf_counter() - image_started
     if not node.image:
         node.label = "MISSING:" + par_value
+
+    total_seconds = time.perf_counter() - texture_started
+    if total_seconds >= _TEXTURE_PROFILE_WARN_THRESHOLD or converted_from_xbm:
+        _log_material_profile_warning(
+            "texture node %s on %s total %.3fs (convert %.3fs, load %.3fs, source %s, final %s)",
+            par_name,
+            getattr(mat, "name", "<material>"),
+            total_seconds,
+            conversion_seconds,
+            image_load_seconds,
+            par_value,
+            tex_path,
+        )
 
     return node
 
@@ -1724,6 +1813,7 @@ def load_texture(
         ,tex_path: str
         ,uncook_path: str
     ) -> Image:
+    texture_started = time.perf_counter()
     tex_path = win_unprefix_path(tex_path)
     img_filename = os.path.basename(tex_path)	# Filename with extension.
     overwrite_existing = overwrite_existing_enabled()
@@ -1785,6 +1875,16 @@ def load_texture(
         img.alpha_mode = 'CHANNEL_PACKED'
 
     _apply_image_texture_metadata(img, tex_path)
+
+    total_seconds = time.perf_counter() - texture_started
+    if total_seconds >= _TEXTURE_PROFILE_WARN_THRESHOLD:
+        _log_material_profile_warning(
+            "load texture %s total %.3fs (material %s, exists %s)",
+            tex_path,
+            total_seconds,
+            getattr(mat, "name", "<material>"),
+            "yes" if os.path.isfile(win_safe_path(tex_path)) else "no",
+        )
 
     return img
 

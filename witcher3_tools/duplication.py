@@ -15,6 +15,7 @@ import bpy
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "duplicate_object_hierarchy",
     "duplicate_character_hierarchy",
     "duplicate_object_for_morph_bake",
     "remap_duplicated_object_links",
@@ -165,6 +166,19 @@ def _link_duplicate_to_source_collections(context, source_obj, duplicate_obj):
         target_collection = getattr(getattr(context, "scene", None), "collection", None)
     if target_collection is not None:
         target_collection.objects.link(duplicate_obj)
+
+
+def _link_duplicate_to_collection(context, source_obj, duplicate_obj, *, target_collection=None, link_to_source_collections=True):
+    if link_to_source_collections:
+        _link_duplicate_to_source_collections(context, source_obj, duplicate_obj)
+        return
+    target = target_collection
+    if target is None:
+        target = getattr(context, "collection", None)
+    if target is None:
+        target = getattr(getattr(context, "scene", None), "collection", None)
+    if target is not None:
+        target.objects.link(duplicate_obj)
 
 
 def _mesh_duplicate_requires_unique_data(obj):
@@ -538,22 +552,25 @@ def _retarget_duplicate_character_guids(duplicate_armature, duplicate_records):
                 slot.template_guid = new_guid
 
 
-def duplicate_character_hierarchy(context, source_armature):
-    """Create a linked duplicate of a character hierarchy."""
-    source_objects = _iter_character_duplicate_objects(source_armature)
+def _duplicate_object_hierarchy_impl(context, source_root, *, target_collection=None, link_to_source_collections=True):
+    source_objects = _iter_character_duplicate_objects(source_root)
     if not source_objects:
-        return None
+        return None, {}, []
 
     object_map = {}
     id_map = {}
     node_group_map = {}
     duplicate_records = []
 
-    # First pass: create and link every duplicate object so Blender gives each
-    # copy a real identity before we start fixing references.
     for source_obj in source_objects:
         duplicate_obj, copied_data = _duplicate_character_object(source_obj)
-        _link_duplicate_to_source_collections(context, source_obj, duplicate_obj)
+        _link_duplicate_to_collection(
+            context,
+            source_obj,
+            duplicate_obj,
+            target_collection=target_collection,
+            link_to_source_collections=link_to_source_collections,
+        )
         visibility_state = _capture_duplicate_visibility_state(source_obj)
         object_map[source_obj.name] = (source_obj, duplicate_obj)
         duplicate_records.append((source_obj, duplicate_obj, copied_data, visibility_state))
@@ -563,8 +580,6 @@ def duplicate_character_hierarchy(context, source_armature):
 
     simple_object_map = {name: duplicate for name, (_source, duplicate) in object_map.items()}
 
-    # Second pass: every duplicate exists now, so internal references can be
-    # pointed back at the duplicate hierarchy instead of the source hierarchy.
     for source_obj, duplicate_obj, _copied_data, visibility_state in duplicate_records:
         _remap_duplicate_object_parent(source_obj, duplicate_obj, simple_object_map)
         _remap_duplicate_object_constraints(duplicate_obj, id_map)
@@ -582,17 +597,40 @@ def duplicate_character_hierarchy(context, source_armature):
         _remap_duplicate_object_drivers(duplicate_obj, id_map)
         _apply_duplicate_visibility_state(duplicate_obj, visibility_state)
 
-    duplicate_armature = simple_object_map.get(source_armature.name)
+    duplicate_root = simple_object_map.get(source_root.name)
+    if duplicate_root is None:
+        return None, object_map, duplicate_records
+
+    try:
+        duplicate_root.matrix_world = source_root.matrix_world.copy()
+    except Exception:
+        pass
+
+    return duplicate_root, object_map, duplicate_records
+
+
+def duplicate_object_hierarchy(context, source_root, *, target_collection=None, link_to_source_collections=False):
+    duplicate_root, _object_map, _duplicate_records = _duplicate_object_hierarchy_impl(
+        context,
+        source_root,
+        target_collection=target_collection,
+        link_to_source_collections=link_to_source_collections,
+    )
+    return duplicate_root
+
+
+def duplicate_character_hierarchy(context, source_armature):
+    """Create a linked duplicate of a character hierarchy."""
+    duplicate_armature, object_map, duplicate_records = _duplicate_object_hierarchy_impl(
+        context,
+        source_armature,
+        link_to_source_collections=True,
+    )
     if duplicate_armature is None:
         return None
 
     _retarget_duplicate_character_metadata(source_armature, duplicate_armature, object_map)
     _retarget_duplicate_character_guids(duplicate_armature, duplicate_records)
-
-    try:
-        duplicate_armature.matrix_world = source_armature.matrix_world.copy()
-    except Exception:
-        pass
 
     rig_settings = getattr(getattr(duplicate_armature, "data", None), "witcherui_RigSettings", None)
     if rig_settings is not None:

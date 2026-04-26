@@ -171,6 +171,7 @@ class WITCH_MT_Menu(bpy.types.Menu):
         layout.separator()
         layout.operator(WITCH_OT_w2L.bl_idname, text="Layer (.w2l)", icon='SPHERE')
         layout.operator(WITCH_OT_w2w.bl_idname, text="World (.w2w)", icon='WORLD_DATA')
+        layout.operator("witcher.load_layers_around_camera", text="Load Layers Around Camera", icon='VIEW_CAMERA')
         layout.operator(WITCH_OT_flyr.bl_idname, text="Foliage (.flyr)", icon='FORCE_WIND')
         layout.operator(WITCH_OT_srt.bl_idname, text="SpeedTree (.srt)", icon='OUTLINER_COLLECTION')
         layout.separator()

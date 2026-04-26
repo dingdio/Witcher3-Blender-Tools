@@ -39,6 +39,7 @@ from ..CR2W.dc_entity import is_valid_mesh_path
 from ..CR2W.CR2W_types import EngineTransform
 from ..importers.import_helpers import set_blender_object_transform
 from ..importers import import_isolation
+from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
 from ..CR2W.common_blender import repo_file
 from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
@@ -67,6 +68,9 @@ _ENTITY_RUNTIME_CACHE = {}
 _BEH_IDLE_BUDGET_MS = 500.0
 _BEH_IDLE_TRANSITION_RE = re.compile(r"_to_idle", re.IGNORECASE)
 _BEH_IDLE_DOWNGRADE_RE = re.compile(r"additive|lookat|look_at|combat", re.IGNORECASE)
+_REDCLOTH_PROFILE_ENABLED = True
+_REDCLOTH_PROFILE_WARN_THRESHOLD = 0.10
+_REDCLOTH_CACHE_COLLECTION_NAME = "_WitcherRedclothCache"
 
 
 @persistent
@@ -93,12 +97,22 @@ def _unregister_entity_cache_handler():
 _register_entity_cache_handler()
 
 
+def _log_redcloth_profile_warning(message, *args):
+    if not _REDCLOTH_PROFILE_ENABLED:
+        return
+    log.info("[redcloth-profile] " + str(message), *args)
+
+
 def _norm_redcloth_key_path(value) -> str:
     return str(value or "").replace("/", "\\").lower()
 
 
+def _make_redcloth_resource_key(resource_path: str) -> str:
+    return _norm_redcloth_key_path(resource_path)
+
+
 def _make_redcloth_reuse_key(resource_path: str, redcloth_mat_path: str) -> str:
-    return f"{_norm_redcloth_key_path(resource_path)}|{_norm_redcloth_key_path(redcloth_mat_path)}"
+    return f"{_make_redcloth_resource_key(resource_path)}|{_norm_redcloth_key_path(redcloth_mat_path)}"
 
 
 def _get_chunk_component_name(chunk) -> str:
@@ -312,21 +326,141 @@ def _iter_object_descendants(root_obj):
         stack.extend(list(getattr(obj, "children", [])))
 
 
-def _find_reusable_redcloth_armature(owner_armature, reuse_key: str):
+def _find_reusable_redcloth_armature(owner_armature, reuse_key: str, *, key_prop: str = "witcher_redcloth_reuse_key"):
     if owner_armature is None or not reuse_key:
         return None
     for obj in _iter_object_descendants(owner_armature):
         try:
             if obj.type != 'ARMATURE':
                 continue
-            if obj.get("witcher_redcloth_reuse_key") == reuse_key:
+            if obj.get(key_prop) == reuse_key:
                 return obj
         except Exception:
             continue
     return None
 
 
-def _tag_redcloth_for_reuse(cloth_armature, reuse_key: str, resource_path: str, redcloth_mat_path: str):
+def _find_layer_collection_for_collection(layer_collection, target_collection):
+    if layer_collection is None or target_collection is None:
+        return None
+    if getattr(layer_collection, "collection", None) == target_collection:
+        return layer_collection
+    for child in getattr(layer_collection, "children", []) or []:
+        found = _find_layer_collection_for_collection(child, target_collection)
+        if found is not None:
+            return found
+    return None
+
+
+def _configure_redcloth_cache_collection(scene, cache_collection):
+    if scene is None or cache_collection is None:
+        return
+    try:
+        cache_collection.hide_render = True
+    except Exception:
+        pass
+    try:
+        cache_collection.hide_viewport = True
+    except Exception:
+        pass
+    try:
+        cache_collection["witcher_redcloth_cache"] = True
+    except Exception:
+        pass
+    for view_layer in getattr(scene, "view_layers", []) or []:
+        layer_collection = _find_layer_collection_for_collection(getattr(view_layer, "layer_collection", None), cache_collection)
+        if layer_collection is None:
+            continue
+        try:
+            layer_collection.hide_viewport = True
+        except Exception:
+            pass
+
+
+def _get_redcloth_cache_collection(scene, create: bool = False):
+    if scene is None:
+        return None
+    cache_collection = bpy.data.collections.get(_REDCLOTH_CACHE_COLLECTION_NAME)
+    if cache_collection is None and not create:
+        return None
+    if cache_collection is None:
+        cache_collection = bpy.data.collections.new(_REDCLOTH_CACHE_COLLECTION_NAME)
+    try:
+        scene_children = getattr(scene.collection, "children", None)
+        if scene_children is not None and cache_collection.name not in scene_children.keys():
+            scene_children.link(cache_collection)
+    except Exception:
+        pass
+    _configure_redcloth_cache_collection(scene, cache_collection)
+    return cache_collection
+
+
+def _iter_redcloth_cache_objects(scene):
+    cache_collection = _get_redcloth_cache_collection(scene, create=False)
+    if cache_collection is not None:
+        for obj in getattr(cache_collection, "all_objects", []) or []:
+            yield obj
+        return
+    for obj in getattr(scene, "objects", []) or []:
+        yield obj
+
+
+def _find_reusable_redcloth_root(scene, resource_key: str):
+    if scene is None or not resource_key:
+        return None
+    for obj in _iter_redcloth_cache_objects(scene):
+        try:
+            if not obj.get("witcher_redcloth_cache_root", False):
+                continue
+            if obj.get("witcher_redcloth_resource_key") == resource_key:
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+def _get_reusable_redcloth_root(cloth_armature, resource_key: str):
+    if cloth_armature is None:
+        return None
+    parent = getattr(cloth_armature, "parent", None)
+    if parent is not None:
+        try:
+            if parent.get("witcher_redcloth_resource_key") == resource_key:
+                return parent
+        except Exception:
+            pass
+    return cloth_armature
+
+
+def _resolve_redcloth_armature_from_root(root_obj, resource_key: str):
+    if root_obj is None:
+        return None, None
+    if getattr(root_obj, "type", "") == 'ARMATURE':
+        return root_obj, None
+    cloth_arma = _find_reusable_redcloth_armature(
+        root_obj,
+        resource_key,
+        key_prop="witcher_redcloth_resource_key",
+    )
+    if cloth_arma is not None:
+        return cloth_arma, root_obj
+    return None, root_obj if getattr(root_obj, "type", "") == 'EMPTY' else None
+
+
+def _clear_redcloth_cache_root_flag(root_obj):
+    if root_obj is None:
+        return
+    try:
+        if "witcher_redcloth_cache_root" in root_obj:
+            del root_obj["witcher_redcloth_cache_root"]
+    except Exception:
+        try:
+            root_obj["witcher_redcloth_cache_root"] = False
+        except Exception:
+            pass
+
+
+def _tag_redcloth_for_reuse(cloth_armature, reuse_key: str, resource_key: str, resource_path: str, redcloth_mat_path: str):
     if cloth_armature is None:
         return
     targets = [cloth_armature]
@@ -336,10 +470,286 @@ def _tag_redcloth_for_reuse(cloth_armature, reuse_key: str, resource_path: str, 
     for obj in targets:
         try:
             obj["witcher_redcloth_reuse_key"] = reuse_key
+            obj["witcher_redcloth_resource_key"] = resource_key
             obj["witcher_redcloth_resource"] = resource_path or ""
             obj["witcher_redcloth_material"] = redcloth_mat_path or ""
         except Exception:
             pass
+
+
+def _tag_redcloth_reuse_root(root_obj, reuse_key: str, resource_key: str, resource_path: str, redcloth_mat_path: str):
+    if root_obj is None:
+        return
+    try:
+        root_obj["witcher_redcloth_cache_root"] = True
+        root_obj["witcher_redcloth_reuse_key"] = reuse_key
+        root_obj["witcher_redcloth_resource_key"] = resource_key
+        root_obj["witcher_redcloth_resource"] = resource_path or ""
+        root_obj["witcher_redcloth_material"] = redcloth_mat_path or ""
+    except Exception:
+        pass
+
+
+def _get_redcloth_stored_material_path(cloth_armature) -> str:
+    if cloth_armature is None:
+        return ""
+    for obj in (cloth_armature, getattr(cloth_armature, "parent", None)):
+        if obj is None:
+            continue
+        try:
+            value = str(obj.get("witcher_redcloth_material", "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            return value
+    return ""
+
+
+def _refresh_reused_redcloth_materials(cloth_armature, redcloth_resource: str, redcloth_mat_path: str) -> float:
+    requested_mat = _norm_redcloth_key_path(redcloth_mat_path)
+    cached_mat = _norm_redcloth_key_path(_get_redcloth_stored_material_path(cloth_armature))
+    if not requested_mat or requested_mat == cached_mat:
+        return 0.0
+    cloth_meshes = _collect_redcloth_meshes(cloth_armature)
+    refresh_stats = cloth_util.apply_redcloth_materials_to_meshes(
+        cloth_meshes,
+        redcloth_resource,
+        redcloth_mat_path,
+        context=bpy.context,
+        apply_runtime_defaults=True,
+    )
+    refresh_seconds = float(refresh_stats.get("read_seconds", 0.0) or 0.0) + float(refresh_stats.get("apply_seconds", 0.0) or 0.0)
+    if refresh_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+        _log_redcloth_profile_warning(
+            "material refresh %s %.3fs (cached %s, requested %s, meshes %d, slots %d)",
+            Path(redcloth_resource.replace("/", "\\")).name or redcloth_resource,
+            refresh_seconds,
+            Path(cached_mat).name or cached_mat or "<none>",
+            Path(requested_mat).name or requested_mat or "<none>",
+            len(cloth_meshes),
+            int(refresh_stats.get("material_count", 0) or 0),
+        )
+    return refresh_seconds
+
+
+def _seed_redcloth_cache_root(scene, source_root, reuse_key: str, resource_key: str, resource_path: str, redcloth_mat_path: str):
+    if scene is None or source_root is None or not resource_key:
+        return None
+    existing_root = _find_reusable_redcloth_root(scene, resource_key)
+    if existing_root is not None:
+        return existing_root
+    cache_collection = _get_redcloth_cache_collection(scene, create=True)
+    if cache_collection is None:
+        return None
+    duplicate_root = duplicate_object_hierarchy(
+        bpy.context,
+        source_root,
+        target_collection=cache_collection,
+        link_to_source_collections=False,
+    )
+    if duplicate_root is None:
+        return None
+    _clear_redcloth_cache_root_flag(duplicate_root)
+    cache_armature, _cache_group = _resolve_redcloth_armature_from_root(duplicate_root, resource_key)
+    if cache_armature is not None:
+        _tag_redcloth_for_reuse(cache_armature, reuse_key, resource_key, resource_path, redcloth_mat_path)
+    cache_root = _get_reusable_redcloth_root(cache_armature or duplicate_root, resource_key) or duplicate_root
+    _tag_redcloth_reuse_root(cache_root, reuse_key, resource_key, resource_path, redcloth_mat_path)
+    return cache_root
+
+
+def import_or_reuse_redcloth(
+    owner_armature,
+    redcloth_resource: str,
+    redcloth_mat_path: str,
+    *,
+    import_name: str,
+    entity_name: str,
+    target_collection=None,
+):
+    total_started = time.perf_counter()
+    resolve_seconds = 0.0
+    import_seconds = 0.0
+    activate_seconds = 0.0
+    collect_seconds = 0.0
+    material_refresh_seconds = 0.0
+    reused = False
+    imported = False
+    redcloth_resource = str(redcloth_resource or "").strip()
+    redcloth_mat_path = str(redcloth_mat_path or "").strip()
+    if not redcloth_resource or not redcloth_mat_path:
+        return None, None, []
+
+    redcloth_resource_key = _make_redcloth_resource_key(redcloth_resource)
+    redcloth_reuse_key = _make_redcloth_reuse_key(redcloth_resource, redcloth_mat_path)
+    scene = getattr(bpy.context, "scene", None)
+    cloth_arma = _find_reusable_redcloth_armature(owner_armature, redcloth_reuse_key)
+    if cloth_arma is not None:
+        reused = True
+        log.info("Reusing redcloth import for %s", redcloth_resource)
+    else:
+        cloth_grp = None
+        reusable_root = _find_reusable_redcloth_root(scene, redcloth_resource_key)
+        if reusable_root is not None:
+            duplicate_root = duplicate_object_hierarchy(
+                bpy.context,
+                reusable_root,
+                target_collection=target_collection,
+                link_to_source_collections=False,
+            )
+            _clear_redcloth_cache_root_flag(duplicate_root)
+            cloth_arma, cloth_grp = _resolve_redcloth_armature_from_root(duplicate_root, redcloth_resource_key)
+            if cloth_arma is not None:
+                reused = True
+                log.info("Reusing global redcloth import for %s", redcloth_resource)
+                material_refresh_seconds = _refresh_reused_redcloth_materials(
+                    cloth_arma,
+                    redcloth_resource,
+                    redcloth_mat_path,
+                )
+                _tag_redcloth_for_reuse(
+                    cloth_arma,
+                    redcloth_reuse_key,
+                    redcloth_resource_key,
+                    redcloth_resource,
+                    redcloth_mat_path,
+                )
+        if cloth_arma is not None:
+            imported = False
+        else:
+            resolve_started = time.perf_counter()
+            apx_info = resolve_redcloth_apx(bpy.context, redcloth_resource, loadmods=False)
+            resolve_seconds = time.perf_counter() - resolve_started
+            apx_path = apx_info.get("apx_path", "")
+            if not apx_path or not os.path.isfile(apx_path):
+                apx_status = get_apx_addon_status(bpy.context)
+                if not apx_status["enabled"]:
+                    set_external_import_dependency_alert(
+                        "redcloth",
+                        source_path=redcloth_resource,
+                        status="apx_addon_disabled",
+                        reason=apx_info.get("message") or "io_mesh_apx addon is not enabled.",
+                    )
+                elif not apx_status["sdk_ready"]:
+                    set_external_import_dependency_alert(
+                        "redcloth",
+                        source_path=redcloth_resource,
+                        status="apx_sdk_missing",
+                        reason=apx_info.get("message") or "APX SDK CLI path is not configured or does not exist.",
+                    )
+                log.warning(
+                    "Skipping redcloth import for %s: %s",
+                    redcloth_resource,
+                    apx_info.get("message") or apx_info.get("status"),
+                )
+                cloth_arma = None
+            else:
+                try:
+                    import_started = time.perf_counter()
+                    cloth_arma = cloth_util.importCloth(
+                        False,
+                        apx_path,
+                        True,
+                        False,
+                        True,
+                        redcloth_mat_path,
+                        str(import_name or "CClothComponent"),
+                        str(entity_name or Path(redcloth_resource.replace("/", "\\")).stem),
+                    )
+                    import_seconds = time.perf_counter() - import_started
+                    imported = cloth_arma is not None
+                    if target_collection is not None:
+                        activate_started = time.perf_counter()
+                        _activate_target_collection(bpy.context, target_collection)
+                        activate_seconds = time.perf_counter() - activate_started
+                    if cloth_arma is None:
+                        legacy_exists, legacy_enabled = addon_utils.check("io_scene_apx")
+                        apx_status = get_apx_addon_status(bpy.context)
+                        if not apx_status["enabled"] and not bool(legacy_enabled):
+                            set_external_import_dependency_alert(
+                                "redcloth",
+                                source_path=redcloth_resource,
+                                status="apx_addon_disabled",
+                                reason="io_mesh_apx (or legacy io_scene_apx) addon is not enabled.",
+                            )
+                        log.warning("Redcloth import returned no object for %s", redcloth_resource)
+                except Exception as e:
+                    import_seconds = time.perf_counter() - import_started
+                    apx_status = get_apx_addon_status(bpy.context)
+                    if not apx_status["enabled"]:
+                        legacy_exists, legacy_enabled = addon_utils.check("io_scene_apx")
+                        if not bool(legacy_enabled):
+                            set_external_import_dependency_alert(
+                                "redcloth",
+                                source_path=redcloth_resource,
+                                status="apx_addon_disabled",
+                                reason="io_mesh_apx (or legacy io_scene_apx) addon is not enabled.",
+                            )
+                    log.warning("Redcloth import failed for %s: %s", redcloth_resource, e)
+                    cloth_arma = None
+
+    if cloth_arma is None:
+        total_seconds = time.perf_counter() - total_started
+        if total_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+            _log_redcloth_profile_warning(
+                "entity %s total %.3fs (resolve %.3fs, import %.3fs, activate %.3fs, material_refresh %.3fs, collect %.3fs, reused %s, imported %s, ok no)",
+                Path(redcloth_resource.replace("/", "\\")).name or redcloth_resource,
+                total_seconds,
+                resolve_seconds,
+                import_seconds,
+                activate_seconds,
+                material_refresh_seconds,
+                collect_seconds,
+                "yes" if reused else "no",
+                "yes" if imported else "no",
+            )
+        return None, None, []
+
+    clear_external_import_dependency_alert("redcloth")
+    cloth_grp = None
+    if cloth_arma.type == 'EMPTY':
+        cloth_grp = cloth_arma
+        for child in cloth_arma.children:
+            if child.type == 'ARMATURE':
+                cloth_arma = child
+                break
+    _tag_redcloth_for_reuse(
+        cloth_arma,
+        redcloth_reuse_key,
+        redcloth_resource_key,
+        redcloth_resource,
+        redcloth_mat_path,
+    )
+    visible_root = _get_reusable_redcloth_root(cloth_arma, redcloth_resource_key)
+    _clear_redcloth_cache_root_flag(visible_root)
+    if imported:
+        _seed_redcloth_cache_root(
+            scene,
+            visible_root,
+            redcloth_reuse_key,
+            redcloth_resource_key,
+            redcloth_resource,
+            redcloth_mat_path,
+        )
+    collect_started = time.perf_counter()
+    cloth_meshes = _collect_redcloth_meshes(cloth_arma)
+    collect_seconds = time.perf_counter() - collect_started
+    total_seconds = time.perf_counter() - total_started
+    if total_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+        _log_redcloth_profile_warning(
+            "entity %s total %.3fs (resolve %.3fs, import %.3fs, activate %.3fs, material_refresh %.3fs, collect %.3fs, reused %s, imported %s, meshes %d, ok yes)",
+            Path(redcloth_resource.replace("/", "\\")).name or redcloth_resource,
+            total_seconds,
+            resolve_seconds,
+            import_seconds,
+            activate_seconds,
+            material_refresh_seconds,
+            collect_seconds,
+            "yes" if reused else "no",
+            "yes" if imported else "no",
+            len(cloth_meshes),
+        )
+    return cloth_arma, cloth_grp, cloth_meshes
 
 
 def _build_coloring_entry_lookup(coloring_entries, appearance_name):
@@ -3215,83 +3625,15 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             redcloth_mat_path = repo_file(redcloth_resource, entity.version)
             component_name = _get_chunk_component_name(chunk)
             owner_armature = objdict.get(entity.name)
-            redcloth_reuse_key = _make_redcloth_reuse_key(redcloth_resource, redcloth_mat_path)
-            cloth_arma = _find_reusable_redcloth_armature(owner_armature, redcloth_reuse_key)
+            cloth_arma, cloth_grp, cloth_meshes = import_or_reuse_redcloth(
+                owner_armature,
+                redcloth_resource,
+                redcloth_mat_path,
+                import_name=f"{chunk['type']}{i}{chunk['chunkIndex']}",
+                entity_name=entity.name,
+                target_collection=target_collection,
+            )
             if cloth_arma is not None:
-                log.info("Reusing redcloth import for %s", redcloth_resource)
-            else:
-                apx_info = resolve_redcloth_apx(bpy.context, redcloth_resource, loadmods=False)
-                apx_path = apx_info.get("apx_path", "")
-                if not apx_path or not os.path.isfile(apx_path):
-                    apx_status = get_apx_addon_status(bpy.context)
-                    if not apx_status["enabled"]:
-                        set_external_import_dependency_alert(
-                            "redcloth",
-                            source_path=redcloth_resource,
-                            status="apx_addon_disabled",
-                            reason=apx_info.get("message") or "io_mesh_apx addon is not enabled.",
-                        )
-                    elif not apx_status["sdk_ready"]:
-                        set_external_import_dependency_alert(
-                            "redcloth",
-                            source_path=redcloth_resource,
-                            status="apx_sdk_missing",
-                            reason=apx_info.get("message") or "APX SDK CLI path is not configured or does not exist.",
-                        )
-                    log.warning(
-                        "Skipping redcloth import for %s: %s",
-                        redcloth_resource,
-                        apx_info.get("message") or apx_info.get("status"),
-                    )
-                    cloth_arma = None
-                else:
-                    try:
-                        cloth_arma = cloth_util.importCloth(
-                            False,
-                            apx_path,
-                            True,
-                            False,
-                            True,
-                            redcloth_mat_path,
-                            f"{chunk['type']}{i}{chunk['chunkIndex']}",
-                            entity.name,
-                        )
-                        if target_collection is not None:
-                            _activate_target_collection(bpy.context, target_collection)
-                        if cloth_arma is None:
-                            legacy_exists, legacy_enabled = addon_utils.check("io_scene_apx")
-                            apx_status = get_apx_addon_status(bpy.context)
-                            if not apx_status["enabled"] and not bool(legacy_enabled):
-                                set_external_import_dependency_alert(
-                                    "redcloth",
-                                    source_path=redcloth_resource,
-                                    status="apx_addon_disabled",
-                                    reason="io_mesh_apx (or legacy io_scene_apx) addon is not enabled.",
-                                )
-                            log.warning("Redcloth import returned no object for %s", redcloth_resource)
-                    except Exception as e:
-                        apx_status = get_apx_addon_status(bpy.context)
-                        if not apx_status["enabled"]:
-                            legacy_exists, legacy_enabled = addon_utils.check("io_scene_apx")
-                            if not bool(legacy_enabled):
-                                set_external_import_dependency_alert(
-                                    "redcloth",
-                                    source_path=redcloth_resource,
-                                    status="apx_addon_disabled",
-                                    reason="io_mesh_apx (or legacy io_scene_apx) addon is not enabled.",
-                                )
-                        log.warning("Redcloth import failed for %s: %s", redcloth_resource, e)
-                        cloth_arma = None
-            if cloth_arma is not None:
-                clear_external_import_dependency_alert("redcloth")
-                cloth_grp = None
-                if cloth_arma.type == 'EMPTY':
-                    cloth_grp = cloth_arma
-                    for child in cloth_arma.children:
-                        if child.type == 'ARMATURE':
-                            cloth_arma = child
-                            break
-                _tag_redcloth_for_reuse(cloth_arma, redcloth_reuse_key, redcloth_resource, redcloth_mat_path)
                 add_chunk_metadata(cloth_arma, chunk, chunk['resource'], component_name=component_name)
                 objdict[chunk_ns] = cloth_arma
                 if cloth_grp is not None:
@@ -3299,7 +3641,6 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 if not any(c[1] == chunk_ns for c in constrains):
                     constrains.append([entity.name, chunk_ns])
 
-                cloth_meshes = _collect_redcloth_meshes(cloth_arma)
                 if component_name:
                     for mesh in cloth_meshes:
                         mesh['witcher_name'] = component_name

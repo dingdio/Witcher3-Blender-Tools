@@ -1,11 +1,21 @@
 import logging
 from pathlib import Path
 import inspect
+import addon_utils
 import bmesh
 import json
 import hashlib
+import time
 
 log = logging.getLogger(__name__)
+_REDCLOTH_PROFILE_ENABLED = True
+_REDCLOTH_PROFILE_WARN_THRESHOLD = 0.10
+
+
+def _log_redcloth_profile_warning(message, *args):
+    if not _REDCLOTH_PROFILE_ENABLED:
+        return
+    log.info("[redcloth-profile] " + str(message), *args)
 
 from .importers.import_rig import rotate_and_connect_bones
 from .w3_material import create_param, read_2wmi_params2, setup_w3_material, xml_data_from_CR2W
@@ -226,6 +236,108 @@ def _find_matching_material_on_object(obj: Object, xml_mat_name: str):
     return None
 
 
+def _redcloth_material_name_prefix(redcloth_resource: str = "", fallback_path: str = "") -> str:
+    source_path = str(redcloth_resource or fallback_path or "").strip()
+    if not source_path:
+        return ""
+    return Path(source_path.replace("/", "\\")).stem
+
+
+def _read_redcloth_material_payload(redcloth_resource: str, mat_filename: str):
+    started = time.perf_counter()
+    redcloth_material = None
+    materials = []
+    material_names = []
+    mat_filename = str(mat_filename or "").strip()
+    if mat_filename:
+        redcloth_material = CR2W.CR2W_reader.load_material(mat_filename)
+    prefix = _redcloth_material_name_prefix(redcloth_resource, mat_filename)
+    if redcloth_material:
+        for chunk in redcloth_material:
+            if chunk.name != "CApexClothResource":
+                continue
+            materials_handle = chunk.GetVariableByName('materials')
+            if materials_handle and hasattr(materials_handle, "Handles"):
+                materials = [redcloth_material[o.Reference] for o in materials_handle.Handles]
+            apex_names = chunk.GetVariableByName('apexMaterialNames')
+            if apex_names and hasattr(apex_names, "elements"):
+                material_names = []
+                for element in apex_names.elements:
+                    raw_name = str(getattr(element, "String", "") or "")
+                    suffix = raw_name.split("::", 1)[1] if "::" in raw_name else raw_name
+                    material_names.append(prefix + suffix)
+            break
+    return redcloth_material, materials, material_names, time.perf_counter() - started
+
+
+def apply_redcloth_materials_to_meshes(
+    mesh_objects,
+    redcloth_resource: str,
+    mat_filename: str,
+    *,
+    context=None,
+    force_mat_update: bool = False,
+    apply_runtime_defaults: bool = False,
+):
+    mesh_list = [obj for obj in (mesh_objects or []) if obj is not None and getattr(obj, "type", None) == 'MESH']
+    result = {
+        "read_seconds": 0.0,
+        "apply_seconds": 0.0,
+        "material_count": 0,
+        "mesh_count": len(mesh_list),
+    }
+    mat_filename = str(mat_filename or "").strip()
+    if not mesh_list or not mat_filename:
+        return result
+
+    ctx = context or bpy.context
+    uncook_path = get_texture_path(ctx) + "\\"
+    redcloth_material, materials, material_names, read_seconds = _read_redcloth_material_payload(redcloth_resource, mat_filename)
+    result["read_seconds"] = read_seconds
+    result["material_count"] = len(material_names)
+
+    if not redcloth_material or not materials or not material_names:
+        if apply_runtime_defaults:
+            for mesh_obj in mesh_list:
+                _apply_redcloth_runtime_defaults(mesh_obj, ctx)
+        return result
+
+    total_apply_seconds = 0.0
+    for mesh_obj in mesh_list:
+        target_mat = False
+        for idx, _mat in enumerate(materials):
+            if idx >= len(material_names):
+                break
+            xml_mat_name = material_names[idx]
+            target_mat = _find_matching_material_on_object(mesh_obj, xml_mat_name)
+            if target_mat:
+                break
+
+        if not target_mat and material_names:
+            for idx, material in enumerate(mesh_obj.data.materials):
+                if idx >= len(material_names):
+                    break
+                if material is not None:
+                    material.name = material_names[idx]
+
+        apply_started = time.perf_counter()
+        load_w3_materials_CR2W(
+            mesh_obj,
+            uncook_path,
+            materials,
+            material_names,
+            force_mat_update=force_mat_update,
+            mat_filename=mat_filename,
+        )
+        total_apply_seconds += time.perf_counter() - apply_started
+
+        if apply_runtime_defaults:
+            _apply_redcloth_runtime_defaults(mesh_obj, ctx)
+
+    result["apply_seconds"] = total_apply_seconds
+    return result
+
+
 def getGeometryCenter(obj):
 		sumWCoord = [0,0,0]
 		numbVert = 0
@@ -428,6 +540,21 @@ def _sanitize_apx_for_import(filepath: str) -> str:
 
     graphical_lods = _apx_try_find_child(clothing, "array", "name", "graphicalLods")
     physical_meshes = _apx_try_find_child(clothing, "array", "name", "physicalMeshes")
+
+    for array_elem, label in (
+        (graphical_lods, "graphical lods"),
+        (physical_meshes, "physical meshes"),
+    ):
+        if array_elem is None:
+            continue
+        original_count = len(array_elem)
+        if original_count <= 1:
+            continue
+        for idx in range(original_count - 1, 0, -1):
+            del array_elem[idx]
+        array_elem.attrib["size"] = "1"
+        change_notes.append(f"trimmed {label} {original_count}->1")
+
     required_sim_materials = max(
         len(graphical_lods) if graphical_lods is not None else 0,
         len(physical_meshes) if physical_meshes is not None else 0,
@@ -1897,7 +2024,39 @@ except ImportError:
     older_addon_installed = False
 
 
+def _addon_enabled(addon_id: str) -> bool:
+    try:
+        exists, enabled = addon_utils.check(addon_id)
+    except Exception:
+        return False
+    return bool(exists and enabled)
+
+
+def _io_mesh_apx_runtime_ready(context=None) -> bool:
+    ctx = context or bpy.context
+    wm = getattr(ctx, "window_manager", None)
+    return wm is not None and hasattr(wm, "physx")
+
+
 def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="", ns="cloth", name=":"):
+    total_started = time.perf_counter()
+    sanitize_seconds = 0.0
+    addon_import_seconds = 0.0
+    armature_scan_seconds = 0.0
+    fix_tail_seconds = 0.0
+    collision_seconds = 0.0
+    mesh_scan_seconds = 0.0
+    material_read_seconds = 0.0
+    material_apply_seconds = 0.0
+    runtime_defaults_seconds = 0.0
+    patch_seconds = 0.0
+    weights_seconds = 0.0
+    merge_seconds = 0.0
+    move_seconds = 0.0
+    restore_seconds = 0.0
+    proxy_count = 0
+    gmesh_count = 0
+    addon_name = "none"
 
     save_selected = bpy.context.selected_objects[:]
     save_active = bpy.context.view_layer.objects.active
@@ -1941,22 +2100,54 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
 
     uncook_path = get_texture_path(context)+"\\" # PATH WITH TEXTURES
 
+    sanitize_started = time.perf_counter()
     filepath = _sanitize_apx_for_import(filepath)
+    sanitize_seconds = time.perf_counter() - sanitize_started
+    if sanitize_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+        _log_redcloth_profile_warning(
+            "sanitize %s %.3fs",
+            os.path.basename(filepath),
+            sanitize_seconds,
+        )
 
     try:
-        if addon_installed:
+        io_mesh_enabled = _addon_enabled("io_mesh_apx")
+        legacy_enabled = _addon_enabled("io_scene_apx")
+        io_mesh_runtime_ready = _io_mesh_apx_runtime_ready(context)
+
+        if io_mesh_enabled and io_mesh_runtime_ready:
+            addon_name = "io_mesh_apx"
             from io_mesh_apx.importer.import_clothing import read_clothing
             args_count = len(inspect.signature(read_clothing).parameters)
             if args_count == 4:
+                addon_import_started = time.perf_counter()
                 read_clothing(context, filepath, rotate_180, rm_ph_me)
+                addon_import_seconds = time.perf_counter() - addon_import_started
             else:
                 raise RuntimeError(f"Unsupported io_mesh_apx.read_clothing signature: {args_count}")
-        elif older_addon_installed:
+        elif legacy_enabled:
+            addon_name = "io_scene_apx"
             from io_scene_apx.importer.import_clothing import read_clothing
+            addon_import_started = time.perf_counter()
             read_clothing(context, filepath, use_mat, rotate_180, rm_ph_me)
+            addon_import_seconds = time.perf_counter() - addon_import_started
         else:
-            log.warning("Cloth plugin unavailable: enable io_mesh_apx (or legacy io_scene_apx)")
+            if io_mesh_enabled and not io_mesh_runtime_ready:
+                log.warning(
+                    "Skipping redcloth import for %s: io_mesh_apx is enabled but not runtime-ready in this Blender session "
+                    "(WindowManager.physx missing).",
+                    os.path.basename(filepath),
+                )
+            else:
+                log.warning("Cloth plugin unavailable: enable io_mesh_apx (or legacy io_scene_apx)")
             return None
+        if addon_import_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+            _log_redcloth_profile_warning(
+                "addon import %s %.3fs (addon %s)",
+                os.path.basename(filepath),
+                addon_import_seconds,
+                addon_name,
+            )
         # objs = bpy.context.objects[:]
         # for obj in objs:
         #     print (obj.name)
@@ -1969,11 +2160,13 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
         if active_coll is None:
             raise RuntimeError(f"No active collection available after APX import for {filepath}")
         arma = None
+        armature_scan_started = time.perf_counter()
         arma_objs = []
         for ob in active_coll.all_objects:
             if ob.type == "ARMATURE" and "Armature" in ob.name:
                 arma_objs.append(ob)
         arma_objs.sort(key=lambda x: x.name, reverse=True)
+        armature_scan_seconds = time.perf_counter() - armature_scan_started
         if not arma_objs:
             raise RuntimeError(f"No APX armature found after import for {filepath}")
         arma = arma_objs[0]
@@ -1982,6 +2175,7 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
         do_fix_tail = get_do_fix_tail(bpy.context) #True
         if do_fix_tail: #!
             #ROTATE BONES
+            fix_tail_started = time.perf_counter()
             bpy.context.view_layer.objects.active = None
             bpy.ops.object.select_all(action='DESELECT')
             bpy.context.view_layer.objects.active = arma
@@ -1989,6 +2183,13 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
             bpy.ops.object.mode_set(mode='EDIT')
             rotate_and_connect_bones(arma)
             bpy.ops.object.mode_set(mode='OBJECT')
+            fix_tail_seconds = time.perf_counter() - fix_tail_started
+            if fix_tail_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+                _log_redcloth_profile_warning(
+                    "fix tail %s %.3fs",
+                    filename,
+                    fix_tail_seconds,
+                )
 
         collision_proxy_objects = {
             "spheres": None,
@@ -1997,6 +2198,7 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
         }
 
         if DO_WEAR_CLOTH:
+            collision_started = time.perf_counter()
             cloth_group = createEmpty(filename,"_grp")
             collision_transform = createEmpty(filename, "Collision Spheres", cloth_group)
             connections_transform = createEmpty(filename, "Collision Connections", cloth_group)
@@ -2053,15 +2255,30 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
                 active_coll,
                 all_capsules_coll,
             )
+            proxy_count = sum(1 for proxy in collision_proxy_objects.values() if proxy is not None)
+            collision_seconds = time.perf_counter() - collision_started
+            if collision_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+                _log_redcloth_profile_warning(
+                    "collision setup %s %.3fs (spheres %d, connections %d, capsules %d, proxies %d)",
+                    filename,
+                    collision_seconds,
+                    len(all_spheres_coll),
+                    len(all_connect_coll),
+                    len(all_capsules_coll),
+                    proxy_count,
+                )
 
 
         bpy.context.view_layer.objects.active = None
         bpy.ops.object.select_all(action='DESELECT')
+        mesh_scan_started = time.perf_counter()
         GMesh_objs = []
         for ob in active_coll.all_objects:
             if ob.type == "MESH" and ob.name.startswith("GMesh_lod"):
                 GMesh_objs.append(ob)
         GMesh_objs.sort(key=lambda x: x.name, reverse=False)
+        gmesh_count = len(GMesh_objs)
+        mesh_scan_seconds = time.perf_counter() - mesh_scan_started
         if not GMesh_objs:
             raise RuntimeError(f"No GMesh_lod mesh found after APX import for {filepath}")
         gmesh = GMesh_objs[0]
@@ -2087,79 +2304,157 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
         gmesh.select_set(True)
         bpy.context.view_layer.objects.active = gmesh
 
-        redcloth_material = CR2W.CR2W_reader.load_material(mat_filename)
-        materials = []
-        material_names = []
-        if redcloth_material:
-            for chunk in redcloth_material:
-                if chunk.name == "CApexClothResource":
-                    log.info(chunk.name)
-                    materials = [redcloth_material[o.Reference] for o in chunk.GetVariableByName('materials').Handles]
-                    material_names = [
-                        os.path.splitext(os.path.basename(filepath))[0] + o.String.split('::')[1]
-                        for o in chunk.GetVariableByName('apexMaterialNames').elements
-                    ]
-                    break
+        material_stats = apply_redcloth_materials_to_meshes(
+            [gmesh],
+            filepath,
+            mat_filename,
+            context=context,
+        )
+        material_read_seconds = float(material_stats.get("read_seconds", 0.0) or 0.0)
+        material_apply_seconds = float(material_stats.get("apply_seconds", 0.0) or 0.0)
+        material_slot_count = int(material_stats.get("material_count", 0) or 0)
+        if material_read_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD or material_apply_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+            _log_redcloth_profile_warning(
+                "materials %s %.3fs (read %.3fs, apply %.3fs, slots %d)",
+                gmesh.name,
+                material_read_seconds + material_apply_seconds,
+                material_read_seconds,
+                material_apply_seconds,
+                material_slot_count,
+            )
 
-        target_mat = False
-        for idx, mat in enumerate(materials):
-            if idx >= len(material_names):
-                break
-            xml_mat_name = material_names[idx]
-            target_mat = _find_matching_material_on_object(gmesh, xml_mat_name)
-            if target_mat:
-                break
-
-        if not target_mat and material_names:
-            for idx, m in enumerate(gmesh.data.materials):
-                if idx >= len(material_names):
-                    break
-                m.name = material_names[idx]
-
-        if redcloth_material and materials and material_names:
-            load_w3_materials_CR2W(gmesh, uncook_path, materials, material_names, mat_filename=mat_filename)
-
+        runtime_defaults_started = time.perf_counter()
         _apply_redcloth_runtime_defaults(gmesh, context)
+        runtime_defaults_seconds = time.perf_counter() - runtime_defaults_started
 
         if DO_WEAR_CLOTH:
+            patch_started = time.perf_counter()
             patched_collision_mode = _patch_clothsim_nodegroup_to_object_proxies(
                 gmesh,
                 collision_proxy_objects,
             )
+            patch_seconds = time.perf_counter() - patch_started
             if not patched_collision_mode:
                 log.warning(
                     "Redcloth import: could not patch ClothSimulation to object proxies for %s. "
                     "Collision may remain static or disabled without APX collections.",
                     gmesh.name,
                 )
+            if patch_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+                _log_redcloth_profile_warning(
+                    "patch proxies %s %.3fs (patched %s)",
+                    gmesh.name,
+                    patch_seconds,
+                    "yes" if patched_collision_mode else "no",
+                )
 
             if 'MaximumDistance' in gmesh.data.color_attributes:
+                weights_started = time.perf_counter()
                 vcol = gmesh.data.color_attributes['MaximumDistance']
                 vgroup_id = 'SimplyPin'
                 vgroup = gmesh.vertex_groups.new(name=vgroup_id)
                 gmesh.vertex_groups.active_index = vgroup.index
 
                 color_to_weights(gmesh, vcol, 0, vgroup.index)
+                weights_seconds = time.perf_counter() - weights_started
+                if weights_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+                    _log_redcloth_profile_warning(
+                        "pin weights %s %.3fs",
+                        gmesh.name,
+                        weights_seconds,
+                    )
 
             try:
+                merge_started = time.perf_counter()
                 _merge_mesh_by_distance_data(gmesh, merge_threshold=0.0001)
+                merge_seconds = time.perf_counter() - merge_started
+                if merge_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+                    _log_redcloth_profile_warning(
+                        "merge distance %s %.3fs",
+                        gmesh.name,
+                        merge_seconds,
+                    )
             except Exception as e:
+                merge_seconds = time.perf_counter() - merge_started
                 log.warning("Redcloth import: merge-by-distance failed for %s: %s", gmesh.name, e)
 
             # Move imported APX objects back into the collection the user started from.
+            move_started = time.perf_counter()
             move_objects_between_collections(active_coll, save_collection)
+            move_seconds = time.perf_counter() - move_started
+            if move_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+                _log_redcloth_profile_warning(
+                    "move collections %s %.3fs",
+                    filename,
+                    move_seconds,
+                )
 
+        restore_started = time.perf_counter()
         _restore_import_context()
+        restore_seconds = time.perf_counter() - restore_started
+
+        total_seconds = time.perf_counter() - total_started
+        if total_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+            _log_redcloth_profile_warning(
+                "total %s %.3fs (sanitize %.3fs, addon %.3fs, armatures %.3fs, fix_tail %.3fs, collision %.3fs, meshes %.3fs, material_read %.3fs, material_apply %.3fs, defaults %.3fs, patch %.3fs, weights %.3fs, merge %.3fs, move %.3fs, restore %.3fs, gmeshes %d, proxies %d, wear %s)",
+                filename,
+                total_seconds,
+                sanitize_seconds,
+                addon_import_seconds,
+                armature_scan_seconds,
+                fix_tail_seconds,
+                collision_seconds,
+                mesh_scan_seconds,
+                material_read_seconds,
+                material_apply_seconds,
+                runtime_defaults_seconds,
+                patch_seconds,
+                weights_seconds,
+                merge_seconds,
+                move_seconds,
+                restore_seconds,
+                gmesh_count,
+                proxy_count,
+                "yes" if DO_WEAR_CLOTH else "no",
+            )
 
         if DO_WEAR_CLOTH:
             return cloth_group
         else:
             return arma
     except Exception as e:
-        log.critical("Cloth import failed for %s: %s", os.path.basename(filepath), e)
+        total_seconds = time.perf_counter() - total_started
+        if total_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
+            _log_redcloth_profile_warning(
+                "failed %s %.3fs (sanitize %.3fs, addon %.3fs, armatures %.3fs, fix_tail %.3fs, collision %.3fs, meshes %.3fs, material_read %.3fs, material_apply %.3fs, defaults %.3fs, patch %.3fs, weights %.3fs, merge %.3fs, move %.3fs, restore %.3fs, gmeshes %d, proxies %d, wear %s, error %s)",
+                os.path.basename(filepath),
+                total_seconds,
+                sanitize_seconds,
+                addon_import_seconds,
+                armature_scan_seconds,
+                fix_tail_seconds,
+                collision_seconds,
+                mesh_scan_seconds,
+                material_read_seconds,
+                material_apply_seconds,
+                runtime_defaults_seconds,
+                patch_seconds,
+                weights_seconds,
+                merge_seconds,
+                move_seconds,
+                restore_seconds,
+                gmesh_count,
+                proxy_count,
+                "yes" if DO_WEAR_CLOTH else "no",
+                e,
+            )
+        log.warning("Redcloth import failed for %s: %s", os.path.basename(filepath), e)
+        log.debug("Redcloth import traceback for %s", filepath, exc_info=True)
         try:
             _cleanup_failed_cloth_import(import_snapshot)
         except Exception as cleanup_exc:
             log.debug("Failed cleaning up partial cloth import for %s: %s", filepath, cleanup_exc)
+        restore_started = time.perf_counter()
         _restore_import_context()
+        restore_seconds = time.perf_counter() - restore_started
         return None

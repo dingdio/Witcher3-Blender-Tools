@@ -17,9 +17,12 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "ENABLE_ISOLATED_IMPORTS",
+    "ImportIsolationBatchSession",
     "ImportIsolationSession",
     "collect_related_hierarchy_objects",
     "import_isolation_enabled",
+    "isolated_batch_import_target",
+    "isolated_import_batch_session",
     "is_isolated_import_context",
     "isolated_import_session",
     "needs_isolation_session",
@@ -144,6 +147,15 @@ def _iter_collection_descendants(root_collection):
         yield from _iter_collection_descendants(child)
 
 
+def _object_identity(obj):
+    if obj is None:
+        return None
+    try:
+        return int(obj.as_pointer())
+    except Exception:
+        return id(obj)
+
+
 def _find_layer_collection_for_collection(layer_collection, target_collection):
     if layer_collection is None or target_collection is None:
         return None
@@ -205,6 +217,65 @@ def _move_temp_objects_to_target(source_collection, target_collection, skip_obje
     return moved_objects
 
 
+def _capture_hidden_state_for_collection(source_collection, view_layer):
+    hidden_state_by_id = {}
+    if source_collection is None or view_layer is None:
+        return hidden_state_by_id
+    for obj in list(getattr(source_collection, "all_objects", []) or []):
+        if obj is None or getattr(obj, "name", None) not in bpy.data.objects:
+            continue
+        obj_id = _object_identity(obj)
+        if obj_id is None:
+            continue
+        try:
+            hidden_state_by_id[obj_id] = bool(obj.hide_get(view_layer=view_layer))
+        except TypeError:
+            try:
+                hidden_state_by_id[obj_id] = bool(obj.hide_get())
+            except Exception:
+                hidden_state_by_id[obj_id] = bool(getattr(obj, "hide_viewport", False))
+        except Exception:
+            hidden_state_by_id[obj_id] = bool(getattr(obj, "hide_viewport", False))
+    return hidden_state_by_id
+
+
+def _restore_hidden_state_for_objects(moved_objects, hidden_state_by_id, view_layer):
+    if view_layer is None or not moved_objects or not hidden_state_by_id:
+        return
+    for obj in moved_objects:
+        if obj is None or getattr(obj, "name", None) not in bpy.data.objects:
+            continue
+        obj_id = _object_identity(obj)
+        hidden = hidden_state_by_id.get(obj_id)
+        if hidden is None:
+            continue
+        try:
+            obj.hide_set(hidden, view_layer=view_layer)
+        except TypeError:
+            try:
+                obj.hide_set(hidden)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+def _cleanup_temp_collection_tree(temp_collection):
+    if temp_collection is None:
+        return
+    for child_collection in reversed(list(_iter_collection_descendants(temp_collection))):
+        try:
+            if child_collection.name in bpy.data.collections:
+                bpy.data.collections.remove(child_collection)
+        except Exception:
+            pass
+    try:
+        if temp_collection.name in bpy.data.collections:
+            bpy.data.collections.remove(temp_collection)
+    except Exception:
+        pass
+
+
 @dataclass
 class ImportIsolationSession:
     """Small result object returned by isolated_import_session()."""
@@ -212,6 +283,18 @@ class ImportIsolationSession:
     isolated: bool = False
     target_collection: object = None
     final_target_collection: object = None
+
+
+@dataclass
+class ImportIsolationBatchSession:
+    """Reusable isolated import environment for multi-item batch imports."""
+    context: object
+    isolated: bool = False
+    root_collection: object = None
+    view_layer: object = None
+    previous_view_layer: object = None
+    root_layer_collection: object = None
+    linked_visible_objects: tuple = ()
 
 
 @contextmanager
@@ -324,22 +407,7 @@ def isolated_import_session(context, target_collection, *, label="Import", visib
     finally:
         # Capture hide state before we move objects out of the temp collection.
         if temp_collection is not None and temp_view_layer is not None:
-            for obj in list(getattr(temp_collection, "all_objects", []) or []):
-                if obj is None or getattr(obj, "name", None) not in bpy.data.objects:
-                    continue
-                try:
-                    obj_id = int(obj.as_pointer())
-                except Exception:
-                    obj_id = id(obj)
-                try:
-                    hidden_state_by_id[obj_id] = bool(obj.hide_get(view_layer=temp_view_layer))
-                except TypeError:
-                    try:
-                        hidden_state_by_id[obj_id] = bool(obj.hide_get())
-                    except Exception:
-                        hidden_state_by_id[obj_id] = bool(getattr(obj, "hide_viewport", False))
-                except Exception:
-                    hidden_state_by_id[obj_id] = bool(getattr(obj, "hide_viewport", False))
+            hidden_state_by_id = _capture_hidden_state_for_collection(temp_collection, temp_view_layer)
 
         # Move newly imported objects into the real target collection before the
         # temporary collection is deleted.
@@ -366,25 +434,7 @@ def isolated_import_session(context, target_collection, *, label="Import", visib
 
         # Re-apply the hide state that objects had inside the isolated layer.
         if previous_view_layer is not None and moved_objects:
-            for obj in moved_objects:
-                if obj is None or getattr(obj, "name", None) not in bpy.data.objects:
-                    continue
-                try:
-                    obj_id = int(obj.as_pointer())
-                except Exception:
-                    obj_id = id(obj)
-                hidden = hidden_state_by_id.get(obj_id)
-                if hidden is None:
-                    continue
-                try:
-                    obj.hide_set(hidden, view_layer=previous_view_layer)
-                except TypeError:
-                    try:
-                        obj.hide_set(hidden)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+            _restore_hidden_state_for_objects(moved_objects, hidden_state_by_id, previous_view_layer)
 
         # Clean up the temporary layer and collection tree.
         if temp_view_layer is not None:
@@ -394,14 +444,168 @@ def isolated_import_session(context, target_collection, *, label="Import", visib
             except Exception:
                 pass
         if temp_collection is not None:
-            for child_collection in reversed(list(_iter_collection_descendants(temp_collection))):
-                try:
-                    if child_collection.name in bpy.data.collections:
-                        bpy.data.collections.remove(child_collection)
-                except Exception:
-                    pass
+            _cleanup_temp_collection_tree(temp_collection)
+
+
+@contextmanager
+def isolated_import_batch_session(context, *, label="ImportBatch", visible_objects=None, enabled=True):
+    """Open one isolated view layer that can be reused across many imports."""
+    ctx = context or bpy.context
+
+    if not needs_isolation_session(ctx, enabled=enabled):
+        yield ImportIsolationBatchSession(
+            context=ctx,
+            isolated=False,
+        )
+        return
+
+    window = getattr(ctx, "window", None)
+    scene = getattr(ctx, "scene", None)
+    if window is None or scene is None:
+        yield ImportIsolationBatchSession(
+            context=ctx,
+            isolated=False,
+        )
+        return
+
+    temp_root_collection = None
+    temp_view_layer = None
+    root_layer_collection = None
+    previous_view_layer = getattr(window, "view_layer", None)
+    linked_visible_objects = []
+    visible_object_ids = set()
+
+    try:
+        temp_root_collection = bpy.data.collections.new(f"{_IMPORT_PREFIX}{str(label or 'ImportBatch')[:40]}")
+        scene.collection.children.link(temp_root_collection)
+
+        temp_view_layer = scene.view_layers.new(f"{_IMPORT_PREFIX}{str(label or 'ImportBatch')[:40]}")
+        root_layer_collection = _find_layer_collection_for_collection(
+            getattr(temp_view_layer, "layer_collection", None),
+            temp_root_collection,
+        )
+        if root_layer_collection is None:
+            raise RuntimeError(f"Could not find isolated import layer for '{temp_root_collection.name}'")
+
+        for child_layer_collection in getattr(temp_view_layer.layer_collection, "children", []) or []:
+            child_layer_collection.exclude = (child_layer_collection.collection != temp_root_collection)
+        temp_view_layer.active_layer_collection = root_layer_collection
+
+        for obj in visible_objects or []:
+            if obj is None or getattr(obj, "name", None) not in bpy.data.objects:
+                continue
+            obj_id = _object_identity(obj)
+            if obj_id is not None:
+                visible_object_ids.add(obj_id)
             try:
-                if temp_collection.name in bpy.data.collections:
-                    bpy.data.collections.remove(temp_collection)
+                if temp_root_collection not in obj.users_collection:
+                    temp_root_collection.objects.link(obj)
+                    linked_visible_objects.append(obj)
             except Exception:
                 pass
+
+        for obj in list(getattr(scene.collection, "objects", []) or []):
+            obj_id = _object_identity(obj)
+            if obj_id in visible_object_ids:
+                continue
+            try:
+                obj.hide_set(True, view_layer=temp_view_layer)
+            except TypeError:
+                try:
+                    obj.hide_set(True)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        window.view_layer = temp_view_layer
+
+        yield ImportIsolationBatchSession(
+            context=bpy.context,
+            isolated=True,
+            root_collection=temp_root_collection,
+            view_layer=temp_view_layer,
+            previous_view_layer=previous_view_layer,
+            root_layer_collection=root_layer_collection,
+            linked_visible_objects=tuple(linked_visible_objects),
+        )
+    finally:
+        try:
+            if previous_view_layer is not None and getattr(window, "view_layer", None) != previous_view_layer:
+                window.view_layer = previous_view_layer
+        except Exception:
+            pass
+
+        if temp_view_layer is not None:
+            try:
+                if temp_view_layer.name in [vl.name for vl in scene.view_layers]:
+                    scene.view_layers.remove(temp_view_layer)
+            except Exception:
+                pass
+        if temp_root_collection is not None:
+            _cleanup_temp_collection_tree(temp_root_collection)
+
+
+@contextmanager
+def isolated_batch_import_target(batch_session, target_collection, *, label="ImportTarget"):
+    """Create a cheap per-target isolated import scope inside a batch session."""
+    session = batch_session
+    if session is None or not getattr(session, "isolated", False):
+        yield ImportIsolationSession(
+            context=getattr(session, "context", bpy.context),
+            isolated=False,
+            target_collection=target_collection,
+            final_target_collection=target_collection,
+        )
+        return
+
+    temp_collection = None
+    moved_objects = []
+    hidden_state_by_id = {}
+
+    try:
+        temp_collection = bpy.data.collections.new(f"{_IMPORT_PREFIX}{str(label or 'ImportTarget')[:40]}")
+        session.root_collection.children.link(temp_collection)
+        target_layer_collection = _find_layer_collection_for_collection(
+            getattr(session.view_layer, "layer_collection", None),
+            temp_collection,
+        )
+        if target_layer_collection is None:
+            raise RuntimeError(f"Could not find isolated import layer for '{temp_collection.name}'")
+        session.view_layer.active_layer_collection = target_layer_collection
+
+        yield ImportIsolationSession(
+            context=bpy.context,
+            isolated=True,
+            target_collection=temp_collection,
+            final_target_collection=target_collection,
+        )
+    finally:
+        if temp_collection is not None and session.view_layer is not None:
+            hidden_state_by_id = _capture_hidden_state_for_collection(temp_collection, session.view_layer)
+
+        if temp_collection is not None and target_collection is not None:
+            try:
+                moved_objects = _move_temp_objects_to_target(
+                    temp_collection,
+                    target_collection,
+                    skip_objects=session.linked_visible_objects,
+                )
+            except Exception:
+                log.warning(
+                    "Failed to move batched isolated import objects back to '%s'",
+                    getattr(target_collection, "name", "?"),
+                    exc_info=True,
+                )
+
+        if session.previous_view_layer is not None and moved_objects:
+            _restore_hidden_state_for_objects(moved_objects, hidden_state_by_id, session.previous_view_layer)
+
+        if session.view_layer is not None and session.root_layer_collection is not None:
+            try:
+                session.view_layer.active_layer_collection = session.root_layer_collection
+            except Exception:
+                pass
+
+        if temp_collection is not None:
+            _cleanup_temp_collection_tree(temp_collection)

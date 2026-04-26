@@ -8,11 +8,21 @@ from typing import List, Tuple, Dict
 from bpy.types import Operator, Object
 
 import bpy, os, sys
+import time
 from math import pi
 
 from .w3_material import load_w3_materials_XML
 
 log = logging.getLogger(__name__)
+
+_FBX_PROFILE_ENABLED = True
+_FBX_PROFILE_WARN_THRESHOLD = 0.25
+
+
+def _log_fbx_profile_warning(message, *args):
+    if not _FBX_PROFILE_ENABLED:
+        return
+    log.info("[mesh-import-profile] " + str(message), *args)
 
 def enable_print(bool):
     """For suppressing prints from fbx importer and remove_doubles()."""
@@ -62,6 +72,7 @@ def import_w3_fbx(context
         ,fix_armature = True
         ,force_mat_update = False
     ) -> Tuple[List[Object], List[Object]]:
+    fbx_started = time.perf_counter()
     if not filepath.endswith(".fbx"):
         return ([], [])
     
@@ -72,6 +83,7 @@ def import_w3_fbx(context
     filename = filepath.split("\\")[-1].split(".")[0]
     enable_print(False)
     # Small note: The imported objects automatically became selected on import.
+    op_started = time.perf_counter()
     bpy.ops.import_scene.fbx(
         filepath = filepath
         ,use_image_search = False
@@ -80,6 +92,7 @@ def import_w3_fbx(context
         ,do_UV_fix = False
         #,use_custom_props = False
     )
+    fbx_op_seconds = time.perf_counter() - op_started
     enable_print(True)
     obj_name = filename
 
@@ -95,6 +108,7 @@ def import_w3_fbx(context
 
     armatures = []
     meshes = []
+    material_total_seconds = 0.0
     for o in context.selected_objects[:]:
         bpy.ops.object.select_all(action='DESELECT')
         assert o.type != 'EMPTY', "You didn't fix import_fbx.py"
@@ -121,7 +135,17 @@ def import_w3_fbx(context
             xml_path = filepath.replace(".fbx", ".xml")
             xml_path = xml_path.replace("_CONVERT_","")
             try:
+                material_started = time.perf_counter()
                 load_w3_materials_XML(o, uncook_path, xml_path, force_mat_update=force_mat_update)
+                material_seconds = time.perf_counter() - material_started
+                material_total_seconds += material_seconds
+                if material_seconds >= _FBX_PROFILE_WARN_THRESHOLD:
+                    _log_fbx_profile_warning(
+                        "fbx object materials %s total %.3fs (xml %s)",
+                        o.name,
+                        material_seconds,
+                        os.path.basename(xml_path),
+                    )
             except ValueError as err:
                 log.warning("Problem loading material in fbx importer: %s", err.reason)
             if len(o.data.vertices) == 0:
@@ -145,9 +169,11 @@ def import_w3_fbx(context
             o['repo_path'] = final_path.replace(".fbx", ".w2mesh")
 
     # Apply transforms. (Armatures have a scale of 0.1 for some reason)
+    transform_started = time.perf_counter()
     for o in armatures+meshes:
         o.select_set(True)
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+    transform_seconds = time.perf_counter() - transform_started
 
     # for o in reversed(meshes):
     #     if "lod1" in o.name or \
@@ -166,6 +192,19 @@ def import_w3_fbx(context
             obj.select_set(True)
     if saved_active and saved_active.name in bpy.data.objects:
         context.view_layer.objects.active = saved_active
+
+    total_seconds = time.perf_counter() - fbx_started
+    if total_seconds >= _FBX_PROFILE_WARN_THRESHOLD:
+        _log_fbx_profile_warning(
+            "fbx import %s total %.3fs (fbx op %.3fs, materials %.3fs, transform %.3fs, meshes %d, armatures %d)",
+            os.path.basename(filepath),
+            total_seconds,
+            fbx_op_seconds,
+            material_total_seconds,
+            transform_seconds,
+            len(meshes),
+            len(armatures),
+        )
     
     return (meshes, armatures)
 

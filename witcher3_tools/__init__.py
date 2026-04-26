@@ -364,6 +364,10 @@ from .ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_w2w,
                                      WITCH_OT_load_layer,
                                      WITCH_OT_load_layer_group,
+                                     WITCH_OT_cancel_layer_stream_job,
+                                     WITCH_OT_load_layers_around_camera,
+                                     WITCH_OT_rebuild_layer_scan_cache,
+                                     WITCH_OT_scan_layers_nearby,
                                      WITCH_OT_radish_w2L,
                                      WITCH_OT_export_textures)
 from .ui import ui_anims
@@ -2715,6 +2719,56 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
             else:
                 col.label(text="No active collection", icon='INFO')
 
+        if scene_settings and hasattr(scene_settings, "terrain_layer_load_radius"):
+            body = section("witcher_terrain_layer_streaming", "Load Layers", 'VIEW_CAMERA', default_closed=True)
+            if body:
+                col = body.column(align=True)
+                ui_map.draw_layer_stream_job_ui(col, context)
+                controls = col.column(align=True)
+                controls.enabled = not ui_map.layer_stream_job_running()
+                range_box = controls.box()
+                range_box.label(text="Range")
+                range_box.prop(scene_settings, "terrain_layer_load_radius", text="Radius (World Units)")
+                range_box.prop(scene_settings, "terrain_layer_max_load_count", text="Load Limit (0 = All)")
+                range_box.prop(scene_settings, "terrain_layer_skip_loaded", text="Skip Complete Layers")
+
+                filter_box = controls.box()
+                filter_box.label(text="Content Filter")
+                filter_col = filter_box.column(align=True)
+                filter_col.prop(scene_settings, "terrain_layer_do_import_mesh", text="Mesh")
+                filter_col.prop(scene_settings, "terrain_layer_do_import_proxy_mesh", text="Proxy Mesh")
+                filter_col.prop(scene_settings, "terrain_layer_do_import_entity", text="Entity")
+                filter_col.prop(scene_settings, "terrain_layer_do_import_redcloth", text="Redcloth")
+                filter_col.prop(scene_settings, "terrain_layer_do_import_collision", text="Collision")
+                filter_col.prop(scene_settings, "terrain_layer_do_import_rigidbody", text="Rigid Body")
+                filter_col.prop(scene_settings, "terrain_layer_do_import_point_light", text="Point Lights")
+                filter_col.prop(scene_settings, "terrain_layer_do_import_spot_light", text="Spot Lights")
+
+                mesh_box = controls.box()
+                mesh_box.label(text="Mesh Settings")
+                mesh_row = mesh_box.row(align=True)
+                mesh_row.prop(scene_settings, "terrain_layer_keep_lod_meshes", text="Keep LODs")
+                mesh_row.prop(scene_settings, "terrain_layer_keep_empty_lods", text="Keep Empty LODs")
+                mesh_box.prop(scene_settings, "terrain_layer_keep_proxy_meshes", text="Keep Proxy Mesh LODs")
+                mesh_box.prop(scene_settings, "terrain_layer_enable_name_filter", text="Enable Regex Filter")
+                regex_row = mesh_box.row(align=True)
+                regex_row.enabled = bool(getattr(scene_settings, "terrain_layer_enable_name_filter", False))
+                regex_row.prop(scene_settings, "terrain_layer_name_filter_regex", text="Regex")
+
+                visibility_box = controls.box()
+                visibility_box.label(text="Post Import Visibility")
+                visibility_box.prop(scene_settings, "terrain_layer_hide_volume_meshes", text="Hide _volume_ Meshes")
+                visibility_box.prop(scene_settings, "terrain_layer_hide_shadow_meshes", text="Hide _shadow_ Meshes")
+
+                controls.prop(scene_settings, "terrain_layer_write_profile_log", text="Write Profile Log")
+                controls.label(text=ui_map.get_camera_position_label(context))
+                scan_row = controls.row(align=True)
+                scan_row.label(text=ui_map.get_nearby_cache_summary_label(context))
+                scan_row.operator("witcher.scan_layers_nearby", text="", icon='VIEWZOOM')
+                row = controls.row(align=True)
+                row.operator("witcher.load_layers_around_camera", text="Load Layers Around Camera", icon='VIEW_CAMERA')
+                row.operator("witcher.rebuild_layer_scan_cache", text="", icon='FILE_REFRESH')
+
         full_map_obj = _resolve_terrain_full_map(context)
         if full_map_obj:
             body = section("witcher_terrain_full_map", "Full Map", 'NODETREE')
@@ -3393,6 +3447,10 @@ _classes = [
     WITCH_OT_ToggleClothSimulation,
     WITCH_OT_load_layer,
     WITCH_OT_load_layer_group,
+    WITCH_OT_cancel_layer_stream_job,
+    WITCH_OT_load_layers_around_camera,
+    WITCH_OT_rebuild_layer_scan_cache,
+    WITCH_OT_scan_layers_nearby,
     WITCH_OT_load_texarray,
     WITCHER_OT_open_external_path,
     WITCHER_OT_open_addon_preferences,
@@ -3448,7 +3506,6 @@ def register():
     ui_morphs.register()
     ui_texture_export.register()
     ui_import_menu.register()
-    #ui_map.register()
     ui_anims.register()
     ui_speech.register()
     ui_scene.register()
@@ -3520,7 +3577,6 @@ def unregister():
         unregister_class(cls)
     ui_import_menu.unregister()
     ui_texture_export.unregister()
-    #ui_map.unregister()
     ui_scene.unregister()
     ui_speech.unregister()
     ui_anims.unregister()
