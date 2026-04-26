@@ -376,13 +376,13 @@ class MySettings(PropertyGroup):
     )
     terrain_layer_do_import_mesh: BoolProperty(
         name="Mesh",
-        description="Import static mesh, foliage, and grass items from nearby layers",
+        description="Import static mesh",
         default=True,
     )
     terrain_layer_do_import_proxy_mesh: BoolProperty(
         name="Proxy Mesh",
         description="Import proxy mesh items from nearby layers",
-        default=False,
+        default=True,
     )
     terrain_layer_do_import_collision: BoolProperty(
         name="Collision",
@@ -412,7 +412,7 @@ class MySettings(PropertyGroup):
     terrain_layer_do_import_redcloth: BoolProperty(
         name="Redcloth",
         description="Import cloth simulation assets",
-        default=False,
+        default=True,
     )
     terrain_layer_keep_lod_meshes: BoolProperty(
         name="Keep LODs",

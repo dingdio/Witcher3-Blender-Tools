@@ -394,9 +394,9 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
     
     def draw(self, context):
         layout = self.layout
-        sections = ["Import Filter", "Settings"]
+        sections = ["Resources to Import", "Settings"]
         section_options = {
-            "Import Filter" : ["do_import_Mesh","do_import_Collision","do_import_RigidBody","do_import_Entity",
+            "Resources to Import" : ["do_import_Mesh","do_import_Collision","do_import_RigidBody","do_import_Entity",
                                "do_import_PointLight", "do_import_SpotLight",],
             "Settings" : [
                         "keep_lod_meshes",

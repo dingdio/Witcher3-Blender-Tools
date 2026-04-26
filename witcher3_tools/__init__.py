@@ -2733,7 +2733,7 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 range_box.prop(scene_settings, "terrain_layer_skip_loaded", text="Skip Complete Layers")
 
                 filter_box = controls.box()
-                filter_box.label(text="Content Filter")
+                filter_box.label(text="Resources to Import")
                 filter_col = filter_box.column(align=True)
                 filter_col.prop(scene_settings, "terrain_layer_do_import_mesh", text="Mesh")
                 filter_col.prop(scene_settings, "terrain_layer_do_import_proxy_mesh", text="Proxy Mesh")
