@@ -2153,6 +2153,16 @@ class W_CLASS:
                 self.PROPS.append(prop)
             self.sceneEventElements = CArray(CR2WFILE, CVariantSizeType)
             self.sceneEventElements.Read(f, 0)
+        elif currentClass == "CFoliageResource":
+            while True:
+                prop = PROPERTY(f, CR2WFILE, self)
+                if prop.Type is None:
+                    break
+                self.PROPS.append(prop)
+            self.Trees = CBufferVLQInt32(CR2WFILE, SFoliageResourceData)
+            self.Trees.Read(f, 0)
+            self.Grasses = CBufferVLQInt32(CR2WFILE, SFoliageResourceData)
+            self.Grasses.Read(f, 0)
         elif currentClass == "CMesh":
             while True:
                 prop = PROPERTY(f, CR2WFILE, self)

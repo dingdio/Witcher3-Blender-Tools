@@ -227,6 +227,11 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
         description="Rotate both the mesh and the armature on the Z-axis by 180°. Default is False",
         default=False
     )
+    do_import_collision: BoolProperty(
+        name="Import Collision",
+        description="Import collision shapes. For uncooked meshes the embedded collision is used; for cooked meshes the .nxs file is loaded from the collision cache with per-shape pose transforms applied",
+        default=False
+    )
     def invoke(self, context, event):
         """Invoke."""
         MeshImportSettings.from_addon_prefs(get_all_addon_prefs(context)).apply_to(self)
@@ -246,7 +251,8 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
                         "keep_empty_lods",
                         #"do_merge_normals",
                         "rotate_180",
-                        "hide_zero_weight_faces"]
+                        "hide_zero_weight_faces",
+                        "do_import_collision"]
         }
         for section in sections:
             row = layout.row()

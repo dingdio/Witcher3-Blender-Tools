@@ -33,7 +33,9 @@ from ..exporters import export_radish
 _LEVEL_FILE_CACHE = {}
 _WORLD_LAYER_INDEX_CACHE = {}
 _WORLD_LAYER_RUNTIME_CACHE = {}
-_WORLD_LAYER_SCAN_CACHE_VERSION = 4
+_LAYER_VISIBILITY_CACHE = {}
+_DEFAULT_HIDDEN_GROUP_CACHE = {}
+_WORLD_LAYER_SCAN_CACHE_VERSION = 5
 _WORLD_LAYER_SPATIAL_CELL_SIZE = 10.0
 _LAYER_SCAN_BATCH_SIZE = 16
 _LAYER_LOAD_BATCH_SIZE = 8
@@ -69,6 +71,13 @@ _LAYER_QUERY_FILTER_KINDS = frozenset({
     "entity",
     "entity_template",
 })
+_LAYER_VIS_REASON_BITS = {
+    "volume": 1 << 0,
+    "shadow": 1 << 1,
+    "collision": 1 << 2,
+    "engine_hidden": 1 << 3,
+    "proxy": 1 << 4,
+}
 def _layer_import_kwargs_from_scene(scene_settings):
     return {
         "do_import_Mesh": bool(getattr(scene_settings, "terrain_layer_do_import_mesh", True)),
@@ -84,6 +93,17 @@ def _layer_import_kwargs_from_scene(scene_settings):
         "keep_proxy_meshes": bool(getattr(scene_settings, "terrain_layer_keep_proxy_meshes", True)),
         "do_enable_name_filter": bool(getattr(scene_settings, "terrain_layer_enable_name_filter", False)),
         "do_name_filter_regex": str(getattr(scene_settings, "terrain_layer_name_filter_regex", "") or ""),
+        "instanced_sector": bool(getattr(scene_settings, "terrain_layer_instanced_sector", False)),
+        "hide_engine_hidden_meshes": bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True)),
+        "solo_engine_hidden_meshes": bool(getattr(scene_settings, "terrain_layer_solo_engine_hidden_meshes", False)),
+        "hide_proxy_meshes": bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False)),
+        "solo_proxy_meshes": bool(getattr(scene_settings, "terrain_layer_solo_proxy_meshes", False)),
+        "hide_collision": bool(getattr(scene_settings, "terrain_layer_hide_collision", False)),
+        "solo_collision": bool(getattr(scene_settings, "terrain_layer_solo_collision", False)),
+        "hide_volume_meshes": bool(getattr(scene_settings, "terrain_layer_hide_volume_meshes", False)),
+        "solo_volume_meshes": bool(getattr(scene_settings, "terrain_layer_solo_volume_meshes", False)),
+        "hide_shadow_meshes": bool(getattr(scene_settings, "terrain_layer_hide_shadow_meshes", False)),
+        "solo_shadow_meshes": bool(getattr(scene_settings, "terrain_layer_solo_shadow_meshes", False)),
     }
 
 
@@ -121,6 +141,7 @@ def _layer_load_mode_signature_for_scene(scene_settings):
         f";lods={int(settings.get('keep_lod_meshes', False))}"
         f";empty_lods={int(settings.get('keep_empty_lods', False))}"
         f";proxy={int(settings.get('keep_proxy_meshes', True))}"
+        f";instanced={int(settings.get('instanced_sector', False))}"
         f";regex={regex}"
     )
 
@@ -381,6 +402,11 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
         default=True,
         description="If enabled, it will always keep any proxy meshes regardless of lod"
     )
+    instanced_sector: BoolProperty(
+        name="Instance Repeated Meshes",
+        default=False,
+        description="Group identical CSectorData mesh placements into a single instancer object instead of one object per placement. Greatly reduces object count for dense static layers (rocks, cliffs, debris). Individual selection is not possible for instanced meshes."
+    )
     do_enable_name_filter: BoolProperty(
         name="Enable Regex Filter",
         default=False,
@@ -399,6 +425,7 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
             "Resources to Import" : ["do_import_Mesh","do_import_Collision","do_import_RigidBody","do_import_Entity",
                                "do_import_PointLight", "do_import_SpotLight",],
             "Settings" : [
+                        "instanced_sector",
                         "keep_lod_meshes",
                         "keep_empty_lods",
                         "keep_proxy_meshes",
@@ -442,7 +469,9 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
                                         do_import_SpotLight = self.do_import_SpotLight,
                                         do_enable_name_filter = self.do_enable_name_filter,
                                         do_name_filter_regex = self.do_name_filter_regex,
+                                        instanced_sector = self.instanced_sector,
                                         )
+            apply_layer_visibility_settings(context)
         else:
             log.warn('Did not select .w2l')
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
@@ -813,6 +842,54 @@ def _find_world_root_collection(context):
                     return collection
 
     return _find_world_root_collection_for_collection(getattr(context, "collection", None))
+
+
+def _collection_has_imported_layer_objects(collection):
+    if collection is None:
+        return False
+    try:
+        if str(collection.get("level_path", "") or "").strip():
+            return True
+        if str(collection.get("group_type", "") or "").strip() in {"LayerInfo", "LayerGroup"}:
+            return True
+    except Exception:
+        pass
+    for obj in list(getattr(collection, "all_objects", []) or []):
+        try:
+            if _layer_visibility_is_imported_layer_object(obj):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _resolve_layer_visibility_root_collection(context):
+    root_collection = _find_world_root_collection(context)
+    if root_collection is not None:
+        return root_collection
+
+    candidate_objects = []
+    active_object = getattr(context, "active_object", None)
+    if active_object is not None:
+        candidate_objects.append(active_object)
+    for obj in getattr(context, "selected_objects", []) or []:
+        if obj is not None and obj != active_object:
+            candidate_objects.append(obj)
+
+    for obj in candidate_objects:
+        for collection in getattr(obj, "users_collection", []) or []:
+            if _collection_has_imported_layer_objects(collection):
+                return collection
+            parent = _find_parent_collection(collection)
+            while parent is not None:
+                if _collection_has_imported_layer_objects(parent):
+                    return parent
+                parent = _find_parent_collection(parent)
+
+    context_collection = getattr(context, "collection", None)
+    if _collection_has_imported_layer_objects(context_collection):
+        return context_collection
+    return None
 
 
 def _iter_layer_info_collections(root_collection):
@@ -3639,6 +3716,8 @@ def _finish_layer_stream_job(operator, context, cancelled=False, failed=False):
     if job.get("phase") == "load" and not failed:
         _apply_layer_post_import_visibility(job, context)
 
+    _restore_default_hidden_layer_groups(context)
+
     if failed:
         message = job.get("error", "") or "Layer scan/load failed."
         level = 'ERROR'
@@ -3760,7 +3839,13 @@ def _layer_should_skip_for_load(collection, camera_position, radius, mode_signat
 def _layer_visibility_token_name(obj):
     name = str(getattr(obj, "name", "") or "").lower().replace(".", "_")
     data_name = str(getattr(getattr(obj, "data", None), "name", "") or "").lower().replace(".", "_")
-    return f"_{name}_{data_name}_"
+    repo_path = ""
+    try:
+        if bool(obj.get("_is_sector_instancer", False)):
+            repo_path = str(obj.get("repo_path", "") or "").lower().replace(".", "_").replace("/", "_").replace("\\", "_")
+    except Exception:
+        repo_path = ""
+    return f"_{name}_{data_name}_{repo_path}_"
 
 
 def _layer_visibility_is_volume_mesh(obj):
@@ -3773,35 +3858,457 @@ def _layer_visibility_is_shadow_mesh(obj):
     return "_shadow_" in token_name or "shadowmesh" in compact_name
 
 
-def _apply_layer_post_import_visibility(job, context):
-    hide_volume = bool((job or {}).get("hide_volume_meshes"))
-    hide_shadow = bool((job or {}).get("hide_shadow_meshes"))
-    if not hide_volume and not hide_shadow:
-        return 0
-    root_collection = bpy.data.collections.get(str((job or {}).get("root_collection_name", "") or ""))
-    if root_collection is None:
-        root_collection = _find_world_root_collection(context)
-    if root_collection is None:
-        return 0
-    hidden_count = 0
-    for obj in list(getattr(root_collection, "all_objects", []) or []):
-        if getattr(obj, "type", "") != 'MESH':
-            continue
-        should_hide = (
-            (hide_volume and _layer_visibility_is_volume_mesh(obj))
-            or (hide_shadow and _layer_visibility_is_shadow_mesh(obj))
-        )
-        if not should_hide:
-            continue
+def _object_or_parent_matches(obj, predicate):
+    current = obj
+    while current is not None:
         try:
-            obj.hide_viewport = True
-            obj.hide_render = True
-            hidden_count += 1
+            if predicate(current):
+                return True
         except Exception:
             pass
-    if hidden_count:
-        _log_layer_load_timing_warning("post-import visibility hid %d mesh object(s)", hidden_count)
-    return hidden_count
+        current = getattr(current, "parent", None)
+    return False
+
+
+def _layer_visibility_is_collision_object(obj):
+    def is_collision_marker(candidate):
+        try:
+            if str(candidate.get("witcher_layer_visibility_kind", "") or "").strip().lower() == "collision":
+                return True
+            if str(candidate.get("witcher_cached_plan_kind", "") or "").strip().lower() == "collision":
+                return True
+            repo_path = str(candidate.get("repo_path", "") or "").strip().lower()
+            if repo_path.endswith(".nxs"):
+                return True
+        except Exception:
+            pass
+        return str(getattr(candidate, "name", "") or "").strip().lower() == "collision"
+
+    return _object_or_parent_matches(obj, is_collision_marker)
+
+
+def _layer_visibility_is_engine_hidden_object(obj):
+    def is_engine_hidden_marker(candidate):
+        try:
+            value = candidate.get("witcher_layer_engine_visible", None)
+            if value is not None:
+                return not bool(value)
+        except Exception:
+            pass
+        return False
+
+    if _object_or_parent_matches(obj, is_engine_hidden_marker):
+        return True
+    if getattr(obj, "type", "") != 'EMPTY':
+        return False
+
+    child_values = []
+    for child in list(getattr(obj, "children_recursive", []) or []):
+        try:
+            value = child.get("witcher_layer_engine_visible", None)
+            drawable_visible = child.get("witcher_drawableFlags_has_DF_IsVisible", None)
+        except Exception:
+            value = None
+            drawable_visible = None
+        if value is not None:
+            child_values.append(bool(value))
+        elif drawable_visible is not None:
+            child_values.append(bool(drawable_visible))
+    return bool(child_values) and not any(child_values)
+
+
+def _layer_visibility_is_proxy_mesh_object(obj):
+    def is_proxy_marker(candidate):
+        try:
+            if bool(candidate.get("witcher_layer_proxy_mesh", False)):
+                return True
+            if str(candidate.get("witcher_layer_visibility_kind", "") or "").strip().lower() == "proxy_mesh":
+                return True
+            repo_path = str(candidate.get("repo_path", "") or candidate.get("witcher_dev_source_path", "") or "").strip().lower()
+            if repo_path and "proxy" in repo_path.replace("\\", "/"):
+                return True
+        except Exception:
+            pass
+        name = str(getattr(candidate, "name", "") or "").strip().lower()
+        return "_proxy" in name or name.endswith("_proxy") or "proxy" in name
+
+    return _object_or_parent_matches(obj, is_proxy_marker)
+
+
+def _layer_visibility_is_imported_layer_object(obj):
+    def is_layer_marker(candidate):
+        try:
+            for key in (
+                "witcher_layer_owner",
+                "witcher_layer_generation",
+                "witcher_layer_visibility_kind",
+                "witcher_cached_plan_kind",
+                "witcher_layer_engine_visible",
+                "witcher_sector_flags",
+                "repo_path",
+                "_is_sector_instancer",
+            ):
+                value = candidate.get(key, None)
+                if value is not None and str(value) != "":
+                    return True
+        except Exception:
+            pass
+        return False
+
+    return _object_or_parent_matches(obj, is_layer_marker)
+
+
+def _layer_visibility_reasons(obj):
+    reasons = set()
+    if getattr(obj, "type", "") == 'MESH':
+        if _layer_visibility_is_volume_mesh(obj):
+            reasons.add("volume")
+        if _layer_visibility_is_shadow_mesh(obj):
+            reasons.add("shadow")
+        if _layer_visibility_is_proxy_mesh_object(obj):
+            reasons.add("proxy")
+    if _layer_visibility_is_collision_object(obj):
+        reasons.add("collision")
+    if _layer_visibility_is_engine_hidden_object(obj):
+        reasons.add("engine_hidden")
+    return reasons
+
+
+def _layer_visibility_reason_mask(reasons):
+    mask = 0
+    for reason in reasons:
+        mask |= _LAYER_VIS_REASON_BITS.get(reason, 0)
+    return mask
+
+
+def _layer_visibility_cache_key(root_collection):
+    try:
+        return int(root_collection.as_pointer())
+    except Exception:
+        return str(getattr(root_collection, "name_full", None) or getattr(root_collection, "name", ""))
+
+
+def _layer_visibility_cache_signature(root_collection):
+    try:
+        object_count = len(root_collection.all_objects)
+    except Exception:
+        object_count = 0
+    return (object_count, str(getattr(root_collection, "name_full", "") or getattr(root_collection, "name", "")))
+
+
+def invalidate_layer_visibility_cache(root_collection=None):
+    if root_collection is None:
+        _LAYER_VISIBILITY_CACHE.clear()
+        _DEFAULT_HIDDEN_GROUP_CACHE.clear()
+        return
+    key = _layer_visibility_cache_key(root_collection)
+    _LAYER_VISIBILITY_CACHE.pop(key, None)
+    _DEFAULT_HIDDEN_GROUP_CACHE.pop(key, None)
+
+
+def _get_layer_visibility_cache(root_collection):
+    key = _layer_visibility_cache_key(root_collection)
+    signature = _layer_visibility_cache_signature(root_collection)
+    cached = _LAYER_VISIBILITY_CACHE.get(key)
+    if cached and cached.get("signature") == signature:
+        return cached
+
+    entries = []
+    for obj in list(getattr(root_collection, "all_objects", []) or []):
+        obj_type = getattr(obj, "type", "")
+        if obj_type not in {'MESH', 'EMPTY', 'LIGHT'}:
+            continue
+        reasons = _layer_visibility_reasons(obj)
+        is_empty = obj_type == 'EMPTY'
+        is_layer_object = _layer_visibility_is_imported_layer_object(obj)
+        try:
+            was_solo_hidden = (
+                bool(obj.get("witcher_layer_solo_hidden", False))
+                or bool(obj.get("witcher_layer_solo_proxy_hidden", False))
+            )
+        except Exception:
+            was_solo_hidden = False
+        entry = {
+            "obj": obj,
+            "reason_mask": _layer_visibility_reason_mask(reasons),
+            "is_empty": is_empty,
+            "is_layer_object": is_layer_object,
+            "was_solo_hidden": was_solo_hidden,
+        }
+        if entry["reason_mask"] or is_layer_object or was_solo_hidden:
+            entries.append(entry)
+
+    cached = {
+        "signature": signature,
+        "entries": entries,
+    }
+    _LAYER_VISIBILITY_CACHE[key] = cached
+    return cached
+
+
+def _update_entry_solo_marker(entry, should_hide, solo_active):
+    obj = entry["obj"]
+    was_solo_hidden = bool(entry.get("was_solo_hidden", False))
+    try:
+        if not entry["is_empty"]:
+            if solo_active and should_hide:
+                obj["witcher_layer_solo_hidden"] = True
+                entry["was_solo_hidden"] = True
+            elif was_solo_hidden:
+                try:
+                    del obj["witcher_layer_solo_hidden"]
+                except Exception:
+                    obj["witcher_layer_solo_hidden"] = False
+                try:
+                    del obj["witcher_layer_solo_proxy_hidden"]
+                except Exception:
+                    obj["witcher_layer_solo_proxy_hidden"] = False
+                entry["was_solo_hidden"] = False
+    except Exception:
+        pass
+
+
+def _apply_layer_object_visibility_rules(
+    context,
+    hide_volume=False,
+    hide_shadow=False,
+    hide_collision=False,
+    hide_engine_hidden=False,
+    hide_proxy=False,
+    solo_volume=False,
+    solo_shadow=False,
+    solo_collision=False,
+    solo_engine_hidden=False,
+    solo_proxy=False,
+    root_collection=None,
+):
+    if root_collection is None:
+        root_collection = _resolve_layer_visibility_root_collection(context)
+    if root_collection is None:
+        return 0
+    hide_reasons = {
+        "volume": bool(hide_volume),
+        "shadow": bool(hide_shadow),
+        "collision": bool(hide_collision),
+        "engine_hidden": bool(hide_engine_hidden),
+        "proxy": bool(hide_proxy),
+    }
+    solo_reasons = {
+        reason
+        for reason, enabled in {
+            "volume": bool(solo_volume),
+            "shadow": bool(solo_shadow),
+            "collision": bool(solo_collision),
+            "engine_hidden": bool(solo_engine_hidden),
+            "proxy": bool(solo_proxy),
+        }.items()
+        if enabled
+    }
+    hide_mask = 0
+    for reason, enabled in hide_reasons.items():
+        if enabled:
+            hide_mask |= _LAYER_VIS_REASON_BITS.get(reason, 0)
+    solo_mask = _layer_visibility_reason_mask(solo_reasons)
+    changed_count = 0
+    cached = _get_layer_visibility_cache(root_collection)
+    entries = cached["entries"]
+    for entry in entries:
+        obj = entry["obj"]
+        reason_mask = int(entry["reason_mask"])
+        if not reason_mask and not (solo_mask and entry["is_layer_object"] and not entry["is_empty"]) and not entry.get("was_solo_hidden", False):
+            continue
+        if solo_mask and entry["is_layer_object"]:
+            should_hide = not bool(reason_mask & solo_mask) if (reason_mask or not entry["is_empty"]) else False
+        else:
+            should_hide = bool(reason_mask & hide_mask)
+        try:
+            _update_entry_solo_marker(entry, should_hide, bool(solo_mask))
+            if bool(obj.hide_viewport) != should_hide or bool(obj.hide_render) != should_hide:
+                obj.hide_viewport = should_hide
+                obj.hide_render = should_hide
+                changed_count += 1
+        except Exception:
+            pass
+    if changed_count:
+        _log_layer_load_timing_warning("post-import visibility updated %d object(s)", changed_count)
+    return changed_count
+
+
+def _apply_layer_post_import_visibility(job, context):
+    root_collection = bpy.data.collections.get(str((job or {}).get("root_collection_name", "") or ""))
+    return _apply_layer_object_visibility_rules(
+        context,
+        hide_volume=bool((job or {}).get("hide_volume_meshes")),
+        hide_shadow=bool((job or {}).get("hide_shadow_meshes")),
+        hide_collision=bool((job or {}).get("hide_collision")),
+        hide_engine_hidden=bool((job or {}).get("hide_engine_hidden_meshes")),
+        hide_proxy=bool((job or {}).get("hide_proxy_meshes")),
+        solo_volume=bool((job or {}).get("solo_volume_meshes")),
+        solo_shadow=bool((job or {}).get("solo_shadow_meshes")),
+        solo_collision=bool((job or {}).get("solo_collision")),
+        solo_engine_hidden=bool((job or {}).get("solo_engine_hidden_meshes")),
+        solo_proxy=bool((job or {}).get("solo_proxy_meshes")),
+        root_collection=root_collection,
+    )
+
+
+def apply_layer_visibility_settings(context, scene_settings=None):
+    scene = getattr(context, "scene", None) or getattr(bpy.context, "scene", None)
+    if scene_settings is None and scene is not None:
+        scene_settings = getattr(scene, "witcher_file_browser", None)
+    if scene_settings is None:
+        return 0
+    return _apply_layer_object_visibility_rules(
+        context,
+        hide_volume=bool(getattr(scene_settings, "terrain_layer_hide_volume_meshes", False)),
+        hide_shadow=bool(getattr(scene_settings, "terrain_layer_hide_shadow_meshes", False)),
+        hide_collision=bool(getattr(scene_settings, "terrain_layer_hide_collision", False)),
+        hide_engine_hidden=bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True)),
+        hide_proxy=bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False)),
+        solo_volume=bool(getattr(scene_settings, "terrain_layer_solo_volume_meshes", False)),
+        solo_shadow=bool(getattr(scene_settings, "terrain_layer_solo_shadow_meshes", False)),
+        solo_collision=bool(getattr(scene_settings, "terrain_layer_solo_collision", False)),
+        solo_engine_hidden=bool(getattr(scene_settings, "terrain_layer_solo_engine_hidden_meshes", False)),
+        solo_proxy=bool(getattr(scene_settings, "terrain_layer_solo_proxy_meshes", False)),
+    )
+
+
+def _iter_default_hidden_layer_groups(root_collection):
+    """Yield every LayerGroup collection under root_collection whose witcher_visible_on_start == 0."""
+    for child in getattr(root_collection, "children", []):
+        if str(child.get("group_type", "")).strip() == "LayerGroup":
+            if int(child.get("witcher_visible_on_start", 1)) == 0:
+                yield child
+            yield from _iter_default_hidden_layer_groups(child)
+
+
+def _collect_default_hidden_layer_group_ids(root_collection):
+    default_hidden = set()
+    ancestors = set()
+
+    def visit(collection, parent_chain):
+        for child in getattr(collection, "children", []):
+            if str(child.get("group_type", "")).strip() != "LayerGroup":
+                continue
+            child_id = _collection_identity(child)
+            if int(child.get("witcher_visible_on_start", 1)) == 0:
+                default_hidden.add(child_id)
+                ancestors.update(parent_chain)
+            visit(child, parent_chain + [child_id])
+
+    visit(root_collection, [])
+    return default_hidden, ancestors
+
+
+def _iter_layer_groups(root_collection):
+    for child in getattr(root_collection, "children", []):
+        if str(child.get("group_type", "")).strip() == "LayerGroup":
+            yield child
+            yield from _iter_layer_groups(child)
+
+
+def _default_hidden_group_cache_signature(root_collection):
+    group_count = 0
+    for _coll in _iter_layer_groups(root_collection):
+        group_count += 1
+    return (group_count, str(getattr(root_collection, "name_full", "") or getattr(root_collection, "name", "")))
+
+
+def _get_default_hidden_group_cache(root_collection):
+    key = _layer_visibility_cache_key(root_collection)
+    signature = _default_hidden_group_cache_signature(root_collection)
+    cached = _DEFAULT_HIDDEN_GROUP_CACHE.get(key)
+    if cached and cached.get("signature") == signature:
+        return cached
+
+    default_hidden_ids, ancestor_ids = _collect_default_hidden_layer_group_ids(root_collection)
+    groups = []
+    for coll in _iter_layer_groups(root_collection):
+        coll_id = _collection_identity(coll)
+        groups.append((
+            coll,
+            coll_id in default_hidden_ids,
+            coll_id in ancestor_ids,
+        ))
+    cached = {"signature": signature, "groups": groups}
+    _DEFAULT_HIDDEN_GROUP_CACHE[key] = cached
+    return cached
+
+
+def apply_default_hidden_layer_groups(context, hide: bool, solo: bool = False):
+    """Show/hide default-hidden LayerGroup collections in all world roots in the scene."""
+    seen = set()
+    scene = getattr(context, "scene", None) or getattr(bpy.context, "scene", None)
+    if scene is None:
+        return
+    for top_coll in scene.collection.children:
+        if str(top_coll.get("group_type", "")).strip() == "LayerGroup":
+            cached = _get_default_hidden_group_cache(top_coll)
+            for coll, is_default_hidden, is_ancestor in cached["groups"]:
+                coll_id = _collection_identity(coll)
+                if coll_id in seen:
+                    continue
+                seen.add(coll_id)
+                try:
+                    was_solo_hidden = bool(coll.get("witcher_layer_solo_default_hidden", False))
+                except Exception:
+                    was_solo_hidden = False
+                try:
+                    if solo:
+                        should_hide = not (is_default_hidden or is_ancestor)
+                        if should_hide:
+                            coll["witcher_layer_solo_default_hidden"] = True
+                        elif was_solo_hidden:
+                            try:
+                                del coll["witcher_layer_solo_default_hidden"]
+                            except Exception:
+                                coll["witcher_layer_solo_default_hidden"] = False
+                        coll.hide_viewport = should_hide
+                    elif is_default_hidden:
+                        if was_solo_hidden:
+                            try:
+                                del coll["witcher_layer_solo_default_hidden"]
+                            except Exception:
+                                coll["witcher_layer_solo_default_hidden"] = False
+                        coll.hide_viewport = hide
+                    elif was_solo_hidden:
+                        try:
+                            del coll["witcher_layer_solo_default_hidden"]
+                        except Exception:
+                            coll["witcher_layer_solo_default_hidden"] = False
+                        coll.hide_viewport = False
+                except Exception:
+                    pass
+
+
+def _unhide_default_hidden_layer_groups(context):
+    """Temporarily show all default-hidden layer groups (call before any layer import)."""
+    scene = getattr(context, "scene", None) or getattr(bpy.context, "scene", None)
+    if scene is None:
+        return
+    for top_coll in scene.collection.children:
+        if str(top_coll.get("group_type", "")).strip() == "LayerGroup":
+            for coll in _iter_layer_groups(top_coll):
+                try:
+                    if int(coll.get("witcher_visible_on_start", 1)) == 0 or bool(coll.get("witcher_layer_solo_default_hidden", False)):
+                        try:
+                            del coll["witcher_layer_solo_default_hidden"]
+                        except Exception:
+                            coll["witcher_layer_solo_default_hidden"] = False
+                        coll.hide_viewport = False
+                except Exception:
+                    pass
+
+
+def _restore_default_hidden_layer_groups(context):
+    """Re-apply the current toggle state after a layer import finishes."""
+    scene = getattr(context, "scene", None) or getattr(bpy.context, "scene", None)
+    if scene is None:
+        return
+    scene_settings = getattr(scene, "witcher_file_browser", None)
+    hide = bool(getattr(scene_settings, "terrain_layer_hide_default_hidden", False))
+    solo = bool(getattr(scene_settings, "terrain_layer_solo_default_hidden", False))
+    apply_default_hidden_layer_groups(context, hide, solo)
 
 
 def _distance_sq_to_bounds_xy(point_x, point_y, entry):
@@ -4038,16 +4545,21 @@ class WITCH_OT_load_layer_group(bpy.types.Operator):
     def execute(self, context):
         coll = context.collection
         if coll:
-            start_time = time.time()
-            stats = {"imported": 0, "failed": 0, "messages": []}
-            import_group(context, coll, stats)
-            log.info(' Finished importing LayerGroup in %f seconds.', time.time() - start_time)
-            if stats["failed"] > 0:
-                self.report({'WARNING'}, f"Imported {stats['imported']} levels, failed {stats['failed']}")
-                if stats["messages"]:
-                    log.warning(stats["messages"][0])
-            else:
-                self.report({'INFO'}, f"Imported {stats['imported']} levels")
+            _unhide_default_hidden_layer_groups(context)
+            try:
+                start_time = time.time()
+                stats = {"imported": 0, "failed": 0, "messages": []}
+                import_group(context, coll, stats)
+                log.info(' Finished importing LayerGroup in %f seconds.', time.time() - start_time)
+                if stats["failed"] > 0:
+                    self.report({'WARNING'}, f"Imported {stats['imported']} levels, failed {stats['failed']}")
+                    if stats["messages"]:
+                        log.warning(stats["messages"][0])
+                else:
+                    self.report({'INFO'}, f"Imported {stats['imported']} levels")
+            finally:
+                _restore_default_hidden_layer_groups(context)
+                apply_layer_visibility_settings(context)
         else:
             self.report({'WARNING'}, "No active collection")
         return {'FINISHED'}
@@ -4066,7 +4578,12 @@ class WITCH_OT_load_layer(bpy.types.Operator):
         if not coll:
             self.report({'WARNING'}, "No active collection")
             return {'CANCELLED'}
-        ok, resolved, err, _cancelled = _import_level_from_collection(context, coll)
+        _unhide_default_hidden_layer_groups(context)
+        try:
+            ok, resolved, err, _cancelled = _import_level_from_collection(context, coll)
+        finally:
+            _restore_default_hidden_layer_groups(context)
+            apply_layer_visibility_settings(context)
         if not ok:
             self.report({'ERROR'}, err or "Failed to load level")
             return {'CANCELLED'}
@@ -4174,6 +4691,7 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
         import_kwargs = _layer_import_kwargs_from_scene(scene_settings)
         import_filter_active = _layer_import_query_filter_active(scene_settings)
 
+        _unhide_default_hidden_layer_groups(context)
         job = _start_layer_stream_job(context, "load_nearby", root_collection)
         job["radius"] = radius
         job["load_limit"] = load_limit
@@ -4185,6 +4703,14 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
         job["import_filter_active"] = import_filter_active
         job["hide_volume_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_volume_meshes", False))
         job["hide_shadow_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_shadow_meshes", False))
+        job["hide_collision"] = bool(getattr(scene_settings, "terrain_layer_hide_collision", False))
+        job["hide_engine_hidden_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True))
+        job["hide_proxy_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False))
+        job["solo_volume_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_volume_meshes", False))
+        job["solo_shadow_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_shadow_meshes", False))
+        job["solo_collision"] = bool(getattr(scene_settings, "terrain_layer_solo_collision", False))
+        job["solo_engine_hidden_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_engine_hidden_meshes", False))
+        job["solo_proxy_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_proxy_meshes", False))
         job["nearby_load_started_at"] = execute_started
         _log_layer_load_timing_warning(
             "settings radius %.1f limit %d skip_complete %s mesh %s proxy_mesh %s collision %s rigid %s entity %s point %s spot %s redcloth %s lods %s empty_lods %s keep_proxy_lods %s regex_enabled %s regex '%s'",
@@ -4287,3 +4813,367 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
             return _finish_layer_stream_job(self, context, failed=True)
         _maybe_tag_layer_stream_redraw(context, wm=getattr(context, "window_manager", None))
         return {'RUNNING_MODAL'}
+
+
+# ===========================================================================
+# Foliage loading system
+# ===========================================================================
+
+_FOLIAGE_JOB = {
+    "running": False,
+    "cancel_requested": False,
+    "pending_cells": [],
+    "cell_idx": 0,
+    "total": 0,
+    "loaded_count": 0,
+    "instance_count": 0,
+    "foliage_root_name": None,
+    "world_root_name": None,
+    "foliage_dir": None,
+    "wm": None,
+    "timer": None,
+    "error": None,
+}
+
+
+def foliage_job_running() -> bool:
+    return bool(_FOLIAGE_JOB.get("running"))
+
+
+def _start_foliage_job(pending_cells, foliage_root, world_root, foliage_dir: str):
+    _FOLIAGE_JOB.clear()
+    _FOLIAGE_JOB.update({
+        "running": True,
+        "cancel_requested": False,
+        "pending_cells": list(pending_cells),
+        "cell_idx": 0,
+        "total": len(pending_cells),
+        "loaded_count": 0,
+        "instance_count": 0,
+        "foliage_root_name": foliage_root.name,
+        "world_root_name": world_root.name,
+        "foliage_dir": foliage_dir,
+        "wm": None,
+        "timer": None,
+        "error": None,
+    })
+
+
+def _finish_foliage_job(operator, context, cancelled=False, failed=False):
+    wm = _FOLIAGE_JOB.get("wm")
+    timer = _FOLIAGE_JOB.get("timer")
+    if wm is not None and timer is not None:
+        try:
+            wm.event_timer_remove(timer)
+        except Exception:
+            pass
+
+    loaded = int(_FOLIAGE_JOB.get("loaded_count", 0))
+    instances = int(_FOLIAGE_JOB.get("instance_count", 0))
+    error = _FOLIAGE_JOB.get("error")
+
+    _FOLIAGE_JOB.clear()
+    _FOLIAGE_JOB.update({
+        "running": False,
+        "cancel_requested": False,
+        "pending_cells": [],
+        "cell_idx": 0,
+        "total": 0,
+        "loaded_count": 0,
+        "instance_count": 0,
+        "foliage_root_name": None,
+        "world_root_name": None,
+        "foliage_dir": None,
+        "wm": None,
+        "timer": None,
+        "error": None,
+    })
+
+    _tag_layer_stream_redraw(context)
+
+    if failed and error:
+        operator.report({"ERROR"}, f"Foliage load failed: {error}")
+    elif cancelled:
+        operator.report({"INFO"}, f"Foliage load cancelled. Loaded {loaded} cells ({instances:,} instances).")
+    else:
+        operator.report({"INFO"}, f"Foliage load complete. {loaded} cells, {instances:,} instances.")
+
+    return {"FINISHED"}
+
+
+def draw_foliage_job_ui(layout, context) -> None:
+    if not _FOLIAGE_JOB.get("running"):
+        return
+    total = int(_FOLIAGE_JOB.get("total", 0) or 0)
+    current = int(_FOLIAGE_JOB.get("cell_idx", 0) or 0)
+    pct = 100.0 if total <= 0 else (current / total) * 100.0
+    box = layout.box()
+    row = box.row(align=True)
+    row.label(text=f"Loading foliage  {current} / {total}  ({pct:.0f}%)", icon="PARTICLE_DATA")
+    row.operator("witcher.cancel_foliage_job", text="Cancel", icon="CANCEL")
+
+
+def get_foliage_info_label(context) -> str:
+    root_coll = _find_world_root_collection(context)
+    if root_coll is None:
+        return "No world loaded"
+    world_path = str(root_coll.get("world_path", "")).strip()
+    world_name = os.path.splitext(os.path.basename(world_path))[0] if world_path else root_coll.name
+
+    from ..importers import import_foliage as _if
+    foliage_prefix = _if.get_game_rel_foliage_prefix(world_path, context) if world_path else ""
+
+    for child in root_coll.children:
+        if child.get("_is_foliage_root"):
+            cells = _if.count_loaded_cells(child)
+            instances = _if.count_instances(child)
+            total_cells = _if.count_all_foliage_cells(foliage_prefix) if foliage_prefix else 0
+            return f"{world_name}  |  Cells: {cells}/{total_cells}  Instances: {instances:,}"
+
+    if foliage_prefix:
+        total_cells = _if.count_all_foliage_cells(foliage_prefix)
+        return f"{world_name}  |  {total_cells} foliage cells available (none loaded)"
+    return f"{world_name}  |  No foliage loaded"
+
+
+class WITCH_OT_cancel_foliage_job(bpy.types.Operator):
+    bl_idname = "witcher.cancel_foliage_job"
+    bl_label = "Cancel Foliage Job"
+    bl_description = "Cancel the running foliage load job"
+
+    def execute(self, context):
+        if foliage_job_running():
+            _FOLIAGE_JOB["cancel_requested"] = True
+        return {"FINISHED"}
+
+
+class WITCH_OT_load_foliage_around_camera(bpy.types.Operator):
+    bl_idname = "witcher.load_foliage_around_camera"
+    bl_label = "Load Foliage Around Camera"
+    bl_description = "Load foliage cells within the configured radius of the current viewport camera"
+
+    def execute(self, context):
+        if foliage_job_running():
+            self.report({"WARNING"}, "A foliage load job is already running")
+            return {"CANCELLED"}
+        if layer_stream_job_running():
+            self.report({"WARNING"}, "A terrain layer stream job is running; wait for it to finish first")
+            return {"CANCELLED"}
+
+        root_coll = _find_world_root_collection(context)
+        if root_coll is None:
+            self.report({"WARNING"}, "Select imported terrain or a world collection first")
+            return {"CANCELLED"}
+
+        world_path = str(root_coll.get("world_path", "")).strip()
+        if not world_path:
+            self.report({"WARNING"}, "World collection has no world_path property")
+            return {"CANCELLED"}
+
+        camera_pos = _get_camera_position(context)
+        if camera_pos is None:
+            self.report({"WARNING"}, "Could not determine viewport camera position")
+            return {"CANCELLED"}
+
+        if getattr(context, "window", None) is None:
+            self.report({"ERROR"}, "This operator must be started from a Blender window")
+            return {"CANCELLED"}
+
+        from ..importers import import_foliage as _if
+
+        scene_settings = getattr(context.scene, "witcher_file_browser", None)
+        radius = max(1.0, float(getattr(scene_settings, "foliage_load_radius", 200.0)))
+
+        foliage_prefix = _if.get_game_rel_foliage_prefix(world_path, context)
+        all_cells = _if.find_all_flyr_keys_in_bundles(foliage_prefix)
+        if not all_cells:
+            self.report({"WARNING"}, f"No foliage cells found for: {foliage_prefix}")
+            return {"CANCELLED"}
+
+        terrain_size = _if.get_terrain_size_for_world(root_coll)
+        cam_x, cam_y, _cam_z = camera_pos
+
+        foliage_root = _if.get_foliage_root_collection(root_coll)
+        loaded_cells = _if.get_loaded_cells(foliage_root)
+
+        # Build pending list from cells that are in bundles AND in camera radius
+        pending = []
+        for cx, cy in _if.cells_in_radius(cam_x, cam_y, terrain_size, radius):
+            key = _if.cell_key(cx, cy)
+            if key in loaded_cells:
+                continue
+            if key not in all_cells:
+                continue
+            pending.append((key, all_cells[key]))
+
+        if not pending:
+            self.report({"INFO"}, f"No new foliage cells to load in this area (radius {radius:.0f})")
+            return {"FINISHED"}
+
+        _start_foliage_job(pending, foliage_root, root_coll, foliage_prefix)
+
+        wm = context.window_manager
+        _FOLIAGE_JOB["wm"] = wm
+        _FOLIAGE_JOB["timer"] = wm.event_timer_add(0.05, window=context.window)
+        wm.modal_handler_add(self)
+        _tag_layer_stream_redraw(context, wm=wm)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if event.type == "ESC":
+            _FOLIAGE_JOB["cancel_requested"] = True
+            return {"RUNNING_MODAL"}
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        if not foliage_job_running():
+            return _finish_foliage_job(self, context)
+        if _FOLIAGE_JOB.get("cancel_requested"):
+            return _finish_foliage_job(self, context, cancelled=True)
+
+        try:
+            idx = int(_FOLIAGE_JOB.get("cell_idx", 0))
+            pending = _FOLIAGE_JOB.get("pending_cells", [])
+            if idx >= len(pending):
+                return _finish_foliage_job(self, context)
+
+            key, flyr_path = pending[idx]
+            _FOLIAGE_JOB["cell_idx"] = idx + 1
+
+            foliage_root_name = _FOLIAGE_JOB.get("foliage_root_name")
+            foliage_root = bpy.data.collections.get(foliage_root_name) if foliage_root_name else None
+            if foliage_root is None:
+                _FOLIAGE_JOB["error"] = "Foliage root collection was removed during loading"
+                return _finish_foliage_job(self, context, failed=True)
+
+            from ..importers import import_foliage as _if
+            success, n = _if.load_foliage_cell(flyr_path, foliage_root, context)
+            if success:
+                _if.mark_cell_loaded(foliage_root, key)
+                _FOLIAGE_JOB["loaded_count"] = int(_FOLIAGE_JOB.get("loaded_count", 0)) + 1
+                _FOLIAGE_JOB["instance_count"] = int(_FOLIAGE_JOB.get("instance_count", 0)) + n
+            else:
+                log.warning("Skipping failed foliage cell without marking loaded: %s", flyr_path)
+
+            if idx + 1 >= len(pending):
+                return _finish_foliage_job(self, context)
+        except Exception as exc:
+            log.exception("Foliage load job failed")
+            _FOLIAGE_JOB["error"] = str(exc)
+            return _finish_foliage_job(self, context, failed=True)
+
+        _maybe_tag_layer_stream_redraw(context, wm=getattr(context, "window_manager", None))
+        return {"RUNNING_MODAL"}
+
+
+class WITCH_OT_toggle_foliage_visibility(bpy.types.Operator):
+    bl_idname = "witcher.toggle_foliage_visibility"
+    bl_label = "Toggle Foliage Visibility"
+    bl_description = "Show or hide the loaded foliage collection"
+
+    def execute(self, context):
+        root_coll = _find_world_root_collection(context)
+        if root_coll is None:
+            self.report({"WARNING"}, "No world collection found")
+            return {"CANCELLED"}
+        for child in root_coll.children:
+            if child.get("_is_foliage_root"):
+                from ..importers import import_foliage as _if
+                _if.toggle_foliage_visibility(child)
+                state = "hidden" if child.hide_viewport else "visible"
+                self.report({"INFO"}, f"Foliage is now {state}")
+                return {"FINISHED"}
+        self.report({"INFO"}, "No foliage loaded")
+        return {"CANCELLED"}
+
+
+class WITCH_OT_unload_foliage(bpy.types.Operator):
+    bl_idname = "witcher.unload_foliage"
+    bl_label = "Unload All Foliage"
+    bl_description = "Remove all loaded foliage instances and mesh data from the scene"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        root_coll = _find_world_root_collection(context)
+        if root_coll is None:
+            self.report({"WARNING"}, "No world collection found")
+            return {"CANCELLED"}
+        for child in list(root_coll.children):
+            if child.get("_is_foliage_root"):
+                from ..importers import import_foliage as _if
+                _if.unload_foliage(child)
+                self.report({"INFO"}, "Foliage unloaded")
+                return {"FINISHED"}
+        self.report({"INFO"}, "No foliage to unload")
+        return {"CANCELLED"}
+
+
+class WITCH_OT_open_foliage_browser(bpy.types.Operator):
+    bl_idname = "witcher.open_foliage_browser"
+    bl_label = "Browse in Asset Browser"
+    bl_description = "Navigate the Witcher Asset Browser to the source_foliage folder for the current world"
+
+    def execute(self, context):
+        root_coll = _find_world_root_collection(context)
+        if root_coll is None:
+            self.report({"WARNING"}, "No world collection found")
+            return {"CANCELLED"}
+        world_path = str(root_coll.get("world_path", "")).strip()
+        if not world_path:
+            self.report({"WARNING"}, "World collection has no world_path property")
+            return {"CANCELLED"}
+
+        from ..importers import import_foliage as _if
+        foliage_prefix = _if.get_game_rel_foliage_prefix(world_path, context)
+        if not foliage_prefix:
+            self.report({"WARNING"}, "Could not determine foliage path")
+            return {"CANCELLED"}
+
+        try:
+            from ..ui.ui_file_browser import _navigate_browser_to_location
+            _navigate_browser_to_location(context, "Bundle", foliage_prefix)
+            self.report({"INFO"}, f"Navigated to: {foliage_prefix}")
+        except Exception as e:
+            log.warning("Could not navigate asset browser: %s", e)
+            self.report({"WARNING"}, f"Could not open asset browser: {e}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class WITCH_OT_check_foliage_world(bpy.types.Operator):
+    bl_idname = "witcher.check_foliage_world"
+    bl_label = "Check Foliage World"
+    bl_description = "Print the current world name and foliage statistics to the Info log"
+
+    def execute(self, context):
+        root_coll = _find_world_root_collection(context)
+        if root_coll is None:
+            self.report({"WARNING"}, "No world collection found")
+            return {"CANCELLED"}
+
+        world_path = str(root_coll.get("world_path", "")).strip()
+        world_name = os.path.splitext(os.path.basename(world_path))[0] if world_path else root_coll.name
+
+        from ..importers import import_foliage as _if
+
+        foliage_prefix = _if.get_game_rel_foliage_prefix(world_path, context) if world_path else ""
+        terrain_size = _if.get_terrain_size_for_world(root_coll)
+        total_cells = _if.count_all_foliage_cells(foliage_prefix) if foliage_prefix else 0
+
+        loaded_cells = 0
+        loaded_instances = 0
+        for child in root_coll.children:
+            if child.get("_is_foliage_root"):
+                loaded_cells = _if.count_loaded_cells(child)
+                loaded_instances = _if.count_instances(child)
+                break
+
+        msg = (
+            f"World: {world_name}  |  Terrain: {terrain_size:.0f}  |  "
+            f"Foliage cells: {loaded_cells}/{total_cells}  |  Instances: {loaded_instances:,}  |  "
+            f"Foliage path: {foliage_prefix}"
+        )
+        self.report({"INFO"}, msg)
+        log.info(msg)
+        return {"FINISHED"}

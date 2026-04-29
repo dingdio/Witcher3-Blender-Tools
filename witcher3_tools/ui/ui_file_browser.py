@@ -46,6 +46,26 @@ from .browser_dummy_icons import (
 )
 from . import asset_browser_import_bridge
 from bpy.props import IntProperty, StringProperty
+
+
+def _update_hide_default_hidden(self, context):
+    try:
+        from ..ui import ui_map
+        ui_map.apply_default_hidden_layer_groups(
+            context,
+            bool(self.terrain_layer_hide_default_hidden),
+            bool(getattr(self, "terrain_layer_solo_default_hidden", False)),
+        )
+    except Exception:
+        pass
+
+
+def _update_layer_visibility_settings(self, context):
+    try:
+        from ..ui import ui_map
+        ui_map.apply_layer_visibility_settings(context, self)
+    except Exception:
+        pass
 from ..importers.import_entity import test_load_entity, fixed_chunk_paths
 import os
 import numpy as np
@@ -362,6 +382,13 @@ class MySettings(PropertyGroup):
         min=1.0,
         soft_max=5000.0,
     )
+    foliage_load_radius: FloatProperty(
+        name="Foliage Load Radius",
+        description="Radius around the viewport camera (in world units) to search for foliage cells to load",
+        default=200.0,
+        min=1.0,
+        soft_max=2000.0,
+    )
     terrain_layer_max_load_count: IntProperty(
         name="Layer Load Limit",
         description="Safety limit for nearby layer imports in one pass; set to 0 to load every matching layer",
@@ -414,6 +441,11 @@ class MySettings(PropertyGroup):
         description="Import cloth simulation assets",
         default=True,
     )
+    terrain_layer_instanced_sector: BoolProperty(
+        name="Instance Repeated Meshes",
+        description="Group identical CSectorData mesh placements into a single instancer object instead of one object per placement. Greatly reduces object count for dense static layers (rocks, cliffs, debris). Individual selection is not possible for instanced meshes.",
+        default=False,
+    )
     terrain_layer_keep_lod_meshes: BoolProperty(
         name="Keep LODs",
         description="Keep lower-detail mesh LODs when importing nearby layers",
@@ -440,19 +472,81 @@ class MySettings(PropertyGroup):
         default="_proxy",
     )
     terrain_layer_hide_volume_meshes: BoolProperty(
-        name="Hide _volume_ Meshes",
-        description="Hide imported mesh objects with _volume_ in the name",
+        name="Hide Volume Meshes",
+        description="Hide imported layer mesh objects identified as volume helpers, including names containing _volume_",
         default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
+    )
+    terrain_layer_solo_volume_meshes: BoolProperty(
+        name="Solo Volume Meshes",
+        description="Show imported layer volume helper meshes and hide other imported layer objects",
+        default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
     )
     terrain_layer_hide_shadow_meshes: BoolProperty(
-        name="Hide _shadow_ Meshes",
-        description="Hide imported mesh objects with _shadow_ or shadowmesh in the name",
+        name="Hide Shadow Meshes",
+        description="Hide imported layer mesh objects identified as shadow helpers, including names containing _shadow_ or shadowmesh",
         default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
+    )
+    terrain_layer_solo_shadow_meshes: BoolProperty(
+        name="Solo Shadow Meshes",
+        description="Show imported layer shadow helper meshes and hide other imported layer objects",
+        default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
+    )
+    terrain_layer_hide_collision: BoolProperty(
+        name="Hide Collision",
+        description="Hide collision objects imported from W2L/W2W layer collision resources while keeping them in the scene",
+        default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
+    )
+    terrain_layer_solo_collision: BoolProperty(
+        name="Solo Collision",
+        description="Show imported layer collision objects and hide other imported layer objects",
+        default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
+    )
+    terrain_layer_hide_engine_hidden_meshes: BoolProperty(
+        name="Hide Engine-Hidden Meshes",
+        description="Hide imported layer meshes whose REDengine visibility is off: CSectorData visible flags or component drawableFlags without DF_IsVisible",
+        default=True,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
+    )
+    terrain_layer_solo_engine_hidden_meshes: BoolProperty(
+        name="Solo Engine-Hidden Meshes",
+        description="Show only imported layer meshes hidden by REDengine visibility: CSectorData visible flags or component drawableFlags without DF_IsVisible",
+        default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
+    )
+    terrain_layer_hide_proxy_meshes: BoolProperty(
+        name="Hide Proxy Meshes",
+        description="Hide imported layer proxy mesh objects while keeping them in the scene",
+        default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
+    )
+    terrain_layer_solo_proxy_meshes: BoolProperty(
+        name="Solo Proxy Meshes",
+        description="Show imported layer proxy meshes and hide non-proxy layer meshes",
+        default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
     )
     terrain_layer_write_profile_log: BoolProperty(
         name="Write Profile Log",
         description="Write a timestamped nearby-layer import profile log to the extension cache log folder",
         default=False,
+    )
+    terrain_layer_hide_default_hidden: BoolProperty(
+        name="Hide Default-Hidden Layer Groups",
+        description="Hide layer group collections whose isVisibleOnStart flag is off in the game data. Layers are always temporarily shown during any import operation, then this state is restored",
+        default=False,
+        update=lambda self, context: _update_hide_default_hidden(self, context),
+    )
+    terrain_layer_solo_default_hidden: BoolProperty(
+        name="Solo Default-Hidden Layer Groups",
+        description="Show default-hidden layer group collections and hide other layer-group branches where possible",
+        default=False,
+        update=lambda self, context: _update_hide_default_hidden(self, context),
     )
 
 
@@ -7185,8 +7279,10 @@ class FileActionOperatorImportToScene(Operator):
             elif ext == ".w2l":
                 from ..CR2W import CR2W_reader
                 from ..importers import import_w2l
+                from . import ui_map
                 level_file = CR2W_reader.load_w2l(abs_file_path)
                 import_w2l.btn_import_W2L(level_file, context, False, keep_proxy_meshes=True)
+                ui_map.apply_layer_visibility_settings(context)
             elif ext == ".w2w":
                 from ..CR2W import CR2W_reader
                 from ..importers import import_w2w

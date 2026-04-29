@@ -103,7 +103,7 @@ from .CR2W_types import PROPERTY, v_types
 
 def loadProps(self, args):
     if not args:
-        log.warning("tried to load props with args")
+        log.debug("loadProps called without args")
         return
 
     PROPS = None

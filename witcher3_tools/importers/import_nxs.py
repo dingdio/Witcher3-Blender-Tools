@@ -169,10 +169,8 @@ class CCollisionShapeConvexNXS(CCollisionShapeConvex):
         self.physicalMaterialName = "nxs_material"
         self.vertices = []
         self.polygons = []
-        
-        #[3, 0, 1, 2, 3, 3, 2, 1, 3, 3, 1, 4, 3, 5, 0, 4, 3, 5, 4, 1, 3, 5, 1, 0, 3, 6, 0, 2, 3, 6, 2, 3, 3, 6, 3, 4, 3, 7, 4, 0, 3, 7, 0, 6, 3, 7, 6, 4]
-        #[[1.6416839361190796, -2.7701783180236816, -1.867128610610962, 1.0], [1.6745022535324097, 1.4850211143493652, 1.3138643503189087, 1.0], [1.309401273727417, -1.7657175064086914, 1.6282947063446045, 1.0], [-1.516736626625061, 1.1127550601959229, 1.26220703125, 1.0], [-1.2304162979125977, 1.3502894639968872, -1.3770170211791992, 1.0], [1.3311097621917725, 1.2567826509475708, -1.5260848999023438, 1.0], [-1.2908622026443481, -1.255009651184082, 1.0589591264724731, 1.0], [-0.9999999403953552, -0.9999998211860657, -1.0, 1.0]]
-        
+        self.matrix_world = _identity_matrix_list()
+
         try:
             for face in entry.faces:
                 self.polygons.append(len(face))
@@ -188,8 +186,10 @@ class CCollisionShapeTriMeshNXS(CCollisionShapeTriMesh):
         self.vertices = []
         self.triangles = []
         self.physicalMaterialIndexes = []
+        self.matrix_world = _identity_matrix_list()
         try:
-            self.physicalMaterialNames = [f"nxs_Material_{num}" for num in sorted(set(entry.materials))]
+            max_material_index = max((int(num) for num in entry.materials), default=0)
+            self.physicalMaterialNames = [f"nxs_Material_{num}" for num in range(max_material_index + 1)]
             for vert in entry.vertices:
                 self.vertices.append([vert.x,vert.y,vert.z,1.0])
             for face in entry.faces:
@@ -320,6 +320,21 @@ import bpy
 import bmesh
 from mathutils import Matrix
 
+def _apply_collision_shape_pose(obj, shape_, obj_name):
+    """Apply the cached local collision pose stored in RED collision data."""
+    if hasattr(shape_, 'matrix_world') and shape_.matrix_world:
+        mat_list = shape_.matrix_world
+        mat = Matrix([
+            [mat_list[0][0], mat_list[1][0], mat_list[2][0], mat_list[3][0]],
+            [mat_list[0][1], mat_list[1][1], mat_list[2][1], mat_list[3][1]],
+            [mat_list[0][2], mat_list[1][2], mat_list[2][2], mat_list[3][2]],
+            [mat_list[0][3], mat_list[1][3], mat_list[2][3], mat_list[3][3]],
+        ])
+        obj.matrix_world = mat
+    else:
+        log.warning("No valid matrix_world for %s", obj_name)
+
+
 def _setup_collision_object(mesh, obj_name, material_name, shape_):
     """Common setup: material, debug color, linking, display settings"""
     # Material handling
@@ -355,17 +370,7 @@ def _setup_collision_object(mesh, obj_name, material_name, shape_):
     obj.show_in_front = True
     
     # Apply pose matrix if available
-    if hasattr(shape_, 'matrix_world') and shape_.matrix_world:
-        mat_list = shape_.matrix_world
-        mat = Matrix([
-            [mat_list[0][0], mat_list[1][0], mat_list[2][0], mat_list[3][0]],
-            [mat_list[0][1], mat_list[1][1], mat_list[2][1], mat_list[3][1]],
-            [mat_list[0][2], mat_list[1][2], mat_list[2][2], mat_list[3][2]],
-            [mat_list[0][3], mat_list[1][3], mat_list[2][3], mat_list[3][3]],
-        ])
-        obj.matrix_world = mat
-    else:
-        log.warning("No valid matrix_world for %s", obj_name)
+    _apply_collision_shape_pose(obj, shape_, obj_name)
     
     return obj
 
@@ -474,24 +479,29 @@ def createTri(shape_:CCollisionShapeTriMesh, mesh_name:str = "Custom"):
     if any(not isinstance(name, str) or not name for name in physicalMaterialNames):
         raise TypeError(f"TRI collision '{mesh_name}' has invalid physicalMaterialNames data")
 
+    max_index = max((idx for idx in physicalMaterialIndexes if idx >= 0), default=0)
+
     if not physicalMaterialNames:
         # Empty TRI material-name array is treated as implicit default material.
-        # Keep strict behavior if indexes reference any non-zero slot.
-        if any(idx > 0 for idx in physicalMaterialIndexes):
-            raise ValueError(
-                f"TRI collision '{mesh_name}' has empty physicalMaterialNames but "
-                "indexes reference non-default material slots"
-            )
-        physicalMaterialNames = ["default"]
+        # If cooked PhysX data has sparse material indices, keep the geometry
+        # importable by synthesizing placeholder slots for visualization.
+        physicalMaterialNames = ["default"] + [
+            f"nxs_Material_{idx}" for idx in range(1, max_index + 1)
+        ]
 
     if not physicalMaterialIndexes and triangles:
         raise ValueError(f"TRI collision '{mesh_name}' has triangles but no physicalMaterialIndexes")
 
-    max_index = max((idx for idx in physicalMaterialIndexes if idx >= 0), default=0)
     if len(physicalMaterialNames) <= max_index:
-        raise ValueError(
-            f"TRI collision '{mesh_name}' material index references {max_index + 1} slot(s) "
-            f"but file contains only {len(physicalMaterialNames)} name(s)"
+        old_count = len(physicalMaterialNames)
+        physicalMaterialNames.extend(
+            f"nxs_Material_{idx}" for idx in range(old_count, max_index + 1)
+        )
+        log.warning(
+            "TRI collision '%s' material index references %d slot(s) but file contains only %d name(s); added placeholder slots",
+            mesh_name,
+            max_index + 1,
+            old_count,
         )
 
     mesh = bpy.data.meshes.new(mesh_name+'_tri')
@@ -540,6 +550,7 @@ def createTri(shape_:CCollisionShapeTriMesh, mesh_name:str = "Custom"):
 
     obj.display_type = 'WIRE'
     obj.show_in_front = True
+    _apply_collision_shape_pose(obj, shape_, mesh_name+'_tri')
     return obj
 
 def _read_cvxm_entry(f: bStream) -> CVXMCacheEntry:
@@ -930,6 +941,102 @@ def _try_import_primitive_blob_bytes(data: bytes, base_name: str, source_label: 
         )
         return [createCapsule(shape, base_name)]
 
+    # Multi-primitive blob: the collision cache extractor concatenates sub-file payloads
+    # into one stream without type tags. Priority:
+    #   1. Pure capsule decomposition when len % 8 == 0 and every capsule is elongated (h >= r)
+    #   2. Pure box decomposition when len % 12 == 0
+    #   3. Greedy mixed: boxes (12 b) first, then capsules (8 b), then spheres (4 b)
+    if len(data) % 4 == 0 and len(data) >= 16:
+        primitives = []
+
+        # 1. Try pure capsule
+        if len(data) % 8 == 0:
+            caps = []
+            for i in range(0, len(data), 8):
+                r, h = struct.unpack_from('<2f', data, i)
+                if _valid_positive_float(r) and _valid_positive_float(h) and h >= r:
+                    caps.append(('capsule', r, h))
+                else:
+                    caps = []
+                    break
+            if caps:
+                primitives = caps
+
+        # 2. Try pure box (if capsule didn't win)
+        if not primitives and len(data) % 12 == 0:
+            boxes = []
+            for i in range(0, len(data), 12):
+                hx, hy, hz = struct.unpack_from('<3f', data, i)
+                if all(_valid_positive_float(v) for v in (hx, hy, hz)):
+                    boxes.append(('box', hx, hy, hz))
+                else:
+                    boxes = []
+                    break
+            if boxes:
+                primitives = boxes
+
+        # 3. Greedy mixed fallback
+        if not primitives:
+            offset = 0
+            while offset < len(data):
+                remaining = len(data) - offset
+                if remaining >= 12:
+                    hx, hy, hz = struct.unpack_from('<3f', data, offset)
+                    if all(_valid_positive_float(v) for v in (hx, hy, hz)):
+                        primitives.append(('box', hx, hy, hz))
+                        offset += 12
+                        continue
+                if remaining >= 8:
+                    r, h = struct.unpack_from('<2f', data, offset)
+                    if _valid_positive_float(r) and _valid_positive_float(h):
+                        primitives.append(('capsule', r, h))
+                        offset += 8
+                        continue
+                if remaining >= 4:
+                    (r,) = struct.unpack_from('<f', data, offset)
+                    if _valid_positive_float(r):
+                        primitives.append(('sphere', r))
+                        offset += 4
+                        continue
+                primitives = []
+                break
+
+        if primitives:
+            log.info(
+                "Primitive collision fallback: interpreting non-NXS %s (%d bytes) as %d primitive(s): %s",
+                source_label or base_name, len(data), len(primitives),
+                [p[0] for p in primitives],
+            )
+            objects = []
+            for i, prim in enumerate(primitives):
+                prim_name = base_name if len(primitives) == 1 else f"{base_name}_{i:02d}"
+                if prim[0] == 'box':
+                    hx, hy, hz = prim[1], prim[2], prim[3]
+                    shape = CCollisionShapeBox()
+                    shape.physicalMaterialName = "nxs_material"
+                    shape.matrix_world = _identity_matrix_list()
+                    shape.halfExtendsX = float(hx)
+                    shape.halfExtendsY = float(hy)
+                    shape.halfExtendsZ = float(hz)
+                    objects.append(createBox(shape, prim_name))
+                elif prim[0] == 'capsule':
+                    r, h = prim[1], prim[2]
+                    shape = CCollisionShapeCapsule()
+                    shape.physicalMaterialName = "nxs_material"
+                    shape.matrix_world = _identity_matrix_list()
+                    shape.radius = float(r)
+                    shape.height = float(h) * 2.0
+                    objects.append(createCapsule(shape, prim_name))
+                elif prim[0] == 'sphere':
+                    r = prim[1]
+                    shape = CCollisionShapeSphere()
+                    shape.physicalMaterialName = "nxs_material"
+                    shape.matrix_world = _identity_matrix_list()
+                    shape.radius = float(r)
+                    objects.append(createSphere(shape, prim_name))
+            if objects:
+                return objects
+
     return None
 
 
@@ -999,22 +1106,82 @@ def _try_import_primitive_blob(filePath: str):
         return None
     return _try_import_primitive_blob_bytes(data, Path(filePath).stem, source_label=filePath)
 
-def create_from_nxs(filePath):
-    """Import NXS file, creating Blender objects for all collision entries.
+def _create_primitive_from_item(payload: bytes, flag: int, pose, material_name: str, name: str):
+    """Create one collision primitive from a RED header item's data and pose.
 
-    NXS files can contain multiple CVXM (convex hull) and/or MESH (triangle mesh)
-    entries. This function reads all entries and creates corresponding collision
-    objects in the scene.
+    Args:
+        payload: Raw shape bytes (12=box, 4=sphere, 8=capsule)
+        flag: PxGeometryType (0=sphere, 2=capsule, 3=box, 4/5=NXS handled elsewhere)
+        pose: 4x4 row-major matrix list or None for identity
+        material_name: Physics material name
+        name: Blender object name base
+
+    Returns:
+        Created Blender object, or None on failure
+    """
+    pose_mat = pose if pose is not None else _identity_matrix_list()
+    mat_name = material_name or "nxs_material"
+
+    if flag == 3:  # box: 3 x float32 half-extents
+        if len(payload) < 12:
+            log.warning("Box primitive payload too small: %d bytes for '%s'", len(payload), name)
+            return None
+        hx, hy, hz = struct.unpack_from('<3f', payload)
+        shape = CCollisionShapeBox()
+        shape.physicalMaterialName = mat_name
+        shape.matrix_world = pose_mat
+        shape.halfExtendsX = float(hx)
+        shape.halfExtendsY = float(hy)
+        shape.halfExtendsZ = float(hz)
+        return createBox(shape, name)
+
+    elif flag == 0:  # sphere: 1 x float32 radius
+        if len(payload) < 4:
+            log.warning("Sphere primitive payload too small: %d bytes for '%s'", len(payload), name)
+            return None
+        (r,) = struct.unpack_from('<f', payload)
+        shape = CCollisionShapeSphere()
+        shape.physicalMaterialName = mat_name
+        shape.matrix_world = pose_mat
+        shape.radius = float(r)
+        return createSphere(shape, name)
+
+    elif flag == 2:  # capsule: 2 x float32 (radius, halfHeight)
+        if len(payload) < 8:
+            log.warning("Capsule primitive payload too small: %d bytes for '%s'", len(payload), name)
+            return None
+        r, half_h = struct.unpack_from('<2f', payload)
+        shape = CCollisionShapeCapsule()
+        shape.physicalMaterialName = mat_name
+        shape.matrix_world = pose_mat
+        shape.radius = float(r)
+        shape.height = float(half_h) * 2.0
+        return createCapsule(shape, name)
+
+    log.debug("Unhandled primitive flag %d for '%s'", flag, name)
+    return None
+
+
+def create_from_nxs(filePath, shape_items=None):
+    """Import NXS file, creating Blender objects for all collision entries.
 
     Args:
         filePath: Path to the NXS file
+        shape_items: Optional list of (matrix_4x4_or_None, flag, payload_bytes, material_name)
+                     tuples from CollisionCacheItem.get_shapes_with_data(). When provided:
+                     - NXS shapes (flag 4=convex, 5=trimesh): pose applied to the created object
+                     - Primitive shapes (flag 0-3): created individually with pose + material
 
     Returns:
         list: List of created Blender objects
 
     Raises:
-        FileFormatException: If no valid NXS entries are found
+        FileFormatException: If no valid NXS entries are found and no shape_items
     """
+    NXS_FLAGS = (4, 5)
+    nxs_poses = [pose for pose, flag, payload, mat in shape_items if flag in NXS_FLAGS] if shape_items else []
+
+    base_name = Path(filePath).stem
     nxs_file = bStream(path=filePath)
     objects = []
 
@@ -1036,6 +1203,20 @@ def create_from_nxs(filePath):
             objects.extend(primitive_objects)
 
     if not entries:
+        # Use per-item data from RED header when available — gives correct pose per primitive.
+        if shape_items:
+            primitive_items = [(pose, flag, payload, mat) for pose, flag, payload, mat in shape_items if flag not in NXS_FLAGS]
+            if primitive_items:
+                for i, (pose, flag, payload, mat) in enumerate(primitive_items):
+                    prim_name = base_name if len(primitive_items) == 1 else f"{base_name}_{i:02d}"
+                    obj = _create_primitive_from_item(payload, flag, pose, mat, prim_name)
+                    if obj:
+                        objects.append(obj)
+                if objects:
+                    log.info("Imported %d primitive collision object(s) from %s", len(objects), filePath)
+                    return objects
+
+        # Fall back to heuristic blob parsing (no pose data available)
         primitive_objects = _try_import_primitive_blob(filePath)
         if primitive_objects:
             log.info(f"Imported {len(primitive_objects)} primitive collision object(s) from {filePath}")
@@ -1046,21 +1227,19 @@ def create_from_nxs(filePath):
             f"No valid NXS entries found in file (size={file_size} bytes, header={header_hex})"
         )
 
-    base_name = Path(filePath).stem
-
     for i, entry in enumerate(entries):
-        # Generate unique name for each entry when multiple exist
-        if len(entries) > 1:
-            mesh_name = f"{base_name}_{i:02d}"
-        else:
-            mesh_name = base_name
+        mesh_name = f"{base_name}_{i:02d}" if len(entries) > 1 else base_name
 
         if isinstance(entry, CVXMCacheEntry):
             shape = CCollisionShapeConvexNXS(entry)
+            if i < len(nxs_poses) and nxs_poses[i] is not None:
+                shape.matrix_world = nxs_poses[i]
             obj = createCol(shape, mesh_name)
             objects.append(obj)
         elif isinstance(entry, MeshCacheEntry):
             shape = CCollisionShapeTriMeshNXS(entry)
+            if i < len(nxs_poses) and nxs_poses[i] is not None:
+                shape.matrix_world = nxs_poses[i]
             obj = createTri(shape, mesh_name)
             objects.append(obj)
 

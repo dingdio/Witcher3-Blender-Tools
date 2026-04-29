@@ -8,6 +8,7 @@ _PREF_FIELD_MAP = {
     "keep_empty_lods": "mesh_import_keep_empty_lods",
     "rotate_180": "mesh_import_rotate_180",
     "hide_zero_weight_faces": "mesh_import_hide_zero_weight_faces",
+    "do_import_collision": "mesh_import_do_import_collision",
 }
 
 
@@ -19,6 +20,7 @@ class MeshImportSettings:
     keep_empty_lods: bool = False
     rotate_180: bool = False
     hide_zero_weight_faces: bool = True
+    do_import_collision: bool = False
 
     @classmethod
     def from_source(cls, source=None):
@@ -71,4 +73,5 @@ class MeshImportSettings:
             "keep_empty_lods": self.keep_empty_lods,
             "rotate_180": self.rotate_180,
             "hide_zero_weight_faces": self.hide_zero_weight_faces,
+            "do_import_collision": self.do_import_collision,
         }

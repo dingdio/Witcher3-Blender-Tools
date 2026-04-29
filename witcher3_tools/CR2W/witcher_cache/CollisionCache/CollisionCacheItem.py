@@ -273,5 +273,66 @@ class CollisionCacheItem:
         output.seek(0)
         return output
 
+    def get_shapes_with_data(self):
+        """Return per-shape (pose_matrix, flag, payload_bytes, material_name) tuples.
+
+        Re-decompresses the raw entry to extract both the RED header (poses, flags,
+        material names) and each shape's raw payload bytes, so callers can create
+        each primitive with its correct localToMesh transform.
+
+        Each shape's 70-byte Unk4 field encodes (per SCachedGeometry::Serialize):
+            bytes  0-63 : 4x4 pose matrix as 16 little-endian float32 values (row-major)
+            bytes 64-67 : density scaler (float32)
+            bytes 68-69 : asset ID (uint16)
+
+        Returns:
+            list of (matrix_4x4_or_None, flag, payload_bytes, material_name) tuples.
+            PxGeometryType: sphere=0, plane=1, capsule=2, box=3, convex=4, trimesh=5
+            Returns empty list for Comtype 1/5 entries or on error.
+        """
+        archive_path = self.Bundle.ArchiveAbsolutePath
+
+        try:
+            with open(archive_path, 'rb') as f:
+                mmapped_file = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                try:
+                    compressed_data = mmapped_file[self.PageOffset:self.PageOffset + self.ZSize]
+                    decompressed_data = zlib.decompress(compressed_data)
+                finally:
+                    mmapped_file.close()
+        except Exception:
+            return []
+
+        if self.Comtype in (5, 1):
+            return []
+        if self.Extension == '.nxs' and decompressed_data.startswith(b'NXS\x01'):
+            return []
+
+        header = CollisionCacheItemHeader()
+        try:
+            data_offset = header.read(decompressed_data)
+        except Exception:
+            return []
+
+        result = []
+        payload_offset = data_offset
+        for item in header.Items:
+            flag = item.Flag
+            pose = None
+            if item.Unk4 and len(item.Unk4) >= 64:
+                floats = struct.unpack('<16f', item.Unk4[:64])
+                pose = [
+                    [floats[0],  floats[1],  floats[2],  floats[3]],
+                    [floats[4],  floats[5],  floats[6],  floats[7]],
+                    [floats[8],  floats[9],  floats[10], floats[11]],
+                    [floats[12], floats[13], floats[14], floats[15]],
+                ]
+            payload = decompressed_data[payload_offset:payload_offset + item.FileSize]
+            payload_offset += item.FileSize
+            material_name = item.Name or "nxs_material"
+            result.append((pose, flag, payload, material_name))
+
+        return result
+
     def __repr__(self):
         return f"CollisionCacheItem(Name={self.Name!r}, Comtype={self.Comtype}, Size={self.Size}, ZSize={self.ZSize})"

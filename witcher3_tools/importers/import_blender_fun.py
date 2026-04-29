@@ -269,21 +269,170 @@ _CACHED_FULL_LIGHT_ITEM_KINDS = frozenset({
     "component_point_light",
     "component_spot_light",
 })
+_CACHED_SECTOR_INSTANCER_KINDS = frozenset({"sector_instancer"})
 _CACHED_FULL_ITEM_KINDS = (
     _CACHED_FULL_MESH_ITEM_KINDS
     | _CACHED_REDCLOTH_ITEM_KINDS
     | _CACHED_FULL_LIGHT_ITEM_KINDS
+    | _CACHED_SECTOR_INSTANCER_KINDS
 )
 _CACHED_FULL_PARENT_ITEM_KINDS = frozenset({"group", "entity"})
+_SECTOR_FLAG_MESH_VISIBLE = 1 << 2
 _SECTOR_FLAG_MESH_PART_OF_ENTITY_PROXY = 1 << 10
 _SECTOR_FLAG_MESH_ROOT_ENTITY_PROXY = 1 << 11
+
+
+def _sector_flags_value(flags):
+    try:
+        return int(flags)
+    except Exception:
+        return None
+
+
+def _sector_mesh_visible_from_flags(flags, default=True):
+    value = _sector_flags_value(flags)
+    if value is None:
+        return bool(default)
+    return bool(value & _SECTOR_FLAG_MESH_VISIBLE)
+
+
+def _sector_visibility_key_from_flags(flags, default=True):
+    return "visible" if _sector_mesh_visible_from_flags(flags, default=default) else "hidden"
+
+
+def _drawable_flags_visible_from_value(flags, default=True):
+    if flags is None:
+        return bool(default)
+    if hasattr(flags, "strings"):
+        return _drawable_flags_visible_from_value(getattr(flags, "strings", None), default=default)
+    if hasattr(flags, "Value"):
+        return _drawable_flags_visible_from_value(getattr(flags, "Value", None), default=default)
+    if isinstance(flags, (list, tuple, set)):
+        names = {str(value or "").strip() for value in flags}
+        return "DF_IsVisible" in names or "IsVisible" in names
+    if isinstance(flags, str):
+        parts = {part for part in re.split(r"[\s,|;]+", flags.strip()) if part}
+        return "DF_IsVisible" in parts or "IsVisible" in parts
+    try:
+        return bool(int(flags) & 1)
+    except Exception:
+        return bool(default)
+
+
+def _component_drawable_flags(component):
+    prop = None
+    try:
+        prop = component.GetVariableByName("drawableFlags")
+    except Exception:
+        prop = None
+    if prop is None:
+        try:
+            prop = getattr(component, "drawableFlags", None)
+        except Exception:
+            prop = None
+    if prop is None:
+        return None
+    if hasattr(prop, "strings"):
+        return list(getattr(prop, "strings", []) or [])
+    if hasattr(prop, "Value"):
+        return getattr(prop, "Value", None)
+    return prop
+
+
+def _drawable_flags_display_value(flags):
+    if flags is None:
+        return ""
+    if hasattr(flags, "strings"):
+        return _drawable_flags_display_value(getattr(flags, "strings", None))
+    if hasattr(flags, "Value"):
+        return _drawable_flags_display_value(getattr(flags, "Value", None))
+    if isinstance(flags, (list, tuple, set)):
+        return "|".join(str(value or "").strip() for value in flags if str(value or "").strip())
+    return str(flags)
+
+
+def _tag_entity_empty_engine_visibility_from_children(entity_empty, kwargs=None):
+    if entity_empty is None:
+        return
+    tagged_children = []
+    for child in list(getattr(entity_empty, "children_recursive", []) or []):
+        try:
+            value = child.get("witcher_layer_engine_visible", None)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        tagged_children.append((child, bool(value)))
+    if not tagged_children:
+        return
+
+    hidden_children = [child for child, visible in tagged_children if not visible]
+    all_hidden = len(hidden_children) == len(tagged_children)
+    try:
+        entity_empty["witcher_entity_drawable_components"] = len(tagged_children)
+        entity_empty["witcher_entity_engine_hidden_components"] = len(hidden_children)
+        entity_empty["witcher_layer_engine_visible"] = not all_hidden
+        drawable_values = []
+        for child, _visible in tagged_children:
+            value = child.get("witcher_redkit_drawableFlags", child.get("witcher_drawableFlags", None))
+            if value is not None and str(value) not in drawable_values:
+                drawable_values.append(str(value))
+        if drawable_values:
+            entity_empty["witcher_redkit_drawableFlags"] = ";".join(drawable_values)
+    except Exception:
+        pass
+
+    if all_hidden and _hide_engine_hidden_meshes_enabled(kwargs):
+        try:
+            entity_empty.hide_viewport = True
+            entity_empty.hide_render = True
+        except Exception:
+            pass
+    elif _hide_engine_hidden_meshes_enabled(kwargs):
+        try:
+            entity_empty.hide_viewport = False
+            entity_empty.hide_render = False
+        except Exception:
+            pass
+
+
+def _sector_visibility_key_for_item(kind, item):
+    kind = str(kind or "").strip().lower()
+    if kind not in {"mesh", "rigid", "rigid_body", "sector_instancer"}:
+        return ""
+    if not isinstance(item, dict) or "sector_flags" not in item:
+        return ""
+    return _sector_visibility_key_from_flags(item.get("sector_flags"), default=True)
+
+
+def _hide_engine_hidden_meshes_enabled(kwargs=None, context=None):
+    if kwargs and "hide_engine_hidden_meshes" in kwargs:
+        return bool(kwargs.get("hide_engine_hidden_meshes"))
+    scene = getattr(context or bpy.context, "scene", None)
+    scene_settings = getattr(scene, "witcher_file_browser", None) if scene is not None else None
+    return bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True))
 
 
 def _path_indicates_proxy_mesh(repo_path, name=""):
     text = f"{repo_path or ''}/{name or ''}".replace("\\", "/").lower()
     if not text:
         return False
-    return "proxy" in text
+    parts = [part for part in re.split(r"[\\/]+", text) if part]
+    tokens = []
+    for part in parts:
+        stem = Path(part).stem if "." in part else part
+        if stem == "no_proxy" or stem.endswith("_no_proxy") or stem.endswith("-no-proxy"):
+            continue
+        tokens.extend(token for token in re.split(r"[_\-\s]+", stem) if token)
+    return any(token == "proxy" for token in tokens)
+
+
+def _path_extension(repo_path):
+    return Path(str(repo_path or "").replace("\\", "/")).suffix.lower()
+
+
+def _sector_collision_path_is_visual_mesh(repo_path):
+    return _path_extension(repo_path) in {".w2mesh", ".mesh"}
 
 
 def _sector_proxy_role_from_flags(flags):
@@ -301,6 +450,11 @@ def _sector_proxy_role_from_flags(flags):
 def _cached_plan_item_is_proxy_mesh(item):
     if not isinstance(item, dict):
         return False
+    proxy_role = str(item.get("proxy_role", "") or "").strip().lower()
+    if proxy_role == "part":
+        return False
+    if proxy_role == "root":
+        return True
     if bool(item.get("is_proxy_mesh", False)):
         return True
     return _path_indicates_proxy_mesh(item.get("repo_path", ""), item.get("name", ""))
@@ -362,8 +516,8 @@ def get_CSectorData(level, *, mesh_fbx_uncook_path=None, mesh_uncook_path=None):
                     uncook_path=mesh_uncook_path,
                 )
                 mesh_item.sector_flags = int(getattr(block, "flags", 0) or 0)
-                mesh_item.is_proxy_mesh = bool(_sector_proxy_role_from_flags(mesh_item.sector_flags)) or _path_indicates_proxy_mesh(mesh_path, "")
                 mesh_item.proxy_role = _sector_proxy_role_from_flags(mesh_item.sector_flags)
+                mesh_item.is_proxy_mesh = mesh_item.proxy_role == "root" or _path_indicates_proxy_mesh(mesh_path, "")
                 static_mesh_list.append(mesh_item)
             if block.packedObjectType == Enums.BlockDataObjectType.RigidBody:
                 mesh_path = level.CSectorData.Resources[block.packedObject.meshIndex].pathHash
@@ -630,6 +784,12 @@ def _add_level_import_plan_item(
     is_proxy_mesh=None,
     proxy_role="",
     sector_flags=None,
+    sector_transforms=None,
+    sector_visibility_key="",
+    sector_visible=None,
+    source_kind="",
+    drawable_flags=None,
+    engine_visible=None,
 ):
     item_kind = str(kind or "unknown").strip() or "unknown"
     item = {
@@ -652,6 +812,18 @@ def _add_level_import_plan_item(
             item["sector_flags"] = int(sector_flags)
         except Exception:
             pass
+    if sector_transforms is not None:
+        item["sector_transforms"] = list(sector_transforms)
+    if sector_visibility_key:
+        item["sector_visibility_key"] = str(sector_visibility_key)
+    if sector_visible is not None:
+        item["sector_visible"] = bool(sector_visible)
+    if source_kind:
+        item["_source_kind"] = str(source_kind)
+    if drawable_flags is not None:
+        item["drawable_flags"] = drawable_flags
+    if engine_visible is not None:
+        item["engine_visible"] = bool(engine_visible)
     plan["items"].append(item)
     plan["stats"]["total"] = len(plan["items"])
     by_kind = plan["stats"]["by_kind"]
@@ -796,6 +968,8 @@ def cached_plan_can_use_full_import(plan_items, camera_position=None, radius=0.0
             import_kwargs or {},
             context=context,
         )
+        source_items = _maybe_group_cached_items_into_sector_instancers(source_items, import_kwargs)
+        source_items = _ensure_cached_sector_group_hierarchy(source_items)
     filtered_items = _filter_cached_plan_items_by_proximity(
         source_items,
         nearby_filter,
@@ -1104,6 +1278,16 @@ def _cached_plan_mesh_enabled(kind, kwargs, item=None):
         return bool(kwargs.get("do_import_ProxyMesh", False))
     if kind in {"mesh", "component_mesh", "foliage", "grass"}:
         return bool(kwargs.get("do_import_Mesh", True))
+    if kind == "sector_instancer":
+        # Synthetic sector_instancer items are only emitted by the grouping helper after
+        # the per-toggle filter, so respecting their original source kind here would just
+        # double-filter. Trust upstream filtering.
+        source_kind = str((item or {}).get("_source_kind", "") or "").strip().lower()
+        if source_kind in {"rigid", "rigid_body"}:
+            return bool(kwargs.get("do_import_RigidBody", True))
+        if source_kind == "collision":
+            return bool(kwargs.get("do_import_Collision", True))
+        return bool(kwargs.get("do_import_Mesh", True))
     if kind == "collision":
         return bool(kwargs.get("do_import_Collision", True))
     if kind in {"rigid", "rigid_body"}:
@@ -1133,6 +1317,30 @@ def _cached_plan_mesh_from_item(item, kind, context=None):
         transform=item.get("transform") or False,
         block_data_object_type=block_type,
     )
+    if item.get("sector_flags") is not None:
+        try:
+            mesh.sector_flags = int(item.get("sector_flags"))
+        except Exception:
+            pass
+    if item.get("engine_visible") is not None:
+        try:
+            mesh.engine_visible = bool(item.get("engine_visible"))
+        except Exception:
+            pass
+    if item.get("drawable_flags") is not None:
+        try:
+            mesh.drawable_flags = item.get("drawable_flags")
+        except Exception:
+            pass
+    try:
+        mesh.is_proxy_mesh = _cached_plan_item_is_proxy_mesh(item)
+        mesh.proxy_role = str(item.get("proxy_role", "") or "")
+    except Exception:
+        pass
+    try:
+        mesh.import_name = str(item.get("name", "") or "").strip()
+    except Exception:
+        pass
     if kind in {"foliage", "grass"}:
         mesh.type = "mesh_foliage"
     return mesh
@@ -1216,6 +1424,738 @@ def _import_cached_plan_light_item(
     return light_obj
 
 
+# ---------------------------------------------------------------------------
+# Sector GN instancer helpers
+# ---------------------------------------------------------------------------
+
+def _decompose_sector_3x3(mat3_rows):
+    """Return (euler_xyz_radians, scale_xyz) from a CR2W 3x3 rotation matrix.
+
+    The engine stores the basis vectors as rows but Blender expects them as columns,
+    so the matrix has to be transposed before decomposition. import_single_mesh applies
+    the same transpose when placing individual mesh objects.
+    """
+    try:
+        from mathutils import Matrix
+        r0 = mat3_rows[0]
+        r1 = mat3_rows[1]
+        r2 = mat3_rows[2]
+        m3 = Matrix((
+            (float(r0[0]), float(r1[0]), float(r2[0])),
+            (float(r0[1]), float(r1[1]), float(r2[1])),
+            (float(r0[2]), float(r1[2]), float(r2[2])),
+        ))
+        _, rot_quat, scale = m3.to_4x4().decompose()
+        e = rot_quat.to_euler('XYZ')
+        return (e.x, e.y, e.z), (scale.x, scale.y, scale.z)
+    except Exception:
+        return (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
+
+
+def _rebuild_sector_instancer_mesh(instancer_obj, transforms):
+    """
+    Rebuild the instancer point-cloud mesh.
+    transforms: list of (x, y, z, ex, ey, ez, sx, sy, sz)
+    """
+    mesh = instancer_obj.data
+    n = len(transforms)
+    mesh.clear_geometry()
+    if n == 0:
+        return
+    flat_pos, flat_rot, flat_scale = [], [], []
+    for (x, y, z, ex, ey, ez, sx, sy, sz) in transforms:
+        flat_pos  += [x, y, z]
+        flat_rot  += [ex, ey, ez]
+        flat_scale += [sx, sy, sz]
+    mesh.vertices.add(n)
+    mesh.vertices.foreach_set("co", flat_pos)
+    for attr_name, flat_data in (("rot", flat_rot), ("scale", flat_scale)):
+        existing = mesh.attributes.get(attr_name)
+        if existing is not None:
+            mesh.attributes.remove(existing)
+        attr = mesh.attributes.new(attr_name, 'FLOAT_VECTOR', 'POINT')
+        attr.data.foreach_set("vector", flat_data)
+    mesh.update()
+
+
+def _build_sector_instancer_gn_tree(ng, source_obj):
+    """
+    Geometry Nodes tree:
+      Named Attribute "rot"   (FLOAT_VECTOR euler XYZ) → Euler→Rotation ─┐
+      Named Attribute "scale" (FLOAT_VECTOR)           ─────────────────────┤ Instance on Points → Output
+      Object Info (source_obj) → Geometry              ─────────────────────┘
+    """
+    nodes = ng.nodes
+    links = ng.links
+    nodes.clear()
+
+    use_iface = hasattr(ng, "interface") and hasattr(ng.interface, "new_socket")
+
+    def _sock(name, in_out, stype):
+        if use_iface:
+            ng.interface.new_socket(name=name, in_out=in_out, socket_type=stype)
+        else:
+            (ng.inputs if in_out == 'INPUT' else ng.outputs).new(stype, name)
+
+    _sock("Geometry", "OUTPUT", "NodeSocketGeometry")
+    _sock("Geometry", "INPUT",  "NodeSocketGeometry")
+
+    gin  = nodes.new('NodeGroupInput');  gin.location  = (-800, 0)
+    gout = nodes.new('NodeGroupOutput'); gout.location = ( 500, 0)
+
+    # Named attribute: rotation
+    na_rot = nodes.new('GeometryNodeInputNamedAttribute')
+    na_rot.location = (-600, -100)
+    for v in ('FLOAT_VECTOR', 'VECTOR'):
+        try: na_rot.data_type = v; break
+        except Exception: pass
+    try:    na_rot.inputs["Name"].default_value = "rot"
+    except Exception: na_rot.inputs[0].default_value = "rot"
+
+    # Named attribute: scale
+    na_scale = nodes.new('GeometryNodeInputNamedAttribute')
+    na_scale.location = (-600, -250)
+    for v in ('FLOAT_VECTOR', 'VECTOR'):
+        try: na_scale.data_type = v; break
+        except Exception: pass
+    try:    na_scale.inputs["Name"].default_value = "scale"
+    except Exception: na_scale.inputs[0].default_value = "scale"
+
+    # Euler → Rotation
+    e2r = None
+    for bl_id in ('FunctionNodeEulerToRotation', 'FunctionNodeRotationFromEuler'):
+        try: e2r = nodes.new(bl_id); e2r.location = (-350, -100); break
+        except Exception: pass
+
+    # Object Info
+    oi = nodes.new('GeometryNodeObjectInfo')
+    oi.location = (-350, -300)
+    try:    oi.inputs['Object'].default_value = source_obj
+    except Exception: pass
+    try:    oi.transform_space = 'ORIGINAL'
+    except Exception: pass
+
+    # Instance on Points
+    iop = nodes.new('GeometryNodeInstanceOnPoints')
+    iop.location = (150, 0)
+
+    links.new(gin.outputs['Geometry'], iop.inputs['Points'])
+    links.new(oi.outputs['Geometry'],  iop.inputs['Instance'])
+    if e2r is not None:
+        links.new(na_rot.outputs[0], e2r.inputs[0])
+        try:    links.new(e2r.outputs['Rotation'], iop.inputs['Rotation'])
+        except Exception: links.new(e2r.outputs[0], iop.inputs['Rotation'])
+    else:
+        try: links.new(na_rot.outputs[0], iop.inputs['Rotation'])
+        except Exception: pass
+    try:    links.new(na_scale.outputs[0], iop.inputs['Scale'])
+    except Exception: pass
+    links.new(iop.outputs['Instances'], gout.inputs['Geometry'])
+
+
+_SECTOR_SOURCE_MARKER_PROP = "_sector_source_repo"
+_SECTOR_SOURCES_COLLECTION_NAME = "__sector_sources__"
+
+
+def _get_sector_sources_collection(context=None):
+    """Return a persistent scene-level collection that holds all hidden source meshes.
+
+    This collection lives as a direct child of the scene's master collection, NOT inside
+    any layer collection. That way _capture_previous_layer_object_ids never sees the
+    sources and they are never deleted during a layer reload cycle.
+    """
+    existing = bpy.data.collections.get(_SECTOR_SOURCES_COLLECTION_NAME)
+    if existing is not None:
+        return existing
+    coll = bpy.data.collections.new(_SECTOR_SOURCES_COLLECTION_NAME)
+    coll.hide_viewport = True
+    coll.hide_render = True
+    scene = _get_scene(context)
+    if scene is not None:
+        try:
+            scene.collection.children.link(coll)
+        except Exception:
+            pass
+    return coll
+
+
+def _apply_sector_collision_transform_and_tags(wrapper, mesh, parent_transform, kwargs):
+    if wrapper is None:
+        return None
+    if parent_transform:
+        wrapper.parent = parent_transform
+
+    # Apply rotation (same column-transposed pattern as import_single_mesh).
+    mat_src = getattr(mesh, "matrix", None)
+    if mat_src:
+        try:
+            mat = Matrix()
+            mat[0][0], mat[0][1], mat[0][2] = mat_src[0][0], mat_src[1][0], mat_src[2][0]
+            mat[1][0], mat[1][1], mat[1][2] = mat_src[0][1], mat_src[1][1], mat_src[2][1]
+            mat[2][0], mat[2][1], mat[2][2] = mat_src[0][2], mat_src[1][2], mat_src[2][2]
+            wrapper.matrix_world = wrapper.matrix_world @ mat
+        except Exception:
+            pass
+
+    translation = _extract_vector_position(getattr(mesh, "translation", None))
+    if translation is not None:
+        wrapper.location[0] = translation[0]
+        wrapper.location[1] = translation[1]
+        wrapper.location[2] = translation[2]
+
+    _tag_object_tree_for_layer_and_plan(
+        wrapper,
+        kwargs.get("_layer_import_owner"),
+        kwargs.get("_layer_import_generation"),
+        kwargs.get("_layer_import_plan_item_id"),
+        kwargs.get("_layer_import_plan_mode"),
+    )
+    for obj in [wrapper] + list(getattr(wrapper, "children_recursive", []) or []):
+        try:
+            obj["witcher_layer_visibility_kind"] = "collision"
+        except Exception:
+            pass
+    return wrapper
+
+
+def _import_sector_w2mesh_collision(mesh, errors, parent_transform, **kwargs):
+    """Import collision-only geometry for a CSectorData collision record backed by .w2mesh."""
+    mesh_path = str(getattr(mesh, "meshName", "") or "").strip()
+    if not mesh_path or mesh_path == "0":
+        return None
+
+    try:
+        from .import_nxs import create_from_nxs
+        from ..CR2W.common_blender import get_collision_for_mesh_with_poses
+    except ImportError as exc:
+        log.warning("sector w2mesh collision import: missing module: %s", exc)
+        return None
+
+    collision_root_key = f"{mesh_path}#collision"
+    existing = check_if_empty_already_in_scene(
+        collision_root_key,
+        fast_static_clone=bool(kwargs.get("_cached_plan_fast_static_clone", False)),
+    )
+    if existing:
+        return _apply_sector_collision_transform_and_tags(existing, mesh, parent_transform, kwargs)
+
+    collision_path, shape_items = get_collision_for_mesh_with_poses(mesh_path)
+    if not collision_path:
+        log.debug("No collision cache item found for mesh collision record: %s", mesh_path)
+        return None
+
+    try:
+        nxs_objects = create_from_nxs(collision_path, shape_items=shape_items)
+    except Exception as exc:
+        log.warning("Mesh collision NXS import failed %s: %s", collision_path, exc)
+        if errors is not None:
+            errors.append(f"Mesh collision NXS import failed {mesh_path}: {exc}")
+        return None
+
+    if not nxs_objects:
+        return None
+
+    bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
+    wrapper = bpy.context.object
+    stem = Path(mesh_path.replace("\\", "/")).stem or "Collision"
+    wrapper.name = stem
+    wrapper["repo_path"] = collision_root_key
+    wrapper["witcher_collision_source_repo_path"] = mesh_path
+    wrapper["witcher_layer_visibility_kind"] = "collision"
+    wrapper.show_in_front = False
+
+    for obj in nxs_objects:
+        if obj is not None:
+            obj.parent = wrapper
+            try:
+                obj["witcher_layer_visibility_kind"] = "collision"
+                obj.show_in_front = False
+            except Exception:
+                pass
+
+    _record_duplicate_root(wrapper)
+    return _apply_sector_collision_transform_and_tags(wrapper, mesh, parent_transform, kwargs)
+
+
+def _import_sector_collision_from_cache(mesh, errors, parent_transform, **kwargs):
+    """Import sector collision blocks as collision-only geometry."""
+    collision_path = str(getattr(mesh, "meshName", "") or "").strip()
+    if not collision_path or collision_path == "0":
+        return None
+    if _sector_collision_path_is_visual_mesh(collision_path):
+        return _import_sector_w2mesh_collision(mesh, errors, parent_transform, **kwargs)
+
+    try:
+        from .import_nxs import create_from_nxs
+        from ..CR2W.witcher_cache.CollisionCache.CollisionManager import CollisionManager
+    except ImportError as exc:
+        log.warning("sector collision import: missing module: %s", exc)
+        return None
+
+    manager = CollisionManager.Get()
+
+    # Prefer exact key match, fall back to case-insensitive
+    raw = manager.Items.get(collision_path)
+    item = None
+    if raw:
+        item = raw[0] if isinstance(raw, list) else raw
+    if item is None:
+        collision_lower = collision_path.lower()
+        for key, val in manager.Items.items():
+            if key.lower() == collision_lower:
+                item = val[0] if isinstance(val, list) else val
+                break
+
+    if item is None:
+        log.debug("Collision cache item not found for sector block: %s", collision_path)
+        return None
+
+    existing = check_if_empty_already_in_scene(
+        collision_path,
+        fast_static_clone=bool(kwargs.get("_cached_plan_fast_static_clone", False)),
+    )
+    if existing:
+        return _apply_sector_collision_transform_and_tags(existing, mesh, parent_transform, kwargs)
+
+    uncook = get_uncook_path(bpy.context)
+    if not uncook:
+        log.warning("No uncook path for collision extraction: %s", collision_path)
+        return None
+
+    ext = item.Extension or ".nxs"
+    out_path = os.path.join(uncook, collision_path.replace("/", "\\"))
+    if not out_path.lower().endswith(ext.lower()):
+        out_path = os.path.splitext(out_path)[0] + ext
+
+    if not os.path.exists(out_path):
+        try:
+            item.extract_to_file(out_path)
+        except Exception as exc:
+            log.warning("Collision extraction failed %s: %s", collision_path, exc)
+            if errors is not None:
+                errors.append(f"Collision extraction failed {collision_path}: {exc}")
+            return None
+
+    try:
+        nxs_objects = create_from_nxs(out_path)
+    except Exception as exc:
+        log.warning("NXS import failed %s: %s", out_path, exc)
+        if errors is not None:
+            errors.append(f"NXS import failed {out_path}: {exc}")
+        return None
+
+    if not nxs_objects:
+        return None
+
+    bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
+    wrapper = bpy.context.object
+    stem = Path(collision_path.replace("\\", "/")).stem or "Collision"
+    wrapper.name = stem
+    wrapper["repo_path"] = collision_path
+    wrapper["witcher_layer_visibility_kind"] = "collision"
+    wrapper.show_in_front = False
+
+    for obj in nxs_objects:
+        if obj is not None:
+            obj.parent = wrapper
+            try:
+                obj.show_in_front = False
+            except Exception:
+                pass
+
+    _record_duplicate_root(wrapper)
+    return _apply_sector_collision_transform_and_tags(wrapper, mesh, parent_transform, kwargs)
+
+
+def _join_nxs_objects_to_single_mesh(nxs_objects, name):
+    """Merge all mesh objects returned by create_from_nxs into one mesh object.
+
+    NXS files can contain multiple shapes (convex hulls, tri-meshes). For GN instancing
+    all shapes must live in one source object so Object Info emits all of them together.
+    Uses bmesh.from_mesh which appends (merges) geometry into an existing BMesh.
+    """
+    import bmesh as _bmesh
+    mesh_objs = [o for o in (nxs_objects or []) if o is not None and o.type == 'MESH']
+    if not mesh_objs:
+        return None
+
+    if len(mesh_objs) == 1:
+        mesh_objs[0].name = name
+        return mesh_objs[0]
+
+    combined_mesh = bpy.data.meshes.new(name)
+    bm = _bmesh.new()
+    try:
+        for obj in mesh_objs:
+            mesh_copy = obj.data.copy()
+            # Embed the object's own local transform so shapes align correctly
+            mesh_copy.transform(obj.matrix_local)
+            bm.from_mesh(mesh_copy)
+            bpy.data.meshes.remove(mesh_copy)
+        bm.to_mesh(combined_mesh)
+    finally:
+        bm.free()
+
+    combined_obj = bpy.data.objects.new(name, combined_mesh)
+    combined_obj.show_in_front = False
+    # Remove the now-redundant individual objects
+    for obj in mesh_objs:
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:
+            pass
+    return combined_obj
+
+
+def _get_or_import_sector_nxs_source_mesh(repo_path, kwargs, errors, mode_signature, item_id):
+    """Return a single mesh object suitable as GN source for an NXS collision instancer.
+
+    For standalone collision-cache paths, look up repo_path directly in the
+    CollisionManager. For CSectorData collision records that point at .w2mesh,
+    resolve the mesh's collision cache/NXS entry first. The returned object is a
+    single joined mesh stored in the __sector_sources__ collection.
+    """
+    repo_path = str(repo_path or "").strip()
+    if not repo_path:
+        return None
+    is_mesh_collision = _sector_collision_path_is_visual_mesh(repo_path)
+    marker = f"{repo_path}#collision" if is_mesh_collision else repo_path
+
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        try:
+            if str(obj.get(_SECTOR_SOURCE_MARKER_PROP, "") or "") == marker:
+                return obj
+        except Exception:
+            continue
+
+    try:
+        from .import_nxs import create_from_nxs
+        if is_mesh_collision:
+            from ..CR2W.common_blender import get_collision_for_mesh_with_poses
+        else:
+            from ..CR2W.witcher_cache.CollisionCache.CollisionManager import CollisionManager
+    except ImportError as exc:
+        log.warning("sector nxs source: missing module: %s", exc)
+        return None
+
+    shape_items = None
+    if is_mesh_collision:
+        out_path, shape_items = get_collision_for_mesh_with_poses(repo_path)
+        if not out_path:
+            log.debug("NXS source not found for mesh collision: %s", repo_path)
+            return None
+    else:
+        manager = CollisionManager.Get()
+        raw = manager.Items.get(repo_path)
+        item = None
+        if raw:
+            item = raw[0] if isinstance(raw, list) else raw
+        if item is None:
+            path_lower = repo_path.lower()
+            for key, val in manager.Items.items():
+                if key.lower() == path_lower:
+                    item = val[0] if isinstance(val, list) else val
+                    break
+
+        if item is None:
+            log.debug("NXS source not found in collision cache: %s", repo_path)
+            return None
+
+        uncook = get_uncook_path(bpy.context)
+        if not uncook:
+            return None
+
+        ext = item.Extension or ".nxs"
+        out_path = os.path.join(uncook, repo_path.replace("/", "\\"))
+        if not out_path.lower().endswith(ext.lower()):
+            out_path = os.path.splitext(out_path)[0] + ext
+
+        if not os.path.exists(out_path):
+            try:
+                item.extract_to_file(out_path)
+            except Exception as exc:
+                log.warning("NXS extraction failed %s: %s", repo_path, exc)
+                if errors is not None:
+                    errors.append(f"NXS extraction failed {repo_path}: {exc}")
+                return None
+
+    try:
+        nxs_objects = create_from_nxs(out_path, shape_items=shape_items)
+    except Exception as exc:
+        log.warning("NXS import failed %s: %s", out_path, exc)
+        if errors is not None:
+            errors.append(f"NXS import failed {out_path}: {exc}")
+        return None
+
+    if not nxs_objects:
+        return None
+
+    stem = Path(repo_path.replace("\\", "/")).stem or "ColSrc"
+    source = _join_nxs_objects_to_single_mesh(nxs_objects, f"si_{stem}_src")
+    if source is None:
+        return None
+
+    source[_SECTOR_SOURCE_MARKER_PROP] = marker
+    source["_is_sector_source"] = True
+    source["repo_path"] = marker
+    if is_mesh_collision:
+        source["witcher_collision_source_repo_path"] = repo_path
+    source.hide_viewport = True
+    source.hide_render = True
+    source.show_in_front = False
+
+    for c in list(source.users_collection):
+        try:
+            c.objects.unlink(source)
+        except Exception:
+            pass
+    sources_coll = _get_sector_sources_collection()
+    try:
+        sources_coll.objects.link(source)
+    except Exception:
+        pass
+    return source
+
+
+def _pick_best_sector_source_mesh(new_objects, parent_root):
+    """From a freshly-imported mesh hierarchy, keep only the highest-poly mesh as the source.
+
+    parent_root is the empty wrapper from import_single_mesh; it is removed too because
+    the GN Object Info node needs a real mesh, not an empty parent. Returns the kept mesh
+    object or None if no mesh was found.
+    """
+    candidates = [o for o in new_objects if o is not None and o.type == 'MESH' and getattr(o, "data", None)]
+    if not candidates:
+        for o in new_objects:
+            if o is None:
+                continue
+            try:
+                bpy.data.objects.remove(o, do_unlink=True)
+            except Exception:
+                pass
+        return None
+
+    best = max(candidates, key=lambda o: len(o.data.polygons))
+    for o in list(new_objects):
+        if o is None or o is best:
+            continue
+        try:
+            data = o.data if getattr(o, "type", "") == 'MESH' else None
+        except Exception:
+            data = None
+        try:
+            bpy.data.objects.remove(o, do_unlink=True)
+        except Exception:
+            continue
+        if data is not None and data.users == 0:
+            try:
+                bpy.data.meshes.remove(data)
+            except Exception:
+                pass
+
+    best.parent = None
+    try:
+        best.matrix_world = Matrix.Identity(4)
+        best.matrix_local = Matrix.Identity(4)
+        best.matrix_basis = Matrix.Identity(4)
+    except Exception:
+        pass
+    best.location = (0.0, 0.0, 0.0)
+    best.rotation_euler = (0.0, 0.0, 0.0)
+    best.scale = (1.0, 1.0, 1.0)
+    return best
+
+
+def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, errors, mode_signature, item_id):
+    """Return the single LOD0 mesh that the GN instancer references for repo_path.
+
+    Reuses an already-imported source within the current scene so multiple instancers
+    of the same mesh share one source mesh object. The source is stored in the dedicated
+    __sector_sources__ scene-level collection so it is invisible in the viewport and
+    immune to layer-reload cleanup (target_collection is unused but kept for API compat).
+    """
+    marker = str(repo_path or "").strip()
+    if not marker:
+        return None
+
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        try:
+            if str(obj.get(_SECTOR_SOURCE_MARKER_PROP, "") or "") == marker:
+                return obj
+        except Exception:
+            continue
+
+    src_mesh_data = _new_mesh_path(
+        repo_path,
+        False, False,
+        uncook_path=kwargs.get("mesh_uncook_path"),
+        fbx_uncook_path=kwargs.get("mesh_fbx_uncook_path"),
+    )
+    mesh_kwargs = dict(kwargs)
+    mesh_kwargs.pop("_cached_plan_fast_static_clone", None)
+    # Remove positional-equivalent kwargs so they don't collide with the explicit args below
+    mesh_kwargs.pop("keep_lod_meshes", None)
+    mesh_kwargs.pop("keep_empty_lods", None)
+    mesh_kwargs["_layer_import_plan_item_id"] = (item_id or "") + "_src"
+    mesh_kwargs["_layer_import_plan_mode"] = mode_signature
+
+    before_ids = {o.as_pointer() for o in bpy.data.objects}
+    try:
+        wrapper = import_single_mesh(
+            src_mesh_data,
+            errors,
+            None,
+            keep_lod_meshes=False,
+            **mesh_kwargs,
+        )
+    except Exception as exc:
+        log.warning("sector_instancer source import failed %s: %s", repo_path, exc)
+        if errors is not None:
+            errors.append(f"sector_instancer source failed {repo_path}: {exc}")
+        return None
+
+    new_objects = [o for o in bpy.data.objects if o.as_pointer() not in before_ids]
+    if wrapper is not None and wrapper not in new_objects:
+        new_objects.append(wrapper)
+
+    source = _pick_best_sector_source_mesh(new_objects, wrapper)
+    if source is None:
+        return None
+
+    stem = Path(repo_path.replace("\\", "/")).stem or "Source"
+    source.name = f"si_{stem}_src"
+    source[_SECTOR_SOURCE_MARKER_PROP] = marker
+    source["_is_sector_source"] = True
+    source["repo_path"] = repo_path
+    source.hide_viewport = True
+    source.hide_render = True
+    source.show_in_front = False
+
+    for c in list(source.users_collection):
+        try:
+            c.objects.unlink(source)
+        except Exception:
+            pass
+    # Link source to the dedicated scene-level sources collection, NOT to the
+    # per-layer target_collection. This keeps sources out of layer cleanup sweeps
+    # so they survive reloads and are shared across all layers using the same mesh.
+    sources_coll = _get_sector_sources_collection()
+    try:
+        sources_coll.objects.link(source)
+    except Exception:
+        pass
+    return source
+
+
+def _import_cached_plan_sector_instancer_item(
+    item,
+    target_collection,
+    parent_obj,
+    owner_tag,
+    generation_tag,
+    item_id,
+    mode_signature,
+    kwargs,
+    errors,
+    context=None,
+):
+    """Import a sector_instancer plan item: one hidden source mesh + one GN instancer per mesh type.
+
+    The source must be a real MESH object (not an empty wrapper) because the GN Object Info
+    node reads geometry directly from the referenced object — empties have no geometry and
+    produce no instances.
+    """
+    repo_path = str(item.get("repo_path", "") or "").strip()
+    if not repo_path:
+        return None
+    sector_transforms = item.get("sector_transforms") or []
+    if not sector_transforms:
+        return None
+
+    stem = Path(repo_path.replace("\\", "/")).stem or "Mesh"
+    source_kind = str(item.get("_source_kind", "") or "mesh").strip().lower()
+
+    if source_kind == "collision":
+        src_root = _get_or_import_sector_nxs_source_mesh(
+            repo_path, kwargs, errors, mode_signature, item_id,
+        )
+    else:
+        src_root = _get_or_import_sector_source_mesh(
+            repo_path,
+            target_collection,
+            kwargs,
+            errors,
+            mode_signature,
+            item_id,
+        )
+    if src_root is None:
+        return None
+    # Do NOT tag src_root with owner/generation: sources live in __sector_sources__
+    # (a separate scene-level collection) and are shared across all layers that use
+    # the same mesh. Tagging them would cause them to be captured and deleted by
+    # _finalize_layer_reload_cleanup on subsequent around-camera reloads.
+
+    all_t = []
+    for t_entry in sector_transforms:
+        if not isinstance(t_entry, dict):
+            continue
+        tx = t_entry.get("t") or [0.0, 0.0, 0.0]
+        mx = t_entry.get("m")
+        (ex, ey, ez), (sx, sy, sz) = _decompose_sector_3x3(mx) if mx else ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+        try:
+            all_t.append((float(tx[0]), float(tx[1]), float(tx[2]), ex, ey, ez, sx, sy, sz))
+        except Exception:
+            continue
+    if not all_t:
+        return None
+
+    safe_name = f"si_{stem}"
+    inst_mesh = bpy.data.meshes.new(safe_name)
+    inst_obj  = bpy.data.objects.new(safe_name, inst_mesh)
+    inst_obj.show_in_front = False
+    if target_collection is not None:
+        target_collection.objects.link(inst_obj)
+    if parent_obj is not None:
+        inst_obj.parent = parent_obj
+    inst_obj["_is_sector_instancer"] = True
+    inst_obj["repo_path"] = repo_path
+    inst_obj["witcher_layer_visibility_kind"] = source_kind
+    if item.get("sector_visible") is not None:
+        inst_obj["witcher_layer_engine_visible"] = bool(item.get("sector_visible"))
+    elif item.get("sector_visibility_key"):
+        inst_obj["witcher_layer_engine_visible"] = str(item.get("sector_visibility_key")).lower() != "hidden"
+    if (
+        not bool(inst_obj.get("witcher_layer_engine_visible", True))
+        and _hide_engine_hidden_meshes_enabled(kwargs, context)
+    ):
+        inst_obj.hide_viewport = True
+        inst_obj.hide_render = True
+    if item.get("sector_flags") is not None:
+        try:
+            inst_obj["witcher_sector_flags"] = int(item.get("sector_flags"))
+        except Exception:
+            pass
+    _tag_single_object_for_layer(inst_obj, owner_tag, generation_tag)
+    _tag_object_tree_for_plan_item(inst_obj, item_id, mode_signature)
+
+    _rebuild_sector_instancer_mesh(inst_obj, all_t)
+
+    mod = inst_obj.modifiers.new("SectorInstancer", 'NODES')
+    ng  = bpy.data.node_groups.new(f"SectorInstancer_{stem}", 'GeometryNodeTree')
+    mod.node_group = ng
+    _build_sector_instancer_gn_tree(ng, src_root)
+
+    log.info(
+        "sector_instancer: %s -> %d placements (source=%s)",
+        stem, len(all_t), src_root.name,
+    )
+    return inst_obj
+
+
 def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None, loaded_collection=None, errors=None, level_file=""):
     total_started = time.perf_counter()
     if target_collection is None:
@@ -1248,6 +2188,9 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 skipped_loaded += 1
             continue
         if kind in _CACHED_FULL_MESH_ITEM_KINDS:
+            if not repo_path_value or not _cached_plan_mesh_enabled(kind, kwargs, item):
+                continue
+        elif kind in _CACHED_SECTOR_INSTANCER_KINDS:
             if not repo_path_value or not _cached_plan_mesh_enabled(kind, kwargs, item):
                 continue
         elif kind in _CACHED_REDCLOTH_ITEM_KINDS:
@@ -1331,6 +2274,30 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
         kind = str(item.get("kind", "") or "").strip().lower()
         parent_obj = ensure_parent_empty(str(item.get("parent_id", "") or "").strip())
 
+        if kind in _CACHED_SECTOR_INSTANCER_KINDS:
+            mesh_started = time.perf_counter()
+            root_obj = _import_cached_plan_sector_instancer_item(
+                item,
+                target_collection,
+                parent_obj,
+                owner_tag,
+                generation_tag,
+                item_id,
+                mode_signature,
+                kwargs,
+                errors,
+                context=context,
+            )
+            mesh_seconds += time.perf_counter() - mesh_started
+            if root_obj is None:
+                continue
+            loaded_by_id[item_id] = root_obj
+            created[item_id] = root_obj
+            _tag_entity_empty_engine_visibility_from_children(parent_obj, kwargs)
+            imported_count += 1
+            mesh_count += 1
+            continue
+
         if kind in _CACHED_FULL_MESH_ITEM_KINDS:
             mesh = _cached_plan_mesh_from_item(item, kind, context=context)
             if mesh is None:
@@ -1342,13 +2309,18 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 mesh_kwargs["_layer_import_plan_item_id"] = item_id
                 mesh_kwargs["_layer_import_plan_mode"] = mode_signature
                 mesh_kwargs["_cached_plan_fast_static_clone"] = True
-                root_obj = import_single_mesh(
-                    mesh,
-                    errors,
-                    parent_obj,
-                    keep_lod_meshes=keep_lod_meshes or (keep_proxy_meshes and _cached_plan_item_is_proxy_mesh(item)),
-                    **mesh_kwargs,
-                )
+                if kind == "collision":
+                    root_obj = _import_sector_collision_from_cache(
+                        mesh, errors, parent_obj, **mesh_kwargs,
+                    )
+                else:
+                    root_obj = import_single_mesh(
+                        mesh,
+                        errors,
+                        parent_obj,
+                        keep_lod_meshes=keep_lod_meshes or (keep_proxy_meshes and _cached_plan_item_is_proxy_mesh(item)),
+                        **mesh_kwargs,
+                    )
                 mesh_seconds += time.perf_counter() - mesh_started
             except Exception as exc:
                 log.warning("Problem with cached mesh import %s: %s", mesh.meshName, exc)
@@ -1358,6 +2330,7 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 continue
             loaded_by_id[item_id] = root_obj
             created[item_id] = root_obj
+            _tag_entity_empty_engine_visibility_from_children(parent_obj, kwargs)
             imported_count += 1
             mesh_count += 1
             continue
@@ -1422,6 +2395,13 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
             imported_count += 1
             cloth_count += 1
 
+    for item_id, obj in list(created.items()):
+        item = by_id.get(str(item_id or ""))
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind", "") or "").strip().lower() == "entity":
+            _tag_entity_empty_engine_visibility_from_children(obj, kwargs)
+
     total_seconds = time.perf_counter() - total_started
     if total_seconds >= _LAYER_IMPORT_PROFILE_WARN_THRESHOLD:
         _log_layer_import_profile_warning(
@@ -1450,6 +2430,10 @@ def _filter_cached_plan_items_by_proximity(items, nearby_filter, nearby_stats, i
 
     Group items and items without world_position are kept only if a
     descendant survives the cull, so parent chains stay connected.
+
+    Sector instancer items are kept whole if any of their packed sector_transforms
+    falls within the radius (per-placement culling is intentionally avoided so
+    the instancer's identity stays stable across reloads as the camera moves).
     """
     if nearby_filter is None:
         return list(items)
@@ -1472,6 +2456,19 @@ def _filter_cached_plan_items_by_proximity(items, nearby_filter, nearby_stats, i
             continue
         if target_kinds is not None and kind not in target_kinds:
             continue
+        if kind == "sector_instancer":
+            transforms = item.get("sector_transforms") or []
+            any_nearby = False
+            for tr in transforms:
+                t_pos = tr.get("t") if isinstance(tr, dict) else None
+                if t_pos and _position_within_nearby_filter(t_pos, nearby_filter):
+                    any_nearby = True
+                    break
+            if any_nearby:
+                keep.add(str(item.get("id", "") or ""))
+            elif transforms:
+                filtered_count += 1
+            continue
         position = item.get("world_position")
         if position is None:
             continue
@@ -1492,6 +2489,166 @@ def _filter_cached_plan_items_by_proximity(items, nearby_filter, nearby_stats, i
 
     nearby_stats["filtered"] = int(nearby_stats.get("filtered", 0) or 0) + filtered_count
     return [item for item in items if str(item.get("id", "") or "") in full_keep]
+
+
+def _stable_sector_instancer_id(repo_path, kind, visibility_key=""):
+    """Build a deterministic id from (kind, repo_path) so reloads can find the same instancer."""
+    import hashlib
+    key = f"{str(kind or '').lower()}|{str(repo_path or '').lower().replace('/', chr(92))}|{str(visibility_key or '').lower()}"
+    return "_si_" + hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
+
+
+def _maybe_group_cached_items_into_sector_instancers(items, kwargs):
+    """If instanced_sector=True, replace top-level non-proxy mesh and rigid_body items with
+    synthetic sector_instancer items grouped by repo_path. Each instancer holds every
+    placement for that repo_path so subsequent camera-radius reloads of the same layer
+    re-attach to the same instancer instead of duplicating it.
+    """
+    if not bool(kwargs and kwargs.get("instanced_sector", False)):
+        return list(items or [])
+
+    items = list(items or [])
+    if not items:
+        return items
+
+    grouped = {}  # (kind, repo_path, visibility_key) -> list of items
+    survivors = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            survivors.append(item)
+            continue
+        kind = str(item.get("kind", "") or "").strip().lower()
+        parent_id = str(item.get("parent_id", "") or "").strip()
+        repo_path = str(item.get("repo_path", "") or "").strip()
+        if parent_id or not repo_path:
+            survivors.append(item)
+            continue
+        is_proxy = _cached_plan_item_is_proxy_mesh(item) if kind in {"mesh", "component_mesh"} else False
+        if (kind == "mesh" and not is_proxy) or kind in {"rigid", "rigid_body", "collision"}:
+            visibility_key = _sector_visibility_key_for_item(kind, item)
+            grouped.setdefault((kind, repo_path, visibility_key), []).append(item)
+        else:
+            survivors.append(item)
+
+    if not grouped:
+        return items
+
+    new_items = list(survivors)
+    for (kind, repo_path, visibility_key), grouped_items in grouped.items():
+        sector_transforms = []
+        for it in grouped_items:
+            t_src = it.get("translation") or it.get("local_position") or it.get("world_position") or [0.0, 0.0, 0.0]
+            try:
+                t = [float(t_src[0]), float(t_src[1]), float(t_src[2])]
+            except Exception:
+                t = [0.0, 0.0, 0.0]
+            m = it.get("matrix")
+            if m:
+                try:
+                    m = [list(r) for r in m]
+                except Exception:
+                    m = None
+            sector_transforms.append({"t": t, "m": m})
+        synth = {
+            "id": _stable_sector_instancer_id(repo_path, kind, visibility_key),
+            "kind": "sector_instancer",
+            "name": Path(repo_path.replace("\\", "/")).stem or "Instancer",
+            "parent_id": "",
+            "repo_path": repo_path,
+            "sector_transforms": sector_transforms,
+            "_source_kind": kind,
+        }
+        if visibility_key:
+            synth["sector_visibility_key"] = visibility_key
+            synth["sector_visible"] = visibility_key != "hidden"
+            first_flags = grouped_items[0].get("sector_flags") if grouped_items else None
+            if first_flags is not None:
+                synth["sector_flags"] = first_flags
+        new_items.append(synth)
+
+    return new_items
+
+
+def _ensure_cached_sector_group_hierarchy(items):
+    """Add CSectorData child groups to flat cached sector items.
+
+    Fast scan cache entries record sector meshes/lights as top-level items. Direct
+    W2L import and slow resolved plans already expose them under CSectorData, so
+    normalize the fast path before creating Blender objects.
+    """
+    source_items = [item for item in items or [] if isinstance(item, dict)]
+    if not source_items:
+        return []
+    for item in source_items:
+        if (
+            str(item.get("kind", "") or "").strip().lower() == "group"
+            and str(item.get("name", "") or "").strip() == "CSectorData"
+        ):
+            return list(source_items)
+
+    sector_kind_to_group = {
+        "mesh": "_sector_mesh",
+        "sector_instancer": "_sector_mesh",
+        "rigid": "_sector_rigid",
+        "rigid_body": "_sector_rigid",
+        "collision": "_sector_collision",
+        "point_light": "_sector_point_light",
+        "spot_light": "_sector_spot_light",
+    }
+    group_names = {
+        "_sector_collision": "Collision",
+        "_sector_rigid": "Rigid",
+        "_sector_mesh": "Mesh",
+        "_sector_point_light": "PointLight",
+        "_sector_spot_light": "SpotLight",
+    }
+    needed_groups = set()
+    normalized = []
+    for item in source_items:
+        copied = dict(item)
+        kind = str(copied.get("kind", "") or "").strip().lower()
+        source_kind = str(copied.get("_source_kind", "") or "").strip().lower()
+        parent_id = str(copied.get("parent_id", "") or "").strip()
+        group_id = sector_kind_to_group.get(source_kind if kind == "sector_instancer" else kind)
+        if group_id and not parent_id:
+            copied["parent_id"] = group_id
+            needed_groups.add(group_id)
+        normalized.append(copied)
+
+    if not needed_groups:
+        return normalized
+
+    groups = [
+        {
+            "id": "_sector_root",
+            "kind": "group",
+            "name": "CSectorData",
+            "parent_id": "",
+            "repo_path": "",
+            "transform": None,
+            "matrix": None,
+            "translation": None,
+            "world_position": None,
+        }
+    ]
+    for group_id in ("_sector_collision", "_sector_rigid", "_sector_mesh", "_sector_point_light", "_sector_spot_light"):
+        if group_id not in needed_groups:
+            continue
+        groups.append(
+            {
+                "id": group_id,
+                "kind": "group",
+                "name": group_names[group_id],
+                "parent_id": "_sector_root",
+                "repo_path": "",
+                "transform": None,
+                "matrix": None,
+                "translation": None,
+                "world_position": None,
+            }
+        )
+    return groups + normalized
 
 
 def _resolve_component_import_plan(
@@ -1521,10 +2678,15 @@ def _resolve_component_import_plan(
         except Exception:
             log.exception("Problem resolving mesh component %s", component_name)
             return None
+        mesh_label = str(getattr(mesh, "name", "") or "").strip()
+        if not mesh_label or mesh_label == "Mesh Item":
+            mesh_label = Path(mesh.meshName).stem or component_name
+        drawable_flags = _component_drawable_flags(component)
+        engine_visible = _drawable_flags_visible_from_value(drawable_flags, default=True)
         return _add_level_import_plan_item(
             plan,
             "component_mesh",
-            Path(mesh.meshName).stem or component_name,
+            f"{component_name} {mesh_label}",
             parent_id=parent_id,
             repo_path=mesh.meshName,
             transform=getattr(mesh, "transform", None),
@@ -1532,6 +2694,8 @@ def _resolve_component_import_plan(
             translation=getattr(mesh, "translation", None),
             world_position=_mesh_world_position(mesh, parent_position),
             is_proxy_mesh=_path_indicates_proxy_mesh(mesh.meshName, component_name),
+            drawable_flags=drawable_flags,
+            engine_visible=engine_visible,
         )
 
     if component_name == "CPointLightComponent":
@@ -1767,7 +2931,7 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
     mesh_uncook_path = kwargs.get("_mesh_uncook_path")
 
     if levelData.Foliage and do_import_Mesh:
-        for treeCollection in levelData.Foliage.Trees.elements:
+        for treeCollection in (levelData.Foliage.Trees.elements if hasattr(levelData.Foliage, 'Trees') else []):
             treeFilePath = treeCollection.TreeType.DepotPath
             for treeTransform in treeCollection.TreeCollection.elements:
                 if not _position_within_nearby_filter(
@@ -1784,7 +2948,7 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
                     transform=treeTransform,
                     world_position=_extract_transform_position(treeTransform),
                 )
-        for treeCollection in levelData.Foliage.Grasses.elements:
+        for treeCollection in (levelData.Foliage.Grasses.elements if hasattr(levelData.Foliage, 'Grasses') else []):
             treeFilePath = treeCollection.TreeType.DepotPath
             for treeTransform in treeCollection.TreeCollection.elements:
                 if not _position_within_nearby_filter(
@@ -1825,50 +2989,85 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
             point_light_root_id = _add_level_import_plan_item(plan, "group", "PointLight", parent_id=sector_root_id)
             spot_light_root_id = _add_level_import_plan_item(plan, "group", "SpotLight", parent_id=sector_root_id)
 
+            instanced_sector = bool(kwargs.get("instanced_sector", False))
+            # Per-repo_path/visibility transform accumulator for GN instancing.
+            _sector_instancer_groups: dict = {}  # (kind, repo_path, visibility_key) -> [{"t": [...], "m": [...]}, ...]
+
             for mesh in mesh_candidates:
                 is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
-                if (
-                    mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
-                    and ((is_proxy_mesh and proxy_filter_active and do_import_ProxyMesh) or ((not is_proxy_mesh or not proxy_filter_active) and do_import_Mesh))
+                if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh and (
+                    (is_proxy_mesh and proxy_filter_active and do_import_ProxyMesh)
+                    or ((not is_proxy_mesh or not proxy_filter_active) and do_import_Mesh)
                 ):
-                    _add_level_import_plan_item(
-                        plan,
-                        "mesh",
-                        Path(mesh.meshName).stem or "Mesh",
-                        parent_id=mesh_root_id,
-                        repo_path=mesh.meshName,
-                        transform=getattr(mesh, "transform", None),
-                        matrix=getattr(mesh, "matrix", None),
-                        translation=getattr(mesh, "translation", None),
-                        world_position=_mesh_world_position(mesh),
-                        is_proxy_mesh=is_proxy_mesh,
-                        proxy_role=getattr(mesh, "proxy_role", ""),
-                        sector_flags=getattr(mesh, "sector_flags", None),
-                    )
+                    if instanced_sector and not is_proxy_mesh:
+                        # Accumulate for GN instancer instead of individual object
+                        rp = str(mesh.meshName or "").strip()
+                        if rp:
+                            tv = _extract_vector_position(getattr(mesh, "translation", None))
+                            t = list(tv) if tv else [0.0, 0.0, 0.0]
+                            m = _copy_matrix_array(getattr(mesh, "matrix", None))
+                            m = [list(r) for r in m] if m else None
+                            vis_key = _sector_visibility_key_from_flags(getattr(mesh, "sector_flags", None), default=True)
+                            _sector_instancer_groups.setdefault(("mesh", rp, vis_key), []).append({"t": t, "m": m})
+                    else:
+                        _add_level_import_plan_item(
+                            plan,
+                            "mesh",
+                            Path(mesh.meshName).stem or "Mesh",
+                            parent_id=mesh_root_id,
+                            repo_path=mesh.meshName,
+                            transform=getattr(mesh, "transform", None),
+                            matrix=getattr(mesh, "matrix", None),
+                            translation=getattr(mesh, "translation", None),
+                            world_position=_mesh_world_position(mesh),
+                            is_proxy_mesh=is_proxy_mesh,
+                            proxy_role=getattr(mesh, "proxy_role", ""),
+                            sector_flags=getattr(mesh, "sector_flags", None),
+                        )
                 elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
-                    _add_level_import_plan_item(
-                        plan,
-                        "collision",
-                        Path(mesh.meshName).stem or "Collision",
-                        parent_id=collision_root_id,
-                        repo_path=mesh.meshName,
-                        transform=getattr(mesh, "transform", None),
-                        matrix=getattr(mesh, "matrix", None),
-                        translation=getattr(mesh, "translation", None),
-                        world_position=_mesh_world_position(mesh),
-                    )
+                    if instanced_sector:
+                        rp = str(mesh.meshName or "").strip()
+                        if rp:
+                            tv = _extract_vector_position(getattr(mesh, "translation", None))
+                            t = list(tv) if tv else [0.0, 0.0, 0.0]
+                            m = _copy_matrix_array(getattr(mesh, "matrix", None))
+                            m = [list(r) for r in m] if m else None
+                            _sector_instancer_groups.setdefault(("collision", rp, ""), []).append({"t": t, "m": m})
+                    else:
+                        _add_level_import_plan_item(
+                            plan,
+                            "collision",
+                            Path(mesh.meshName).stem or "Collision",
+                            parent_id=collision_root_id,
+                            repo_path=mesh.meshName,
+                            transform=getattr(mesh, "transform", None),
+                            matrix=getattr(mesh, "matrix", None),
+                            translation=getattr(mesh, "translation", None),
+                            world_position=_mesh_world_position(mesh),
+                        )
                 elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
-                    _add_level_import_plan_item(
-                        plan,
-                        "rigid_body",
-                        Path(mesh.meshName).stem or "RigidBody",
-                        parent_id=rigid_root_id,
-                        repo_path=mesh.meshName,
-                        transform=getattr(mesh, "transform", None),
-                        matrix=getattr(mesh, "matrix", None),
-                        translation=getattr(mesh, "translation", None),
-                        world_position=_mesh_world_position(mesh),
-                    )
+                    if instanced_sector:
+                        rp = str(mesh.meshName or "").strip()
+                        if rp:
+                            tv = _extract_vector_position(getattr(mesh, "translation", None))
+                            t = list(tv) if tv else [0.0, 0.0, 0.0]
+                            m = _copy_matrix_array(getattr(mesh, "matrix", None))
+                            m = [list(r) for r in m] if m else None
+                            vis_key = _sector_visibility_key_from_flags(getattr(mesh, "sector_flags", None), default=True)
+                            _sector_instancer_groups.setdefault(("rigid", rp, vis_key), []).append({"t": t, "m": m})
+                    else:
+                        _add_level_import_plan_item(
+                            plan,
+                            "rigid_body",
+                            Path(mesh.meshName).stem or "RigidBody",
+                            parent_id=rigid_root_id,
+                            repo_path=mesh.meshName,
+                            transform=getattr(mesh, "transform", None),
+                            matrix=getattr(mesh, "matrix", None),
+                            translation=getattr(mesh, "translation", None),
+                            world_position=_mesh_world_position(mesh),
+                            sector_flags=getattr(mesh, "sector_flags", None),
+                        )
                 elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
                     _add_level_import_plan_item(
                         plan,
@@ -1891,6 +3090,26 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
                         translation=getattr(mesh, "translation", None),
                         world_position=_mesh_world_position(mesh),
                     )
+
+            # Emit one sector_instancer item per unique repo_path
+            instancer_parent_by_kind = {
+                "mesh": mesh_root_id,
+                "rigid": rigid_root_id,
+                "rigid_body": rigid_root_id,
+                "collision": collision_root_id,
+            }
+            for (si_kind, rp, vis_key), transforms in _sector_instancer_groups.items():
+                _add_level_import_plan_item(
+                    plan,
+                    "sector_instancer",
+                    Path(rp.replace("\\", "/")).stem or "Instancer",
+                    parent_id=instancer_parent_by_kind.get(si_kind, mesh_root_id),
+                    repo_path=rp,
+                    sector_transforms=transforms,
+                    sector_visibility_key=vis_key,
+                    sector_visible=(vis_key != "hidden"),
+                    source_kind=si_kind,
+                )
 
     if do_import_Entity:
         for INCLUDE_OBJECT in levelData.includes:
@@ -2027,6 +3246,60 @@ def _tag_object_tree_for_layer_and_plan(
 
 def _tag_object_tree_for_layer(root_obj, owner_tag=None, generation_tag=None):
     _tag_object_tree_for_layer_and_plan(root_obj, owner_tag, generation_tag)
+
+
+def _tag_object_tree_as_proxy_mesh(root_obj):
+    if root_obj is None:
+        return
+    for obj in _iter_object_tree(root_obj):
+        try:
+            obj["witcher_layer_proxy_mesh"] = True
+            obj["witcher_layer_visibility_kind"] = "proxy_mesh"
+        except Exception:
+            continue
+
+
+def _clear_object_tree_proxy_mesh_tags(root_obj):
+    if root_obj is None:
+        return
+    for obj in _iter_object_tree(root_obj):
+        try:
+            if "witcher_layer_proxy_mesh" in obj:
+                del obj["witcher_layer_proxy_mesh"]
+            if str(obj.get("witcher_layer_visibility_kind", "") or "").strip().lower() == "proxy_mesh":
+                del obj["witcher_layer_visibility_kind"]
+            if "witcher_sector_flags" in obj:
+                del obj["witcher_sector_flags"]
+            if "witcher_layer_engine_visible" in obj:
+                del obj["witcher_layer_engine_visible"]
+            obj.hide_viewport = False
+            obj.hide_render = False
+        except Exception:
+            continue
+
+
+def _tag_object_tree_engine_visibility(root_obj, visible, kwargs=None, *, drawable_flags=None, sector_flags=None):
+    if root_obj is None:
+        return
+    visible = bool(visible)
+    drawable_flags_text = _drawable_flags_display_value(drawable_flags) if drawable_flags is not None else None
+    for obj in _iter_object_tree(root_obj):
+        try:
+            obj["witcher_layer_engine_visible"] = visible
+            if sector_flags is not None:
+                obj["witcher_sector_flags"] = int(sector_flags)
+            if drawable_flags_text is not None:
+                obj["witcher_drawableFlags"] = drawable_flags_text
+                obj["witcher_redkit_drawableFlags"] = drawable_flags_text
+                obj["witcher_drawableFlags_has_DF_IsVisible"] = visible
+            if not visible and _hide_engine_hidden_meshes_enabled(kwargs):
+                obj.hide_viewport = True
+                obj.hide_render = True
+            elif visible and _hide_engine_hidden_meshes_enabled(kwargs):
+                obj.hide_viewport = False
+                obj.hide_render = False
+        except Exception:
+            continue
 
 
 def _capture_previous_layer_object_ids(collection, owner_tag, fallback_to_all=False):
@@ -2331,7 +3604,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                 progress_count = _import_plan_as_dev_empties(resolved_plan, dev_target_collection, kwargs)
             else:
                 if levelData.Foliage:
-                    for treeCollection in levelData.Foliage.Trees.elements:
+                    for treeCollection in (levelData.Foliage.Trees.elements if hasattr(levelData.Foliage, 'Trees') else []):
                         _raise_if_layer_import_cancelled(kwargs)
                         treeFilePath = treeCollection.TreeType.DepotPath
                         for treeTransform in treeCollection.TreeCollection.elements:
@@ -2348,7 +3621,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                             tree_mesh.type = "mesh_foliage"
                             import_single_mesh(tree_mesh, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
                             progress_count += 1
-                    for treeCollection in levelData.Foliage.Grasses.elements:
+                    for treeCollection in (levelData.Foliage.Grasses.elements if hasattr(levelData.Foliage, 'Grasses') else []):
                         _raise_if_layer_import_cancelled(kwargs)
                         treeFilePath = treeCollection.TreeType.DepotPath
                         for treeTransform in treeCollection.TreeCollection.elements:
@@ -2405,33 +3678,118 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                         SpotLight_transform.parent = empty_transform
 
                         total_loops = len(mesh_candidates)
-                        mesh:meshPath
-                        for idx, mesh in enumerate(mesh_candidates):
-                            _raise_if_layer_import_cancelled(kwargs)
-                            progress_msg = f"{idx+1}/{total_loops} - {os.path.basename(mesh.meshName)}"
-                            is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
-                            if (
-                                mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
-                                and ((is_proxy_mesh and proxy_filter_active and do_import_ProxyMesh) or ((not is_proxy_mesh or not proxy_filter_active) and do_import_Mesh))
-                            ):
-                                import_single_mesh(
-                                    mesh,
-                                    errors,
-                                    Mesh_transform,
-                                    keep_lod_meshes=keep_lod_meshes or (is_proxy_mesh and bool(kwargs.get("keep_proxy_meshes", True))),
-                                    **kwargs,
+                        instanced_sector = bool(kwargs.get("instanced_sector", False))
+
+                        if instanced_sector:
+                            # Group Mesh/RigidBody placements by repo_path, build one instancer per type.
+                            # Lights and proxy meshes are still imported individually.
+                            # Key: (kind_str, repo_path) → list of transforms + source_kind tag.
+                            instancer_groups = {}
+                            mesh: meshPath
+                            for idx, mesh in enumerate(mesh_candidates):
+                                _raise_if_layer_import_cancelled(kwargs)
+                                is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
+                                if (
+                                    mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
+                                    and not is_proxy_mesh and do_import_Mesh
+                                ):
+                                    rp = str(mesh.meshName or "").strip()
+                                    if rp:
+                                        tv = _extract_vector_position(getattr(mesh, "translation", None))
+                                        t = list(tv) if tv else [0.0, 0.0, 0.0]
+                                        m = _copy_matrix_array(getattr(mesh, "matrix", None))
+                                        m = [list(r) for r in m] if m else None
+                                        vis_key = _sector_visibility_key_from_flags(getattr(mesh, "sector_flags", None), default=True)
+                                        instancer_groups.setdefault(("mesh", rp, vis_key), []).append({"t": t, "m": m})
+                                elif (
+                                    mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
+                                    and is_proxy_mesh and proxy_filter_active and do_import_ProxyMesh
+                                ):
+                                    import_single_mesh(
+                                        mesh, errors, Mesh_transform,
+                                        keep_lod_meshes=keep_lod_meshes or bool(kwargs.get("keep_proxy_meshes", True)),
+                                        **kwargs,
+                                    )
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
+                                    rp = str(mesh.meshName or "").strip()
+                                    if rp:
+                                        tv = _extract_vector_position(getattr(mesh, "translation", None))
+                                        t = list(tv) if tv else [0.0, 0.0, 0.0]
+                                        m = _copy_matrix_array(getattr(mesh, "matrix", None))
+                                        m = [list(r) for r in m] if m else None
+                                        vis_key = _sector_visibility_key_from_flags(getattr(mesh, "sector_flags", None), default=True)
+                                        instancer_groups.setdefault(("rigid", rp, vis_key), []).append({"t": t, "m": m})
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
+                                    rp = str(mesh.meshName or "").strip()
+                                    if rp:
+                                        tv = _extract_vector_position(getattr(mesh, "translation", None))
+                                        t = list(tv) if tv else [0.0, 0.0, 0.0]
+                                        m = _copy_matrix_array(getattr(mesh, "matrix", None))
+                                        m = [list(r) for r in m] if m else None
+                                        instancer_groups.setdefault(("collision", rp, ""), []).append({"t": t, "m": m})
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
+                                    import_light(mesh, PointLight_transform)
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.SpotLight and do_import_SpotLight:
+                                    import_light(mesh, SpotLight_transform)
+                                progress_count += 1
+
+                            active_coll = getattr(bpy.context, "collection", None) or collection
+                            owner_tag = kwargs.get("_layer_import_owner")
+                            gen_tag = kwargs.get("_layer_import_generation")
+                            mode_sig = str(kwargs.get("_layer_import_mode_signature", "") or "")
+                            instancer_parent_by_kind = {
+                                "mesh": Mesh_transform,
+                                "rigid": Rigid_transform,
+                                "rigid_body": Rigid_transform,
+                                "collision": Collision_transform,
+                            }
+                            for si_idx, ((si_kind, rp, vis_key), transforms) in enumerate(instancer_groups.items()):
+                                _raise_if_layer_import_cancelled(kwargs)
+                                synthetic_item = {
+                                    "id": f"si_{si_idx}",
+                                    "repo_path": rp,
+                                    "sector_transforms": transforms,
+                                    "_source_kind": si_kind,
+                                    "sector_visibility_key": vis_key,
+                                    "sector_visible": vis_key != "hidden",
+                                }
+                                _import_cached_plan_sector_instancer_item(
+                                    synthetic_item,
+                                    active_coll,
+                                    instancer_parent_by_kind.get(si_kind, Mesh_transform),
+                                    owner_tag, gen_tag,
+                                    f"si_{si_idx}", mode_sig,
+                                    kwargs, errors, context=context,
                                 )
-                            elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
-                                import_single_mesh(mesh, errors, Collision_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                            elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
-                                import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                            elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
-                                import_light(mesh, PointLight_transform)
-                            elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.SpotLight and do_import_SpotLight:
-                                import_light(mesh, SpotLight_transform)
-                            progress_count += 1
-                            progress_msg += " " * (80 - len(progress_msg))
-                            log.info(progress_msg)
+                        else:
+                            mesh: meshPath
+                            for idx, mesh in enumerate(mesh_candidates):
+                                _raise_if_layer_import_cancelled(kwargs)
+                                progress_msg = f"{idx+1}/{total_loops} - {os.path.basename(mesh.meshName)}"
+                                is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
+                                if (
+                                    mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
+                                    and ((is_proxy_mesh and proxy_filter_active and do_import_ProxyMesh) or ((not is_proxy_mesh or not proxy_filter_active) and do_import_Mesh))
+                                ):
+                                    import_single_mesh(
+                                        mesh,
+                                        errors,
+                                        Mesh_transform,
+                                        keep_lod_meshes=keep_lod_meshes or (is_proxy_mesh and bool(kwargs.get("keep_proxy_meshes", True))),
+                                        **kwargs,
+                                    )
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
+                                    _import_sector_collision_from_cache(mesh, errors, Collision_transform, **kwargs)
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
+                                    import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
+                                    import_light(mesh, PointLight_transform)
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.SpotLight and do_import_SpotLight:
+                                    import_light(mesh, SpotLight_transform)
+                                progress_count += 1
+                                progress_msg += " " * (80 - len(progress_msg))
+                                log.info(progress_msg)
+
                         _tag_object_tree_for_layer(
                             empty_transform,
                             kwargs.get("_layer_import_owner"),
@@ -2608,6 +3966,8 @@ def loadLevelFromCachedPlan(level_file, plan_items, context=None, **kwargs):
                 kwargs,
                 context=context,
             )
+            source_items = _maybe_group_cached_items_into_sector_instancers(source_items, kwargs)
+            source_items = _ensure_cached_sector_group_hierarchy(source_items)
         filtered_items = _filter_cached_plan_items_by_proximity(
             source_items,
             nearby_filter,
@@ -3011,7 +4371,8 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
             if obj not in objs:
                 objs.append(obj)
             #if keep_lod_meshes:
-            obj.name = Path(mesh.meshName).stem
+            import_name = str(getattr(mesh, "import_name", "") or "").strip()
+            obj.name = import_name or Path(mesh.meshName).stem
             obj['repo_path'] = mesh.meshName
             for subobj in objs:
                 if subobj == obj:
@@ -3107,6 +4468,32 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
         kwargs.get("_layer_import_plan_item_id"),
         kwargs.get("_layer_import_plan_mode"),
     )
+    is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
+    if is_proxy_mesh:
+        _tag_object_tree_as_proxy_mesh(obj)
+    else:
+        _clear_object_tree_proxy_mesh_tags(obj)
+    sector_flags = getattr(mesh, "sector_flags", None)
+    if sector_flags is not None:
+        try:
+            _tag_object_tree_engine_visibility(
+                obj,
+                _sector_mesh_visible_from_flags(sector_flags, default=True),
+                kwargs,
+                sector_flags=sector_flags,
+            )
+        except Exception:
+            pass
+    elif hasattr(mesh, "engine_visible"):
+        try:
+            _tag_object_tree_engine_visibility(
+                obj,
+                bool(getattr(mesh, "engine_visible")),
+                kwargs,
+                drawable_flags=getattr(mesh, "drawable_flags", None) if hasattr(mesh, "drawable_flags") else None,
+            )
+        except Exception:
+            pass
     transform_seconds = time.perf_counter() - transform_started
     total_seconds = time.perf_counter() - mesh_started
     _record_layer_mesh_profile(
@@ -3158,12 +4545,14 @@ def getDataBufferMesh(entity, *, mesh_fbx_uncook_path=None, mesh_uncook_path=Non
             if chunk.name in Entity_Type_List:
                 log.info("Found an entity in data buffer??")
             if chunk.name in MeshComponent_Type_List:
-                mesh_list.append(
-                    _new_mesh_path(
-                        fbx_uncook_path=mesh_fbx_uncook_path,
-                        uncook_path=mesh_uncook_path,
-                    ).static_from_chunk(chunk)
-                )
+                mesh = _new_mesh_path(
+                    fbx_uncook_path=mesh_fbx_uncook_path,
+                    uncook_path=mesh_uncook_path,
+                ).static_from_chunk(chunk)
+                drawable_flags = _component_drawable_flags(chunk)
+                mesh.drawable_flags = drawable_flags
+                mesh.engine_visible = _drawable_flags_visible_from_value(drawable_flags, default=True)
+                mesh_list.append(mesh)
             
             if chunk.name == "CClothComponent":
                 cloth_list.append(chunk)
@@ -3184,6 +4573,13 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False, **kw
                 return
             # if component.get_CR2W_version() <= 115:
             #     mesh.uncook_path = get_witcher2_game_path(bpy.context) + '\\data'
+            mesh_label = str(getattr(mesh, "name", "") or "").strip()
+            if not mesh_label or mesh_label == "Mesh Item":
+                mesh_label = Path(mesh.meshName).stem or component.name
+            drawable_flags = _component_drawable_flags(component)
+            mesh.drawable_flags = drawable_flags
+            mesh.engine_visible = _drawable_flags_visible_from_value(drawable_flags, default=True)
+            mesh.import_name = f"{component.name} {mesh_label}"
             import_single_mesh(
                 mesh,
                 [],
@@ -3382,6 +4778,7 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
         _raise_if_layer_import_cancelled(kwargs)
         import_single_component(component, empty_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
         imported_any = True
+    _tag_entity_empty_engine_visibility_from_children(empty_transform, kwargs)
     #MESH THIS ENTITY HAS
     # for mesh in ENTITY_OBJECT.static_mesh_list:
     #     import_single_mesh(mesh, errors, empty_transform, **kwargs)

@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -57,6 +58,7 @@ _STREAM_COMPONENT_TYPES = _STREAM_MESH_COMPONENT_TYPES | {"CClothComponent"}
 _TARGET_PROP_NAMES = frozenset(
     {
         "actionName",
+        "drawableFlags",
         "includes",
         "mesh",
         "name",
@@ -79,15 +81,49 @@ _PLAN_ITEM_EXTRA_KEYS = frozenset(
         "is_proxy_mesh",
         "proxy_role",
         "sector_flags",
+        "drawable_flags",
+        "engine_visible",
     }
 )
 _SECTOR_FLAG_MESH_PART_OF_ENTITY_PROXY = 1 << 10
 _SECTOR_FLAG_MESH_ROOT_ENTITY_PROXY = 1 << 11
 
 
+def _drawable_flags_visible_from_value(flags, default=True):
+    if flags is None:
+        return bool(default)
+    if isinstance(flags, (list, tuple, set)):
+        names = {str(value or "").strip() for value in flags}
+        return "DF_IsVisible" in names or "IsVisible" in names
+    if isinstance(flags, str):
+        parts = {part for part in re.split(r"[\s,|;]+", flags.strip()) if part}
+        return "DF_IsVisible" in parts or "IsVisible" in parts
+    try:
+        return bool(int(flags) & 1)
+    except Exception:
+        return bool(default)
+
+
 def _path_indicates_proxy_mesh(repo_path, name=""):
     text = f"{repo_path or ''}/{name or ''}".replace("\\", "/").lower()
-    return bool(text and "proxy" in text)
+    if not text:
+        return False
+    parts = [part for part in re.split(r"[\\/]+", text) if part]
+    tokens = []
+    for part in parts:
+        stem = Path(part).stem if "." in part else part
+        if stem == "no_proxy" or stem.endswith("_no_proxy") or stem.endswith("-no-proxy"):
+            continue
+        tokens.extend(token for token in re.split(r"[_\-\s]+", stem) if token)
+    return any(token == "proxy" for token in tokens)
+
+
+def _path_extension(repo_path):
+    return Path(str(repo_path or "").replace("\\", "/")).suffix.lower()
+
+
+def _sector_collision_path_is_visual_mesh(repo_path):
+    return _path_extension(repo_path) in {".w2mesh", ".mesh"}
 
 
 def _sector_proxy_role_from_flags(flags):
@@ -385,6 +421,18 @@ def _parse_selected_prop_value(cr2w_file, handle, prop, data_end):
     if prop_name in {"mesh", "resource"}:
         return _read_first_handle_path(handle, cr2w_file, count)
 
+    if prop_name == "drawableFlags":
+        flags = []
+        while handle.tell() + 2 <= data_end:
+            idx = int(readUShort(handle) or 0)
+            if idx == 0:
+                break
+            try:
+                flags.append(cr2w_file.CNAMES[idx].name.value)
+            except Exception:
+                break
+        return flags
+
     if prop_name == "streamingDistance":
         if element_type == "Float":
             return float(readFloat(handle))
@@ -573,7 +621,7 @@ def _scan_sector_export(cr2w_file, handle, class_end):
                     "sector_flags": sector_flags,
                 }
                 if kind == "mesh":
-                    item["is_proxy_mesh"] = bool(proxy_role) or _path_indicates_proxy_mesh(repo_path)
+                    item["is_proxy_mesh"] = proxy_role == "root" or _path_indicates_proxy_mesh(repo_path)
                     if proxy_role:
                         item["proxy_role"] = proxy_role
         elif packed_type == Enums.BlockDataObjectType.PointLight:
@@ -797,6 +845,7 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
             repo_path = str(props.get("mesh", "") or props.get("resource", "") or "").strip()
             if not repo_path:
                 return None
+            drawable_flags = props.get("drawableFlags")
             return {
                 "kind": "mesh",
                 "name": Path(repo_path).stem or export_name,
@@ -806,6 +855,8 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
                 "translation": None,
                 "local_position": local_position,
                 "is_proxy_mesh": _path_indicates_proxy_mesh(repo_path, export_name),
+                "drawable_flags": drawable_flags,
+                "engine_visible": _drawable_flags_visible_from_value(drawable_flags, default=True),
             }
         if export_name == "CClothComponent":
             repo_path = str(props.get("resource", "") or "").strip()
@@ -827,9 +878,11 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
         repo_path = str(props.get("mesh", "") or props.get("resource", "") or "").strip()
         if not repo_path:
             return None
+        component_label = str(props.get("name", "") or "").strip() or Path(repo_path).stem or export_name
+        drawable_flags = props.get("drawableFlags")
         return {
             "kind": "component_mesh",
-            "name": Path(repo_path).stem or export_name,
+            "name": f"{export_name} {component_label}",
             "repo_path": repo_path,
             "transform": transform,
             "matrix": None,
@@ -837,6 +890,8 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
             "local_position": local_position,
             "streaming_distance": float(props.get("streamingDistance", 0.0) or 0.0),
             "is_proxy_mesh": _path_indicates_proxy_mesh(repo_path, export_name),
+            "drawable_flags": drawable_flags,
+            "engine_visible": _drawable_flags_visible_from_value(drawable_flags, default=True),
         }
 
     if export_name == "CPointLightComponent":

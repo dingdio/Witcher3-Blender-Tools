@@ -8,7 +8,7 @@ from typing import List, Tuple
 from mathutils import Vector, Matrix
 import numpy as np
 import array
-from ..CR2W.common_blender import repo_file, get_collision_for_mesh, win_safe_path
+from ..CR2W.common_blender import repo_file, get_collision_for_mesh, get_collision_for_mesh_with_poses, win_safe_path
 from ..importers.import_rig import rotate_and_connect_bones
 
 from ..cloth_util import setup_w3_material_CR2W
@@ -329,7 +329,7 @@ def import_mesh(filename:str,
                 rotate_180:bool = False,
                 keep_empty_lods:bool = False,
                 keep_proxy_meshes:bool = False,
-                do_import_cache_collision:bool = False,
+                do_import_collision:bool = False,
                 hide_zero_weight_faces:bool = True) -> w3_types.CSkeletalAnimationSet:
     mesh_started = time.perf_counter()
     parse_seconds = 0.0
@@ -403,70 +403,81 @@ def import_mesh(filename:str,
 
                 from ..CR2W.CR2W_types import W_CLASS
                 collision_started = time.perf_counter()
-                for CHUNK in meshFile.CHUNKS.CHUNKS:
-                    CHUNK:W_CLASS
-                    if CHUNK.name == 'CCollisionMesh':
-                        log.info('Found Collision Mesh')
-                        shapes = CHUNK.GetVariableByName('shapes')
-                        if hasattr(shapes, 'value'): ##TODO HANDLE WITCHER 2 COLLISION
-                            for shape_chunk_id in shapes.value:
-                                shape_ = meshFile.CHUNKS.CHUNKS[shape_chunk_id-1]
-                                log.info(shape_.Type+' found')
-                                if shape_.Type == 'CCollisionShapeConvex':
-                                    col_ = CCollisionShapeConvex(shape_)
-                                    try:
-                                        createCol(col_, meshName)
-                                    except Exception as e:
-                                        log.warning("Skipping convex collision for '%s': %s", meshName, e)
-                                        continue
-                                    if not getattr(col_, 'physicalMaterialName', None):
-                                        _warn_missing_physical_material(shape_.Type, meshName)
-                                    log.debug("physicalMaterialName: %s", col_.physicalMaterialName)
-                                    log.debug("polygons: %s", col_.polygons)
-                                    log.debug("vertices: %s", col_.vertices)
-                                elif shape_.Type == 'CCollisionShapeTriMesh':
-                                    tri_ = CCollisionShapeTriMesh(shape_)
-                                    try:
-                                        createTri(tri_, meshName)
-                                    except Exception as e:
-                                        log.warning("Skipping tri collision for '%s': %s", meshName, e)
-                                        continue
-                                    if not getattr(tri_, 'physicalMaterialNames', None):
-                                        _warn_missing_physical_material(shape_.Type, meshName)
-                                    log.debug("physicalMaterialNames: %s", tri_.physicalMaterialNames)
-                                    log.debug("vertices: %s", tri_.vertices)
-                                    log.debug("triangles: %s", tri_.triangles)
-                                    log.debug("physicalMaterialIndexes: %s", tri_.physicalMaterialIndexes)
-                                elif shape_.Type == 'CCollisionShapeBox':
-                                    box_ = CCollisionShapeBox(shape_)
-                                    createBox(box_, meshName)
-                                    if not getattr(box_, 'physicalMaterialName', None):
-                                        _warn_missing_physical_material(shape_.Type, meshName)
-                                    log.debug("physicalMaterialName: %s", getattr(box_, 'physicalMaterialName', 'NO_MATERIAL'))
-                                elif shape_.Type == 'CCollisionShapeSphere':
-                                    sphere_ = CCollisionShapeSphere(shape_)
-                                    createSphere(sphere_, meshName)
-                                    if not getattr(sphere_, 'physicalMaterialName', None):
-                                        _warn_missing_physical_material(shape_.Type, meshName)
-                                    log.debug("physicalMaterialName: %s", getattr(sphere_, 'physicalMaterialName', 'NO_MATERIAL'))
-                                elif shape_.Type == 'CCollisionShapeCapsule':
-                                    capsule_ = CCollisionShapeCapsule(shape_)
-                                    createCapsule(capsule_, meshName)
-                                    if not getattr(capsule_, 'physicalMaterialName', None):
-                                        _warn_missing_physical_material(shape_.Type, meshName)
-                                    log.debug("physicalMaterialName: %s", getattr(capsule_, 'physicalMaterialName', 'NO_MATERIAL'))
-                        break
+                found_embedded_collision = False
+
+                ###################
+                ##### COLLISION ###
+                ###################
+                # Uncooked mesh: import embedded CCollisionMesh shapes directly.
+                # Cooked mesh: no CCollisionMesh chunk present; use collision cache instead.
+                if do_import_collision:
+                    for CHUNK in meshFile.CHUNKS.CHUNKS:
+                        CHUNK:W_CLASS
+                        if CHUNK.name == 'CCollisionMesh':
+                            found_embedded_collision = True
+                            log.info('Found embedded Collision Mesh (uncooked)')
+                            shapes = CHUNK.GetVariableByName('shapes')
+                            if hasattr(shapes, 'value'): ##TODO HANDLE WITCHER 2 COLLISION
+                                for shape_chunk_id in shapes.value:
+                                    shape_ = meshFile.CHUNKS.CHUNKS[shape_chunk_id-1]
+                                    log.info(shape_.Type+' found')
+                                    if shape_.Type == 'CCollisionShapeConvex':
+                                        col_ = CCollisionShapeConvex(shape_)
+                                        try:
+                                            createCol(col_, meshName)
+                                        except Exception as e:
+                                            log.warning("Skipping convex collision for '%s': %s", meshName, e)
+                                            continue
+                                        if not getattr(col_, 'physicalMaterialName', None):
+                                            _warn_missing_physical_material(shape_.Type, meshName)
+                                        log.debug("physicalMaterialName: %s", col_.physicalMaterialName)
+                                        log.debug("polygons: %s", col_.polygons)
+                                        log.debug("vertices: %s", col_.vertices)
+                                    elif shape_.Type == 'CCollisionShapeTriMesh':
+                                        tri_ = CCollisionShapeTriMesh(shape_)
+                                        try:
+                                            createTri(tri_, meshName)
+                                        except Exception as e:
+                                            log.warning("Skipping tri collision for '%s': %s", meshName, e)
+                                            continue
+                                        if not getattr(tri_, 'physicalMaterialNames', None):
+                                            _warn_missing_physical_material(shape_.Type, meshName)
+                                        log.debug("physicalMaterialNames: %s", tri_.physicalMaterialNames)
+                                        log.debug("vertices: %s", tri_.vertices)
+                                        log.debug("triangles: %s", tri_.triangles)
+                                        log.debug("physicalMaterialIndexes: %s", tri_.physicalMaterialIndexes)
+                                    elif shape_.Type == 'CCollisionShapeBox':
+                                        box_ = CCollisionShapeBox(shape_)
+                                        createBox(box_, meshName)
+                                        if not getattr(box_, 'physicalMaterialName', None):
+                                            _warn_missing_physical_material(shape_.Type, meshName)
+                                        log.debug("physicalMaterialName: %s", getattr(box_, 'physicalMaterialName', 'NO_MATERIAL'))
+                                    elif shape_.Type == 'CCollisionShapeSphere':
+                                        sphere_ = CCollisionShapeSphere(shape_)
+                                        createSphere(sphere_, meshName)
+                                        if not getattr(sphere_, 'physicalMaterialName', None):
+                                            _warn_missing_physical_material(shape_.Type, meshName)
+                                        log.debug("physicalMaterialName: %s", getattr(sphere_, 'physicalMaterialName', 'NO_MATERIAL'))
+                                    elif shape_.Type == 'CCollisionShapeCapsule':
+                                        capsule_ = CCollisionShapeCapsule(shape_)
+                                        createCapsule(capsule_, meshName)
+                                        if not getattr(capsule_, 'physicalMaterialName', None):
+                                            _warn_missing_physical_material(shape_.Type, meshName)
+                                        log.debug("physicalMaterialName: %s", getattr(capsule_, 'physicalMaterialName', 'NO_MATERIAL'))
+                            break
 
                 ###################
                 ### CACHE COLLISION
                 ###################
-                # Optionally load .nxs collision file from collision cache
-                if do_import_cache_collision:
+                # Cooked mesh: no embedded collision chunk found, look up the .nxs in
+                # the collision cache. Poses (localToMesh transforms per shape) are
+                # parsed from the RED header wrapper stored alongside the NXS data.
+                if do_import_collision and not found_embedded_collision:
                     try:
-                        collision_path = get_collision_for_mesh(filename)
+                        collision_path, shape_items = get_collision_for_mesh_with_poses(filename)
                         if collision_path and os.path.exists(collision_path):
                             log.info(f'Loading collision from cache: {collision_path}')
-                            create_from_nxs(collision_path)
+                            create_from_nxs(collision_path, shape_items=shape_items)
                     except Exception as e:
                         log.warning(f'Failed to load collision from cache: {e}')
 

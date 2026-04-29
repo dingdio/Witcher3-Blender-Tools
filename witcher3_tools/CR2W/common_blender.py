@@ -892,6 +892,68 @@ def repo_collision_file(mesh_filepath: str) -> str:
     return output_path
 
 
+def repo_collision_file_with_poses(mesh_filepath: str):
+    """Like repo_collision_file but also returns per-shape data from the RED header.
+
+    Returns:
+        tuple: (path, shape_items) where path is the extracted .nxs path (or None) and
+               shape_items is a list of (matrix_4x4_or_None, flag, payload_bytes, material_name)
+               tuples from CollisionCacheItem.get_shapes_with_data().
+               matrix_4x4 is row-major [[X.x,X.y,X.z,X.w], [Y...], [Z...], [T...]]
+               matching the format expected by _setup_collision_object in import_nxs.py.
+    """
+    from .witcher_cache.CollisionCache.CollisionManager import CollisionManager
+
+    _, uncook_path, _, _ = _get_repo_roots_from_prefs()
+    if not uncook_path:
+        return None, []
+
+    if mesh_filepath.endswith('.w2mesh'):
+        collision_path = mesh_filepath[:-8]
+    else:
+        collision_path = mesh_filepath
+
+    collision_manager = CollisionManager.Get()
+    item = None
+
+    items = collision_manager.find_item_by_path_name(collision_path)
+    if items and len(items) > 0:
+        item = items[0]
+    else:
+        items = collision_manager.find_item_by_path_name(collision_path + ".nxs")
+        if items and len(items) > 0:
+            item = items[0]
+
+    if item is None:
+        normalized_path = collision_path.replace('/', '\\').lower()
+        for key in collision_manager.Items:
+            if normalized_path in key.lower():
+                items = collision_manager.Items[key]
+                if items and len(items) > 0:
+                    item = items[0]
+                    break
+
+    if item is None:
+        return None, []
+
+    shape_items = item.get_shapes_with_data()
+
+    output_path = os.path.join(uncook_path, item.Name)
+    if not output_path.endswith('.nxs'):
+        output_path = output_path + '.nxs'
+
+    if not os.path.exists(output_path):
+        try:
+            extracted_path = item.extract_to_file(output_path)
+            log.info("Extracted collision file: %s", extracted_path)
+            return extracted_path, shape_items
+        except Exception as e:
+            log.error("Failed to extract collision file: %s", e)
+            return None, []
+
+    return output_path, shape_items
+
+
 def get_collision_for_mesh(mesh_filepath: str) -> str:
     """
     Convenience function to get collision file path for a mesh.
@@ -915,3 +977,22 @@ def get_collision_for_mesh(mesh_filepath: str) -> str:
             mesh_filepath = mesh_filepath.replace(uncook_path + '/', '')
 
     return repo_collision_file(mesh_filepath)
+
+
+def get_collision_for_mesh_with_poses(mesh_filepath: str):
+    """Like get_collision_for_mesh but also returns per-shape pose matrices.
+
+    Returns:
+        tuple: (path, poses) — path is the extracted .nxs file path (or None),
+               poses is a list of (matrix_4x4, flag) from CollisionCacheItem.get_shape_poses().
+    """
+    _, uncook_path, _, _ = _get_repo_roots_from_prefs()
+    if os.path.isabs(mesh_filepath) and not uncook_path:
+        return None, []
+
+    if os.path.isabs(mesh_filepath):
+        if uncook_path and uncook_path in mesh_filepath:
+            mesh_filepath = mesh_filepath.replace(uncook_path + '\\', '')
+            mesh_filepath = mesh_filepath.replace(uncook_path + '/', '')
+
+    return repo_collision_file_with_poses(mesh_filepath)

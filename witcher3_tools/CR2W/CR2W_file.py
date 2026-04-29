@@ -109,6 +109,7 @@ class LayerGroup(object):
 
     def __init__(self, name = "GROUP_NAME"):
         self.name = name
+        self.isVisibleOnStart = True
         self.ChildrenGroups = []
         self.ChildrenInfos = []
 
@@ -175,6 +176,9 @@ def getChildrenInfos(info, CHUNKS):
 def getChildrenGroups(group, CHUNKS):
     groupName = group.GetVariableByName('name').String.String
     group_obj = LayerGroup(groupName)
+    visible_prop = group.GetVariableByName('isVisibleOnStart')
+    if visible_prop is not None:
+        group_obj.isVisibleOnStart = bool(visible_prop.Value)
     if group.ChildrenGroups:
         for ChildGroup in group.ChildrenGroups:
             group_obj.ChildrenGroups.append(getChildrenGroups(ChildGroup.GetRef(CHUNKS), CHUNKS))

@@ -350,6 +350,7 @@ def _store_world_layer_metadata(target, world_path="", world_root_collection=Non
 def AddCLayerGroup(groups, parent_collection, world_path=""):
     this_collection = bpy.data.collections.new(groups.name)
     this_collection['group_type'] = "LayerGroup"
+    this_collection['witcher_visible_on_start'] = int(getattr(groups, 'isVisibleOnStart', True))
     if world_path and not parent_collection:
         this_collection["world_path"] = str(world_path)
     if parent_collection:

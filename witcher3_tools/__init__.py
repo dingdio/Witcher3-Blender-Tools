@@ -369,7 +369,13 @@ from .ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_rebuild_layer_scan_cache,
                                      WITCH_OT_scan_layers_nearby,
                                      WITCH_OT_radish_w2L,
-                                     WITCH_OT_export_textures)
+                                     WITCH_OT_export_textures,
+                                     WITCH_OT_cancel_foliage_job,
+                                     WITCH_OT_load_foliage_around_camera,
+                                     WITCH_OT_toggle_foliage_visibility,
+                                     WITCH_OT_unload_foliage,
+                                     WITCH_OT_open_foliage_browser,
+                                     WITCH_OT_check_foliage_world)
 from .ui import ui_anims
 from .ui import ui_speech
 from .ui import ui_entity
@@ -1053,6 +1059,12 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         name="Mesh Import: Hide Zero-Weight Faces",
         default=True,
         description="Hides faces without bones on skinned meshes. The default game behaviour",
+        options={'HIDDEN'},
+    )
+    mesh_import_do_import_collision: bpy.props.BoolProperty(
+        name="Mesh Import: Import Collision",
+        default=False,
+        description="Import collision shapes. Uncooked meshes use the embedded collision; cooked meshes look up the .nxs file in the collision cache",
         options={'HIDDEN'},
     )
 
@@ -2746,6 +2758,7 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
 
                 mesh_box = controls.box()
                 mesh_box.label(text="Mesh Settings")
+                mesh_box.prop(scene_settings, "terrain_layer_instanced_sector", text="Instance Repeated Meshes")
                 mesh_row = mesh_box.row(align=True)
                 mesh_row.prop(scene_settings, "terrain_layer_keep_lod_meshes", text="Keep LODs")
                 mesh_row.prop(scene_settings, "terrain_layer_keep_empty_lods", text="Keep Empty LODs")
@@ -2756,11 +2769,24 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 regex_row.prop(scene_settings, "terrain_layer_name_filter_regex", text="Regex")
 
                 visibility_box = controls.box()
-                visibility_box.label(text="Post Import Visibility")
-                visibility_box.prop(scene_settings, "terrain_layer_hide_volume_meshes", text="Hide _volume_ Meshes")
-                visibility_box.prop(scene_settings, "terrain_layer_hide_shadow_meshes", text="Hide _shadow_ Meshes")
+                visibility_box.label(text="Visibility After Load")
+                def visibility_row(label, hide_prop, solo_prop):
+                    row = visibility_box.row(align=True)
+                    hide_enabled = bool(getattr(scene_settings, hide_prop, False))
+                    solo_enabled = bool(getattr(scene_settings, solo_prop, False))
+                    row.prop(scene_settings, hide_prop, text=label, icon='HIDE_ON' if hide_enabled else 'HIDE_OFF', toggle=True)
+                    row.prop(scene_settings, solo_prop, text="", icon='HIDE_OFF' if solo_enabled else 'HIDE_ON', toggle=True)
 
-                controls.prop(scene_settings, "terrain_layer_write_profile_log", text="Write Profile Log")
+                visibility_row("Default-Hidden Groups", "terrain_layer_hide_default_hidden", "terrain_layer_solo_default_hidden")
+                visibility_row("Engine Hidden", "terrain_layer_hide_engine_hidden_meshes", "terrain_layer_solo_engine_hidden_meshes")
+                visibility_row("Proxy Meshes", "terrain_layer_hide_proxy_meshes", "terrain_layer_solo_proxy_meshes")
+                visibility_row("Collision", "terrain_layer_hide_collision", "terrain_layer_solo_collision")
+                visibility_row("Volume Meshes", "terrain_layer_hide_volume_meshes", "terrain_layer_solo_volume_meshes")
+                visibility_row("Shadow Meshes", "terrain_layer_hide_shadow_meshes", "terrain_layer_solo_shadow_meshes")
+
+                debug_box = controls.box()
+                debug_box.label(text="Debug")
+                debug_box.prop(scene_settings, "terrain_layer_write_profile_log", text="Write Profile Log")
                 controls.label(text=ui_map.get_camera_position_label(context))
                 scan_row = controls.row(align=True)
                 scan_row.label(text=ui_map.get_nearby_cache_summary_label(context))
@@ -2768,6 +2794,24 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 row = controls.row(align=True)
                 row.operator("witcher.load_layers_around_camera", text="Load Layers Around Camera", icon='VIEW_CAMERA')
                 row.operator("witcher.rebuild_layer_scan_cache", text="", icon='FILE_REFRESH')
+
+        body = section("witcher_terrain_foliage", "Foliage", 'PARTICLE_DATA', default_closed=True)
+        if body:
+            col = body.column(align=True)
+            col.label(text=ui_map.get_foliage_info_label(context))
+            ui_map.draw_foliage_job_ui(col, context)
+            controls = col.column(align=True)
+            controls.enabled = not ui_map.foliage_job_running()
+            if scene_settings and hasattr(scene_settings, "foliage_load_radius"):
+                controls.prop(scene_settings, "foliage_load_radius", text="Radius (World Units)")
+            controls.operator("witcher.load_foliage_around_camera", text="Load Foliage Around Camera", icon='PARTICLE_DATA')
+            row = controls.row(align=True)
+            row.operator("witcher.check_foliage_world", text="World Info", icon='INFO')
+            row.operator("witcher.open_foliage_browser", text="Browse Folder", icon='FILE_FOLDER')
+            controls.separator()
+            row2 = controls.row(align=True)
+            row2.operator("witcher.toggle_foliage_visibility", text="Toggle Visibility", icon='HIDE_OFF')
+            row2.operator("witcher.unload_foliage", text="Unload", icon='TRASH')
 
         full_map_obj = _resolve_terrain_full_map(context)
         if full_map_obj:
@@ -3451,6 +3495,12 @@ _classes = [
     WITCH_OT_load_layers_around_camera,
     WITCH_OT_rebuild_layer_scan_cache,
     WITCH_OT_scan_layers_nearby,
+    WITCH_OT_cancel_foliage_job,
+    WITCH_OT_load_foliage_around_camera,
+    WITCH_OT_toggle_foliage_visibility,
+    WITCH_OT_unload_foliage,
+    WITCH_OT_open_foliage_browser,
+    WITCH_OT_check_foliage_world,
     WITCH_OT_load_texarray,
     WITCHER_OT_open_external_path,
     WITCHER_OT_open_addon_preferences,
