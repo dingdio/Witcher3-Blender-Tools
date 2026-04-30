@@ -18,7 +18,7 @@ from ..ui.ui_anims import (
     WITCH_OT_ExportW2RigJson,
     WITCH_OT_ExportW2Cutscene,
 )
-from ..ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_w2mesh_export, WITCH_OT_apx, WITCH_OT_nxs,
+from ..ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_w2mesh_export, WITCH_OT_apx, WITCH_OT_redcloth, WITCH_OT_redapex, WITCH_OT_nxs,
                           WITCH_OT_export_goto_project_path, WITCH_OT_set_repo_path_from_browser,
                           WITCH_OT_generate_lods,
                           WITCH_OT_create_box_collider, WITCH_OT_create_sphere_collider,
@@ -124,6 +124,8 @@ _ASSET_BROWSER_DIALOG_OPERATORS = (
     WITCH_OT_ImportW2Rig,
     WITCH_OT_w2mesh,
     WITCH_OT_apx,
+    WITCH_OT_redcloth,
+    WITCH_OT_redapex,
     WITCH_OT_nxs,
     WITCH_OT_w2ent,
     WITCH_OT_flyr,
@@ -150,7 +152,8 @@ class WITCH_MT_Menu(bpy.types.Menu):
     def draw(self, context):
         layout = self.layout
         layout.operator(WITCH_OT_w2mesh.bl_idname, text="Mesh (.w2mesh)", icon='MESH_DATA')
-        layout.operator(WITCH_OT_apx.bl_idname, text="Redcloth (.redcloth)", icon='MESH_DATA')
+        layout.operator(WITCH_OT_redcloth.bl_idname, text="Redcloth (.redcloth)", icon='MESH_DATA')
+        layout.operator(WITCH_OT_redapex.bl_idname, text="Redapex (.redapex)", icon='MESH_DATA')
         layout.operator(WITCH_OT_nxs.bl_idname, text="Collision (.nxs)", icon='MESH_DATA')
         layout.operator(WITCH_OT_import_w3_fbx.bl_idname, text="Witcher 3 FBX (.fbx)", icon='MESH_DATA')
         layout.separator()
@@ -240,6 +243,8 @@ classes = (
     WITCH_OT_create_sound_info,
     WITCH_OT_remove_sound_info,
     WITCH_OT_apx,
+    WITCH_OT_redcloth,
+    WITCH_OT_redapex,
     WITCH_OT_nxs,
     WITCH_OT_srt,
     WITCH_MT_Menu,

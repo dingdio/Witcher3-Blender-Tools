@@ -54,13 +54,14 @@ _STREAM_MESH_COMPONENT_TYPES = frozenset(
         "CWindowComponent",
     }
 )
-_STREAM_COMPONENT_TYPES = _STREAM_MESH_COMPONENT_TYPES | {"CClothComponent"}
+_STREAM_COMPONENT_TYPES = _STREAM_MESH_COMPONENT_TYPES | {"CClothComponent", "CDestructionSystemComponent"}
 _TARGET_PROP_NAMES = frozenset(
     {
         "actionName",
         "drawableFlags",
         "includes",
         "mesh",
+        "m_resource",
         "name",
         "resource",
         "streamingDataBuffer",
@@ -418,7 +419,7 @@ def _parse_selected_prop_value(cr2w_file, handle, prop, data_end):
     if prop_name == "includes":
         return _read_handle_paths(handle, cr2w_file, count)
 
-    if prop_name in {"mesh", "resource"}:
+    if prop_name in {"mesh", "resource", "m_resource"}:
         return _read_first_handle_path(handle, cr2w_file, count)
 
     if prop_name == "drawableFlags":
@@ -866,6 +867,20 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
             return {
                 "kind": "cloth",
                 "name": cloth_name,
+                "repo_path": repo_path,
+                "transform": transform,
+                "matrix": None,
+                "translation": None,
+                "local_position": local_position,
+            }
+        if export_name == "CDestructionSystemComponent":
+            repo_path = str(props.get("m_resource", "") or "").strip()
+            if not repo_path:
+                return None
+            redapex_name = str(props.get("name", "") or "").strip() or Path(repo_path).stem or "Redapex"
+            return {
+                "kind": "cloth",
+                "name": redapex_name,
                 "repo_path": repo_path,
                 "transform": transform,
                 "matrix": None,

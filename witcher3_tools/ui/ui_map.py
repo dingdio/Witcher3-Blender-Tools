@@ -35,7 +35,7 @@ _WORLD_LAYER_INDEX_CACHE = {}
 _WORLD_LAYER_RUNTIME_CACHE = {}
 _LAYER_VISIBILITY_CACHE = {}
 _DEFAULT_HIDDEN_GROUP_CACHE = {}
-_WORLD_LAYER_SCAN_CACHE_VERSION = 5
+_WORLD_LAYER_SCAN_CACHE_VERSION = 6
 _WORLD_LAYER_SPATIAL_CELL_SIZE = 10.0
 _LAYER_SCAN_BATCH_SIZE = 16
 _LAYER_LOAD_BATCH_SIZE = 8
@@ -77,6 +77,7 @@ _LAYER_VIS_REASON_BITS = {
     "collision": 1 << 2,
     "engine_hidden": 1 << 3,
     "proxy": 1 << 4,
+    "redapex": 1 << 5,
 }
 def _layer_import_kwargs_from_scene(scene_settings):
     return {
@@ -87,7 +88,11 @@ def _layer_import_kwargs_from_scene(scene_settings):
         "do_import_Entity": bool(getattr(scene_settings, "terrain_layer_do_import_entity", True)),
         "do_import_PointLight": bool(getattr(scene_settings, "terrain_layer_do_import_point_light", True)),
         "do_import_SpotLight": bool(getattr(scene_settings, "terrain_layer_do_import_spot_light", True)),
-        "do_import_Redcloth": bool(getattr(scene_settings, "terrain_layer_do_import_redcloth", False)),
+        "do_import_Redcloth": bool(getattr(scene_settings, "terrain_layer_do_import_redcloth", True)),
+        "do_import_Redapex": bool(getattr(scene_settings, "terrain_layer_do_import_redapex", True)),
+        "redapex_import_chunks": bool(getattr(scene_settings, "terrain_layer_redapex_import_chunks", False)),
+        "redapex_import_floor": bool(getattr(scene_settings, "terrain_layer_redapex_import_floor", False)),
+        "redapex_collections_as_empties": bool(getattr(scene_settings, "terrain_layer_redapex_collections_as_empties", True)),
         "keep_lod_meshes": bool(getattr(scene_settings, "terrain_layer_keep_lod_meshes", False)),
         "keep_empty_lods": bool(getattr(scene_settings, "terrain_layer_keep_empty_lods", False)),
         "keep_proxy_meshes": bool(getattr(scene_settings, "terrain_layer_keep_proxy_meshes", True)),
@@ -98,6 +103,8 @@ def _layer_import_kwargs_from_scene(scene_settings):
         "solo_engine_hidden_meshes": bool(getattr(scene_settings, "terrain_layer_solo_engine_hidden_meshes", False)),
         "hide_proxy_meshes": bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False)),
         "solo_proxy_meshes": bool(getattr(scene_settings, "terrain_layer_solo_proxy_meshes", False)),
+        "hide_redapex": bool(getattr(scene_settings, "terrain_layer_hide_redapex", False)),
+        "solo_redapex": bool(getattr(scene_settings, "terrain_layer_solo_redapex", False)),
         "hide_collision": bool(getattr(scene_settings, "terrain_layer_hide_collision", False)),
         "solo_collision": bool(getattr(scene_settings, "terrain_layer_solo_collision", False)),
         "hide_volume_meshes": bool(getattr(scene_settings, "terrain_layer_hide_volume_meshes", False)),
@@ -118,6 +125,7 @@ def _layer_import_query_filter_active(scene_settings):
         "do_import_PointLight",
         "do_import_SpotLight",
         "do_import_Redcloth",
+        "do_import_Redapex",
     )
     if any(not bool(settings.get(key, True)) for key in content_keys):
         return True
@@ -137,7 +145,11 @@ def _layer_load_mode_signature_for_scene(scene_settings):
         f";entity={int(settings.get('do_import_Entity', True))}"
         f";point={int(settings.get('do_import_PointLight', True))}"
         f";spot={int(settings.get('do_import_SpotLight', True))}"
-        f";redcloth={int(settings.get('do_import_Redcloth', False))}"
+        f";redcloth={int(settings.get('do_import_Redcloth', True))}"
+        f";redapex={int(settings.get('do_import_Redapex', True))}"
+        f";redapex_chunks={int(settings.get('redapex_import_chunks', False))}"
+        f";redapex_floor={int(settings.get('redapex_import_floor', False))}"
+        f";redapex_empties={int(settings.get('redapex_collections_as_empties', True))}"
         f";lods={int(settings.get('keep_lod_meshes', False))}"
         f";empty_lods={int(settings.get('keep_empty_lods', False))}"
         f";proxy={int(settings.get('keep_proxy_meshes', True))}"
@@ -387,6 +399,31 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
         default=True,
         description="If enabled, SpotLight types are imported"
     )
+    do_import_Redcloth: BoolProperty(
+        name="Redcloth",
+        default=True,
+        description="If enabled, Redcloth assets are imported"
+    )
+    do_import_Redapex: BoolProperty(
+        name="Redapex",
+        default=True,
+        description="If enabled, Redapex assets are imported"
+    )
+    redapex_import_chunks: BoolProperty(
+        name="Redapex Chunks",
+        default=False,
+        description="Keep destructible chunk meshes when importing redapex resources"
+    )
+    redapex_import_floor: BoolProperty(
+        name="Redapex Floor",
+        default=False,
+        description="Keep the helper floor plane created by the APX destruction importer"
+    )
+    redapex_collections_as_empties: BoolProperty(
+        name="Redapex Collections as Empties",
+        default=True,
+        description="Flatten APX importer collections into Blender empties/objects"
+    )
     keep_lod_meshes: BoolProperty(
         name="Keep LODs",
         default=False,
@@ -420,24 +457,48 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
     
     def draw(self, context):
         layout = self.layout
-        sections = ["Resources to Import", "Settings"]
-        section_options = {
-            "Resources to Import" : ["do_import_Mesh","do_import_Collision","do_import_RigidBody","do_import_Entity",
-                               "do_import_PointLight", "do_import_SpotLight",],
-            "Settings" : [
-                        "instanced_sector",
-                        "keep_lod_meshes",
-                        "keep_empty_lods",
-                        "keep_proxy_meshes",
-                        "do_enable_name_filter",
-                        "do_name_filter_regex"]
-        }
-        for section in sections:
-            row = layout.row()
-            box = row.box()
-            box.label(text=section)
-            for prop in section_options[section]:
-                box.prop(self, prop)
+
+        resources = layout.row().box()
+        resources.label(text="Resources to Import")
+        for prop in [
+            "do_import_Mesh",
+            "do_import_Collision",
+            "do_import_RigidBody",
+            "do_import_Entity",
+            "do_import_PointLight",
+            "do_import_SpotLight",
+            "do_import_Redcloth",
+            "do_import_Redapex",
+        ]:
+            resources.prop(self, prop)
+
+        per_type = layout.row().box()
+        per_type.label(text="Per-Type Import Options")
+
+        mesh_box = per_type.box()
+        mesh_box.label(text="W2Mesh")
+        for prop in [
+            "instanced_sector",
+            "keep_lod_meshes",
+            "keep_empty_lods",
+            "keep_proxy_meshes",
+        ]:
+            mesh_box.prop(self, prop)
+
+        redapex_box = per_type.box()
+        redapex_box.label(text="Redapex")
+        redapex_box.enabled = bool(self.do_import_Redapex)
+        for prop in [
+            "redapex_import_chunks",
+            "redapex_import_floor",
+            "redapex_collections_as_empties",
+        ]:
+            redapex_box.prop(self, prop)
+
+        filters = layout.row().box()
+        filters.label(text="Filters")
+        filters.prop(self, "do_enable_name_filter")
+        filters.prop(self, "do_name_filter_regex")
     
     def execute(self, context):
         log.info("Importing layer")
@@ -467,6 +528,11 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
                                         do_import_Entity = self.do_import_Entity,
                                         do_import_PointLight = self.do_import_PointLight,
                                         do_import_SpotLight = self.do_import_SpotLight,
+                                        do_import_Redcloth = self.do_import_Redcloth,
+                                        do_import_Redapex = self.do_import_Redapex,
+                                        redapex_import_chunks = self.redapex_import_chunks,
+                                        redapex_import_floor = self.redapex_import_floor,
+                                        redapex_collections_as_empties = self.redapex_collections_as_empties,
                                         do_enable_name_filter = self.do_enable_name_filter,
                                         do_name_filter_regex = self.do_name_filter_regex,
                                         instanced_sector = self.instanced_sector,
@@ -3935,6 +4001,22 @@ def _layer_visibility_is_proxy_mesh_object(obj):
     return _object_or_parent_matches(obj, is_proxy_marker)
 
 
+def _layer_visibility_is_redapex_object(obj):
+    def is_redapex_marker(candidate):
+        try:
+            kind = str(candidate.get("witcher_layer_visibility_kind", "") or candidate.get("witcher_cached_plan_kind", "") or "").strip().lower()
+            if kind in {"redapex", "redapex_chunks"}:
+                return True
+            repo_path = str(candidate.get("repo_path", "") or candidate.get("witcher_dev_source_path", "") or "").strip().lower()
+            if repo_path.endswith(".redapex"):
+                return True
+        except Exception:
+            pass
+        return False
+
+    return _object_or_parent_matches(obj, is_redapex_marker)
+
+
 def _layer_visibility_is_imported_layer_object(obj):
     def is_layer_marker(candidate):
         try:
@@ -3969,6 +4051,8 @@ def _layer_visibility_reasons(obj):
             reasons.add("proxy")
     if _layer_visibility_is_collision_object(obj):
         reasons.add("collision")
+    if _layer_visibility_is_redapex_object(obj):
+        reasons.add("redapex")
     if _layer_visibility_is_engine_hidden_object(obj):
         reasons.add("engine_hidden")
     return reasons
@@ -4075,11 +4159,13 @@ def _apply_layer_object_visibility_rules(
     hide_collision=False,
     hide_engine_hidden=False,
     hide_proxy=False,
+    hide_redapex=False,
     solo_volume=False,
     solo_shadow=False,
     solo_collision=False,
     solo_engine_hidden=False,
     solo_proxy=False,
+    solo_redapex=False,
     root_collection=None,
 ):
     if root_collection is None:
@@ -4092,6 +4178,7 @@ def _apply_layer_object_visibility_rules(
         "collision": bool(hide_collision),
         "engine_hidden": bool(hide_engine_hidden),
         "proxy": bool(hide_proxy),
+        "redapex": bool(hide_redapex),
     }
     solo_reasons = {
         reason
@@ -4101,6 +4188,7 @@ def _apply_layer_object_visibility_rules(
             "collision": bool(solo_collision),
             "engine_hidden": bool(solo_engine_hidden),
             "proxy": bool(solo_proxy),
+            "redapex": bool(solo_redapex),
         }.items()
         if enabled
     }
@@ -4143,11 +4231,13 @@ def _apply_layer_post_import_visibility(job, context):
         hide_collision=bool((job or {}).get("hide_collision")),
         hide_engine_hidden=bool((job or {}).get("hide_engine_hidden_meshes")),
         hide_proxy=bool((job or {}).get("hide_proxy_meshes")),
+        hide_redapex=bool((job or {}).get("hide_redapex")),
         solo_volume=bool((job or {}).get("solo_volume_meshes")),
         solo_shadow=bool((job or {}).get("solo_shadow_meshes")),
         solo_collision=bool((job or {}).get("solo_collision")),
         solo_engine_hidden=bool((job or {}).get("solo_engine_hidden_meshes")),
         solo_proxy=bool((job or {}).get("solo_proxy_meshes")),
+        solo_redapex=bool((job or {}).get("solo_redapex")),
         root_collection=root_collection,
     )
 
@@ -4165,11 +4255,13 @@ def apply_layer_visibility_settings(context, scene_settings=None):
         hide_collision=bool(getattr(scene_settings, "terrain_layer_hide_collision", False)),
         hide_engine_hidden=bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True)),
         hide_proxy=bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False)),
+        hide_redapex=bool(getattr(scene_settings, "terrain_layer_hide_redapex", False)),
         solo_volume=bool(getattr(scene_settings, "terrain_layer_solo_volume_meshes", False)),
         solo_shadow=bool(getattr(scene_settings, "terrain_layer_solo_shadow_meshes", False)),
         solo_collision=bool(getattr(scene_settings, "terrain_layer_solo_collision", False)),
         solo_engine_hidden=bool(getattr(scene_settings, "terrain_layer_solo_engine_hidden_meshes", False)),
         solo_proxy=bool(getattr(scene_settings, "terrain_layer_solo_proxy_meshes", False)),
+        solo_redapex=bool(getattr(scene_settings, "terrain_layer_solo_redapex", False)),
     )
 
 
@@ -4706,14 +4798,16 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
         job["hide_collision"] = bool(getattr(scene_settings, "terrain_layer_hide_collision", False))
         job["hide_engine_hidden_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True))
         job["hide_proxy_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False))
+        job["hide_redapex"] = bool(getattr(scene_settings, "terrain_layer_hide_redapex", False))
         job["solo_volume_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_volume_meshes", False))
         job["solo_shadow_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_shadow_meshes", False))
         job["solo_collision"] = bool(getattr(scene_settings, "terrain_layer_solo_collision", False))
         job["solo_engine_hidden_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_engine_hidden_meshes", False))
         job["solo_proxy_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_proxy_meshes", False))
+        job["solo_redapex"] = bool(getattr(scene_settings, "terrain_layer_solo_redapex", False))
         job["nearby_load_started_at"] = execute_started
         _log_layer_load_timing_warning(
-            "settings radius %.1f limit %d skip_complete %s mesh %s proxy_mesh %s collision %s rigid %s entity %s point %s spot %s redcloth %s lods %s empty_lods %s keep_proxy_lods %s regex_enabled %s regex '%s'",
+            "settings radius %.1f limit %d skip_complete %s mesh %s proxy_mesh %s collision %s rigid %s entity %s point %s spot %s redcloth %s redapex %s lods %s empty_lods %s keep_proxy_lods %s regex_enabled %s regex '%s'",
             radius,
             load_limit,
             bool(skip_loaded),
@@ -4724,7 +4818,8 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
             bool(import_kwargs.get("do_import_Entity", True)),
             bool(import_kwargs.get("do_import_PointLight", True)),
             bool(import_kwargs.get("do_import_SpotLight", True)),
-            bool(import_kwargs.get("do_import_Redcloth", False)),
+            bool(import_kwargs.get("do_import_Redcloth", True)),
+            bool(import_kwargs.get("do_import_Redapex", True)),
             bool(import_kwargs.get("keep_lod_meshes", False)),
             bool(import_kwargs.get("keep_empty_lods", False)),
             bool(import_kwargs.get("keep_proxy_meshes", True)),

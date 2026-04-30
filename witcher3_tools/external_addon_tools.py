@@ -140,7 +140,7 @@ def ensure_apx_from_apb(context, apb_path: str, overwrite: bool = False) -> Dict
 
 
 def resolve_redcloth_apx(context, redcloth_resource_path: str, loadmods: bool = False) -> Dict[str, Any]:
-    """Resolve or generate a .apx path for a depot-style .redcloth resource path."""
+    """Resolve or generate a .apx path for a depot-style .redcloth/.redapex resource path."""
     redcloth_resource_path = (redcloth_resource_path or "").replace("/", "\\").lstrip("\\")
     result: Dict[str, Any] = {
         "status": "invalid_input",
@@ -150,8 +150,8 @@ def resolve_redcloth_apx(context, redcloth_resource_path: str, loadmods: bool = 
         "message": "",
     }
 
-    if not redcloth_resource_path or not redcloth_resource_path.lower().endswith(".redcloth"):
-        result["message"] = "Input is not a .redcloth depot path."
+    if not redcloth_resource_path or not redcloth_resource_path.lower().endswith((".redcloth", ".redapex")):
+        result["message"] = "Input is not a .redcloth/.redapex depot path."
         return result
 
     try:
@@ -203,7 +203,16 @@ def resolve_redcloth_apx(context, redcloth_resource_path: str, loadmods: bool = 
     if uncook:
         try:
             cm = LoadCollisionManager(do_reload=False, loadmods=loadmods)
-            items = cm.find_item_by_path_name(redcloth_resource_path)
+            lookup_paths = []
+            for candidate in (redcloth_resource_path, base_rel + ".apb"):
+                candidate = str(candidate or "").replace("/", "\\").lstrip("\\")
+                if candidate and candidate not in lookup_paths:
+                    lookup_paths.append(candidate)
+            items = None
+            for lookup_path in lookup_paths:
+                items = cm.find_item_by_path_name(lookup_path)
+                if items:
+                    break
             if items:
                 item = items[-1] if isinstance(items, list) else items
                 item_name = getattr(item, "Name", redcloth_resource_path)

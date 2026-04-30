@@ -254,7 +254,7 @@ def _read_redcloth_material_payload(redcloth_resource: str, mat_filename: str):
     prefix = _redcloth_material_name_prefix(redcloth_resource, mat_filename)
     if redcloth_material:
         for chunk in redcloth_material:
-            if chunk.name != "CApexClothResource":
+            if chunk.name not in {"CApexClothResource", "CApexDestructionResource"}:
                 continue
             materials_handle = chunk.GetVariableByName('materials')
             if materials_handle and hasattr(materials_handle, "Handles"):
@@ -474,10 +474,15 @@ def _format_apx_int_array_text(values: List[int]) -> str:
     return " ".join(str(value) for value in values)
 
 
-def _sanitize_apx_triangle_indices(indices: List[int], vertex_count: int | None = None) -> Tuple[List[int], Dict[str, int]]:
+def _sanitize_apx_triangle_indices(
+    indices: List[int],
+    vertex_count: int | None = None,
+    positions: List[Tuple[float, float, float]] | None = None,
+) -> Tuple[List[int], Dict[str, int]]:
     stats = {
         "removed_total": 0,
         "removed_degenerate": 0,
+        "removed_zero_area": 0,
         "removed_out_of_range": 0,
         "removed_truncated": 0,
     }
@@ -504,16 +509,36 @@ def _sanitize_apx_triangle_indices(indices: List[int], vertex_count: int | None 
             stats["removed_total"] += 1
             stats["removed_out_of_range"] += 1
             continue
+        if positions is not None:
+            try:
+                pa, pb, pc = positions[a], positions[b], positions[c]
+                ux, uy, uz = (pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2])
+                vx, vy, vz = (pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2])
+                cx = uy * vz - uz * vy
+                cy = uz * vx - ux * vz
+                cz = ux * vy - uy * vx
+                if (cx * cx + cy * cy + cz * cz) <= 1.0e-20:
+                    stats["removed_total"] += 1
+                    stats["removed_zero_area"] += 1
+                    continue
+            except Exception:
+                pass
         filtered.extend(tri)
 
     return filtered, stats
 
 
-def _sanitize_apx_triangle_array(array_elem, vertex_count: int | None = None) -> Dict[str, int]:
+def _sanitize_apx_triangle_array(
+    array_elem,
+    vertex_count: int | None = None,
+    positions: List[Tuple[float, float, float]] | None = None,
+) -> Dict[str, int]:
     indices = _parse_apx_int_array_text(getattr(array_elem, "text", ""))
-    filtered, stats = _sanitize_apx_triangle_indices(indices, vertex_count)
+    filtered, stats = _sanitize_apx_triangle_indices(indices, vertex_count, positions)
     if stats["removed_total"]:
         array_elem.text = _format_apx_int_array_text(filtered)
+    if str(array_elem.attrib.get("size", "")).strip() != str(len(filtered)):
+        array_elem.attrib["size"] = str(len(filtered))
     stats["triangle_count"] = len(filtered) // 3
     return stats
 
@@ -522,8 +547,100 @@ def _clone_apx_xml_element(elem):
     return ElementTree.fromstring(ElementTree.tostring(elem, encoding="utf-8"))
 
 
+def _parse_apx_float_array_text(text: str) -> List[float]:
+    raw = str(text or "").replace(",", " ").split()
+    return [float(value) for value in raw]
+
+
+def _apx_destructible_submesh_positions(submesh, vertex_count: int) -> List[Tuple[float, float, float]] | None:
+    try:
+        vertex_format = _apx_find_child(submesh, "value", "name", "vertexFormat")[0]
+        buffer_formats = _apx_find_child(vertex_format, "array", "name", "bufferFormats")
+        buffers = _apx_find_child(submesh, "array", "name", "buffers")
+        for idx, fmt_container in enumerate(buffer_formats):
+            try:
+                buffer_name = _apx_find_child(fmt_container, "value", "name", "name").text
+            except Exception:
+                continue
+            if buffer_name != "SEMANTIC_POSITION" or idx >= len(buffers):
+                continue
+            data_elem = _apx_find_child(buffers[idx][0], "array", "name", "data")
+            values = _parse_apx_float_array_text(getattr(data_elem, "text", ""))
+            usable_count = min(len(values) - (len(values) % 3), vertex_count * 3)
+            positions = [
+                (values[i], values[i + 1], values[i + 2])
+                for i in range(0, usable_count, 3)
+            ]
+            if len(positions) >= vertex_count:
+                return positions[:vertex_count]
+    except Exception:
+        return None
+    return None
+
+
+def _write_sanitized_apx_copy(path: str, tree, change_notes: List[str]) -> str:
+    if not change_notes:
+        return path
+    try:
+        stat = os.stat(path)
+        cache_key = hashlib.sha1(
+            f"{os.path.normcase(path)}|{stat.st_mtime_ns}|{stat.st_size}".encode("utf-8")
+        ).hexdigest()[:12]
+        out_dir = os.path.join(get_temp_root(create=True), "sanitized_apx")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{Path(path).stem}.{cache_key}.apx")
+        tree.write(out_path, encoding="utf-8", xml_declaration=True)
+        log.warning(
+            "Using sanitized APX copy for %s: %s",
+            os.path.basename(path),
+            "; ".join(change_notes),
+        )
+        return out_path
+    except Exception as exc:
+        log.warning("Failed to write sanitized APX copy for %s: %s", path, exc)
+        return path
+
+
+def _sanitize_destructible_apx_for_import(path: str) -> str:
+    try:
+        tree = ElementTree.parse(path)
+        root = tree.getroot()
+        destructible = _apx_find_child(root, "value", "className", "DestructibleAssetParameters")[0]
+    except Exception as exc:
+        log.debug("Skipping destructible APX sanitization for %s: %s", path, exc)
+        return path
+
+    change_notes: List[str] = []
+    try:
+        render_mesh = _apx_find_child(destructible, "value", "name", "renderMeshAsset")[0]
+        submeshes = _apx_find_child(render_mesh, "array", "name", "submeshes")
+    except Exception:
+        return path
+
+    for sub_idx, submesh_container in enumerate(submeshes):
+        try:
+            submesh = submesh_container[0][0][0]
+            vertex_count_elem = _apx_find_child(submesh, "value", "name", "vertexCount")
+            vertex_count = int(str(vertex_count_elem.text or "0").strip())
+            index_buffer_elem = _apx_find_child(submesh_container[0], "array", "name", "indexBuffer")
+        except Exception:
+            continue
+        positions = _apx_destructible_submesh_positions(submesh, vertex_count)
+        stats = _sanitize_apx_triangle_array(index_buffer_elem, vertex_count, positions=positions)
+        if stats["removed_total"]:
+            change_notes.append(
+                f"destructible submesh {sub_idx}: "
+                f"degenerate={stats['removed_degenerate']} "
+                f"zero_area={stats['removed_zero_area']} "
+                f"out_of_range={stats['removed_out_of_range']} "
+                f"truncated={stats['removed_truncated']}"
+            )
+
+    return _write_sanitized_apx_copy(path, tree, change_notes)
+
+
 def _sanitize_apx_for_import(filepath: str) -> str:
-    """Write a sanitized APX copy when cloth triangle data would crash Blender import."""
+    """Write a sanitized APX copy when triangle data would crash Blender import."""
     path = str(filepath or "").strip()
     if not path.lower().endswith(".apx") or not os.path.isfile(path):
         return filepath
@@ -533,8 +650,8 @@ def _sanitize_apx_for_import(filepath: str) -> str:
         root = tree.getroot()
         clothing = _apx_find_child(root, "value", "className", "ClothingAssetParameters")[0]
     except Exception as exc:
-        log.debug("Skipping APX sanitization for %s: %s", path, exc)
-        return filepath
+        log.debug("Skipping clothing APX sanitization for %s: %s", path, exc)
+        return _sanitize_destructible_apx_for_import(path)
 
     change_notes: List[str] = []
 
@@ -599,6 +716,7 @@ def _sanitize_apx_for_import(filepath: str) -> str:
                     change_notes.append(
                         f"graphical lod {lod_idx} submesh {sub_idx}: "
                         f"degenerate={stats['removed_degenerate']} "
+                        f"zero_area={stats['removed_zero_area']} "
                         f"out_of_range={stats['removed_out_of_range']} "
                         f"truncated={stats['removed_truncated']}"
                     )
@@ -619,6 +737,7 @@ def _sanitize_apx_for_import(filepath: str) -> str:
                 change_notes.append(
                     f"physical mesh {phys_idx}: "
                     f"degenerate={stats['removed_degenerate']} "
+                    f"zero_area={stats['removed_zero_area']} "
                     f"out_of_range={stats['removed_out_of_range']} "
                     f"truncated={stats['removed_truncated']}"
                 )
@@ -626,24 +745,7 @@ def _sanitize_apx_for_import(filepath: str) -> str:
     if not change_notes:
         return filepath
 
-    try:
-        stat = os.stat(path)
-        cache_key = hashlib.sha1(
-            f"{os.path.normcase(path)}|{stat.st_mtime_ns}|{stat.st_size}".encode("utf-8")
-        ).hexdigest()[:12]
-        out_dir = os.path.join(get_temp_root(create=True), "sanitized_apx")
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{Path(path).stem}.{cache_key}.apx")
-        tree.write(out_path, encoding="utf-8", xml_declaration=True)
-        log.warning(
-            "Using sanitized APX copy for %s: %s",
-            os.path.basename(path),
-            "; ".join(change_notes),
-        )
-        return out_path
-    except Exception as exc:
-        log.warning("Failed to write sanitized APX copy for %s: %s", path, exc)
-        return filepath
+    return _write_sanitized_apx_copy(path, tree, change_notes)
 
 
 def _bpy_data_block_identity(data_block):

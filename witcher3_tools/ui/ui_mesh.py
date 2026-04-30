@@ -3,7 +3,9 @@ import os
 import re
 import time
 import math
+import xml.etree.ElementTree as ET
 from collections import defaultdict
+from pathlib import Path
 import bpy
 from mathutils import Vector, Matrix
 from ..importers import import_nxs
@@ -11,12 +13,18 @@ from ..importers.import_nxs import material_colors, color_map
 
 log = logging.getLogger(__name__)
 
+_REDAPEX_PROFILE_WARN_THRESHOLD = 0.05
+
+
+def _log_redapex_profile(message, *args):
+    log.info("[redapex-profile] " + str(message), *args)
+
 from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty, EnumProperty
 from bpy_extras.io_utils import (
         ImportHelper,
         ExportHelper
         )
-from ..cloth_util import importCloth
+from ..cloth_util import importCloth, apply_redcloth_materials_to_meshes, _sanitize_apx_for_import
 
 from .. import file_helpers
 from ..importers import import_mesh, import_rig
@@ -34,8 +42,559 @@ from ..exporters.export_mesh import do_export_mesh
 
 import addon_utils
 
+
+def _link_object_to_collection(obj, collection):
+    if obj is None or collection is None:
+        return
+    try:
+        if obj.name not in collection.objects.keys():
+            collection.objects.link(obj)
+    except Exception:
+        pass
+
+
+def _unlink_object_from_collections(obj, keep_collection=None):
+    if obj is None:
+        return
+    for collection in list(getattr(obj, "users_collection", []) or []):
+        if keep_collection is not None and collection == keep_collection:
+            continue
+        try:
+            collection.objects.unlink(obj)
+        except Exception:
+            pass
+
+
+def _remove_empty_collection_tree(collection):
+    if collection is None:
+        return
+    try:
+        children = list(getattr(collection, "children", []) or [])
+    except ReferenceError:
+        return
+    except Exception:
+        children = []
+    for child in children:
+        _remove_empty_collection_tree(child)
+    try:
+        if len(collection.objects) == 0 and len(collection.children) == 0:
+            bpy.data.collections.remove(collection)
+    except ReferenceError:
+        pass
+    except Exception:
+        pass
+
+
+def _collection_identity(collection):
+    if collection is None:
+        return None
+    try:
+        return int(collection.as_pointer())
+    except Exception:
+        return id(collection)
+
+
+def _iter_collection_tree(collection):
+    if collection is None:
+        return
+    yield collection
+    try:
+        children = list(getattr(collection, "children", []) or [])
+    except ReferenceError:
+        children = []
+    except Exception:
+        children = []
+    for child in children:
+        yield from _iter_collection_tree(child)
+
+
+def _create_collection_empty(name, target_collection, parent=None):
+    empty = bpy.data.objects.new(name, None)
+    empty.empty_display_type = 'PLAIN_AXES'
+    empty.empty_display_size = 0.35
+    if parent is not None:
+        empty.parent = parent
+    _link_object_to_collection(empty, target_collection)
+    return empty
+
+
+def _apx_find_elem(element, tag, attr_name, attr_value):
+    return [
+        child
+        for child in element.iter(tag)
+        if child.attrib.get(attr_name) == attr_value
+    ]
+
+
+def _apx_array(text, value_type, width=None):
+    cleaned = re.sub(r"[,;]+", " ", str(text or ""))
+    values = [value_type(value) for value in cleaned.split()]
+    if width is None:
+        return values
+    return [values[index:index + width] for index in range(0, len(values), width)]
+
+
+def _redapex_material_name(raw_name):
+    material_name = str(raw_name or "")
+    if len(material_name) > 63:
+        material_name = material_name[-63:]
+    return material_name
+
+
+def _import_redapex_base_mesh_fast(context, apx_filepath, redapex_path, target_collection, *, rotate_180=False):
+    started = time.perf_counter()
+    root = ET.parse(apx_filepath).getroot()
+    destructible_values = _apx_find_elem(root, "value", "className", "DestructibleAssetParameters")
+    if not destructible_values:
+        raise RuntimeError("APX DestructibleAssetParameters not found")
+    destructible_params = destructible_values[0][0]
+    graphical_values = _apx_find_elem(destructible_params, "value", "name", "renderMeshAsset")
+    if not graphical_values:
+        raise RuntimeError("APX renderMeshAsset not found")
+    graphical_mesh = graphical_values[0][0]
+    materials_node = _apx_find_elem(graphical_mesh, "array", "name", "materialNames")
+    submeshes_node = _apx_find_elem(graphical_mesh, "array", "name", "submeshes")
+    if not materials_node or not submeshes_node:
+        raise RuntimeError("APX render mesh materials/submeshes not found")
+
+    material_names = [_redapex_material_name(child.text) for child in materials_node[0]]
+    vertices_out = []
+    normals_out = []
+    faces_out = []
+    face_material_indices = []
+    uv_layers_out = []
+
+    for material_index, submesh_entry in enumerate(submeshes_node[0]):
+        submesh = submesh_entry[0][0][0]
+        vertex_format = _apx_find_elem(submesh, "value", "name", "vertexFormat")[0][0]
+        buffer_formats_node = _apx_find_elem(vertex_format, "array", "name", "bufferFormats")[0]
+        buffer_names = []
+        buffer_formats = []
+        for buffer_format_entry in buffer_formats_node:
+            buffer_names.append(_apx_find_elem(buffer_format_entry, "value", "name", "name")[0].text)
+            buffer_formats.append(_apx_find_elem(buffer_format_entry, "value", "name", "format")[0].text)
+
+        buffers_node = _apx_find_elem(submesh, "array", "name", "buffers")[0]
+        vertices = []
+        normals = []
+        bone_indices = []
+        uv_maps = []
+        for buffer_index, buffer_entry in enumerate(buffers_node):
+            buffer = buffer_entry[0]
+            buffer_name = buffer_names[buffer_index]
+            data_node = _apx_find_elem(buffer, "array", "name", "data")
+            data_text = data_node[0].text if data_node else ""
+            if buffer_name == "SEMANTIC_POSITION":
+                vertices = _apx_array(data_text, float, 3)
+            elif buffer_name == "SEMANTIC_NORMAL":
+                normals = _apx_array(data_text, float, 3)
+                if buffer_formats[buffer_index] == "31":
+                    normals = [
+                        [
+                            (component / 127.0) - (2.0 if component / 127.0 > 1.0 else 0.0)
+                            for component in normal
+                        ]
+                        for normal in normals
+                    ]
+            elif "SEMANTIC_TEXCOORD" in buffer_name:
+                uv_maps.append(_apx_array(data_text, float, 2))
+            elif buffer_name == "SEMANTIC_BONE_INDEX":
+                bone_indices = _apx_array(data_text, int)
+
+        faces_node = _apx_find_elem(submesh_entry[0], "array", "name", "indexBuffer")
+        faces = _apx_array(faces_node[0].text if faces_node else "", int, 3)
+        if not vertices or not faces:
+            continue
+        if not bone_indices:
+            bone_indices = [0] * len(vertices)
+
+        base_faces = [
+            face for face in faces
+            if all(0 <= idx < len(bone_indices) and int(bone_indices[idx]) == 0 for idx in face)
+        ]
+        if not base_faces:
+            base_faces = faces
+
+        vertex_map = {}
+        for face in base_faces:
+            remapped_face = []
+            original_face = []
+            for original_index in face:
+                if original_index not in vertex_map:
+                    vertex_map[original_index] = len(vertices_out)
+                    vertices_out.append(vertices[original_index])
+                    if normals and original_index < len(normals):
+                        normals_out.append(normals[original_index])
+                    else:
+                        normals_out.append((0.0, 0.0, 1.0))
+                remapped_face.append(vertex_map[original_index])
+                original_face.append(original_index)
+            faces_out.append(remapped_face)
+            face_material_indices.append(material_index)
+            while len(uv_layers_out) < len(uv_maps):
+                uv_layers_out.append([])
+            for uv_index, uv_map in enumerate(uv_maps):
+                for original_index in original_face:
+                    if original_index < len(uv_map):
+                        uv_layers_out[uv_index].append(uv_map[original_index])
+                    else:
+                        uv_layers_out[uv_index].append((0.0, 0.0))
+
+    if not vertices_out or not faces_out:
+        raise RuntimeError("APX base mesh contains no importable geometry")
+
+    name_stem = Path(str(redapex_path or apx_filepath)).stem or "Redapex"
+    mesh = bpy.data.meshes.new(name_stem)
+    mesh.from_pydata(vertices_out, [], faces_out)
+    mesh.update()
+    if normals_out and len(normals_out) == len(vertices_out):
+        try:
+            mesh.normals_split_custom_set_from_vertices(normals_out)
+        except Exception:
+            pass
+    for material_index, material_name in enumerate(material_names):
+        material = bpy.data.materials.get(material_name)
+        if material is None:
+            material = bpy.data.materials.new(material_name)
+        mesh.materials.append(material)
+    for poly, material_index in zip(mesh.polygons, face_material_indices):
+        poly.material_index = min(material_index, max(0, len(mesh.materials) - 1))
+    for uv_index, uv_values in enumerate(uv_layers_out):
+        if len(uv_values) != len(mesh.loops):
+            continue
+        uv_layer = mesh.uv_layers.new(name=f"{uv_index + 1}UV")
+        for loop_index, uv in enumerate(uv_values):
+            uv_layer.data[loop_index].uv = (float(uv[0]), float(uv[1]))
+
+    obj = bpy.data.objects.new(name_stem, mesh)
+    if rotate_180:
+        obj.rotation_euler[2] = math.pi
+    if target_collection is not None:
+        target_collection.objects.link(obj)
+    else:
+        context.collection.objects.link(obj)
+    obj["witcher_layer_visibility_kind"] = "redapex"
+    obj["witcher_cached_plan_kind"] = "redapex"
+    obj["repo_path"] = str(redapex_path or "")
+    elapsed = time.perf_counter() - started
+    if elapsed >= _REDAPEX_PROFILE_WARN_THRESHOLD:
+        _log_redapex_profile(
+            "fast base %s %.3fs (verts %d, faces %d, materials %d)",
+            Path(str(redapex_path or apx_filepath)).name,
+            elapsed,
+            len(vertices_out),
+            len(faces_out),
+            len(material_names),
+        )
+    return obj
+
+
+def _postprocess_redapex_import(
+    context,
+    redapex_path,
+    imported_objects,
+    imported_collections,
+    target_collection,
+    *,
+    import_chunks=False,
+    import_floor=False,
+    collections_as_empties=True,
+):
+    imported_objects = list(imported_objects or [])
+    imported_collections = list(imported_collections or [])
+    imported_meshes = [obj for obj in imported_objects if getattr(obj, "type", None) == 'MESH']
+    name_stem = Path(str(redapex_path or "")).stem or "Redapex"
+
+    base_mesh = None
+    for obj in imported_meshes:
+        if str(getattr(obj, "name", "") or "").startswith("Base_Mesh"):
+            base_mesh = obj
+            break
+    if base_mesh is None and imported_meshes:
+        candidates = [
+            obj for obj in imported_meshes
+            if not str(getattr(obj, "name", "") or "").startswith("Chunk")
+            and str(getattr(obj, "name", "") or "").lower() != "plane"
+        ]
+        base_mesh = max(candidates or imported_meshes, key=lambda obj: len(getattr(getattr(obj, "data", None), "vertices", []) or []))
+
+    floor_objects = [
+        obj for obj in imported_meshes
+        if str(getattr(obj, "name", "") or "").lower().startswith("plane")
+    ]
+    chunk_objects = [
+        obj for obj in imported_meshes
+        if obj is not base_mesh and str(getattr(obj, "name", "") or "").startswith("Chunk")
+    ]
+
+    if not import_floor:
+        for obj in floor_objects:
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception:
+                pass
+
+    if not import_chunks:
+        for obj in chunk_objects:
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception:
+                pass
+        chunk_objects = []
+
+    if base_mesh is not None:
+        base_mesh.name = name_stem
+        try:
+            base_mesh.data.name = name_stem
+        except Exception:
+            pass
+        try:
+            base_mesh["witcher_layer_visibility_kind"] = "redapex"
+            base_mesh["witcher_cached_plan_kind"] = "redapex"
+            base_mesh["repo_path"] = str(redapex_path or "")
+        except Exception:
+            pass
+
+    if collections_as_empties:
+        if base_mesh is not None:
+            _link_object_to_collection(base_mesh, target_collection)
+            _unlink_object_from_collections(base_mesh, keep_collection=target_collection)
+
+        chunks_empty = None
+        if import_chunks and chunk_objects:
+            chunks_empty = _create_collection_empty("Chunks", target_collection, parent=base_mesh)
+            try:
+                chunks_empty["witcher_layer_visibility_kind"] = "redapex_chunks"
+                chunks_empty["witcher_cached_plan_kind"] = "redapex_chunks"
+            except Exception:
+                pass
+            for obj in chunk_objects:
+                _link_object_to_collection(obj, target_collection)
+                _unlink_object_from_collections(obj, keep_collection=target_collection)
+                obj.parent = chunks_empty
+
+        for collection in imported_collections:
+            _remove_empty_collection_tree(collection)
+    else:
+        for collection in imported_collections:
+            if collection.name.startswith(name_stem + ".") or collection.name == Path(str(redapex_path or "")).stem:
+                collection.name = name_stem
+                break
+        for collection in imported_collections:
+            _remove_empty_collection_tree(collection)
+
+    return base_mesh
+
+
+def import_redapex_resource(
+    context,
+    redapex_path,
+    *,
+    repo_path=None,
+    loadmods=False,
+    use_mat=True,
+    rotate_180=False,
+    import_chunks=False,
+    import_floor=False,
+    collections_as_empties=True,
+    target_collection=None,
+):
+    total_started = time.perf_counter()
+    sanitize_seconds = 0.0
+    import_seconds = 0.0
+    material_seconds = 0.0
+    backend = "fast"
+    apx_filepath = find_apx(redapex_path)
+    if not os.path.isfile(apx_filepath):
+        resolve_path = str(repo_path or "").strip()
+        if not resolve_path:
+            try:
+                uncook_root = os.path.normpath(get_uncook_path(context) or "")
+                redapex_abs = os.path.normpath(str(redapex_path or ""))
+                if uncook_root and redapex_abs.lower().startswith(uncook_root.lower()):
+                    resolve_path = os.path.relpath(redapex_abs, uncook_root)
+            except Exception:
+                resolve_path = ""
+        if not resolve_path:
+            resolve_path = str(redapex_path or "")
+
+        try:
+            from ..external_addon_tools import resolve_redcloth_apx
+            resolved = resolve_redcloth_apx(context, resolve_path, loadmods=loadmods)
+            resolved_apx = str((resolved or {}).get("apx_path", "") or "")
+            if resolved_apx and os.path.isfile(resolved_apx):
+                apx_filepath = resolved_apx
+            else:
+                message = str((resolved or {}).get("message", "") or "").strip()
+                status = str((resolved or {}).get("status", "") or "").strip()
+                detail = f" ({status}: {message})" if status or message else ""
+                raise FileNotFoundError(
+                    "Cannot find or prepare associated .apx in the uncook path. "
+                    "Extract collision .apb and convert to .apx (io_mesh_apx + apex_sdk_cli)."
+                    + detail
+                )
+        except FileNotFoundError:
+            raise
+        except Exception as exc:
+            raise FileNotFoundError(
+                "Cannot find or prepare associated .apx in the uncook path. "
+                "Extract collision .apb and convert to .apx (io_mesh_apx + apex_sdk_cli). "
+                f"APX resolve failed: {exc}"
+            )
+
+    if target_collection is None:
+        target_layer_collection = getattr(context.view_layer, "active_layer_collection", None)
+        target_collection = getattr(target_layer_collection, "collection", None) or context.scene.collection
+
+    if not import_chunks and not import_floor and collections_as_empties:
+        try:
+            import_started = time.perf_counter()
+            base_mesh = _import_redapex_base_mesh_fast(
+                context,
+                apx_filepath,
+                redapex_path,
+                target_collection,
+                rotate_180=rotate_180,
+            )
+            import_seconds = time.perf_counter() - import_started
+            material_started = time.perf_counter()
+            apply_redcloth_materials_to_meshes(
+                [base_mesh],
+                redapex_path,
+                redapex_path,
+                context=context,
+                force_mat_update=not use_mat,
+            )
+            material_seconds = time.perf_counter() - material_started
+            total_seconds = time.perf_counter() - total_started
+            _log_redapex_profile(
+                "resource %s total %.3fs (backend %s, sanitize %.3fs, import %.3fs, materials %.3fs, chunks %s, floor %s)",
+                Path(str(redapex_path or "")).name,
+                total_seconds,
+                backend,
+                sanitize_seconds,
+                import_seconds,
+                material_seconds,
+                bool(import_chunks),
+                bool(import_floor),
+            )
+            return base_mesh
+        except Exception as exc:
+            backend = "io_mesh_apx"
+            log.warning("Fast redapex base import failed for %s; falling back to io_mesh_apx: %s", redapex_path, exc)
+
+    sanitize_started = time.perf_counter()
+    apx_filepath = _sanitize_apx_for_import(apx_filepath)
+    sanitize_seconds = time.perf_counter() - sanitize_started
+
+    _exist, enabled = addon_utils.check("io_mesh_apx")
+    if not enabled:
+        raise RuntimeError("io_mesh_apx addon is required for .redapex imports.")
+
+    parent_layer_collection = getattr(context.view_layer, "active_layer_collection", None)
+    parent_collection = getattr(parent_layer_collection, "collection", None)
+    before_child_ids = {
+        _collection_identity(coll)
+        for coll in (getattr(parent_collection, "children", []) or [])
+    }
+    from io_mesh_apx.importer.import_destruction import read_destruction
+    try:
+        import_started = time.perf_counter()
+        read_destruction(context, apx_filepath, rotate_180)
+        import_seconds = time.perf_counter() - import_started
+    except Exception:
+        try:
+            if parent_layer_collection is not None:
+                context.view_layer.active_layer_collection = parent_layer_collection
+        except Exception:
+            pass
+        raise
+
+    imported_root_collections = []
+    for coll in list(getattr(parent_collection, "children", []) or []):
+        if _collection_identity(coll) not in before_child_ids:
+            imported_root_collections.append(coll)
+    if not imported_root_collections:
+        active_layer_collection = getattr(context.view_layer, "active_layer_collection", None)
+        active_collection = getattr(active_layer_collection, "collection", None)
+        if active_collection is not None and active_collection is not parent_collection:
+            imported_root_collections.append(active_collection)
+    try:
+        if parent_layer_collection is not None:
+            context.view_layer.active_layer_collection = parent_layer_collection
+    except Exception:
+        pass
+
+    imported_collections = []
+    seen_collection_ids = set()
+    for root_collection in imported_root_collections:
+        for coll in _iter_collection_tree(root_collection):
+            coll_id = _collection_identity(coll)
+            if coll_id in seen_collection_ids:
+                continue
+            seen_collection_ids.add(coll_id)
+            imported_collections.append(coll)
+
+    imported_objects = []
+    seen_object_ids = set()
+    for coll in imported_collections:
+        for obj in list(getattr(coll, "all_objects", []) or []):
+            try:
+                obj_id = int(obj.as_pointer())
+            except Exception:
+                obj_id = id(obj)
+            if obj_id in seen_object_ids:
+                continue
+            seen_object_ids.add(obj_id)
+            imported_objects.append(obj)
+    imported_meshes = [obj for obj in imported_objects if getattr(obj, "type", None) == 'MESH']
+
+    base_mesh = _postprocess_redapex_import(
+        context,
+        redapex_path,
+        imported_objects,
+        imported_collections,
+        target_collection,
+        import_chunks=import_chunks,
+        import_floor=import_floor,
+        collections_as_empties=collections_as_empties,
+    )
+
+    material_targets = [
+        obj for obj in imported_objects
+        if getattr(obj, "type", None) == 'MESH'
+    ]
+    if base_mesh is not None and base_mesh not in material_targets:
+        material_targets.append(base_mesh)
+    if not material_targets:
+        material_targets = imported_meshes
+    material_started = time.perf_counter()
+    apply_redcloth_materials_to_meshes(
+        material_targets,
+        redapex_path,
+        redapex_path,
+        context=context,
+        force_mat_update=not use_mat,
+    )
+    material_seconds = time.perf_counter() - material_started
+    total_seconds = time.perf_counter() - total_started
+    _log_redapex_profile(
+        "resource %s total %.3fs (backend %s, sanitize %.3fs, import %.3fs, materials %.3fs, targets %d, chunks %s, floor %s)",
+        Path(str(redapex_path or "")).name,
+        total_seconds,
+        backend,
+        sanitize_seconds,
+        import_seconds,
+        material_seconds,
+        len(material_targets),
+        bool(import_chunks),
+        bool(import_floor),
+    )
+    return base_mesh
+
+
 class WITCH_OT_apx(bpy.types.Operator, ImportHelper):
-    """Load a Redcloth file with materials. To enable this button go to https://github.com/ArdCarraigh/Blender_APX_Addon and install the APX addon. Sep 19 2022 release"""
+    """Load a Redcloth file with materials using io_mesh_apx."""
     bl_idname = "witcher.import_apx_materials"  # important since its how bpy.ops.import.apx is constructed
     bl_label = "Import APX"
 
@@ -98,11 +657,7 @@ class WITCH_OT_apx(bpy.types.Operator, ImportHelper):
 
     @classmethod
     def poll(self, context):
-        #print(bpy.ops) # debug ops _utils
-        (exist, enabled) = addon_utils.check("io_mesh_apx")
-        if not enabled:
-            (exist, enabled) = addon_utils.check("io_scene_apx")
-        return enabled
+        return True
     
     def execute(self, context):
 
@@ -119,9 +674,11 @@ class WITCH_OT_apx(bpy.types.Operator, ImportHelper):
                 "Extract collision .apb and convert to .apx (io_mesh_apx + apex_sdk_cli)."
             )
             return {'CANCELLED'}
-        else:
-            importCloth(context, apx_filepath, self.use_mat, self.rotate_180, self.rm_ph_me, filepath)
-            return {'FINISHED'}
+        imported_obj = importCloth(context, apx_filepath, self.use_mat, self.rotate_180, self.rm_ph_me, filepath)
+        if imported_obj is None:
+            self.report({'ERROR'}, "Redcloth import failed. Enable io_mesh_apx and check its APX runtime settings.")
+            return {'CANCELLED'}
+        return {'FINISHED'}
 
     def invoke(self, context, event):
         """Invoke."""
@@ -130,7 +687,85 @@ class WITCH_OT_apx(bpy.types.Operator, ImportHelper):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
 
-from pathlib import Path
+
+class WITCH_OT_redcloth(WITCH_OT_apx):
+    """Load a Redcloth file with materials using io_mesh_apx."""
+    bl_idname = "witcher.import_redcloth_materials"
+    bl_label = "Import Redcloth"
+
+
+class WITCH_OT_redapex(WITCH_OT_apx):
+    """Load a Redapex file using the APX importer."""
+    bl_idname = "witcher.import_redapex_materials"
+    bl_label = "Import Redapex"
+
+    filename_ext = ".redapex"
+
+    filter_glob: StringProperty(
+        default="*.redapex",
+        options={'HIDDEN'},
+        maxlen=255,
+    )
+
+    rotate_180: BoolProperty(
+        name="Rotate 180 deg",
+        description="Rotate the mesh on the Z-axis by 180 degrees",
+        default=False
+    )
+    import_chunks: BoolProperty(
+        name="Import Chunks",
+        description="Keep destructible chunk meshes from the APX import",
+        default=False,
+    )
+    import_floor: BoolProperty(
+        name="Import Floor",
+        description="Keep the helper floor plane created by the APX destruction importer",
+        default=False,
+    )
+    collections_as_empties: BoolProperty(
+        name="Collections as Empties",
+        description="Flatten APX importer collections into Blender empties/objects",
+        default=True,
+    )
+
+    def draw(self, context):
+        layout = self.layout
+
+        general = layout.row().box()
+        general.label(text="General", icon="WORLD")
+        general.prop(self, "rotate_180")
+
+        materials = layout.row().box()
+        materials.label(text="Materials", icon="MATERIAL")
+        materials.prop(self, "use_mat")
+
+        destructible = layout.row().box()
+        destructible.label(text="Destruction", icon="MOD_EXPLODE")
+        destructible.prop(self, "import_chunks")
+        destructible.prop(self, "import_floor")
+        destructible.prop(self, "collections_as_empties")
+
+    def execute(self, context):
+        filepath = self.filepath
+        if os.path.isdir(filepath):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+
+        try:
+            import_redapex_resource(
+                context,
+                filepath,
+                use_mat=self.use_mat,
+                rotate_180=self.rotate_180,
+                import_chunks=self.import_chunks,
+                import_floor=self.import_floor,
+                collections_as_empties=self.collections_as_empties,
+            )
+        except Exception as e:
+            self.report({'ERROR'}, f"Redapex import failed: {e}")
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
 
 root_folders = [
     "animations",

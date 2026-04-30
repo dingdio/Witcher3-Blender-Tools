@@ -470,6 +470,41 @@ def _redcloth_enabled_for_import(kwargs, context=None):
         return bool(kwargs.get("do_import_Redcloth", False)) and global_enabled
     return global_enabled
 
+
+def _redapex_enabled_for_import(kwargs, context=None):
+    if "do_import_Redapex" in dict(kwargs or {}):
+        return bool(kwargs.get("do_import_Redapex", False))
+    return False
+
+
+def _is_redapex_resource(resource_path):
+    return str(resource_path or "").strip().lower().endswith(".redapex")
+
+
+def _cloth_resource_enabled_for_import(resource_path, kwargs, context=None):
+    if _is_redapex_resource(resource_path):
+        return _redapex_enabled_for_import(kwargs, context)
+    return _redcloth_enabled_for_import(kwargs, context)
+
+
+def _redapex_import_options(kwargs):
+    return {
+        "import_chunks": bool(kwargs.get("redapex_import_chunks", False)),
+        "import_floor": bool(kwargs.get("redapex_import_floor", False)),
+        "collections_as_empties": bool(kwargs.get("redapex_collections_as_empties", True)),
+    }
+
+
+def _chunk_cloth_resource(chunk):
+    try:
+        resource_var = chunk.GetVariableByName('resource') or chunk.GetVariableByName('m_resource')
+        handles = getattr(resource_var, "Handles", None) or []
+        if handles:
+            return str(getattr(handles[0], "DepotPath", "") or "").strip()
+    except Exception:
+        pass
+    return ""
+
 def _new_mesh_path(
     mesh_name=False,
     translation=False,
@@ -893,6 +928,46 @@ def _apply_plan_item_transform(obj, item):
             pass
 
 
+def _engine_transform_to_local_matrix(engine_transform, rotate_180=False):
+    yaw = _transform_real(engine_transform, "Yaw", 0.0)
+    pitch = _transform_real(engine_transform, "Pitch", 0.0)
+    roll = _transform_real(engine_transform, "Roll", 0.0)
+    loc_x = _transform_real(engine_transform, "X", 0.0)
+    loc_y = _transform_real(engine_transform, "Y", 0.0)
+    loc_z = _transform_real(engine_transform, "Z", 0.0)
+
+    if yaw == 0.0 and pitch == 0.0 and roll == 0.0:
+        mat = Matrix.Identity(4)
+    else:
+        mat = Euler((radians(yaw), radians(pitch), radians(roll)), 'YXZ').to_matrix().to_4x4()
+        if rotate_180:
+            mat[0][0], mat[0][1], mat[0][2] = -mat[0][0], -mat[0][1], mat[0][2]
+            mat[1][0], mat[1][1], mat[1][2] = -mat[1][0], -mat[1][1], mat[1][2]
+            mat[2][0], mat[2][1], mat[2][2] = -mat[2][0], -mat[2][1], mat[2][2]
+
+    mat.translation = (loc_x, loc_y, loc_z)
+    return mat
+
+
+def _apply_engine_transform_local(obj, engine_transform, rotate_180=False):
+    if obj is None or engine_transform is None:
+        return
+    obj.matrix_parent_inverse = Matrix.Identity(4)
+    obj.matrix_basis = _engine_transform_to_local_matrix(engine_transform, rotate_180=rotate_180)
+    if isinstance(engine_transform, dict) or hasattr(engine_transform, "Scale_x"):
+        obj.scale[0] = _transform_real(engine_transform, "Scale_x", 1.0)
+        obj.scale[1] = _transform_real(engine_transform, "Scale_y", 1.0)
+        obj.scale[2] = _transform_real(engine_transform, "Scale_z", 1.0)
+
+
+def _apply_plan_item_transform_as_child(obj, item):
+    transform = item.get("transform")
+    if transform:
+        _apply_engine_transform_local(obj, transform)
+        return
+    _apply_plan_item_transform(obj, item)
+
+
 def _tag_single_object_for_layer(obj, owner_tag=None, generation_tag=None):
     if obj is None:
         return
@@ -1073,7 +1148,7 @@ def _cached_plan_item_enabled_by_import_options(item, by_id, kwargs, *, context=
     if is_proxy_mesh and _proxy_mesh_filter_active(kwargs):
         return bool(kwargs.get("do_import_ProxyMesh", False))
     if kind in _CACHED_REDCLOTH_ITEM_KINDS:
-        return _redcloth_enabled_for_import(kwargs, context)
+        return _cloth_resource_enabled_for_import(item.get("repo_path", ""), kwargs, context)
     if kind in {"mesh", "component_mesh", "foliage", "grass"}:
         return bool(kwargs.get("do_import_Mesh", True))
     if kind == "collision":
@@ -1240,26 +1315,44 @@ def _import_cached_plan_redcloth_items(plan, target_collection, kwargs, context=
         resource = str(item.get("repo_path", "") or "").strip()
         if not resource or item_id in loaded_item_ids:
             continue
+        if not _cloth_resource_enabled_for_import(resource, kwargs, context):
+            continue
         parent_obj = ensure_parent_empty(str(item.get("parent_id", "") or "").strip())
         try:
-            cloth_arma, cloth_grp, _cloth_meshes = import_entity.import_or_reuse_redcloth(
-                parent_obj,
-                resource,
-                repo_file(resource),
-                import_name="CClothComponent",
-                entity_name=str(item.get("name", "") or Path(resource.replace("/", "\\")).stem),
-                target_collection=target_collection,
-            )
+            if _is_redapex_resource(resource):
+                root_obj, _cloth_meshes = import_entity.import_or_reuse_redapex(
+                    resource,
+                    repo_file(resource),
+                    context=context or bpy.context,
+                    loadmods=bool(kwargs.get("loadmods", False)),
+                    target_collection=target_collection,
+                    **_redapex_import_options(kwargs),
+                )
+                cloth_arma = root_obj
+                cloth_grp = None
+            else:
+                cloth_arma, cloth_grp, _cloth_meshes = import_entity.import_or_reuse_redcloth(
+                    parent_obj,
+                    resource,
+                    repo_file(resource),
+                    import_name="CClothComponent",
+                    entity_name=str(item.get("name", "") or Path(resource.replace("/", "\\")).stem),
+                    target_collection=target_collection,
+                )
         except Exception as exc:
-            log.warning("Problem with cached redcloth import %s: %s", resource, exc)
+            resource_label = "redapex" if _is_redapex_resource(resource) else "redcloth"
+            log.warning("Problem with cached %s import %s: %s", resource_label, resource, exc)
             if errors is not None:
-                errors.append(f"Problem with cached redcloth import {resource}: {exc}")
+                errors.append(f"Problem with cached {resource_label} import {resource}: {exc}")
             continue
         if cloth_arma is None:
             continue
         root_obj = cloth_grp if cloth_grp is not None else cloth_arma
         if parent_obj is not None:
             root_obj.parent = parent_obj
+            _apply_plan_item_transform_as_child(root_obj, item)
+        else:
+            _apply_plan_item_transform(root_obj, item)
         _tag_object_tree_for_layer_and_plan(
             root_obj,
             owner_tag,
@@ -1555,6 +1648,21 @@ def _build_sector_instancer_gn_tree(ng, source_obj):
 
 _SECTOR_SOURCE_MARKER_PROP = "_sector_source_repo"
 _SECTOR_SOURCES_COLLECTION_NAME = "__sector_sources__"
+_SECTOR_SOURCE_CACHE = {
+    "collection_key": None,
+    "dirty": True,
+    "sources": {},
+}
+_SECTOR_MISSING_NXS_CACHE = set()
+
+
+def _id_key(data_block):
+    if data_block is None:
+        return None
+    try:
+        return int(data_block.as_pointer())
+    except Exception:
+        return id(data_block)
 
 
 def _get_sector_sources_collection(context=None):
@@ -1577,6 +1685,79 @@ def _get_sector_sources_collection(context=None):
         except Exception:
             pass
     return coll
+
+
+def _get_cached_sector_source(marker):
+    marker = str(marker or "").strip()
+    if not marker:
+        return None
+    sources_coll = _get_sector_sources_collection()
+    collection_key = _id_key(sources_coll)
+    if _SECTOR_SOURCE_CACHE.get("dirty") or _SECTOR_SOURCE_CACHE.get("collection_key") != collection_key:
+        sources = {}
+        for obj in list(getattr(sources_coll, "all_objects", []) or []):
+            try:
+                key = str(obj.get(_SECTOR_SOURCE_MARKER_PROP, "") or "").strip()
+                if key:
+                    sources[key] = obj
+            except Exception:
+                continue
+        _SECTOR_SOURCE_CACHE["collection_key"] = collection_key
+        _SECTOR_SOURCE_CACHE["dirty"] = False
+        _SECTOR_SOURCE_CACHE["sources"] = sources
+    obj = (_SECTOR_SOURCE_CACHE.get("sources") or {}).get(marker)
+    if obj is None:
+        return None
+    try:
+        if obj.name in bpy.data.objects:
+            return obj
+    except Exception:
+        pass
+    _SECTOR_SOURCE_CACHE["dirty"] = True
+    return None
+
+
+def _remember_sector_source(marker, source):
+    marker = str(marker or "").strip()
+    if not marker or source is None:
+        return
+    _SECTOR_SOURCE_CACHE.setdefault("sources", {})[marker] = source
+    _SECTOR_SOURCE_CACHE["collection_key"] = _id_key(_get_sector_sources_collection())
+    _SECTOR_SOURCE_CACHE["dirty"] = False
+
+
+def _nxs_missing_key(path):
+    return os.path.normcase(os.path.normpath(str(path or "")))
+
+
+def _is_missing_nxs(path):
+    key = _nxs_missing_key(path)
+    return bool(key and key in _SECTOR_MISSING_NXS_CACHE)
+
+
+def _remember_missing_nxs(path):
+    key = _nxs_missing_key(path)
+    if key:
+        _SECTOR_MISSING_NXS_CACHE.add(key)
+
+
+def _is_missing_file_error(exc):
+    if isinstance(exc, FileNotFoundError):
+        return True
+    try:
+        if getattr(exc, "errno", None) == 2:
+            return True
+    except Exception:
+        pass
+    text = str(exc or "").lower()
+    return "no such file or directory" in text or "[errno 2]" in text
+
+
+def _note_missing_nxs_once(path, label):
+    if _is_missing_nxs(path):
+        return
+    _remember_missing_nxs(path)
+    log.warning("%s missing NXS skipped %s", label, path)
 
 
 def _apply_sector_collision_transform_and_tags(wrapper, mesh, parent_transform, kwargs):
@@ -1643,10 +1824,18 @@ def _import_sector_w2mesh_collision(mesh, errors, parent_transform, **kwargs):
     if not collision_path:
         log.debug("No collision cache item found for mesh collision record: %s", mesh_path)
         return None
+    if _is_missing_nxs(collision_path):
+        return None
+    if not os.path.exists(collision_path):
+        _note_missing_nxs_once(collision_path, "Mesh collision")
+        return None
 
     try:
         nxs_objects = create_from_nxs(collision_path, shape_items=shape_items)
     except Exception as exc:
+        if _is_missing_file_error(exc):
+            _note_missing_nxs_once(collision_path, "Mesh collision")
+            return None
         log.warning("Mesh collision NXS import failed %s: %s", collision_path, exc)
         if errors is not None:
             errors.append(f"Mesh collision NXS import failed {mesh_path}: {exc}")
@@ -1731,14 +1920,22 @@ def _import_sector_collision_from_cache(mesh, errors, parent_transform, **kwargs
         try:
             item.extract_to_file(out_path)
         except Exception as exc:
+            if _is_missing_file_error(exc):
+                _note_missing_nxs_once(out_path, "Collision extraction")
+                return None
             log.warning("Collision extraction failed %s: %s", collision_path, exc)
             if errors is not None:
                 errors.append(f"Collision extraction failed {collision_path}: {exc}")
             return None
 
+    if _is_missing_nxs(out_path):
+        return None
     try:
         nxs_objects = create_from_nxs(out_path)
     except Exception as exc:
+        if _is_missing_file_error(exc):
+            _note_missing_nxs_once(out_path, "Collision")
+            return None
         log.warning("NXS import failed %s: %s", out_path, exc)
         if errors is not None:
             errors.append(f"NXS import failed {out_path}: {exc}")
@@ -1821,14 +2018,9 @@ def _get_or_import_sector_nxs_source_mesh(repo_path, kwargs, errors, mode_signat
     is_mesh_collision = _sector_collision_path_is_visual_mesh(repo_path)
     marker = f"{repo_path}#collision" if is_mesh_collision else repo_path
 
-    for obj in bpy.data.objects:
-        if obj.type != 'MESH':
-            continue
-        try:
-            if str(obj.get(_SECTOR_SOURCE_MARKER_PROP, "") or "") == marker:
-                return obj
-        except Exception:
-            continue
+    cached_source = _get_cached_sector_source(marker)
+    if cached_source is not None:
+        return cached_source
 
     try:
         from .import_nxs import create_from_nxs
@@ -1845,6 +2037,11 @@ def _get_or_import_sector_nxs_source_mesh(repo_path, kwargs, errors, mode_signat
         out_path, shape_items = get_collision_for_mesh_with_poses(repo_path)
         if not out_path:
             log.debug("NXS source not found for mesh collision: %s", repo_path)
+            return None
+        if _is_missing_nxs(out_path):
+            return None
+        if not os.path.exists(out_path):
+            _note_missing_nxs_once(out_path, "NXS source")
             return None
     else:
         manager = CollisionManager.Get()
@@ -1876,14 +2073,22 @@ def _get_or_import_sector_nxs_source_mesh(repo_path, kwargs, errors, mode_signat
             try:
                 item.extract_to_file(out_path)
             except Exception as exc:
+                if _is_missing_file_error(exc):
+                    _note_missing_nxs_once(out_path, "NXS extraction")
+                    return None
                 log.warning("NXS extraction failed %s: %s", repo_path, exc)
                 if errors is not None:
                     errors.append(f"NXS extraction failed {repo_path}: {exc}")
                 return None
 
+    if _is_missing_nxs(out_path):
+        return None
     try:
         nxs_objects = create_from_nxs(out_path, shape_items=shape_items)
     except Exception as exc:
+        if _is_missing_file_error(exc):
+            _note_missing_nxs_once(out_path, "NXS source")
+            return None
         log.warning("NXS import failed %s: %s", out_path, exc)
         if errors is not None:
             errors.append(f"NXS import failed {out_path}: {exc}")
@@ -1916,6 +2121,7 @@ def _get_or_import_sector_nxs_source_mesh(repo_path, kwargs, errors, mode_signat
         sources_coll.objects.link(source)
     except Exception:
         pass
+    _remember_sector_source(marker, source)
     return source
 
 
@@ -1980,14 +2186,9 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
     if not marker:
         return None
 
-    for obj in bpy.data.objects:
-        if obj.type != 'MESH':
-            continue
-        try:
-            if str(obj.get(_SECTOR_SOURCE_MARKER_PROP, "") or "") == marker:
-                return obj
-        except Exception:
-            continue
+    cached_source = _get_cached_sector_source(marker)
+    if cached_source is not None:
+        return cached_source
 
     src_mesh_data = _new_mesh_path(
         repo_path,
@@ -2003,7 +2204,11 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
     mesh_kwargs["_layer_import_plan_item_id"] = (item_id or "") + "_src"
     mesh_kwargs["_layer_import_plan_mode"] = mode_signature
 
-    before_ids = {o.as_pointer() for o in bpy.data.objects}
+    active_collection = _get_active_collection()
+    before_ids = {
+        _id_key(o)
+        for o in list(getattr(active_collection, "all_objects", []) or [])
+    }
     try:
         wrapper = import_single_mesh(
             src_mesh_data,
@@ -2018,7 +2223,11 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
             errors.append(f"sector_instancer source failed {repo_path}: {exc}")
         return None
 
-    new_objects = [o for o in bpy.data.objects if o.as_pointer() not in before_ids]
+    new_objects = [
+        o
+        for o in list(getattr(active_collection, "all_objects", []) or [])
+        if _id_key(o) not in before_ids
+    ]
     if wrapper is not None and wrapper not in new_objects:
         new_objects.append(wrapper)
 
@@ -2048,6 +2257,7 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
         sources_coll.objects.link(source)
     except Exception:
         pass
+    _remember_sector_source(marker, source)
     return source
 
 
@@ -2196,7 +2406,7 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
         elif kind in _CACHED_REDCLOTH_ITEM_KINDS:
             if (
                 not repo_path_value
-                or not _redcloth_enabled_for_import(kwargs, context)
+                or not _cloth_resource_enabled_for_import(repo_path_value, kwargs, context)
             ):
                 continue
         elif kind in _CACHED_FULL_LIGHT_ITEM_KINDS:
@@ -2360,29 +2570,45 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
             resource = str(item.get("repo_path", "") or "").strip()
             if (
                 not resource
-                or not _redcloth_enabled_for_import(kwargs, context)
+                or not _cloth_resource_enabled_for_import(resource, kwargs, context)
             ):
                 continue
             try:
                 cloth_started = time.perf_counter()
-                cloth_arma, cloth_grp, _cloth_meshes = import_entity.import_or_reuse_redcloth(
-                    parent_obj,
-                    resource,
-                    repo_file(resource),
-                    import_name="CClothComponent",
-                    entity_name=str(item.get("name", "") or Path(resource.replace("/", "\\")).stem),
-                    target_collection=target_collection,
-                )
+                if _is_redapex_resource(resource):
+                    root_obj, _cloth_meshes = import_entity.import_or_reuse_redapex(
+                        resource,
+                        repo_file(resource),
+                        context=context or bpy.context,
+                        loadmods=bool(kwargs.get("loadmods", False)),
+                        target_collection=target_collection,
+                        **_redapex_import_options(kwargs),
+                    )
+                    cloth_arma = root_obj
+                    cloth_grp = None
+                else:
+                    cloth_arma, cloth_grp, _cloth_meshes = import_entity.import_or_reuse_redcloth(
+                        parent_obj,
+                        resource,
+                        repo_file(resource),
+                        import_name="CClothComponent",
+                        entity_name=str(item.get("name", "") or Path(resource.replace("/", "\\")).stem),
+                        target_collection=target_collection,
+                    )
                 cloth_seconds += time.perf_counter() - cloth_started
             except Exception as exc:
-                log.warning("Problem with cached redcloth import %s: %s", resource, exc)
-                errors.append(f"Problem with cached redcloth import {resource}: {exc}")
+                resource_label = "redapex" if _is_redapex_resource(resource) else "redcloth"
+                log.warning("Problem with cached %s import %s: %s", resource_label, resource, exc)
+                errors.append(f"Problem with cached {resource_label} import {resource}: {exc}")
                 continue
             if cloth_arma is None:
                 continue
             root_obj = cloth_grp if cloth_grp is not None else cloth_arma
             if parent_obj is not None:
                 root_obj.parent = parent_obj
+                _apply_plan_item_transform_as_child(root_obj, item)
+            else:
+                _apply_plan_item_transform(root_obj, item)
             _tag_object_tree_for_layer_and_plan(
                 root_obj,
                 owner_tag,
@@ -3147,6 +3373,12 @@ _REPO_DUPLICATE_CACHE = {
 }
 
 
+def _invalidate_duplicate_root_index():
+    _REPO_DUPLICATE_CACHE["scene_key"] = None
+    _REPO_DUPLICATE_CACHE["object_count"] = -1
+    _REPO_DUPLICATE_CACHE["roots"] = {}
+
+
 def _scene_identity(scene):
     if scene is None:
         return None
@@ -3163,6 +3395,17 @@ def _object_identity(obj):
         return int(obj.as_pointer())
     except Exception:
         return id(obj)
+
+
+def _is_live_blender_object(obj):
+    if obj is None:
+        return False
+    try:
+        return bool(obj.name)
+    except ReferenceError:
+        return False
+    except Exception:
+        return False
 
 
 def _get_scene(context=None):
@@ -3387,6 +3630,8 @@ def _finalize_layer_reload_cleanup(collection, kwargs):
     if not previous_ids:
         return 0
     removed_count = _cleanup_captured_layer_objects(collection, previous_ids)
+    if removed_count:
+        _invalidate_duplicate_root_index()
     kwargs["_layer_import_previous_ids"] = set()
     return removed_count
 
@@ -3552,6 +3797,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
     levelFile = levelData.layerNode
     if target_collection is None:
         target_collection = _ensure_level_collection(levelFile, context)
+    kwargs["_level_target_collection"] = target_collection
     _ensure_layer_reload_tracking(target_collection, levelFile, context, nearby_filter, kwargs)
 
     if import_isolation.needs_isolation_session(context):
@@ -3924,6 +4170,7 @@ def loadLevelFromCachedPlan(level_file, plan_items, context=None, **kwargs):
 
     if target_collection is None:
         target_collection = _ensure_level_collection(level_file, context)
+    kwargs["_level_target_collection"] = target_collection
     mode_signature = str(kwargs.get("_layer_import_mode_signature", "") or "").strip()
     if not mode_signature:
         mode_signature = _layer_load_mode_signature(dev_empty_only)
@@ -4051,12 +4298,20 @@ def _has_blender_numeric_suffix(name: str) -> bool:
 
 
 def _is_duplicate_root_candidate(obj, repo_path=None):
-    if obj is None or getattr(obj, "type", "") != 'EMPTY':
+    if not _is_live_blender_object(obj):
         return False
-    obj_name = getattr(obj, "name", "")
-    if not obj_name or obj_name not in bpy.data.objects:
+    try:
+        obj_type = getattr(obj, "type", "")
+        obj_name = getattr(obj, "name", "")
+        obj_repo_path = str(obj.get("repo_path", "") or "").strip()
+    except ReferenceError:
         return False
-    obj_repo_path = str(obj.get("repo_path", "") or "").strip()
+    except Exception:
+        return False
+    if obj_type != 'EMPTY':
+        return False
+    if not obj_name:
+        return False
     if not obj_repo_path:
         return False
     if repo_path is not None and obj_repo_path != repo_path:
@@ -4065,10 +4320,15 @@ def _is_duplicate_root_candidate(obj, repo_path=None):
 
 
 def _prefer_duplicate_root(current_obj, candidate_obj):
-    if current_obj is None:
+    if not _is_duplicate_root_candidate(candidate_obj):
+        return current_obj
+    if not _is_duplicate_root_candidate(current_obj):
         return candidate_obj
-    current_primary = not _has_blender_numeric_suffix(getattr(current_obj, "name", ""))
-    candidate_primary = not _has_blender_numeric_suffix(getattr(candidate_obj, "name", ""))
+    try:
+        current_primary = not _has_blender_numeric_suffix(getattr(current_obj, "name", ""))
+        candidate_primary = not _has_blender_numeric_suffix(getattr(candidate_obj, "name", ""))
+    except ReferenceError:
+        return candidate_obj
     if candidate_primary and not current_primary:
         return candidate_obj
     return current_obj
@@ -4098,8 +4358,9 @@ def _get_duplicate_root_index(scene=None):
     cached_object_count = int(_REPO_DUPLICATE_CACHE.get("object_count", -1))
     if object_count >= 0 and cached_object_count >= 0 and object_count < cached_object_count:
         return _rebuild_duplicate_root_index(scene)
+    roots = _REPO_DUPLICATE_CACHE.get("roots") or {}
     _REPO_DUPLICATE_CACHE["object_count"] = max(cached_object_count, object_count)
-    return _REPO_DUPLICATE_CACHE["roots"]
+    return roots
 
 
 def _touch_duplicate_root_index(scene=None):
@@ -4144,7 +4405,7 @@ def _remap_object_reference(owner, attr_name, clone_by_id):
 
 
 def _clone_duplicate_hierarchy(source_root, target_collection=None, *, remap_links=True):
-    if source_root is None:
+    if not _is_duplicate_root_candidate(source_root):
         return None
     target_collection = target_collection or _get_active_collection()
     if target_collection is None:
@@ -4152,7 +4413,10 @@ def _clone_duplicate_hierarchy(source_root, target_collection=None, *, remap_lin
 
     clone_pairs = []
     clone_by_id = {}
-    source_objects = [source_root] + list(getattr(source_root, "children_recursive", []) or [])
+    try:
+        source_objects = [source_root] + list(getattr(source_root, "children_recursive", []) or [])
+    except ReferenceError:
+        return None
     for source_obj in source_objects:
         clone_obj = source_obj.copy()
         target_collection.objects.link(clone_obj)
@@ -4554,7 +4818,7 @@ def getDataBufferMesh(entity, *, mesh_fbx_uncook_path=None, mesh_uncook_path=Non
                 mesh.engine_visible = _drawable_flags_visible_from_value(drawable_flags, default=True)
                 mesh_list.append(mesh)
             
-            if chunk.name == "CClothComponent":
+            if chunk.name in {"CClothComponent", "CDestructionSystemComponent"}:
                 cloth_list.append(chunk)
 
     return (mesh_list, cloth_list)
@@ -4666,6 +4930,7 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
     proxy_filter_active = _proxy_mesh_filter_active(kwargs)
     do_import_proxy_mesh = bool(kwargs.get("do_import_ProxyMesh", False))
     do_import_redcloth = _redcloth_enabled_for_import(kwargs, bpy.context)
+    do_import_redapex = _redapex_enabled_for_import(kwargs, bpy.context)
     parent_world_position = kwargs.get("_nearby_parent_position")
     entity_world_position = _entity_world_position(ENTITY_OBJECT, parent_world_position)
     supported_component_names = {
@@ -4698,7 +4963,11 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
     filtered_cloth_list = []
     for chunk in cloth_list:
         _raise_if_layer_import_cancelled(kwargs)
-        if not do_import_redcloth:
+        cloth_resource = _chunk_cloth_resource(chunk)
+        if _is_redapex_resource(cloth_resource):
+            if not do_import_redapex:
+                continue
+        elif not do_import_redcloth:
             continue
         if not _position_within_nearby_filter(_chunk_world_position(chunk, anchor_position), nearby_filter):
             _note_nearby_filter_skip(nearby_stats)
@@ -4731,6 +5000,12 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
         )
         return None
 
+    entity_target_collection = kwargs.get("_level_target_collection")
+    if import_isolation.is_isolated_import_context(bpy.context):
+        entity_target_collection = _get_active_collection(bpy.context) or entity_target_collection
+    if entity_target_collection is not None:
+        _activate_collection(bpy.context, entity_target_collection)
+
     #TRANSFORM FOR THIS ENTITY
     bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
     empty_transform = bpy.context.object
@@ -4749,30 +5024,56 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
             imported_any = True
     if cloth_list:
         from ..importers import import_entity
-        target_collection = _get_active_collection()
+        target_collection = entity_target_collection or _get_active_collection()
         for chunk in cloth_list:
             _raise_if_layer_import_cancelled(kwargs)
             try:
-                if not do_import_redcloth:
+                resource = _chunk_cloth_resource(chunk)
+                if _is_redapex_resource(resource):
+                    if not do_import_redapex:
+                        continue
+                elif not do_import_redcloth:
                     continue
                 cloth_name = chunk.GetVariableByName('name').String.String
-                resource = chunk.GetVariableByName('resource').Handles[0].DepotPath
-                cloth_arma, cloth_grp, _cloth_meshes = import_entity.import_or_reuse_redcloth(
-                    empty_transform,
-                    resource,
-                    repo_file(resource),
-                    import_name="CClothComponent",
-                    entity_name=cloth_name,
-                    target_collection=target_collection,
-                )
+                if _is_redapex_resource(resource):
+                    root_obj, _cloth_meshes = import_entity.import_or_reuse_redapex(
+                        resource,
+                        repo_file(resource),
+                        context=bpy.context,
+                        loadmods=bool(kwargs.get("loadmods", False)),
+                        target_collection=target_collection,
+                        **_redapex_import_options(kwargs),
+                    )
+                    cloth_arma = root_obj
+                    cloth_grp = None
+                else:
+                    cloth_arma, cloth_grp, _cloth_meshes = import_entity.import_or_reuse_redcloth(
+                        empty_transform,
+                        resource,
+                        repo_file(resource),
+                        import_name="CClothComponent",
+                        entity_name=cloth_name,
+                        target_collection=target_collection,
+                    )
+                    root_obj = cloth_grp if cloth_grp is not None else cloth_arma
+                if target_collection is not None:
+                    _activate_collection(bpy.context, target_collection)
                 if cloth_arma:
-                    if cloth_grp is not None:
-                        cloth_grp.parent = empty_transform
-                    else:
-                        cloth_arma.parent = empty_transform
+                    if root_obj is not None:
+                        root_obj.parent = empty_transform
+                        try:
+                            transform_prop = chunk.GetVariableByName('transform')
+                        except Exception:
+                            transform_prop = None
+                        if transform_prop is not None:
+                            try:
+                                _apply_engine_transform_local(root_obj, getattr(transform_prop, "EngineTransform", None))
+                            except Exception:
+                                pass
                     imported_any = True
             except Exception as e:
-                log.warning("Problem with cloth import: %s", e)
+                resource_label = "redapex" if _is_redapex_resource(resource if 'resource' in locals() else "") else "cloth"
+                log.warning("Problem with %s import: %s", resource_label, e)
     
     for component in eligible_components:
         _raise_if_layer_import_cancelled(kwargs)

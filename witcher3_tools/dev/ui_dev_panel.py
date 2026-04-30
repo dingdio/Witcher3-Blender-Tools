@@ -234,6 +234,7 @@ DEV_OPERATOR_ITEMS = [
     ('w2mesh', 'W2MESH', 'Mesh import test paths'),
     ('nxs', 'NXS', 'Collision import test paths'),
     ('apx', 'APX', 'Cloth import test paths (Entity only)'),
+    ('redapex', 'REDAPEX', 'Redapex import test paths'),
     ('w2ent_chara', 'CHARACTER', 'Character entity import (.w2ent)'),
     ('w2ent', 'ENTITY', 'Item/prop entity import (.w2ent)'),
     ('w2anims', 'W2ANIMS', 'Animation import (.w2anims)'),
@@ -759,7 +760,9 @@ class DEV_OT_ImportPath(Operator):
         elif op == 'nxs':
             bpy.ops.witcher.import_nxs(invoke_mode, filepath=filepath)
         elif op == 'apx':
-            bpy.ops.witcher.import_apx_materials(invoke_mode, filepath=filepath)
+            bpy.ops.witcher.import_redcloth_materials(invoke_mode, filepath=filepath)
+        elif op == 'redapex':
+            bpy.ops.witcher.import_redapex_materials(invoke_mode, filepath=filepath)
         elif op == 'w2ent_chara':
             bpy.ops.witcher.import_w2ent_character(invoke_mode, filepath=filepath)
         elif op == 'w2ent':

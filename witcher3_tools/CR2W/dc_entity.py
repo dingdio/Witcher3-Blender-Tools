@@ -47,6 +47,7 @@ _KNOWN_REPO_EXTS = (
     ".w2steer",
     ".w2ent",
     ".redcloth",
+    ".redapex",
     ".w3fac",
     ".w2fac",
     ".w3dyng",
@@ -82,6 +83,13 @@ def _extract_depot_subpath(path_value):
     return None
 
 
+def _expected_exts(expected_ext) -> tuple[str, ...]:
+    if isinstance(expected_ext, (list, tuple, set)):
+        return tuple(str(ext).lower() for ext in expected_ext if str(ext or "").strip())
+    ext = str(expected_ext or "").lower()
+    return (ext,) if ext else ()
+
+
 def _is_valid_repo_path(path_value, expected_ext: str | None = None) -> bool:
     if not isinstance(path_value, str):
         return False
@@ -93,13 +101,17 @@ def _is_valid_repo_path(path_value, expected_ext: str | None = None) -> bool:
     lowered = candidate.lower()
     if lowered.startswith(("array:", "handle:", "ptr:")):
         return False
-    if expected_ext:
-        return lowered.endswith(expected_ext.lower())
+    expected_exts = _expected_exts(expected_ext)
+    if expected_exts:
+        return lowered.endswith(expected_exts)
     return any(lowered.endswith(ext) for ext in _KNOWN_REPO_EXTS)
 
 
 def _path_candidate_exts(expected_ext: str):
-    ext = str(expected_ext or "").lower()
+    exts = _expected_exts(expected_ext)
+    if len(exts) > 1:
+        return exts
+    ext = exts[0] if exts else ""
     candidate_map = {
         ".w2mesh": (".w2mesh", ".lmf", ".mmm"),
         ".w2rig": (".w2rig", ".hkx"),
@@ -139,10 +151,12 @@ def _template_cache_key(template_filename: str) -> str:
 
 def _normalize_repo_subpath(depot_subpath: str, expected_ext: str):
     normalized = depot_subpath.replace("/", "\\").lstrip("\\")
-    if expected_ext.lower() == ".w2mesh":
+    expected_exts = _expected_exts(expected_ext)
+    primary_ext = expected_exts[0] if expected_exts else ""
+    if primary_ext == ".w2mesh":
         normalized = re.sub(r"(?i)\\export\\", r"\\model\\", normalized, count=1)
-    root, _ = os.path.splitext(normalized)
-    normalized = root + expected_ext
+    root, current_ext = os.path.splitext(normalized)
+    normalized = root + (current_ext if current_ext.lower() in expected_exts else primary_ext)
     return normalized if _is_valid_repo_path(normalized, expected_ext) else None
 
 
@@ -1474,7 +1488,7 @@ def _convert_chunk_for_model(chunk):
         component.mesh = _resolve_mesh_path(chunk, getattr(component, "mesh", None))
         return component if component.mesh else None
     if chunk.Type == "CClothComponent":
-        resource = _resolve_repo_path(chunk, "resource", ".redcloth")
+        resource = _resolve_repo_path(chunk, "resource", (".redcloth", ".redapex"))
         _cname_prop = chunk.GetVariableByName("name")
         _cname = str(_prop_to_string(_cname_prop) or "").strip()
         return CClothComponent(resource, name=_cname) if resource else None

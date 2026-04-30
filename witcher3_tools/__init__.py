@@ -392,7 +392,7 @@ from .ui import ui_import_menu
 from .ui import ui_scene
 from .ui import armature_context
 from .ui import ui_cache_export
-from .ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_apx, WITCH_OT_w2mesh_export, WITCH_OT_nxs,
+from .ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_apx, WITCH_OT_redcloth, WITCH_OT_redapex, WITCH_OT_w2mesh_export, WITCH_OT_nxs,
                          WITCH_OT_export_goto_project_path,
                          WITCH_OT_create_sound_info, WITCH_OT_remove_sound_info,
                          WITCH_OT_toggle_rot90, WITCH_OT_merge_armature_hierarchy,
@@ -432,6 +432,42 @@ bl_info = {
     "doc_url": "https://github.com/dingdio/Witcher3_Blender_Tools",
     "category": "Import-Export"
 }
+
+def _get_addon_about_info():
+    info = globals().get("bl_info")
+    if isinstance(info, dict):
+        version = info.get("version", ())
+        version_text = ".".join(str(part) for part in version)
+        return {
+            "version": version_text,
+            "author": info.get("author", "Unknown"),
+            "doc_url": info.get("doc_url", "") or "https://github.com/dingdio/Witcher3_Blender_Tools",
+        }
+
+    manifest_path = os.path.join(os.path.dirname(__file__), "blender_manifest.toml")
+    manifest_info = {
+        "version": "",
+        "author": "Unknown",
+        "doc_url": "https://github.com/dingdio/Witcher3_Blender_Tools",
+    }
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            for line in manifest_file:
+                key, separator, value = line.partition("=")
+                if not separator:
+                    continue
+                key = key.strip()
+                value = value.strip().strip('"')
+                if key == "version":
+                    manifest_info["version"] = value
+                elif key == "maintainer":
+                    manifest_info["author"] = value
+                elif key == "website":
+                    manifest_info["doc_url"] = value
+    except OSError:
+        pass
+
+    return manifest_info
 
 import tempfile
 
@@ -2751,20 +2787,36 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 filter_col.prop(scene_settings, "terrain_layer_do_import_proxy_mesh", text="Proxy Mesh")
                 filter_col.prop(scene_settings, "terrain_layer_do_import_entity", text="Entity")
                 filter_col.prop(scene_settings, "terrain_layer_do_import_redcloth", text="Redcloth")
+                filter_col.prop(scene_settings, "terrain_layer_do_import_redapex", text="Redapex")
                 filter_col.prop(scene_settings, "terrain_layer_do_import_collision", text="Collision")
                 filter_col.prop(scene_settings, "terrain_layer_do_import_rigidbody", text="Rigid Body")
                 filter_col.prop(scene_settings, "terrain_layer_do_import_point_light", text="Point Lights")
                 filter_col.prop(scene_settings, "terrain_layer_do_import_spot_light", text="Spot Lights")
 
-                mesh_box = controls.box()
-                mesh_box.label(text="Mesh Settings")
+                import_options_box = controls.box()
+                import_options_box.label(text="Per-Type Import Options")
+
+                mesh_box = import_options_box.box()
+                mesh_box.label(text="W2Mesh")
                 mesh_box.prop(scene_settings, "terrain_layer_instanced_sector", text="Instance Repeated Meshes")
                 mesh_row = mesh_box.row(align=True)
                 mesh_row.prop(scene_settings, "terrain_layer_keep_lod_meshes", text="Keep LODs")
                 mesh_row.prop(scene_settings, "terrain_layer_keep_empty_lods", text="Keep Empty LODs")
                 mesh_box.prop(scene_settings, "terrain_layer_keep_proxy_meshes", text="Keep Proxy Mesh LODs")
-                mesh_box.prop(scene_settings, "terrain_layer_enable_name_filter", text="Enable Regex Filter")
-                regex_row = mesh_box.row(align=True)
+
+                redapex_box = import_options_box.box()
+                redapex_box.label(text="Redapex")
+                redapex_box.enabled = bool(getattr(scene_settings, "terrain_layer_do_import_redapex", True))
+                redapex_row = redapex_box.row(align=True)
+                redapex_row.enabled = bool(getattr(scene_settings, "terrain_layer_do_import_redapex", True))
+                redapex_row.prop(scene_settings, "terrain_layer_redapex_import_chunks", text="Redapex Chunks")
+                redapex_row.prop(scene_settings, "terrain_layer_redapex_import_floor", text="Redapex Floor")
+                redapex_box.prop(scene_settings, "terrain_layer_redapex_collections_as_empties", text="Collections as Empties")
+
+                filter_options_box = controls.box()
+                filter_options_box.label(text="Filters")
+                filter_options_box.prop(scene_settings, "terrain_layer_enable_name_filter", text="Enable Regex Filter")
+                regex_row = filter_options_box.row(align=True)
                 regex_row.enabled = bool(getattr(scene_settings, "terrain_layer_enable_name_filter", False))
                 regex_row.prop(scene_settings, "terrain_layer_name_filter_regex", text="Regex")
 
@@ -2780,6 +2832,7 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 visibility_row("Default-Hidden Groups", "terrain_layer_hide_default_hidden", "terrain_layer_solo_default_hidden")
                 visibility_row("Engine Hidden", "terrain_layer_hide_engine_hidden_meshes", "terrain_layer_solo_engine_hidden_meshes")
                 visibility_row("Proxy Meshes", "terrain_layer_hide_proxy_meshes", "terrain_layer_solo_proxy_meshes")
+                visibility_row("Redapex", "terrain_layer_hide_redapex", "terrain_layer_solo_redapex")
                 visibility_row("Collision", "terrain_layer_hide_collision", "terrain_layer_solo_collision")
                 visibility_row("Volume Meshes", "terrain_layer_hide_volume_meshes", "terrain_layer_solo_volume_meshes")
                 visibility_row("Shadow Meshes", "terrain_layer_hide_shadow_meshes", "terrain_layer_solo_shadow_meshes")
@@ -3068,10 +3121,10 @@ class WITCH_PT_Utils(WITCH_PT_Base, bpy.types.Panel):
         body = section("witcher_utils_about", "About", 'INFO', default_closed=True)
         if body:
             col = body.column(align=True)
-            version_text = ".".join(str(part) for part in bl_info.get("version", ()))
-            col.label(text=f"Witcher 3 Tools v{version_text}")
-            col.label(text=f"Author: {bl_info.get('author', 'Unknown')}")
-            doc_url = bl_info.get("doc_url", "") or "https://github.com/dingdio/Witcher3_Blender_Tools"
+            about_info = _get_addon_about_info()
+            col.label(text=f"Witcher 3 Tools v{about_info['version']}")
+            col.label(text=f"Author: {about_info['author']}")
+            doc_url = about_info["doc_url"]
             row = col.row(align=True)
             row.operator("wm.url_open", text="GitHub", icon='URL').url = doc_url
             col.label(text="Settings also live in Add-on Preferences", icon='PREFERENCES')
@@ -3284,10 +3337,10 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
             body = section("witcher_settings_about", "About", 'INFO', default_closed=True)
             if body:
                 col = body.column(align=True)
-                version_text = ".".join(str(part) for part in bl_info.get("version", ()))
-                col.label(text=f"Witcher 3 Tools v{version_text}")
-                col.label(text=f"Author: {bl_info.get('author', 'Unknown')}")
-                doc_url = bl_info.get("doc_url", "") or "https://github.com/dingdio/Witcher3_Blender_Tools"
+                about_info = _get_addon_about_info()
+                col.label(text=f"Witcher 3 Tools v{about_info['version']}")
+                col.label(text=f"Author: {about_info['author']}")
+                doc_url = about_info["doc_url"]
                 row = col.row(align=True)
                 row.operator("wm.url_open", text="GitHub", icon='URL').url = doc_url
                 col.label(text="Settings also live in Add-on Preferences", icon='PREFERENCES')

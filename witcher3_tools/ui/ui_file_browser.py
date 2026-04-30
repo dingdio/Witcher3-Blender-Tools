@@ -441,6 +441,26 @@ class MySettings(PropertyGroup):
         description="Import cloth simulation assets",
         default=True,
     )
+    terrain_layer_do_import_redapex: BoolProperty(
+        name="Redapex",
+        description="Import Apex destruction resources from nearby layers",
+        default=True,
+    )
+    terrain_layer_redapex_import_chunks: BoolProperty(
+        name="Redapex Chunks",
+        description="Keep destructible chunk meshes when importing redapex resources",
+        default=False,
+    )
+    terrain_layer_redapex_import_floor: BoolProperty(
+        name="Redapex Floor",
+        description="Keep the helper floor plane created by the APX destruction importer",
+        default=False,
+    )
+    terrain_layer_redapex_collections_as_empties: BoolProperty(
+        name="Redapex Collections as Empties",
+        description="Flatten APX importer collections into Blender empties/objects",
+        default=True,
+    )
     terrain_layer_instanced_sector: BoolProperty(
         name="Instance Repeated Meshes",
         description="Group identical CSectorData mesh placements into a single instancer object instead of one object per placement. Greatly reduces object count for dense static layers (rocks, cliffs, debris). Individual selection is not possible for instanced meshes.",
@@ -528,6 +548,18 @@ class MySettings(PropertyGroup):
     terrain_layer_solo_proxy_meshes: BoolProperty(
         name="Solo Proxy Meshes",
         description="Show imported layer proxy meshes and hide non-proxy layer meshes",
+        default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
+    )
+    terrain_layer_hide_redapex: BoolProperty(
+        name="Hide Redapex",
+        description="Hide imported redapex objects while keeping them in the scene",
+        default=False,
+        update=lambda self, context: _update_layer_visibility_settings(self, context),
+    )
+    terrain_layer_solo_redapex: BoolProperty(
+        name="Solo Redapex",
+        description="Show imported redapex objects and hide other imported layer objects",
         default=False,
         update=lambda self, context: _update_layer_visibility_settings(self, context),
     )
@@ -1620,7 +1652,7 @@ def get_collision_output_rel_path(item_path: str, loadmods: bool = False) -> str
 
 
 def _ensure_redcloth_apx_for_asset_import(context, redcloth_abs_path: str, redcloth_rel_path: str, loadmods: bool = False) -> str:
-    """Ensure a .redcloth file has a corresponding .apx in the uncook tree."""
+    """Ensure a .redcloth/.redapex file has a corresponding .apx in the uncook tree."""
     from .ui_mesh import find_apx
 
     redcloth_abs_path = win_safe_path(redcloth_abs_path or "")
@@ -2133,26 +2165,28 @@ def _restore_active_layer_collection(context, collection_name: str) -> None:
 
 
 def _find_redcloth_material_for_collision_apb(context, collision_item_path: str, loadmods: bool = False) -> str:
-    """Find/extract the matching .redcloth material file for a collision cache APB import."""
+    """Find/extract the matching .redcloth/.redapex material file for a collision cache APB import."""
     collision_item_path = (collision_item_path or "").replace("/", "\\")
     if not collision_item_path:
         return ""
 
     candidates = []
-    if collision_item_path.lower().endswith(".redcloth"):
+    if collision_item_path.lower().endswith((".redcloth", ".redapex")):
         candidates.append(collision_item_path)
     else:
         base, _ext = os.path.splitext(collision_item_path)
         candidates.append(base + ".redcloth")
+        candidates.append(base + ".redapex")
 
     # Also try vanilla path when browsing mods.
     vanilla_path = get_vanilla_path(collision_item_path, loadmods)
     if vanilla_path:
-        if vanilla_path.lower().endswith(".redcloth"):
+        if vanilla_path.lower().endswith((".redcloth", ".redapex")):
             candidates.append(vanilla_path)
         else:
             base, _ext = os.path.splitext(vanilla_path)
             candidates.append(base + ".redcloth")
+            candidates.append(base + ".redapex")
 
     seen = set()
     browser = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
@@ -7131,8 +7165,9 @@ class FileActionOperatorImportToScene(Operator):
                     log.info("BIN (terrain) import not yet implemented: %s", abs_file_path)
                 else:
                     log.warning("Unknown collision format %s: %s", ext, abs_file_path)
-            elif ext == ".redcloth":
+            elif ext in {".redcloth", ".redapex"}:
                 from ..cloth_util import importCloth
+                from .ui_mesh import import_redapex_resource
 
                 apx_path = _ensure_redcloth_apx_for_asset_import(
                     context,
@@ -7158,20 +7193,32 @@ class FileActionOperatorImportToScene(Operator):
                         )
                     self.report(
                         {'ERROR'},
-                        "No matching .apx found/generated for this .redcloth. "
+                        f"No matching .apx found/generated for this {ext}. "
                         "Enable io_mesh_apx and set its apex_sdk_cli to convert collision .apb files."
                     )
                     return {'CANCELLED'}
 
-                cloth_obj = importCloth(
-                    context,
-                    apx_path,
-                    True,
-                    False,
-                    True,
-                    abs_file_path,
-                )
-                if cloth_obj is None:
+                imported_obj = None
+                if ext == ".redapex":
+                    imported_obj = import_redapex_resource(
+                        context,
+                        abs_file_path,
+                        use_mat=True,
+                        rotate_180=False,
+                        import_chunks=False,
+                        import_floor=False,
+                        collections_as_empties=True,
+                    )
+                else:
+                    imported_obj = importCloth(
+                        context,
+                        apx_path,
+                        True,
+                        False,
+                        True,
+                        abs_file_path,
+                    )
+                if imported_obj is None:
                     apx_status = get_apx_addon_status(context)
                     if not apx_status["enabled"] and not _legacy_apx_addon_enabled():
                         set_external_import_dependency_alert(
@@ -7180,7 +7227,7 @@ class FileActionOperatorImportToScene(Operator):
                             status="apx_addon_disabled",
                             reason="io_mesh_apx addon is not enabled.",
                         )
-                    self.report({'ERROR'}, f"Redcloth import failed for {os.path.basename(abs_file_path)}")
+                    self.report({'ERROR'}, f"{ext} import failed for {os.path.basename(abs_file_path)}")
                     return {'CANCELLED'}
                 clear_external_import_dependency_alert("redcloth")
             elif ext == ".srt":

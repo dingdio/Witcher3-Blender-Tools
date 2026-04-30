@@ -197,7 +197,9 @@ def invoke_asset_browser_import_dialog(context, resolved: dict):
         if effective_cache_type == "Collision" and ext == ".nxs":
             result = bpy.ops.witcher.import_nxs('INVOKE_DEFAULT', **kwargs)
         elif ext == ".redcloth":
-            result = bpy.ops.witcher.import_apx_materials('INVOKE_DEFAULT', **kwargs)
+            result = bpy.ops.witcher.import_redcloth_materials('INVOKE_DEFAULT', **kwargs)
+        elif ext == ".redapex":
+            result = bpy.ops.witcher.import_redapex_materials('INVOKE_DEFAULT', **kwargs)
         elif ext == ".srt":
             result = bpy.ops.witcher.import_srt('INVOKE_DEFAULT', **kwargs)
         elif ext == ".w2mesh":

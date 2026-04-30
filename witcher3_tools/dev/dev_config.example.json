@@ -75,6 +75,22 @@
                 }
             ]
         },
+        "redapex": {
+            "enabled": true,
+            "selected_section": 0,
+            "selected_path": 0,
+            "sections": [
+                {
+                    "name": "Redapex Files",
+                    "paths": [
+                        {
+                            "repo_path": "environment\\architecture\\human\\common\\fence\\fence_wooden_a_fallen_snow_px.redapex",
+                            "note": "fence_wooden_a_fallen_snow_px"
+                        }
+                    ]
+                }
+            ]
+        },
         "w2ent_chara": {
             "enabled": true,
             "selected_section": 0,
