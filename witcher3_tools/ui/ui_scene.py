@@ -1729,6 +1729,8 @@ class WITCHER_PT_scene_panel(WITCH_PT_Base, Panel):
         action_row = cs_box.row(align=True)
         action_row.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Import CS (.w2cutscene)", icon='IMPORT')
         action_row.operator("witcher.export_w2_cutscene", text="Export CS (.w2cutscene)", icon='EXPORT')
+        if hasattr(scene, "witcher_cutscene_export_repo_path"):
+            cs_box.prop(scene, "witcher_cutscene_export_repo_path", text="Repo Path")
 
         loaded_cutscene_path = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
         if loaded_cutscene_path and not scene.witcher_cutscene_actor_items and not scene.witcher_cutscene_animation_items:

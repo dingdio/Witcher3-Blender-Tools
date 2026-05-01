@@ -291,6 +291,24 @@ def _resolve_action_frame_range(action, strip=None):
     return start, end
 
 
+def _resolve_strip_frame_count(strip, fallback_count: int = 1) -> int:
+    fallback_count = max(1, int(fallback_count or 1))
+    if strip is None:
+        return fallback_count
+
+    try:
+        strip_start = float(getattr(strip, "frame_start", 0.0) or 0.0)
+        strip_end = float(getattr(strip, "frame_end", strip_start) or strip_start)
+    except Exception:
+        return fallback_count
+
+    if strip_end < strip_start:
+        return fallback_count
+
+    strip_count = int(round(strip_end - strip_start)) + 1
+    return max(fallback_count, strip_count)
+
+
 def _scene_fps(scene=None) -> float:
     scene = scene or getattr(bpy.context, "scene", None)
     render = getattr(scene, "render", None)
@@ -382,6 +400,8 @@ def _collect_cutscene_nla_entries(context):
                         or component_name
                     )
                     frame_start, frame_end = _resolve_action_frame_range(action, strip=strip)
+                    fallback_count = max(1, frame_end - frame_start + 1)
+                    strip_frame_count = _resolve_strip_frame_count(strip, fallback_count=fallback_count)
                     entries.append({
                         "actor_name": actor_name,
                         "component": component_name,
@@ -393,6 +413,8 @@ def _collect_cutscene_nla_entries(context):
                         "track_name": track_name,
                         "strip_name": export_anims._strip_text(getattr(strip, "name", "")),
                         "strip_frame_start": float(getattr(strip, "frame_start", 0.0) or 0.0),
+                        "strip_frame_end": float(getattr(strip, "frame_end", 0.0) or 0.0),
+                        "strip_frame_count": strip_frame_count,
                         "source_path": export_anims._strip_text(action.get(CUTSCENE_SOURCE_PATH_PROP, "")),
                         "source_index": export_anims._safe_int(action.get(CUTSCENE_SOURCE_INDEX_PROP, -1), -1),
                         "frame_start": frame_start,
@@ -499,7 +521,15 @@ def _group_cutscene_entries(export_entries):
         parts = []
         total_num_frames = 0
         for part_index, entry in enumerate(ordered_entries):
-            part_num_frames = max(1, int(entry.get("frame_end", 0) or 0) - int(entry.get("frame_start", 0) or 0) + 1)
+            action_num_frames = max(
+                1,
+                int(entry.get("frame_end", 0) or 0) - int(entry.get("frame_start", 0) or 0) + 1,
+            )
+            part_num_frames = max(
+                action_num_frames,
+                int(entry.get("strip_frame_count", 0) or 0),
+                1,
+            )
             part_start_frame = max(
                 0,
                 int(round(float(entry.get("strip_frame_start", 0.0) or 0.0) - base_strip_start)),
@@ -537,6 +567,44 @@ def _group_cutscene_entries(export_entries):
     return groups
 
 
+def _sync_multipart_group_timings(groups):
+    """Use the longest scene-derived timing for groups that share the same cut layout."""
+    references = {}
+    for group in groups:
+        parts = list(group.get("parts", []) or [])
+        if len(parts) <= 1:
+            continue
+        first_frames = tuple(int(part.get("part_start_frame", 0) or 0) for part in parts)
+        key = (len(parts), first_frames)
+        part_lengths = [max(1, int(part.get("part_num_frames", 0) or 0)) for part in parts]
+        total_num_frames = max(
+            int(first_frames[idx]) + part_lengths[idx]
+            for idx in range(len(parts))
+        )
+        score = (total_num_frames, sum(part_lengths))
+        current = references.get(key)
+        if current is None or score > current["score"]:
+            references[key] = {
+                "part_lengths": part_lengths,
+                "num_frames": total_num_frames,
+                "score": score,
+            }
+
+    for group in groups:
+        parts = list(group.get("parts", []) or [])
+        if len(parts) <= 1:
+            continue
+        first_frames = tuple(int(part.get("part_start_frame", 0) or 0) for part in parts)
+        reference = references.get((len(parts), first_frames))
+        if not reference:
+            continue
+        for part, part_length in zip(parts, reference["part_lengths"]):
+            part["part_num_frames"] = max(1, int(part_length or 1))
+        group["num_frames"] = max(1, int(reference["num_frames"] or 1))
+
+    return groups
+
+
 def _load_cutscene_source_template(source_path: str, source_cache: Dict[str, object]):
     source_path = export_anims._strip_text(source_path)
     if not source_path or not source_path.lower().endswith(".w2cutscene"):
@@ -555,16 +623,6 @@ def _load_cutscene_source_template(source_path: str, source_cache: Dict[str, obj
 
 
 def _resolve_cutscene_entry_fps(entry, scene, source_cache) -> float:
-    source_path = export_anims._strip_text(entry.get("source_path", ""))
-    source_index = int(entry.get("source_index", -1) or -1)
-    if source_path and source_index >= 0:
-        cutscene_template = _load_cutscene_source_template(source_path, source_cache)
-        animations = getattr(cutscene_template, "animations", None) or []
-        if 0 <= source_index < len(animations):
-            animation = getattr(animations[source_index], "animation", None)
-            fps = float(getattr(animation, "framesPerSecond", 0.0) or 0.0)
-            if fps > 0.0:
-                return fps
     return _scene_fps(scene)
 
 
@@ -825,7 +883,7 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
         _redkit_root, export_entries = _plan_cutscene_re_files(resolved_save_path, export_entries)
 
     template_metadata = _collect_cutscene_template_metadata(scene, export_entries, source_cache)
-    animation_groups = _group_cutscene_entries(export_entries)
+    animation_groups = _sync_multipart_group_timings(_group_cutscene_entries(export_entries))
 
     animations = []
     successful_entries = []
@@ -844,14 +902,17 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
 
         part_payloads = []
         for part_entry in group["parts"]:
+            part_num_frames = max(1, int(part_entry.get("part_num_frames", 0) or 0))
+            sample_frame_start = int(part_entry.get("frame_start", 0) or 0)
+            sample_frame_end = sample_frame_start + part_num_frames - 1
             animation_payload = export_anims._build_cutscene_animation_from_action(
                 part_entry["armature_obj"],
                 part_entry["action"],
                 group["actor_name"],
                 group["component"],
                 group["action_name"],
-                part_entry["frame_start"],
-                part_entry["frame_end"],
+                sample_frame_start,
+                sample_frame_end,
                 float(part_entry.get("fps", group["fps"]) or group["fps"]),
                 skeleton_path=skeleton_path,
                 source_entry=part_entry,
@@ -866,6 +927,7 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
                 )
                 part_payloads = []
                 break
+            animation_payload["num_frames"] = part_num_frames
             part_payloads.append(animation_payload)
 
         if not part_payloads:
@@ -879,6 +941,9 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
                 int(first_frames[idx]) + int(part_payload.get("num_frames", 0) or 0)
                 for idx, part_payload in enumerate(part_payloads)
             )
+            multipart_dt = float(part_payloads[0].get("dt", anims_builder.DEFAULT_DT) or anims_builder.DEFAULT_DT)
+            multipart_fps = float(part_payloads[0].get("fps", group["fps"]) or group["fps"])
+
             animations.append({
                 "actor": group["actor_name"],
                 "component": group["component"],
@@ -886,8 +951,8 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
                 "parts": part_payloads,
                 "first_frames": first_frames,
                 "num_frames": max(1, total_num_frames),
-                "dt": float(part_payloads[0].get("dt", anims_builder.DEFAULT_DT) or anims_builder.DEFAULT_DT),
-                "fps": float(part_payloads[0].get("fps", group["fps"]) or group["fps"]),
+                "dt": multipart_dt,
+                "fps": multipart_fps,
                 "skeletal_type": "SAT_Normal",
                 "additive_type": None,
                 "motion_extraction": None,

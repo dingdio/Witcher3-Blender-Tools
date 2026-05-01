@@ -519,6 +519,115 @@ class WITCH_OT_AnimSetRepoFromBrowser(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WITCH_OT_CutsceneExportGotoProjectPath(bpy.types.Operator):
+    """Create REDkit directory structure and navigate the file browser to the cutscene's game path"""
+    bl_idname = "witcher.cutscene_export_goto_project_path"
+    bl_label = "Go To Project Path"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        project_path = _anim_get_active_redkit_project(context)
+        if not project_path:
+            self.report({'WARNING'}, "No REDkit project configured. Set one in addon preferences.")
+            return {'CANCELLED'}
+
+        workspace_root = os.path.join(project_path, "workspace")
+        repo_path = getattr(context.scene, "witcher_cutscene_export_repo_path", "")
+
+        if repo_path:
+            full_path = _anim_compute_full_export_path(workspace_root, repo_path)
+        else:
+            full_path = workspace_root
+
+        if not full_path:
+            self.report({'WARNING'}, "Could not compute project path.")
+            return {'CANCELLED'}
+
+        dir_path = os.path.dirname(full_path) if repo_path else full_path
+        try:
+            os.makedirs(dir_path, exist_ok=True)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to create directories: {e}")
+            return {'CANCELLED'}
+
+        space = context.space_data
+        if space and hasattr(space, 'params') and space.params:
+            space.params.directory = dir_path.encode('utf-8')
+            if repo_path:
+                space.params.filename = os.path.basename(full_path)
+            self.report({'INFO'}, f"Navigated to: {dir_path}")
+        else:
+            self.report({'INFO'}, f"Created path: {dir_path}")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneSetRepoFromBrowser(bpy.types.Operator):
+    """Set the cutscene repo path from the current file browser location"""
+    bl_idname = "witcher.cutscene_set_repo_from_browser"
+    bl_label = "Set Repo from Here"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        project_path = _anim_get_active_redkit_project(context)
+        if not project_path:
+            self.report({'ERROR'}, "No active REDkit project found.")
+            return {'CANCELLED'}
+
+        workspace_root = os.path.join(project_path, "workspace")
+        space = context.space_data
+        if not (space and hasattr(space, 'params') and space.params):
+            self.report({'ERROR'}, "Must run from File Browser area.")
+            return {'CANCELLED'}
+
+        current_filename = space.params.filename
+        try:
+            current_dir = space.params.directory
+            if isinstance(current_dir, bytes):
+                current_dir = current_dir.decode('utf-8')
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to read browser path: {e}")
+            return {'CANCELLED'}
+
+        current_path_abs = os.path.abspath(current_dir)
+        workspace_root_abs = os.path.abspath(workspace_root)
+
+        if not current_path_abs.lower().startswith(workspace_root_abs.lower()):
+            self.report({'WARNING'}, "Current folder is outside the active REDkit project workspace.")
+            return {'CANCELLED'}
+
+        try:
+            rel_path = os.path.relpath(current_path_abs, workspace_root_abs)
+        except ValueError:
+            self.report({'ERROR'}, "Path is on a different drive.")
+            return {'CANCELLED'}
+
+        if rel_path == '.':
+            rel_path = ""
+
+        filename = current_filename
+        if isinstance(filename, bytes):
+            filename = filename.decode('utf-8')
+        filename = filename or ""
+
+        if rel_path and filename:
+            full_repo_path = os.path.join(rel_path, filename)
+        elif filename:
+            full_repo_path = filename
+        else:
+            full_repo_path = rel_path
+
+        full_repo_path = full_repo_path.replace('/', '\\')
+        context.scene.witcher_cutscene_export_repo_path = full_repo_path
+        self.report({'INFO'}, f"Repo path set to: {full_repo_path}")
+
+        if current_filename:
+            space.params.filename = current_filename
+        for area in context.screen.areas:
+            if area.type == 'FILE_BROWSER':
+                area.tag_redraw()
+        return {'FINISHED'}
+
+
 class TOOL_UL_List(UIList):
     """Demo UIList."""
     bl_idname = "TOOL_UL_List"
@@ -2207,6 +2316,14 @@ def _normalize_w2anims_export_path(path, use_native_writer):
         return str(p) + ".json"
     return str(p.with_suffix(".json"))
 
+
+def _normalize_w2cutscene_export_path(path):
+    p = Path(path)
+    if p.suffix.lower() != ".w2cutscene":
+        p = p.with_suffix(".w2cutscene")
+    return str(p)
+
+
 class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
     """Export Witcher 3 animation set (.w2anims)"""
     bl_idname = "witcher.export_w2_anim"
@@ -2416,6 +2533,7 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
 
     def draw(self, context):
         layout = self.layout
+        scene = context.scene
         re_status = get_re_addon_status()
 
         layout.prop(self, "export_redkit_re_files")
@@ -2432,6 +2550,29 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
                 warning_row.label(text="Enable blender_re_animations_plugin before exporting Redkit .re files.", icon='ERROR')
             layout.label(text="Files write to <cutscene>_redkit/<actor>/*.re", icon='FILE_FOLDER')
 
+        path_box = layout.box()
+        path_box.label(text="Game Path (REDkit)", icon='FILE_FOLDER')
+        path_box.prop(scene, "witcher_cutscene_export_repo_path", text="Repo Path")
+
+        project_path = _anim_get_active_redkit_project(context)
+        if project_path:
+            repo_path = getattr(scene, "witcher_cutscene_export_repo_path", "")
+            if repo_path:
+                full_path = _anim_compute_full_export_path(
+                    os.path.join(project_path, "workspace"), repo_path,
+                )
+                if full_path:
+                    col = path_box.column(align=True)
+                    col.scale_y = 0.75
+                    col.label(text=os.path.dirname(full_path))
+                    col.label(text=os.path.basename(full_path))
+            row = path_box.row(align=True)
+            row.operator(WITCH_OT_CutsceneExportGotoProjectPath.bl_idname, text="Go To Project Path", icon='FILEBROWSER')
+            row.operator(WITCH_OT_CutsceneSetRepoFromBrowser.bl_idname, text="Set from Folder", icon='FILE_FOLDER')
+        else:
+            path_box.label(text="No REDkit project configured", icon='INFO')
+            path_box.label(text="Set one in Preferences -> Add-ons -> Witcher 3 Tools")
+
     def execute(self, context):
         if self.export_redkit_re_files or self.export_redkit_csv:
             re_status = get_re_addon_status()
@@ -2439,12 +2580,34 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
                 self.report({'ERROR'}, "Enable blender_re_animations_plugin to export Redkit .re files")
                 return {'CANCELLED'}
 
+        savepath = _normalize_w2cutscene_export_path(self.filepath)
         return export_cutscene.export_w3_cutscene(
             context,
-            self.filepath,
+            savepath,
             export_redkit_re_files=self.export_redkit_re_files,
             export_redkit_csv=self.export_redkit_csv,
         )
+
+    def invoke(self, context, event):
+        scene = context.scene
+        repo_path = getattr(scene, "witcher_cutscene_export_repo_path", "")
+        project_path = _anim_get_active_redkit_project(context)
+        if project_path and repo_path:
+            workspace_root = os.path.join(project_path, "workspace")
+            full_path = _anim_compute_full_export_path(workspace_root, repo_path)
+            if full_path:
+                self.filepath = _normalize_w2cutscene_export_path(full_path)
+                return ExportHelper.invoke(self, context, event)
+
+        loaded_path = getattr(scene, "witcher_loaded_w2cutscene_path", "")
+        if loaded_path:
+            current = Path(self.filepath) if self.filepath else None
+            filename = Path(loaded_path).name
+            if current and str(current.parent) not in (".", ""):
+                self.filepath = str(current.parent / filename)
+            else:
+                self.filepath = filename
+        return ExportHelper.invoke(self, context, event)
 
 
 #-----------------------------------------------------------------------------
@@ -2475,6 +2638,8 @@ classes = [
     WITCH_OT_AnimExportSetRemove,
     WITCH_OT_AnimExportGotoProjectPath,
     WITCH_OT_AnimSetRepoFromBrowser,
+    WITCH_OT_CutsceneExportGotoProjectPath,
+    WITCH_OT_CutsceneSetRepoFromBrowser,
     WITCH_OT_ExportW2AnimJson,
     WITCH_OT_ExportW2Cutscene,
 ]
@@ -2541,6 +2706,11 @@ def register():
     bpy.types.Scene.witcher_anim_export_repo_path = StringProperty(
         name="Animation Repo Path",
         description="Game-relative path for this .w2anims file (e.g. dlc\\bob\\data\\animations\\my_anim.w2anims)",
+        default="",
+    )
+    bpy.types.Scene.witcher_cutscene_export_repo_path = StringProperty(
+        name="Cutscene Repo Path",
+        description="Game-relative path for this .w2cutscene file (e.g. dlc\\bob\\data\\cutscenes\\my_scene.w2cutscene)",
         default="",
     )
 
@@ -2620,6 +2790,7 @@ def unregister():
         "witcher_anim_export_set",
         "witcher_anim_export_set_index",
         "witcher_anim_export_repo_path",
+        "witcher_cutscene_export_repo_path",
     ):
         if hasattr(bpy.types.Scene, prop_name):
             delattr(bpy.types.Scene, prop_name)

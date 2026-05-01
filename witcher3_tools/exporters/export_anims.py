@@ -887,6 +887,7 @@ def export_w3_anim_set(context, savePath, entries, use_native_writer=True):
 
 CUTSCENE_DEFAULT_FPS = 30.0
 CUTSCENE_ROOT_COMPONENT = "Root"
+_CUTSCENE_FACE_BONE_NAME_CACHE: Dict[str, List[str]] = {}
 _CUTSCENE_FACE_TRACK_NAME_CACHE: Dict[str, List[str]] = {}
 _CUTSCENE_RIG_BONE_NAME_CACHE: Dict[str, List[str]] = {}
 
@@ -990,73 +991,9 @@ def _load_cutscene_rig_bone_names(rig_path: str) -> List[str]:
     return list(bone_names)
 
 
-def _load_source_cutscene_animation(entry, source_cache: Dict[str, object], rig_load_path: str = ""):
-    if not entry or source_cache is None:
-        return None
-    if not _strip_text(rig_load_path):
-        return None
-
-    source_path = _strip_text(entry.get("source_path", ""))
-    if not source_path or not source_path.lower().endswith(".w2cutscene"):
-        return None
-
-    animation_name = _strip_text(entry.get("source_animation_name", ""))
-    if not animation_name:
-        animation_name = _compose_cutscene_animation_name(
-            entry.get("actor_name", ""),
-            entry.get("component", ""),
-            entry.get("action_name", ""),
-        )
-    if not animation_name:
-        return None
-
-    cache_key = ("cutscene_source_animation", source_path, animation_name, _strip_text(rig_load_path))
-    if cache_key in source_cache:
-        return source_cache[cache_key]
-
-    source_animation = None
-    try:
-        from ..CR2W.dc_anims import load_bin_anims_single
-
-        anim_set = load_bin_anims_single(
-            source_path,
-            anim_name=animation_name,
-            rigPath=rig_load_path or None,
-        )
-        animations = getattr(anim_set, "animations", None) or []
-        if animations:
-            source_animation = getattr(animations[0], "animation", None)
-    except Exception:
-        log.warning(
-            "Failed to inspect source cutscene animation '%s' from '%s' while exporting.",
-            animation_name,
-            source_path,
-            exc_info=True,
-        )
-
-    source_cache[cache_key] = source_animation
-    return source_animation
-
-
-def _load_source_cutscene_track_names(entry, source_cache: Dict[str, object], rig_load_path: str = "") -> List[str]:
-    source_animation = _load_source_cutscene_animation(entry, source_cache, rig_load_path=rig_load_path)
-    if source_animation is None:
-        return []
-
-    track_names = []
-    seen = set()
-    for track in getattr(getattr(source_animation, "animBuffer", None), "tracks", None) or []:
-        track_name = _strip_text(getattr(track, "trackName", ""))
-        if not track_name or track_name in seen:
-            continue
-        seen.add(track_name)
-        track_names.append(track_name)
-    return track_names
-
-
 def _resolve_cutscene_export_bone_order(armature_obj, action, component: str, source_entry=None,
                                         source_cache: Optional[Dict[str, object]] = None,
-                                        rig_repo_path: str = "") -> List[str]:
+                                        rig_repo_path: str = "", related_armatures=None) -> List[str]:
     if armature_obj is None:
         return []
 
@@ -1065,26 +1002,19 @@ def _resolve_cutscene_export_bone_order(armature_obj, action, component: str, so
     pose_bone_names = set(pose_bones.keys()) if pose_bones is not None else set()
     armature_order = _get_armature_bone_order(armature_obj)
 
-    rig_load_path = _resolve_cutscene_animation_rig_load_path(rig_repo_path)
-    source_animation = _load_source_cutscene_animation(source_entry, source_cache, rig_load_path=rig_load_path)
-    if source_animation is not None:
-        source_bone_names = []
-        for bone in getattr(getattr(source_animation, "animBuffer", None), "bones", None) or []:
-            bone_name = _strip_text(getattr(bone, "BoneName", ""))
-            if bone_name:
-                source_bone_names.append(bone_name)
-        if source_bone_names:
-            filtered = [name for name in source_bone_names if not pose_bone_names or name in pose_bone_names]
-            if filtered:
-                return filtered
-
     if _is_face_cutscene_component(component):
-        face_bone_names = [
-            name for name in _load_cutscene_rig_bone_names(rig_load_path)
-            if not pose_bone_names or name in pose_bone_names
-        ]
+        face_bone_names = _resolve_cutscene_face_bone_names(
+            armature_obj,
+            related_armatures=related_armatures,
+        )
         if face_bone_names:
             return face_bone_names
+
+    rig_load_path = _resolve_cutscene_animation_rig_load_path(rig_repo_path)
+    rig_bone_names = _load_cutscene_rig_bone_names(rig_load_path)
+    if rig_bone_names:
+        filtered = [name for name in rig_bone_names if not pose_bone_names or name in pose_bone_names]
+        return filtered or rig_bone_names
 
     animated_bone_names = _iter_action_bone_names(action, target=armature_obj)
     if animated_bone_names:
@@ -1194,8 +1124,32 @@ def _load_face_track_names(face_file_path: str) -> List[str]:
     return list(track_names)
 
 
-def _resolve_cutscene_face_track_names(armature_obj, related_armatures=None) -> List[str]:
-    track_names: List[str] = []
+def _load_face_mimic_bone_names(face_file_path: str) -> List[str]:
+    face_file_path = _normalize_repo_path(face_file_path)
+    if not face_file_path:
+        return []
+    cached = _CUTSCENE_FACE_BONE_NAME_CACHE.get(face_file_path)
+    if cached is not None:
+        return list(cached)
+
+    bone_names: List[str] = []
+    try:
+        from ..CR2W.common_blender import repo_file
+        from ..importers.import_rig import loadFaceFile
+
+        face_data = loadFaceFile(repo_file(face_file_path))
+        mimic_skeleton = getattr(face_data, "mimicSkeleton", None)
+        raw_bone_names = getattr(mimic_skeleton, "names", None) or []
+        bone_names = [_strip_text(bone_name) for bone_name in raw_bone_names if _strip_text(bone_name)]
+    except Exception:
+        log.warning("Failed to load mimic bone names from '%s' while exporting cutscene.", face_file_path, exc_info=True)
+        bone_names = []
+
+    _CUTSCENE_FACE_BONE_NAME_CACHE[face_file_path] = list(bone_names)
+    return list(bone_names)
+
+
+def _iter_cutscene_face_file_paths(armature_obj, related_armatures=None):
     seen = set()
     candidate_armatures = list(related_armatures or [])
     if not candidate_armatures and armature_obj is not None:
@@ -1203,33 +1157,34 @@ def _resolve_cutscene_face_track_names(armature_obj, related_armatures=None) -> 
     for candidate in candidate_armatures:
         _entity_skeleton, face_skeleton = _get_armature_skeleton_paths(candidate)
         for face_file_path in (face_skeleton, _normalize_repo_path(candidate.get("mimicFaceFile", ""))):
-            for track_name in _load_face_track_names(face_file_path):
-                if track_name in seen:
-                    continue
-                seen.add(track_name)
-                track_names.append(track_name)
-    if track_names:
-        return track_names
-
-    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
-    morph_entries = getattr(rig_settings, "witcher_morphs_list", None) if rig_settings else None
-    if morph_entries:
-        for entry in morph_entries:
-            if int(getattr(entry, "type", 0) or 0) not in (4, 5):
+            face_file_path = _normalize_repo_path(face_file_path)
+            if not face_file_path or face_file_path in seen:
                 continue
-            track_name = _strip_text(getattr(entry, "path", "") or getattr(entry, "name", ""))
-            if not track_name or track_name in seen:
+            seen.add(face_file_path)
+            yield face_file_path
+
+
+def _resolve_cutscene_face_bone_names(armature_obj, related_armatures=None) -> List[str]:
+    bone_names: List[str] = []
+    seen = set()
+    for face_file_path in _iter_cutscene_face_file_paths(armature_obj, related_armatures=related_armatures):
+        for bone_name in _load_face_mimic_bone_names(face_file_path):
+            if bone_name in seen:
+                continue
+            seen.add(bone_name)
+            bone_names.append(bone_name)
+    return bone_names
+
+
+def _resolve_cutscene_face_track_names(armature_obj, related_armatures=None) -> List[str]:
+    track_names: List[str] = []
+    seen = set()
+    for face_file_path in _iter_cutscene_face_file_paths(armature_obj, related_armatures=related_armatures):
+        for track_name in _load_face_track_names(face_file_path):
+            if track_name in seen:
                 continue
             seen.add(track_name)
             track_names.append(track_name)
-    if track_names:
-        return track_names
-
-    for track_name in _pose_bone_custom_prop_names(armature_obj, "w3_face_poses"):
-        if track_name in seen:
-            continue
-        seen.add(track_name)
-        track_names.append(track_name)
     return track_names
 
 
@@ -1264,26 +1219,26 @@ def _collect_cutscene_action_tracks(armature_obj, action, component: str, frame_
     if armature_obj is None or action is None or not frame_numbers:
         return []
 
-    rig_load_path = _resolve_cutscene_animation_rig_load_path(rig_repo_path)
-    source_track_names = _load_source_cutscene_track_names(source_entry, source_cache, rig_load_path=rig_load_path)
-
     if _is_face_cutscene_component(component):
         control_bone_name = "w3_face_poses"
-        ordered_names = source_track_names or _resolve_cutscene_face_track_names(
+        ordered_names = _resolve_cutscene_face_track_names(
             armature_obj,
             related_armatures=related_armatures,
         )
     else:
         control_bone_name = "Camera_Node"
-        ordered_names = source_track_names or _resolve_cutscene_camera_track_names(armature_obj)
+        ordered_names = _resolve_cutscene_camera_track_names(armature_obj)
 
     animated_names = _iter_action_custom_prop_names(action, control_bone_name, target=armature_obj)
     if not ordered_names and not animated_names:
         return []
-
-    if source_track_names:
-        source_name_set = set(source_track_names)
-        animated_names = [track_name for track_name in animated_names if _strip_text(track_name) in source_name_set]
+    if _is_face_cutscene_component(component) and ordered_names:
+        ordered_name_set = set(ordered_names)
+        animated_names = [
+            track_name
+            for track_name in animated_names
+            if _strip_text(track_name) in ordered_name_set
+        ]
 
     seen = set()
     track_names = []
@@ -1376,6 +1331,7 @@ def _build_cutscene_animation_from_action(armature_obj, action, actor_name, comp
         source_entry=source_entry,
         source_cache=source_cache,
         rig_repo_path=rig_repo_path,
+        related_armatures=related_armatures,
     )
     if not bone_order:
         bone_order = _get_armature_bone_order(armature_obj)
