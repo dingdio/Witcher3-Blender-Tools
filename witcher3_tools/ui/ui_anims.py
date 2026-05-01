@@ -285,6 +285,240 @@ class ListItem(PropertyGroup):
     #        description="",
     #        default="")
 
+class W3AnimExportEntry(PropertyGroup):
+    """One entry in the multi-animation export set."""
+    action_name: StringProperty(
+        name="Action",
+        description="Name of the Blender action to export",
+        default="",
+    )
+    enabled: BoolProperty(
+        name="Enabled",
+        description="Include this entry in the next multi-export",
+        default=True,
+    )
+    skeletal_anim_type: EnumProperty(
+        name="Animation Type",
+        items=[
+            ('SAT_Normal', "Normal", "Standard skeletal animation"),
+            ('SAT_Additive', "Additive", "Additive skeletal animation"),
+            ('SAT_MS', "MS", "Motion-sampled animation"),
+        ],
+        default='SAT_Normal',
+    )
+    additive_type: EnumProperty(
+        name="Additive Type",
+        items=[
+            ('NONE', "None", "No additive type"),
+            ('AT_Local', "Local", "Local additive"),
+            ('AT_Ref', "Ref", "Reference additive"),
+            ('AT_TPose', "T-Pose", "T-Pose additive"),
+            ('AT_Animation', "Animation", "Animation additive"),
+        ],
+        default='NONE',
+    )
+    include_motion_extraction: BoolProperty(
+        name="Include Motion Extraction",
+        description="Generate motion extraction from Trajectory bone",
+        default=False,
+    )
+
+
+class WITCH_UL_AnimExportSet(UIList):
+    bl_idname = "WITCH_UL_AnimExportSet"
+
+    def draw_item(self, context, layout, data, item, icon,
+                  active_data, active_propname, index, flt_flag):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.prop(item, "enabled", text="")
+            action_exists = item.action_name in bpy.data.actions
+            icon_id = 'ACTION' if action_exists else 'ERROR'
+            row.label(text=item.action_name or "<empty>", icon=icon_id)
+            type_badges = {'SAT_Additive': 'Add', 'SAT_MS': 'MS'}
+            badge = type_badges.get(item.skeletal_anim_type, '')
+            if badge:
+                row.label(text=badge)
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon='ACTION')
+
+
+class WITCH_OT_AnimExportSetAdd(bpy.types.Operator):
+    """Add the currently resolved action to the export set"""
+    bl_idname = "witcher.anim_export_set_add"
+    bl_label = "Add Current"
+
+    @classmethod
+    def poll(cls, context):
+        return export_anims.get_selected_armature(context) is not None
+
+    def execute(self, context):
+        armature = export_anims.get_selected_armature(context)
+        source_mode = getattr(context.scene, "witcher_w3_anim_source", "NLA")
+        action, _ = export_anims.resolve_action(armature, context=context, source_mode=source_mode)
+        if action is None:
+            self.report({'WARNING'}, "No action resolved; nothing added.")
+            return {'CANCELLED'}
+
+        for entry in context.scene.witcher_anim_export_set:
+            if entry.action_name == action.name:
+                self.report({'INFO'}, f"'{action.name}' is already in the export set.")
+                return {'CANCELLED'}
+
+        entry = context.scene.witcher_anim_export_set.add()
+        entry.action_name = action.name
+        entry.enabled = True
+        context.scene.witcher_anim_export_set_index = len(context.scene.witcher_anim_export_set) - 1
+        return {'FINISHED'}
+
+
+class WITCH_OT_AnimExportSetRemove(bpy.types.Operator):
+    """Remove the selected entry from the export set"""
+    bl_idname = "witcher.anim_export_set_remove"
+    bl_label = "Remove"
+
+    @classmethod
+    def poll(cls, context):
+        return (context.scene
+                and getattr(context.scene, "witcher_anim_export_set", None)
+                and len(context.scene.witcher_anim_export_set) > 0)
+
+    def execute(self, context):
+        lst = context.scene.witcher_anim_export_set
+        idx = context.scene.witcher_anim_export_set_index
+        lst.remove(idx)
+        context.scene.witcher_anim_export_set_index = max(0, min(idx, len(lst) - 1))
+        return {'FINISHED'}
+
+
+def _anim_get_active_redkit_project(context):
+    addon_prefs = get_all_addon_prefs(context)
+    projects = getattr(addon_prefs, "redkit_projects", [])
+    index = getattr(addon_prefs, "redkit_projects_index", 0)
+    if projects and 0 <= index < len(projects):
+        p = projects[index].path
+        if p:
+            return os.path.normpath(bpy.path.abspath(p))
+    return None
+
+
+def _anim_compute_full_export_path(workspace_root, repo_path):
+    if not workspace_root or not repo_path:
+        return None
+    clean = repo_path.replace("/", os.sep).replace("\\", os.sep).lstrip(os.sep)
+    return os.path.normpath(os.path.join(workspace_root, clean))
+
+
+class WITCH_OT_AnimExportGotoProjectPath(bpy.types.Operator):
+    """Create REDkit directory structure and navigate the file browser to the animation's game path"""
+    bl_idname = "witcher.anim_export_goto_project_path"
+    bl_label = "Go To Project Path"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        project_path = _anim_get_active_redkit_project(context)
+        if not project_path:
+            self.report({'WARNING'}, "No REDkit project configured. Set one in addon preferences.")
+            return {'CANCELLED'}
+
+        workspace_root = os.path.join(project_path, "workspace")
+        repo_path = getattr(context.scene, "witcher_anim_export_repo_path", "")
+
+        if repo_path:
+            full_path = _anim_compute_full_export_path(workspace_root, repo_path)
+        else:
+            full_path = workspace_root
+
+        if not full_path:
+            self.report({'WARNING'}, "Could not compute project path.")
+            return {'CANCELLED'}
+
+        dir_path = os.path.dirname(full_path) if repo_path else full_path
+        try:
+            os.makedirs(dir_path, exist_ok=True)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to create directories: {e}")
+            return {'CANCELLED'}
+
+        space = context.space_data
+        if space and hasattr(space, 'params') and space.params:
+            space.params.directory = dir_path.encode('utf-8')
+            if repo_path:
+                space.params.filename = os.path.basename(full_path)
+            self.report({'INFO'}, f"Navigated to: {dir_path}")
+        else:
+            self.report({'INFO'}, f"Created path: {dir_path}")
+        return {'FINISHED'}
+
+
+class WITCH_OT_AnimSetRepoFromBrowser(bpy.types.Operator):
+    """Set the animation repo path from the current file browser location"""
+    bl_idname = "witcher.anim_set_repo_from_browser"
+    bl_label = "Set Repo from Here"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        project_path = _anim_get_active_redkit_project(context)
+        if not project_path:
+            self.report({'ERROR'}, "No active REDkit project found.")
+            return {'CANCELLED'}
+
+        workspace_root = os.path.join(project_path, "workspace")
+        space = context.space_data
+        if not (space and hasattr(space, 'params') and space.params):
+            self.report({'ERROR'}, "Must run from File Browser area.")
+            return {'CANCELLED'}
+
+        current_filename = space.params.filename
+        try:
+            current_dir = space.params.directory
+            if isinstance(current_dir, bytes):
+                current_dir = current_dir.decode('utf-8')
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to read browser path: {e}")
+            return {'CANCELLED'}
+
+        current_path_abs = os.path.abspath(current_dir)
+        workspace_root_abs = os.path.abspath(workspace_root)
+
+        if not current_path_abs.lower().startswith(workspace_root_abs.lower()):
+            self.report({'WARNING'}, "Current folder is outside the active REDkit project workspace.")
+            return {'CANCELLED'}
+
+        try:
+            rel_path = os.path.relpath(current_path_abs, workspace_root_abs)
+        except ValueError:
+            self.report({'ERROR'}, "Path is on a different drive.")
+            return {'CANCELLED'}
+
+        if rel_path == '.':
+            rel_path = ""
+
+        filename = current_filename
+        if isinstance(filename, bytes):
+            filename = filename.decode('utf-8')
+        filename = filename or ""
+
+        if rel_path and filename:
+            full_repo_path = os.path.join(rel_path, filename)
+        elif filename:
+            full_repo_path = filename
+        else:
+            full_repo_path = rel_path
+
+        full_repo_path = full_repo_path.replace('/', '\\')
+        context.scene.witcher_anim_export_repo_path = full_repo_path
+        self.report({'INFO'}, f"Repo path set to: {full_repo_path}")
+
+        if current_filename:
+            space.params.filename = current_filename
+        for area in context.screen.areas:
+            if area.type == 'FILE_BROWSER':
+                area.tag_redraw()
+        return {'FINISHED'}
+
+
 class TOOL_UL_List(UIList):
     """Demo UIList."""
     bl_idname = "TOOL_UL_List"
@@ -966,6 +1200,104 @@ class WITCH_OT_ResampleAnimation(bpy.types.Operator):
             self.report({'ERROR'}, f"Bake failed: {str(e)}")
             return {'CANCELLED'}
         
+        return {'FINISHED'}
+
+
+class WITCH_OT_BakePelvisToTrajectory(bpy.types.Operator):
+    """Bake Pelvis XY locomotion onto the Trajectory bone (Z=0, grounded).
+
+    Use before export when your animation has root motion on the Pelvis
+    instead of the Trajectory bone. The Pelvis world position is preserved —
+    its XY+Yaw locomotion transfers to Trajectory so motion extraction works."""
+    bl_idname = "witcher.bake_pelvis_to_trajectory"
+    bl_label = "Bake Pelvis → Trajectory"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            return False
+        if not obj.animation_data or not obj.animation_data.action:
+            return False
+        bones = getattr(getattr(obj, "pose", None), "bones", None)
+        if bones is None:
+            return False
+        bone_names_lower = {b.name.lower() for b in bones}
+        return 'pelvis' in bone_names_lower and 'trajectory' in bone_names_lower
+
+    def _find_bone(self, armature, name_lower):
+        for b in armature.pose.bones:
+            if b.name.lower() == name_lower:
+                return b
+        return None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        from mathutils import Matrix
+        armature = context.active_object
+        action = armature.animation_data.action
+        frame_start = int(action.frame_range[0])
+        frame_end = int(action.frame_range[1])
+        original_frame = context.scene.frame_current
+
+        pelvis = self._find_bone(armature, 'pelvis')
+        traj = self._find_bone(armature, 'trajectory')
+        if not pelvis or not traj:
+            self.report({'ERROR'}, "Could not find Pelvis or Trajectory bone")
+            return {'CANCELLED'}
+
+        # First pass: record Pelvis armature-space matrices at every frame
+        # (read before we modify any keyframes so we get the original motion)
+        pelvis_matrices = {}
+        for frame in range(frame_start, frame_end + 1):
+            context.scene.frame_set(frame)
+            pelvis_matrices[frame] = pelvis.matrix.copy()
+
+        # Second pass: bake Trajectory from Pelvis XY+Yaw, then re-seat Pelvis
+        for frame in range(frame_start, frame_end + 1):
+            context.scene.frame_set(frame)
+            m = pelvis_matrices[frame]
+
+            x = m.translation.x
+            y = m.translation.y
+            # Z rotation = yaw; XYZ euler is reliable for typical locomotion
+            yaw = m.to_euler('XYZ').z
+
+            # Trajectory carries XY + yaw only; Z stays at 0 (ground plane)
+            traj_mat = Matrix.Translation((x, y, 0.0)) @ Matrix.Rotation(yaw, 4, 'Z')
+            traj.matrix = traj_mat
+
+            traj.keyframe_insert(data_path='location', frame=frame)
+            if traj.rotation_mode == 'QUATERNION':
+                traj.keyframe_insert(data_path='rotation_quaternion', frame=frame)
+            elif traj.rotation_mode == 'AXIS_ANGLE':
+                traj.keyframe_insert(data_path='rotation_axis_angle', frame=frame)
+            else:
+                traj.keyframe_insert(data_path='rotation_euler', frame=frame)
+
+            # Re-evaluate the dependency graph so the new Trajectory keyframes
+            # propagate through the parent chain before we re-seat Pelvis
+            context.view_layer.update()
+
+            # Set Pelvis back to its original world position; Blender solves for
+            # the new local transform relative to the updated Trajectory parent
+            pelvis.matrix = m
+            pelvis.keyframe_insert(data_path='location', frame=frame)
+            if pelvis.rotation_mode == 'QUATERNION':
+                pelvis.keyframe_insert(data_path='rotation_quaternion', frame=frame)
+            elif pelvis.rotation_mode == 'AXIS_ANGLE':
+                pelvis.keyframe_insert(data_path='rotation_axis_angle', frame=frame)
+            else:
+                pelvis.keyframe_insert(data_path='rotation_euler', frame=frame)
+
+        context.scene.frame_set(original_frame)
+        self.report(
+            {'INFO'},
+            f"Baked {frame_end - frame_start + 1} frames: Pelvis XY+Yaw → Trajectory",
+        )
         return {'FINISHED'}
 
 
@@ -1695,6 +2027,37 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             else:
                 action_info_box.label(text="No action found.")
 
+        export_body = section("witcher_anim_export_set", "Export Set", 'EXPORT', default_closed=True) if anim_tab == "CLIPS" else None
+        if export_body:
+            export_set = getattr(scene, "witcher_anim_export_set", None)
+
+            row = export_body.row()
+            row.template_list(
+                "WITCH_UL_AnimExportSet", "",
+                scene, "witcher_anim_export_set",
+                scene, "witcher_anim_export_set_index",
+                rows=3,
+            )
+            btn_col = row.column(align=True)
+            btn_col.operator(WITCH_OT_AnimExportSetAdd.bl_idname, text="", icon='ADD')
+            btn_col.operator(WITCH_OT_AnimExportSetRemove.bl_idname, text="", icon='REMOVE')
+
+            if export_set and len(export_set) > 0:
+                idx = scene.witcher_anim_export_set_index
+                if 0 <= idx < len(export_set):
+                    entry = export_set[idx]
+                    settings_row = export_body.row(align=True)
+                    settings_row.prop(entry, "skeletal_anim_type", text="")
+                    if entry.skeletal_anim_type == 'SAT_Additive':
+                        settings_row.prop(entry, "additive_type", text="")
+                    settings_row.prop(entry, "include_motion_extraction", text="Motion Extraction")
+
+            export_body.separator()
+            bake_row = export_body.row(align=True)
+            bake_row.operator(WITCH_OT_BakePelvisToTrajectory.bl_idname, text="Bake Pelvis → Trajectory", icon='BONE_DATA')
+            export_body.prop(scene, "witcher_anim_export_repo_path", text="Repo Path")
+            export_body.operator(WITCH_OT_ExportW2AnimJson.bl_idname, text="Export...", icon='EXPORT')
+
 class WITCH_OT_import_w3_fbx(Operator, ImportHelper):
     """Same as normal FBX import but applies materials. Need seprate "FBX Import plugin for blender" enabled. Download from Nexus"""
     bl_idname = "witcher.import_witcher3_fbx"
@@ -1845,9 +2208,9 @@ def _normalize_w2anims_export_path(path, use_native_writer):
     return str(p.with_suffix(".json"))
 
 class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
-    """export W2 Anim Json"""
+    """Export Witcher 3 animation set (.w2anims)"""
     bl_idname = "witcher.export_w2_anim"
-    bl_label = "Export"
+    bl_label = "Export Animations"
     filename_ext = ".w2anims"
 
     @classmethod
@@ -1857,12 +2220,12 @@ class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
     use_json_legacy: BoolProperty(
         name="Use JSON (Legacy)",
         description="Export as .w2anims.json for WolvenKit processing instead of writing .w2anims directly",
-        default=False
+        default=False,
     )
 
+    # Fallback settings used only when the export set is empty
     skeletal_anim_type: EnumProperty(
         name="Animation Type",
-        description="Skeletal animation type",
         items=[
             ('SAT_Normal', "Normal", "Standard skeletal animation"),
             ('SAT_Additive', "Additive", "Additive skeletal animation"),
@@ -1870,10 +2233,8 @@ class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
         ],
         default='SAT_Normal',
     )
-
     additive_type: EnumProperty(
         name="Additive Type",
-        description="Additive animation type (only used when Animation Type is Additive)",
         items=[
             ('NONE', "None", "No additive type"),
             ('AT_Local', "Local", "Local additive"),
@@ -1883,7 +2244,6 @@ class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
         ],
         default='NONE',
     )
-
     include_motion_extraction: BoolProperty(
         name="Include Motion Extraction",
         description="Generate motion extraction from Trajectory bone",
@@ -1892,48 +2252,133 @@ class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
 
     def draw(self, context):
         layout = self.layout
-        source_mode = getattr(context.scene, "witcher_w3_anim_source", "NLA")
+        scene = context.scene
         armature = export_anims.get_selected_armature(context)
-        action, info = export_anims.resolve_action(armature, context=context, source_mode=source_mode)
-        if action:
-            layout.label(text=f"Exporting Action: {action.name}", icon='ACTION')
+        source_mode = getattr(scene, "witcher_w3_anim_source", "NLA")
+        export_set = getattr(scene, "witcher_anim_export_set", None)
+        entries = [e for e in (export_set or []) if e.enabled]
+
+        # --- Export Set ---
+        set_box = layout.box()
+        header_row = set_box.row(align=True)
+        header_row.label(text=f"Export Set ({len(entries)} enabled)", icon='ACTION')
+        header_row.operator(WITCH_OT_AnimExportSetAdd.bl_idname, text="Add Current", icon='ADD')
+
+        list_row = set_box.row()
+        list_row.template_list(
+            "WITCH_UL_AnimExportSet", "",
+            scene, "witcher_anim_export_set",
+            scene, "witcher_anim_export_set_index",
+            rows=3,
+        )
+        btn_col = list_row.column(align=True)
+        btn_col.operator(WITCH_OT_AnimExportSetRemove.bl_idname, text="", icon='REMOVE')
+
+        if export_set and len(export_set) > 0:
+            idx = scene.witcher_anim_export_set_index
+            if 0 <= idx < len(export_set):
+                entry = export_set[idx]
+                settings_row = set_box.row(align=True)
+                settings_row.prop(entry, "skeletal_anim_type", text="")
+                if entry.skeletal_anim_type == 'SAT_Additive':
+                    settings_row.prop(entry, "additive_type", text="")
+                settings_row.prop(entry, "include_motion_extraction", text="Motion Extraction")
         else:
-            layout.label(text="Exporting Action: None", icon='INFO')
-        source_label = _format_action_source_label((info or {}).get("source"))
-        if source_label:
-            layout.label(text=f"Source: {source_label}")
-        layout.separator()
-        layout.prop(self, "skeletal_anim_type")
-        if self.skeletal_anim_type == 'SAT_Additive':
-            layout.prop(self, "additive_type")
-        layout.prop(self, "include_motion_extraction")
-        layout.separator()
+            # No entries: show current action info and fallback settings
+            if armature:
+                action, info = export_anims.resolve_action(armature, context=context, source_mode=source_mode)
+                if action:
+                    set_box.label(text=f"Current: {action.name}", icon='PLAY')
+                    source_label = _format_action_source_label((info or {}).get("source"))
+                    if source_label:
+                        set_box.label(text=f"Source: {source_label}")
+                else:
+                    set_box.label(text="No action found", icon='ERROR')
+            set_box.label(text="Empty set — exports current action", icon='INFO')
+            set_box.prop(self, "skeletal_anim_type")
+            if self.skeletal_anim_type == 'SAT_Additive':
+                set_box.prop(self, "additive_type")
+            set_box.prop(self, "include_motion_extraction")
+
+        # --- Format ---
         layout.prop(self, "use_json_legacy")
 
-    def execute(self, context):
-        obj = context.object
-        use_native = not self.use_json_legacy
-        fdir = _normalize_w2anims_export_path(self.filepath, use_native)
-        ext = file_helpers.getFilenameType(fdir)
+        # --- Game Path ---
+        path_box = layout.box()
+        path_box.label(text="Game Path (REDkit)", icon='FILE_FOLDER')
+        path_box.prop(scene, "witcher_anim_export_repo_path", text="Repo Path")
 
-        additive = self.additive_type if self.additive_type != 'NONE' else None
-        export_anims.export_w3_anim(
-            context, fdir,
-            use_native_writer=use_native,
-            skeletal_type=self.skeletal_anim_type,
-            additive_type=additive,
-            include_motion_extraction=self.include_motion_extraction,
-        )
-        return {'FINISHED'}
+        project_path = _anim_get_active_redkit_project(context)
+        if project_path:
+            repo_path = getattr(scene, "witcher_anim_export_repo_path", "")
+            if repo_path:
+                full_path = _anim_compute_full_export_path(
+                    os.path.join(project_path, "workspace"), repo_path,
+                )
+                if full_path:
+                    col = path_box.column(align=True)
+                    col.scale_y = 0.75
+                    col.label(text=os.path.dirname(full_path))
+                    col.label(text=os.path.basename(full_path))
+            row = path_box.row(align=True)
+            row.operator(WITCH_OT_AnimExportGotoProjectPath.bl_idname, text="Go To Project Path", icon='FILEBROWSER')
+            row.operator(WITCH_OT_AnimSetRepoFromBrowser.bl_idname, text="Set from Folder", icon='FILE_FOLDER')
+        else:
+            path_box.label(text="No REDkit project configured", icon='INFO')
+            path_box.label(text="Set one in Preferences → Add-ons → Witcher 3 Tools")
+
+    def execute(self, context):
+        use_native = not self.use_json_legacy
+        savepath = _normalize_w2anims_export_path(self.filepath, use_native)
+
+        export_set = getattr(context.scene, "witcher_anim_export_set", [])
+        entries = [e for e in export_set if e.enabled]
+
+        if entries:
+            result = export_anims.export_w3_anim_set(
+                context, savepath, entries=entries, use_native_writer=use_native,
+            )
+            if result == {'FINISHED'}:
+                self.report({'INFO'}, f"Exported {len(entries)} animation(s) to {savepath}")
+            return result or {'FINISHED'}
+        else:
+            additive = self.additive_type if self.additive_type != 'NONE' else None
+            result = export_anims.export_w3_anim(
+                context, savepath,
+                use_native_writer=use_native,
+                skeletal_type=self.skeletal_anim_type,
+                additive_type=additive,
+                include_motion_extraction=self.include_motion_extraction,
+            )
+            return result or {'FINISHED'}
 
     def invoke(self, context, event):
-        source_mode = getattr(context.scene, "witcher_w3_anim_source", "NLA")
-        armature = export_anims.get_selected_armature(context)
-        action, _ = export_anims.resolve_action(armature, context=context, source_mode=source_mode)
+        scene = context.scene
+        # If repo path + project are set, pre-fill filepath from them
+        repo_path = getattr(scene, "witcher_anim_export_repo_path", "")
+        project_path = _anim_get_active_redkit_project(context)
+        if project_path and repo_path:
+            workspace_root = os.path.join(project_path, "workspace")
+            full_path = _anim_compute_full_export_path(workspace_root, repo_path)
+            if full_path:
+                use_native = not self.use_json_legacy
+                self.filepath = _normalize_w2anims_export_path(full_path, use_native)
+                return ExportHelper.invoke(self, context, event)
+
+        # Fall back to action name
+        export_set = getattr(scene, "witcher_anim_export_set", [])
+        first = next((e for e in export_set if e.enabled), None)
+        action = None
+        if first:
+            action = bpy.data.actions.get(first.action_name)
+        if action is None:
+            source_mode = getattr(scene, "witcher_w3_anim_source", "NLA")
+            armature = export_anims.get_selected_armature(context)
+            action, _ = export_anims.resolve_action(armature, context=context, source_mode=source_mode)
         if action:
-            current_path = Path(self.filepath) if self.filepath else None
-            if current_path and str(current_path.parent) not in (".", ""):
-                self.filepath = str(current_path.parent / f"{action.name}{self.filename_ext}")
+            current = Path(self.filepath) if self.filepath else None
+            if current and str(current.parent) not in (".", ""):
+                self.filepath = str(current.parent / f"{action.name}{self.filename_ext}")
             else:
                 self.filepath = f"{action.name}{self.filename_ext}"
         return ExportHelper.invoke(self, context, event)
@@ -2005,6 +2450,7 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
 #-----------------------------------------------------------------------------
 #
 classes = [
+    W3AnimExportEntry,
     ButtonOperatorImportW2Anims,
     ButtonOperatorToggloRootMotion,
     WITCH_OT_ToggleRootMotionDrivers,
@@ -2014,6 +2460,7 @@ classes = [
     WITCH_OT_ToggleRootMotionController,
     WITCH_OT_ApplyRootOrientation,
     WITCH_OT_ResampleAnimation,
+    WITCH_OT_BakePelvisToTrajectory,
     ListItem,
     TOOL_UL_List,
     TOOL_OT_List_Add,
@@ -2023,6 +2470,11 @@ classes = [
     TOOL_OT_List_LoadAnim,
     WITCH_OT_ImportW2Rig,
     WITCH_OT_ExportW2RigJson,
+    WITCH_UL_AnimExportSet,
+    WITCH_OT_AnimExportSetAdd,
+    WITCH_OT_AnimExportSetRemove,
+    WITCH_OT_AnimExportGotoProjectPath,
+    WITCH_OT_AnimSetRepoFromBrowser,
     WITCH_OT_ExportW2AnimJson,
     WITCH_OT_ExportW2Cutscene,
 ]
@@ -2079,6 +2531,17 @@ def register():
             ('ACTION', "Action Slot", "Use the legacy action slot"),
         ],
         default='NLA'
+    )
+
+    bpy.types.Scene.witcher_anim_export_set = CollectionProperty(type=W3AnimExportEntry)
+    bpy.types.Scene.witcher_anim_export_set_index = IntProperty(
+        name="Index for witcher_anim_export_set",
+        default=0,
+    )
+    bpy.types.Scene.witcher_anim_export_repo_path = StringProperty(
+        name="Animation Repo Path",
+        description="Game-relative path for this .w2anims file (e.g. dlc\\bob\\data\\animations\\my_anim.w2anims)",
+        default="",
     )
 
     bpy.types.Scene.witcher_auto_orient_root = BoolProperty(
@@ -2154,6 +2617,9 @@ def unregister():
         "witcher_bake_every_frame",
         "witcher_smooth_missing_frames",
         "witcher_scale_keys_to_duration",
+        "witcher_anim_export_set",
+        "witcher_anim_export_set_index",
+        "witcher_anim_export_repo_path",
     ):
         if hasattr(bpy.types.Scene, prop_name):
             delattr(bpy.types.Scene, prop_name)

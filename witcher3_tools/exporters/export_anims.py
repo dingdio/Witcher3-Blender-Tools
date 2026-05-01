@@ -526,92 +526,66 @@ class W3AnimationExporter:
                 return (frames, False)
         return ([firstFrame], True)
         
-    def __save(self, filepath, action_name, single_action):
-        
+    def collect_json_entry(self, action_name: str):
+        """Build a CSkeletalAnimationSetEntry from current boneAnimation state without writing."""
         bones = []
         longestnumframes = 0
-        #for name, frames in self.boneAnimation.items():
-        
-        #get total frames first
         for name in self.__bone_order:
             frames = self.boneAnimation[name]
-            if longestnumframes > len(frames):
-                pass
-            else:
-                longestnumframes = len(frames)
-        
+            longestnumframes = max(longestnumframes, len(frames))
+
         for name in self.__bone_order:
             frames = self.boneAnimation[name]
             positionFrames = []
             rotationFrames = []
             scaleFrames = []
-            (frames, is_reduced) = self.__reduceFrames(frames)
+            (frames, _) = self.__reduceFrames(frames)
             for frame in frames:
-                positionFrames.append({
-                            "x": round(frame.location.x, 8), 
-                            "y": round(frame.location.y, 8),  
-                            "z": round(frame.location.z, 8), 
-                        })
-                rotationFrames.append({ 
-                            "X": round(frame.rotation[0], 11), 
-                            "Y": round(frame.rotation[1], 11),  
-                            "Z": round(frame.rotation[2], 11), 
-                            "W": round(frame.rotation[3], 11), 
-                        })
-                scaleFrames.append({
-                            "x": 1.0, 
-                            "y": 1.0, 
-                            "z": 1.0, 
-                        })
-                
-            
-            position_dt = 0.0333333351
-            rotation_dt = 0.0333333351
-            scale_dt = 0.0333333351
-            if len(positionFrames) != longestnumframes and len(positionFrames) !=1:
+                positionFrames.append({"x": round(frame.location.x, 8), "y": round(frame.location.y, 8), "z": round(frame.location.z, 8)})
+                rotationFrames.append({"X": round(frame.rotation[0], 11), "Y": round(frame.rotation[1], 11), "Z": round(frame.rotation[2], 11), "W": round(frame.rotation[3], 11)})
+                scaleFrames.append({"x": 1.0, "y": 1.0, "z": 1.0})
+
+            position_dt = rotation_dt = scale_dt = 0.0333333351
+            if len(positionFrames) != longestnumframes and len(positionFrames) != 1:
                 position_dt = 0.06666667
-            if len(rotationFrames) != longestnumframes and len(rotationFrames) !=1:
+            if len(rotationFrames) != longestnumframes and len(rotationFrames) != 1:
                 rotation_dt = 0.06666667
-            if len(scaleFrames) != longestnumframes and len(scaleFrames) !=1:
+            if len(scaleFrames) != longestnumframes and len(scaleFrames) != 1:
                 scale_dt = 0.06666667
-                
-            boneframes = w3_types.w2AnimsFrames(
-                id = name,
-                BoneName = name, #boneName,
-                position_dt = position_dt,
-                position_numFrames = len(positionFrames),
-                positionFrames = positionFrames,
-                rotation_dt = rotation_dt,
-                rotation_numFrames = len(rotationFrames),
-                rotationFrames = rotationFrames,
-                scale_dt = scale_dt,
-                scale_numFrames = len(scaleFrames), 
-                scaleFrames = scaleFrames,
-                rotationFramesQuat = None
-            )
-            bones.append(boneframes)
+
+            bones.append(w3_types.w2AnimsFrames(
+                id=name, BoneName=name,
+                position_dt=position_dt, position_numFrames=len(positionFrames), positionFrames=positionFrames,
+                rotation_dt=rotation_dt, rotation_numFrames=len(rotationFrames), rotationFrames=rotationFrames,
+                scale_dt=scale_dt, scale_numFrames=len(scaleFrames), scaleFrames=scaleFrames,
+                rotationFramesQuat=None,
+            ))
+
         CBuffer = w3_types.CAnimationBufferBitwiseCompressed()
         CBuffer.bones = bones
         CBuffer.numFrames = longestnumframes
         CBuffer.duration = longestnumframes * 0.0333333351
-        CAnimation = w3_types.CSkeletalAnimation(action_name,
-                                                CBuffer.duration,
-                                                30.0,
-                                                CBuffer)
+        CAnimation = w3_types.CSkeletalAnimation(action_name, CBuffer.duration, 30.0, CBuffer)
         del CAnimation.motionExtraction
-        CSetEntry = w3_types.CSkeletalAnimationSetEntry(CAnimation)
+        return w3_types.CSkeletalAnimationSetEntry(CAnimation)
+
+    def __save(self, filepath, action_name, single_action):
+        CSetEntry = self.collect_json_entry(action_name)
         if not single_action:
             CSkeletalAnimationSet = w3_types.CSkeletalAnimationSet([CSetEntry])
         else:
             CSkeletalAnimationSet = CSetEntry
         log.info("Exporting Animation")
-
         with open(filepath, "w") as file:
-            file.write(json.dumps(CSkeletalAnimationSet.__dict__, default=lambda obj: obj.__json_serializable__() if hasattr(obj, "__json_serializable__") else obj.__dict__ ,indent=2, sort_keys=False))
+            file.write(json.dumps(CSkeletalAnimationSet.__dict__, default=lambda obj: obj.__json_serializable__() if hasattr(obj, "__json_serializable__") else obj.__dict__, indent=2, sort_keys=False))
 
-    def export_native(self, **args):
+    def collect_native_anim_spec(self, **args) -> Optional[Dict]:
+        """Collect all data needed to build one native animation, without writing.
+
+        Returns a spec dict suitable for anims_builder.build_w2anims /
+        build_w2anims, or None on failure.
+        """
         armature = args.get('armature', None)
-        filepath = args.get('filepath', '')
         action = args.get('action', None)
 
         self.__scale = args.get('scale', 1.0)
@@ -620,22 +594,20 @@ class W3AnimationExporter:
             self.__frame_start = bpy.context.scene.frame_start
             self.__frame_end = bpy.context.scene.frame_end
 
-        # Bone order preserved via bone_order_list stored on rig settings.
-        # Refactor target: derive order from skeleton data directly rather than a stored list.
         self.__bone_order = _get_armature_bone_order(armature)
 
         if not armature:
-            return
+            return None
 
         frame_numbers = list(range(int(self.__frame_start), int(self.__frame_end) + 1))
         self.boneAnimation = self.__exportBoneAnimation(armature, frame_numbers=frame_numbers, action=action)
         if self.boneAnimation is None:
-            return
+            return None
         if action is None and armature and armature.animation_data:
             action = armature.animation_data.action
         if action is None:
             log.warning(f'No action found on armature "{armature.name}", skipping export')
-            return
+            return None
         action_name = action.name if action else armature.name
 
         num_frames = max(1, int(self.__frame_end - self.__frame_start + 1))
@@ -692,10 +664,6 @@ class W3AnimationExporter:
             trajectory_bone = armature.pose.bones.get("Trajectory")
             if trajectory_bone and armature.animation_data:
                 try:
-                    # 1) Sample every frame → CUncompressedMotionExtraction.
-                    # pose_bone.matrix is in armature object space and already
-                    # includes the full parent chain (Root), so it gives game
-                    # world-space positions directly regardless of rot90.
                     uncomp_frames = []
                     initial_pos = None
                     initial_yaw = 0.0
@@ -716,10 +684,8 @@ class W3AnimationExporter:
                         uncomp_frames.append((dx, dy, dz, dyaw))
                     bpy.context.scene.frame_set(int(self.__frame_start))
 
-                    # 2) Derive CLine (compressed) from the per-frame data.
                     fps_val = float(bpy.context.scene.render.fps)
-                    me = cline_from_per_frame(uncomp_frames, frame_numbers,
-                                              fps_val)
+                    me = cline_from_per_frame(uncomp_frames, frame_numbers, fps_val)
                     if me is not None:
                         motion_extraction_data = {
                             "duration": me.duration,
@@ -731,16 +697,26 @@ class W3AnimationExporter:
                 except Exception as e:
                     log.warning(f"Failed to generate motion extraction: {e}")
 
-        cr2w = anims_builder.build_w2anims(
-            action_name=action_name,
-            bones=bones_data,
-            num_frames=num_frames,
-            dt=dt,
-            fps=fps,
-            skeletal_type=skeletal_type,
-            additive_type=additive_type,
-            motion_extraction=motion_extraction_data,
-        )
+        return {
+            "action_name": action_name,
+            "bones": bones_data,
+            "num_frames": num_frames,
+            "dt": dt,
+            "fps": fps,
+            "skeletal_type": skeletal_type,
+            "additive_type": additive_type,
+            "motion_extraction": motion_extraction_data,
+        }
+
+    def export_native(self, **args):
+        armature = args.get('armature', None)
+        filepath = args.get('filepath', '')
+
+        spec = self.collect_native_anim_spec(**args)
+        if spec is None:
+            return
+
+        cr2w = anims_builder.build_w2anims([spec])
         cr2w_writer.write_w2anims(cr2w, filepath)
     
     def export(self, **args):
@@ -803,6 +779,110 @@ def export_w3_anim(context, savePath, use_native_writer=False,
                         action = curr_action)
         log.info(f'Finished Exporting {curr_action.name} (json)')
     return {'FINISHED'}
+
+
+def export_w3_anim_set(context, savePath, entries, use_native_writer=True):
+    """Export multiple animations from the export set into one .w2anims/.w2anims.json file.
+    """
+    armObj = get_selected_armature(context)
+    if not armObj:
+        log.warning("No armature selected for export")
+        return {'CANCELLED'}
+
+    skipped = []
+
+    if use_native_writer:
+        specs = []
+        for entry in entries:
+            action = bpy.data.actions.get(entry.action_name)
+            if action is None:
+                log.warning(f'Export set entry "{entry.action_name}": action not found, skipping')
+                skipped.append(entry.action_name)
+                continue
+
+            frame_start = int(action.frame_range[0])
+            frame_end = int(action.frame_range[1])
+
+            exporter = W3AnimationExporter()
+            exporter._W3AnimationExporter__frame_start = frame_start
+            exporter._W3AnimationExporter__frame_end = frame_end
+            exporter._W3AnimationExporter__bone_order = _get_armature_bone_order(armObj)
+
+            additive = entry.additive_type if entry.additive_type != 'NONE' else None
+            spec = exporter.collect_native_anim_spec(
+                armature=armObj,
+                action=action,
+                skeletal_type=entry.skeletal_anim_type,
+                additive_type=additive,
+                include_motion_extraction=entry.include_motion_extraction,
+            )
+            if spec is None:
+                log.warning(f'Export set entry "{entry.action_name}": failed to collect animation data, skipping')
+                skipped.append(entry.action_name)
+                continue
+            specs.append(spec)
+            log.info(f'Collected spec for "{entry.action_name}" ({spec["num_frames"]} frames)')
+
+        if not specs:
+            log.warning("No valid animations collected for export set")
+            return {'CANCELLED'}
+        if skipped:
+            log.warning(f'Skipped {len(skipped)} entries: {", ".join(skipped)}')
+
+        cr2w = anims_builder.build_w2anims(specs)
+        cr2w_writer.write_w2anims(cr2w, savePath)
+        log.info(f'Finished exporting {len(specs)} animations (native) to {savePath}')
+        return {'FINISHED'}
+
+    else:
+        # JSON path — collect CSkeletalAnimationSetEntry objects and write one JSON file
+        json_entries = []
+        for entry in entries:
+            action = bpy.data.actions.get(entry.action_name)
+            if action is None:
+                log.warning(f'Export set entry "{entry.action_name}": action not found, skipping')
+                skipped.append(entry.action_name)
+                continue
+
+            frame_start = int(action.frame_range[0])
+            frame_end = int(action.frame_range[1])
+
+            exporter = W3AnimationExporter()
+            exporter._W3AnimationExporter__frame_start = frame_start
+            exporter._W3AnimationExporter__frame_end = frame_end
+            exporter._W3AnimationExporter__bone_order = _get_armature_bone_order(armObj)
+
+            exporter.boneAnimation = exporter._W3AnimationExporter__exportBoneAnimation(
+                armObj, frame_numbers=list(range(frame_start, frame_end + 1)), action=action
+            )
+            if exporter.boneAnimation is None:
+                log.warning(f'Export set entry "{entry.action_name}": failed to collect bone animation, skipping')
+                skipped.append(entry.action_name)
+                continue
+
+            json_entry = exporter.collect_json_entry(entry.action_name)
+            json_entries.append(json_entry)
+            log.info(f'Collected JSON entry for "{entry.action_name}"')
+
+        if not json_entries:
+            log.warning("No valid animations collected for JSON export set")
+            return {'CANCELLED'}
+        if skipped:
+            log.warning(f'Skipped {len(skipped)} entries: {", ".join(skipped)}')
+
+        if len(json_entries) == 1:
+            output_obj = json_entries[0]
+        else:
+            output_obj = w3_types.CSkeletalAnimationSet(json_entries)
+
+        with open(savePath, "w") as f:
+            f.write(json.dumps(
+                output_obj.__dict__,
+                default=lambda obj: obj.__json_serializable__() if hasattr(obj, "__json_serializable__") else obj.__dict__,
+                indent=2, sort_keys=False,
+            ))
+        log.info(f'Finished exporting {len(json_entries)} animations (JSON) to {savePath}')
+        return {'FINISHED'}
 
 
 CUTSCENE_DEFAULT_FPS = 30.0

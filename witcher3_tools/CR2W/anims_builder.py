@@ -1010,55 +1010,86 @@ def _build_multipart_animation_chunks(
 # ---------------------------------------------------------------------------
 
 def build_w2anims(
-    action_name: str,
-    bones: List[Dict[str, List[Tuple[float, ...]]]],
-    num_frames: int,
-    dt: float = DEFAULT_DT,
-    fps: float = 30.0,
-    skeletal_type: str = "SAT_Normal",
-    additive_type: Optional[str] = None,
-    motion_extraction: Optional[dict] = None,
+    animations: List[Dict],
     header_version: int = DEFAULT_HEADER_VERSION,
     build_version: int = DEFAULT_BUILD_VERSION,
 ) -> CR2W:
+    """Build a .w2anims CR2W file from one or more animation specs.
+
+    animations: list of dicts, each with keys:
+        action_name (str), bones (list), num_frames (int), dt (float), fps (float),
+        skeletal_type (str), additive_type (str or None),
+        motion_extraction (dict or None)
+    """
+    if not animations:
+        raise ValueError("build_w2anims requires at least one animation")
+
     cr2w = _init_cr2w(header_version, build_version)
 
-    # Chunk 0: CSkeletalAnimationSet (root)
-    # Entry handle index = 1 (always the next chunk after root)
-    entry_handle = _make_handle(cr2w, 1, "ptr:CSkeletalAnimationSetEntry")
+    # Reserve slot 0 for the CSkeletalAnimationSet root chunk.
+    # We build animation chunks first (to know their entry indices), then
+    # fill in the root's animations array — same pattern as build_w2cutscene.
+    root_idx = cr2w.HEADER.numChunks
+    cr2w.HEADER.numChunks += 1
+    cr2w.CR2WExport.append(
+        CR2WExport(
+            crc32=0, dataOffset=0, dataSize=0, name="CSkeletalAnimationSet",
+            objectFlags=0, parentID=0, template=0,
+        )
+    )
+    root_chunk = W_CLASS(
+        CR2WFILE=cr2w, idx=root_idx, PROPS=[],
+        Type="CSkeletalAnimationSet", name="CSkeletalAnimationSet",
+    )
+    cr2w.CHUNKS.CHUNKS.append(root_chunk)
+
+    entry_indices = []
+    buffer_payloads = []
+    buffer_index = 1
+
+    for anim in animations:
+        result = _build_animation_chunks(
+            cr2w,
+            action_name=anim["action_name"],
+            bones=anim["bones"],
+            tracks=anim.get("tracks"),
+            num_frames=anim["num_frames"],
+            dt=anim.get("dt", DEFAULT_DT),
+            fps=anim.get("fps", 30.0),
+            buffer_index=buffer_index,
+            skeletal_type=anim.get("skeletal_type", "SAT_Normal"),
+            additive_type=anim.get("additive_type"),
+            motion_extraction=anim.get("motion_extraction"),
+        )
+        entry_indices.append(result["entry_idx"])
+        payloads = result.get("buffer_payloads", [result["buffer_payload"]])
+        buffer_payloads.extend(payloads)
+        buffer_index += len(payloads)
+
+    entry_handles = [
+        _make_handle(cr2w, eidx, "ptr:CSkeletalAnimationSetEntry")
+        for eidx in entry_indices
+    ]
     animations_prop = PROPERTY(
         CR2WFILE=cr2w,
-        Handles=[entry_handle], elements=[entry_handle],
+        Handles=entry_handles, elements=entry_handles,
         theName="animations", theType="array:2,0,ptr:CSkeletalAnimationSetEntry",
     )
     ext_events_prop = PROPERTY(
         CR2WFILE=cr2w, Handles=[], elements=[],
         theName="extAnimEvents", theType="array:2,0,handle:CExtAnimEventsFile",
     )
-    streaming_prop = _make_enum_prop(cr2w, "Streaming option", "SAnimationBufferStreamingOption", "ABSO_FullyStreamable")
-    _, set_chunk = _add_chunk(cr2w, "CSkeletalAnimationSet", [animations_prop, ext_events_prop, streaming_prop])
-    # Vanilla files have 4 trailing bytes after properties
-    set_chunk.postPropsData = struct.pack("<I", 0)
-
-    # Animation chunks (Entry → [ME] → Animation → Buffer) starting at index 1
-    result = _build_animation_chunks(
-        cr2w,
-        action_name=action_name,
-        bones=bones,
-        tracks=None,
-        num_frames=num_frames,
-        dt=dt,
-        fps=fps,
-        buffer_index=1,
-        skeletal_type=skeletal_type,
-        additive_type=additive_type,
-        motion_extraction=motion_extraction,
+    streaming_prop = _make_enum_prop(
+        cr2w, "Streaming option", "SAnimationBufferStreamingOption", "ABSO_FullyStreamable",
     )
+    root_chunk.PROPS = [animations_prop, ext_events_prop, streaming_prop]
+    root_chunk.postPropsData = struct.pack("<I", 0)
 
-    # Populate buffer table
-    payload = result["buffer_payload"]
-    cr2w.CR2WBuffer = [CR2WBuffer(index=1, diskSize=len(payload), memSize=len(payload))]
-    cr2w.BufferData = [payload]
+    cr2w.CR2WBuffer = [
+        CR2WBuffer(index=i + 1, diskSize=len(p), memSize=len(p))
+        for i, p in enumerate(buffer_payloads)
+    ]
+    cr2w.BufferData = list(buffer_payloads)
 
     return cr2w
 
