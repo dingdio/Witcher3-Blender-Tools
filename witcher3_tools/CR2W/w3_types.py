@@ -224,6 +224,11 @@ class CStorySceneEvent(base_w3):
         self.linkParentTimeOffset = None #<property Name="linkParentTimeOffset" Type="Float" />
         loadProps(self, args)
 
+class CStorySceneUnknownEvent(CStorySceneEvent):
+    def __init__(self, *args):
+        self.originalEventType = getattr(args[0], "theType", None) if args else None
+        super().__init__(*args)
+
 class CStorySceneEventInterpolation(CStorySceneEvent):
     def __init__(self, *args):
         self.eventName = None #<property Name="eventName" Type="String" />
@@ -1858,13 +1863,15 @@ class CStorySceneSection(base_w3):
         self.distantLightStartOverride = None #<property Name="distantLightStartOverride" Type="Float" />
   
         sceneEventElements = []
-        for sceneEventElement in args[0].sceneEventElements.elements:
+        event_buffer = getattr(args[0], "sceneEventElements", None)
+        for sceneEventElement in getattr(event_buffer, "elements", []):
             sceneEventElement = sceneEventElement.PROP
-            if sceneEventElement.theType in elementTypes:
+            if sceneEventElement.theType in elementTypes and hasattr(sys.modules[__name__], sceneEventElement.theType):
                 cls = getattr(sys.modules[__name__], sceneEventElement.theType)
                 sceneEventElement = cls(sceneEventElement)
             else:
-                raise Exception('Unknown Event Type')
+                log.warning("Unsupported story scene event type %s; preserving raw properties", sceneEventElement.theType)
+                sceneEventElement = CStorySceneUnknownEvent(sceneEventElement)
             sceneEventElements.append(sceneEventElement)
         
         self.sceneEventElements = sceneEventElements

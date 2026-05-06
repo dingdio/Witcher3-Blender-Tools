@@ -4,6 +4,7 @@ import os
 log = logging.getLogger(__name__)
 
 from ..CR2W import w3_types
+from ..CR2W.prop_utils import prop_to_string
 from ..importers import import_cutscene
 from ..importers import import_scene
 from ..exporters import export_cutscene
@@ -1323,19 +1324,157 @@ def _rebuild_cutscene_actor_animations(scene, actor_entry):
             animation_entry.is_loaded = int(animation_entry.source_index) in applied_indices
     return applied_indices, error_messages
 
+
+def _derive_w2scene_repo_path(context, filepath):
+    normalized = os.path.normpath(str(filepath or ""))
+    if not normalized:
+        return ""
+
+    roots = []
+    try:
+        roots.append(get_uncook_path(context))
+    except Exception:
+        pass
+    for root in roots:
+        if not root:
+            continue
+        root_norm = os.path.normpath(root)
+        try:
+            rel = os.path.relpath(normalized, root_norm)
+        except ValueError:
+            continue
+        if not rel.startswith(".."):
+            return rel.replace("/", "\\")
+
+    lowered = normalized.lower()
+    for marker in ("\\r4data\\", "\\content\\content0\\"):
+        marker_index = lowered.find(marker)
+        if marker_index >= 0:
+            return normalized[marker_index + len(marker):].replace("/", "\\")
+    return ""
+
+
+def _update_w2scene_preview(operator, context):
+    filepath = str(getattr(operator, "filepath", "") or "").strip()
+    if not filepath:
+        operator.w2scene_preview_status = "Select a .w2scene file"
+        operator.w2scene_repo_path = ""
+        operator.w2scene_section_summary = ""
+        operator.w2scene_actor_summary = ""
+        operator.w2scene_cutscene_summary = ""
+        operator.w2scene_first_cutscene = ""
+        return True
+
+    try:
+        mtime = os.path.getmtime(filepath)
+    except OSError:
+        mtime = 0.0
+
+    same_file = (
+        filepath == getattr(operator, "w2scene_preview_path", "")
+        and mtime == getattr(operator, "w2scene_preview_mtime", 0.0)
+    )
+    if same_file:
+        return False
+
+    operator.w2scene_preview_path = filepath
+    operator.w2scene_preview_mtime = mtime
+    operator.w2scene_repo_path = _derive_w2scene_repo_path(context, filepath)
+
+    if not filepath.lower().endswith(".w2scene"):
+        operator.w2scene_preview_status = "Select a .w2scene file"
+        operator.w2scene_section_summary = ""
+        operator.w2scene_actor_summary = ""
+        operator.w2scene_cutscene_summary = ""
+        operator.w2scene_first_cutscene = ""
+        return True
+
+    try:
+        scene_importer = import_scene.import_w3_scene(filepath)
+        scene_importer.load_sections()
+        story_scene = scene_importer._CStoryScene
+    except Exception as exc:
+        operator.w2scene_preview_status = f"Preview failed: {exc}"
+        operator.w2scene_section_summary = ""
+        operator.w2scene_actor_summary = ""
+        operator.w2scene_cutscene_summary = ""
+        operator.w2scene_first_cutscene = ""
+        return True
+
+    sections = list(getattr(scene_importer, "scene_sections", []) or [])
+    cutscene_sections = [section for section in sections if section.__class__.__name__ == "CStorySceneCutsceneSection"]
+    element_count = sum(len(getattr(getattr(section, "sceneElements", None), "value", []) or []) for section in sections)
+    event_count = sum(len(getattr(section, "sceneEventElements", []) or []) for section in sections)
+    actor_count = len(getattr(getattr(story_scene, "sceneTemplates", None), "value", []) or [])
+    dialogset_count = len(getattr(getattr(story_scene, "dialogsetInstances", None), "value", []) or [])
+
+    linked_cutscenes = []
+    for section in cutscene_sections:
+        cutscene_path = prop_to_string(getattr(section, "cutscene", None))
+        if cutscene_path:
+            linked_cutscenes.append(cutscene_path)
+
+    operator.w2scene_preview_status = os.path.basename(filepath)
+    operator.w2scene_section_summary = (
+        f"Sections: {len(sections)} ({len(sections) - len(cutscene_sections)} dialog, "
+        f"{len(cutscene_sections)} cutscene), elements: {element_count}, events: {event_count}"
+    )
+    operator.w2scene_actor_summary = f"Entities: {actor_count}, dialogsets: {dialogset_count}"
+    operator.w2scene_cutscene_summary = f"Linked cutscenes: {len(linked_cutscenes)}"
+    operator.w2scene_first_cutscene = linked_cutscenes[0] if linked_cutscenes else ""
+    return True
+
+
 class ButtonOperatorImportW2scene(bpy.types.Operator, ImportHelper):
     """Import W2 Cutscee"""
     bl_idname = "witcher.import_w2_scene"
     bl_label = "W2 Scene"
     filename_ext = ".w2scene"
+    filter_glob: StringProperty(default='*.w2scene', options={'HIDDEN'})
+    w2scene_preview_status: StringProperty(default="Select a .w2scene file")
+    w2scene_preview_path: StringProperty(default="")
+    w2scene_preview_mtime: FloatProperty(default=0.0)
+    w2scene_repo_path: StringProperty(default="")
+    w2scene_section_summary: StringProperty(default="")
+    w2scene_actor_summary: StringProperty(default="")
+    w2scene_cutscene_summary: StringProperty(default="")
+    w2scene_first_cutscene: StringProperty(default="")
+
+    def draw(self, context):
+        layout = self.layout
+        preview_box = layout.box()
+        preview_box.label(text="Scene Preview")
+        preview_box.label(text=self.w2scene_preview_status, icon='SCENE_DATA')
+        if self.w2scene_repo_path:
+            preview_box.label(text=f"Repo Path: {self.w2scene_repo_path}", icon='FILE')
+        if self.w2scene_section_summary:
+            preview_box.label(text=self.w2scene_section_summary)
+        if self.w2scene_actor_summary:
+            preview_box.label(text=self.w2scene_actor_summary)
+        if self.w2scene_cutscene_summary:
+            preview_box.label(text=self.w2scene_cutscene_summary)
+        if self.w2scene_first_cutscene:
+            preview_box.label(text=f"First cutscene: {self.w2scene_first_cutscene}", icon='SEQUENCE')
+
+    def check(self, context):
+        return _update_w2scene_preview(self, context)
+
     def execute(self, context):
         if os.path.isdir(self.filepath):
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
             return {'CANCELLED'}
+        if not self.filepath.lower().endswith(".w2scene"):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
         context.scene.witcher_sections_filepath = self.filepath
         context.scene.witcher_sections.clear()
-        sceneImporter = import_scene.import_w3_scene(self.filepath)
-        sceneImporter.load_sections()
+        try:
+            sceneImporter = import_scene.import_w3_scene(self.filepath)
+            sceneImporter.load_sections()
+        except Exception as exc:
+            log.exception("Failed to load scene sections from %s", self.filepath)
+            self.report({'ERROR'}, f"Failed to load scene: {exc}")
+            return {'CANCELLED'}
         for section in sceneImporter.scene_sections:
             add_scene_section(section.sectionName, "{}", context.scene)
         #sceneImporter.execute()
@@ -1345,6 +1484,7 @@ class ButtonOperatorImportW2scene(bpy.types.Operator, ImportHelper):
         UNCOOK_PATH = os.path.join(get_uncook_path(context),"animations\\")
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        _update_w2scene_preview(self, context)
         return ImportHelper.invoke(self, context, event)
 
 class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
