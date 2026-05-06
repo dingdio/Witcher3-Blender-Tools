@@ -13,7 +13,7 @@ from ..duplication import duplicate_character_hierarchy
 log = logging.getLogger(__name__)
 
 CUTSCENE_GUID_PROP = "witcher_cutscene_guid"
-CUTSCENE_TRACK_NAME = "cutscene_import"
+CUTSCENE_TRACK_NAME = "cutscene_anim"
 CUTSCENE_FACE_TRACK_NAME = f"{CUTSCENE_TRACK_NAME}_face"
 CUTSCENE_SOURCE_PATH_PROP = "witcher_cutscene_source_path"
 CUTSCENE_SOURCE_INDEX_PROP = "witcher_cutscene_source_index"
@@ -436,6 +436,17 @@ def _tag_cutscene_actor(actor_obj, actor, source_index=-1, source_path="", impor
     if appearance_name:
         actor_obj["cutscene_actor_appearance"] = appearance_name
     actor_obj["cutscene_actor_use_mimic"] = bool(getattr(actor, "useMimic", False))
+
+    # Extended actor properties (all fields on SCutsceneActorDef)
+    tag_list = getattr(actor, "tag", None)
+    actor_obj["cutscene_actor_tag"] = "; ".join(str(t or "").strip() for t in (tag_list or []) if str(t or "").strip())
+    voice_tag = str(getattr(actor, "voiceTag", "") or "").strip()
+    actor_obj["cutscene_actor_voice_tag"] = voice_tag
+    final_pos_list = getattr(actor, "finalPosition", None)
+    actor_obj["cutscene_actor_final_position"] = "; ".join(str(t or "").strip() for t in (final_pos_list or []) if str(t or "").strip())
+    actor_obj["cutscene_actor_kill_me"] = bool(getattr(actor, "killMe", False) or False)
+    actor_obj["cutscene_actor_anim_final_pos"] = str(getattr(actor, "animationAtFinalPosition", "") or "").strip()
+
     if source_path:
         actor_obj[CUTSCENE_SOURCE_PATH_PROP] = str(source_path)
     if int(source_index or -1) >= 0:
@@ -454,6 +465,11 @@ def _clear_cutscene_actor_tags(actor_obj):
         "cutscene_component",
         "cutscene_actor_appearance",
         "cutscene_actor_use_mimic",
+        "cutscene_actor_tag",
+        "cutscene_actor_voice_tag",
+        "cutscene_actor_final_position",
+        "cutscene_actor_kill_me",
+        "cutscene_actor_anim_final_pos",
         CUTSCENE_SOURCE_PATH_PROP,
         CUTSCENE_SOURCE_INDEX_PROP,
         CUTSCENE_ACTOR_IMPORTED_PROP,
@@ -1347,10 +1363,13 @@ def collect_cutscene_preview(filename, cutscene_template=None):
             repo_path=template_path,
             duplicate_count=template_counts.get(template_path, 0),
         )
+        tag_list = getattr(actor, "tag", None)
+        final_pos_list = getattr(actor, "finalPosition", None)
         actor_items.append({
             "source_index": idx,
             "label": display_name,
             "actor_name": actor_name,
+            "tag": "; ".join(str(t or "").strip() for t in (tag_list or []) if str(t or "").strip()),
             "voice_tag": str(getattr(actor, "voiceTag", "") or "").strip(),
             "template_path": template_path,
             "appearance_name": appearance_name,
@@ -1358,7 +1377,10 @@ def collect_cutscene_preview(filename, cutscene_template=None):
                 _safe_actor_type_str(getattr(actor, "type", None)),
                 actor_name=actor_name,
             ),
+            "final_position": "; ".join(str(t or "").strip() for t in (final_pos_list or []) if str(t or "").strip()),
+            "kill_me": bool(getattr(actor, "killMe", False) or False),
             "use_mimic": bool(getattr(actor, "useMimic", False)),
+            "anim_final_pos": str(getattr(actor, "animationAtFinalPosition", "") or "").strip(),
             "already_in_scene": bool(existing),
         })
 

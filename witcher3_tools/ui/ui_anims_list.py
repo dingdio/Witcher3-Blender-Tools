@@ -516,7 +516,9 @@ def _load_selected_quick_anim(context):
     if not anim_name or not fdir:
         return False
     fdir_abs = repo_file(fdir)
-    load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj)
+    _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
+    _nla_mode = _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+    load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj, nla_mode=_nla_mode)
     if getattr(context.scene, "witcher_auto_orient_root", True):
         try:
             from ..ui.ui_anims import apply_root_orientation
@@ -721,7 +723,7 @@ def FilterData(context):
         _apply_cached_items_to_scene(scene, cached_items)
 
 def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0,
-                         face_target_mode="auto"):
+                         face_target_mode="auto", nla_mode='replace'):
     face_animation = is_face_animation(anim_name, fdir)
     if face_target_mode == "owner" and face_animation:
         main_arm_obj, owner_armature, rig_path = resolve_owner_face_animation_context(
@@ -779,6 +781,7 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
     # with open("anim_debug_example.json", "w") as file:
     #     file.write(json.dumps(animation, indent=2, default=vars, sort_keys=False))
 
+    effective_at_frame = float(context.scene.frame_current) if nla_mode == 'append_at_cursor' else at_frame
     import_anims.import_anim(
         context,
         fdir,
@@ -786,7 +789,8 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
         use_NLA=True,
         NLA_track=effective_track,
         override_select=actual_target_armatures if len(actual_target_armatures) > 1 else actual_target_armatures[0],
-        at_frame=at_frame,
+        at_frame=effective_at_frame,
+        nla_mode=nla_mode,
     )
     return actual_target_armatures
     # print(fdir)

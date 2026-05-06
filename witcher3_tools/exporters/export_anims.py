@@ -15,6 +15,7 @@ from ..action_compat import iter_action_fcurves
 log = logging.getLogger(__name__)
 
 from ..w3_armature_constants import human_bone_order
+from ..camera_tracks import CAMERA_TRACK_NAMES
 from ..CR2W import w3_types
 from ..CR2W import anims_builder, cr2w_writer
 from ..importers.motion_tools import cline_from_per_frame
@@ -274,51 +275,12 @@ class _FCurve:
         return result
 
     def sampleFrames(self, frame_numbers: List[int]):
-        # assume set(frame_numbers) & set(self.frameNumbers()) == set(self.frameNumbers())
         fcurve = self.__fcurve
         if fcurve is None or len(fcurve.keyframe_points) == 0: # no key frames
             return [[self.__default_value, ((20, 20), (107, 107))] for _ in frame_numbers]
 
-        result = list()
-
         evaluate = fcurve.evaluate
-        frame_iter = iter(frame_numbers)
-        prev_kp = None
-        prev_i = None
-        exhausted = False
-        kp: bpy.types.Keyframe
-        for kp in self.__sorted_keyframe_points:
-            i = int(kp.co[0]+0.5)
-            if i == prev_i:
-                prev_kp = kp
-                continue
-            prev_i = i
-            frames = []
-            while True:
-                try:
-                    frame = next(frame_iter)
-                except StopIteration:
-                    exhausted = True
-                    break
-                frames.append(frame)
-                if frame >= i:
-                    break
-            if exhausted or not frames:
-                break
-            if prev_kp is None:
-                for f in frames: # starting key frames
-                    result.append([kp.co[1], ((20, 20), (107, 107))])
-            elif len(frames) == 1:
-                result.append([kp.co[1], ((20, 20), (107, 107))])
-            else:
-                for f in frames:
-                    result.append([evaluate(f), ((20, 20), (107, 107))])
-            prev_kp = kp
-
-        prev_kp_co_1 = prev_kp.co[1]
-        result.extend([[prev_kp_co_1, ((20, 20), (107, 107))] for _ in frame_iter])
-        
-        return result
+        return [[evaluate(float(frame)), ((20, 20), (107, 107))] for frame in frame_numbers]
 
 class _AnimationBase(collections.defaultdict):
     def __init__(self):
@@ -1210,6 +1172,12 @@ def _resolve_cutscene_camera_track_names(armature_obj) -> List[str]:
             continue
         seen.add(track_name)
         track_names.append(track_name)
+    if track_names:
+        ordered = [track_name for track_name in CAMERA_TRACK_NAMES if track_name in seen]
+        ordered.extend(track_name for track_name in track_names if track_name not in ordered)
+        return ordered
+    if armature_obj is not None and getattr(getattr(armature_obj, "pose", None), "bones", {}).get("Camera_Node"):
+        return list(CAMERA_TRACK_NAMES)
     return track_names
 
 

@@ -7,6 +7,7 @@ from ..CR2W.dc_anims import load_bin_anims, load_lipsync_file, load_bin_anims_in
 from ..CR2W.CR2W_helpers import Enums
 log = logging.getLogger(__name__)
 
+from ..camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties
 from ..importers.import_rig import get_ordered_bones
 from ..importers.motion_tools import MotionExtraction, apply_motion, apply_motion_to_bone, extract_motion_from_bone
 from .. import get_do_fix_tail, get_rig_rot90_enabled
@@ -319,7 +320,7 @@ class AnimationBufferType(Enum):
     Multi = 1
 
 class AnimImporter:
-    def __init__(self, filepath, SetEntry:w3_types.CSkeletalAnimationSetEntry, scale=1.0, use_pose_mode=False, use_NLA=False, facePose=False, NLA_track = 'anim_import', at_frame = 0):
+    def __init__(self, filepath, SetEntry:w3_types.CSkeletalAnimationSetEntry, scale=1.0, use_pose_mode=False, use_NLA=False, facePose=False, NLA_track = 'anim_import', at_frame = 0, nla_mode='replace'):
         self.__animFile = animFile()
         self.__animFile.load(filepath=filepath)
         #log.debug(str(self.__animFile.header))
@@ -328,12 +329,118 @@ class AnimImporter:
         self.__use_NLA = use_NLA
         self.__NLA_track = NLA_track
         self.__NLA_frame_margin = at_frame
-        self.__frame_margin = 0 
+        self.__nla_mode = nla_mode
+        self.__nla_base_frames = {}
+        self.__nla_shifted_targets = set()
+        self.__frame_margin = 0
         self.__AnimationBufferType = AnimationBufferType.Normal
         if type(SetEntry.animation.animBuffer) == w3_types.CAnimationBufferMultipart:
             self.__AnimationBufferType = AnimationBufferType.Multi
         self.__frame_current = 0
         self.facePose = facePose
+
+    def __strip_action_range(self, strip):
+        action = getattr(strip, "action", None)
+        fallback_start, fallback_end = (0.0, 0.0)
+        if action is not None:
+            try:
+                fallback_start, fallback_end = action.frame_range
+            except Exception:
+                pass
+        action_start = float(getattr(strip, "action_frame_start", fallback_start) or fallback_start)
+        action_end = float(getattr(strip, "action_frame_end", fallback_end) or fallback_end)
+        if action_end < action_start:
+            action_end = action_start
+        return action_start, action_end
+
+    def __scene_frame_to_strip_action_frame(self, strip, scene_frame):
+        strip_start = float(getattr(strip, "frame_start", 0.0) or 0.0)
+        action_start, action_end = self.__strip_action_range(strip)
+        scale = float(getattr(strip, "scale", 1.0) or 1.0)
+        if abs(scale) <= 1e-6:
+            scale = 1.0
+        action_frame = action_start + ((float(scene_frame) - strip_start) / scale)
+        return max(action_start, min(action_end, action_frame))
+
+    def __copy_nla_strip_settings(self, source_strip, target_strip):
+        for attr in (
+            "blend_type",
+            "extrapolation",
+            "influence",
+            "mute",
+            "use_auto_blend",
+            "blend_in",
+            "blend_out",
+            "use_animated_influence",
+            "repeat",
+            "scale",
+        ):
+            if not hasattr(source_strip, attr) or not hasattr(target_strip, attr):
+                continue
+            try:
+                setattr(target_strip, attr, getattr(source_strip, attr))
+            except Exception:
+                pass
+
+    def __set_strip_action_range(self, strip, action_start=None, action_end=None):
+        if strip is None:
+            return
+        if action_start is not None and hasattr(strip, "action_frame_start"):
+            try:
+                strip.action_frame_start = float(action_start)
+            except Exception:
+                pass
+        if action_end is not None and hasattr(strip, "action_frame_end"):
+            try:
+                strip.action_frame_end = float(action_end)
+            except Exception:
+                pass
+
+    def __split_nla_strip_at_cursor(self, target, target_track, strip, cursor, insert_length):
+        action = getattr(strip, "action", None)
+        if action is None:
+            return None
+
+        old_start = float(getattr(strip, "frame_start", 0.0) or 0.0)
+        old_end = float(getattr(strip, "frame_end", old_start) or old_start)
+        if not (old_start < cursor < old_end):
+            return None
+
+        old_action_start, old_action_end = self.__strip_action_range(strip)
+        split_action_frame = self.__scene_frame_to_strip_action_frame(strip, cursor)
+        right_start = float(cursor) + float(insert_length)
+        right_end = old_end + float(insert_length)
+
+        strip.frame_end = float(cursor)
+        self.__set_strip_action_range(strip, action_start=old_action_start, action_end=split_action_frame)
+
+        right_strip = target_track.strips.new(str(getattr(strip, "name", "") or action.name), int(round(right_start)), action)
+        self.__copy_nla_strip_settings(strip, right_strip)
+        right_strip.frame_start = right_start
+        right_strip.frame_end = right_end
+        self.__set_strip_action_range(right_strip, action_start=split_action_frame, action_end=old_action_end)
+        try:
+            bind_strip_action_slot(right_strip, resolve_action_slot(action, target=target, ensure=True))
+        except Exception:
+            pass
+        return right_strip
+
+    def __prepare_nla_append_at_cursor(self, target, target_track, cursor, insert_length):
+        cursor = float(cursor)
+        insert_length = max(1.0, float(insert_length))
+        original_strips = list(getattr(target_track, "strips", []) or [])
+
+        for strip in sorted(original_strips, key=lambda s: float(getattr(s, "frame_start", 0.0) or 0.0), reverse=True):
+            strip_start = float(getattr(strip, "frame_start", 0.0) or 0.0)
+            if strip_start >= cursor:
+                strip.frame_start = strip_start + insert_length
+                strip.frame_end = float(getattr(strip, "frame_end", strip_start) or strip_start) + insert_length
+
+        for strip in original_strips:
+            strip_start = float(getattr(strip, "frame_start", 0.0) or 0.0)
+            strip_end = float(getattr(strip, "frame_end", strip_start) or strip_start)
+            if strip_start < cursor < strip_end:
+                self.__split_nla_strip_at_cursor(target, target_track, strip, cursor, insert_length)
 
     def __assign_action(self, target: Union[bpy.types.ID, HasAnimationData], action: bpy.types.Action):
         if target.animation_data is None:
@@ -343,44 +450,70 @@ class AnimImporter:
             assign_action(target, action)
         else:
             #frame_current = bpy.context.scene.frame_current
+            is_multi_subsequent = self.__AnimationBufferType == AnimationBufferType.Multi and self.__frame_current != 0
+
+            start_frame, end_frame = action.frame_range
+            length = end_frame - start_frame
+            total_insert_length = max(1.0, float(length))
+            if self.__AnimationBufferType == AnimationBufferType.Multi:
+                anim_buffer = getattr(getattr(self.__SetEntry, "animation", None), "animBuffer", None)
+                total_insert_length = max(
+                    total_insert_length,
+                    float(max(1, int(getattr(anim_buffer, "numFrames", 0) or 0)) - 1),
+                )
+
             if self.__NLA_track:
                 target_track: bpy.types.NlaTrack = target.animation_data.nla_tracks.get(self.__NLA_track)
                 if target_track is None:
                     target_track: bpy.types.NlaTrack = target.animation_data.nla_tracks.new()
-                    target_track.name = self.__NLA_track #action.name
-                if self.__AnimationBufferType == AnimationBufferType.Multi and self.__frame_current !=0 or self.__NLA_frame_margin !=0:
-                    pass # adding multiple strips
-                else:
-                    for strip in target_track.strips:
-                        target_track.strips.remove(strip)
+                    target_track.name = self.__NLA_track
+
+                nla_key = (id(target), str(self.__NLA_track or ""))
+                if self.__nla_mode in {'append', 'append_at_cursor'}:
+                    if nla_key not in self.__nla_base_frames:
+                        if self.__nla_mode == 'append':
+                            self.__nla_base_frames[nla_key] = (
+                                float(target_track.strips[-1].frame_end)
+                                if len(target_track.strips)
+                                else float(self.__NLA_frame_margin)
+                            )
+                        else:
+                            cursor = float(self.__NLA_frame_margin)
+                            self.__nla_base_frames[nla_key] = cursor
+                            if nla_key not in self.__nla_shifted_targets:
+                                self.__prepare_nla_append_at_cursor(target, target_track, cursor, total_insert_length)
+                                self.__nla_shifted_targets.add(nla_key)
+                else:  # 'replace'
+                    if self.__NLA_frame_margin == 0:
+                        for strip in target_track.strips:
+                            target_track.strips.remove(strip)
             else:
                 target_track: bpy.types.NlaTrack = target.animation_data.nla_tracks.new()
                 target_track.name = action.name
-                
-            self.__frame_current = self.__NLA_frame_margin + self.__frame_current
-            
+
+            # Compute placement frame. Append modes use a stable base per target so
+            # multipart clips preserve firstFrames offsets after existing strips.
+            nla_key = (id(target), str(self.__NLA_track or ""))
+            if self.__nla_mode in {'append', 'append_at_cursor'} and nla_key in self.__nla_base_frames:
+                frame_pos = float(self.__nla_base_frames[nla_key]) + float(self.__frame_current)
+            else:
+                frame_pos = self.__NLA_frame_margin + self.__frame_current
+
             last_strip = target_track.strips[-1] if len(target_track.strips) else None
             try:
-                target_strip = target_track.strips.new(action.name, int(self.__frame_current + 1), action)
+                target_strip = target_track.strips.new(action.name, int(frame_pos + 1), action)
             except Exception as e:
-                target_strip = target_track.strips.new(action.name, int(last_strip.frame_end + 1), action)
-            target_strip.frame_start = self.__frame_current
+                fallback_frame = int((last_strip.frame_end if last_strip is not None else frame_pos) + 1)
+                target_strip = target_track.strips.new(action.name, fallback_frame, action)
+            target_strip.frame_start = frame_pos
             bind_strip_action_slot(target_strip, resolve_action_slot(action, target=target, ensure=True))
-            start_frame, end_frame = action.frame_range
-            length = end_frame - start_frame
-            target_strip.frame_end = self.__frame_current + length
+            target_strip.frame_end = frame_pos + length
             target_strip.blend_type = 'REPLACE'
-            
+
             if self.__NLA_track:
                 track_name = str(self.__NLA_track or "")
-                if track_name in {'mimic_import', 'voice_import', 'anim_import'} or track_name.startswith('cutscene_import'):
+                if track_name in {'mimic_import', 'voice_import', 'anim_import'} or track_name.startswith('cutscene_anim') or track_name.startswith('cutscene_import'):
                     target_strip.blend_type = 'COMBINE'
-            # try:
-            #     __frame_start = self.__NLA_frame_margin + self.__frame_current #TODO exact float start
-            #     target_strip = target_track.strips.new(action.name, int(__frame_start), action)
-            # except Exception as e:
-            #     raise e
-            # target_strip.blend_type = 'COMBINE'
 
     def __assignPartToArmature(self, armObj, SkeletalAnimation, SkeletalAnimationData, armature_namespace, SkeletalAnimationType, scale):
         
@@ -696,10 +829,12 @@ class AnimImporter:
             control_bone_name = "Camera_Node"
         AnimTracks = SkeletalAnimationData.tracks
         morph_action_target = None
-        if AnimTracks and len(AnimTracks) > 1:
+        if AnimTracks:
             log.info('---- morph animations:%5d  target: %s', len(AnimTracks), armObj.name)
 
             control_arm_obj = armObj
+            if camera_animation:
+                ensure_camera_track_properties(control_arm_obj, track_names=CAMERA_TRACK_NAMES)
             control_bone = control_arm_obj.pose.bones.get(control_bone_name)
             if control_bone is None:
                 log.warning('No shape key control bone "%s" on "%s". Attempting to load face morphs.', control_bone_name, armObj.name)
@@ -1114,7 +1249,7 @@ def create_lopsided_cube():
 
     return cube
 
-def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=False, override_select = False, update_scene_settings = True, NLA_track = 'anim_import', at_frame = 0):
+def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=False, override_select = False, update_scene_settings = True, NLA_track = 'anim_import', at_frame = 0, nla_mode = 'replace'):
     if not override_select:
         selected_objects = set(context.selected_objects)
     else:
@@ -1224,7 +1359,7 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
             #     empty_obj.location.x = value
             #     empty_obj.keyframe_insert(data_path="location", index=0, frame=frame)
     
-    importer = AnimImporter(fileName, AnimationSetEntry, use_NLA=use_NLA, facePose=facePose, NLA_track = NLA_track, at_frame=at_frame)
+    importer = AnimImporter(fileName, AnimationSetEntry, use_NLA=use_NLA, facePose=facePose, NLA_track = NLA_track, at_frame=at_frame, nla_mode=nla_mode)
     for i in selected_objects:
         importer.assign(i)
     log.info(' Finished importing motion in %f seconds.', time.time() - start_time)
@@ -1243,7 +1378,8 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
                     break
         auto_scene_setup.setupFrameRanges(use_NLA, target_obj=target_for_ranges)
         auto_scene_setup.setupFps()
-        bpy.context.scene.frame_current = 0#context.scene.frame_current)
+        if nla_mode == 'replace':
+            bpy.context.scene.frame_current = 0
     return {'FINISHED'}
 
 # global GLOBAL_ANIMSET
@@ -1304,7 +1440,7 @@ def import_w3_animSet(filename, rigPath = False)->w3_types.CSkeletalAnimationSet
         anim = None
     return anim
 
-def import_lipsync(context, fileName = False, load_from_data = False, use_NLA=True, NLA_track="mimic_import", override_select = None, at_frame = 0):
+def import_lipsync(context, fileName = False, load_from_data = False, use_NLA=True, NLA_track="mimic_import", override_select = None, at_frame = 0, nla_mode = 'replace'):
     if fileName:
         dirpath, file = os.path.split(fileName)
         basename, ext = os.path.splitext(file)
@@ -1314,7 +1450,7 @@ def import_lipsync(context, fileName = False, load_from_data = False, use_NLA=Tr
             lipsync_CSkeletalAnimation.name = getFilenameFile(lipsync_CSkeletalAnimation.name)
             anim_set_entry.name = lipsync_CSkeletalAnimation.name
             anim_set_entry.animation = lipsync_CSkeletalAnimation
-            import_anim(context, "lipsync", anim_set_entry, use_NLA=use_NLA, NLA_track=NLA_track, override_select = override_select, at_frame = at_frame)
+            import_anim(context, "lipsync", anim_set_entry, use_NLA=use_NLA, NLA_track=NLA_track, override_select = override_select, at_frame = at_frame, nla_mode=nla_mode)
     log.info('Lipsync loaded')
     return {'FINISHED'}
     

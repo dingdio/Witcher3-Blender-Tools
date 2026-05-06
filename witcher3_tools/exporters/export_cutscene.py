@@ -15,7 +15,7 @@ from . import export_anims
 log = logging.getLogger(__name__)
 
 
-CUTSCENE_TRACK_NAME = "cutscene_import"
+CUTSCENE_TRACK_NAME = "cutscene_anim"
 CUTSCENE_FACE_TRACK_NAME = f"{CUTSCENE_TRACK_NAME}_face"
 CUTSCENE_SOURCE_PATH_PROP = "witcher_cutscene_source_path"
 CUTSCENE_SOURCE_INDEX_PROP = "witcher_cutscene_source_index"
@@ -50,6 +50,105 @@ def _scene_cutscene_template_metadata(scene) -> Dict[str, object]:
         ),
         "_synced": bool(getattr(scene, CUTSCENE_EXPORT_METADATA_SYNCED_PROP, False)),
     }
+
+
+def _split_cutscene_tag_text(value) -> List[str]:
+    if isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raw_items = str(value or "").replace("\n", ";").split(";")
+    return [
+        export_anims._strip_text(item)
+        for item in raw_items
+        if export_anims._strip_text(item)
+    ]
+
+
+def _cutscene_event_item_payload(item) -> Dict[str, object]:
+    return {
+        "event_type": export_anims._strip_text(getattr(item, "event_type", "")),
+        "event_name": export_anims._strip_text(getattr(item, "event_name", "")),
+        "start_time": float(getattr(item, "start_time", 0.0) or 0.0),
+        "duration": float(getattr(item, "duration", 0.0) or 0.0),
+        "animation_name": export_anims._strip_text(getattr(item, "animation_name", "")),
+        "track_name": export_anims._strip_text(getattr(item, "track_name", "")),
+        "effect_name": export_anims._strip_text(getattr(item, "effect_name", "")),
+        "appearance": export_anims._strip_text(getattr(item, "appearance", "")),
+        "event_scope": export_anims._strip_text(getattr(item, "event_scope", "")),
+        "source_index": export_anims._safe_int(getattr(item, "source_index", -1), -1),
+        "always_fires_end": bool(getattr(item, "always_fires_end", False)),
+    }
+
+
+def _collect_scene_cutscene_events(scene):
+    root_events = []
+    entry_events = []
+    for item in getattr(scene, "witcher_cutscene_event_items", []) or []:
+        payload = _cutscene_event_item_payload(item)
+        if not payload["event_type"]:
+            continue
+        scope = payload["event_scope"].upper()
+        if scope == "ROOT":
+            root_events.append(payload)
+        else:
+            entry_events.append(payload)
+    return root_events, entry_events
+
+
+def _cutscene_entry_event_matches_group(event, group) -> bool:
+    source_index = export_anims._safe_int(event.get("source_index", -1), -1)
+    group_parts = list(group.get("entries", []) or group.get("parts", []) or [])
+    if source_index >= 0:
+        for part in group_parts:
+            if export_anims._safe_int(part.get("source_index", -1), -1) == source_index:
+                return True
+
+    event_anim_name = export_anims._strip_text(event.get("animation_name", ""))
+    if not event_anim_name:
+        return False
+
+    candidates = {
+        export_anims._strip_text(group.get("source_animation_name", "")),
+        export_anims._strip_text(group.get("action_name", "")),
+        export_anims._compose_cutscene_animation_name(
+            group.get("actor_name", ""),
+            group.get("component", ""),
+            group.get("action_name", ""),
+        ),
+    }
+    for part in group_parts:
+        candidates.add(export_anims._strip_text(part.get("source_animation_name", "")))
+        candidates.add(export_anims._strip_text(part.get("action_name", "")))
+    return event_anim_name in {candidate for candidate in candidates if candidate}
+
+
+def _entry_events_for_group(entry_events, group):
+    events = []
+    seen = set()
+    default_animation_name = export_anims._compose_cutscene_animation_name(
+        group.get("actor_name", ""),
+        group.get("component", ""),
+        group.get("action_name", ""),
+    )
+    for event in entry_events or []:
+        if not _cutscene_entry_event_matches_group(event, group):
+            continue
+        payload = dict(event)
+        if not payload.get("animation_name"):
+            payload["animation_name"] = default_animation_name
+        key = (
+            payload.get("event_type"),
+            payload.get("event_name"),
+            payload.get("start_time"),
+            payload.get("duration"),
+            payload.get("animation_name"),
+            payload.get("source_index"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        events.append(payload)
+    return events
 
 
 def _source_cutscene_template_metadata(source_path: str, source_cache: Dict[str, object]) -> Dict[str, object]:
@@ -335,6 +434,11 @@ def _collect_cutscene_scene_actors(scene=None):
                 actor_name=actor_name,
             ),
             "use_mimic": bool(actor_obj.get("cutscene_actor_use_mimic", False)),
+            "tag": _split_cutscene_tag_text(actor_obj.get("cutscene_actor_tag", "")),
+            "voice_tag": export_anims._strip_text(actor_obj.get("cutscene_actor_voice_tag", "")),
+            "final_position": _split_cutscene_tag_text(actor_obj.get("cutscene_actor_final_position", "")),
+            "kill_me": bool(actor_obj.get("cutscene_actor_kill_me", False)),
+            "anim_final_pos": export_anims._strip_text(actor_obj.get("cutscene_actor_anim_final_pos", "")),
             "source_index": export_anims._safe_int(actor_obj.get(CUTSCENE_SOURCE_INDEX_PROP, -1), -1),
         })
     actors.sort(key=lambda actor: (
@@ -356,6 +460,79 @@ def _cutscene_entry_sort_key(entry):
         export_anims._strip_text(entry.get("armature_name", "")),
         export_anims._strip_text(entry.get("strip_name", "")),
     )
+
+
+def _armature_has_cutscene_camera_bone(armature_obj) -> bool:
+    pose_bones = getattr(getattr(armature_obj, "pose", None), "bones", None)
+    return bool(pose_bones and pose_bones.get("Camera_Node") is not None)
+
+
+def _cutscene_actor_type_map(actors) -> Dict[str, str]:
+    return {
+        export_anims._strip_text(actor.get("name", "")): export_anims._strip_text(actor.get("type", ""))
+        for actor in actors or []
+        if export_anims._strip_text(actor.get("name", ""))
+    }
+
+
+def _is_cutscene_camera_entry(entry, actor_types_by_name=None) -> bool:
+    actor_name = export_anims._strip_text(entry.get("actor_name", ""))
+    actor_type = export_anims._strip_text((actor_types_by_name or {}).get(actor_name, ""))
+    if actor_type == "CAT_Camera" or actor_name.lower() == "camera":
+        return True
+    return _armature_has_cutscene_camera_bone(entry.get("armature_obj"))
+
+
+def _entry_scene_frame_range(entry):
+    start = float(entry.get("strip_frame_start", entry.get("frame_start", 0.0)) or 0.0)
+    end = float(entry.get("strip_frame_end", entry.get("frame_end", start)) or start)
+    if end < start:
+        end = start
+    return start, end
+
+
+def _collect_camera_cut_segments(export_entries, actors):
+    actor_types_by_name = _cutscene_actor_type_map(actors)
+    raw_segments = []
+    seen = set()
+    for entry in export_entries:
+        if not _is_cutscene_camera_entry(entry, actor_types_by_name=actor_types_by_name):
+            continue
+        scene_start, scene_end = _entry_scene_frame_range(entry)
+        if scene_end <= scene_start:
+            continue
+        key = (int(round(scene_start)), int(round(scene_end)))
+        if key in seen:
+            continue
+        seen.add(key)
+        raw_segments.append({
+            "scene_start": scene_start,
+            "scene_end": scene_end,
+            "sort_name": export_anims._strip_text(entry.get("strip_name", "")),
+        })
+
+    raw_segments.sort(key=lambda segment: (
+        float(segment["scene_start"]),
+        float(segment["scene_end"]),
+        segment["sort_name"],
+    ))
+    if not raw_segments:
+        return []
+
+    base_start = float(raw_segments[0]["scene_start"])
+    segments = []
+    for segment in raw_segments:
+        scene_start = float(segment["scene_start"])
+        scene_end = float(segment["scene_end"])
+        part_start_frame = max(0, int(round(scene_start - base_start)))
+        part_num_frames = max(1, int(round(scene_end - scene_start)) + 1)
+        segments.append({
+            "scene_start": scene_start,
+            "scene_end": scene_end,
+            "part_start_frame": part_start_frame,
+            "part_num_frames": part_num_frames,
+        })
+    return segments
 
 
 def _collect_cutscene_nla_entries(context):
@@ -414,6 +591,7 @@ def _collect_cutscene_nla_entries(context):
                         "strip_name": export_anims._strip_text(getattr(strip, "name", "")),
                         "strip_frame_start": float(getattr(strip, "frame_start", 0.0) or 0.0),
                         "strip_frame_end": float(getattr(strip, "frame_end", 0.0) or 0.0),
+                        "strip_scale": float(getattr(strip, "scale", 1.0) or 1.0),
                         "strip_frame_count": strip_frame_count,
                         "source_path": export_anims._strip_text(action.get(CUTSCENE_SOURCE_PATH_PROP, "")),
                         "source_index": export_anims._safe_int(action.get(CUTSCENE_SOURCE_INDEX_PROP, -1), -1),
@@ -493,6 +671,32 @@ def _resolve_cutscene_group_action_name(entries) -> str:
     return "cutscene"
 
 
+def _resolve_camera_conformed_group_action_name(entries, actor_name: str, component: str) -> str:
+    names = []
+    seen = set()
+    for entry in entries:
+        source_animation_name = export_anims._strip_text(entry.get("source_animation_name", ""))
+        if source_animation_name:
+            _actor_name, _component_name, display_name = _split_cutscene_animation_name(source_animation_name)
+            candidate = display_name or source_animation_name
+        else:
+            candidate = entry.get("action_name", "") or entry.get("strip_name", "")
+        candidate = _strip_blender_duplicate_suffix(candidate)
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        names.append(candidate)
+
+    if len(names) == 1:
+        return names[0]
+    if export_anims._strip_text(actor_name).lower() == "camera":
+        return "camera"
+    component = export_anims._normalize_cutscene_component(component)
+    if component and component != export_anims.CUTSCENE_ROOT_COMPONENT:
+        return component
+    return "cutscene"
+
+
 def _group_cutscene_entries(export_entries):
     grouped_entries = collections.OrderedDict()
     for entry in sorted(export_entries, key=_cutscene_entry_sort_key):
@@ -563,6 +767,140 @@ def _group_cutscene_entries(export_entries):
             "num_frames": max(1, total_num_frames),
             "parts": parts,
             "entries": parts,
+        })
+    return groups
+
+
+def _camera_conformed_group_key(entry):
+    return (
+        export_anims._strip_text(entry.get("actor_name", "")),
+        export_anims._normalize_cutscene_component(entry.get("component", "")),
+    )
+
+
+def _find_entry_for_camera_segment(entries, segment):
+    if not entries:
+        return None
+
+    scene_start = float(segment.get("scene_start", 0.0) or 0.0)
+
+    covering = []
+    for entry in entries:
+        entry_start, entry_end = _entry_scene_frame_range(entry)
+        if entry_start <= scene_start <= entry_end:
+            covering.append((entry_start, entry_end, entry))
+    if covering:
+        covering.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return covering[0][2]
+
+    previous = []
+    upcoming = []
+    for entry in entries:
+        entry_start, entry_end = _entry_scene_frame_range(entry)
+        if entry_end <= scene_start:
+            previous.append((entry_end, entry_start, entry))
+        elif entry_start > scene_start:
+            upcoming.append((entry_start, entry_end, entry))
+    if previous:
+        previous.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return previous[0][2]
+    if upcoming:
+        upcoming.sort(key=lambda item: (item[0], item[1]))
+        return upcoming[0][2]
+    return entries[0]
+
+
+def _scene_frame_to_action_frame(entry, scene_frame) -> int:
+    action_start = int(entry.get("frame_start", 0) or 0)
+    action_end = int(entry.get("frame_end", action_start) or action_start)
+    strip_start, strip_end = _entry_scene_frame_range(entry)
+    if action_end < action_start:
+        action_end = action_start
+
+    scene_frame = float(scene_frame)
+    if scene_frame <= strip_start:
+        return action_start
+    if scene_frame >= strip_end:
+        return action_end
+
+    scale = float(entry.get("strip_scale", 1.0) or 1.0)
+    if abs(scale) <= 1e-6:
+        scale = 1.0
+    action_frame = action_start + ((scene_frame - strip_start) / scale)
+    return max(action_start, min(action_end, int(round(action_frame))))
+
+
+def _group_cutscene_entries_to_camera_segments(export_entries, camera_segments):
+    grouped_entries = collections.OrderedDict()
+    for entry in sorted(export_entries, key=_cutscene_entry_sort_key):
+        group_key = _camera_conformed_group_key(entry)
+        grouped_entries.setdefault(group_key, []).append(entry)
+
+    groups = []
+    for entries in grouped_entries.values():
+        ordered_entries = sorted(
+            entries,
+            key=lambda entry: (
+                float(entry.get("strip_frame_start", 0.0) or 0.0),
+                float(entry.get("strip_frame_end", 0.0) or 0.0),
+                export_anims._strip_text(entry.get("strip_name", "")),
+            ),
+        )
+        if not ordered_entries:
+            continue
+
+        actor_name = export_anims._strip_text(ordered_entries[0].get("actor_name", ""))
+        component = export_anims._normalize_cutscene_component(ordered_entries[0].get("component", ""))
+        action_name = _resolve_camera_conformed_group_action_name(ordered_entries, actor_name, component)
+
+        parts = []
+        total_num_frames = 0
+        for part_index, segment in enumerate(camera_segments):
+            source_entry = _find_entry_for_camera_segment(ordered_entries, segment)
+            if source_entry is None:
+                continue
+
+            part_num_frames = max(1, int(segment.get("part_num_frames", 0) or 0))
+            part_start_frame = max(0, int(segment.get("part_start_frame", 0) or 0))
+            sample_frame_start = _scene_frame_to_action_frame(source_entry, segment.get("scene_start", 0.0))
+
+            part_entry = dict(source_entry)
+            part_entry["part_index"] = part_index
+            part_entry["part_start_frame"] = part_start_frame
+            part_entry["part_num_frames"] = part_num_frames
+            part_entry["action_name"] = action_name
+            part_entry["source_animation_name"] = export_anims._compose_cutscene_animation_name(
+                actor_name,
+                component,
+                action_name,
+            )
+            part_entry["frame_start"] = sample_frame_start
+            part_entry["frame_end"] = sample_frame_start + part_num_frames - 1
+            part_entry["camera_segment_start"] = float(segment.get("scene_start", 0.0) or 0.0)
+            part_entry["camera_segment_end"] = float(segment.get("scene_end", 0.0) or 0.0)
+            parts.append(part_entry)
+            total_num_frames = max(total_num_frames, part_start_frame + part_num_frames)
+
+        if not parts:
+            continue
+
+        primary_entry = parts[0]
+        groups.append({
+            "actor_name": actor_name,
+            "component": component,
+            "action_name": action_name,
+            "armature_obj": primary_entry.get("armature_obj"),
+            "armature_name": export_anims._strip_text(primary_entry.get("armature_name", "")),
+            "track_name": export_anims._strip_text(primary_entry.get("track_name", "")),
+            "fps": float(primary_entry.get("fps", export_anims.CUTSCENE_DEFAULT_FPS) or export_anims.CUTSCENE_DEFAULT_FPS),
+            "source_path": export_anims._strip_text(primary_entry.get("source_path", "")),
+            "source_index": export_anims._safe_int(primary_entry.get("source_index", -1), -1),
+            "source_animation_name": export_anims._compose_cutscene_animation_name(actor_name, component, action_name),
+            "strip_frame_start": float(camera_segments[0].get("scene_start", 0.0) or 0.0),
+            "num_frames": max(1, total_num_frames),
+            "parts": parts,
+            "entries": parts,
+            "conformed_to_camera_cuts": True,
         })
     return groups
 
@@ -879,11 +1217,20 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
 
     resolved_save_path = _resolve_filesystem_export_path(savePath)
     csv_path = os.path.splitext(resolved_save_path)[0] + ".csv"
-    if export_redkit_re_files:
-        _redkit_root, export_entries = _plan_cutscene_re_files(resolved_save_path, export_entries)
 
+    root_events, entry_events = _collect_scene_cutscene_events(scene)
     template_metadata = _collect_cutscene_template_metadata(scene, export_entries, source_cache)
-    animation_groups = _sync_multipart_group_timings(_group_cutscene_entries(export_entries))
+    if root_events:
+        template_metadata["animevents"] = root_events
+    camera_segments = _collect_camera_cut_segments(export_entries, actors)
+    if camera_segments:
+        animation_groups = _group_cutscene_entries_to_camera_segments(export_entries, camera_segments)
+        log.info(
+            "Conforming cutscene export to %d camera cut segment(s)",
+            len(camera_segments),
+        )
+    else:
+        animation_groups = _sync_multipart_group_timings(_group_cutscene_entries(export_entries))
 
     animations = []
     successful_entries = []
@@ -934,6 +1281,7 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
             continue
 
         if len(part_payloads) == 1:
+            part_payloads[0]["entry_events"] = _entry_events_for_group(entry_events, group)
             animations.append(part_payloads[0])
         else:
             first_frames = [int(part.get("part_start_frame", 0) or 0) for part in group["parts"]]
@@ -957,6 +1305,7 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
                 "additive_type": None,
                 "motion_extraction": None,
                 "skeleton_path": export_anims._normalize_repo_path(skeleton_path),
+                "entry_events": _entry_events_for_group(entry_events, group),
             })
         successful_entries.extend(group["entries"])
 
@@ -973,6 +1322,7 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
 
     re_exports_done = 0
     if export_redkit_re_files:
+        _redkit_root, successful_entries = _plan_cutscene_re_files(resolved_save_path, successful_entries)
         for entry in successful_entries:
             if _export_cutscene_re_file(context, entry):
                 re_exports_done += 1

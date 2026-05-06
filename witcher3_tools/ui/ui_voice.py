@@ -1073,7 +1073,8 @@ def _on_voice_list_index_update(self, context):
     active_arm = _get_active_armature(context)
     if active_arm and not _armature_has_face_morphs(active_arm):
         _auto_load_face_morphs(context, active_arm)
-    load_voice_and_lipsync(item.voiceLineId, actor=active_arm, context=context)
+    _at_frame = context.scene.frame_current if getattr(scene, 'witcher_anim_nla_mode', 'REPLACE') == 'APPEND_AT_CURSOR' else 0
+    load_voice_and_lipsync(item.voiceLineId, actor=active_arm, context=context, at_frame=_at_frame)
 
 
 def has_invalid_surrogates(s):
@@ -1389,6 +1390,8 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
 
     if cr2wPath.is_file():
         log.info('Importing Lipsync')
+        _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
+        _nla_mode = _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
         import_anims.import_lipsync(
             context,
             str(cr2wPath),
@@ -1396,6 +1399,7 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
             NLA_track="voice_import",
             override_select=target_armature if target_armature else actor,
             at_frame=at_frame,
+            nla_mode=_nla_mode,
         )
         # Ensure the newly created NLA track evaluates during morph sampling.
         _actor_arm = target_armature
@@ -1492,7 +1496,8 @@ class MyVoiceListItem_Debug(bpy.types.Operator):
                     _auto_load_face_morphs(context, active_arm)
 
                 filename = item.voiceLineId
-                load_voice_and_lipsync(filename, actor=active_arm, context=context)
+                _at_frame = context.scene.frame_current if getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE') == 'APPEND_AT_CURSOR' else 0
+                load_voice_and_lipsync(filename, actor=active_arm, context=context, at_frame=_at_frame)
                 
         elif "reset3" == action:
             log.debug("=== Debug Reset ====")

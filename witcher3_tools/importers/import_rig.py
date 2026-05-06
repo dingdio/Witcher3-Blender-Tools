@@ -16,6 +16,7 @@ from .. import file_helpers
 from ..CR2W import w3_types
 from ..CR2W import read_json_w3
 from ..w3_armature_constants import *
+from ..camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties
 from ..ui.ui_morphs import witcherui_add_redmorph
 from .. import get_uncook_path, get_do_fix_tail, set_rig_rot90_enabled
 import logging
@@ -237,7 +238,11 @@ def start_rig_import(fileName=False, ns="", do_fix_tail=None, context=None):
         bone = arm.data.witcherui_RigSettings.bone_order_list.add()
         bone.name = bonedata.name
     if  tracks_bone:
-        for track in w3Data.tracks:
+        camera_track_names = [str(track) for track in (getattr(w3Data, "tracks", None) or [])]
+        if not camera_track_names:
+            camera_track_names = list(CAMERA_TRACK_NAMES)
+        ensure_camera_track_properties(arm, track_names=camera_track_names)
+        for track in camera_track_names:
             witcherui_add_redmorph(arm.data.witcherui_RigSettings.witcher_tracks_list, [track, track, 0])
 
     # for bone in arm.pose.bones:

@@ -448,6 +448,9 @@ def _load_selected_mimic(context):
     if not _ensure_face_morphs_loaded(context, target_armature):
         log.info("Mimic face morphs were not auto-loaded; importing mimic animation anyway.")
 
+    _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
+    _nla_mode = _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+    _at_frame = float(context.scene.frame_current) if _nla_mode == 'append_at_cursor' else 0
     import_anims.import_anim(
         context,
         fileName,
@@ -455,6 +458,8 @@ def _load_selected_mimic(context):
         use_NLA=True,
         NLA_track="mimic_import",
         override_select=target_armature,
+        nla_mode=_nla_mode,
+        at_frame=_at_frame,
     )
     return True
 

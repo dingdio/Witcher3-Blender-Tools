@@ -118,12 +118,17 @@ class ButtonOperatorImportVoice(bpy.types.Operator, ImportHelper):
             filename = Path(cr2wPath).stem
             if active_armature and active_armature.animation_data is None:
                 active_armature.animation_data_create()
+            _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
+            _nla_mode = _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+            _at_frame = float(context.scene.frame_current) if _nla_mode == 'append_at_cursor' else 0
             import_anims.import_lipsync(
                 context,
                 cr2wPath,
                 use_NLA=self.use_NLA,
                 NLA_track="voice_import",
-                override_select=active_armature
+                override_select=active_armature,
+                at_frame=_at_frame,
+                nla_mode=_nla_mode,
             )
             if active_armature and active_armature.animation_data:
                 active_armature.animation_data.use_nla = True
@@ -253,6 +258,9 @@ class WITCHER_PT_speech_panel(WITCH_PT_Base, Panel):
         if getattr(context.scene, "witcher_voice_recreate_phonemes", False):
             if hasattr(context.scene, "witcher_voice_phoneme_accuracy"):
                 layout.prop(context.scene, "witcher_voice_phoneme_accuracy", text="Accuracy", slider=True)
+
+        if hasattr(context.scene, "witcher_anim_nla_mode"):
+            layout.prop(context.scene, "witcher_anim_nla_mode", text="NLA Load Mode")
 
         row = layout.row(align=True)
         row.operator(ButtonOperatorImportVoice.bl_idname, text="Import Voiceline Pair", icon='SPHERE')

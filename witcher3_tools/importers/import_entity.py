@@ -37,6 +37,7 @@ from ..CR2W.dc_entity import LoadCEntityTemplateFile, clear_template_cache
 from ..CR2W.dc_entity import read_entity_template_appearance_metadata as _read_entity_template_appearance_metadata
 from ..CR2W.dc_entity import is_valid_mesh_path
 from ..CR2W.CR2W_types import EngineTransform
+from ..camera_tracks import setup_camera_preview_drivers
 from ..importers.import_helpers import set_blender_object_transform
 from ..importers import import_isolation
 from ..duplication import duplicate_object_hierarchy
@@ -3417,26 +3418,7 @@ def length_to_fov( length:float, crop:float = 1.0 ):
 
 
 def create_camera_drivers(armobj, camera, name):
-    camera_data:bpy.types.Camera = camera.data
-    camera_data.lens_unit = 'FOV' #convert witcher FOV angle to mm, angle cannot be driven it uses mm lens prop
-    camera_data.sensor_fit = 'VERTICAL'
-    camera_data.sensor_height = 43.266615300557
-
-    driver_curve = camera_data.driver_add("lens")
-    driver = driver_curve.driver
-    channel = name
-    driver.expression = f'43.266615300557 / ( 2 * tan( pi * {channel} / 360.0 ) )' #channel
-    var = driver.variables.get(channel)
-    if var is None:
-        var = driver.variables.new()
-    var.type = "SINGLE_PROP"
-    var.name = channel
-    armobj.pose.bones["Camera_Node"]["%s" % channel] = 35
-    target = var.targets[0]
-    target.id_type = "OBJECT"
-    target.data_path = 'pose.bones["Camera_Node"]["%s"]' % channel #'["%s"]' % channel
-    target.id = armobj
-    armobj.update_tag()
+    setup_camera_preview_drivers(armobj, camera)
 
 def do_constraints(constrains, objdict, meshdict, HardAttachments, group_parent=None):
     """

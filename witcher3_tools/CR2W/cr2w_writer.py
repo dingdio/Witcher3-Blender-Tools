@@ -378,6 +378,9 @@ def _collect_names_and_imports(cr2w):
                     if isinstance(el, CVariantSizeNameType) and el.PROP:
                         collect_prop(el.PROP)
 
+        for prop in getattr(chunk, "postPropsVariantProps", []) or []:
+            collect_prop(prop)
+
     return names, imports
 
 
@@ -540,10 +543,20 @@ def _encode_chunk(chunk, name_to_index, import_index):
     if hasattr(chunk, "CBitmapTexture"):
         out.write(_encode_cbitmap_texture(chunk.CBitmapTexture))
 
-    # Post-property trailing data (e.g. events on CSkeletalAnimationSetEntry)
-    post = getattr(chunk, "postPropsData", None)
-    if post:
-        out.write(post if isinstance(post, (bytes, bytearray)) else bytes(post))
+    # Post-property trailing data (e.g. events on CSkeletalAnimationSetEntry).
+    if hasattr(chunk, "postPropsVariantProps"):
+        prefix = getattr(chunk, "postPropsPrefix", b"")
+        if prefix:
+            out.write(prefix if isinstance(prefix, (bytes, bytearray)) else bytes(prefix))
+        out.write(_encode_variant_size_type_array(
+            getattr(chunk, "postPropsVariantProps", []) or [],
+            name_to_index,
+            import_index,
+        ))
+    else:
+        post = getattr(chunk, "postPropsData", None)
+        if post:
+            out.write(post if isinstance(post, (bytes, bytearray)) else bytes(post))
 
     embedded = getattr(chunk, "embeddedAnimData", None)
     if embedded:
@@ -906,6 +919,21 @@ def _encode_instance_parameters(params, name_to_index, import_index):
         if isinstance(el, CVariantSizeNameType) and el.PROP:
             out.write(_encode_variant_size_name_type(el, name_to_index, import_index))
     return out.getvalue()
+
+
+def _encode_variant_size_type_array(props, name_to_index, import_index):
+    out = io.BytesIO()
+    out.write(struct.pack("<I", len(props)))
+    for prop in props:
+        out.write(_encode_variant_size_type_prop(prop, name_to_index, import_index))
+    return out.getvalue()
+
+
+def _encode_variant_size_type_prop(prop, name_to_index, import_index):
+    value_bytes = _encode_property_value(prop, name_to_index, import_index)
+    var_size = 6 + len(value_bytes)
+    type_id = name_to_index.get(prop.theType, 0)
+    return struct.pack("<IH", var_size, type_id) + value_bytes
 
 
 def _encode_variant_size_name_type(variant, name_to_index, import_index):

@@ -14,8 +14,140 @@ from bpy.props import IntProperty, StringProperty, CollectionProperty, FloatProp
 from bpy_extras.io_utils import ImportHelper
 
 from .. import get_uncook_path
+from ..camera_tracks import (
+    CAMERA_TRACK_NAMES,
+    ensure_camera_track_properties,
+)
 
 _CUTSCENE_SYNC_DEFERRED = set()
+
+_SCRATCH_CAMERA_DEFAULT_REPO_PATH = "gameplay\\camera\\scene_camera.w2ent"
+_SCRATCH_CUTSCENE_TRACK_NAME = "cutscene_anim"
+_CUTSCENE_IMPORT_NLA_TRACK_COMPONENTS = {
+    "anim_import": "Root",
+    "mimic_import": "face",
+}
+
+
+def _cs_text(value):
+    return str(value or "").strip()
+
+
+def _cs_yield_once(obj, seen):
+    if obj is None or getattr(obj, "type", None) != 'ARMATURE':
+        return
+    obj_name = _cs_text(getattr(obj, "name", ""))
+    if not obj_name or obj_name in seen:
+        return
+    seen.add(obj_name)
+    yield obj
+
+
+def _cs_mimic_face_armature(actor_obj):
+    if actor_obj is None:
+        return None
+    mimic_name = _cs_text(actor_obj.get("mimicFace", ""))
+    if mimic_name:
+        mimic_obj = bpy.data.objects.get(mimic_name)
+        if mimic_obj is not None and getattr(mimic_obj, "type", None) == 'ARMATURE':
+            return mimic_obj
+    return None
+
+
+def _cs_iter_import_clip_armatures(actor_obj, scene):
+    seen = set()
+    try:
+        related = export_cutscene._iter_cutscene_related_armatures(actor_obj, scene)
+    except Exception:
+        related = (actor_obj,)
+    for obj in related:
+        yield from _cs_yield_once(obj, seen)
+    yield from _cs_yield_once(_cs_mimic_face_armature(actor_obj), seen)
+
+
+def _collect_cutscene_import_nla_candidates(scene):
+    candidates = []
+    try:
+        actor_roots = export_cutscene._collect_cutscene_actor_roots(scene)
+    except Exception:
+        actor_roots = []
+    for actor_obj in actor_roots:
+        actor_name = _cs_text(actor_obj.get("cutscene_actor_name", ""))
+        if not actor_name:
+            continue
+        for source_obj in _cs_iter_import_clip_armatures(actor_obj, scene):
+            anim_data = getattr(source_obj, "animation_data", None)
+            if anim_data is None:
+                continue
+            for track in getattr(anim_data, "nla_tracks", []) or []:
+                track_name = _cs_text(getattr(track, "name", ""))
+                component = _CUTSCENE_IMPORT_NLA_TRACK_COMPONENTS.get(track_name)
+                if component is None or getattr(track, "mute", False):
+                    continue
+                for strip in getattr(track, "strips", []) or []:
+                    if getattr(strip, "mute", False):
+                        continue
+                    action = getattr(strip, "action", None)
+                    if action is None:
+                        continue
+                    candidates.append({
+                        "actor_name": actor_name,
+                        "actor_object_name": getattr(actor_obj, "name", ""),
+                        "source_object_name": getattr(source_obj, "name", ""),
+                        "track_name": track_name,
+                        "strip_name": _cs_text(getattr(strip, "name", "")),
+                        "action_name": _cs_text(getattr(action, "name", "")),
+                        "component": component,
+                        "frame_start": float(getattr(strip, "frame_start", 0.0) or 0.0),
+                        "frame_end": float(getattr(strip, "frame_end", 0.0) or 0.0),
+                    })
+    candidates.sort(key=lambda item: (
+        item["actor_name"].lower(),
+        item["frame_start"],
+        item["component"].lower(),
+        item["source_object_name"].lower(),
+        item["strip_name"].lower(),
+    ))
+    return candidates
+
+
+def _cs_find_camera_armature(context):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return None
+    for obj in scene.objects:
+        if getattr(obj, "type", None) == 'ARMATURE':
+            actor_type = str(obj.get("cutscene_actor_type", "") or "")
+            if actor_type == "CAT_Camera" or str(obj.get("cutscene_actor_name", "") or "").lower() == "camera":
+                return obj
+    return None
+
+
+def _cs_iter_camera_cuts(armature_obj):
+    if armature_obj is None or not getattr(armature_obj, "animation_data", None):
+        return []
+    cuts = []
+    for track in (armature_obj.animation_data.nla_tracks or []):
+        if str(getattr(track, "name", "") or "") != _SCRATCH_CUTSCENE_TRACK_NAME:
+            continue
+        for strip in (track.strips or []):
+            cuts.append((track, strip))
+    cuts.sort(key=lambda ts: ts[1].frame_start)
+    return cuts
+
+
+def _cs_current_cut_index(context, armature_obj, cuts):
+    if not cuts:
+        return -1
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return -1
+    frame = getattr(scene, "frame_current", 0)
+    best = -1
+    for i, (_, strip) in enumerate(cuts):
+        if strip.frame_start <= frame:
+            best = i
+    return best
 
 def add_scene_section(name, json_data, scene):
     if not hasattr(scene, "witcher_sections"):
@@ -55,11 +187,15 @@ class CutsceneLoadedActorItem(PropertyGroup):
     source_index: IntProperty(default=-1)
     label: StringProperty(default="")
     actor_name: StringProperty(default="")
+    tag: StringProperty(default="")
     voice_tag: StringProperty(default="")
     template_path: StringProperty(default="")
     appearance_name: StringProperty(default="")
     actor_type: StringProperty(default="")
+    final_position: StringProperty(default="")
+    kill_me: BoolProperty(default=False)
     use_mimic: BoolProperty(default=False)
+    anim_final_pos: StringProperty(default="")
     object_name: StringProperty(default="")
     cutscene_guid: StringProperty(default="")
     is_loaded: BoolProperty(default=False)
@@ -86,6 +222,7 @@ class CutsceneEventItem(PropertyGroup):
     track_name: StringProperty(name="Track", default="")
     effect_name: StringProperty(name="Effect", default="")
     appearance: StringProperty(name="Appearance", default="")
+    always_fires_end: BoolProperty(name="Always Fires End", default=False)
     event_scope: StringProperty(default="ROOT")
     source_index: IntProperty(default=-1)
 
@@ -352,6 +489,137 @@ def _get_cutscene_event_label(item):
     return event_name or event_type or "Event"
 
 
+# ── Event class schema ─────────────────────────────────────────────────────
+# (class_name, base_class, scope, own_props)
+# scope: "ROOT" = cutscene-level (CCutsceneTemplate.animevents)
+#        "ENTRY" = animation-level (CSkeletalAnimationSetEntry.entries)
+# own_props: fields added by this class beyond its base (name, type pairs)
+_CUTSCENE_EVENT_SCHEMA = [
+    # ── ROOT: cutscene-level events ─────────────────────────────────────────
+    ("CExtAnimCutsceneFadeEvent",             "CExtAnimEvent",                 "ROOT",
+        [("in","Bool"), ("duration","Float"), ("color","Color")]),
+    ("CExtAnimCutsceneSlowMoEvent",           "CExtAnimCutsceneDurationEvent", "ROOT",
+        [("enabled","Bool"), ("factor","Float"), ("useWeightCurve","Bool"), ("weightCurve","SCurveData")]),
+    ("CExtAnimCutsceneWindEvent",             "CExtAnimCutsceneDurationEvent", "ROOT",
+        [("enabled","Bool"), ("factor","Float"), ("useWeightCurve","Bool"), ("weightCurve","SCurveData")]),
+    ("CExtAnimCutsceneEnvironmentEvent",      "CExtAnimEvent",                 "ROOT",
+        [("environmentName","String"), ("environmentActivate","Bool"),
+         ("stabilizeBlending","Bool"), ("instantEyeAdaptation","Bool"),
+         ("instantDissolve","Bool"), ("forceNoOtherEnvironments","Bool"),
+         ("forceSetupLocalEnvironments","Bool"), ("forceSetupGlobalEnvironments","Bool")]),
+    ("CExtAnimCutsceneLightEvent",            "CExtAnimEvent",                 "ROOT",
+        [("tag","TagList"), ("isEnabled","Bool"), ("radius","Float"), ("brightness","Float"), ("color","Color")]),
+    ("CExtAnimCutsceneSoundEvent",            "CExtAnimEvent",                 "ROOT",
+        [("soundEventName","StringAnsi"), ("bone","CName"), ("useMaterialInfo","Bool")]),
+    ("CExtAnimCutsceneEffectEvent",           "CExtAnimDurationEvent",         "ROOT",
+        [("effect","CName"), ("tag","TagList"), ("template","soft:CEntityTemplate"),
+         ("spawnPosMS","Vector"), ("spawnRotMS","EulerAngles")]),
+    ("CExtAnimCutsceneActorEffect",           "CExtAnimDurationEvent",         "ROOT",
+        [("effectName","CName")]),
+    ("CExtAnimCutsceneHideEntityEvent",       "CExtAnimCutsceneEvent",         "ROOT",
+        [("entTohideTag","CName")]),
+    ("CExtAnimCutsceneHideTerrainEvent",      "CExtAnimCutsceneDurationEvent", "ROOT", []),
+    ("CExtAnimCutsceneSurfaceEffect",         "CExtAnimCutsceneEvent",         "ROOT",
+        [("type","ESceneEventSurfacePostFXType"), ("worldPos","Bool"), ("position","Vector"),
+         ("radius","Float"), ("fadeInTime","Float"), ("fadeOutTime","Float"), ("durationTime","Float")]),
+    ("CExtAnimCutsceneDisableClothEvent",     "CExtAnimEvent",                 "ROOT",
+        [("weight","Float"), ("blendTime","Float")]),
+    ("CExtAnimCutsceneDisableDangleEvent",    "CExtAnimEvent",                 "ROOT",
+        [("weight","Float")]),
+    ("CExtAnimCutsceneResetClothAndDangleEvent","CExtAnimEvent",               "ROOT",
+        [("forceRelaxedState","Bool")]),
+    ("CExtAnimCutsceneSetClippingPlanesEvent","CExtAnimEvent",                 "ROOT",
+        [("nearPlaneDistance","ENearPlaneDistance"), ("farPlaneDistance","EFarPlaneDistance")]),
+    ("CExtAnimCutsceneBokehDofEvent",         "CExtAnimEvent",                 "ROOT",
+        [("bokehDofParams","SBokehDofParams")]),
+    ("CExtAnimCutsceneBokehDofBlendEvent",    "CExtAnimDurationEvent",         "ROOT",
+        [("bokehDofParamsStart","SBokehDofParams"), ("bokehDofParamsEnd","SBokehDofParams")]),
+    ("CExtAnimCutsceneQuestEvent",            "CExtAnimEvent",                 "ROOT",
+        [("cutsceneName","String")]),
+    ("CExtAnimCutsceneBreakEvent",            "CExtAnimEvent",                 "ROOT", []),
+    # ── ENTRY: animation-level events ───────────────────────────────────────
+    ("CExtAnimCutsceneBodyPartEvent",         "CExtAnimEvent",                 "ENTRY",
+        [("appearance","CName")]),
+    ("CExtAnimCutsceneDialogEvent",           "CExtAnimEvent",                 "ENTRY", []),
+    ("CExtAnimDialogKeyPoseMarker",           "CExtAnimEvent",                 "ENTRY", []),
+    ("CExtAnimDialogKeyPoseDuration",         "CExtAnimDurationEvent",         "ENTRY",
+        [("transition","Bool"), ("keyPose","Bool")]),
+    ("CExtAnimDisableDialogLookatEvent",      "CExtAnimDurationEvent",         "ENTRY",
+        [("speed","Float")]),
+    ("CExtAnimScriptEvent",                   "CExtAnimEvent",                 "ENTRY", []),
+    ("CExtAnimScriptDurationEvent",           "CExtAnimDurationEvent",         "ENTRY", []),
+    ("CExtAnimRaiseEventEvent",               "CExtAnimEvent",                 "ENTRY",
+        [("eventToBeRaisedName","CName"), ("forceRaiseEvent","Bool")]),
+    ("CExtAnimEffectEvent",                   "CExtAnimEvent",                 "ENTRY",
+        [("effectName","CName"), ("action","EAnimEffectAction")]),
+    ("CExtAnimEffectDurationEvent",           "CExtAnimDurationEvent",         "ENTRY",
+        [("effectName","CName")]),
+    ("CExtAnimMorphEvent",                    "CExtAnimDurationEvent",         "ENTRY",
+        [("morphComponentId","CName"), ("invertWeight","Bool"), ("useCurve","Bool")]),
+    ("CExtAnimItemEvent",                     "CExtAnimEvent",                 "ENTRY",
+        [("category","CName"), ("itemName_optional","CName"), ("action","EItemAction"), ("itemGetting","EGettingItem")]),
+    ("CExtAnimItemEffectEvent",               "CExtAnimEvent",                 "ENTRY",
+        [("effectName","CName"), ("itemSlot","CName"), ("action","EItemEffectAction")]),
+    ("CExtAnimItemEffectDurationEvent",       "CExtAnimDurationEvent",         "ENTRY",
+        [("effectName","CName"), ("itemSlot","CName")]),
+    ("CExtAnimItemSyncEvent",                 "CExtAnimEvent",                 "ENTRY",
+        [("equipSlot","CName"), ("holdSlot","CName"), ("action","EItemLatentAction")]),
+    ("CExtAnimItemSyncDurationEvent",         "CExtAnimDurationEvent",         "ENTRY",
+        [("equipSlot","CName"), ("holdSlot","CName"), ("action","EItemLatentAction")]),
+    ("CExtAnimItemSyncWithCorrectionEvent",   "CExtAnimDurationEvent",         "ENTRY",
+        [("equipSlot","CName"), ("holdSlot","CName"), ("action","EItemLatentAction"), ("correctionBone","CName")]),
+    ("CExtAnimItemAnimationEvent",            "CExtAnimEvent",                 "ENTRY",
+        [("itemCategory","CName"), ("itemAnimationName","CName")]),
+    ("CExtAnimItemBehaviorEvent",             "CExtAnimEvent",                 "ENTRY",
+        [("itemCategory","CName"), ("event","CName")]),
+    ("CExtAnimDropItemEvent",                 "CExtAnimEvent",                 "ENTRY",
+        [("action","EDropAction")]),
+    ("CExtAnimReattachItemEvent",             "CExtAnimDurationEvent",         "ENTRY",
+        [("item","CName"), ("targetSlot","CName")]),
+    ("CExtAnimAttackEvent",                   "CExtAnimEvent",                 "ENTRY",
+        [("soundAttackType","CName")]),
+    ("CExtAnimHitEvent",                      "CExtAnimEvent",                 "ENTRY",
+        [("hitLevel","Uint32")]),
+    ("CExtAnimSoundEvent",                    "CExtAnimEvent",                 "ENTRY",
+        [("soundEventName","StringAnsi"), ("maxDistance","Float"), ("bone","CName"),
+         ("filter","Bool"), ("filterCooldown","Float"), ("useDistanceParameter","Bool")]),
+    ("CExtAnimFootstepEvent",                 "CExtAnimSoundEvent",            "ENTRY",
+        [("fx","Bool"), ("customFxName","CName")]),
+    ("CExtAnimLookAtEvent",                   "CExtAnimDurationEvent",         "ENTRY",
+        [("level","ELookAtLevel")]),
+    ("CExtAnimMaterialBasedFxEvent",          "CExtAnimEvent",                 "ENTRY",
+        [("bone","CName"), ("vfxKickup","Bool"), ("vfxFootstep","Bool")]),
+    ("CExtAnimProjectileEvent",               "CExtAnimEvent",                 "ENTRY",
+        [("castPosition","EProjectileCastPosition"), ("boneName","CName")]),
+    ("CExtAnimGameplayMimicEvent",            "CExtAnimDurationEvent",         "ENTRY",
+        [("animation","CName")]),
+    ("CExtAnimOnSlopeEvent",                  "CExtAnimDurationEvent",         "ENTRY",
+        [("slopeAngle","Float")]),
+    ("CExtAnimExplorationEvent",              "CExtAnimDurationEvent",         "ENTRY", []),
+    ("CExtAnimComboEvent",                    "CExtAnimDurationEvent",         "ENTRY", []),
+    ("CExtAnimLocationAdjustmentEvent",       "CExtAnimDurationEvent",         "ENTRY",
+        [("locationAdjustmentVar","CName"), ("adjustmentActiveVar","CName")]),
+    ("CExtAnimRotationAdjustmentEvent",       "CExtAnimDurationEvent",         "ENTRY",
+        [("rotationAdjustmentVar","CName")]),
+    ("CExtAnimRotationAdjustmentLocationBasedEvent","CExtAnimDurationEvent",   "ENTRY",
+        [("locationAdjustmentVar","CName"), ("targetLocationVar","CName"), ("adjustmentActiveVar","CName")]),
+]
+
+_EVENT_SCHEMA_BY_CLASS = {s[0]: s for s in _CUTSCENE_EVENT_SCHEMA}
+
+# EnumProperty items lists (module-level so Blender can cache them)
+_ANIM_EVENT_ENUM_ITEMS_ROOT  = [(c, c, f"↑ {b}") for c,b,s,_ in _CUTSCENE_EVENT_SCHEMA if s=="ROOT"]
+_ANIM_EVENT_ENUM_ITEMS_ENTRY = [(c, c, f"↑ {b}") for c,b,s,_ in _CUTSCENE_EVENT_SCHEMA if s=="ENTRY"]
+_ANIM_EVENT_ENUM_ITEMS_ALL   = _ANIM_EVENT_ENUM_ITEMS_ROOT + _ANIM_EVENT_ENUM_ITEMS_ENTRY
+
+
+def _event_schema_has_duration(class_name):
+    """True if the event class (or its base) is a duration event."""
+    entry = _EVENT_SCHEMA_BY_CLASS.get(class_name)
+    if not entry:
+        return "Duration" in class_name
+    base = entry[1]
+    return "Duration" in class_name or "Duration" in base
 
 
 class WITCH_UL_CutsceneDialogList(UIList):
@@ -391,6 +659,38 @@ class WITCH_UL_LoadedActorList(UIList):
             layout.label(text="")
 
 
+def _count_cutscene_anim_parts(context, anim_item):
+    """Count NLA strips on the cutscene_anim track for the actor+component of anim_item."""
+    actor_name = str(getattr(anim_item, "actor_name", "") or "").strip().lower()
+    component = str(getattr(anim_item, "component_name", "") or "").strip().lower()
+    full_name = str(getattr(anim_item, "full_name", "") or "").strip()
+    scene = getattr(context, "scene", None)
+    if scene is None or not actor_name:
+        return 1
+    count = 0
+    track_names = {export_cutscene.CUTSCENE_TRACK_NAME, export_cutscene.CUTSCENE_FACE_TRACK_NAME}
+    for obj in scene.objects:
+        if getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        obj_actor = str(obj.get("cutscene_actor_name", "") or "").strip().lower()
+        if obj_actor != actor_name:
+            continue
+        anim_data = getattr(obj, "animation_data", None)
+        if anim_data is None:
+            continue
+        for track in getattr(anim_data, "nla_tracks", []) or []:
+            if str(getattr(track, "name", "") or "") not in track_names:
+                continue
+            for strip in getattr(track, "strips", []) or []:
+                strip_action = getattr(strip, "action", None)
+                if strip_action is None:
+                    continue
+                stored = str(strip_action.get(export_cutscene.CUTSCENE_ANIMATION_NAME_PROP, "") or "").strip()
+                if stored == full_name:
+                    count += 1
+    return max(1, count)
+
+
 class WITCH_UL_LoadedAnimList(UIList):
     bl_idname = "WITCH_UL_LoadedAnimList"
     layout_type = "DEFAULT"
@@ -403,6 +703,9 @@ class WITCH_UL_LoadedAnimList(UIList):
             else:
                 row.label(text="", icon='CHECKMARK' if item.is_loaded else 'RADIOBUT_OFF')
                 row.label(text=_get_cutscene_animation_label(item), icon='ACTION')
+                part_count = _count_cutscene_anim_parts(context, item)
+                if part_count > 1:
+                    row.label(text=f"×{part_count}", icon='BLANK1')
                 if item.duration:
                     row.label(text=f"{item.duration:.2f}s")
         elif self.layout_type == 'GRID':
@@ -911,11 +1214,15 @@ def _sync_loaded_cutscene_state(scene, filepath, cutscene_data=None):
         item.source_index = source_index
         item.label = str(actor_data["label"])
         item.actor_name = str(actor_data["actor_name"])
+        item.tag = str(actor_data.get("tag", "") or "")
         item.voice_tag = str(actor_data.get("voice_tag", "") or "")
         item.template_path = str(actor_data["template_path"])
         item.appearance_name = str(actor_data["appearance_name"])
         item.actor_type = str(actor_data["actor_type"])
+        item.final_position = str(actor_data.get("final_position", "") or "")
+        item.kill_me = bool(actor_data.get("kill_me", False))
         item.use_mimic = bool(actor_data["use_mimic"])
+        item.anim_final_pos = str(actor_data.get("anim_final_pos", "") or "")
         item.object_name = str(state.get("object_name", "") or "")
         item.cutscene_guid = str(state.get("cutscene_guid", "") or "")
         item.is_loaded = bool(state.get("is_loaded", False))
@@ -1129,7 +1436,7 @@ class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
             selected_animation_count = sum(1 for item in self.cutscene_animation_items if item.selected)
             anim_box.label(text=f"Will import: {selected_animation_count}/{len(self.cutscene_animation_items)} animations")
             if self.auto_apply_animations:
-                anim_box.label(text="Auto-apply uses matching actors already in scene or selected for import.", icon='INFO')
+                anim_box.label(text="Auto-apply uses matching actors already in scene or being loaded.", icon='INFO')
             idx = self.cutscene_animation_index
             if 0 <= idx < len(self.cutscene_animation_items):
                 anim = self.cutscene_animation_items[idx]
@@ -1349,7 +1656,7 @@ class WITCH_OT_SetCutsceneActorLoaded(bpy.types.Operator):
 class WITCH_OT_SetCutsceneAnimationLoaded(bpy.types.Operator):
     bl_idname = "witcher.set_cutscene_animation_loaded"
     bl_label = "Toggle Cutscene Animation"
-    bl_description = "Load or unload a cutscene animation"
+    bl_description = "Activate or deactivate a cutscene animation (mutes/unmutes NLA strips)"
     bl_options = {'REGISTER', 'UNDO'}
 
     source_index: IntProperty(default=-1)
@@ -1398,9 +1705,15 @@ def _draw_event_list_item(self, layout, item):
     if self.layout_type in {'DEFAULT', 'COMPACT'}:
         row = layout.row(align=True)
         row.label(text=_get_cutscene_event_label(item), icon=_event_type_icon(item.event_type))
+        # Short class name badge
+        cls_badge = row.row(align=True)
+        cls_badge.enabled = False
+        cls_badge.scale_x = 0.7
+        cls_short = str(item.event_type or "").replace("CExtAnimCutscene","").replace("CExtAnim","")
+        cls_badge.label(text=cls_short)
         row.label(text=f"{item.start_time:.2f}s")
         if item.duration > 0.0:
-            row.label(text=f"[{item.duration:.2f}s]")
+            row.label(text=f"+{item.duration:.2f}s")
     elif self.layout_type == 'GRID':
         layout.alignment = 'CENTER'
         layout.label(text="")
@@ -1443,23 +1756,72 @@ class WITCH_UL_EntryEventList(UIList):
         return flags, []
 
 
+class WITCH_UL_ActorEntryEventList(UIList):
+    """Events UIList filtered to animations belonging to the actor selected in the Actors tab."""
+    bl_idname = "WITCH_UL_ActorEntryEventList"
+    layout_type = "DEFAULT"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
+        _draw_event_list_item(self, layout, item)
+
+    def filter_items(self, context, data, propname):
+        items = getattr(data, propname, [])
+        scene = context.scene
+        actor_filter = str(getattr(scene, "witcher_cs_actor_event_filter", "") or "").strip().lower()
+        anims = list(getattr(scene, "witcher_cutscene_animation_items", []))
+        actor_anim_indices = {
+            int(getattr(a, "source_index", -1))
+            for a in anims
+            if str(getattr(a, "actor_name", "") or "").strip().lower() == actor_filter
+        }
+        flags = [
+            self.bitflag_filter_item
+            if (str(getattr(i, "event_scope", "") or "").upper() == "ENTRY"
+                and int(getattr(i, "source_index", -1)) in actor_anim_indices)
+            else 0
+            for i in items
+        ]
+        return flags, []
+
+
+_STORED_EVENT_FIELDS = frozenset({"eventName","startTime","animationName","duration","alwaysFiresEnd"})
+
 def _draw_event_detail(layout, ev):
     detail_box = layout.box()
-    detail_row = detail_box.row(align=True)
-    detail_row.label(text=_get_cutscene_event_label(ev), icon=_event_type_icon(ev.event_type))
+    event_type = str(getattr(ev, "event_type", "") or "")
+    schema_entry = _EVENT_SCHEMA_BY_CLASS.get(event_type)
+
+    # Class header with inheritance
+    hdr = detail_box.row(align=True)
+    hdr.label(text=event_type or "Event", icon=_event_type_icon(event_type))
+    if schema_entry:
+        hdr.label(text=f"↑ {schema_entry[1]}", icon='BLANK1')
+
     col = detail_box.column(align=True)
     col.use_property_split = True
     col.enabled = False
+
     col.prop(ev, "event_name")
     col.prop(ev, "start_time")
-    col.prop(ev, "duration")
-    col.prop(ev, "track_name")
-    if ev.animation_name:
-        col.prop(ev, "animation_name")
+    col.prop(ev, "animation_name")
+    if ev.duration > 0.0 or _event_schema_has_duration(event_type):
+        col.prop(ev, "duration")
+    if ev.track_name:
+        col.prop(ev, "track_name")
     if ev.effect_name:
         col.prop(ev, "effect_name")
-    if ev.appearance or 'BodyPart' in ev.event_type or 'Appearance' in ev.event_type:
+    if ev.appearance or 'BodyPart' in event_type or 'Appearance' in event_type:
         col.prop(ev, "appearance")
+
+    # Informational: schema own props that we don't store in CutsceneEventItem
+    if schema_entry:
+        extra_names = [n for n, t in schema_entry[3]
+                       if n not in _STORED_EVENT_FIELDS
+                       and n not in ("appearance", "effectName", "effect")]
+        if extra_names:
+            info = detail_box.row()
+            info.enabled = False
+            info.label(text="+ " + ", ".join(extra_names), icon='INFO')
 
 
 def _draw_imported_class_sections(layout, field_items, schema, show_unset, empty_label):
@@ -1484,6 +1846,247 @@ def _draw_imported_class_sections(layout, field_items, schema, show_unset, empty
 
     if not visible_any:
         layout.label(text=empty_label, icon='INFO')
+
+
+_ACTOR_CUSTOM_PROPS_DEFAULTS = {
+    "cutscene_actor_name":         "",
+    "cutscene_actor_tag":          "",
+    "cutscene_actor_voice_tag":    "",
+    "cutscene_actor_template":     "",
+    "cutscene_actor_appearance":   "",
+    "cutscene_actor_type":         "CAT_Actor",
+    "cutscene_actor_final_position":  "",
+    "cutscene_actor_kill_me":      False,
+    "cutscene_actor_use_mimic":    False,
+    "cutscene_actor_anim_final_pos": "",
+}
+
+
+def _ensure_actor_custom_props(obj):
+    """Initialize missing actor custom props to their defaults (for safe layout.prop display)."""
+    if obj is None:
+        return
+    for k, v in _ACTOR_CUSTOM_PROPS_DEFAULTS.items():
+        if k not in obj:
+            obj[k] = v
+
+
+class WITCH_OT_CutsceneSelectActor(bpy.types.Operator):
+    """Select this actor to view and edit its properties"""
+    bl_idname = "witcher.cutscene_select_actor"
+    bl_label = "Select Actor"
+    bl_options = set()
+    object_name: StringProperty(default="")
+
+    def execute(self, context):
+        scene = context.scene
+        cur = str(getattr(scene, "witcher_cutscene_selected_actor_obj", "") or "")
+        if cur == self.object_name:
+            scene.witcher_cutscene_selected_actor_obj = ""
+            if hasattr(scene, "witcher_cs_actor_event_filter"):
+                scene.witcher_cs_actor_event_filter = ""
+        else:
+            scene.witcher_cutscene_selected_actor_obj = self.object_name
+            obj = bpy.data.objects.get(self.object_name)
+            _ensure_actor_custom_props(obj)
+            if hasattr(scene, "witcher_cs_actor_event_filter"):
+                actor_name = str(obj.get("cutscene_actor_name", "") or "").strip().lower() if obj else ""
+                scene.witcher_cs_actor_event_filter = actor_name
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneRemoveActor(bpy.types.Operator):
+    """Remove this armature from the cutscene (clears its cutscene tags)"""
+    bl_idname = "witcher.cutscene_remove_actor"
+    bl_label = "Remove Actor"
+    bl_options = {'UNDO'}
+    object_name: StringProperty(default="")
+
+    def execute(self, context):
+        scene = context.scene
+        obj = bpy.data.objects.get(self.object_name)
+        if obj is None:
+            return {'CANCELLED'}
+        import_cutscene._clear_cutscene_actor_tags(obj)
+        for pn in ("cutscene_actor_tag", "cutscene_actor_voice_tag",
+                   "cutscene_actor_final_position", "cutscene_actor_kill_me",
+                   "cutscene_actor_anim_final_pos"):
+            try:
+                if pn in obj:
+                    del obj[pn]
+            except Exception:
+                pass
+        if str(getattr(scene, "witcher_cutscene_selected_actor_obj", "") or "") == self.object_name:
+            scene.witcher_cutscene_selected_actor_obj = ""
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneRemoveAnimation(bpy.types.Operator):
+    """Remove this animation entry from the cutscene list"""
+    bl_idname = "witcher.cutscene_remove_animation"
+    bl_label = "Remove Animation"
+    bl_options = {'UNDO'}
+    source_index: bpy.props.IntProperty(default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        anims = list(getattr(scene, "witcher_cutscene_animation_items", []))
+        for i, item in enumerate(anims):
+            if int(getattr(item, "source_index", -2)) == self.source_index:
+                scene.witcher_cutscene_animation_items.remove(i)
+                break
+        # Remove events tied to this animation
+        events = list(getattr(scene, "witcher_cutscene_event_items", []))
+        for i in reversed(range(len(events))):
+            if int(getattr(events[i], "source_index", -2)) == self.source_index:
+                scene.witcher_cutscene_event_items.remove(i)
+        return {'FINISHED'}
+
+
+def _add_event_class_items(self, context):
+    """Dynamic enum items filtered by event_scope."""
+    scope = str(getattr(self, "event_scope", "") or "")
+    if scope == "ROOT":
+        return _ANIM_EVENT_ENUM_ITEMS_ROOT
+    if scope == "ENTRY":
+        return _ANIM_EVENT_ENUM_ITEMS_ENTRY
+    return _ANIM_EVENT_ENUM_ITEMS_ALL
+
+
+class WITCH_OT_CutsceneAddEvent(bpy.types.Operator):
+    """Add a new event to the cutscene or animation event list"""
+    bl_idname = "witcher.cutscene_add_event"
+    bl_label = "Add Event"
+    bl_options = {'UNDO'}
+
+    event_scope: bpy.props.EnumProperty(
+        name="Scope",
+        items=[("ROOT", "Cutscene (ROOT)", "Attached to the cutscene template"),
+               ("ENTRY", "Animation (ENTRY)", "Attached to a specific animation entry")],
+        default="ENTRY",
+    )
+    event_class: bpy.props.EnumProperty(name="Event Class", items=_add_event_class_items)
+    source_index: bpy.props.IntProperty(name="Animation Source Index", default=-1)
+
+    # CExtAnimEvent base fields
+    event_name: bpy.props.StringProperty(name="eventName", default="")
+    start_time: bpy.props.FloatProperty(name="startTime", default=0.0, min=0.0)
+    animation_name: bpy.props.StringProperty(name="animationName", default="")
+    report_to_script: bpy.props.BoolProperty(name="reportToScript", default=False)
+    report_min_weight: bpy.props.FloatProperty(name="reportToScriptMinWeight", default=0.0, min=0.0, max=1.0)
+
+    # CExtAnimDurationEvent
+    duration: bpy.props.FloatProperty(name="duration", default=0.0, min=0.0)
+    always_fires_end: bpy.props.BoolProperty(name="alwaysFiresEnd", default=False)
+
+    # Own fields (stored in CutsceneEventItem)
+    appearance: bpy.props.StringProperty(name="appearance (CName)", default="")
+    effect_name: bpy.props.StringProperty(name="effectName / effect (CName)", default="")
+
+    # Extra informational fields (displayed but not stored beyond event_type)
+    extra_str1: bpy.props.StringProperty(name="", default="")
+    extra_str2: bpy.props.StringProperty(name="", default="")
+
+    def invoke(self, context, event):
+        scene = context.scene
+        # Pre-fill scope and source_index from context
+        if self.event_scope == "ENTRY" and self.source_index < 0:
+            anims = list(getattr(scene, "witcher_cutscene_animation_items", []))
+            anim_ui_idx = getattr(scene, "witcher_cutscene_loaded_anim_index", 0)
+            if 0 <= anim_ui_idx < len(anims):
+                anim = anims[anim_ui_idx]
+                if anim.source_index != -1:
+                    self.source_index = anim.source_index
+                    if not self.animation_name:
+                        self.animation_name = str(anim.display_name or "")
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        layout.prop(self, "event_scope")
+        layout.prop(self, "event_class")
+
+        schema_entry = _EVENT_SCHEMA_BY_CLASS.get(self.event_class)
+        if schema_entry:
+            base_row = layout.row()
+            base_row.enabled = False
+            base_row.label(text=f"↑ {schema_entry[1]}", icon='BLANK1')
+
+        layout.separator()
+        layout.label(text="Base fields  (CExtAnimEvent):", icon='PROPERTIES')
+        layout.prop(self, "event_name")
+        layout.prop(self, "start_time")
+        layout.prop(self, "animation_name")
+        layout.prop(self, "report_to_script")
+        if self.report_to_script:
+            layout.prop(self, "report_min_weight")
+
+        if _event_schema_has_duration(self.event_class):
+            layout.separator()
+            layout.label(text="Duration fields  (CExtAnimDurationEvent):", icon='PROPERTIES')
+            layout.prop(self, "duration")
+            layout.prop(self, "always_fires_end")
+
+        if schema_entry:
+            own_props = schema_entry[3]
+            if own_props:
+                layout.separator()
+                layout.label(text=f"Own fields  ({self.event_class}):", icon='PROPERTIES')
+                for prop_name, prop_type in own_props:
+                    if prop_name in ("duration", "alwaysFiresEnd"):
+                        continue
+                    if prop_name == "appearance":
+                        layout.prop(self, "appearance")
+                    elif prop_name in ("effectName", "effect"):
+                        layout.prop(self, "effect_name")
+                    else:
+                        # Field not stored — show label only
+                        row = layout.row()
+                        row.enabled = False
+                        row.label(text=f"{prop_name} ({prop_type}) — edit in game files", icon='INFO')
+
+        if self.event_scope == "ENTRY":
+            layout.separator()
+            info = layout.row()
+            info.enabled = False
+            info.label(text=f"Animation source index: {self.source_index}", icon='INFO')
+
+    def execute(self, context):
+        scene = context.scene
+        new_ev = scene.witcher_cutscene_event_items.add()
+        new_ev.event_type = self.event_class
+        new_ev.event_name = self.event_name
+        new_ev.start_time = self.start_time
+        new_ev.duration = self.duration
+        new_ev.animation_name = self.animation_name
+        new_ev.appearance = self.appearance
+        new_ev.effect_name = self.effect_name
+        new_ev.always_fires_end = self.always_fires_end
+        new_ev.event_scope = self.event_scope
+        new_ev.source_index = self.source_index
+        return {'FINISHED'}
+
+
+_ECutsceneActorType_ITEMS = [
+    ("CAT_Actor",  "CAT_Actor",  "Animated actor"),
+    ("CAT_Prop",   "CAT_Prop",   "Animated prop"),
+    ("CAT_Camera", "CAT_Camera", "Cutscene camera"),
+    ("CAT_None",   "CAT_None",   "No type"),
+]
+_ECutsceneActorType_VALUES = [item[0] for item in _ECutsceneActorType_ITEMS]
+_ECutsceneActorType_INDEX = {v: i for i, v in enumerate(_ECutsceneActorType_VALUES)}
+
+
+def _actor_type_get(self):
+    val = str(self.get("cutscene_actor_type", "CAT_Actor") or "CAT_Actor")
+    return _ECutsceneActorType_INDEX.get(val, 0)
+
+
+def _actor_type_set(self, value):
+    if 0 <= value < len(_ECutsceneActorType_VALUES):
+        self["cutscene_actor_type"] = _ECutsceneActorType_VALUES[value]
 
 
 def _draw_cutscene_template_tab(layout, scene):
@@ -1529,7 +2132,7 @@ def _draw_cutscene_template_tab(layout, scene):
 
     template_box = layout.box()
     header = template_box.row(align=True)
-    header.label(text="Imported Classes", icon='PROPERTIES')
+    header.label(text="Template Fields", icon='PROPERTIES')
     header.prop(scene, "witcher_cutscene_show_unset_template_fields", text="Show Unset", toggle=True)
 
     _draw_imported_class_sections(
@@ -1541,59 +2144,118 @@ def _draw_cutscene_template_tab(layout, scene):
     )
 
 
-def _draw_cutscene_actors_tab(layout, scene):
-    actors = list(getattr(scene, "witcher_cutscene_actor_items", []))
-    loaded_count = sum(1 for a in actors if _get_cutscene_actor_display_state(a)["is_loaded"])
+def _draw_cutscene_actors_tab(layout, scene, context=None):
+    actor_objects = [
+        obj for obj in scene.objects
+        if getattr(obj, "type", None) == 'ARMATURE'
+        and str(obj.get("cutscene_actor_name", "") or "").strip()
+    ]
+    actor_objects.sort(key=lambda o: str(o.get("cutscene_actor_name", "") or o.name).lower())
 
-    if actors:
-        layout.template_list(
-            "WITCH_UL_LoadedActorList", "",
-            scene, "witcher_cutscene_actor_items",
-            scene, "witcher_cutscene_loaded_actor_index",
-            rows=min(len(actors), 6),
-        )
-        idx = getattr(scene, "witcher_cutscene_loaded_actor_index", 0)
-        if 0 <= idx < len(actors):
-            actor = actors[idx]
-            state = _get_cutscene_actor_display_state(actor)
-            detail_box = layout.box()
-            detail_row = detail_box.row(align=True)
-            label = actor.label or actor.actor_name or f"Actor {actor.source_index + 1}"
-            detail_row.label(text=label, icon='ARMATURE_DATA')
-            if state["is_loaded"]:
-                op = detail_row.operator(WITCH_OT_SetCutsceneActorLoaded.bl_idname, text="Unload", icon='X')
-                op.source_index = actor.source_index
-                op.load = False
-            else:
-                op = detail_row.operator(WITCH_OT_SetCutsceneActorLoaded.bl_idname, text="Load", icon='IMPORT')
-                op.source_index = actor.source_index
-                op.load = True
-            col = detail_box.column(align=True)
-            if actor.voice_tag:
-                col.label(text=f"Voice Tag:  {actor.voice_tag}")
-            if actor.template_path:
-                col.label(text=actor.template_path, icon='FILE_3D')
-            if actor.appearance_name:
-                col.label(text=f"Appearance:  {actor.appearance_name}", icon='MATERIAL_DATA')
-            if actor.actor_type:
-                col.label(text=f"Type:  {actor.actor_type.replace('CAT_', '')}")
-            if actor.use_mimic:
-                col.label(text="Uses mimic data", icon='FACE_MAPS')
-            if state["is_loaded"] and not state["imported_by_cutscene"]:
-                col.label(text="Existing scene object", icon='LINKED')
+    selected_obj_name = str(getattr(scene, "witcher_cutscene_selected_actor_obj", "") or "")
+    selected_obj = bpy.data.objects.get(selected_obj_name) if selected_obj_name else None
+    if selected_obj not in actor_objects:
+        selected_obj = None
+
+    # --- Actor list ---
+    if actor_objects:
+        list_box = layout.box()
+        for obj in actor_objects:
+            actor_name = str(obj.get("cutscene_actor_name", "") or obj.name)
+            actor_type = str(obj.get("cutscene_actor_type", "") or "CAT_Actor")
+            is_sel = (obj == selected_obj)
+            type_icon = 'CAMERA_DATA' if actor_type == 'CAT_Camera' else ('OBJECT_DATA' if actor_type == 'CAT_Prop' else 'ARMATURE_DATA')
+            row = list_box.row(align=True)
+            sel_op = row.operator("witcher.cutscene_select_actor", text=actor_name, icon=type_icon, emboss=is_sel, depress=is_sel)
+            sel_op.object_name = obj.name
+            badge = row.row(align=True)
+            badge.enabled = False
+            badge.scale_x = 0.55
+            badge.label(text=actor_type.replace("CAT_", ""))
+            rm_op = row.operator("witcher.cutscene_remove_actor", text="", icon='X')
+            rm_op.object_name = obj.name
     else:
         layout.label(text="No actors in cutscene.", icon='INFO')
 
-    layout.label(text=f"Loaded: {loaded_count}/{len(actors)}")
+    # --- Selected actor detail panel ---
+    if selected_obj is not None:
+        layout.separator(factor=0.3)
+        detail_box = layout.box()
+        actor_name = str(selected_obj.get("cutscene_actor_name", "") or selected_obj.name)
+        detail_box.label(text=actor_name, icon='PROPERTIES')
+        col = detail_box.column(align=True)
+
+        col.prop(selected_obj, '["cutscene_actor_name"]', text="name")
+        col.prop(selected_obj, '["cutscene_actor_tag"]', text="tag")
+        col.prop(selected_obj, '["cutscene_actor_voice_tag"]', text="voiceTag")
+        col.prop(selected_obj, '["cutscene_actor_template"]', text="template")
+        col.prop(selected_obj, '["cutscene_actor_appearance"]', text="appearance")
+        col.prop(selected_obj, '["cutscene_actor_final_position"]', text="finalPosition")
+        col.prop(selected_obj, '["cutscene_actor_anim_final_pos"]', text="animationAtFinalPosition")
+        col.prop(selected_obj, '["cutscene_actor_kill_me"]', text="killMe")
+        col.prop(selected_obj, '["cutscene_actor_use_mimic"]', text="useMimic")
+
+        col.separator()
+        col.prop(selected_obj, "witcher_cutscene_actor_type", text="type")
+
+        # Per-actor events (filter entry events by actor name)
+        actor_name_key = str(selected_obj.get("cutscene_actor_name", "") or "").strip().lower()
+        all_anims = list(getattr(scene, "witcher_cutscene_animation_items", []))
+        all_events = list(getattr(scene, "witcher_cutscene_event_items", []))
+        actor_anim_indices = {
+            int(getattr(a, "source_index", -1))
+            for a in all_anims
+            if str(getattr(a, "actor_name", "") or "").strip().lower() == actor_name_key
+        }
+        actor_events = [
+            e for e in all_events
+            if str(getattr(e, "event_scope", "") or "").upper() == "ENTRY"
+            and int(getattr(e, "source_index", -1)) in actor_anim_indices
+        ]
+        detail_box.separator(factor=0.5)
+        ev_hdr = detail_box.row(align=True)
+        ev_hdr.label(text=f"Events ({len(actor_events)})", icon='SEQUENCE')
+        add_op = ev_hdr.operator("witcher.cutscene_add_event", text="", icon='ADD')
+        add_op.event_scope = "ENTRY"
+        add_op.source_index = min(actor_anim_indices, default=-1)
+        if actor_events:
+            detail_box.template_list(
+                "WITCH_UL_ActorEntryEventList", "",
+                scene, "witcher_cutscene_event_items",
+                scene, "witcher_cs_actor_event_idx",
+                rows=min(len(actor_events), 5),
+            )
+            ev_idx = getattr(scene, "witcher_cs_actor_event_idx", 0)
+            if 0 <= ev_idx < len(all_events):
+                ev = all_events[ev_idx]
+                if int(getattr(ev, "source_index", -1)) in actor_anim_indices:
+                    _draw_event_detail(detail_box, ev)
+        else:
+            detail_box.label(text="No events for this actor.", icon='INFO')
+
+    layout.separator(factor=0.5)
+
+    # --- Assign actor form ---
+    assign_box = layout.box()
+    assign_box.label(text="Assign Selected Armature", icon='ADD')
+    actor_row = assign_box.row(align=True)
+    actor_row.prop(scene, "witcher_cutscene_scratch_actor_name", text="Name")
+    actor_row.prop(scene, "witcher_cutscene_scratch_actor_type", text="")
+    assign_box.prop(scene, "witcher_cutscene_scratch_actor_template", text="Template")
+    assign_box.prop(scene, "witcher_cutscene_scratch_actor_appearance", text="Appearance")
+    opts_row = assign_box.row(align=True)
+    opts_row.prop(scene, "witcher_cutscene_scratch_use_mimic", text="Mimic")
+    opts_row.operator("witcher.cutscene_scratch_assign_actor", text="Assign Selected", icon='CHECKMARK')
 
 
-def _draw_cutscene_anims_tab(layout, scene):
+def _draw_cutscene_anims_tab(layout, scene, context=None):
     anims = list(getattr(scene, "witcher_cutscene_animation_items", []))
     idx = getattr(scene, "witcher_cutscene_loaded_anim_index", 0)
     cs_selected = len(anims) > 0 and 0 <= idx < len(anims) and anims[idx].source_index == -1
     real_anims = [a for a in anims if a.source_index != -1]
-    loaded_count = sum(1 for a in real_anims if _get_cutscene_animation_display_state(scene, a)["is_loaded"])
+    active_count = sum(1 for a in real_anims if _get_cutscene_animation_display_state(scene, a)["is_loaded"])
 
+    # ── Animation list ────────────────────────────────────────────────────────
     if anims:
         layout.template_list(
             "WITCH_UL_LoadedAnimList", "",
@@ -1601,33 +2263,217 @@ def _draw_cutscene_anims_tab(layout, scene):
             scene, "witcher_cutscene_loaded_anim_index",
             rows=min(len(anims), 8),
         )
-        # Only show detail / load-unload when an animation (not Cutscene sentinel) is active
-        if not cs_selected:
-            if 0 <= idx < len(anims):
-                anim = anims[idx]
-                anim_state = _get_cutscene_animation_display_state(scene, anim)
-                detail_box = layout.box()
-                detail_row = detail_box.row(align=True)
-                detail_row.label(text=_get_cutscene_animation_label(anim), icon='ACTION')
-                if anim_state["is_loaded"]:
-                    op = detail_row.operator(WITCH_OT_SetCutsceneAnimationLoaded.bl_idname, text="Unload", icon='X')
-                    op.source_index = anim.source_index
-                    op.load = False
-                else:
-                    op = detail_row.operator(WITCH_OT_SetCutsceneAnimationLoaded.bl_idname, text="Load", icon='IMPORT')
-                    op.source_index = anim.source_index
-                    op.load = True
-                col = detail_box.column(align=True)
-                if anim.component_name:
-                    col.label(text=f"Component: {anim.component_name}", icon='BONE_DATA')
-                if anim.frames_per_second:
-                    col.label(text=f"FPS: {anim.frames_per_second:.1f}   Frames: {anim.num_frames}")
-                if anim.duration:
-                    col.label(text=f"Duration: {anim.duration:.3f}s")
+        if not cs_selected and 0 <= idx < len(anims):
+            anim = anims[idx]
+            anim_state = _get_cutscene_animation_display_state(scene, anim)
+            detail_box = layout.box()
+            detail_row = detail_box.row(align=True)
+            detail_row.label(text=_get_cutscene_animation_label(anim), icon='ACTION')
+            # Active / inactive toggle
+            if anim_state["is_loaded"]:
+                op = detail_row.operator(WITCH_OT_SetCutsceneAnimationLoaded.bl_idname, text="Deactivate", icon='HIDE_ON')
+                op.source_index = anim.source_index
+                op.load = False
+            else:
+                op = detail_row.operator(WITCH_OT_SetCutsceneAnimationLoaded.bl_idname, text="Activate", icon='HIDE_OFF')
+                op.source_index = anim.source_index
+                op.load = True
+            # Remove button
+            rm_op = detail_row.operator("witcher.cutscene_remove_animation", text="", icon='X')
+            rm_op.source_index = anim.source_index
+            col = detail_box.column(align=True)
+            if anim.actor_name:
+                col.label(text=f"Actor: {anim.actor_name}", icon='ARMATURE_DATA')
+            if anim.component_name:
+                col.label(text=f"Component: {anim.component_name}", icon='BONE_DATA')
+            if anim.frames_per_second:
+                col.label(text=f"FPS: {anim.frames_per_second:.1f}   Frames: {anim.num_frames}")
+            if anim.duration:
+                col.label(text=f"Duration: {anim.duration:.3f}s")
     else:
-        layout.label(text="No animations in cutscene.", icon='INFO')
+        layout.label(text="No animations.", icon='INFO')
 
-    layout.label(text=f"Loaded: {loaded_count}/{len(real_anims)}")
+    if real_anims:
+        layout.label(text=f"Active: {active_count}/{len(real_anims)}")
+
+    layout.separator(factor=0.5)
+
+    # Imported NLA clips
+    import_box = layout.box()
+    import_box.label(text="Loaded Import Clips", icon='NLA')
+    import_candidates = _collect_cutscene_import_nla_candidates(scene)
+    if import_candidates:
+        for cand in import_candidates[:8]:
+            row = import_box.row(align=True)
+            label_name = cand["action_name"] or cand["strip_name"] or cand["track_name"]
+            frame_start = int(round(cand["frame_start"]))
+            frame_end = int(round(cand["frame_end"]))
+            row.label(
+                text=f"{cand['actor_name']} {cand['component']}: {label_name}  [{frame_start}-{frame_end}]",
+                icon='ACTION',
+            )
+            op = row.operator("witcher.cutscene_use_import_nla_strip", text="Use", icon='CHECKMARK')
+            op.actor_object_name = cand["actor_object_name"]
+            op.source_object_name = cand["source_object_name"]
+            op.track_name = cand["track_name"]
+            op.strip_name = cand["strip_name"]
+            op.source_frame_start = cand["frame_start"]
+            op.component = cand["component"]
+            op.mute_source = True
+        if len(import_candidates) > 8:
+            import_box.label(text=f"{len(import_candidates) - 8} more loaded import clips not shown.", icon='INFO')
+    else:
+        import_box.label(text="No active anim_import or mimic_import clips on cutscene actors.", icon='INFO')
+
+    layout.separator(factor=0.5)
+
+    # Add animation from an explicit action
+    add_box = layout.box()
+    add_hdr = add_box.row(align=True)
+    add_hdr.label(text="Add Animation", icon='NLA')
+    add_hdr.prop_search(scene, "witcher_cutscene_scratch_action_name", bpy.data, "actions", text="")
+    opts_row = add_box.row(align=True)
+    opts_row.prop(scene, "witcher_cutscene_scratch_component", text="")
+    length_row = add_box.row(align=True)
+    length_row.prop(scene, "witcher_cutscene_scratch_strip_length", text="Length (frames)")
+    length_row.prop(scene, "witcher_cutscene_scratch_add_after_last", text="After Last")
+    add_box.operator("witcher.cutscene_scratch_add_action", text="Add to Cutscene", icon='ADD')
+
+    layout.separator(factor=0.3)
+    validate_row = layout.row(align=True)
+    validate_row.operator("witcher.cutscene_scratch_validate", text="Validate", icon='CHECKMARK')
+    report = str(getattr(scene, "witcher_cutscene_scratch_validation_report", "") or "").strip()
+    if report:
+        for line in report.splitlines()[:6]:
+            ico = 'ERROR' if line.startswith("ERROR") else ('INFO' if line.startswith("WARN") else 'CHECKMARK')
+            layout.label(text=line[:100], icon=ico)
+
+
+def _draw_cutscene_camera_tab(layout, scene, context):
+    # ── Primary workflow: Blender-native shots ─────────────────────────────
+    shots_box = layout.box()
+    shots_hdr = shots_box.row(align=True)
+    shots_hdr.label(text="Shots", icon='CAMERA_DATA')
+    shots_hdr.operator("witcher.cutscene_new_shot", text="New Shot", icon='ADD')
+    shots_hdr.operator("witcher.cutscene_use_selected_camera_as_shot", text="Use Selected", icon='CHECKMARK')
+
+    # List current shots from timeline markers
+    shot_markers = [
+        m for m in sorted(scene.timeline_markers, key=lambda m: m.frame)
+        if getattr(m, "camera", None) is not None
+        and m.camera.get("witcher_shot_index") is not None
+    ]
+    if shot_markers:
+        for m in shot_markers:
+            row = shots_box.row(align=True)
+            row.label(text="", icon='SEQUENCE')
+            row.label(text=m.camera.name)
+            row.label(text=f"f{m.frame}")
+    else:
+        shots_box.label(text="No shots yet — press 'New Shot'", icon='INFO')
+
+    shots_box.operator("witcher.camera_apply_blender_cameras_to_rig", text="Shots → Rig", icon='NLA_PUSHDOWN')
+
+    layout.separator(factor=0.5)
+
+    # ── Witcher rig tools (only if rig is in scene) ────────────────────────
+    camera_arm = _cs_find_camera_armature(context)
+    if camera_arm is None:
+        # Offer quick rig import as a secondary action
+        import_box = layout.box()
+        import_box.label(text="Witcher Camera Rig", icon='ARMATURE_DATA')
+        import_box.prop(scene, "witcher_cutscene_scratch_camera_repo_path", text="Entity")
+        import_box.operator("witcher.cutscene_scratch_import_camera", text="Load Rig", icon='IMPORT')
+        return
+
+    rig_box = layout.box()
+    cuts = _cs_iter_camera_cuts(camera_arm)
+    cut_idx = _cs_current_cut_index(context, camera_arm, cuts)
+    current_strip = cuts[cut_idx][1] if cut_idx >= 0 else None
+
+    hdr = rig_box.row(align=True)
+    hdr.label(text=camera_arm.name, icon='ARMATURE_DATA')
+    if current_strip is not None:
+        hdr.label(text=f"Cut {cut_idx + 1}/{len(cuts)}  {int(current_strip.frame_start)}–{int(current_strip.frame_end)}", icon='SEQUENCE')
+    else:
+        hdr.label(text="No cuts", icon='SEQUENCE')
+
+    preview_row = rig_box.row(align=True)
+    preview_row.operator("witcher.camera_setup_preview", text="Setup Preview", icon='CAMERA_DATA')
+    preview_row.operator("witcher.camera_set_scene_camera", text="Set Scene Camera", icon='VIEW_CAMERA')
+
+    key_row = rig_box.row(align=True)
+    key_row.operator("witcher.camera_key_rig_from_scene_camera", text="Key Rig + DOF", icon='KEY_HLT')
+    key_row.operator("witcher.camera_bake_cut_from_scene_camera", text="Bake Cut + DOF", icon='REC')
+
+    convert_row = rig_box.row(align=True)
+    convert_row.operator("witcher.camera_convert_cuts_to_blender_cameras", text="Cuts → Blender Cams", icon='CAMERA_DATA')
+    convert_row.operator("witcher.cutscene_scratch_bake_selected_camera_range", text="Bake Selected Range", icon='REC')
+
+    nav_row = rig_box.row(align=True)
+    nav_row.operator("witcher.camera_cut_jump", text="", icon='TRIA_LEFT').direction = 'PREV'
+    nav_row.operator("witcher.camera_cut_jump", text="Current Cut", icon='PREVIEW_RANGE').direction = 'CURRENT'
+    nav_row.operator("witcher.camera_cut_jump", text="", icon='TRIA_RIGHT').direction = 'NEXT'
+
+    edit_row = rig_box.row(align=True)
+    edit_row.operator("witcher.camera_cut_split", text="Cut", icon='MOD_BOOLEAN')
+    edit_row.operator("witcher.camera_cut_combine", text="Combine", icon='NLA')
+    edit_row.operator("witcher.cutscene_scratch_create_camera_cut", text="", icon='SEQUENCE')
+
+    resize_row = rig_box.row(align=True)
+    resize_row.operator("witcher.camera_cut_resize", text="-5", icon='REMOVE').delta = -5
+    resize_row.operator("witcher.camera_cut_resize", text="-1", icon='REMOVE').delta = -1
+    resize_row.operator("witcher.camera_cut_resize", text="+1", icon='ADD').delta = 1
+    resize_row.operator("witcher.camera_cut_resize", text="+5", icon='ADD').delta = 5
+
+    marker_row = rig_box.row(align=True)
+    marker_row.operator("witcher.camera_cut_sync_markers", text="Sync Markers", icon='MARKER')
+    marker_row.operator("witcher.camera_cut_apply_markers", text="Apply Markers", icon='CHECKMARK')
+
+    camera_bone = ensure_camera_track_properties(camera_arm, track_names=CAMERA_TRACK_NAMES)
+    if camera_bone is not None:
+        tracks_box = rig_box.box()
+        tracks_box.label(text="Camera Tracks", icon='ANIM')
+        tracks_box.operator("witcher.camera_set_dof_from_selected", text="DOF From Selected", icon='CAMERA_DATA')
+        for track_name in CAMERA_TRACK_NAMES:
+            if track_name in camera_bone:
+                tracks_box.prop(camera_bone, f'["{track_name}"]', text=track_name)
+
+
+def _draw_event_schema_browser(layout, scene, cs_selected):
+    """Collapsible schema browser listing all event types grouped ROOT / ENTRY."""
+    scope_filter = "ROOT" if cs_selected else "ENTRY"
+
+    for scope_label, scope_key, icon in [
+        ("Cutscene ROOT events", "ROOT", 'SCENE_DATA'),
+        ("Animation ENTRY events", "ENTRY", 'ACTION'),
+    ]:
+        if scope_key != scope_filter:
+            continue
+        sect = layout.box()
+        sect.label(text=scope_label, icon=icon)
+        for cls_name, base_cls, scope, own_props in _CUTSCENE_EVENT_SCHEMA:
+            if scope != scope_key:
+                continue
+            row = sect.row(align=True)
+            row.scale_y = 0.85
+            label_col = row.column()
+            label_col.scale_x = 1.0
+            # Class name + base
+            name_row = label_col.row(align=True)
+            name_row.label(text=cls_name, icon=_event_type_icon(cls_name))
+            base_col = name_row.row()
+            base_col.enabled = False
+            base_col.label(text=f"↑ {base_cls}")
+            # Own props list
+            if own_props:
+                props_row = label_col.row()
+                props_row.enabled = False
+                props_row.label(text="  " + "  ·  ".join(f"{n} ({t})" for n, t in own_props[:5]))
+            # Add button
+            add_op = row.operator("witcher.cutscene_add_event", text="", icon='ADD')
+            add_op.event_scope = scope_key
+            add_op.event_class = cls_name
 
 
 def _draw_cutscene_events_tab(layout, scene):
@@ -1680,6 +2526,25 @@ def _draw_cutscene_events_tab(layout, scene):
         else:
             layout.label(text="Select an animation in the Animations tab.", icon='INFO')
 
+    # ── Add Event ─────────────────────────────────────────────────────────────
+    layout.separator(factor=0.5)
+    add_box = layout.box()
+    add_hdr = add_box.row(align=True)
+    add_hdr.label(text="Add Event", icon='ADD')
+    add_hdr.prop(scene, "witcher_cs_show_event_schema", text="Schema", toggle=True, icon='PROPERTIES')
+
+    # Quick-add row: two most common types
+    quick_row = add_box.row(align=True)
+    op_cs = quick_row.operator("witcher.cutscene_add_event", text="Cutscene (ROOT)", icon='SCENE_DATA')
+    op_cs.event_scope = "ROOT"
+    op_cs.source_index = -1
+    op_anim = quick_row.operator("witcher.cutscene_add_event", text="Animation (ENTRY)", icon='ACTION')
+    op_anim.event_scope = "ENTRY"
+
+    # Schema browser (collapsible)
+    if bool(getattr(scene, "witcher_cs_show_event_schema", False)):
+        _draw_event_schema_browser(add_box, scene, cs_selected)
+
     layout.separator()
     dialog_header = layout.row(align=True)
     dialog_header.label(text="Dialogs", icon='OUTLINER_OB_SPEAKER')
@@ -1725,45 +2590,52 @@ class WITCHER_PT_scene_panel(WITCH_PT_Base, Panel):
             return
 
         cs_box = self.layout.box()
-        cs_box.label(text="Cutscene (.w2cutscene)", icon='SCENE_DATA')
-        action_row = cs_box.row(align=True)
-        action_row.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Import CS (.w2cutscene)", icon='IMPORT')
-        action_row.operator("witcher.export_w2_cutscene", text="Export CS (.w2cutscene)", icon='EXPORT')
+
+        # --- File header: repo path + Import / Export / Create New ---
         if hasattr(scene, "witcher_cutscene_export_repo_path"):
             cs_box.prop(scene, "witcher_cutscene_export_repo_path", text="Repo Path")
+        action_row = cs_box.row(align=True)
+        action_row.operator(ButtonOperatorImportW2cutscene.bl_idname, text="Import", icon='IMPORT')
+        action_row.operator("witcher.export_w2_cutscene", text="Export", icon='EXPORT')
+        action_row.operator(WITCH_OT_CutsceneCreateNew.bl_idname, text="New", icon='FILE_NEW')
 
         loaded_cutscene_path = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
         if loaded_cutscene_path and not scene.witcher_cutscene_actor_items and not scene.witcher_cutscene_animation_items:
             _schedule_deferred_cutscene_state_sync(scene, loaded_cutscene_path)
 
         if loaded_cutscene_path:
-            header = cs_box.row(align=True)
+            hdr_row = cs_box.row(align=True)
             cs_name = scene.witcher_loaded_cutscene_name or _get_loaded_cutscene_name(loaded_cutscene_path)
-            header.label(text=cs_name, icon='ACTION')
-            header.operator(WITCH_OT_ReopenCutsceneImportDialog.bl_idname, text="", icon='FILE_REFRESH')
+            hdr_row.label(text=cs_name, icon='ACTION')
+            hdr_row.operator(WITCH_OT_ReopenCutsceneImportDialog.bl_idname, text="", icon='FILE_REFRESH')
             last_import_seconds = float(getattr(scene, "witcher_cutscene_last_import_seconds", 0.0) or 0.0)
             if last_import_seconds > 0.0:
                 cs_box.label(text=f"Last import: {last_import_seconds:.2f}s", icon='TIME')
 
-            prev_split = cs_box.use_property_split
-            cs_box.use_property_split = False
-            tab_row = cs_box.row(align=True)
-            tab_row.prop_enum(scene, "witcher_cs_tab", 'TEMPLATE')
-            tab_row.prop_enum(scene, "witcher_cs_tab", 'ACTORS')
-            tab_row.prop_enum(scene, "witcher_cs_tab", 'ANIMS')
-            tab_row.prop_enum(scene, "witcher_cs_tab", 'EVENTS')
-            cs_box.use_property_split = prev_split
-            cs_box.separator(factor=0.5)
+        # --- Tabs always visible ---
+        prev_split = cs_box.use_property_split
+        cs_box.use_property_split = False
+        tab_row = cs_box.row(align=True)
+        tab_row.scale_y = 1.3
+        tab_row.prop_enum(scene, "witcher_cs_tab", 'TEMPLATE')
+        tab_row.prop_enum(scene, "witcher_cs_tab", 'ACTORS')
+        tab_row.prop_enum(scene, "witcher_cs_tab", 'ANIMS')
+        tab_row.prop_enum(scene, "witcher_cs_tab", 'CAMERA')
+        tab_row.prop_enum(scene, "witcher_cs_tab", 'EVENTS')
+        cs_box.use_property_split = prev_split
+        cs_box.separator(factor=0.5)
 
-            tab = str(getattr(scene, "witcher_cs_tab", "ACTORS") or "ACTORS")
-            if tab == 'TEMPLATE':
-                _draw_cutscene_template_tab(cs_box, scene)
-            elif tab == 'ACTORS':
-                _draw_cutscene_actors_tab(cs_box, scene)
-            elif tab == 'ANIMS':
-                _draw_cutscene_anims_tab(cs_box, scene)
-            elif tab == 'EVENTS':
-                _draw_cutscene_events_tab(cs_box, scene)
+        tab = str(getattr(scene, "witcher_cs_tab", "ACTORS") or "ACTORS")
+        if tab == 'TEMPLATE':
+            _draw_cutscene_template_tab(cs_box, scene)
+        elif tab == 'ACTORS':
+            _draw_cutscene_actors_tab(cs_box, scene, context)
+        elif tab == 'ANIMS':
+            _draw_cutscene_anims_tab(cs_box, scene, context)
+        elif tab == 'CAMERA':
+            _draw_cutscene_camera_tab(cs_box, scene, context)
+        elif tab == 'EVENTS':
+            _draw_cutscene_events_tab(cs_box, scene)
 
         self.layout.separator()
         w2s_box = self.layout.box()
@@ -1823,6 +2695,33 @@ class WITCHER_PT_witcher_sections_panel(WITCH_PT_Base, Panel):
         col = row.column()
         box.operator(Witcher_OT_load_section.bl_idname, text="Load Section")
 
+
+class WITCH_OT_CutsceneCreateNew(bpy.types.Operator):
+    """Set up a fresh cutscene with a default repo path, clearing any previously imported file"""
+    bl_idname = "witcher.cutscene_create_new"
+    bl_label = "Create New Cutscene"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        if scene is None:
+            return {'CANCELLED'}
+        base = "animations\\cutscenes\\blender_tools\\new_cutscene"
+        existing = set()
+        repo_path_lower = str(getattr(scene, "witcher_cutscene_export_repo_path", "") or "").replace("/", "\\").lower()
+        if repo_path_lower:
+            existing.add(repo_path_lower)
+        candidate = f"{base}_01.w2cutscene"
+        for i in range(1, 100):
+            candidate = f"{base}_{i:02d}.w2cutscene"
+            if candidate.lower() not in existing:
+                break
+        scene.witcher_cutscene_export_repo_path = candidate
+        scene.witcher_loaded_w2cutscene_path = ""
+        self.report({'INFO'}, f"New cutscene: {candidate}")
+        return {'FINISHED'}
+
+
 classes = [
     WitcherSection,
     CutsceneActorPreviewItem,
@@ -1840,7 +2739,13 @@ classes = [
     WITCH_UL_LoadedAnimList,
     WITCH_UL_RootEventList,
     WITCH_UL_EntryEventList,
+    WITCH_UL_ActorEntryEventList,
+    WITCH_OT_CutsceneSelectActor,
+    WITCH_OT_CutsceneRemoveActor,
+    WITCH_OT_CutsceneRemoveAnimation,
+    WITCH_OT_CutsceneAddEvent,
     ButtonOperatorImportW2cutscene,
+    WITCH_OT_CutsceneCreateNew,
     WITCH_OT_ReopenCutsceneImportDialog,
     WITCH_OT_ImportCutsceneBurnedAudio,
     WITCH_OT_RemoveCutsceneBurnedAudio,
@@ -1870,12 +2775,16 @@ def register():
     bpy.types.Scene.witcher_cutscene_event_items = bpy.props.CollectionProperty(type=CutsceneEventItem)
     bpy.types.Scene.witcher_cutscene_event_index = bpy.props.IntProperty(default=0)
     bpy.types.Scene.witcher_cs_entry_event_idx = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.witcher_cs_actor_event_idx = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.witcher_cs_actor_event_filter = bpy.props.StringProperty(default="", options={'SKIP_SAVE'})
+    bpy.types.Scene.witcher_cs_show_event_schema = bpy.props.BoolProperty(name="Show Event Schema", default=False)
     bpy.types.Scene.witcher_cs_tab = bpy.props.EnumProperty(
         name="Cutscene Tab",
         items=[
-            ('TEMPLATE', 'Template', 'Cutscene template properties and linked scenes'),
+            ('TEMPLATE', 'Template', 'Cutscene template properties, burned track and export metadata'),
             ('ACTORS', 'Actors', 'Manage cutscene actors'),
-            ('ANIMS', 'Animations', 'Manage cutscene animations'),
+            ('ANIMS', 'Animations', 'Add animations and manage cutscene animation strips'),
+            ('CAMERA', 'Camera', 'Camera entity, cut creation and camera rig tools'),
             ('EVENTS', 'Events', 'Cutscene events and dialog lines'),
         ],
         default='ACTORS',
@@ -1912,6 +2821,19 @@ def register():
     bpy.types.Scene.witcher_cutscene_effect_items = bpy.props.CollectionProperty(type=CutsceneEffectItem)
     bpy.types.Scene.witcher_cutscene_dialog_items = bpy.props.CollectionProperty(type=CutsceneDialogItem)
     bpy.types.Scene.witcher_cutscene_dialog_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.witcher_cutscene_selected_actor_obj = bpy.props.StringProperty(
+        name="Selected Cutscene Actor",
+        description="Name of the Blender object currently selected in the Actors tab",
+        default="",
+        options={'SKIP_SAVE'},
+    )
+    bpy.types.Object.witcher_cutscene_actor_type = bpy.props.EnumProperty(
+        name="type",
+        description="ECutsceneActorType for the cutscene actor",
+        items=_ECutsceneActorType_ITEMS,
+        get=_actor_type_get,
+        set=_actor_type_set,
+    )
 
 def unregister():
     if hasattr(bpy.types.Scene, "witcher_sections"):
@@ -1942,12 +2864,16 @@ def unregister():
                   "witcher_cutscene_used_in_files",
                   "witcher_cutscene_export_metadata_synced",
                   "witcher_cs_entry_event_idx",
+                  "witcher_cs_actor_event_idx",
+                  "witcher_cs_actor_event_filter",
+                  "witcher_cs_show_event_schema",
                   # legacy props removed in this version:
                   "witcher_cs_fade_before", "witcher_cs_fade_after", "witcher_cs_cam_blend_in", "witcher_cs_cam_blend_out",
                  "witcher_cs_blackscreen", "witcher_cs_check_actors_pos", "witcher_cs_reverb_name",
                  "witcher_cs_audio_track", "witcher_cs_ent_to_hide_tags",
                  "witcher_cutscene_info_tab", "witcher_cutscene_event_scope_tab", "witcher_cutscene_events_tab",
-                 "witcher_cs_events_anim_idx", "witcher_cs_event_view"):
+                 "witcher_cs_events_anim_idx", "witcher_cs_event_view",
+                 "witcher_cutscene_selected_actor_obj"):
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
     if hasattr(bpy.types.Scene, "witcher_cutscene_template_fields"):
@@ -1958,5 +2884,7 @@ def unregister():
         del bpy.types.Scene.witcher_cutscene_dialog_items
     if hasattr(bpy.types.Scene, "witcher_cutscene_dialog_index"):
         del bpy.types.Scene.witcher_cutscene_dialog_index
+    if hasattr(bpy.types.Object, "witcher_cutscene_actor_type"):
+        del bpy.types.Object.witcher_cutscene_actor_type
     for c in reversed(classes):
         bpy.utils.unregister_class(c)

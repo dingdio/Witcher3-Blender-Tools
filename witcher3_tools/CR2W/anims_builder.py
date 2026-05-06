@@ -343,6 +343,14 @@ def _make_string_prop(name: str, value: str, theType: str = "String") -> PROPERT
     )
 
 
+def _make_cname_prop(name: str, value: str) -> PROPERTY:
+    return PROPERTY(
+        theName=name,
+        theType="CName",
+        String=CSTRING(isUTF=False, String=str(value or "")),
+    )
+
+
 def _make_taglist_prop(name: str, values) -> PROPERTY:
     prop = PROPERTY(theName=name, theType="TagList")
     prop.TagList = [str(value or "").strip() for value in (values or []) if str(value or "").strip()]
@@ -368,6 +376,57 @@ def _make_uint32_array_prop(name: str, values) -> PROPERTY:
         theType="array:2,0,Uint32",
         elements=[PROPERTY(Value=int(value), theType="Uint32") for value in (values or [])],
     )
+
+
+def _make_cutscene_event_prop(event: Dict[str, object]) -> Optional[PROPERTY]:
+    event_type = str(event.get("event_type", "") or event.get("type", "") or "").strip()
+    if not event_type:
+        return None
+
+    props = []
+    event_name = str(event.get("event_name", "") or "").strip()
+    if event_name:
+        props.append(_make_cname_prop("eventName", event_name))
+
+    props.append(PROPERTY(
+        Value=float(event.get("start_time", event.get("startTime", 0.0)) or 0.0),
+        theName="startTime",
+        theType="Float",
+    ))
+
+    animation_name = str(event.get("animation_name", event.get("animationName", "")) or "").strip()
+    if animation_name:
+        props.append(_make_cname_prop("animationName", animation_name))
+
+    track_name = str(event.get("track_name", event.get("trackName", "")) or "").strip()
+    if track_name:
+        props.append(_make_string_prop("trackName", track_name))
+
+    duration = float(event.get("duration", 0.0) or 0.0)
+    if duration > 0.0 or "Duration" in event_type:
+        props.append(PROPERTY(Value=duration, theName="duration", theType="Float"))
+        if bool(event.get("always_fires_end", event.get("alwaysFiresEnd", False))):
+            props.append(PROPERTY(Value=True, theName="alwaysFiresEnd", theType="Bool"))
+
+    appearance = str(event.get("appearance", "") or "").strip()
+    if appearance:
+        props.append(_make_cname_prop("appearance", appearance))
+
+    effect_name = str(event.get("effect_name", event.get("effectName", "")) or "").strip()
+    if effect_name:
+        prop_name = "effect" if event_type == "CExtAnimCutsceneEffectEvent" else "effectName"
+        props.append(_make_cname_prop(prop_name, effect_name))
+
+    return PROPERTY(theName=event_type, theType=event_type, More=props)
+
+
+def _make_cutscene_event_props(events) -> List[PROPERTY]:
+    props = []
+    for event in events or []:
+        event_prop = _make_cutscene_event_prop(event)
+        if event_prop is not None:
+            props.append(event_prop)
+    return props
 
 
 def _make_handle(cr2w: CR2W, ref_idx: int, handle_type: str) -> HANDLE:
@@ -742,6 +801,7 @@ def _build_animation_chunks(
     additive_type: Optional[str] = None,
     motion_extraction: Optional[dict] = None,
     skeleton_path: str = "",
+    entry_events: Optional[List[Dict[str, object]]] = None,
 ) -> dict:
     """Build Entry → [MotionExtraction] → Animation → Buffer chunks for one animation.
 
@@ -775,8 +835,7 @@ def _build_animation_chunks(
         theName="animation", theType="ptr:CSkeletalAnimation",
     )
     _, entry_chunk = _add_chunk(cr2w, "CSkeletalAnimationSetEntry", [animation_prop])
-    # WolvenKit reads an events array after properties; write count=0
-    entry_chunk.postPropsData = struct.pack("<I", 0)
+    entry_chunk.postPropsVariantProps = _make_cutscene_event_props(entry_events)
 
     # 2) CSkeletalAnimation (comes BEFORE motion extraction chunks in vanilla)
     anim_buffer_handle = _make_handle(cr2w, idx_buffer, "ptr:IAnimationBuffer")
@@ -901,6 +960,7 @@ def _build_multipart_animation_chunks(
     additive_type: Optional[str] = None,
     motion_extraction: Optional[dict] = None,
     skeleton_path: str = "",
+    entry_events: Optional[List[Dict[str, object]]] = None,
 ) -> dict:
     if not parts:
         raise ValueError("Multipart animation requires at least one part")
@@ -924,7 +984,7 @@ def _build_multipart_animation_chunks(
         theType="ptr:CSkeletalAnimation",
     )
     _, entry_chunk = _add_chunk(cr2w, "CSkeletalAnimationSetEntry", [animation_prop])
-    entry_chunk.postPropsData = struct.pack("<I", 0)
+    entry_chunk.postPropsVariantProps = _make_cutscene_event_props(entry_events)
 
     multipart_handle = _make_handle(cr2w, idx_multipart, "ptr:IAnimationBuffer")
     skeleton_handle = _make_import_handle(cr2w, "CSkeleton", skeleton_path, "handle:CSkeleton")
@@ -1060,6 +1120,7 @@ def build_w2anims(
             skeletal_type=anim.get("skeletal_type", "SAT_Normal"),
             additive_type=anim.get("additive_type"),
             motion_extraction=anim.get("motion_extraction"),
+            entry_events=anim.get("entry_events"),
         )
         entry_indices.append(result["entry_idx"])
         payloads = result.get("buffer_payloads", [result["buffer_payload"]])
@@ -1162,6 +1223,7 @@ def build_w2cutscene(
                 additive_type=anim.get("additive_type", None),
                 motion_extraction=anim.get("motion_extraction", None),
                 skeleton_path=anim.get("skeleton_path", ""),
+                entry_events=anim.get("entry_events"),
             )
         else:
             result = _build_animation_chunks(
@@ -1177,6 +1239,7 @@ def build_w2cutscene(
                 additive_type=anim.get("additive_type", None),
                 motion_extraction=anim.get("motion_extraction", None),
                 skeleton_path=anim.get("skeleton_path", ""),
+                entry_events=anim.get("entry_events"),
             )
         entry_indices.append(result["entry_idx"])
         buffer_payloads.extend(result.get("buffer_payloads", [result["buffer_payload"]]))
@@ -1199,8 +1262,13 @@ def build_w2cutscene(
     for actor in actors:
         actor_props = [
             PROPERTY(theName="name", theType="String", String=CSTRING(isUTF=False, String=actor["name"])),
-            _make_enum_prop(cr2w, "type", "ECutsceneActorType", actor.get("type", "CAT_Actor")),
         ]
+        tag_values = [str(value or "").strip() for value in (actor.get("tag", None) or []) if str(value or "").strip()]
+        if tag_values:
+            actor_props.append(_make_taglist_prop("tag", tag_values))
+        voice_tag = str(actor.get("voice_tag", "") or actor.get("voiceTag", "") or "").strip()
+        if voice_tag:
+            actor_props.append(_make_cname_prop("voiceTag", voice_tag))
         template_handle = _make_import_handle(
             cr2w,
             "CEntityTemplate",
@@ -1218,21 +1286,24 @@ def build_w2cutscene(
             )
         appearance_name = str(actor.get("appearance", "") or "").strip()
         if appearance_name:
-            actor_props.append(
-                PROPERTY(
-                    theName="appearance",
-                    theType="CName",
-                    String=CSTRING(isUTF=False, String=appearance_name),
-                )
-            )
+            actor_props.append(_make_cname_prop("appearance", appearance_name))
+        actor_props.append(_make_enum_prop(cr2w, "type", "ECutsceneActorType", actor.get("type", "CAT_Actor")))
+        final_position = [
+            str(value or "").strip()
+            for value in (actor.get("final_position", None) or actor.get("finalPosition", None) or [])
+            if str(value or "").strip()
+        ]
+        if final_position:
+            actor_props.append(_make_taglist_prop("finalPosition", final_position))
+        if bool(actor.get("kill_me", actor.get("killMe", False))):
+            actor_props.append(PROPERTY(Value=True, theName="killMe", theType="Bool"))
         if bool(actor.get("use_mimic", False)):
-            actor_props.append(
-                PROPERTY(
-                    Value=True,
-                    theName="useMimic",
-                    theType="Bool",
-                )
-            )
+            actor_props.append(PROPERTY(Value=True, theName="useMimic", theType="Bool"))
+        anim_final_pos = str(
+            actor.get("anim_final_pos", "") or actor.get("animationAtFinalPosition", "") or ""
+        ).strip()
+        if anim_final_pos:
+            actor_props.append(_make_cname_prop("animationAtFinalPosition", anim_final_pos))
         actor_def = PROPERTY(
             theName="SCutsceneActorDef", theType="SCutsceneActorDef",
             More=actor_props,
@@ -1246,6 +1317,7 @@ def build_w2cutscene(
     )
 
     template_metadata = dict(template_metadata or {})
+    root_event_props = _make_cutscene_event_props(template_metadata.get("animevents", []))
     point_tags = [
         str(value or "").strip()
         for value in (template_metadata.get("point", None) or [])
@@ -1274,8 +1346,8 @@ def build_w2cutscene(
     root_chunk.PROPS = root_props
     # CCutsceneTemplate carries two REDBuffer fields after its normal properties:
     #   [uint32 Unk11][CBufferUInt32<CVariantSizeType> Animevents]
-    # For an empty event list we still need both u32 values present.
-    root_chunk.postPropsData = struct.pack("<II", 0, 0)
+    root_chunk.postPropsPrefix = struct.pack("<I", 0)
+    root_chunk.postPropsVariantProps = root_event_props
 
     # Populate buffer table
     cr2w.CR2WBuffer = []

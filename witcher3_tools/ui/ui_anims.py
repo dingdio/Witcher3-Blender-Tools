@@ -2,6 +2,7 @@ import logging
 import os
 import math
 from pathlib import Path
+from mathutils import Quaternion as MQuaternion, Vector as MVector, Euler as MEuler, Matrix as MMatrix
 from ..CR2W.common_blender import repo_file
 from ..external_addon_tools import get_re_addon_status
 log = logging.getLogger(__name__)
@@ -11,9 +12,16 @@ from .. import get_W3_VOICE_PATH
 from .. import get_W3_OGG_PATH
 from .. import get_rig_rot90_enabled
 from .. import get_all_addon_prefs
-from ..importers import import_anims, import_rig
+from ..importers import import_anims, import_cutscene, import_entity, import_rig
 from ..exporters import export_anims, export_cutscene
-from ..action_compat import iter_action_fcurves, new_action_fcurve, remove_action_fcurve
+from ..action_compat import (
+    assign_action,
+    bind_strip_action_slot,
+    iter_action_fcurves,
+    new_action_fcurve,
+    remove_action_fcurve,
+    resolve_action_slot,
+)
 # from io_import_w2l.importers import import_cutscene
 # from io_import_w2l.importers import import_scene
 from ..ui.ui_utils import WITCH_PT_Base
@@ -22,9 +30,28 @@ from ..ui.armature_context import (
     get_main_armature,
     set_main_armature,
 )
+from ..camera_tracks import (
+    CAMERA_DOF_TRACK_NAMES,
+    CAMERA_CONTROL_BONE,
+    CAMERA_EDIT_BONE,
+    CAMERA_SENSOR_HEIGHT,
+    CAMERA_TRACK_NAMES,
+    ensure_camera_track_properties,
+    find_camera_preview_object,
+    fov_to_lens,
+    set_camera_dof_from_blender_camera,
+    set_camera_dof_from_distance,
+    setup_camera_preview_drivers,
+)
 
 
 import bpy
+
+
+SCRATCH_CAMERA_DEFAULT_REPO_PATH = "gameplay\\camera\\scene_camera.w2ent"
+SCRATCH_CUTSCENE_TRACK_NAME = "cutscene_anim"
+SCRATCH_CUTSCENE_FACE_TRACK_NAME = "cutscene_anim_face"
+SCRATCH_CUTSCENE_ROOT_COMPONENT = "Root"
 
 
 def _find_character_armature(context):
@@ -199,6 +226,12 @@ def _get_selected_collection_item(owner, collection_name, index_name):
     return collection[safe_index], safe_index
 
 
+_NLA_MODE_MAP = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
+
+def _scene_nla_mode(scene):
+    return _NLA_MODE_MAP.get(getattr(scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+
+
 def on_anim_list_index_changed(self, context):
     """Callback when animation list selection changes. Auto-loads if enabled."""
     if not getattr(context.scene, 'witcher_load_anim_on_select', False):
@@ -225,7 +258,8 @@ def on_anim_list_index_changed(self, context):
         return
 
     try:
-        load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj)
+        _nla_mode = _scene_nla_mode(context.scene)
+        load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj, nla_mode=_nla_mode)
         # Apply root orientation if enabled
         auto_orient = getattr(context.scene, 'witcher_auto_orient_root', False)
         log.info(f"[on_select] Auto orient root setting: {auto_orient}")
@@ -239,7 +273,7 @@ def on_anim_list_index_changed(self, context):
     except Exception as e:
         log.error(f"Auto-load animation failed: {e}")
 from bpy.types import Panel, Operator, UIList, PropertyGroup
-from bpy.props import IntProperty, StringProperty, CollectionProperty, FloatProperty, BoolProperty, EnumProperty
+from bpy.props import IntProperty, StringProperty, CollectionProperty, FloatProperty, FloatVectorProperty, BoolProperty, EnumProperty
 from bpy_extras.io_utils import (
         ImportHelper,
         ExportHelper
@@ -389,6 +423,2947 @@ class WITCH_OT_AnimExportSetRemove(bpy.types.Operator):
         idx = context.scene.witcher_anim_export_set_index
         lst.remove(idx)
         context.scene.witcher_anim_export_set_index = max(0, min(idx, len(lst) - 1))
+        return {'FINISHED'}
+
+
+def _camera_bone_world_position(armature_obj, bone_name=CAMERA_CONTROL_BONE):
+    if armature_obj is None or getattr(armature_obj, "type", None) != 'ARMATURE':
+        return None
+    pose_bones = getattr(getattr(armature_obj, "pose", None), "bones", None)
+    pose_bone = pose_bones.get(bone_name) if pose_bones else None
+    if pose_bone is None:
+        return None
+    return (armature_obj.matrix_world @ pose_bone.matrix).translation
+
+
+def _selected_camera_dof_target_position(context, armature_obj):
+    active_pose_bone = getattr(context, "active_pose_bone", None)
+    active_obj = getattr(context, "object", None)
+    if active_pose_bone is not None and active_obj is not None:
+        return (active_obj.matrix_world @ active_pose_bone.matrix).translation
+
+    selected = list(getattr(context, "selected_objects", []) or [])
+    active_selected = getattr(context, "active_object", None)
+    ordered = []
+    if active_selected in selected:
+        ordered.append(active_selected)
+    ordered.extend(obj for obj in selected if obj is not active_selected)
+    for obj in ordered:
+        if obj is None or obj is armature_obj or getattr(obj, "type", None) == 'CAMERA':
+            continue
+        return obj.matrix_world.translation
+    return None
+
+
+def _is_cutscene_nla_track_name(track_name):
+    track_name = str(track_name or "")
+    return track_name == "cutscene_anim" or track_name.startswith("cutscene_anim")
+
+
+CAMERA_CUT_MARKER_PREFIX = "W3 Cam "
+
+
+def _is_camera_armature(obj):
+    return (
+        obj is not None
+        and getattr(obj, "type", None) == 'ARMATURE'
+        and getattr(getattr(obj, "pose", None), "bones", {}).get(CAMERA_CONTROL_BONE) is not None
+    )
+
+
+def _find_camera_armature(context):
+    active_obj = getattr(context, "active_object", None)
+    if _is_camera_armature(active_obj):
+        return active_obj
+    parent_obj = getattr(active_obj, "parent", None)
+    if _is_camera_armature(parent_obj):
+        return parent_obj
+
+    display_armature = _find_character_armature(context)
+    if _is_camera_armature(display_armature):
+        return display_armature
+
+    for obj in getattr(context, "selected_objects", []) or []:
+        if _is_camera_armature(obj):
+            return obj
+        parent_obj = getattr(obj, "parent", None)
+        if _is_camera_armature(parent_obj):
+            return parent_obj
+
+    scene = getattr(context, "scene", None)
+    for obj in getattr(scene, "objects", []) or []:
+        if not _is_camera_armature(obj):
+            continue
+        actor_type = str(obj.get("cutscene_actor_type", "") or "")
+        actor_name = str(obj.get("cutscene_actor_name", "") or "").lower()
+        if "CAT_Camera" in actor_type or actor_name == "camera":
+            return obj
+    return None
+
+
+def _iter_camera_cut_strips(armature_obj):
+    anim_data = getattr(armature_obj, "animation_data", None)
+    if anim_data is None:
+        return []
+
+    cuts = []
+    for track in getattr(anim_data, "nla_tracks", []) or []:
+        if getattr(track, "mute", False):
+            continue
+        track_name = str(getattr(track, "name", "") or "")
+        if not _is_cutscene_nla_track_name(track_name):
+            continue
+        for strip in getattr(track, "strips", []) or []:
+            if getattr(strip, "mute", False):
+                continue
+            cuts.append((track, strip))
+    cuts.sort(key=lambda item: (float(item[1].frame_start), float(item[1].frame_end), item[1].name))
+    return cuts
+
+
+def _current_camera_cut_index(context, armature_obj, cuts=None):
+    cuts = cuts if cuts is not None else _iter_camera_cut_strips(armature_obj)
+    if not cuts:
+        return -1
+
+    frame = float(getattr(getattr(context, "scene", None), "frame_current", 0.0))
+    for idx, (_track, strip) in enumerate(cuts):
+        if float(strip.frame_start) <= frame <= float(strip.frame_end):
+            return idx
+
+    previous = -1
+    for idx, (_track, strip) in enumerate(cuts):
+        if float(strip.frame_start) <= frame:
+            previous = idx
+        else:
+            break
+    return previous if previous >= 0 else 0
+
+
+def _select_nla_strip(track, strip):
+    try:
+        for other in track.strips:
+            other.select = False
+        strip.select = True
+    except Exception:
+        pass
+
+
+def _camera_cut_marker_name(index):
+    return f"{CAMERA_CUT_MARKER_PREFIX}{int(index) + 1:02d}"
+
+
+def _is_camera_cut_marker(marker):
+    return str(getattr(marker, "name", "") or "").startswith(CAMERA_CUT_MARKER_PREFIX)
+
+
+def _sync_camera_cut_markers(scene, armature_obj):
+    if scene is None or armature_obj is None:
+        return 0
+
+    markers = getattr(scene, "timeline_markers", None)
+    if markers is None:
+        return 0
+
+    for marker in list(markers):
+        if _is_camera_cut_marker(marker):
+            markers.remove(marker)
+
+    camera_obj = find_camera_preview_object(armature_obj)
+    cuts = _iter_camera_cut_strips(armature_obj)
+    for idx, (_track, strip) in enumerate(cuts):
+        marker = markers.new(_camera_cut_marker_name(idx), frame=int(round(float(strip.frame_start))))
+        try:
+            marker.camera = camera_obj
+        except Exception:
+            pass
+    return len(cuts)
+
+
+def _apply_camera_cut_markers_to_strips(scene, armature_obj):
+    if scene is None or armature_obj is None:
+        return 0
+
+    cuts = _iter_camera_cut_strips(armature_obj)
+    markers = sorted(
+        [marker for marker in getattr(scene, "timeline_markers", []) if _is_camera_cut_marker(marker)],
+        key=lambda marker: int(getattr(marker, "frame", 0)),
+    )
+    if not cuts or len(markers) != len(cuts):
+        return 0
+
+    for idx, ((track, strip), marker) in enumerate(zip(cuts, markers)):
+        old_start = float(strip.frame_start)
+        old_end = float(strip.frame_end)
+        old_length = max(1.0, old_end - old_start)
+        new_start = float(getattr(marker, "frame", old_start))
+        if idx + 1 < len(markers):
+            new_end = max(new_start + 1.0, float(getattr(markers[idx + 1], "frame", new_start + old_length)))
+        else:
+            new_end = new_start + old_length
+        strip.frame_start = new_start
+        strip.frame_end = new_end
+        _select_nla_strip(track, strip)
+    return len(cuts)
+
+
+def _iter_scene_cutscene_strips(scene):
+    for obj in getattr(scene, "objects", []) or []:
+        anim_data = getattr(obj, "animation_data", None)
+        if anim_data is None:
+            continue
+        for track in getattr(anim_data, "nla_tracks", []) or []:
+            if getattr(track, "mute", False):
+                continue
+            if not _is_cutscene_nla_track_name(getattr(track, "name", "")):
+                continue
+            for strip in getattr(track, "strips", []) or []:
+                if not getattr(strip, "mute", False):
+                    yield obj, track, strip
+
+
+def _move_cutscene_strips_after(scene, boundary, delta, skip_strip=None):
+    if abs(float(delta)) <= 1e-6:
+        return
+    boundary = float(boundary)
+    for _obj, _track, strip in _iter_scene_cutscene_strips(scene):
+        if strip == skip_strip:
+            continue
+        if float(strip.frame_start) >= boundary - 1e-6:
+            strip.frame_start = float(strip.frame_start) + float(delta)
+            strip.frame_end = float(strip.frame_end) + float(delta)
+
+
+def _linearize_action_keys_near_frame(action, frame, radius=2.0, target=None):
+    if action is None:
+        return 0
+    frame = float(frame)
+    radius = max(0.0, float(radius))
+    changed = 0
+    for fcurve in iter_action_fcurves(action, target=target):
+        for key in getattr(fcurve, "keyframe_points", []) or []:
+            try:
+                if abs(float(key.co.x) - frame) <= radius:
+                    key.interpolation = 'LINEAR'
+                    changed += 1
+            except Exception:
+                continue
+    return changed
+
+
+def _pose_bone_world_matrix(armature_obj, bone_name):
+    pose_bone = getattr(getattr(armature_obj, "pose", None), "bones", {}).get(bone_name)
+    if pose_bone is None:
+        return None
+    return armature_obj.matrix_world @ pose_bone.matrix
+
+
+def _set_pose_bone_world_matrix(armature_obj, bone_name, world_matrix):
+    pose_bone = getattr(getattr(armature_obj, "pose", None), "bones", {}).get(bone_name)
+    if pose_bone is None:
+        return None
+    pose_bone.matrix = armature_obj.matrix_world.inverted() @ world_matrix
+    return pose_bone
+
+
+def _resolve_native_camera_target(context, camera_armature):
+    active_obj = getattr(context, "active_object", None)
+    if getattr(active_obj, "type", None) == 'CAMERA':
+        return active_obj
+    scene_camera = getattr(getattr(context, "scene", None), "camera", None)
+    if getattr(scene_camera, "type", None) == 'CAMERA':
+        return scene_camera
+    return find_camera_preview_object(camera_armature)
+
+
+def _fcurve_insert_direct(action, armature_obj, data_path, frame, values):
+    """Insert keyframe points directly into an action's fcurves (works in Blender 5.0+)."""
+    for i, v in enumerate(values):
+        fc = None
+        for existing in iter_action_fcurves(action, target=armature_obj):
+            if existing.data_path == data_path and existing.array_index == i:
+                fc = existing
+                break
+        if fc is None:
+            try:
+                fc = new_action_fcurve(action, armature_obj, data_path, index=i)
+            except Exception:
+                continue
+        if fc is not None:
+            try:
+                fc.keyframe_points.insert(float(frame), float(v), options={'FAST'})
+            except Exception:
+                pass
+
+
+def _insert_rig_keyframe_to_action(action, armature_obj, edit_bone, camera_bone, frame):
+    """Write one keyframe of rig pose data directly into an action without switching anim_data.action."""
+    if edit_bone is not None:
+        bp = f'pose.bones["{edit_bone.name}"]'
+        loc = edit_bone.location
+        _fcurve_insert_direct(action, armature_obj, f"{bp}.location", frame, [loc.x, loc.y, loc.z])
+        if edit_bone.rotation_mode == 'QUATERNION':
+            q = edit_bone.rotation_quaternion
+            _fcurve_insert_direct(action, armature_obj, f"{bp}.rotation_quaternion", frame, [q.w, q.x, q.y, q.z])
+        elif edit_bone.rotation_mode == 'AXIS_ANGLE':
+            _fcurve_insert_direct(action, armature_obj, f"{bp}.rotation_axis_angle", frame, list(edit_bone.rotation_axis_angle))
+        else:
+            e = edit_bone.rotation_euler
+            _fcurve_insert_direct(action, armature_obj, f"{bp}.rotation_euler", frame, [e.x, e.y, e.z])
+        sc = edit_bone.scale
+        _fcurve_insert_direct(action, armature_obj, f"{bp}.scale", frame, [sc.x, sc.y, sc.z])
+    if camera_bone is not None:
+        cp = f'pose.bones["{camera_bone.name}"]'
+        if "hctFOV" in camera_bone:
+            _fcurve_insert_direct(action, armature_obj, f'{cp}["hctFOV"]', frame, [float(camera_bone["hctFOV"])])
+        for track_name in CAMERA_DOF_TRACK_NAMES:
+            if track_name in camera_bone:
+                _fcurve_insert_direct(action, armature_obj, f'{cp}["{track_name}"]', frame, [float(camera_bone[track_name])])
+
+
+def _key_rig_from_camera(context, camera_armature, camera_obj, insert_key=True, key_frame=None, target_action=None):
+    if camera_armature is None or camera_obj is None:
+        return False
+
+    preview_camera = find_camera_preview_object(camera_armature)
+    edit_world = _pose_bone_world_matrix(camera_armature, CAMERA_EDIT_BONE)
+    if preview_camera is not None and edit_world is not None:
+        offset = edit_world.inverted() @ preview_camera.matrix_world
+        desired_edit_world = camera_obj.matrix_world @ offset.inverted()
+        edit_bone = _set_pose_bone_world_matrix(camera_armature, CAMERA_EDIT_BONE, desired_edit_world)
+    else:
+        edit_bone = _set_pose_bone_world_matrix(camera_armature, CAMERA_EDIT_BONE, camera_obj.matrix_world)
+
+    camera_bone = ensure_camera_track_properties(camera_armature, track_names=CAMERA_TRACK_NAMES)
+    if camera_bone is not None:
+        try:
+            camera_bone["hctFOV"] = math.degrees(float(camera_obj.data.angle_y))
+        except Exception:
+            pass
+        set_camera_dof_from_blender_camera(camera_bone, camera_obj)
+
+    if insert_key:
+        frame = key_frame if key_frame is not None else getattr(getattr(context, "scene", None), "frame_current", None)
+        if frame is not None:
+            if target_action is not None:
+                # Blender 5.0-safe path: write directly into the action's fcurves
+                _insert_rig_keyframe_to_action(target_action, camera_armature, edit_bone, camera_bone, frame)
+            else:
+                # Standard path: keyframe_insert uses whatever action is currently active
+                if edit_bone is not None:
+                    edit_bone.keyframe_insert(data_path="location", frame=frame)
+                    if edit_bone.rotation_mode == 'QUATERNION':
+                        edit_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+                    elif edit_bone.rotation_mode == 'AXIS_ANGLE':
+                        edit_bone.keyframe_insert(data_path="rotation_axis_angle", frame=frame)
+                    else:
+                        edit_bone.keyframe_insert(data_path="rotation_euler", frame=frame)
+                    edit_bone.keyframe_insert(data_path="scale", frame=frame)
+                if camera_bone is not None:
+                    camera_bone.keyframe_insert(data_path='["hctFOV"]', frame=frame)
+                    for track_name in CAMERA_DOF_TRACK_NAMES:
+                        camera_bone.keyframe_insert(data_path=f'["{track_name}"]', frame=frame)
+    return True
+
+
+def _strip_scene_frame_to_action_frame(strip, scene_frame):
+    if strip is None:
+        return scene_frame
+    action_start = float(getattr(strip, "action_frame_start", 0.0) or 0.0)
+    return action_start + float(scene_frame) - float(getattr(strip, "frame_start", 0.0) or 0.0)
+
+
+def _copy_strip_settings(source_strip, target_strip):
+    for attr, value in _strip_settings_snapshot(source_strip).items():
+        if not hasattr(target_strip, attr):
+            continue
+        try:
+            setattr(target_strip, attr, value)
+        except Exception:
+            pass
+
+
+def _strip_settings_snapshot(strip):
+    settings = {}
+    for attr in (
+        "blend_type",
+        "extrapolation",
+        "use_auto_blend",
+        "blend_in",
+        "blend_out",
+        "mute",
+    ):
+        if not hasattr(strip, attr):
+            continue
+        try:
+            settings[attr] = getattr(strip, attr)
+        except Exception:
+            pass
+    return settings
+
+
+def _apply_strip_settings_snapshot(settings, target_strip):
+    for attr, value in dict(settings or {}).items():
+        if not hasattr(target_strip, attr):
+            continue
+        try:
+            setattr(target_strip, attr, value)
+        except Exception:
+            pass
+
+
+def _set_strip_action_range(strip, action_start=None, action_end=None):
+    if strip is None:
+        return
+    if action_start is not None and hasattr(strip, "action_frame_start"):
+        try:
+            strip.action_frame_start = float(action_start)
+        except Exception:
+            pass
+    if action_end is not None and hasattr(strip, "action_frame_end"):
+        try:
+            strip.action_frame_end = float(action_end)
+        except Exception:
+            pass
+
+
+def _selected_camera_cut_strips(camera_armature):
+    selected = []
+    for track, strip in _iter_camera_cut_strips(camera_armature):
+        if bool(getattr(strip, "select", False)):
+            selected.append((track, strip))
+    return selected
+
+
+def _camera_cut_selection_for_combine(context, camera_armature):
+    cuts = _iter_camera_cut_strips(camera_armature)
+    selected = _selected_camera_cut_strips(camera_armature)
+    if len(selected) >= 2:
+        return sorted(selected, key=lambda item: (float(item[1].frame_start), float(item[1].frame_end)))
+
+    cut_index = _current_camera_cut_index(context, camera_armature, cuts)
+    if cut_index < 0 or cut_index + 1 >= len(cuts):
+        return []
+    return [cuts[cut_index], cuts[cut_index + 1]]
+
+
+def _validate_adjacent_camera_cuts(cuts):
+    if len(cuts) < 2:
+        return False
+    previous_end = float(cuts[0][1].frame_end)
+    for _track, strip in cuts[1:]:
+        strip_start = float(strip.frame_start)
+        if abs(strip_start - previous_end) > 1e-4:
+            return False
+        previous_end = float(strip.frame_end)
+    return True
+
+
+def _new_camera_edit_track(camera_armature):
+    anim_data = camera_armature.animation_data_create()
+    track = anim_data.nla_tracks.new()
+    base_name = "cutscene_anim_camera_edits"
+    track.name = base_name
+    return track
+
+
+def _create_camera_cut_strip(camera_armature, preferred_track, name, scene_start, scene_end, action,
+                             action_start=None, action_end=None, settings=None):
+    scene_start = float(scene_start)
+    scene_end = max(scene_start + 1.0, float(scene_end))
+
+    def _create_on_track(track):
+        new_strip = track.strips.new(name, int(round(scene_start)), action)
+        _apply_strip_settings_snapshot(settings or {}, new_strip)
+        _set_strip_action_range(new_strip, action_start=action_start, action_end=action_end)
+        new_strip.frame_start = scene_start
+        new_strip.frame_end = scene_end
+        bind_strip_action_slot(new_strip, resolve_action_slot(action, target=camera_armature, ensure=True))
+        return track, new_strip
+
+    try:
+        return _create_on_track(preferred_track)
+    except RuntimeError:
+        # Blender creates new NLA strips at full action length before we can trim the
+        # action range. If that overlaps neighboring cuts, create the strip on a fresh
+        # camera edit track instead.
+        return _create_on_track(_new_camera_edit_track(camera_armature))
+
+
+def _clear_camera_preview_drivers(camera_obj):
+    if camera_obj is None or getattr(camera_obj, "type", None) != 'CAMERA':
+        return 0
+    camera_data = getattr(camera_obj, "data", None)
+    if camera_data is None:
+        return 0
+    removed = 0
+    for data_path in ("lens", "dof.focus_distance", "dof.aperture_fstop"):
+        try:
+            camera_data.driver_remove(data_path)
+            removed += 1
+        except (TypeError, RuntimeError, ValueError):
+            pass
+    return removed
+
+
+def _scene_edit_range(scene):
+    if scene is None:
+        return 0, 1
+    if bool(getattr(scene, "use_preview_range", False)):
+        start = int(getattr(scene, "frame_preview_start", getattr(scene, "frame_start", 0)))
+        end = int(getattr(scene, "frame_preview_end", getattr(scene, "frame_end", start + 1)))
+    else:
+        start = int(getattr(scene, "frame_start", 0))
+        end = int(getattr(scene, "frame_end", start + 1))
+    if end <= start:
+        end = start + 1
+    return start, end
+
+
+def _selected_blender_camera(context):
+    active_obj = getattr(context, "active_object", None)
+    if getattr(active_obj, "type", None) == 'CAMERA':
+        return active_obj
+    for obj in getattr(context, "selected_objects", []) or []:
+        if getattr(obj, "type", None) == 'CAMERA':
+            return obj
+    scene_camera = getattr(getattr(context, "scene", None), "camera", None)
+    if getattr(scene_camera, "type", None) == 'CAMERA':
+        return scene_camera
+    return None
+
+
+def _handoff_preview_camera_animation_to_rig(camera_armature, camera_obj):
+    if camera_armature is None or camera_obj is None:
+        return
+    if camera_obj != find_camera_preview_object(camera_armature):
+        return
+    for datablock in (camera_obj, getattr(camera_obj, "data", None)):
+        anim_data = getattr(datablock, "animation_data", None)
+        if anim_data is None:
+            continue
+        try:
+            anim_data.action = None
+        except Exception:
+            pass
+        for track in getattr(anim_data, "nla_tracks", []) or []:
+            try:
+                track.mute = True
+            except Exception:
+                pass
+    setup_camera_preview_drivers(camera_armature, camera_obj)
+
+
+def _normalize_scratch_repo_path(path):
+    return export_anims._normalize_repo_path(path)
+
+
+def _iter_object_descendants(root_obj):
+    pending = list(getattr(root_obj, "children", []) or [])
+    while pending:
+        child = pending.pop(0)
+        pending.extend(getattr(child, "children", []) or [])
+        yield child
+
+
+def _resolve_active_armature(context):
+    active_obj = getattr(context, "active_object", None)
+    armature_obj = _resolve_actor_armature_from_object(context, active_obj)
+    if armature_obj is not None:
+        return armature_obj
+    for obj in getattr(context, "selected_objects", []) or []:
+        armature_obj = _resolve_actor_armature_from_object(context, obj)
+        if armature_obj is not None:
+            return armature_obj
+    return _find_character_armature(context)
+
+
+def _object_parent_chain(obj):
+    current = getattr(obj, "parent", None)
+    while current is not None:
+        yield current
+        current = getattr(current, "parent", None)
+
+
+def _armature_from_object_reference(obj):
+    if obj is None:
+        return None
+    if getattr(obj, "type", None) == 'ARMATURE':
+        return obj
+    for parent in _object_parent_chain(obj):
+        if getattr(parent, "type", None) == 'ARMATURE':
+            return parent
+    for modifier in getattr(obj, "modifiers", []) or []:
+        if getattr(modifier, "type", None) != 'ARMATURE':
+            continue
+        target = getattr(modifier, "object", None)
+        if getattr(target, "type", None) == 'ARMATURE':
+            return target
+    for child in _iter_object_descendants(obj):
+        if getattr(child, "type", None) == 'ARMATURE':
+            return child
+    return None
+
+
+def _actor_entity_key(obj):
+    if obj is None:
+        return ""
+    rig_settings = getattr(getattr(obj, "data", None), "witcherui_RigSettings", None)
+    for candidate in (
+        getattr(rig_settings, "repo_path", "") if rig_settings else "",
+        obj.get("witcher_entity_path", ""),
+        obj.get("cutscene_actor_template", ""),
+    ):
+        candidate = _normalize_scratch_repo_path(candidate)
+        if candidate:
+            return candidate.lower()
+    return ""
+
+
+def _actor_entity_name_hint(obj):
+    if obj is None:
+        return ""
+    rig_settings = getattr(getattr(obj, "data", None), "witcherui_RigSettings", None)
+    for candidate in (
+        getattr(rig_settings, "entity_name", "") if rig_settings else "",
+        obj.get("witcher_entity_name", ""),
+        obj.get("cutscene_actor_name", ""),
+    ):
+        candidate = str(candidate or "").strip()
+        if candidate:
+            return candidate
+    obj_name = str(getattr(obj, "name", "") or "").strip()
+    if ":" in obj_name:
+        prefix = obj_name.split(":", 1)[0].strip()
+        if prefix:
+            return prefix
+    return ""
+
+
+def _actor_armature_score(candidate, selected_armature, selected_key, selected_entity_name):
+    if candidate is None or getattr(candidate, "type", None) != 'ARMATURE':
+        return -1
+    score = 0
+    if candidate is selected_armature:
+        score += 100
+    witcher_type = str(candidate.get("witcher_type", "") or "")
+    candidate_name = str(getattr(candidate, "name", "") or "")
+    if witcher_type == "CMovingPhysicalAgentComponent" or "CMovingPhysicalAgentComponent" in candidate_name:
+        score += 80
+    if getattr(getattr(candidate, "pose", None), "bones", {}).get("Trajectory") is not None:
+        score += 40
+    rig_settings = getattr(getattr(candidate, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is not None:
+        if str(getattr(rig_settings, "main_entity_skeleton", "") or "").strip():
+            score += 25
+        if str(getattr(rig_settings, "repo_path", "") or "").strip():
+            score += 20
+    candidate_key = _actor_entity_key(candidate)
+    if selected_key and candidate_key == selected_key:
+        score += 30
+    candidate_entity_name = _actor_entity_name_hint(candidate)
+    if selected_entity_name and candidate_entity_name == selected_entity_name:
+        score += 20
+    if str(candidate.get("_w3_entity_context_role", "") or "").strip().lower() == "primary":
+        score += 10
+    if str(candidate.get("mimicFaceFile", "") or "").strip() and candidate is not selected_armature:
+        score -= 25
+    return score
+
+
+def _prefer_actor_root_armature(context, selected_armature):
+    if selected_armature is None:
+        return None
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return selected_armature
+
+    for obj in getattr(scene, "objects", []) or []:
+        if getattr(obj, "type", None) == 'ARMATURE' and obj.get("mimicFace") == selected_armature.name:
+            return obj
+
+    selected_key = _actor_entity_key(selected_armature)
+    selected_entity_name = _actor_entity_name_hint(selected_armature)
+    candidates = [selected_armature]
+    for obj in getattr(scene, "objects", []) or []:
+        if getattr(obj, "type", None) != 'ARMATURE' or obj is selected_armature:
+            continue
+        if selected_key and _actor_entity_key(obj) == selected_key:
+            candidates.append(obj)
+            continue
+        if selected_entity_name and _actor_entity_name_hint(obj) == selected_entity_name:
+            candidates.append(obj)
+
+    return max(
+        candidates,
+        key=lambda obj: _actor_armature_score(obj, selected_armature, selected_key, selected_entity_name),
+    )
+
+
+def _resolve_actor_armature_from_object(context, obj):
+    armature_obj = _armature_from_object_reference(obj)
+    if armature_obj is None:
+        return None
+    return _prefer_actor_root_armature(context, armature_obj)
+
+
+def _find_armature_in_hierarchy(root_obj, predicate=None):
+    candidates = []
+    if getattr(root_obj, "type", None) == 'ARMATURE':
+        candidates.append(root_obj)
+    candidates.extend(
+        child for child in _iter_object_descendants(root_obj)
+        if getattr(child, "type", None) == 'ARMATURE'
+    )
+    if predicate is not None:
+        for candidate in candidates:
+            if predicate(candidate):
+                return candidate
+    return candidates[0] if candidates else None
+
+
+def _find_new_imported_armature(before_names, predicate=None):
+    before_names = set(before_names or [])
+    for obj in bpy.data.objects:
+        if obj.name in before_names or getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        if predicate is None or predicate(obj):
+            return obj
+    for obj in bpy.data.objects:
+        if obj.name in before_names or getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        return obj
+    return None
+
+
+def _resolve_actor_template_path(armature_obj, explicit_path=""):
+    explicit_path = _normalize_scratch_repo_path(explicit_path)
+    if explicit_path:
+        return explicit_path
+    if armature_obj is None:
+        return ""
+    for prop_name in ("cutscene_actor_template", "witcher_entity_path", "repo_path"):
+        candidate = _normalize_scratch_repo_path(armature_obj.get(prop_name, ""))
+        if candidate:
+            return candidate
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is not None:
+        candidate = _normalize_scratch_repo_path(getattr(rig_settings, "repo_path", ""))
+        if candidate:
+            return candidate
+    return ""
+
+
+def _resolve_actor_display_name(armature_obj, explicit_name=""):
+    explicit_name = str(explicit_name or "").strip()
+    if explicit_name:
+        return explicit_name
+    if armature_obj is None:
+        return ""
+    entity_hint = _actor_entity_name_hint(armature_obj)
+    if entity_hint:
+        return entity_hint
+    actor_name = str(armature_obj.get("cutscene_actor_name", "") or "").strip()
+    if actor_name:
+        return actor_name
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is not None:
+        entity_name = str(getattr(rig_settings, "entity_name", "") or "").strip()
+        if entity_name:
+            return entity_name
+    obj_name = str(getattr(armature_obj, "name", "") or "").strip()
+    if ":" in obj_name:
+        prefix = obj_name.split(":", 1)[0].strip()
+        if prefix:
+            return prefix
+    return obj_name
+
+
+def _resolve_actor_appearance(armature_obj, explicit_appearance=""):
+    explicit_appearance = str(explicit_appearance or "").strip()
+    if explicit_appearance:
+        return explicit_appearance
+    if armature_obj is None:
+        return ""
+    existing = str(armature_obj.get("cutscene_actor_appearance", "") or "").strip()
+    if existing:
+        return existing
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    app_list = getattr(rig_settings, "app_list", None) if rig_settings is not None else None
+    try:
+        app_idx = int(getattr(rig_settings, "app_list_index", -1))
+        if app_list is not None and 0 <= app_idx < len(app_list):
+            return str(getattr(app_list[app_idx], "name", "") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _actor_has_mimic_setup(armature_obj):
+    if armature_obj is None:
+        return False
+    mimic_name = str(armature_obj.get("mimicFace", "") or "").strip()
+    mimic_file = str(armature_obj.get("mimicFaceFile", "") or "").strip()
+    if mimic_name and mimic_file:
+        return True
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    return bool(str(getattr(rig_settings, "main_face_skeleton", "") or "").strip()) if rig_settings else False
+
+
+def _tag_scratch_cutscene_actor(armature_obj, actor_name="", template_path="", actor_type="CAT_Actor",
+                                appearance="", use_mimic=False, imported_new=False):
+    if armature_obj is None or getattr(armature_obj, "type", None) != 'ARMATURE':
+        return False
+    actor_name = _resolve_actor_display_name(armature_obj, actor_name)
+    template_path = _resolve_actor_template_path(armature_obj, template_path)
+    appearance = _resolve_actor_appearance(armature_obj, appearance)
+    actor_type = str(actor_type or "CAT_Actor").strip() or "CAT_Actor"
+
+    armature_obj["cutscene_actor_name"] = actor_name
+    armature_obj["cutscene_actor_template"] = template_path
+    armature_obj["cutscene_actor_type"] = actor_type
+    armature_obj["cutscene_component"] = SCRATCH_CUTSCENE_ROOT_COMPONENT
+    armature_obj["cutscene_actor_appearance"] = appearance
+    armature_obj["cutscene_actor_use_mimic"] = bool(use_mimic)
+    armature_obj[import_cutscene.CUTSCENE_ACTOR_IMPORTED_PROP] = bool(imported_new)
+    # Initialize extended actor props if not already set
+    for _k, _v in (
+        ("cutscene_actor_tag", ""),
+        ("cutscene_actor_voice_tag", ""),
+        ("cutscene_actor_final_position", ""),
+        ("cutscene_actor_kill_me", False),
+        ("cutscene_actor_anim_final_pos", ""),
+    ):
+        if _k not in armature_obj:
+            armature_obj[_k] = _v
+    return True
+
+
+def _resolve_component_armature(actor_obj, component):
+    component_text = str(component or "").strip().lower()
+    if component_text in {"face", "mimic"}:
+        mimic_name = str(actor_obj.get("mimicFace", "") or "").strip() if actor_obj else ""
+        mimic_obj = bpy.data.objects.get(mimic_name) if mimic_name else None
+        if getattr(mimic_obj, "type", None) == 'ARMATURE':
+            return mimic_obj
+    return actor_obj
+
+
+def _resolve_scratch_component(context):
+    scene = getattr(context, "scene", None)
+    component = str(getattr(scene, "witcher_cutscene_scratch_component", "") or "").strip() if scene else ""
+    if not component:
+        component = SCRATCH_CUTSCENE_ROOT_COMPONENT
+    if component.lower() == "mimic":
+        component = "face"
+    return component
+
+
+def _resolve_scratch_action(context, armature_obj):
+    scene = getattr(context, "scene", None)
+    action_name = str(getattr(scene, "witcher_cutscene_scratch_action_name", "") or "").strip() if scene else ""
+    if action_name:
+        return bpy.data.actions.get(action_name)
+    source_mode = getattr(scene, "witcher_w3_anim_source", "NLA") if scene else "NLA"
+    action, _info = export_anims.resolve_action(
+        armature_obj,
+        context=context,
+        source_mode=source_mode,
+        prefer_tracks=("anim_import",),
+    )
+    return action
+
+
+def _scratch_action_group_name(action, armature_obj, component):
+    """Return the group name for a new cutscene strip.
+
+    If the target armature already has strips on the cutscene_anim track,
+    reuse their group name so the new strip joins the same multipart animation.
+    Otherwise, use the action name.
+    """
+    track_name = _scratch_track_name_for_component(component or SCRATCH_CUTSCENE_ROOT_COMPONENT)
+    anim_data = getattr(armature_obj, "animation_data", None)
+    if anim_data is not None:
+        for track in getattr(anim_data, "nla_tracks", []) or []:
+            if str(getattr(track, "name", "") or "") != track_name:
+                continue
+            for strip in getattr(track, "strips", []) or []:
+                strip_action = getattr(strip, "action", None)
+                if strip_action is None:
+                    continue
+                stored = str(strip_action.get(export_cutscene.CUTSCENE_ANIMATION_NAME_PROP, "") or "").strip()
+                if stored and stored.count(":") >= 2:
+                    # format is actor:component:group_name — extract the last part
+                    return stored.split(":", 2)[2]
+    return str(getattr(action, "name", "") or "").strip() or "cutscene"
+
+
+def _import_strip_group_name(action, strip):
+    stored = str(action.get(export_cutscene.CUTSCENE_ANIMATION_NAME_PROP, "") or "").strip() if action is not None else ""
+    if stored and stored.count(":") >= 2:
+        return stored.split(":", 2)[2]
+    strip_name = str(getattr(strip, "name", "") or "").strip()
+    if strip_name:
+        return strip_name
+    return str(getattr(action, "name", "") or "").strip() or "cutscene"
+
+
+def _ensure_cutscene_animation_list_entry(scene, actor_name, component, group_name, action, fps=None):
+    if scene is None:
+        return None
+    anims = list(getattr(scene, "witcher_cutscene_animation_items", []))
+    if not any(int(getattr(a, "source_index", -2)) == -1 for a in anims):
+        sentinel = scene.witcher_cutscene_animation_items.add()
+        sentinel.source_index = -1
+        sentinel.full_name = "Cutscene"
+        sentinel.display_name = "Cutscene"
+        anims = list(getattr(scene, "witcher_cutscene_animation_items", []))
+
+    full_name = export_anims._compose_cutscene_animation_name(actor_name, component, group_name)
+    existing = next(
+        (a for a in anims
+         if str(getattr(a, "full_name", "") or "") == full_name
+         and int(getattr(a, "source_index", -2)) >= 0),
+        None,
+    )
+    if existing is not None:
+        existing.is_loaded = True
+        return existing
+
+    new_src_idx = max(
+        (int(getattr(a, "source_index", -1)) for a in anims if int(getattr(a, "source_index", -1)) >= 0),
+        default=0,
+    ) + 1
+    item = scene.witcher_cutscene_animation_items.add()
+    item.source_index = new_src_idx
+    item.full_name = full_name or getattr(action, "name", "")
+    item.display_name = group_name or getattr(action, "name", "")
+    item.actor_name = actor_name
+    item.component_name = component
+    item.is_loaded = True
+    try:
+        fr_start, fr_end = action.frame_range
+        item.num_frames = max(1, int(round(fr_end - fr_start)))
+    except Exception:
+        item.num_frames = 0
+    if fps is None:
+        render = getattr(scene, "render", None)
+        fps = float(getattr(render, "fps", 30.0) or 30.0)
+    item.frames_per_second = float(fps or 30.0)
+    item.duration = item.num_frames / item.frames_per_second if item.frames_per_second else 0.0
+    return item
+
+
+def _action_frame_range(action):
+    try:
+        start, end = action.frame_range
+        start = float(start)
+        end = float(end)
+    except Exception:
+        start, end = 0.0, 1.0
+    if end < start:
+        end = start + 1.0
+    return start, end
+
+
+def _copy_action_for_cutscene(action, actor_name, component, group_name):
+    if action is None:
+        return None
+    try:
+        cutscene_action = action.copy()
+    except Exception:
+        return action
+    name_parts = [
+        str(actor_name or "").strip(),
+        str(component or "").strip(),
+        str(group_name or getattr(action, "name", "") or "cutscene").strip(),
+        "cutscene",
+    ]
+    cutscene_action.name = "_".join(part.replace(":", "_").replace("\\", "_").replace("/", "_") for part in name_parts if part)
+    return cutscene_action
+
+
+def _scratch_track_name_for_component(component):
+    return SCRATCH_CUTSCENE_FACE_TRACK_NAME if str(component or "").strip().lower() == "face" else SCRATCH_CUTSCENE_TRACK_NAME
+
+
+def _find_or_create_cutscene_track(armature_obj, track_name):
+    anim_data = armature_obj.animation_data_create()
+    track = anim_data.nla_tracks.get(track_name)
+    if track is None:
+        track = anim_data.nla_tracks.new()
+        track.name = track_name
+    return track
+
+
+def _new_cutscene_edit_track(armature_obj, track_name):
+    anim_data = armature_obj.animation_data_create()
+    track = anim_data.nla_tracks.new()
+    track.name = f"{track_name}_edits"
+    return track
+
+
+def _resolve_scratch_strip_start(context, armature_obj, track_name):
+    scene = getattr(context, "scene", None)
+    start = float(getattr(scene, "frame_current", 0.0) if scene else 0.0)
+    if not bool(getattr(scene, "witcher_cutscene_scratch_add_after_last", False)):
+        return start
+
+    anim_data = getattr(armature_obj, "animation_data", None)
+    if anim_data is None:
+        return start
+    last_end = None
+    for track in getattr(anim_data, "nla_tracks", []) or []:
+        if str(getattr(track, "name", "") or "") != track_name:
+            continue
+        for strip in getattr(track, "strips", []) or []:
+            strip_end = float(getattr(strip, "frame_end", start) or start)
+            last_end = strip_end if last_end is None else max(last_end, strip_end)
+    return max(start, last_end) if last_end is not None else start
+
+
+def _tag_action_for_cutscene(action, actor_name, component, group_name):
+    if action is None:
+        return ""
+    anim_name = export_anims._compose_cutscene_animation_name(actor_name, component, group_name)
+    action[export_cutscene.CUTSCENE_ANIMATION_NAME_PROP] = anim_name
+    action[export_cutscene.CUTSCENE_SOURCE_PATH_PROP] = ""
+    action[export_cutscene.CUTSCENE_SOURCE_INDEX_PROP] = -1
+    return anim_name
+
+
+def _create_cutscene_action_strip(context, armature_obj, action, actor_name, component,
+                                  start_frame=None, strip_length=None, group_name=""):
+    if armature_obj is None or action is None:
+        return None, None
+    component = component or SCRATCH_CUTSCENE_ROOT_COMPONENT
+    group_name = group_name or str(getattr(action, "name", "") or "cutscene")
+    action = _copy_action_for_cutscene(action, actor_name, component, group_name)
+    _tag_action_for_cutscene(action, actor_name, component, group_name)
+
+    track_name = _scratch_track_name_for_component(component)
+    action_start, action_end = _action_frame_range(action)
+    default_length = max(1.0, action_end - action_start)
+    length = max(1.0, float(strip_length or default_length))
+    scene_start = float(start_frame) if start_frame is not None else _resolve_scratch_strip_start(context, armature_obj, track_name)
+    scene_end = scene_start + length
+    strip_name = group_name if group_name else action.name
+
+    def _create_on_track(track):
+        strip = track.strips.new(strip_name, int(round(scene_start)), action)
+        strip.frame_start = scene_start
+        strip.frame_end = scene_end
+        strip.blend_type = 'COMBINE'
+        if hasattr(strip, "extrapolation"):
+            try:
+                strip.extrapolation = 'NOTHING'
+            except Exception:
+                pass
+        _set_strip_action_range(strip, action_start=action_start, action_end=action_start + length)
+        bind_strip_action_slot(strip, resolve_action_slot(action, target=armature_obj, ensure=True))
+        return track, strip
+
+    preferred_track = _find_or_create_cutscene_track(armature_obj, track_name)
+    try:
+        return _create_on_track(preferred_track)
+    except RuntimeError:
+        return _create_on_track(_new_cutscene_edit_track(armature_obj, track_name))
+
+
+def _action_has_fcurves(action, target=None):
+    return bool(tuple(iter_action_fcurves(action, target=target))) if action is not None else False
+
+
+def _cutscene_actor_roots(scene):
+    try:
+        return list(export_cutscene._collect_cutscene_actor_roots(scene))
+    except Exception:
+        return []
+
+
+def _cutscene_nla_entries(context):
+    try:
+        return list(export_cutscene._collect_cutscene_nla_entries(context))
+    except Exception:
+        return []
+
+
+def _scratch_validation_lines(context):
+    scene = getattr(context, "scene", None)
+    actors = _cutscene_actor_roots(scene)
+    entries = _cutscene_nla_entries(context)
+    errors = []
+    warnings = []
+
+    if not actors:
+        errors.append("No cutscene actors are assigned.")
+
+    cameras = [
+        actor for actor in actors
+        if str(actor.get("cutscene_actor_type", "") or "") == "CAT_Camera"
+        or str(actor.get("cutscene_actor_name", "") or "").strip().lower() == "camera"
+        or _is_camera_armature(actor)
+    ]
+    camera = cameras[0] if cameras else None
+    if camera is None:
+        errors.append("No cutscene camera actor is assigned.")
+    else:
+        if not _is_camera_armature(camera):
+            errors.append(f"Camera actor '{camera.name}' is missing Camera_Node.")
+        camera_cuts = _iter_camera_cut_strips(camera)
+        if not camera_cuts:
+            errors.append("Camera has no cutscene NLA strips.")
+        else:
+            for _track, strip in camera_cuts:
+                action = getattr(strip, "action", None)
+                if action is None:
+                    errors.append(f"Camera strip '{strip.name}' has no action.")
+                    continue
+                if not _action_has_fcurves(action, target=camera):
+                    errors.append(f"Camera action '{action.name}' has no keyed channels.")
+            markers = [marker for marker in getattr(scene, "timeline_markers", []) if _is_camera_cut_marker(marker)]
+            if markers and len(markers) != len(camera_cuts):
+                warnings.append(f"Camera marker count ({len(markers)}) does not match camera cuts ({len(camera_cuts)}).")
+
+    entries_by_actor = {}
+    for entry in entries:
+        entries_by_actor.setdefault(str(entry.get("actor_name", "") or ""), []).append(entry)
+
+    for actor in actors:
+        actor_name = str(actor.get("cutscene_actor_name", "") or "").strip()
+        actor_type = str(actor.get("cutscene_actor_type", "") or "").strip()
+        if not actor_name:
+            errors.append(f"Actor object '{actor.name}' has no cutscene actor name.")
+        if not _resolve_actor_template_path(actor):
+            warnings.append(f"Actor '{actor_name or actor.name}' has no entity template path.")
+        if actor_type not in {"CAT_None", "CAT_Actor", "CAT_Prop", "CAT_Camera"}:
+            errors.append(f"Actor '{actor_name or actor.name}' has invalid actor type '{actor_type}'.")
+        if actor_type != "CAT_Camera":
+            skeleton_path = export_cutscene._resolve_cutscene_skeleton_path(actor, SCRATCH_CUTSCENE_ROOT_COMPONENT, scene=scene)
+            if not skeleton_path:
+                errors.append(f"Actor '{actor_name or actor.name}' has no body skeleton path.")
+            if not entries_by_actor.get(actor_name):
+                warnings.append(f"Actor '{actor_name or actor.name}' has no cutscene animation strips.")
+            if actor_type == "CAT_Actor" and not getattr(getattr(actor, "pose", None), "bones", {}).get("Trajectory"):
+                warnings.append(f"Actor '{actor_name or actor.name}' has no Trajectory bone.")
+        if bool(actor.get("cutscene_actor_use_mimic", False)):
+            mimic_name = str(actor.get("mimicFace", "") or "").strip()
+            mimic_obj = bpy.data.objects.get(mimic_name) if mimic_name else None
+            if getattr(mimic_obj, "type", None) != 'ARMATURE':
+                warnings.append(f"Actor '{actor_name or actor.name}' is marked mimic but has no face armature.")
+
+    for entry in entries:
+        action = entry.get("action")
+        strip_name = str(entry.get("strip_name", "") or "")
+        if action is None:
+            errors.append(f"Cutscene strip '{strip_name}' has no action.")
+        elif not _action_has_fcurves(action, target=entry.get("armature_obj")):
+            warnings.append(f"Action '{action.name}' has no keyed channels.")
+        if float(entry.get("strip_frame_end", 0.0) or 0.0) <= float(entry.get("strip_frame_start", 0.0) or 0.0):
+            errors.append(f"Cutscene strip '{strip_name}' has zero or negative duration.")
+
+    summary = [
+        f"Actors: {len(actors)}",
+        f"Animation strips: {len(entries)}",
+        f"Camera cuts: {len(_iter_camera_cut_strips(camera)) if camera is not None else 0}",
+    ]
+    lines = ["OK " + ", ".join(summary)] if not errors else ["ERROR " + ", ".join(summary)]
+    lines.extend(f"ERROR {line}" for line in errors)
+    lines.extend(f"WARN {line}" for line in warnings)
+    return lines, errors, warnings
+
+
+def _key_pose_bone_transform(pose_bone, frame):
+    pose_bone.keyframe_insert(data_path="location", frame=frame)
+    if pose_bone.rotation_mode == 'QUATERNION':
+        pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+    elif pose_bone.rotation_mode == 'AXIS_ANGLE':
+        pose_bone.keyframe_insert(data_path="rotation_axis_angle", frame=frame)
+    else:
+        pose_bone.keyframe_insert(data_path="rotation_euler", frame=frame)
+    pose_bone.keyframe_insert(data_path="scale", frame=frame)
+
+
+def _bake_camera_rig_action_from_scene(context, camera_armature, scene_start, scene_end, action_name):
+    scene = getattr(context, "scene", None)
+    if scene is None or camera_armature is None:
+        return None
+    pose_bones = getattr(getattr(camera_armature, "pose", None), "bones", None)
+    if not pose_bones:
+        return None
+
+    scene_start = int(round(float(scene_start)))
+    scene_end = int(round(float(scene_end)))
+    if scene_end <= scene_start:
+        return None
+
+    previous_frame = scene.frame_current
+    bone_names = [bone.name for bone in pose_bones]
+    samples = []
+    try:
+        for scene_frame in range(scene_start, scene_end + 1):
+            scene.frame_set(scene_frame)
+            context.view_layer.update()
+            camera_bone = pose_bones.get(CAMERA_CONTROL_BONE)
+            track_values = {}
+            if camera_bone is not None:
+                for track_name in CAMERA_TRACK_NAMES:
+                    try:
+                        track_values[track_name] = float(camera_bone.get(track_name, 0.0))
+                    except Exception:
+                        track_values[track_name] = 0.0
+            samples.append({
+                "frame": scene_frame,
+                "bone_matrices": {
+                    bone_name: pose_bone.matrix.copy()
+                    for bone_name in bone_names
+                    for pose_bone in (pose_bones.get(bone_name),)
+                    if pose_bone is not None
+                },
+                "tracks": track_values,
+            })
+    finally:
+        scene.frame_set(previous_frame)
+        context.view_layer.update()
+
+    action = bpy.data.actions.new(action_name)
+    anim_data = camera_armature.animation_data_create()
+    previous_action = getattr(anim_data, "action", None)
+    try:
+        assign_action(camera_armature, action)
+        for sample in samples:
+            local_frame = int(sample["frame"] - scene_start)
+            for bone_name, matrix in sample["bone_matrices"].items():
+                pose_bone = pose_bones.get(bone_name)
+                if pose_bone is None:
+                    continue
+                pose_bone.matrix = matrix
+                _key_pose_bone_transform(pose_bone, local_frame)
+            camera_bone = pose_bones.get(CAMERA_CONTROL_BONE)
+            if camera_bone is not None:
+                for track_name, value in sample["tracks"].items():
+                    camera_bone[track_name] = value
+                    camera_bone.keyframe_insert(data_path=f'["{track_name}"]', frame=local_frame)
+    finally:
+        if previous_action is not None:
+            assign_action(camera_armature, previous_action)
+        else:
+            anim_data.action = None
+    return action
+
+
+def _bake_camera_rig_action_from_camera(context, camera_armature, camera_obj, scene_start, scene_end, action_name):
+    scene = getattr(context, "scene", None)
+    if scene is None or camera_armature is None or getattr(camera_obj, "type", None) != 'CAMERA':
+        return None
+    pose_bones = getattr(getattr(camera_armature, "pose", None), "bones", None)
+    if not pose_bones:
+        return None
+
+    scene_start = int(round(float(scene_start)))
+    scene_end = int(round(float(scene_end)))
+    if scene_end <= scene_start:
+        return None
+
+    previous_frame = scene.frame_current
+    samples = []
+    camera_bone = ensure_camera_track_properties(camera_armature, track_names=CAMERA_TRACK_NAMES)
+    preview_camera = find_camera_preview_object(camera_armature)
+    camera_offset = None
+    try:
+        scene.frame_set(scene_start)
+        context.view_layer.update()
+        _clear_camera_preview_drivers(camera_obj)
+        edit_world = _pose_bone_world_matrix(camera_armature, CAMERA_EDIT_BONE)
+        if edit_world is not None and preview_camera is not None:
+            try:
+                camera_offset = edit_world.inverted() @ preview_camera.matrix_world
+            except Exception:
+                camera_offset = None
+        for scene_frame in range(scene_start, scene_end + 1):
+            scene.frame_set(scene_frame)
+            context.view_layer.update()
+            track_values = {}
+            if camera_bone is not None:
+                try:
+                    camera_bone["hctFOV"] = math.degrees(float(camera_obj.data.angle_y))
+                except Exception:
+                    pass
+                set_camera_dof_from_blender_camera(camera_bone, camera_obj)
+                for track_name in CAMERA_TRACK_NAMES:
+                    try:
+                        track_values[track_name] = float(camera_bone.get(track_name, 0.0))
+                    except Exception:
+                        track_values[track_name] = 0.0
+            samples.append({
+                "frame": scene_frame,
+                "matrix_world": camera_obj.matrix_world.copy(),
+                "tracks": track_values,
+            })
+    finally:
+        scene.frame_set(previous_frame)
+        context.view_layer.update()
+
+    action = bpy.data.actions.new(action_name)
+    anim_data = camera_armature.animation_data_create()
+    previous_action = getattr(anim_data, "action", None)
+    try:
+        assign_action(camera_armature, action)
+        edit_bone = pose_bones.get(CAMERA_EDIT_BONE) or pose_bones.get(CAMERA_CONTROL_BONE)
+        camera_bone = ensure_camera_track_properties(camera_armature, track_names=CAMERA_TRACK_NAMES)
+        for sample in samples:
+            local_frame = int(sample["frame"] - scene_start)
+            if edit_bone is not None:
+                desired_world = sample["matrix_world"]
+                if camera_offset is not None:
+                    try:
+                        desired_world = desired_world @ camera_offset.inverted()
+                    except Exception:
+                        desired_world = sample["matrix_world"]
+                keyed_bone = _set_pose_bone_world_matrix(camera_armature, edit_bone.name, desired_world)
+                _key_pose_bone_transform(keyed_bone or edit_bone, local_frame)
+            if camera_bone is not None:
+                for track_name, value in sample["tracks"].items():
+                    camera_bone[track_name] = value
+                    camera_bone.keyframe_insert(data_path=f'["{track_name}"]', frame=local_frame)
+    finally:
+        if previous_action is not None:
+            assign_action(camera_armature, previous_action)
+        else:
+            anim_data.action = None
+    return action
+
+
+class WITCH_OT_CameraSetupPreview(bpy.types.Operator):
+    """Set up a Blender camera lens driver from the Witcher hctFOV track"""
+    bl_idname = "witcher.camera_setup_preview"
+    bl_label = "Setup Preview Camera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        armature_obj = _find_camera_armature(context)
+        return armature_obj is not None and getattr(armature_obj, "type", None) == 'ARMATURE'
+
+    def execute(self, context):
+        armature_obj = _find_camera_armature(context)
+        if armature_obj is None:
+            self.report({'WARNING'}, "No camera armature selected.")
+            return {'CANCELLED'}
+
+        camera_obj = find_camera_preview_object(armature_obj)
+        active_obj = getattr(context, "active_object", None)
+        if camera_obj is None and getattr(active_obj, "type", None) == 'CAMERA':
+            camera_obj = active_obj
+        if camera_obj is None:
+            self.report({'WARNING'}, "No Blender camera found under the camera rig.")
+            return {'CANCELLED'}
+
+        if not setup_camera_preview_drivers(armature_obj, camera_obj):
+            self.report({'WARNING'}, "Could not set up the camera preview drivers.")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Linked {camera_obj.name} lens and DOF to Camera_Node tracks.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraSetSceneCamera(bpy.types.Operator):
+    """Use the imported Witcher camera object as the Blender scene camera"""
+    bl_idname = "witcher.camera_set_scene_camera"
+    bl_label = "Set Scene Camera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        camera_armature = _find_camera_armature(context)
+        camera_obj = find_camera_preview_object(camera_armature)
+        if camera_obj is None:
+            self.report({'WARNING'}, "No Blender camera found under the camera rig.")
+            return {'CANCELLED'}
+        context.scene.camera = camera_obj
+        setup_camera_preview_drivers(camera_armature, camera_obj)
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraKeyRigFromSceneCamera(bpy.types.Operator):
+    """Key the Witcher camera rig from the active Blender camera"""
+    bl_idname = "witcher.camera_key_rig_from_scene_camera"
+    bl_label = "Key Rig From Scene Camera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        camera_armature = _find_camera_armature(context)
+        camera_obj = _resolve_native_camera_target(context, camera_armature)
+        if camera_obj is None or getattr(camera_obj, "type", None) != 'CAMERA':
+            self.report({'WARNING'}, "No Blender camera available.")
+            return {'CANCELLED'}
+        if camera_obj == find_camera_preview_object(camera_armature):
+            self.report({'WARNING'}, "Use a separate Blender camera when keying the rig from camera view.")
+            return {'CANCELLED'}
+
+        cuts = _iter_camera_cut_strips(camera_armature)
+        cut_index = _current_camera_cut_index(context, camera_armature, cuts)
+        target_action = None
+        key_frame = None
+        if cut_index >= 0:
+            _track, strip = cuts[cut_index]
+            target_action = getattr(strip, "action", None)
+            key_frame = _strip_scene_frame_to_action_frame(strip, context.scene.frame_current)
+
+        if not _key_rig_from_camera(
+            context,
+            camera_armature,
+            camera_obj,
+            insert_key=True,
+            key_frame=key_frame,
+            target_action=target_action,
+        ):
+            self.report({'WARNING'}, "Could not key the camera rig.")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraBakeCutFromSceneCamera(bpy.types.Operator):
+    """Bake the current camera cut from the active Blender camera to the Witcher camera rig"""
+    bl_idname = "witcher.camera_bake_cut_from_scene_camera"
+    bl_label = "Bake Cut From Scene Camera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        camera_armature = _find_camera_armature(context)
+        camera_obj = _resolve_native_camera_target(context, camera_armature)
+        if camera_obj is None or getattr(camera_obj, "type", None) != 'CAMERA':
+            self.report({'WARNING'}, "No Blender camera available.")
+            return {'CANCELLED'}
+        if camera_obj == find_camera_preview_object(camera_armature):
+            self.report({'WARNING'}, "Use a separate Blender camera when baking the rig from camera view.")
+            return {'CANCELLED'}
+
+        cuts = _iter_camera_cut_strips(camera_armature)
+        cut_index = _current_camera_cut_index(context, camera_armature, cuts)
+        if cut_index < 0:
+            self.report({'WARNING'}, "No camera cut strip found.")
+            return {'CANCELLED'}
+
+        _track, strip = cuts[cut_index]
+        target_action = getattr(strip, "action", None)
+        start = int(round(float(strip.frame_start)))
+        end = int(round(float(strip.frame_end)))
+        previous_frame = scene.frame_current
+        try:
+            for frame in range(start, end + 1):
+                scene.frame_set(frame)
+                context.view_layer.update()
+                _key_rig_from_camera(
+                    context,
+                    camera_armature,
+                    camera_obj,
+                    insert_key=True,
+                    key_frame=_strip_scene_frame_to_action_frame(strip, frame),
+                    target_action=target_action,
+                )
+        finally:
+            scene.frame_set(previous_frame)
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraCutJump(bpy.types.Operator):
+    """Jump between imported camera cut strips"""
+    bl_idname = "witcher.camera_cut_jump"
+    bl_label = "Jump Cut"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: EnumProperty(
+        name="Direction",
+        items=[
+            ('PREV', "Previous", ""),
+            ('CURRENT', "Current", ""),
+            ('NEXT', "Next", ""),
+        ],
+        default='CURRENT',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        camera_armature = _find_camera_armature(context)
+        cuts = _iter_camera_cut_strips(camera_armature)
+        if not cuts:
+            self.report({'WARNING'}, "No camera cut strips found.")
+            return {'CANCELLED'}
+
+        idx = _current_camera_cut_index(context, camera_armature, cuts)
+        if self.direction == 'PREV':
+            idx = max(0, idx - 1)
+        elif self.direction == 'NEXT':
+            idx = min(len(cuts) - 1, idx + 1)
+        idx = max(0, min(idx, len(cuts) - 1))
+
+        track, strip = cuts[idx]
+        _select_nla_strip(track, strip)
+        context.scene.frame_set(int(round(float(strip.frame_start))))
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraCutResize(bpy.types.Operator):
+    """Resize the current camera cut strip and ripple later cutscene strips"""
+    bl_idname = "witcher.camera_cut_resize"
+    bl_label = "Resize Cut"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    delta: IntProperty(
+        name="Frames",
+        default=1,
+    )
+    ripple: BoolProperty(
+        name="Ripple",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        camera_armature = _find_camera_armature(context)
+        cuts = _iter_camera_cut_strips(camera_armature)
+        cut_index = _current_camera_cut_index(context, camera_armature, cuts)
+        if cut_index < 0:
+            self.report({'WARNING'}, "No camera cut strip found.")
+            return {'CANCELLED'}
+
+        track, strip = cuts[cut_index]
+        old_end = float(strip.frame_end)
+        min_end = float(strip.frame_start) + 1.0
+        new_end = max(min_end, old_end + int(self.delta))
+        actual_delta = new_end - old_end
+        if abs(actual_delta) <= 1e-6:
+            return {'CANCELLED'}
+
+        strip.frame_end = new_end
+        if self.ripple:
+            _move_cutscene_strips_after(scene, old_end, actual_delta, skip_strip=strip)
+        _select_nla_strip(track, strip)
+        scene.frame_set(int(round(float(strip.frame_start))))
+        _sync_camera_cut_markers(scene, camera_armature)
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraCutSplit(bpy.types.Operator):
+    """Split the current camera cut strip at the playhead"""
+    bl_idname = "witcher.camera_cut_split"
+    bl_label = "Cut"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        camera_armature = _find_camera_armature(context)
+        cuts = _iter_camera_cut_strips(camera_armature)
+        cut_index = _current_camera_cut_index(context, camera_armature, cuts)
+        if cut_index < 0:
+            self.report({'WARNING'}, "No camera cut strip found.")
+            return {'CANCELLED'}
+
+        track, strip = cuts[cut_index]
+        action = getattr(strip, "action", None)
+        if action is None:
+            self.report({'WARNING'}, "Current camera cut has no action.")
+            return {'CANCELLED'}
+
+        split_frame = float(scene.frame_current)
+        old_start = float(strip.frame_start)
+        old_end = float(strip.frame_end)
+        if split_frame <= old_start + 1e-4 or split_frame >= old_end - 1e-4:
+            self.report({'WARNING'}, "Move the playhead inside the cut, not on its boundary.")
+            return {'CANCELLED'}
+
+        split_action_frame = _strip_scene_frame_to_action_frame(strip, split_frame)
+        old_action_end = float(getattr(strip, "action_frame_end", split_action_frame) or split_action_frame)
+        strip_settings = _strip_settings_snapshot(strip)
+
+        strip.frame_end = split_frame
+        _set_strip_action_range(strip, action_end=split_action_frame)
+        new_track, new_strip = _create_camera_cut_strip(
+            camera_armature,
+            track,
+            f"{strip.name}_cut",
+            split_frame,
+            old_end,
+            action,
+            action_start=split_action_frame,
+            action_end=old_action_end,
+            settings=strip_settings,
+        )
+
+        _linearize_action_keys_near_frame(action, split_action_frame, radius=2.0, target=camera_armature)
+        _select_nla_strip(new_track, new_strip)
+        _sync_camera_cut_markers(scene, camera_armature)
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraCutCombine(bpy.types.Operator):
+    """Combine adjacent camera cut strips into one baked camera action"""
+    bl_idname = "witcher.camera_cut_combine"
+    bl_label = "Combine"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        camera_armature = _find_camera_armature(context)
+        selected_cuts = _camera_cut_selection_for_combine(context, camera_armature)
+        if len(selected_cuts) < 2:
+            self.report({'WARNING'}, "Select adjacent camera cuts or place the playhead before the next cut.")
+            return {'CANCELLED'}
+        if not _validate_adjacent_camera_cuts(selected_cuts):
+            self.report({'WARNING'}, "Camera cuts must be adjacent.")
+            return {'CANCELLED'}
+
+        first_track, first_strip = selected_cuts[0]
+        scene_start = float(first_strip.frame_start)
+        scene_end = float(selected_cuts[-1][1].frame_end)
+        strip_settings = _strip_settings_snapshot(first_strip)
+        action_name = f"{camera_armature.name}_camera_combined_{int(round(scene_start))}_{int(round(scene_end))}"
+        action = _bake_camera_rig_action_from_scene(
+            context,
+            camera_armature,
+            scene_start,
+            scene_end,
+            action_name,
+        )
+        if action is None:
+            self.report({'WARNING'}, "Could not bake combined camera cut action.")
+            return {'CANCELLED'}
+
+        for track, strip in reversed(selected_cuts):
+            track.strips.remove(strip)
+
+        new_track, new_strip = _create_camera_cut_strip(
+            camera_armature,
+            first_track,
+            action.name,
+            scene_start,
+            scene_end,
+            action,
+            action_start=0.0,
+            action_end=max(1.0, scene_end - scene_start),
+            settings=strip_settings,
+        )
+        _select_nla_strip(new_track, new_strip)
+        scene.frame_set(int(round(scene_start)))
+        _sync_camera_cut_markers(scene, camera_armature)
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraCutSyncMarkers(bpy.types.Operator):
+    """Create timeline markers from the current camera cut NLA strips"""
+    bl_idname = "witcher.camera_cut_sync_markers"
+    bl_label = "Sync Markers"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        camera_armature = _find_camera_armature(context)
+        count = _sync_camera_cut_markers(context.scene, camera_armature)
+        self.report({'INFO'}, f"Synced {count} camera cut markers.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraCutApplyMarkers(bpy.types.Operator):
+    """Apply moved timeline markers back to camera cut NLA strips"""
+    bl_idname = "witcher.camera_cut_apply_markers"
+    bl_label = "Apply Markers"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        camera_armature = _find_camera_armature(context)
+        count = _apply_camera_cut_markers_to_strips(context.scene, camera_armature)
+        if not count:
+            self.report({'WARNING'}, "Camera marker count does not match camera cut count.")
+            return {'CANCELLED'}
+        _sync_camera_cut_markers(context.scene, camera_armature)
+        self.report({'INFO'}, f"Applied {count} camera cut markers.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraSetDofFromSelected(bpy.types.Operator):
+    """Set Witcher DOF tracks from the distance to the active selected object or bone"""
+    bl_idname = "witcher.camera_set_dof_from_selected"
+    bl_label = "DOF From Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    keyframe: BoolProperty(
+        name="Keyframe",
+        default=True,
+        description="Insert keyframes on the DOF tracks at the current frame",
+    )
+    far_distance_factor: FloatProperty(
+        name="Far Blur",
+        default=5.0,
+        min=0.0,
+    )
+    near_distance_factor: FloatProperty(
+        name="Near Blur",
+        default=0.5,
+        min=0.0,
+    )
+    far_focus_factor: FloatProperty(
+        name="Far Focus",
+        default=1.0,
+        min=0.0,
+    )
+    near_focus_factor: FloatProperty(
+        name="Near Focus",
+        default=0.5,
+        min=0.0,
+    )
+    intensity: FloatProperty(
+        name="Intensity",
+        default=1.0,
+        min=0.0,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        armature_obj = _find_camera_armature(context)
+        return armature_obj is not None and getattr(armature_obj, "type", None) == 'ARMATURE'
+
+    def execute(self, context):
+        armature_obj = _find_camera_armature(context)
+        camera_bone = ensure_camera_track_properties(armature_obj, track_names=CAMERA_TRACK_NAMES)
+        if camera_bone is None:
+            self.report({'WARNING'}, "No Camera_Node bone found on the selected armature.")
+            return {'CANCELLED'}
+
+        camera_pos = _camera_bone_world_position(armature_obj)
+        target_pos = _selected_camera_dof_target_position(context, armature_obj)
+        if camera_pos is None or target_pos is None:
+            self.report({'WARNING'}, "Select a target object or pose bone to set camera DOF.")
+            return {'CANCELLED'}
+
+        distance = (target_pos - camera_pos).length
+        set_camera_dof_from_distance(
+            camera_bone,
+            distance,
+            far_distance_factor=self.far_distance_factor,
+            near_distance_factor=self.near_distance_factor,
+            far_focus_factor=self.far_focus_factor,
+            near_focus_factor=self.near_focus_factor,
+            override=1.0,
+            intensity=self.intensity,
+        )
+        if self.keyframe:
+            frame = getattr(getattr(context, "scene", None), "frame_current", None)
+            if frame is not None:
+                target_action = None
+                cuts = _iter_camera_cut_strips(armature_obj)
+                cut_index = _current_camera_cut_index(context, armature_obj, cuts)
+                if cut_index >= 0:
+                    _track, strip = cuts[cut_index]
+                    target_action = getattr(strip, "action", None)
+                    frame = _strip_scene_frame_to_action_frame(strip, frame)
+
+                anim_data = armature_obj.animation_data_create()
+                previous_action = getattr(anim_data, "action", None)
+                if target_action is not None:
+                    anim_data.action = target_action
+                try:
+                    for track_name in CAMERA_DOF_TRACK_NAMES:
+                        camera_bone.keyframe_insert(data_path=f'["{track_name}"]', frame=frame)
+                finally:
+                    if target_action is not None:
+                        anim_data.action = previous_action
+        self.report({'INFO'}, f"Set camera DOF from distance {distance:.3f}.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraConvertCutsToBlenderCameras(bpy.types.Operator):
+    """Create a Blender camera for each NLA cut strip by baking the rig's animation onto it.
+    Tag each camera with the strip name so it can be applied back with 'Blender Cams → Rig'."""
+    bl_idname = "witcher.camera_convert_cuts_to_blender_cameras"
+    bl_label = "Cuts → Blender Cameras"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        camera_armature = _find_camera_armature(context)
+        if camera_armature is None:
+            self.report({'WARNING'}, "No Witcher camera rig found.")
+            return {'CANCELLED'}
+
+        preview_camera = find_camera_preview_object(camera_armature)
+        cuts = _iter_camera_cut_strips(camera_armature)
+        if not cuts:
+            self.report({'WARNING'}, "No camera cut NLA strips found.")
+            return {'CANCELLED'}
+
+        camera_bone = ensure_camera_track_properties(camera_armature, track_names=CAMERA_TRACK_NAMES)
+        previous_frame = scene.frame_current
+        created = []
+        try:
+            for _track, strip in cuts:
+                strip_name = str(getattr(strip, "name", "") or "")
+                cam_name = f"BlenderCam_{strip_name}" if strip_name else f"BlenderCam_{len(created) + 1:02d}"
+
+                cam_data = bpy.data.cameras.new(name=cam_name)
+                cam_data.sensor_fit = 'VERTICAL'
+                cam_data.sensor_height = CAMERA_SENSOR_HEIGHT
+                cam_data.lens_unit = 'FOV'
+
+                cam_obj = bpy.data.objects.new(name=cam_name, object_data=cam_data)
+                cam_obj["witcher_cut_strip_name"] = strip_name
+                scene.collection.objects.link(cam_obj)
+                created.append(cam_obj)
+
+                start = int(round(float(strip.frame_start)))
+                end = int(round(float(strip.frame_end)))
+
+                for frame in range(start, end + 1):
+                    scene.frame_set(frame)
+                    context.view_layer.update()
+
+                    world_mat = None
+                    if preview_camera is not None:
+                        world_mat = preview_camera.matrix_world.copy()
+                    else:
+                        world_mat = _pose_bone_world_matrix(camera_armature, CAMERA_EDIT_BONE)
+
+                    if world_mat is not None:
+                        cam_obj.matrix_world = world_mat
+
+                    if camera_bone is not None and "hctFOV" in camera_bone:
+                        cam_data.lens = fov_to_lens(float(camera_bone["hctFOV"]))
+
+                    cam_obj.keyframe_insert("location", frame=frame)
+                    cam_obj.keyframe_insert("rotation_euler", frame=frame)
+                    cam_data.keyframe_insert("lens", frame=frame)
+        finally:
+            scene.frame_set(previous_frame)
+
+        self.report({'INFO'}, f"Created {len(created)} Blender camera(s) from cuts.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CameraApplyBlenderCamerasToRig(bpy.types.Operator):
+    """Bake Blender shot cameras onto the Witcher camera rig.
+
+    Primary path: reads cameras bound to timeline markers via 'New Shot'.
+    Auto-imports the Witcher camera rig if not yet in the scene.
+    Legacy path: cameras tagged with 'witcher_cut_strip_name' (from Cuts → Blender Cams)."""
+    bl_idname = "witcher.camera_apply_blender_cameras_to_rig"
+    bl_label = "Shots → Rig"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        scene = getattr(context, "scene", None)
+        if scene is None:
+            return False
+        has_shots = any(
+            obj.get("witcher_shot_index") is not None
+            for obj in scene.objects
+            if getattr(obj, "type", None) == 'CAMERA'
+        )
+        return has_shots or _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        shots = _iter_shot_markers(scene)
+        if shots:
+            return self._apply_shots(context, shots)
+        return self._apply_tagged_cameras(context)
+
+    def _apply_shots(self, context, shots):
+        scene = context.scene
+        camera_armature = _find_camera_armature(context)
+        if camera_armature is None:
+            camera_armature = _import_cutscene_camera_rig(context)
+            if camera_armature is None:
+                self.report({'ERROR'}, "Could not find or import the Witcher camera rig. Set the entity path in the Camera tab.")
+                return {'CANCELLED'}
+
+        if not str(camera_armature.get("cutscene_actor_name", "") or "").strip():
+            _tag_scratch_cutscene_actor(
+                camera_armature,
+                actor_name="Camera",
+                template_path=getattr(scene, "witcher_cutscene_scratch_camera_repo_path", "") or SCRATCH_CAMERA_DEFAULT_REPO_PATH,
+                actor_type="CAT_Camera",
+                appearance="",
+                use_mimic=False,
+                imported_new=False,
+            )
+
+        scene_end = int(getattr(scene, "frame_end", 0))
+        shot_ranges = []
+        for i, (shot_idx, cam_obj, frame) in enumerate(shots):
+            next_frame = shots[i + 1][2] if i + 1 < len(shots) else scene_end + 1
+            shot_ranges.append((shot_idx, cam_obj, frame, next_frame - 1))
+
+        actor_name = str(camera_armature.get("cutscene_actor_name", "") or "Camera")
+        component = SCRATCH_CUTSCENE_ROOT_COMPONENT
+        camera_animation_name = "camera"
+        applied = 0
+        baked_shots = []  # (shot_idx, action, range_start, range_end)
+        for shot_idx, cam_obj, range_start, range_end in shot_ranges:
+            if range_end <= range_start:
+                continue
+            action_name = _shot_camera_action_name(shot_idx)
+            old_action = bpy.data.actions.get(action_name)
+            if old_action is not None:
+                _remove_shot_nla_strip(camera_armature, shot_idx)
+                bpy.data.actions.remove(old_action)
+            action = _bake_camera_rig_action_from_camera(
+                context, camera_armature, cam_obj, range_start, range_end, action_name,
+            )
+            if action is None:
+                continue
+            action["witcher_shot_index"] = shot_idx
+            _tag_action_for_cutscene(action, actor_name, component, camera_animation_name)
+
+            # Passthrough bones (Camera_OrbitNode / Camera_LookAtNode) are part of the
+            # rig skeleton but rarely animated. If they have no fcurves in the action the
+            # exporter skips them and the game uses stale bone state from a previous
+            # animation, causing the camera to appear offset / on its side. Insert
+            # identity (rest-pose) keyframes on every frame so the exporter includes them.
+            length_local = max(1, range_end - range_start)
+            _PASSTHROUGH_BONES = ("Camera_OrbitNode", "Camera_LookAtNode")
+            for pb_name in _PASSTHROUGH_BONES:
+                pb = camera_armature.pose.bones.get(pb_name)
+                if pb is None:
+                    continue
+                existing_dps = {
+                    fc.data_path
+                    for fc in iter_action_fcurves(action, target=camera_armature)
+                    if f'pose.bones["{pb_name}"]' in fc.data_path
+                }
+                if existing_dps:
+                    continue
+                rot_mode = getattr(pb, "rotation_mode", "QUATERNION")
+                if rot_mode == "QUATERNION":
+                    dp_rot = f'pose.bones["{pb_name}"].rotation_quaternion'
+                    rot_vals = [1.0, 0.0, 0.0, 0.0]
+                elif rot_mode == "AXIS_ANGLE":
+                    dp_rot = f'pose.bones["{pb_name}"].rotation_axis_angle'
+                    rot_vals = [0.0, 0.0, 1.0, 0.0]
+                else:
+                    dp_rot = f'pose.bones["{pb_name}"].rotation_euler'
+                    rot_vals = [0.0, 0.0, 0.0]
+                dp_loc = f'pose.bones["{pb_name}"].location'
+                for af in range(0, length_local + 1):
+                    _fcurve_insert_direct(action, camera_armature, dp_loc, af, [0.0, 0.0, 0.0])
+                    _fcurve_insert_direct(action, camera_armature, dp_rot, af, rot_vals)
+
+            track = _find_or_create_cutscene_track(camera_armature, SCRATCH_CUTSCENE_TRACK_NAME)
+            _create_camera_cut_strip(
+                camera_armature, track, action_name,
+                float(range_start), float(range_end), action,
+                action_start=0.0,
+                action_end=float(length_local),
+                settings={"blend_type": "COMBINE", "extrapolation": "NOTHING"},
+            )
+            baked_shots.append((shot_idx, action, range_start, range_end))
+            applied += 1
+
+        camera_obj = find_camera_preview_object(camera_armature)
+        if camera_obj is not None:
+            setup_camera_preview_drivers(camera_armature, camera_obj)
+            scene.camera = camera_obj
+        _sync_camera_cut_markers(scene, camera_armature)
+
+        # Register camera shots as one cutscene animation. Each shot remains a separate
+        # NLA strip/action for editing, but they share the same cutscene animation name
+        # so export writes them as multipart parts of Camera:Root:camera.
+        fps = float(getattr(getattr(scene, "render", None), "fps", None) or 30)
+        anims = scene.witcher_cutscene_animation_items
+        # Ensure cutscene sentinel (source_index -1) exists
+        if not any(int(getattr(a, "source_index", -2)) == -1 for a in anims):
+            sentinel = anims.add()
+            sentinel.source_index = -1
+            sentinel.full_name = "Cutscene"
+            sentinel.display_name = "Cutscene"
+        # Remove old camera entries (actor_name == actor_name, source_index >= 0)
+        to_remove = [
+            i for i, a in enumerate(anims)
+            if str(getattr(a, "actor_name", "") or "").lower() == actor_name.lower()
+            and int(getattr(a, "source_index", -2)) >= 0
+        ]
+        for i in reversed(to_remove):
+            anims.remove(i)
+        next_idx = max((int(getattr(a, "source_index", -1)) for a in anims if int(getattr(a, "source_index", -1)) >= 0), default=0) + 1
+        if baked_shots:
+            first_start = min(int(range_start) for _shot_idx, _action, range_start, _range_end in baked_shots)
+            last_end = max(int(range_end) for _shot_idx, _action, _range_start, range_end in baked_shots)
+            full_name = export_anims._compose_cutscene_animation_name(actor_name, component, camera_animation_name)
+            item = anims.add()
+            item.source_index = next_idx
+            item.full_name = full_name
+            item.display_name = camera_animation_name
+            item.actor_name = actor_name
+            item.component_name = component
+            item.is_loaded = True
+            item.num_frames = max(1, last_end - first_start + 1)
+            item.frames_per_second = fps
+            item.duration = item.num_frames / fps if fps else 0.0
+
+        if applied == 0:
+            self.report({'WARNING'}, "No shots baked. Check that shots have markers with cameras bound.")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Baked {applied} shot(s) onto the rig.")
+        return {'FINISHED'}
+
+    def _apply_tagged_cameras(self, context):
+        scene = context.scene
+        camera_armature = _find_camera_armature(context)
+        if camera_armature is None:
+            self.report({'WARNING'}, "No Witcher camera rig found.")
+            return {'CANCELLED'}
+
+        cuts = _iter_camera_cut_strips(camera_armature)
+        if not cuts:
+            self.report({'WARNING'}, "No camera cut NLA strips found.")
+            return {'CANCELLED'}
+
+        tagged_cameras = {}
+        for obj in scene.objects:
+            if getattr(obj, "type", None) == 'CAMERA':
+                strip_name = str(obj.get("witcher_cut_strip_name", "") or "")
+                if strip_name:
+                    tagged_cameras[strip_name] = obj
+
+        if not tagged_cameras:
+            self.report({'WARNING'}, "No shots or tagged cameras found. Use 'New Shot' or 'Cuts → Blender Cams' first.")
+            return {'CANCELLED'}
+
+        previous_frame = scene.frame_current
+        applied = 0
+        try:
+            for _track, strip in cuts:
+                strip_name = str(getattr(strip, "name", "") or "")
+                blender_cam = tagged_cameras.get(strip_name)
+                if blender_cam is None:
+                    continue
+                target_action = getattr(strip, "action", None)
+                if target_action is None:
+                    continue
+
+                start = int(round(float(strip.frame_start)))
+                end = int(round(float(strip.frame_end)))
+
+                for frame in range(start, end + 1):
+                    scene.frame_set(frame)
+                    context.view_layer.update()
+                    action_frame = _strip_scene_frame_to_action_frame(strip, frame)
+                    _key_rig_from_camera(
+                        context,
+                        camera_armature,
+                        blender_cam,
+                        insert_key=True,
+                        key_frame=action_frame,
+                        target_action=target_action,
+                    )
+
+                _PASSTHROUGH_BONES = ("Camera_OrbitNode", "Camera_LookAtNode")
+                for pb_name in _PASSTHROUGH_BONES:
+                    pb = camera_armature.pose.bones.get(pb_name)
+                    if pb is None:
+                        continue
+                    existing_dps = {
+                        fc.data_path
+                        for fc in iter_action_fcurves(target_action, target=camera_armature)
+                        if f'pose.bones["{pb_name}"]' in fc.data_path
+                    }
+                    if existing_dps:
+                        continue
+                    rot_mode = getattr(pb, "rotation_mode", "QUATERNION")
+                    if rot_mode == "QUATERNION":
+                        dp_rot = f'pose.bones["{pb_name}"].rotation_quaternion'
+                        rot_vals = [1.0, 0.0, 0.0, 0.0]
+                    elif rot_mode == "AXIS_ANGLE":
+                        dp_rot = f'pose.bones["{pb_name}"].rotation_axis_angle'
+                        rot_vals = [0.0, 0.0, 1.0, 0.0]
+                    else:
+                        dp_rot = f'pose.bones["{pb_name}"].rotation_euler'
+                        rot_vals = [0.0, 0.0, 0.0]
+                    dp_loc = f'pose.bones["{pb_name}"].location'
+                    for frame in range(start, end + 1):
+                        af = _strip_scene_frame_to_action_frame(strip, frame)
+                        _fcurve_insert_direct(target_action, camera_armature, dp_loc, af, [0.0, 0.0, 0.0])
+                        _fcurve_insert_direct(target_action, camera_armature, dp_rot, af, rot_vals)
+
+                applied += 1
+        finally:
+            scene.frame_set(previous_frame)
+
+        if applied == 0:
+            self.report({'WARNING'}, "No matching strips found for tagged cameras.")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Baked {applied} camera(s) onto the rig.")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Pelvis / Root bone animation offset editor
+# ---------------------------------------------------------------------------
+
+def _get_pelvis_anim_action(armature_obj, context):
+    """Return the action that should be edited for the pelvis bone (NLA-aware)."""
+    anim_data = getattr(armature_obj, "animation_data", None)
+    if anim_data is None:
+        return None
+    if getattr(anim_data, "use_nla", False):
+        scene = getattr(context, "scene", None)
+        frame = getattr(scene, "frame_current", 0)
+        action, _ = export_anims.get_nla_action_at_frame(armature_obj, frame=frame)
+        if action is not None:
+            return action
+    return getattr(anim_data, "action", None)
+
+
+def _apply_loc_delta_to_action_fcurves(action, armature_obj, bone_name, delta_loc):
+    """Add a location delta to every location keyframe of a bone."""
+    dp = f'pose.bones["{bone_name}"].location'
+    modified = 0
+    for fc in iter_action_fcurves(action, target=armature_obj):
+        if fc.data_path != dp:
+            continue
+        idx = fc.array_index
+        if 0 <= idx < 3:
+            for kp in fc.keyframe_points:
+                kp.co[1] += delta_loc[idx]
+            fc.update()
+            modified += 1
+    return modified
+
+
+def _apply_euler_delta_to_action_fcurves(action, armature_obj, bone_name, delta_rad):
+    """Add per-axis radian offset to rotation_euler keyframes of a bone."""
+    dp = f'pose.bones["{bone_name}"].rotation_euler'
+    modified = 0
+    for fc in iter_action_fcurves(action, target=armature_obj):
+        if fc.data_path != dp:
+            continue
+        idx = fc.array_index
+        if 0 <= idx < 3:
+            for kp in fc.keyframe_points:
+                kp.co[1] += delta_rad[idx]
+            fc.update()
+            modified += 1
+    return modified
+
+
+def _apply_quat_delta_to_action_fcurves(action, armature_obj, bone_name, delta_q):
+    """Apply a quaternion delta to all rotation_quaternion keyframes of a bone."""
+    dp = f'pose.bones["{bone_name}"].rotation_quaternion'
+    fcs = [None] * 4
+    for fc in iter_action_fcurves(action, target=armature_obj):
+        if fc.data_path == dp and 0 <= fc.array_index < 4:
+            fcs[fc.array_index] = fc
+    if not any(fcs):
+        return 0
+    frames = set()
+    for fc in fcs:
+        if fc:
+            for kp in fc.keyframe_points:
+                frames.add(kp.co[0])
+    for frame_co in sorted(frames):
+        vals = [1.0, 0.0, 0.0, 0.0]
+        kp_refs = [None] * 4
+        for i, fc in enumerate(fcs):
+            if fc is None:
+                continue
+            for kp in fc.keyframe_points:
+                if abs(kp.co[0] - frame_co) < 0.5:
+                    vals[i] = kp.co[1]
+                    kp_refs[i] = kp
+                    break
+        old_q = MQuaternion(vals)
+        new_q = delta_q @ old_q
+        new_vals = [new_q.w, new_q.x, new_q.y, new_q.z]
+        for i, kp in enumerate(kp_refs):
+            if kp is not None:
+                kp.co[1] = new_vals[i]
+    for fc in fcs:
+        if fc:
+            fc.update()
+    return 1
+
+
+class WITCH_OT_PelvisSetReference(bpy.types.Operator):
+    """Store the current pose of the selected bone as the reference for delta baking"""
+    bl_idname = "witcher.pelvis_set_reference"
+    bl_label = "Set Reference Pose"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        ao = context.active_object
+        return ao is not None and ao.type == 'ARMATURE'
+
+    def execute(self, context):
+        scene = context.scene
+        ao = context.active_object
+        bone_name = str(getattr(scene, "witcher_pelvis_bone_name", "Pelvis") or "Pelvis")
+        pb = ao.pose.bones.get(bone_name)
+        if pb is None:
+            self.report({'WARNING'}, f"Bone '{bone_name}' not found in armature.")
+            return {'CANCELLED'}
+        loc = pb.location
+        scene.witcher_pelvis_ref_loc = (loc.x, loc.y, loc.z)
+        rot = pb.rotation_quaternion if pb.rotation_mode == 'QUATERNION' else pb.rotation_euler.to_quaternion()
+        scene.witcher_pelvis_ref_rot = (rot.w, rot.x, rot.y, rot.z)
+        scene.witcher_pelvis_has_ref = True
+        self.report({'INFO'}, f"Reference pose stored for '{bone_name}'.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_PelvisBakePoseDelta(bpy.types.Operator):
+    """Bake the delta between the reference pose and the current bone pose onto all keyframes"""
+    bl_idname = "witcher.pelvis_bake_pose_delta"
+    bl_label = "Bake Pose Delta"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=400)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="WARNING: This permanently modifies animation keyframe data.", icon='ERROR')
+        layout.label(text="Save your .blend file before applying!", icon='FILE_BLEND')
+        layout.separator()
+        layout.label(text="The delta between the stored reference pose and the")
+        layout.label(text="current bone pose will be baked into every keyframe.")
+
+    @classmethod
+    def poll(cls, context):
+        ao = context.active_object
+        if ao is None or ao.type != 'ARMATURE':
+            return False
+        scene = context.scene
+        return bool(getattr(scene, "witcher_pelvis_has_ref", False))
+
+    def execute(self, context):
+        scene = context.scene
+        ao = context.active_object
+        bone_name = str(getattr(scene, "witcher_pelvis_bone_name", "Pelvis") or "Pelvis")
+        pb = ao.pose.bones.get(bone_name)
+        if pb is None:
+            self.report({'WARNING'}, f"Bone '{bone_name}' not found in armature.")
+            return {'CANCELLED'}
+        action = _get_pelvis_anim_action(ao, context)
+        if action is None:
+            self.report({'WARNING'}, "No active action found for the armature.")
+            return {'CANCELLED'}
+
+        ref_loc = list(getattr(scene, "witcher_pelvis_ref_loc", [0.0, 0.0, 0.0]))
+        ref_rot_vals = list(getattr(scene, "witcher_pelvis_ref_rot", [1.0, 0.0, 0.0, 0.0]))
+        ref_q = MQuaternion(ref_rot_vals)
+
+        cur_loc = pb.location
+        delta_loc = (cur_loc.x - ref_loc[0], cur_loc.y - ref_loc[1], cur_loc.z - ref_loc[2])
+
+        cur_q = pb.rotation_quaternion if pb.rotation_mode == 'QUATERNION' else pb.rotation_euler.to_quaternion()
+        delta_q = cur_q @ ref_q.conjugated()
+
+        _apply_loc_delta_to_action_fcurves(action, ao, bone_name, delta_loc)
+        if pb.rotation_mode == 'QUATERNION':
+            _apply_quat_delta_to_action_fcurves(action, ao, bone_name, delta_q)
+        else:
+            delta_euler_vals = delta_q.to_euler(pb.rotation_mode)
+            _apply_euler_delta_to_action_fcurves(action, ao, bone_name, [delta_euler_vals.x, delta_euler_vals.y, delta_euler_vals.z])
+
+        scene.witcher_pelvis_has_ref = False
+        self.report({'INFO'}, f"Pose delta baked into action '{action.name}' for bone '{bone_name}'.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_PelvisApplyNumericOffset(bpy.types.Operator):
+    """Apply a numeric location/rotation offset to all keyframes of the selected bone"""
+    bl_idname = "witcher.pelvis_apply_numeric_offset"
+    bl_label = "Apply Numeric Offset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=400)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="WARNING: This permanently modifies animation keyframe data.", icon='ERROR')
+        layout.label(text="Save your .blend file before applying!", icon='FILE_BLEND')
+        layout.separator()
+        scene = context.scene
+        layout.label(text="Location offset (Blender units):")
+        layout.prop(scene, "witcher_pelvis_offset_loc", text="")
+        layout.label(text="Rotation offset (degrees, XYZ Euler):")
+        layout.prop(scene, "witcher_pelvis_offset_rot", text="")
+
+    @classmethod
+    def poll(cls, context):
+        ao = context.active_object
+        return ao is not None and ao.type == 'ARMATURE'
+
+    def execute(self, context):
+        import math
+        scene = context.scene
+        ao = context.active_object
+        bone_name = str(getattr(scene, "witcher_pelvis_bone_name", "Pelvis") or "Pelvis")
+        action = _get_pelvis_anim_action(ao, context)
+        if action is None:
+            self.report({'WARNING'}, "No active action found for the armature.")
+            return {'CANCELLED'}
+
+        offset_loc = list(getattr(scene, "witcher_pelvis_offset_loc", [0.0, 0.0, 0.0]))
+        offset_rot_deg = list(getattr(scene, "witcher_pelvis_offset_rot", [0.0, 0.0, 0.0]))
+
+        _apply_loc_delta_to_action_fcurves(action, ao, bone_name, offset_loc)
+
+        rot_rad = [math.radians(d) for d in offset_rot_deg]
+        pb = ao.pose.bones.get(bone_name)
+        rotation_mode = getattr(pb, "rotation_mode", "QUATERNION") if pb else "QUATERNION"
+        if rotation_mode == "QUATERNION":
+            delta_euler = MEuler(rot_rad, 'XYZ')
+            delta_q = delta_euler.to_quaternion()
+            _apply_quat_delta_to_action_fcurves(action, ao, bone_name, delta_q)
+        else:
+            _apply_euler_delta_to_action_fcurves(action, ao, bone_name, rot_rad)
+
+        self.report({'INFO'}, f"Offset applied to action '{action.name}' for bone '{bone_name}'.")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Shot-based camera workflow helpers
+# ---------------------------------------------------------------------------
+
+def _shot_camera_action_name(shot_index):
+    return f"witcher_camera_shot_{int(shot_index):02d}"
+
+
+def _next_shot_index(scene):
+    existing_indices = {
+        int(obj.get("witcher_shot_index", -1))
+        for obj in getattr(scene, "objects", []) or []
+        if getattr(obj, "type", None) == 'CAMERA' and obj.get("witcher_shot_index") is not None
+    }
+    return max(existing_indices, default=-1) + 1
+
+
+def _iter_shot_markers(scene):
+    """Return sorted [(shot_index, camera_obj, marker_frame)] for W3 shot cameras."""
+    shots = []
+    for marker in getattr(scene, "timeline_markers", []) or []:
+        cam = getattr(marker, "camera", None)
+        if cam is None or getattr(cam, "type", None) != 'CAMERA':
+            continue
+        shot_idx = cam.get("witcher_shot_index")
+        if shot_idx is None:
+            continue
+        shots.append((int(shot_idx), cam, int(marker.frame)))
+    shots.sort(key=lambda x: x[2])
+    return shots
+
+
+def _remove_shot_nla_strip(camera_armature, shot_index):
+    """Remove the NLA strip whose action name matches the given shot index."""
+    action_name = _shot_camera_action_name(shot_index)
+    anim_data = getattr(camera_armature, "animation_data", None)
+    if anim_data is None:
+        return
+    for track in getattr(anim_data, "nla_tracks", []) or []:
+        for strip in list(getattr(track, "strips", []) or []):
+            strip_action = getattr(strip, "action", None)
+            if strip_action is not None and str(getattr(strip_action, "name", "") or "") == action_name:
+                try:
+                    track.strips.remove(strip)
+                except Exception:
+                    pass
+                return
+
+
+def _import_cutscene_camera_rig(context):
+    """Import the cutscene camera rig if not already in scene. Returns armature or None."""
+    existing = _find_camera_armature(context)
+    if existing is not None:
+        return existing
+    scene = context.scene
+    repo_path = _normalize_scratch_repo_path(
+        getattr(scene, "witcher_cutscene_scratch_camera_repo_path", "") or SCRATCH_CAMERA_DEFAULT_REPO_PATH
+    )
+    if not repo_path:
+        return None
+    before_names = {obj.name for obj in bpy.data.objects}
+    try:
+        imported_obj = import_entity.import_ent_template(repo_file(repo_path), load_face_poses=False, import_apperance=0)
+    except Exception:
+        log.exception("Failed to auto-import cutscene camera '%s'.", repo_path)
+        return None
+    camera_armature = _find_armature_in_hierarchy(imported_obj, predicate=_is_camera_armature)
+    if camera_armature is None:
+        camera_armature = _find_new_imported_armature(before_names, predicate=_is_camera_armature)
+    if camera_armature is None:
+        return None
+    _tag_scratch_cutscene_actor(
+        camera_armature,
+        actor_name="Camera",
+        template_path=repo_path,
+        actor_type="CAT_Camera",
+        appearance="",
+        use_mimic=False,
+        imported_new=True,
+    )
+    ensure_camera_track_properties(camera_armature, track_names=CAMERA_TRACK_NAMES)
+    camera_obj = find_camera_preview_object(camera_armature)
+    if camera_obj is not None:
+        setup_camera_preview_drivers(camera_armature, camera_obj)
+    set_main_armature(scene, camera_armature)
+    return camera_armature
+
+
+class WITCH_OT_CutsceneNewShot(bpy.types.Operator):
+    """Create a new shot: a Blender camera and a timeline marker at the current frame.
+    Shots are baked onto the Witcher rig with 'Shots → Rig'."""
+    bl_idname = "witcher.cutscene_new_shot"
+    bl_label = "New Shot"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+
+        shot_idx = _next_shot_index(scene)
+        shot_number = shot_idx + 1
+        cam_name = f"Shot {shot_number:02d}"
+
+        cam_data = bpy.data.cameras.new(name=cam_name)
+        cam_obj = bpy.data.objects.new(cam_name, cam_data)
+
+        current_cam = getattr(scene, "camera", None)
+        if current_cam is not None and getattr(current_cam, "type", None) == 'CAMERA':
+            cam_data.lens = getattr(getattr(current_cam, "data", None), "lens", 50.0)
+            cam_obj.matrix_world = current_cam.matrix_world.copy()
+
+        scene.collection.objects.link(cam_obj)
+        cam_obj["witcher_shot_index"] = shot_idx
+
+        frame = scene.frame_current
+        marker = scene.timeline_markers.new(cam_name, frame=frame)
+        marker.camera = cam_obj
+
+        scene.camera = cam_obj
+
+        self.report({'INFO'}, f"Created {cam_name} at frame {frame}.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneUseSelectedCameraAsShot(bpy.types.Operator):
+    """Use the selected Blender camera as a cutscene shot"""
+    bl_idname = "witcher.cutscene_use_selected_camera_as_shot"
+    bl_label = "Use Selected Camera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        scene = getattr(context, "scene", None)
+        active_obj = getattr(context, "active_object", None)
+        scene_cam = getattr(scene, "camera", None) if scene is not None else None
+        return (
+            scene is not None
+            and (
+                getattr(active_obj, "type", None) == 'CAMERA'
+                or getattr(scene_cam, "type", None) == 'CAMERA'
+            )
+        )
+
+    def execute(self, context):
+        scene = context.scene
+        active_obj = getattr(context, "active_object", None)
+        cam_obj = active_obj if getattr(active_obj, "type", None) == 'CAMERA' else getattr(scene, "camera", None)
+        if cam_obj is None or getattr(cam_obj, "type", None) != 'CAMERA':
+            self.report({'WARNING'}, "Select a camera or set the scene camera first.")
+            return {'CANCELLED'}
+
+        shot_idx = cam_obj.get("witcher_shot_index")
+        if shot_idx is None:
+            shot_idx = _next_shot_index(scene)
+            cam_obj["witcher_shot_index"] = int(shot_idx)
+        else:
+            shot_idx = int(shot_idx)
+
+        frame = int(getattr(scene, "frame_current", 0))
+        marker = next(
+            (
+                m for m in getattr(scene, "timeline_markers", []) or []
+                if getattr(m, "camera", None) == cam_obj
+                and cam_obj.get("witcher_shot_index") is not None
+            ),
+            None,
+        )
+        marker_name = f"Shot {shot_idx + 1:02d}"
+        if marker is None:
+            marker = scene.timeline_markers.new(marker_name, frame=frame)
+        else:
+            marker.frame = frame
+            marker.name = marker_name
+        marker.camera = cam_obj
+        scene.camera = cam_obj
+
+        self.report({'INFO'}, f"Using '{cam_obj.name}' as {marker_name} at frame {frame}.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneScratchImportCamera(bpy.types.Operator):
+    """Import and tag the standard cutscene camera entity"""
+    bl_idname = "witcher.cutscene_scratch_import_camera"
+    bl_label = "Import Cutscene Camera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        repo_path = _normalize_scratch_repo_path(
+            getattr(scene, "witcher_cutscene_scratch_camera_repo_path", "") or SCRATCH_CAMERA_DEFAULT_REPO_PATH
+        )
+        if not repo_path:
+            self.report({'WARNING'}, "Camera entity path is empty.")
+            return {'CANCELLED'}
+
+        before_names = {obj.name for obj in bpy.data.objects}
+        try:
+            imported_obj = import_entity.import_ent_template(repo_file(repo_path), load_face_poses=False, import_apperance=0)
+        except Exception as exc:
+            log.exception("Failed to import cutscene camera '%s'.", repo_path)
+            self.report({'ERROR'}, f"Could not import camera entity: {exc}")
+            return {'CANCELLED'}
+
+        camera_armature = _find_armature_in_hierarchy(imported_obj, predicate=_is_camera_armature)
+        if camera_armature is None:
+            camera_armature = _find_new_imported_armature(before_names, predicate=_is_camera_armature)
+        if camera_armature is None:
+            self.report({'WARNING'}, "Imported entity did not contain a Camera_Node rig.")
+            return {'CANCELLED'}
+
+        _tag_scratch_cutscene_actor(
+            camera_armature,
+            actor_name="Camera",
+            template_path=repo_path,
+            actor_type="CAT_Camera",
+            appearance="",
+            use_mimic=False,
+            imported_new=True,
+        )
+        ensure_camera_track_properties(camera_armature, track_names=CAMERA_TRACK_NAMES)
+        camera_obj = find_camera_preview_object(camera_armature)
+        if camera_obj is not None:
+            setup_camera_preview_drivers(camera_armature, camera_obj)
+            scene.camera = camera_obj
+        set_main_armature(scene, camera_armature)
+        self.report({'INFO'}, f"Imported cutscene camera '{camera_armature.name}'.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneScratchAssignActor(bpy.types.Operator):
+    """Tag the selected entity armature as a cutscene actor"""
+    bl_idname = "witcher.cutscene_scratch_assign_actor"
+    bl_label = "Assign Cutscene Actor"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _resolve_active_armature(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        armature_obj = _resolve_active_armature(context)
+        if armature_obj is None:
+            self.report({'WARNING'}, "Select an entity armature first.")
+            return {'CANCELLED'}
+
+        actor_name = _resolve_actor_display_name(armature_obj, "")
+        if not actor_name:
+            actor_name = _resolve_actor_display_name(
+                armature_obj,
+                getattr(scene, "witcher_cutscene_scratch_actor_name", ""),
+            )
+        actor_type = str(getattr(scene, "witcher_cutscene_scratch_actor_type", "CAT_Actor") or "CAT_Actor")
+        template_path = _resolve_actor_template_path(armature_obj, "")
+        if not template_path:
+            template_path = _resolve_actor_template_path(
+                armature_obj,
+                getattr(scene, "witcher_cutscene_scratch_actor_template", ""),
+            )
+        appearance = _resolve_actor_appearance(armature_obj, "")
+        if not appearance:
+            appearance = _resolve_actor_appearance(
+                armature_obj,
+                getattr(scene, "witcher_cutscene_scratch_actor_appearance", ""),
+            )
+        use_mimic = bool(getattr(scene, "witcher_cutscene_scratch_use_mimic", True)) and _actor_has_mimic_setup(armature_obj)
+
+        _tag_scratch_cutscene_actor(
+            armature_obj,
+            actor_name=actor_name,
+            template_path=template_path,
+            actor_type=actor_type,
+            appearance=appearance,
+            use_mimic=use_mimic,
+            imported_new=False,
+        )
+        if use_mimic:
+            import_cutscene._ensure_cutscene_face_setup(armature_obj)
+        scene.witcher_cutscene_scratch_actor_name = actor_name
+        scene.witcher_cutscene_scratch_actor_template = template_path
+        scene.witcher_cutscene_scratch_actor_appearance = appearance
+        self.report({'INFO'}, f"Assigned cutscene actor '{actor_name}'.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneScratchAddAction(bpy.types.Operator):
+    """Add the selected action to the actor's cutscene NLA track"""
+    bl_idname = "witcher.cutscene_scratch_add_action"
+    bl_label = "Add Action To Cutscene"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _resolve_active_armature(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        actor_obj = _resolve_active_armature(context)
+        if actor_obj is None:
+            self.report({'WARNING'}, "Select an actor armature first.")
+            return {'CANCELLED'}
+        actor_name = _resolve_actor_display_name(actor_obj, "")
+        if not actor_name:
+            actor_name = _resolve_actor_display_name(actor_obj, getattr(scene, "witcher_cutscene_scratch_actor_name", ""))
+        if not actor_name:
+            self.report({'WARNING'}, "Actor name is empty.")
+            return {'CANCELLED'}
+        if not str(actor_obj.get("cutscene_actor_name", "") or "").strip():
+            _tag_scratch_cutscene_actor(
+                actor_obj,
+                actor_name=actor_name,
+                template_path=_resolve_actor_template_path(actor_obj, ""),
+                actor_type=str(getattr(scene, "witcher_cutscene_scratch_actor_type", "CAT_Actor") or "CAT_Actor"),
+                appearance=_resolve_actor_appearance(actor_obj, ""),
+                use_mimic=bool(getattr(scene, "witcher_cutscene_scratch_use_mimic", True)) and _actor_has_mimic_setup(actor_obj),
+                imported_new=False,
+            )
+
+        component = _resolve_scratch_component(context)
+        target_armature = _resolve_component_armature(actor_obj, component)
+        if target_armature is None:
+            self.report({'WARNING'}, f"No armature found for component '{component}'.")
+            return {'CANCELLED'}
+
+        action = _resolve_scratch_action(context, target_armature)
+        if action is None:
+            self.report({'WARNING'}, "Choose an action or put one in the active action slot.")
+            return {'CANCELLED'}
+        # Auto-detect group name from existing strips so adding more strips joins the same multipart
+        group_name = _scratch_action_group_name(action, target_armature, component)
+        strip_length = int(getattr(scene, "witcher_cutscene_scratch_strip_length", 0) or 0)
+        track, strip = _create_cutscene_action_strip(
+            context,
+            target_armature,
+            action,
+            actor_name,
+            component,
+            strip_length=strip_length if strip_length > 0 else None,
+            group_name=group_name,
+        )
+        if strip is None:
+            self.report({'WARNING'}, "Could not create cutscene NLA strip.")
+            return {'CANCELLED'}
+        _select_nla_strip(track, strip)
+
+        _ensure_cutscene_animation_list_entry(scene, actor_name, component, group_name, action)
+
+        self.report({'INFO'}, f"Added '{action.name}' as {actor_name}:{component}:{group_name}.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneUseImportNlaStrip(bpy.types.Operator):
+    """Copy an existing import NLA strip into the cutscene workflow"""
+    bl_idname = "witcher.cutscene_use_import_nla_strip"
+    bl_label = "Use NLA Strip In Cutscene"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    actor_object_name: StringProperty(default="")
+    source_object_name: StringProperty(default="")
+    track_name: StringProperty(default="")
+    strip_name: StringProperty(default="")
+    source_frame_start: FloatProperty(default=-1.0)
+    component: StringProperty(default=SCRATCH_CUTSCENE_ROOT_COMPONENT)
+    mute_source: BoolProperty(default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context, "scene", None) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        actor_obj = bpy.data.objects.get(str(self.actor_object_name or ""))
+        source_obj = bpy.data.objects.get(str(self.source_object_name or ""))
+        if actor_obj is None or source_obj is None:
+            self.report({'WARNING'}, "Could not resolve the actor or source armature.")
+            return {'CANCELLED'}
+        if getattr(source_obj, "type", None) != 'ARMATURE':
+            self.report({'WARNING'}, "Source object is not an armature.")
+            return {'CANCELLED'}
+
+        anim_data = getattr(source_obj, "animation_data", None)
+        track = getattr(anim_data, "nla_tracks", {}).get(self.track_name) if anim_data is not None else None
+        if track is None:
+            self.report({'WARNING'}, f"NLA track '{self.track_name}' was not found.")
+            return {'CANCELLED'}
+        source_strip = next(
+            (strip for strip in getattr(track, "strips", []) or []
+             if str(getattr(strip, "name", "") or "") == str(self.strip_name or "")
+             and (self.source_frame_start < 0.0
+                  or abs(float(getattr(strip, "frame_start", 0.0) or 0.0) - float(self.source_frame_start)) < 0.01)),
+            None,
+        )
+        if source_strip is None:
+            self.report({'WARNING'}, f"NLA strip '{self.strip_name}' was not found.")
+            return {'CANCELLED'}
+        source_action = getattr(source_strip, "action", None)
+        if source_action is None:
+            self.report({'WARNING'}, "The selected NLA strip has no action.")
+            return {'CANCELLED'}
+
+        actor_name = _resolve_actor_display_name(actor_obj, getattr(scene, "witcher_cutscene_scratch_actor_name", ""))
+        if not actor_name:
+            self.report({'WARNING'}, "Actor name is empty.")
+            return {'CANCELLED'}
+        if not str(actor_obj.get("cutscene_actor_name", "") or "").strip():
+            _tag_scratch_cutscene_actor(
+                actor_obj,
+                actor_name=actor_name,
+                template_path=_resolve_actor_template_path(actor_obj, ""),
+                actor_type=str(getattr(scene, "witcher_cutscene_scratch_actor_type", "CAT_Actor") or "CAT_Actor"),
+                appearance=_resolve_actor_appearance(actor_obj, ""),
+                use_mimic=bool(getattr(scene, "witcher_cutscene_scratch_use_mimic", True)) and _actor_has_mimic_setup(actor_obj),
+                imported_new=False,
+            )
+
+        component = str(self.component or SCRATCH_CUTSCENE_ROOT_COMPONENT)
+        group_name = _import_strip_group_name(source_action, source_strip)
+        strip_length = max(1.0, float(source_strip.frame_end) - float(source_strip.frame_start))
+        cutscene_track, cutscene_strip = _create_cutscene_action_strip(
+            context,
+            source_obj,
+            source_action,
+            actor_name,
+            component,
+            start_frame=float(source_strip.frame_start),
+            strip_length=strip_length,
+            group_name=group_name,
+        )
+        if cutscene_strip is None:
+            self.report({'WARNING'}, "Could not create cutscene NLA strip.")
+            return {'CANCELLED'}
+
+        try:
+            _set_strip_action_range(
+                cutscene_strip,
+                action_start=float(getattr(source_strip, "action_frame_start", cutscene_strip.action_frame_start)),
+                action_end=float(getattr(source_strip, "action_frame_end", cutscene_strip.action_frame_end)),
+            )
+        except Exception:
+            pass
+        _select_nla_strip(cutscene_track, cutscene_strip)
+        if bool(self.mute_source):
+            source_strip.mute = True
+
+        _ensure_cutscene_animation_list_entry(scene, actor_name, component, group_name, source_action)
+        self.report({'INFO'}, f"Using '{source_strip.name}' in cutscene as {actor_name}:{component}:{group_name}.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneScratchCreateCameraCut(bpy.types.Operator):
+    """Create a camera cut action and NLA strip for scratch cutscene editing"""
+    bl_idname = "witcher.cutscene_scratch_create_camera_cut"
+    bl_label = "Create Camera Cut"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        camera_armature = _find_camera_armature(context)
+        if camera_armature is None:
+            self.report({'WARNING'}, "No camera rig selected.")
+            return {'CANCELLED'}
+        if not str(camera_armature.get("cutscene_actor_name", "") or "").strip():
+            _tag_scratch_cutscene_actor(
+                camera_armature,
+                actor_name="Camera",
+                template_path=getattr(scene, "witcher_cutscene_scratch_camera_repo_path", "") or SCRATCH_CAMERA_DEFAULT_REPO_PATH,
+                actor_type="CAT_Camera",
+                appearance="",
+                use_mimic=False,
+                imported_new=False,
+            )
+
+        scene_start = float(scene.frame_current)
+        length = max(1, int(getattr(scene, "witcher_cutscene_scratch_strip_length", 0) or 0) or 60)
+        action_name = f"{camera_armature.name}_camera_cut_{int(round(scene_start)):04d}"
+        action = bpy.data.actions.new(action_name)
+        actor_name = str(camera_armature.get("cutscene_actor_name", "") or "Camera")
+        _tag_action_for_cutscene(action, actor_name, SCRATCH_CUTSCENE_ROOT_COMPONENT, action_name)
+
+        track = _find_or_create_cutscene_track(camera_armature, SCRATCH_CUTSCENE_TRACK_NAME)
+        _track, strip = _create_camera_cut_strip(
+            camera_armature,
+            track,
+            action_name,
+            scene_start,
+            scene_start + float(length),
+            action,
+            action_start=0.0,
+            action_end=float(length),
+            settings={"blend_type": "COMBINE", "extrapolation": "NOTHING"},
+        )
+
+        camera_obj = _resolve_native_camera_target(context, camera_armature)
+        if camera_obj is not None:
+            _key_rig_from_camera(
+                context,
+                camera_armature,
+                camera_obj,
+                insert_key=True,
+                key_frame=0.0,
+                target_action=action,
+            )
+            _key_rig_from_camera(
+                context,
+                camera_armature,
+                camera_obj,
+                insert_key=True,
+                key_frame=float(length),
+                target_action=action,
+            )
+        _select_nla_strip(_track, strip)
+        _sync_camera_cut_markers(scene, camera_armature)
+        self.report({'INFO'}, f"Created camera cut {int(scene_start)}-{int(scene_start + length)}.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneScratchBakeSelectedCameraRange(bpy.types.Operator):
+    """Bake the selected Blender camera over the timeline range into a cutscene camera NLA cut"""
+    bl_idname = "witcher.cutscene_scratch_bake_selected_camera_range"
+    bl_label = "Bake Selected Camera Range"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _find_camera_armature(context) is not None and _selected_blender_camera(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        camera_armature = _find_camera_armature(context)
+        source_camera = _selected_blender_camera(context)
+        if camera_armature is None:
+            self.report({'WARNING'}, "No cutscene camera rig found.")
+            return {'CANCELLED'}
+        if source_camera is None:
+            self.report({'WARNING'}, "Select a Blender camera to bake.")
+            return {'CANCELLED'}
+
+        if not str(camera_armature.get("cutscene_actor_name", "") or "").strip():
+            _tag_scratch_cutscene_actor(
+                camera_armature,
+                actor_name="Camera",
+                template_path=getattr(scene, "witcher_cutscene_scratch_camera_repo_path", "") or SCRATCH_CAMERA_DEFAULT_REPO_PATH,
+                actor_type="CAT_Camera",
+                appearance="",
+                use_mimic=False,
+                imported_new=False,
+            )
+
+        start_frame, end_frame = _scene_edit_range(scene)
+        action_name = f"{camera_armature.name}_camera_range_{start_frame:04d}_{end_frame:04d}"
+        action = _bake_camera_rig_action_from_camera(
+            context,
+            camera_armature,
+            source_camera,
+            start_frame,
+            end_frame,
+            action_name,
+        )
+        if action is None:
+            self.report({'WARNING'}, "Could not bake the selected camera into the cutscene rig.")
+            return {'CANCELLED'}
+
+        actor_name = str(camera_armature.get("cutscene_actor_name", "") or "Camera")
+        _tag_action_for_cutscene(action, actor_name, SCRATCH_CUTSCENE_ROOT_COMPONENT, action_name)
+        track = _find_or_create_cutscene_track(camera_armature, SCRATCH_CUTSCENE_TRACK_NAME)
+        _track, strip = _create_camera_cut_strip(
+            camera_armature,
+            track,
+            action_name,
+            float(start_frame),
+            float(end_frame),
+            action,
+            action_start=0.0,
+            action_end=float(max(1, end_frame - start_frame)),
+            settings={"blend_type": "COMBINE", "extrapolation": "NOTHING"},
+        )
+        _select_nla_strip(_track, strip)
+        _sync_camera_cut_markers(scene, camera_armature)
+        _handoff_preview_camera_animation_to_rig(camera_armature, source_camera)
+        self.report({'INFO'}, f"Baked '{source_camera.name}' to camera cut {start_frame}-{end_frame}.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneScratchValidate(bpy.types.Operator):
+    """Validate the current scene for cutscene export"""
+    bl_idname = "witcher.cutscene_scratch_validate"
+    bl_label = "Validate Cutscene"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        lines, errors, warnings = _scratch_validation_lines(context)
+        context.scene.witcher_cutscene_scratch_validation_report = "\n".join(lines)
+        if errors:
+            self.report({'ERROR'}, f"{len(errors)} cutscene validation error(s).")
+            return {'CANCELLED'}
+        if warnings:
+            self.report({'WARNING'}, f"Cutscene valid with {len(warnings)} warning(s).")
+        else:
+            self.report({'INFO'}, "Cutscene setup looks exportable.")
         return {'FINISHED'}
 
 
@@ -790,6 +3765,7 @@ class TOOL_OT_List_LoadAnim(Operator):
                             fdir_abs,
                             main_arm_obj,
                             face_target_mode="owner" if action == "load_cutscene" else "auto",
+                            nla_mode=_scene_nla_mode(context.scene),
                         )
                 except FileNotFoundError as e:
                     self.report({'ERROR'}, str(e))
@@ -811,6 +3787,7 @@ class TOOL_OT_List_LoadAnim(Operator):
             bpy.context.scene.witcher_w2anims_list.clear()
             bpy.context.scene.witcher_w2anims_list_index = -1
         return {'FINISHED'}
+
 
 class TOOL_OT_List_Add(Operator):
     """ Add an Item to the UIList"""
@@ -1657,6 +4634,7 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             orient_row = box.row(align=True)
             orient_row.prop(scene, "witcher_auto_orient_root", text="Auto Orient Root")
             orient_row.operator(WITCH_OT_ApplyRootOrientation.bl_idname, text="", icon='ORIENTATION_GLOBAL')
+            box.prop(scene, "witcher_anim_nla_mode", text="NLA Load Mode")
 
             item, _safe_index = _get_selected_collection_item(
                 scene,
@@ -1693,6 +4671,8 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
 
             if hasattr(scene, "witcher_auto_orient_root"):
                 col.prop(scene, "witcher_auto_orient_root", text="Auto Orient Root")
+            if hasattr(scene, "witcher_anim_nla_mode"):
+                col.prop(scene, "witcher_anim_nla_mode", text="NLA Load Mode")
             if hasattr(scene, "witcher_quick_anim_auto_collapse_categories"):
                 col.prop(scene, "witcher_quick_anim_auto_collapse_categories", text="Auto Collapse Categories")
             if hasattr(scene, "witcher_quick_anim_show_all"):
@@ -1717,6 +4697,37 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             act.operator("witcher.myanimlist_debug", text="Rebuild", icon='FILE_REFRESH').action = "reset3"
             act.operator("witcher.myanimlist_debug", text="Load", icon='PLAY').action = "load"
 
+        body = section("witcher_pelvis_edit", "Bone Animation Offset Editor", 'BONE_DATA', default_closed=True) if anim_tab == "CLIPS" else None
+        if body:
+            col = body.column(align=True)
+            col.prop(scene, "witcher_pelvis_bone_name", text="Bone")
+            col.separator()
+
+            move_box = col.box()
+            move_box.label(text="Move & Bake Mode", icon='TRANSFORM_ORIGINS')
+            move_box.label(text="1. Select bone in Pose Mode, move with G/R", icon='INFO')
+            move_box.label(text="2. Set Reference, move bone to desired pose", icon='INFO')
+            move_box.label(text="3. Bake Pose Delta to apply offset to all keyframes", icon='INFO')
+            ref_row = move_box.row(align=True)
+            ref_row.operator("witcher.pelvis_set_reference", text="Set Reference", icon='EYEDROPPER')
+            has_ref = bool(getattr(scene, "witcher_pelvis_has_ref", False))
+            if has_ref:
+                ref_loc = list(getattr(scene, "witcher_pelvis_ref_loc", [0.0, 0.0, 0.0]))
+                move_box.label(
+                    text=f"Ref: ({ref_loc[0]:.3f}, {ref_loc[1]:.3f}, {ref_loc[2]:.3f})",
+                    icon='CHECKMARK',
+                )
+            bake_row = move_box.row(align=True)
+            bake_row.enabled = has_ref
+            bake_row.operator("witcher.pelvis_bake_pose_delta", text="Bake Pose Delta", icon='NLA_PUSHDOWN')
+
+            col.separator()
+
+            num_box = col.box()
+            num_box.label(text="Numeric Offset Mode", icon='DRIVER_TRANSFORM')
+            num_box.prop(scene, "witcher_pelvis_offset_loc", text="Location")
+            num_box.prop(scene, "witcher_pelvis_offset_rot", text="Rotation (deg)")
+            num_box.operator("witcher.pelvis_apply_numeric_offset", text="Apply Offset", icon='CHECKMARK')
 
         if anim_tab == "SPEECH":
             try:
@@ -1752,6 +4763,8 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
 
                 if hasattr(scene, _ui_mimics_dialog.MIMIC_AUTO_COLLAPSE_PROP):
                     mimic_col.prop(scene, _ui_mimics_dialog.MIMIC_AUTO_COLLAPSE_PROP, text="Auto Collapse Categories")
+                if hasattr(scene, "witcher_anim_nla_mode"):
+                    mimic_col.prop(scene, "witcher_anim_nla_mode", text="NLA Load Mode")
 
                 bulk_row = mimic_col.row(align=True)
                 bulk_row.operator("witcher.quick_mimic_category_bulk", text="Expand All").action = "expand_all"
@@ -1795,6 +4808,8 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             if getattr(scene, "witcher_voice_recreate_phonemes", False):
                 if hasattr(scene, "witcher_voice_phoneme_accuracy"):
                     col.prop(scene, "witcher_voice_phoneme_accuracy", text="Accuracy", slider=True)
+            if hasattr(scene, "witcher_anim_nla_mode"):
+                col.prop(scene, "witcher_anim_nla_mode", text="NLA Load Mode")
 
             # --- Loaded lipsync status ---
             _arm = _find_character_armature(context)
@@ -2094,7 +5109,23 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             else:
                 current_box.label(text="No armature found.", icon='INFO')
 
+            camera_bone = None
+            if display_armature and getattr(display_armature, "pose", None):
+                camera_bone = display_armature.pose.bones.get(CAMERA_CONTROL_BONE)
+            track_items = []
+            track_names = []
             if rig_settings and getattr(rig_settings, "witcher_tracks_list", None):
+                track_items = [x for x in rig_settings.witcher_tracks_list if x.type == 0]
+                for track in track_items:
+                    track_name = str(getattr(track, "path", "") or getattr(track, "name", "") or "")
+                    if track_name and track_name not in track_names:
+                        track_names.append(track_name)
+            if camera_bone:
+                ensure_camera_track_properties(display_armature, track_names=track_names or CAMERA_TRACK_NAMES)
+                if not track_names:
+                    track_names = list(CAMERA_TRACK_NAMES)
+
+            if rig_settings and track_names and not camera_bone:
                 tracks_box = col_main.box()
                 row = tracks_box.row(align=False)
                 row.prop(
@@ -2104,14 +5135,11 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                     icon_only=True,
                     emboss=False,
                 )
-                track_items = [x for x in rig_settings.witcher_tracks_list if x.type == 0]
-                row.label(text=f"Tracks ({len(track_items)})", icon='ANIM')
+                row.label(text=f"Tracks ({len(track_names)})", icon='ANIM')
                 if not rig_settings.witcher_tracks_collapse:
-                    for track in track_items:
-                        if 'hctFOV' in track.name:
-                            camera_bone = display_armature.pose.bones.get("Camera_Node") if display_armature and display_armature.pose else None
-                            if camera_bone and hasattr(camera_bone, '["' + track.path + '"]'):
-                                tracks_box.prop(camera_bone, '["' + track.path + '"]', text=track.name)
+                    for track_name in track_names:
+                        if camera_bone and track_name in camera_bone:
+                            tracks_box.prop(camera_bone, f'["{track_name}"]', text=track_name)
 
             action_info_box = col_main.box()
             action_info_box.label(text="Action Import Info", icon='INFO')
@@ -2636,6 +5664,31 @@ classes = [
     WITCH_UL_AnimExportSet,
     WITCH_OT_AnimExportSetAdd,
     WITCH_OT_AnimExportSetRemove,
+    WITCH_OT_CameraSetupPreview,
+    WITCH_OT_CameraSetSceneCamera,
+    WITCH_OT_CameraKeyRigFromSceneCamera,
+    WITCH_OT_CameraBakeCutFromSceneCamera,
+    WITCH_OT_CameraCutJump,
+    WITCH_OT_CameraCutResize,
+    WITCH_OT_CameraCutSplit,
+    WITCH_OT_CameraCutCombine,
+    WITCH_OT_CameraCutSyncMarkers,
+    WITCH_OT_CameraCutApplyMarkers,
+    WITCH_OT_CameraSetDofFromSelected,
+    WITCH_OT_CameraConvertCutsToBlenderCameras,
+    WITCH_OT_CameraApplyBlenderCamerasToRig,
+    WITCH_OT_PelvisSetReference,
+    WITCH_OT_PelvisBakePoseDelta,
+    WITCH_OT_PelvisApplyNumericOffset,
+    WITCH_OT_CutsceneNewShot,
+    WITCH_OT_CutsceneUseSelectedCameraAsShot,
+    WITCH_OT_CutsceneScratchImportCamera,
+    WITCH_OT_CutsceneScratchAssignActor,
+    WITCH_OT_CutsceneScratchAddAction,
+    WITCH_OT_CutsceneUseImportNlaStrip,
+    WITCH_OT_CutsceneScratchCreateCameraCut,
+    WITCH_OT_CutsceneScratchBakeSelectedCameraRange,
+    WITCH_OT_CutsceneScratchValidate,
     WITCH_OT_AnimExportGotoProjectPath,
     WITCH_OT_AnimSetRepoFromBrowser,
     WITCH_OT_CutsceneExportGotoProjectPath,
@@ -2688,6 +5741,17 @@ def register():
         default=False
     )
 
+    bpy.types.Scene.witcher_anim_nla_mode = EnumProperty(
+        name="NLA Load Mode",
+        description="How the clip is placed on the anim_import / mimic_import / voice_import NLA track",
+        items=[
+            ('REPLACE',          "Replace",  "Clear the track and replace it with this clip"),
+            ('APPEND',           "Append",   "Add the clip after the last existing strip on the track"),
+            ('APPEND_AT_CURSOR', "At Frame", "Insert the clip at or after the current frame without deleting existing strips"),
+        ],
+        default='REPLACE',
+    )
+
     bpy.types.Scene.witcher_w3_anim_source = EnumProperty(
         name="Animation Source",
         description="Choose which animation source is treated as current",
@@ -2712,6 +5776,77 @@ def register():
         name="Cutscene Repo Path",
         description="Game-relative path for this .w2cutscene file (e.g. dlc\\bob\\data\\cutscenes\\my_scene.w2cutscene)",
         default="",
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_camera_repo_path = StringProperty(
+        name="Cutscene Camera Entity",
+        description="Game-relative camera entity path to import for scratch cutscenes",
+        default=SCRATCH_CAMERA_DEFAULT_REPO_PATH,
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_actor_name = StringProperty(
+        name="Actor Name",
+        description="Cutscene actor id written to the .w2cutscene actor definition",
+        default="",
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_actor_template = StringProperty(
+        name="Actor Template",
+        description="Game-relative entity template path for the selected cutscene actor",
+        default="",
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_actor_appearance = StringProperty(
+        name="Appearance",
+        description="Cutscene actor appearance name",
+        default="",
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_actor_type = EnumProperty(
+        name="Actor Type",
+        description="Cutscene actor type written to the .w2cutscene actor definition",
+        items=[
+            ("CAT_Actor", "Actor", "Animated actor"),
+            ("CAT_Prop", "Prop", "Animated prop"),
+            ("CAT_Camera", "Camera", "Cutscene camera actor"),
+            ("CAT_None", "None", "No specific cutscene actor type"),
+        ],
+        default="CAT_Actor",
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_use_mimic = BoolProperty(
+        name="Use Mimic",
+        description="Mark the selected actor as using hi-res mimic/face data",
+        default=True,
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_action_name = StringProperty(
+        name="Action",
+        description="Optional Blender action to add; empty uses the active action slot",
+        default="",
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_component = EnumProperty(
+        name="Component",
+        description="Cutscene animation component, usually Root or face",
+        items=[
+            (SCRATCH_CUTSCENE_ROOT_COMPONENT, "Root", "Body/root cutscene animation"),
+            ("face", "Face", "Mimic/face cutscene animation"),
+        ],
+        default=SCRATCH_CUTSCENE_ROOT_COMPONENT,
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_multipart_name = StringProperty(
+        name="Multipart Name",
+        description="Shared cutscene animation name for grouping multiple NLA strips into one multipart animation",
+        default="",
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_strip_length = IntProperty(
+        name="Strip Length",
+        description="Optional strip length in frames; 0 uses the action range",
+        default=0,
+        min=0,
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_add_after_last = BoolProperty(
+        name="Add After Last",
+        description="Place the new strip after the last strip on the same cutscene track",
+        default=False,
+    )
+    bpy.types.Scene.witcher_cutscene_scratch_validation_report = StringProperty(
+        name="Cutscene Validation Report",
+        default="",
+        options={'SKIP_SAVE'},
     )
 
     bpy.types.Scene.witcher_auto_orient_root = BoolProperty(
@@ -2763,6 +5898,44 @@ def register():
         default=False
     )
 
+    # Pelvis / root bone editor properties
+    bpy.types.Scene.witcher_pelvis_bone_name = StringProperty(
+        name="Bone",
+        description="Name of the bone to apply location/rotation offsets to",
+        default="Pelvis",
+    )
+    bpy.types.Scene.witcher_pelvis_offset_loc = FloatVectorProperty(
+        name="Location Offset",
+        description="Location offset to add to every keyframe of the bone",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype='XYZ',
+    )
+    bpy.types.Scene.witcher_pelvis_offset_rot = FloatVectorProperty(
+        name="Rotation Offset (deg)",
+        description="XYZ Euler rotation offset in degrees to add to every keyframe of the bone",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
+    )
+    bpy.types.Scene.witcher_pelvis_ref_loc = FloatVectorProperty(
+        name="Ref Loc",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        options={'SKIP_SAVE'},
+    )
+    bpy.types.Scene.witcher_pelvis_ref_rot = FloatVectorProperty(
+        name="Ref Rot",
+        size=4,
+        default=(1.0, 0.0, 0.0, 0.0),
+        options={'SKIP_SAVE'},
+    )
+    bpy.types.Scene.witcher_pelvis_has_ref = BoolProperty(
+        name="Has Reference Pose",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
 
 def unregister():
     for prop_name in (
@@ -2773,6 +5946,7 @@ def unregister():
         "witcher_loaded_w2anims_source_tag",
         "witcher_animset_filter_text",
         "witcher_load_anim_on_select",
+        "witcher_anim_nla_mode",
         "witcher_w3_anim_source",
         "witcher_auto_orient_root",
         "witcher_motion_extraction_debug_compressed",
@@ -2791,6 +5965,24 @@ def unregister():
         "witcher_anim_export_set_index",
         "witcher_anim_export_repo_path",
         "witcher_cutscene_export_repo_path",
+        "witcher_cutscene_scratch_camera_repo_path",
+        "witcher_cutscene_scratch_actor_name",
+        "witcher_cutscene_scratch_actor_template",
+        "witcher_cutscene_scratch_actor_appearance",
+        "witcher_cutscene_scratch_actor_type",
+        "witcher_cutscene_scratch_use_mimic",
+        "witcher_cutscene_scratch_action_name",
+        "witcher_cutscene_scratch_component",
+        "witcher_cutscene_scratch_multipart_name",
+        "witcher_cutscene_scratch_strip_length",
+        "witcher_cutscene_scratch_add_after_last",
+        "witcher_cutscene_scratch_validation_report",
+        "witcher_pelvis_bone_name",
+        "witcher_pelvis_offset_loc",
+        "witcher_pelvis_offset_rot",
+        "witcher_pelvis_ref_loc",
+        "witcher_pelvis_ref_rot",
+        "witcher_pelvis_has_ref",
     ):
         if hasattr(bpy.types.Scene, prop_name):
             delattr(bpy.types.Scene, prop_name)
