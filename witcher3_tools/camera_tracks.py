@@ -9,6 +9,8 @@ CAMERA_TRACK_DEFAULTS = {
     "dofIntensity": 0.0,
     "dofFocusDistNear": 5.0,
     "dofBlurDistNear": 0.0,
+    "blenderDofFocusDistance": 0.0,
+    "blenderDofFocusDistanceWeight": 0.0,
 }
 
 CAMERA_TRACK_NAMES = tuple(CAMERA_TRACK_DEFAULTS.keys())
@@ -19,11 +21,17 @@ CAMERA_DOF_TRACK_NAMES = (
     "dofIntensity",
     "dofFocusDistNear",
     "dofBlurDistNear",
+    "blenderDofFocusDistance",
+    "blenderDofFocusDistanceWeight",
 )
 CAMERA_CONTROL_BONE = "Camera_Node"
 CAMERA_EDIT_BONE = "Camera_ManipulationNode"
 CAMERA_SENSOR_HEIGHT = 43.266615300557
 BLENDER_DOF_INTENSITY_FSTOP = 2.8
+BLENDER_DOF_INTENSITY_BIAS = 0.25
+BLENDER_DOF_FOCUS_RANGE_FSTOP = 2.0
+BLENDER_DOF_FAR_BLUR_FSTOP = 0.25
+BLENDER_DOF_NEAR_BLUR_FSTOP = 0.5
 
 
 def is_camera_track_name(track_name: str) -> bool:
@@ -133,8 +141,14 @@ def setup_camera_dof_drivers(armature_obj, camera_obj):
         camera_data,
         "dof.focus_distance",
         armature_obj,
-        "dofFocusDistNear + dofFocusDistFar * 0.5",
+        (
+            "blenderDofFocusDistance * blenderDofFocusDistanceWeight + "
+            "(dofFocusDistNear + dofFocusDistFar * 0.5) * "
+            "(1 - blenderDofFocusDistanceWeight)"
+        ),
         [
+            ("blenderDofFocusDistance", "blenderDofFocusDistance"),
+            ("blenderDofFocusDistanceWeight", "blenderDofFocusDistanceWeight"),
             ("dofFocusDistNear", "dofFocusDistNear"),
             ("dofFocusDistFar", "dofFocusDistFar"),
         ],
@@ -143,8 +157,17 @@ def setup_camera_dof_drivers(armature_obj, camera_obj):
         camera_data,
         "dof.aperture_fstop",
         armature_obj,
-        f"{BLENDER_DOF_INTENSITY_FSTOP} / (0.05 + dofIntensity * overrideFactor)",
+        (
+            f"({BLENDER_DOF_INTENSITY_FSTOP} + "
+            f"dofFocusDistFar * {BLENDER_DOF_FOCUS_RANGE_FSTOP} + "
+            f"dofBlurDistFar * {BLENDER_DOF_FAR_BLUR_FSTOP} + "
+            f"dofBlurDistNear * {BLENDER_DOF_NEAR_BLUR_FSTOP}) / "
+            f"({BLENDER_DOF_INTENSITY_BIAS} + dofIntensity * overrideFactor)"
+        ),
         [
+            ("dofFocusDistFar", "dofFocusDistFar"),
+            ("dofBlurDistFar", "dofBlurDistFar"),
+            ("dofBlurDistNear", "dofBlurDistNear"),
             ("dofIntensity", "dofIntensity"),
             ("overrideFactor", "overrideFactor"),
         ],
@@ -181,6 +204,40 @@ def set_camera_dof_from_distance(camera_bone, distance, *,
     for track_name, value in values.items():
         camera_bone[track_name] = value
     return True
+
+
+def engine_dof_planes_to_camera_tracks(*,
+                                      dof_focus_near=0.0,
+                                      dof_focus_far=0.0,
+                                      dof_blur_near=0.0,
+                                      dof_blur_far=0.0,
+                                      dof_intensity=0.0,
+                                      override_factor=1.0):
+    """Convert scene camera DOF planes to the raw camera rig track layout.
+
+    Story scene camera definitions store absolute engine planes. Camera rig
+    animation tracks store near focus plus widths; CCamera expands those widths
+    back into absolute planes before rendering.
+    """
+    near_focus = max(0.0, float(dof_focus_near or 0.0))
+    far_focus = max(0.0, float(dof_focus_far or 0.0))
+    near_blur = max(0.0, float(dof_blur_near or 0.0))
+    far_blur = max(0.0, float(dof_blur_far or 0.0))
+
+    near_focus = min(near_focus, far_focus)
+    near_blur = min(near_blur, near_focus)
+    far_blur = max(far_blur, far_focus)
+
+    intensity = max(0.0, min(1.0, float(dof_intensity or 0.0)))
+    override = max(0.0, float(override_factor or 0.0))
+    return {
+        "overrideFactor": override,
+        "dofIntensity": intensity,
+        "dofFocusDistNear": near_focus,
+        "dofFocusDistFar": max(0.0, far_focus - near_focus),
+        "dofBlurDistNear": max(0.0, near_focus - near_blur),
+        "dofBlurDistFar": max(0.0, far_blur - far_focus),
+    }
 
 
 def get_blender_camera_focus_distance(camera_obj):

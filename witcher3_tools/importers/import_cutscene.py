@@ -20,6 +20,7 @@ CUTSCENE_SOURCE_INDEX_PROP = "witcher_cutscene_source_index"
 CUTSCENE_ANIMATION_NAME_PROP = "witcher_cutscene_animation_name"
 CUTSCENE_ACTOR_IMPORTED_PROP = "cutscene_actor_imported"
 CUTSCENE_APPEARANCE_DATA_PATH = "witcherui_RigSettings.app_list_index"
+FACE_MORPHS_APPEARANCE_PROP = "witcher_face_morphs_loaded_for_appearance"
 CUTSCENE_BURNED_AUDIO_PROP = "witcher_cutscene_burned_audio"
 CUTSCENE_BURNED_AUDIO_EVENT_PROP = "witcher_cutscene_burned_audio_event"
 CUTSCENE_BURNED_AUDIO_ITEM_PATH_PROP = "witcher_cutscene_burned_audio_item_path"
@@ -704,16 +705,46 @@ def _ensure_cutscene_actor_appearance(actor_obj, preferred_name=""):
         )
         return False, resolved_name
 
+
+def _current_actor_appearance_name(actor_obj):
+    rig_settings = getattr(getattr(actor_obj, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is None:
+        return ""
+    try:
+        app_idx = int(getattr(rig_settings, "app_list_index", -1))
+    except Exception:
+        app_idx = -1
+    app_list = getattr(rig_settings, "app_list", None)
+    if app_idx < 0 or app_list is None or app_idx >= len(app_list):
+        return ""
+    try:
+        return str(getattr(app_list[app_idx], "name", "") or "").strip()
+    except Exception:
+        return ""
+
+
 def _ensure_cutscene_face_setup(actor_obj):
     if actor_obj is None or getattr(actor_obj, "type", None) != 'ARMATURE':
         return False
     if 'mimicFaceFile' not in actor_obj or 'mimicFace' not in actor_obj:
         return False
+    current_appearance = _current_actor_appearance_name(actor_obj)
+    last_face_appearance = str(actor_obj.get(FACE_MORPHS_APPEARANCE_PROP, "") or "").strip()
+    force_reload = bool(current_appearance and current_appearance != last_face_appearance)
     try:
         from ..ui.ui_anims_list import ensure_owner_face_animation_setup
 
-        loaded, target_armature = ensure_owner_face_animation_setup(bpy.context, actor_obj)
+        loaded, target_armature = ensure_owner_face_animation_setup(
+            bpy.context,
+            actor_obj,
+            force=force_reload,
+        )
         if target_armature is not None:
+            if loaded and current_appearance:
+                try:
+                    target_armature[FACE_MORPHS_APPEARANCE_PROP] = current_appearance
+                except Exception:
+                    pass
             return bool(loaded)
     except Exception:
         log.warning(
@@ -830,8 +861,15 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
             imported_new = actor_obj is not None
     if not actor_obj and template_path:
         try:
+            resolved_template_path = repo_file(template_path)
+            log.info(
+                "Cutscene actor '%s' template resolved: %s -> %s",
+                actor_name or actor_index,
+                template_path,
+                resolved_template_path,
+            )
             actor_obj = import_entity.import_ent_template(
-                repo_file(template_path),
+                resolved_template_path,
                 load_face_poses=True,
                 import_apperance=1,
                 selected_appearance_name=preferred_appearance_name,
@@ -852,6 +890,8 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
 
     _ensure_cutscene_actor_appearance(actor_obj, preferred_appearance_name)
     _ensure_cutscene_face_setup(actor_obj)
+    if imported_new and cutscene_guid:
+        _tag_cutscene_object_hierarchy(actor_obj, cutscene_guid)
     _tag_cutscene_actor(
         actor_obj,
         actor,

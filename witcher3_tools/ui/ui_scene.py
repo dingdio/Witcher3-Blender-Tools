@@ -5,6 +5,7 @@ log = logging.getLogger(__name__)
 
 from ..CR2W import w3_types
 from ..CR2W.prop_utils import prop_to_string
+from ..CR2W.common_blender import get_repo_override_state, repo_file, set_repo_override_roots
 from ..importers import import_cutscene
 from ..importers import import_scene
 from ..exporters import export_cutscene
@@ -14,8 +15,9 @@ from bpy.types import Panel, Operator, UIList, PropertyGroup
 from bpy.props import IntProperty, StringProperty, CollectionProperty, FloatProperty, BoolProperty
 from bpy_extras.io_utils import ImportHelper
 
-from .. import get_uncook_path
+from .. import get_all_addon_prefs, get_uncook_path
 from ..camera_tracks import (
+    CAMERA_CONTROL_BONE,
     CAMERA_TRACK_NAMES,
     ensure_camera_track_properties,
 )
@@ -124,6 +126,20 @@ def _cs_find_camera_armature(context):
     return None
 
 
+def _w2scene_find_camera_armature(context):
+    camera_arm = _cs_find_camera_armature(context)
+    if camera_arm is not None:
+        return camera_arm
+    scene = getattr(context, "scene", None)
+    for obj in getattr(scene, "objects", []) or []:
+        if (
+            getattr(obj, "type", None) == 'ARMATURE'
+            and getattr(getattr(obj, "pose", None), "bones", {}).get(CAMERA_CONTROL_BONE) is not None
+        ):
+            return obj
+    return None
+
+
 def _cs_iter_camera_cuts(armature_obj):
     if armature_obj is None or not getattr(armature_obj, "animation_data", None):
         return []
@@ -157,10 +173,21 @@ def add_scene_section(name, json_data, scene):
     section = scene.witcher_sections.add()
     section.name = name
     section.json_data = json_data
+    return section
 
 class WitcherSection(bpy.types.PropertyGroup):
-    name = StringProperty(name="Name")
-    json_data = StringProperty(name="JSON Data")
+    name: StringProperty(name="Name")
+    json_data: StringProperty(name="JSON Data")
+    section_index: IntProperty(default=-1)
+    section_type: StringProperty(default="")
+    section_id: IntProperty(default=0)
+    element_count: IntProperty(default=0)
+    event_count: IntProperty(default=0)
+    duration: FloatProperty(default=0.0)
+    dialogset_change: StringProperty(default="")
+    linked_cutscene: StringProperty(default="")
+    is_gameplay: BoolProperty(default=False)
+    is_important: BoolProperty(default=False)
 
 class CutsceneActorPreviewItem(PropertyGroup):
     source_index: IntProperty(default=-1)
@@ -242,6 +269,96 @@ class CutsceneDialogItem(PropertyGroup):
     sound_event: StringProperty(default="")
     line_index: IntProperty(default=0)
     scene_path: StringProperty(default="")
+
+
+class W2SceneFieldItem(PropertyGroup):
+    section_index: IntProperty(default=-1)
+    class_name: StringProperty(default="")
+    field_name: StringProperty(default="")
+    value_text: StringProperty(default="")
+    is_set: BoolProperty(default=False)
+
+
+class W2SceneActorItem(PropertyGroup):
+    source_index: IntProperty(default=-1)
+    actor_id: StringProperty(default="")
+    alias: StringProperty(default="")
+    actor_tags: StringProperty(default="")
+    template_path: StringProperty(default="")
+    appearance_filter: StringProperty(default="")
+    use_mimic: BoolProperty(default=False)
+    force_spawn: BoolProperty(default=False)
+    dont_search_by_voicetag: BoolProperty(default=False)
+
+
+class W2SceneDialogsetItem(PropertyGroup):
+    source_index: IntProperty(default=-1)
+    name: StringProperty(default="")
+    placement_tag: StringProperty(default="")
+    path: StringProperty(default="")
+    slot_count: IntProperty(default=0)
+    snap_to_terrain: BoolProperty(default=False)
+    find_safe_placement: BoolProperty(default=False)
+
+
+class W2SceneDialogsetSlotItem(PropertyGroup):
+    dialogset_index: IntProperty(default=-1)
+    source_index: IntProperty(default=-1)
+    slot_number: IntProperty(default=0)
+    slot_name: StringProperty(default="")
+    actor_name: StringProperty(default="")
+    actor_status: StringProperty(default="")
+    actor_pose_name: StringProperty(default="")
+    actor_emotional_state: StringProperty(default="")
+    actor_mimics_state: StringProperty(default="")
+    force_body_idle_animation: StringProperty(default="")
+    actor_visibility: BoolProperty(default=True)
+
+
+class W2SceneCameraItem(PropertyGroup):
+    source_index: IntProperty(default=-1)
+    camera_name: StringProperty(default="")
+    fov: FloatProperty(default=0.0)
+    zoom: FloatProperty(default=0.0)
+    source_slot_name: StringProperty(default="")
+    target_slot_name: StringProperty(default="")
+    camera_adjust_version: IntProperty(default=0)
+    dof_summary: StringProperty(default="")
+
+
+class W2SceneSectionElementItem(PropertyGroup):
+    section_index: IntProperty(default=-1)
+    source_index: IntProperty(default=-1)
+    element_type: StringProperty(default="")
+    element_id: StringProperty(default="")
+    display_name: StringProperty(default="")
+    start_time: FloatProperty(default=0.0)
+    duration: FloatProperty(default=0.0)
+    actor: StringProperty(default="")
+    target: StringProperty(default="")
+    line_id: StringProperty(default="")
+    detail_text: StringProperty(default="")
+
+
+class W2SceneSectionEventItem(PropertyGroup):
+    section_index: IntProperty(default=-1)
+    source_index: IntProperty(default=-1)
+    event_type: StringProperty(default="")
+    event_name: StringProperty(name="Event Name", default="")
+    start_time: FloatProperty(name="Start Time", default=0.0)
+    start_position: FloatProperty(name="Start Position", default=0.0)
+    duration: FloatProperty(name="Duration", default=0.0)
+    duration_raw: FloatProperty(name="Raw Duration", default=0.0)
+    actor: StringProperty(name="Actor", default="")
+    target: StringProperty(name="Target", default="")
+    scene_element_id: StringProperty(name="Element", default="")
+    track_name: StringProperty(name="Track", default="")
+    animation_name: StringProperty(name="Animation", default="")
+    camera_name: StringProperty(name="Camera", default="")
+    effect_name: StringProperty(name="Effect", default="")
+    guid: StringProperty(name="GUID", default="")
+    is_muted: BoolProperty(name="Muted", default=False)
+    detail_text: StringProperty(default="")
 
 
 def _set_cutscene_burned_audio_scene_state(scene, event_name="", item_path=""):
@@ -331,7 +448,19 @@ def _get_imported_value_label(value):
         if text:
             return text
 
-    for attr_name in ("name", "template", "type_name"):
+    for attr_name in (
+        "name",
+        "sectionName",
+        "elementID",
+        "id",
+        "actorName",
+        "slotName",
+        "cameraName",
+        "eventName",
+        "animationName",
+        "template",
+        "type_name",
+    ):
         text = str(getattr(value, attr_name, "") or "").strip()
         if text:
             return text
@@ -340,6 +469,10 @@ def _get_imported_value_label(value):
 
 
 def _format_imported_field_value(value, depth=0):
+    if depth > 4:
+        label = _get_imported_value_label(value)
+        return label or value.__class__.__name__
+
     if value is None:
         return "\"\""
 
@@ -376,6 +509,36 @@ def _format_imported_field_value(value, depth=0):
         if len(seq) > _IMPORTED_FIELD_LIST_LIMIT:
             text += f" (+{len(seq) - _IMPORTED_FIELD_LIST_LIMIT} more)"
         return text or "[]"
+
+    guid_obj = getattr(value, "GUID", None)
+    guid_text = str(getattr(guid_obj, "GuidString", "") or "").strip()
+    if guid_text:
+        return guid_text
+
+    engine_transform = getattr(value, "EngineTransform", None)
+    if engine_transform is not None and engine_transform is not value:
+        return _format_imported_field_value(engine_transform, depth + 1)
+
+    if all(hasattr(value, attr) for attr in ("X", "Y", "Z")):
+        parts = [f"{attr}={float(getattr(value, attr, 0.0) or 0.0):g}" for attr in ("X", "Y", "Z")]
+        for attr in ("Pitch", "Yaw", "Roll"):
+            if hasattr(value, attr):
+                parts.append(f"{attr}={float(getattr(value, attr, 0.0) or 0.0):g}")
+        return ", ".join(parts)
+
+    try:
+        iter_values = _w2scene_iter_values(value)
+    except NameError:
+        iter_values = []
+    if iter_values:
+        return _format_imported_field_value(iter_values, depth + 1)
+
+    try:
+        prop_text = prop_to_string(value)
+    except Exception:
+        prop_text = ""
+    if prop_text:
+        return prop_text
 
     label = _get_imported_value_label(value)
     if label:
@@ -425,6 +588,533 @@ def _sync_cutscene_burned_audio_state(scene, filepath, cutscene, cutscene_data=N
 
     _set_cutscene_burned_audio_scene_state(scene, event_name=event_name, item_path=item_path)
 
+
+_W2SCENE_ROOT_FIELD_SCHEMA = [
+    ("CStoryScene", [
+        ("sceneId", None),
+        ("elementIDCounter", None),
+        ("sectionIDCounter", None),
+        ("mayActorsStartWorking", None),
+        ("surpassWaterRendering", None),
+        ("blockMusicTriggers", None),
+        ("muteSpeechUnderWater", None),
+        ("soundListenerOverride", None),
+        ("banksDependency", None),
+        ("soundEventsOnEnd", None),
+        ("soundEventsOnSkip", None),
+        ("sceneTemplates", None),
+        ("sceneProps", None),
+        ("sceneEffects", None),
+        ("sceneLights", None),
+        ("dialogsetInstances", None),
+        ("cameraDefinitions", None),
+        ("sections", None),
+        ("controlParts", None),
+    ]),
+]
+
+_W2SCENE_SECTION_FIELD_SCHEMA = [
+    ("CStorySceneSection", [
+        ("sectionId", None),
+        ("sectionName", None),
+        ("comment", None),
+        ("contexID", None),
+        ("defaultVariantId", None),
+        ("nextVariantId", None),
+        ("variants", None),
+        ("localeVariantMappings", None),
+        ("sceneElements", None),
+        ("events", None),
+        ("eventsInfo", None),
+        ("choice", None),
+        ("tags", None),
+        ("isGameplay", None),
+        ("isImportant", None),
+        ("allowCameraMovement", None),
+        ("hasCinematicOneliners", None),
+        ("manualFadeIn", None),
+        ("fadeInAtBeginning", None),
+        ("fadeOutAtEnd", None),
+        ("pauseInCombat", None),
+        ("canBeSkipped", None),
+        ("canHaveLookats", None),
+        ("dialogsetChangeTo", None),
+        ("forceDialogset", None),
+        ("streamingLock", None),
+        ("streamingAreaTag", None),
+        ("blockMusicTriggers", None),
+        ("soundListenerOverride", None),
+        ("soundEventsOnEnd", None),
+        ("soundEventsOnSkip", None),
+    ]),
+    ("CStorySceneCutsceneSection", [
+        ("cutscene", None),
+        ("sceneEventElements", None),
+        ("isLooped", None),
+        ("canBeSkipped", None),
+    ]),
+    ("CStorySceneVideoSection", [
+        ("videoElement", None),
+    ]),
+]
+
+
+def _w2scene_clear_loaded_state(scene):
+    for prop_name in (
+        "witcher_sections",
+        "witcher_w2scene_root_fields",
+        "witcher_w2scene_section_fields",
+        "witcher_w2scene_actor_items",
+        "witcher_w2scene_dialogset_items",
+        "witcher_w2scene_dialogset_slot_items",
+        "witcher_w2scene_camera_items",
+        "witcher_w2scene_section_element_items",
+        "witcher_w2scene_section_event_items",
+    ):
+        collection = getattr(scene, prop_name, None)
+        if collection is not None:
+            collection.clear()
+    scene.witcher_loaded_w2scene_name = ""
+    scene.witcher_loaded_w2scene_path = ""
+    scene.witcher_w2scene_repo_path = ""
+    scene.witcher_w2scene_summary = ""
+    if hasattr(scene, "witcher_w2scene_active_cutscene_path"):
+        scene.witcher_w2scene_active_cutscene_path = ""
+    scene.witcher_sections_index = 0
+    scene.witcher_w2scene_actor_index = 0
+    scene.witcher_w2scene_dialogset_index = 0
+    scene.witcher_w2scene_dialogset_slot_index = 0
+    scene.witcher_w2scene_camera_index = 0
+    scene.witcher_w2scene_element_index = 0
+    scene.witcher_w2scene_event_index = 0
+
+
+def _w2scene_as_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _w2scene_as_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _w2scene_iter_values(prop):
+    if prop is None:
+        return []
+    if isinstance(prop, (list, tuple, set)):
+        return list(prop)
+    for attr in ("value", "More", "elements", "Handles"):
+        values = getattr(prop, attr, None)
+        if values is not None:
+            if isinstance(values, (list, tuple, set)):
+                return list(values)
+            return [values]
+    return []
+
+
+def _w2scene_ptr_value(ptr):
+    if ptr is None:
+        return None
+    value = getattr(ptr, "Value", ptr)
+    return value if isinstance(value, int) else None
+
+
+def _w2scene_prop_text(value, default=""):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if isinstance(value, (int, float, str)):
+        text = str(value).strip()
+        return text or default
+    guid = getattr(value, "GUID", None)
+    guid_text = str(getattr(guid, "GuidString", "") or "").strip()
+    if guid_text:
+        return guid_text
+    try:
+        text = prop_to_string(value)
+        if text:
+            return text
+    except Exception:
+        pass
+    for attr_name in (
+        "String",
+        "Value",
+        "val",
+        "elementID",
+        "sectionName",
+        "id",
+        "name",
+        "actorName",
+        "slotName",
+        "cameraName",
+        "eventName",
+        "animationName",
+    ):
+        attr = getattr(value, attr_name, None)
+        if attr is None:
+            continue
+        if hasattr(attr, "val"):
+            attr = getattr(attr, "val", "")
+        if hasattr(attr, "String"):
+            attr = getattr(attr, "String", "")
+        text = str(attr or "").strip()
+        if text:
+            return text
+    return default
+
+
+def _w2scene_join_values(value):
+    if value is None:
+        return ""
+    values = _w2scene_iter_values(value)
+    if not values and isinstance(value, str):
+        return value
+    if not values:
+        text = _w2scene_prop_text(value)
+        return text
+    parts = []
+    for item in values:
+        text = _w2scene_prop_text(item)
+        if text:
+            parts.append(text)
+    return "; ".join(parts)
+
+
+def _w2scene_is_set(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, (list, tuple, set)):
+        return bool(value)
+    values = _w2scene_iter_values(value)
+    if values:
+        return True
+    return True
+
+
+def _w2scene_fill_field_items(collection, imported_data, schema, section_index=-1):
+    if imported_data is None:
+        return
+    for class_name, fields in schema:
+        if class_name != imported_data.__class__.__name__ and not isinstance(imported_data, getattr(w3_types, class_name, object)):
+            if class_name not in ("CStorySceneSection", "CStoryScene"):
+                continue
+        for field_name, _default in fields:
+            value = getattr(imported_data, field_name, None)
+            item = collection.add()
+            item.section_index = int(section_index)
+            item.class_name = class_name
+            item.field_name = field_name
+            item.is_set = _w2scene_is_set(value)
+            item.value_text = _format_imported_field_value(value) if item.is_set else "<unset>"
+
+
+def _w2scene_load_chunk_object(story_scene, ptr_value):
+    ptr = _w2scene_ptr_value(ptr_value)
+    if not ptr:
+        return None
+    try:
+        chunk = story_scene.chunksRef[ptr - 1]
+        cls = w3_types.str_to_class(chunk.Type)
+        return cls(chunk)
+    except Exception:
+        log.debug("Could not parse w2scene chunk pointer %s", ptr, exc_info=True)
+        return None
+
+
+def _w2scene_element_label(element):
+    element_type = element.__class__.__name__ if element is not None else "CStorySceneElement"
+    element_id = _w2scene_prop_text(getattr(element, "elementID", None))
+    if element_type == "CStorySceneLine":
+        actor = _w2scene_prop_text(getattr(element, "voicetag", None))
+        line_id = _w2scene_prop_text(getattr(element, "dialogLine", None))
+        return f"{actor}: {line_id}" if actor or line_id else (element_id or element_type)
+    if element_type == "CStoryScenePauseElement":
+        return element_id or "Pause"
+    if element_type == "CStorySceneScriptLine":
+        script = _w2scene_prop_text(getattr(element, "script", None))
+        return script[:80] if script else (element_id or element_type)
+    return element_id or _w2scene_prop_text(element) or element_type
+
+
+def _w2scene_event_icon(event_type):
+    if "Camera" in event_type:
+        return "CAMERA_DATA"
+    if "LookAt" in event_type or "Lookat" in event_type or "DialogLine" in event_type:
+        return "OUTLINER_OB_SPEAKER"
+    if "Mimic" in event_type or "Morph" in event_type:
+        return "SHAPEKEY_DATA"
+    if "Animation" in event_type or "Pose" in event_type or "Anim" in event_type:
+        return "ACTION"
+    if "Sound" in event_type:
+        return "SOUND"
+    if "Effect" in event_type or "Surface" in event_type:
+        return "SHADERFX"
+    if "Placement" in event_type or "EnterActor" in event_type or "ExitActor" in event_type:
+        return "EMPTY_AXIS"
+    if "Visibility" in event_type or "Despawn" in event_type:
+        return "HIDE_OFF"
+    if "Fade" in event_type:
+        return "IMAGE_ALPHA"
+    return _event_type_icon(event_type)
+
+
+def _w2scene_event_label(item):
+    for attr_name in ("event_name", "animation_name", "camera_name", "effect_name"):
+        text = str(getattr(item, attr_name, "") or "").strip()
+        if text:
+            return text
+    return str(getattr(item, "event_type", "") or "Event")
+
+
+def _w2scene_event_detail_text(event):
+    parts = []
+    for attr_name in (
+        "actor",
+        "actorName",
+        "target",
+        "bodyTarget",
+        "eyesTarget",
+        "propID",
+        "effectName",
+        "animationName",
+        "customCameraName",
+        "level",
+        "type",
+        "enabled",
+        "instant",
+        "weight",
+        "forceBodyIdleAnimation",
+        "transitionAnimation",
+    ):
+        value = getattr(event, attr_name, None)
+        if not _w2scene_is_set(value):
+            continue
+        text = _format_imported_field_value(value)
+        if text and text != "\"\"":
+            parts.append(f"{attr_name}={text}")
+    return "  ".join(parts[:8])
+
+
+def _w2scene_event_camera_name(event):
+    camera_name = _w2scene_prop_text(getattr(event, "customCameraName", None))
+    if camera_name:
+        return camera_name
+    camera_definition = getattr(event, "cameraDefinition", None)
+    if camera_definition is not None:
+        try:
+            camera_definition = w3_types.StorySceneCameraDefinition(camera_definition)
+            return _w2scene_prop_text(getattr(camera_definition, "cameraName", None))
+        except Exception:
+            return ""
+    return ""
+
+
+def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
+    _w2scene_clear_loaded_state(scene)
+    if not filepath:
+        return None
+
+    if scene_importer is None:
+        scene_importer = import_scene.import_w3_scene(filepath)
+        scene_importer.load_sections()
+
+    story_scene = scene_importer._CStoryScene
+    sections = list(getattr(scene_importer, "scene_sections", []) or [])
+    scene.witcher_sections_filepath = filepath
+    scene.witcher_loaded_w2scene_path = filepath
+    scene.witcher_loaded_w2scene_name = os.path.basename(filepath)
+    scene.witcher_w2scene_repo_path = _derive_w2scene_repo_path(bpy.context, filepath)
+
+    _w2scene_fill_field_items(scene.witcher_w2scene_root_fields, story_scene, _W2SCENE_ROOT_FIELD_SCHEMA)
+
+    total_elements = 0
+    total_events = 0
+    cutscene_sections = 0
+    for section_index, section in enumerate(sections):
+        element_refs = list(getattr(getattr(section, "sceneElements", None), "value", []) or [])
+        events = list(getattr(section, "sceneEventElements", []) or [])
+        total_elements += len(element_refs)
+        total_events += len(events)
+        if section.__class__.__name__ == "CStorySceneCutsceneSection":
+            cutscene_sections += 1
+
+        duration_overrides = {}
+        try:
+            duration_overrides = scene_importer._section_variant_duration_overrides(section)
+        except Exception:
+            log.debug("Could not read section duration overrides", exc_info=True)
+
+        section_duration = 0.0
+        element_meta_by_ptr = {}
+        for element_ref in element_refs:
+            element = _w2scene_load_chunk_object(story_scene, element_ref)
+            ptr = _w2scene_ptr_value(element_ref)
+            element_id = _w2scene_prop_text(getattr(element, "elementID", None))
+            duration = duration_overrides.get(
+                element_id,
+                _w2scene_as_float(
+                    getattr(element, "approvedDuration", None)
+                    or getattr(element, "duration", None),
+                    0.0,
+                ),
+            )
+            element_meta_by_ptr[ptr] = {
+                "element": element,
+                "element_id": element_id,
+                "start": section_duration,
+                "duration": duration,
+                "label": _w2scene_element_label(element),
+            }
+            el_item = scene.witcher_w2scene_section_element_items.add()
+            el_item.section_index = section_index
+            el_item.source_index = ptr or -1
+            el_item.element_type = element.__class__.__name__ if element is not None else "Unknown"
+            el_item.element_id = element_id
+            el_item.display_name = element_meta_by_ptr[ptr]["label"]
+            el_item.start_time = section_duration
+            el_item.duration = duration
+            el_item.actor = _w2scene_prop_text(getattr(element, "voicetag", None))
+            el_item.target = _w2scene_prop_text(getattr(element, "speakingTo", None))
+            el_item.line_id = _w2scene_prop_text(getattr(element, "dialogLine", None))
+            if getattr(element, "soundEventName", None):
+                el_item.detail_text = f"sound={_w2scene_prop_text(getattr(element, 'soundEventName', None))}"
+            section_duration += duration
+
+        sec_item = add_scene_section(_w2scene_prop_text(getattr(section, "sectionName", None)) or f"Section {section_index + 1}", "{}", scene)
+        sec_item.section_index = section_index
+        sec_item.section_type = section.__class__.__name__
+        sec_item.section_id = _w2scene_as_int(getattr(section, "sectionId", 0), 0)
+        sec_item.element_count = len(element_refs)
+        sec_item.event_count = len(events)
+        sec_item.duration = section_duration
+        sec_item.dialogset_change = _w2scene_prop_text(getattr(section, "dialogsetChangeTo", None))
+        sec_item.linked_cutscene = prop_to_string(getattr(section, "cutscene", None))
+        sec_item.is_gameplay = bool(getattr(section, "isGameplay", False) or False)
+        sec_item.is_important = bool(getattr(section, "isImportant", False) or False)
+
+        _w2scene_fill_field_items(scene.witcher_w2scene_section_fields, section, _W2SCENE_SECTION_FIELD_SCHEMA, section_index=section_index)
+
+        for event_index, event in enumerate(events):
+            event_type = event.__class__.__name__
+            scene_element_ptr = _w2scene_ptr_value(getattr(event, "sceneElement", None))
+            meta = element_meta_by_ptr.get(scene_element_ptr, {})
+            element_start = float(meta.get("start", 0.0) or 0.0)
+            element_duration = float(meta.get("duration", 0.0) or 0.0)
+            start_position = _w2scene_as_float(getattr(event, "startPosition", None), 0.0)
+            duration_raw = _w2scene_as_float(getattr(event, "duration", None), 0.0)
+            duration = duration_raw
+            if 0.0 < duration_raw <= 1.001 and element_duration > 0.0:
+                duration = duration_raw * element_duration
+
+            ev_item = scene.witcher_w2scene_section_event_items.add()
+            ev_item.section_index = section_index
+            ev_item.source_index = event_index
+            ev_item.event_type = event_type
+            ev_item.event_name = _w2scene_prop_text(getattr(event, "eventName", None))
+            ev_item.start_position = start_position
+            ev_item.start_time = element_start + (element_duration * start_position)
+            ev_item.duration_raw = duration_raw
+            ev_item.duration = duration
+            ev_item.actor = _w2scene_prop_text(getattr(event, "actor", None) or getattr(event, "actorName", None))
+            ev_item.target = _w2scene_prop_text(
+                getattr(event, "target", None)
+                or getattr(event, "bodyTarget", None)
+                or getattr(event, "eyesTarget", None)
+            )
+            ev_item.scene_element_id = str(meta.get("element_id", "") or scene_element_ptr or "")
+            ev_item.track_name = _w2scene_prop_text(getattr(event, "trackName", None))
+            ev_item.animation_name = _w2scene_prop_text(getattr(event, "animationName", None))
+            ev_item.camera_name = _w2scene_event_camera_name(event)
+            ev_item.effect_name = _w2scene_prop_text(getattr(event, "effectName", None) or getattr(event, "effect", None))
+            ev_item.guid = _w2scene_prop_text(getattr(event, "GUID", None))
+            ev_item.is_muted = bool(getattr(event, "isMuted", False) or False)
+            ev_item.detail_text = _w2scene_event_detail_text(event)
+
+    for actor_index, actor_ref in enumerate(getattr(getattr(story_scene, "sceneTemplates", None), "value", []) or []):
+        actor = _w2scene_load_chunk_object(story_scene, actor_ref)
+        if actor is None:
+            continue
+        item = scene.witcher_w2scene_actor_items.add()
+        item.source_index = actor_index
+        item.actor_id = _w2scene_prop_text(getattr(actor, "id", None))
+        item.alias = _w2scene_prop_text(getattr(actor, "alias", None))
+        item.actor_tags = _w2scene_join_values(getattr(actor, "actorTags", None))
+        item.template_path = _w2scene_prop_text(getattr(actor, "entityTemplate", None))
+        item.appearance_filter = _w2scene_join_values(getattr(actor, "appearanceFilter", None))
+        item.use_mimic = bool(getattr(actor, "useMimic", False) or False)
+        item.force_spawn = bool(getattr(actor, "forceSpawn", False) or False)
+        item.dont_search_by_voicetag = bool(getattr(actor, "dontSearchByVoicetag", False) or False)
+
+    for dialogset_index, dialogset_ref in enumerate(getattr(getattr(story_scene, "dialogsetInstances", None), "value", []) or []):
+        dialogset = _w2scene_load_chunk_object(story_scene, dialogset_ref)
+        if dialogset is None:
+            continue
+        slot_refs = list(getattr(getattr(dialogset, "slots", None), "value", []) or [])
+        item = scene.witcher_w2scene_dialogset_items.add()
+        item.source_index = dialogset_index
+        item.name = _w2scene_prop_text(getattr(dialogset, "name", None))
+        item.placement_tag = _w2scene_join_values(getattr(dialogset, "placementTag", None))
+        item.path = _w2scene_prop_text(getattr(dialogset, "path", None))
+        item.slot_count = len(slot_refs)
+        item.snap_to_terrain = bool(getattr(dialogset, "snapToTerrain", False) or False)
+        item.find_safe_placement = bool(getattr(dialogset, "findSafePlacement", False) or False)
+        for slot_index, slot_ref in enumerate(slot_refs):
+            slot = _w2scene_load_chunk_object(story_scene, slot_ref)
+            if slot is None:
+                continue
+            slot_item = scene.witcher_w2scene_dialogset_slot_items.add()
+            slot_item.dialogset_index = dialogset_index
+            slot_item.source_index = slot_index
+            slot_item.slot_number = _w2scene_as_int(getattr(slot, "slotNumber", 0), 0)
+            slot_item.slot_name = _w2scene_prop_text(getattr(slot, "slotName", None))
+            slot_item.actor_name = _w2scene_prop_text(getattr(slot, "actorName", None))
+            slot_item.actor_status = _w2scene_prop_text(getattr(slot, "actorStatus", None))
+            slot_item.actor_pose_name = _w2scene_prop_text(getattr(slot, "actorPoseName", None))
+            slot_item.actor_emotional_state = _w2scene_prop_text(getattr(slot, "actorEmotionalState", None))
+            slot_item.actor_mimics_state = _w2scene_prop_text(getattr(slot, "actorMimicsEmotionalState", None))
+            slot_item.force_body_idle_animation = _w2scene_prop_text(getattr(slot, "forceBodyIdleAnimation", None))
+            actor_visibility = getattr(slot, "actorVisibility", True)
+            slot_item.actor_visibility = True if actor_visibility is None else bool(actor_visibility)
+
+    for camera_index, camera_def in enumerate(getattr(getattr(story_scene, "cameraDefinitions", None), "More", []) or []):
+        try:
+            camera = w3_types.StorySceneCameraDefinition(camera_def)
+        except Exception:
+            log.debug("Could not parse scene camera definition", exc_info=True)
+            continue
+        item = scene.witcher_w2scene_camera_items.add()
+        item.source_index = camera_index
+        item.camera_name = _w2scene_prop_text(getattr(camera, "cameraName", None))
+        item.fov = _w2scene_as_float(getattr(camera, "cameraFov", None), 0.0)
+        item.zoom = _w2scene_as_float(getattr(camera, "cameraZoom", None), 0.0)
+        item.source_slot_name = _w2scene_prop_text(getattr(camera, "sourceSlotName", None))
+        item.target_slot_name = _w2scene_prop_text(getattr(camera, "targetSlotName", None))
+        item.camera_adjust_version = _w2scene_as_int(getattr(camera, "cameraAdjustVersion", 0), 0)
+        dof_parts = []
+        for attr_name in ("dofFocusDistFar", "dofBlurDistFar", "dofFocusDistNear", "dofBlurDistNear", "dofIntensity"):
+            value = getattr(camera, attr_name, None)
+            if value is not None:
+                dof_parts.append(f"{attr_name}={_w2scene_as_float(value):g}")
+        item.dof_summary = "  ".join(dof_parts[:5])
+
+    scene.witcher_w2scene_summary = (
+        f"Sections: {len(sections)} ({len(sections) - cutscene_sections} dialog, {cutscene_sections} cutscene), "
+        f"elements: {total_elements}, events: {total_events}, "
+        f"actors: {len(scene.witcher_w2scene_actor_items)}, "
+        f"dialogsets: {len(scene.witcher_w2scene_dialogset_items)}, "
+        f"cameras: {len(scene.witcher_w2scene_camera_items)}"
+    )
+    return scene_importer
+
+
 class WITCH_UL_CutsceneActorPreview(UIList):
     bl_idname = "WITCH_UL_CutsceneActorPreview"
     layout_type = "DEFAULT"
@@ -461,7 +1151,7 @@ class WITCH_UL_CutsceneAnimationPreview(UIList):
 def _event_type_icon(event_type):
     if 'BodyPart' in event_type or 'Appearance' in event_type:
         return 'MATERIAL_DATA'
-    if 'Dialog' in event_type or 'Lookat' in event_type:
+    if 'Dialog' in event_type or 'Lookat' in event_type or 'LookAt' in event_type:
         return 'OUTLINER_OB_SPEAKER'
     if 'Effect' in event_type or 'Fx' in event_type:
         return 'SHADERFX'
@@ -978,6 +1668,8 @@ def _clear_loaded_cutscene_state(scene):
         scene.witcher_cutscene_last_import_seconds = 0.0
     if hasattr(scene, "witcher_loaded_w2cutscene_path"):
         scene.witcher_loaded_w2cutscene_path = ""
+    if hasattr(scene, "witcher_w2scene_active_cutscene_path"):
+        scene.witcher_w2scene_active_cutscene_path = ""
 
 def _schedule_deferred_cutscene_state_sync(scene, filepath):
     scene_name = str(getattr(scene, "name", "") or "").strip()
@@ -1048,6 +1740,417 @@ def _get_loaded_cutscene_actor_object(actor_entry):
     if obj is None or getattr(obj, "type", None) != 'ARMATURE':
         return None
     return obj
+
+
+def _same_filesystem_path(path_a, path_b):
+    path_a = str(path_a or "").strip()
+    path_b = str(path_b or "").strip()
+    if not path_a or not path_b:
+        return False
+    try:
+        return os.path.normcase(os.path.normpath(path_a)) == os.path.normcase(os.path.normpath(path_b))
+    except Exception:
+        return path_a == path_b
+
+
+def _w2scene_is_under_root(path, root):
+    path = str(path or "").strip()
+    root = str(root or "").strip()
+    if not path or not root:
+        return False
+    try:
+        path = os.path.normcase(os.path.abspath(os.path.normpath(path)))
+        root = os.path.normcase(os.path.abspath(os.path.normpath(root)))
+        return path == root or path.startswith(root.rstrip("\\/") + os.sep)
+    except Exception:
+        path = os.path.normcase(os.path.normpath(path))
+        root = os.path.normcase(os.path.normpath(root)).rstrip("\\/")
+        return path == root or path.startswith(root + "\\") or path.startswith(root + "/")
+
+
+def _w2scene_normalize_repo_path(path):
+    return str(path or "").replace("/", "\\").lstrip("\\")
+
+
+def _w2scene_add_unique_root(roots, root):
+    root = str(root or "").strip()
+    if not root:
+        return
+    root_norm = os.path.normpath(root)
+    try:
+        root_norm = bpy.path.abspath(root_norm)
+    except Exception:
+        pass
+    if not os.path.isdir(root_norm):
+        return
+    root_key = os.path.normcase(root_norm)
+    if all(os.path.normcase(existing) != root_key for existing in roots):
+        roots.append(root_norm)
+
+
+def _w2scene_repo_root_from_filepath(filepath, repo_path=""):
+    normalized = os.path.normpath(str(filepath or ""))
+    if not normalized:
+        return ""
+    repo_path = _w2scene_normalize_repo_path(repo_path)
+    if repo_path:
+        repo_as_fs = repo_path.replace("\\", os.sep)
+        path_key = os.path.normcase(normalized)
+        repo_key = os.path.normcase(repo_as_fs)
+        if path_key.endswith(repo_key):
+            root = normalized[:len(normalized) - len(repo_as_fs)].rstrip("\\/")
+            if root:
+                return root
+
+    lowered = normalized.lower()
+    for marker in ("\\r4data\\", "\\workspace\\", "\\content\\content0\\"):
+        marker_index = lowered.find(marker)
+        if marker_index >= 0:
+            return normalized[:marker_index + len(marker) - 1]
+    return ""
+
+
+def _w2scene_pref_repo_roots(context):
+    roots = []
+    try:
+        prefs = get_all_addon_prefs(context)
+    except Exception:
+        prefs = None
+    if prefs is None:
+        return roots
+
+    try:
+        projects = list(getattr(prefs, "redkit_projects", []) or [])
+    except Exception:
+        projects = []
+    for project in projects:
+        project_path = str(getattr(project, "path", "") or "").strip()
+        if project_path:
+            _w2scene_add_unique_root(roots, os.path.join(bpy.path.abspath(project_path), "workspace"))
+
+    for attr_name in ("redkit_depot_path", "redkit_uncooked_path"):
+        try:
+            _w2scene_add_unique_root(roots, bpy.path.abspath(getattr(prefs, attr_name, "") or ""))
+        except Exception:
+            pass
+
+    try:
+        _w2scene_add_unique_root(roots, get_uncook_path(context))
+    except Exception:
+        pass
+    return roots
+
+
+def _w2scene_repo_roots_for_loaded_scene(context, filepath="", repo_path=""):
+    roots = []
+    scene = getattr(context, "scene", None)
+    filepath = str(filepath or getattr(scene, "witcher_sections_filepath", "") or getattr(scene, "witcher_loaded_w2scene_path", "") or "")
+    repo_path = str(repo_path or getattr(scene, "witcher_w2scene_repo_path", "") or "")
+    _w2scene_add_unique_root(roots, _w2scene_repo_root_from_filepath(filepath, repo_path))
+    for root in _w2scene_pref_repo_roots(context):
+        _w2scene_add_unique_root(roots, root)
+    return roots
+
+
+def _w2scene_root_kind(context, root):
+    root = os.path.normpath(str(root or ""))
+    try:
+        uncook_root = os.path.normpath(get_uncook_path(context))
+    except Exception:
+        uncook_root = ""
+    if uncook_root and _same_filesystem_path(root, uncook_root):
+        return "cooked r4data"
+    lower = root.lower()
+    if lower.endswith("\\workspace") or "\\workspace\\" in lower:
+        return "REDkit project workspace"
+    if lower.endswith("\\r4data") or "\\r4data\\" in lower:
+        return "REDkit depot/source"
+    if "redkit" in lower:
+        return "REDkit source"
+    return "repo root"
+
+
+def _w2scene_cutscene_dependency_roots(context, roots):
+    project_roots = []
+    cooked_roots = []
+    source_roots = []
+    other_roots = []
+    for root in roots or []:
+        kind = _w2scene_root_kind(context, root)
+        if kind == "REDkit project workspace":
+            _w2scene_add_unique_root(project_roots, root)
+        elif kind == "cooked r4data":
+            _w2scene_add_unique_root(cooked_roots, root)
+        elif kind.startswith("REDkit"):
+            _w2scene_add_unique_root(source_roots, root)
+        else:
+            _w2scene_add_unique_root(other_roots, root)
+
+    ordered = []
+    for root_group in (project_roots, cooked_roots, other_roots, source_roots):
+        for root in root_group:
+            _w2scene_add_unique_root(ordered, root)
+    return ordered
+
+
+def _w2scene_log_cutscene_resolution(context, cutscene_repo_path, cutscene_path, dependency_roots):
+    try:
+        uncook_root = os.path.normpath(get_uncook_path(context))
+    except Exception:
+        uncook_root = ""
+    cutscene_kind = _w2scene_root_kind(context, cutscene_path)
+    if uncook_root and not _w2scene_is_under_root(cutscene_path, uncook_root):
+        log.warning(
+            "W2Scene linked cutscene is being loaded from %s, not cooked r4data: %s -> %s",
+            cutscene_kind,
+            cutscene_repo_path,
+            cutscene_path,
+        )
+    if dependency_roots:
+        root_summary = "; ".join(
+            f"{idx + 1}. {_w2scene_root_kind(context, root)}={root}"
+            for idx, root in enumerate(dependency_roots)
+        )
+        log.warning(
+            "W2Scene linked cutscene dependency search order: %s",
+            root_summary,
+        )
+
+
+def _w2scene_repo_path_from_root(filepath, root):
+    filepath = os.path.normpath(str(filepath or ""))
+    root = os.path.normpath(str(root or ""))
+    if not filepath or not root:
+        return ""
+    try:
+        rel = os.path.relpath(filepath, root)
+    except ValueError:
+        return ""
+    if rel.startswith("..") or os.path.isabs(rel):
+        return ""
+    return rel.replace("/", "\\")
+
+
+def _w2scene_resolve_repo_file(context, repo_path, roots):
+    repo_path = _w2scene_normalize_repo_path(repo_path)
+    if not repo_path:
+        return ""
+    if os.path.isabs(repo_path):
+        return repo_path
+    repo_as_fs = repo_path.replace("\\", os.sep)
+    for root in roots or []:
+        candidate = os.path.normpath(os.path.join(root, repo_as_fs))
+        if os.path.isfile(candidate):
+            return candidate
+    try:
+        return repo_file(repo_path)
+    except Exception:
+        return os.path.join(get_uncook_path(context), repo_as_fs)
+
+
+def _resolve_w2scene_cutscene_file(context, section):
+    cutscene_repo_path = prop_to_string(getattr(section, "cutscene", None))
+    cutscene_repo_path = _w2scene_normalize_repo_path(cutscene_repo_path)
+    if not cutscene_repo_path:
+        return "", "", []
+    if os.path.isabs(cutscene_repo_path):
+        return cutscene_repo_path, cutscene_repo_path, []
+    scene = getattr(context, "scene", None)
+    scene_filepath = str(getattr(scene, "witcher_sections_filepath", "") or getattr(scene, "witcher_loaded_w2scene_path", "") or "")
+    scene_repo_path = str(getattr(scene, "witcher_w2scene_repo_path", "") or "")
+    roots = _w2scene_repo_roots_for_loaded_scene(context, scene_filepath, scene_repo_path)
+    cutscene_path = _w2scene_resolve_repo_file(context, cutscene_repo_path, roots)
+    return cutscene_repo_path, str(cutscene_path or "").strip(), roots
+
+
+def _w2scene_collect_object_tree(root_obj):
+    object_names = set()
+
+    def add_object_tree_names(start_obj):
+        pending = [start_obj] if start_obj is not None else []
+        while pending:
+            obj = pending.pop(0)
+            try:
+                obj_name = str(getattr(obj, "name", "") or "")
+            except ReferenceError:
+                continue
+            if not obj_name or obj_name in object_names:
+                continue
+            object_names.add(obj_name)
+            try:
+                pending.extend(list(getattr(obj, "children", []) or []))
+            except ReferenceError:
+                pass
+
+    add_object_tree_names(root_obj)
+
+    mimic_name = ""
+    try:
+        mimic_name = str(root_obj.get("mimicFace", "") or "").strip() if root_obj is not None else ""
+    except ReferenceError:
+        mimic_name = ""
+    mimic_obj = bpy.data.objects.get(mimic_name) if mimic_name else None
+    add_object_tree_names(mimic_obj)
+
+    try:
+        cutscene_guid = str(root_obj.get(import_cutscene.CUTSCENE_GUID_PROP, "") or "").strip() if root_obj is not None else ""
+    except ReferenceError:
+        cutscene_guid = ""
+    if cutscene_guid:
+        for obj in list(bpy.data.objects):
+            try:
+                if obj.get(import_cutscene.CUTSCENE_GUID_PROP) == cutscene_guid:
+                    object_names.add(str(obj.name))
+            except ReferenceError:
+                pass
+            except Exception:
+                pass
+    return object_names
+
+
+def _w2scene_force_remove_objects(object_names):
+    def parent_depth(obj_name):
+        obj = bpy.data.objects.get(obj_name)
+        if obj is None:
+            return -1
+        depth = 0
+        try:
+            parent = getattr(obj, "parent", None)
+        except ReferenceError:
+            return -1
+        while parent is not None:
+            depth += 1
+            try:
+                parent = getattr(parent, "parent", None)
+            except ReferenceError:
+                break
+        return depth
+
+    removed = 0
+    for obj_name in sorted(set(object_names or []), key=parent_depth, reverse=True):
+        obj = bpy.data.objects.get(obj_name)
+        if obj is None:
+            continue
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed += 1
+        except ReferenceError:
+            pass
+        except Exception:
+            log.debug("Could not force-remove section cutscene object %s", obj_name, exc_info=True)
+    return removed
+
+
+def _w2scene_unload_active_cutscene_section(context):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return {"actors": 0, "audio": 0, "nla": 0}
+    active_path = str(getattr(scene, "witcher_w2scene_active_cutscene_path", "") or "").strip()
+    if not active_path:
+        return {"actors": 0, "audio": 0, "nla": 0}
+
+    removed_audio = 0
+    removed_nla = 0
+    removed_actors = 0
+    try:
+        removed_audio += int(import_cutscene.remove_cutscene_burned_audio_strips(scene, source_path=active_path) or 0)
+    except Exception:
+        log.debug("Could not remove section cutscene burned audio for %s", active_path, exc_info=True)
+    try:
+        removed_audio += int(import_scene.clear_w2scene_section_audio(scene) or 0)
+    except Exception:
+        log.debug("Could not remove section cutscene dialog audio", exc_info=True)
+
+    loaded_path = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+    if not _same_filesystem_path(active_path, loaded_path):
+        scene.witcher_w2scene_active_cutscene_path = ""
+        return {"actors": 0, "audio": removed_audio, "nla": 0}
+
+    for actor_entry in list(getattr(scene, "witcher_cutscene_actor_items", []) or []):
+        actor_obj = _get_loaded_cutscene_actor_object(actor_entry)
+        if actor_obj is None:
+            continue
+        imported_by_cutscene = bool(getattr(actor_entry, "imported_by_cutscene", False))
+        if not imported_by_cutscene:
+            try:
+                imported_by_cutscene = bool(actor_obj.get(import_cutscene.CUTSCENE_ACTOR_IMPORTED_PROP, False))
+            except Exception:
+                imported_by_cutscene = False
+        force_remove_objects = _w2scene_collect_object_tree(actor_obj) if imported_by_cutscene else set()
+        try:
+            removed_nla += int(import_scene.clear_w2scene_actor_section_nla(context, actor_obj) or 0)
+        except Exception:
+            log.debug("Could not clear section voice tracks from %s", getattr(actor_obj, "name", ""), exc_info=True)
+        try:
+            removed_actors += int(import_cutscene.unload_cutscene_actor(actor_obj) or 0)
+        except Exception:
+            log.exception("Failed to unload section cutscene actor %s", getattr(actor_obj, "name", "<unknown>"))
+        if force_remove_objects:
+            removed_actors += _w2scene_force_remove_objects(force_remove_objects)
+
+    _clear_loaded_cutscene_state(scene)
+    scene.witcher_w2scene_active_cutscene_path = ""
+    return {"actors": removed_actors, "audio": removed_audio, "nla": removed_nla}
+
+
+def _load_w2scene_cutscene_section(context, scene_importer, section):
+    scene = context.scene
+    cutscene_repo_path, cutscene_path, repo_roots = _resolve_w2scene_cutscene_file(context, section)
+    if not cutscene_path:
+        raise RuntimeError("Cutscene section has no linked .w2cutscene file.")
+    if not os.path.isfile(cutscene_path):
+        raise RuntimeError(f"Linked cutscene was not found: {cutscene_repo_path} -> {cutscene_path}")
+
+    _w2scene_unload_active_cutscene_section(context)
+    removed = import_scene.clear_w2scene_runtime_state(
+        context,
+        story_scene=getattr(scene_importer, "_CStoryScene", None),
+        reset_actors=True,
+    )
+    if any(int(value or 0) for value in removed.values()):
+        log.info(
+            "Cleared previous .w2scene section state before loading cutscene section: %s",
+            removed,
+        )
+
+    previous_roots, previous_read_only = get_repo_override_state()
+    try:
+        override_roots = list(repo_roots or [])
+        for root in previous_roots:
+            _w2scene_add_unique_root(override_roots, root)
+        override_roots = _w2scene_cutscene_dependency_roots(context, override_roots)
+        _w2scene_log_cutscene_resolution(context, cutscene_repo_path, cutscene_path, override_roots)
+        if override_roots:
+            set_repo_override_roots(override_roots, read_only=True)
+
+        cutscene_data = import_cutscene.import_w3_cutscene(
+            cutscene_path,
+            selected_actor_indices=None,
+            selected_animation_indices=None,
+            auto_apply_selected_animations=True,
+            import_burned_audio=True,
+        )
+        if cutscene_data is None:
+            raise RuntimeError(f"Failed to load linked cutscene: {cutscene_path}")
+
+        _sync_loaded_cutscene_state(scene, cutscene_path, cutscene_data=cutscene_data)
+        scene.witcher_w2scene_active_cutscene_path = cutscene_path
+
+        dialog_stats = {"loaded": 0, "skipped": 0, "total": 0}
+        try:
+            dialog_stats = _load_cutscene_dialogs_into_scene(context)
+        except Exception as exc:
+            log.warning("Cutscene section loaded, but dialog auto-load failed: %s", exc)
+    finally:
+        set_repo_override_roots(previous_roots, read_only=previous_read_only)
+    return {
+        "repo_path": cutscene_repo_path,
+        "path": cutscene_path,
+        "cutscene_data": cutscene_data,
+        "dialog_stats": dialog_stats,
+        "repo_roots": repo_roots,
+    }
+
 
 def _animation_matches_actor_entry(scene, animation_entry, actor_entry):
     if animation_entry is None or actor_entry is None:
@@ -1330,24 +2433,13 @@ def _derive_w2scene_repo_path(context, filepath):
     if not normalized:
         return ""
 
-    roots = []
-    try:
-        roots.append(get_uncook_path(context))
-    except Exception:
-        pass
-    for root in roots:
-        if not root:
-            continue
-        root_norm = os.path.normpath(root)
-        try:
-            rel = os.path.relpath(normalized, root_norm)
-        except ValueError:
-            continue
-        if not rel.startswith(".."):
-            return rel.replace("/", "\\")
+    for root in _w2scene_repo_roots_for_loaded_scene(context, filepath):
+        repo_path = _w2scene_repo_path_from_root(normalized, root)
+        if repo_path:
+            return repo_path
 
     lowered = normalized.lower()
-    for marker in ("\\r4data\\", "\\content\\content0\\"):
+    for marker in ("\\r4data\\", "\\workspace\\", "\\content\\content0\\"):
         marker_index = lowered.find(marker)
         if marker_index >= 0:
             return normalized[marker_index + len(marker):].replace("/", "\\")
@@ -1466,17 +2558,15 @@ class ButtonOperatorImportW2scene(bpy.types.Operator, ImportHelper):
         if not self.filepath.lower().endswith(".w2scene"):
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
             return {'CANCELLED'}
-        context.scene.witcher_sections_filepath = self.filepath
-        context.scene.witcher_sections.clear()
         try:
+            _w2scene_unload_active_cutscene_section(context)
             sceneImporter = import_scene.import_w3_scene(self.filepath)
             sceneImporter.load_sections()
+            _w2scene_sync_loaded_state(context.scene, self.filepath, scene_importer=sceneImporter)
         except Exception as exc:
             log.exception("Failed to load scene sections from %s", self.filepath)
             self.report({'ERROR'}, f"Failed to load scene: {exc}")
             return {'CANCELLED'}
-        for section in sceneImporter.scene_sections:
-            add_scene_section(section.sectionName, "{}", context.scene)
         #sceneImporter.execute()
         bpy.context.view_layer.update()
         return {'FINISHED'}
@@ -1641,6 +2731,8 @@ class ButtonOperatorImportW2cutscene(bpy.types.Operator, ImportHelper):
         auto_loaded_count = int(getattr(cutscene_data, "auto_applied_animation_count", 0) or 0)
         import_duration_seconds = float(getattr(cutscene_data, "import_duration_seconds", 0.0) or 0.0)
         _sync_loaded_cutscene_state(context.scene, self.filepath, cutscene_data=cutscene_data)
+        if hasattr(context.scene, "witcher_w2scene_active_cutscene_path"):
+            context.scene.witcher_w2scene_active_cutscene_path = ""
         dialog_loaded_count = 0
         dialog_skipped_count = 0
         dialog_total_count = 0
@@ -1986,6 +3078,499 @@ def _draw_imported_class_sections(layout, field_items, schema, show_unset, empty
 
     if not visible_any:
         layout.label(text=empty_label, icon='INFO')
+
+
+def _w2scene_active_section_index(scene):
+    sections = list(getattr(scene, "witcher_sections", []) or [])
+    idx = int(getattr(scene, "witcher_sections_index", 0) or 0)
+    if 0 <= idx < len(sections):
+        return int(getattr(sections[idx], "section_index", idx))
+    return -1
+
+
+def _w2scene_selected_item(collection, active_index, predicate):
+    items = list(collection or [])
+    if 0 <= active_index < len(items) and predicate(items[active_index]):
+        return items[active_index]
+    for item in items:
+        if predicate(item):
+            return item
+    return None
+
+
+def _w2scene_element_icon(element_type):
+    if element_type == "CStorySceneLine":
+        return "OUTLINER_OB_SPEAKER"
+    if element_type == "CStoryScenePauseElement":
+        return "TIME"
+    if "Choice" in element_type:
+        return "HELP"
+    if "Script" in element_type:
+        return "CONSOLE"
+    if "Cutscene" in element_type or "Video" in element_type:
+        return "SEQUENCE"
+    return "TEXT"
+
+
+class WITCH_UL_W2SceneActorList(UIList):
+    bl_idname = "WITCH_UL_W2SceneActorList"
+    layout_type = "DEFAULT"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.label(text=item.actor_id or f"Actor {index + 1}", icon='ARMATURE_DATA')
+            if item.appearance_filter:
+                row.label(text=item.appearance_filter, icon='MATERIAL_DATA')
+            if item.use_mimic:
+                row.label(text="mimic", icon='SHAPEKEY_DATA')
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="")
+
+
+class WITCH_UL_W2SceneDialogsetList(UIList):
+    bl_idname = "WITCH_UL_W2SceneDialogsetList"
+    layout_type = "DEFAULT"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.label(text=item.name or f"Dialogset {index + 1}", icon='OUTLINER_COLLECTION')
+            if item.placement_tag:
+                row.label(text=item.placement_tag, icon='EMPTY_AXIS')
+            row.label(text=f"{item.slot_count} slots")
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="")
+
+
+class WITCH_UL_W2SceneDialogsetSlotList(UIList):
+    bl_idname = "WITCH_UL_W2SceneDialogsetSlotList"
+    layout_type = "DEFAULT"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.label(text=item.slot_name or f"Slot {item.slot_number}", icon='EMPTY_AXIS')
+            row.label(text=item.actor_name or "-", icon='ARMATURE_DATA')
+            if item.actor_pose_name:
+                row.label(text=item.actor_pose_name, icon='POSE_HLT')
+            if item.force_body_idle_animation:
+                row.label(text=item.force_body_idle_animation, icon='ACTION')
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="")
+
+    def filter_items(self, context, data, propname):
+        items = getattr(data, propname, [])
+        dialogset_idx = int(getattr(context.scene, "witcher_w2scene_dialogset_index", 0) or 0)
+        flags = [
+            self.bitflag_filter_item
+            if int(getattr(item, "dialogset_index", -1)) == dialogset_idx
+            else 0
+            for item in items
+        ]
+        return flags, []
+
+
+class WITCH_UL_W2SceneCameraList(UIList):
+    bl_idname = "WITCH_UL_W2SceneCameraList"
+    layout_type = "DEFAULT"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.label(text=item.camera_name or f"Camera {index + 1}", icon='CAMERA_DATA')
+            if item.fov:
+                row.label(text=f"FOV {item.fov:g}")
+            if item.source_slot_name or item.target_slot_name:
+                row.label(text=f"{item.source_slot_name or '-'} -> {item.target_slot_name or '-'}")
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="")
+
+
+class WITCH_UL_W2SceneElementList(UIList):
+    bl_idname = "WITCH_UL_W2SceneElementList"
+    layout_type = "DEFAULT"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.label(text=item.display_name or item.element_id or item.element_type, icon=_w2scene_element_icon(item.element_type))
+            cls_badge = row.row(align=True)
+            cls_badge.enabled = False
+            cls_badge.scale_x = 0.75
+            cls_badge.label(text=item.element_type.replace("CStoryScene", ""))
+            row.label(text=f"{item.start_time:.2f}s")
+            if item.duration > 0.0:
+                row.label(text=f"+{item.duration:.2f}s")
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="")
+
+    def filter_items(self, context, data, propname):
+        items = getattr(data, propname, [])
+        active_section = _w2scene_active_section_index(context.scene)
+        flags = [
+            self.bitflag_filter_item
+            if int(getattr(item, "section_index", -1)) == active_section
+            else 0
+            for item in items
+        ]
+        return flags, []
+
+
+class WITCH_UL_W2SceneEventList(UIList):
+    bl_idname = "WITCH_UL_W2SceneEventList"
+    layout_type = "DEFAULT"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.label(text=_w2scene_event_label(item), icon=_w2scene_event_icon(item.event_type))
+            cls_badge = row.row(align=True)
+            cls_badge.enabled = False
+            cls_badge.scale_x = 0.75
+            cls_badge.label(text=item.event_type.replace("CStorySceneEvent", "").replace("CStoryScene", ""))
+            if item.actor:
+                row.label(text=item.actor, icon='ARMATURE_DATA')
+            if item.target:
+                row.label(text=f"-> {item.target}")
+            row.label(text=f"{item.start_time:.2f}s")
+            if item.duration > 0.0:
+                row.label(text=f"+{item.duration:.2f}s")
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="")
+
+    def filter_items(self, context, data, propname):
+        items = getattr(data, propname, [])
+        active_section = _w2scene_active_section_index(context.scene)
+        flags = [
+            self.bitflag_filter_item
+            if int(getattr(item, "section_index", -1)) == active_section
+            else 0
+            for item in items
+        ]
+        return flags, []
+
+
+def _draw_w2scene_readonly_props(layout, item, fields):
+    col = layout.column(align=True)
+    col.use_property_split = True
+    col.enabled = False
+    for prop_name, label in fields:
+        if hasattr(item, prop_name):
+            col.prop(item, prop_name, text=label)
+
+
+def _draw_w2scene_scene_tab(layout, scene):
+    path = str(getattr(scene, "witcher_loaded_w2scene_path", "") or "").strip()
+    repo_path = str(getattr(scene, "witcher_w2scene_repo_path", "") or "").strip()
+    if path:
+        layout.label(text=path, icon='FILE')
+    if repo_path:
+        layout.label(text=f"Repo Path: {repo_path}", icon='FILEBROWSER')
+    summary = str(getattr(scene, "witcher_w2scene_summary", "") or "").strip()
+    if summary:
+        layout.label(text=summary, icon='INFO')
+
+    field_box = layout.box()
+    header = field_box.row(align=True)
+    header.label(text="Scene Fields", icon='PROPERTIES')
+    header.prop(scene, "witcher_w2scene_show_unset_fields", text="Show Unset", toggle=True)
+    _draw_imported_class_sections(
+        field_box,
+        list(getattr(scene, "witcher_w2scene_root_fields", [])),
+        _W2SCENE_ROOT_FIELD_SCHEMA,
+        bool(getattr(scene, "witcher_w2scene_show_unset_fields", False)),
+        "No scene fields loaded.",
+    )
+
+
+def _draw_w2scene_sections_tab(layout, scene):
+    sections = list(getattr(scene, "witcher_sections", []) or [])
+    if not sections:
+        layout.label(text="No .w2scene loaded.", icon='INFO')
+        return
+
+    row = layout.row()
+    col = row.column(align=True)
+    col.template_list("WITCHER_SECTIONS_UL_List", "", scene, "witcher_sections", scene, "witcher_sections_index", rows=min(len(sections), 8))
+    ops_col = row.column(align=True)
+    ops_col.operator(Witcher_OT_load_section.bl_idname, text="", icon='IMPORT')
+
+    active_idx = int(getattr(scene, "witcher_sections_index", 0) or 0)
+    if not (0 <= active_idx < len(sections)):
+        return
+    section = sections[active_idx]
+    section_index = int(getattr(section, "section_index", active_idx))
+
+    detail = layout.box()
+    hdr = detail.row(align=True)
+    hdr.label(text=section.name or f"Section {active_idx + 1}", icon='SEQUENCE')
+    hdr.label(text=section.section_type or "CStorySceneSection")
+    if section.linked_cutscene:
+        detail.label(text=f"Linked cutscene: {section.linked_cutscene}", icon='ACTION')
+    detail.label(
+        text=(
+            f"Duration {section.duration:.3f}s  "
+            f"Elements {section.element_count}  Events {section.event_count}"
+        ),
+        icon='TIME',
+    )
+    flag_row = detail.row(align=True)
+    flag_row.enabled = False
+    flag_row.label(text=f"sectionId={section.section_id}")
+    flag_row.label(text=f"gameplay={section.is_gameplay}")
+    flag_row.label(text=f"important={section.is_important}")
+    if section.dialogset_change:
+        flag_row.label(text=f"dialogset={section.dialogset_change}")
+
+    detail.separator(factor=0.5)
+    elem_box = detail.box()
+    elem_box.label(text="Elements", icon='TEXT')
+    elem_box.template_list(
+        "WITCH_UL_W2SceneElementList", "",
+        scene, "witcher_w2scene_section_element_items",
+        scene, "witcher_w2scene_element_index",
+        rows=min(max(1, section.element_count), 7),
+    )
+    elem = _w2scene_selected_item(
+        getattr(scene, "witcher_w2scene_section_element_items", []),
+        int(getattr(scene, "witcher_w2scene_element_index", 0) or 0),
+        lambda item: int(getattr(item, "section_index", -1)) == section_index,
+    )
+    if elem is not None:
+        _draw_w2scene_readonly_props(elem_box, elem, [
+            ("element_type", "type"),
+            ("element_id", "elementID"),
+            ("display_name", "name"),
+            ("start_time", "start"),
+            ("duration", "duration"),
+            ("actor", "actor"),
+            ("target", "target"),
+            ("line_id", "dialogLine"),
+            ("detail_text", "details"),
+        ])
+
+    event_box = detail.box()
+    event_box.label(text="Events", icon='KEYFRAME')
+    event_box.template_list(
+        "WITCH_UL_W2SceneEventList", "",
+        scene, "witcher_w2scene_section_event_items",
+        scene, "witcher_w2scene_event_index",
+        rows=min(max(1, section.event_count), 9),
+    )
+    event = _w2scene_selected_item(
+        getattr(scene, "witcher_w2scene_section_event_items", []),
+        int(getattr(scene, "witcher_w2scene_event_index", 0) or 0),
+        lambda item: int(getattr(item, "section_index", -1)) == section_index,
+    )
+    if event is not None:
+        ev_detail = event_box.box()
+        ev_header = ev_detail.row(align=True)
+        ev_header.label(text=event.event_type or "Event", icon=_w2scene_event_icon(event.event_type))
+        if str(getattr(event, "event_type", "") or "") in {"CStorySceneEventCustomCamera", "CStorySceneEventCustomCameraInstance"}:
+            op = ev_header.operator(WITCH_OT_W2ScenePreviewCameraEvent.bl_idname, text="Preview", icon='VIEW_CAMERA')
+            op.section_index = section_index
+            op.source_index = int(getattr(event, "source_index", -1))
+        _draw_w2scene_readonly_props(ev_detail, event, [
+            ("event_name", "eventName"),
+            ("scene_element_id", "sceneElement"),
+            ("start_time", "start"),
+            ("start_position", "startPosition"),
+            ("duration", "duration"),
+            ("duration_raw", "rawDuration"),
+            ("actor", "actor"),
+            ("target", "target"),
+            ("track_name", "track"),
+            ("animation_name", "animation"),
+            ("camera_name", "camera"),
+            ("effect_name", "effect"),
+            ("guid", "GUID"),
+            ("is_muted", "muted"),
+            ("detail_text", "details"),
+        ])
+
+    fields = [
+        item for item in getattr(scene, "witcher_w2scene_section_fields", [])
+        if int(getattr(item, "section_index", -1)) == section_index
+    ]
+    fields_box = detail.box()
+    header = fields_box.row(align=True)
+    header.label(text="Section Fields", icon='PROPERTIES')
+    header.prop(scene, "witcher_w2scene_show_unset_fields", text="Show Unset", toggle=True)
+    _draw_imported_class_sections(
+        fields_box,
+        fields,
+        _W2SCENE_SECTION_FIELD_SCHEMA,
+        bool(getattr(scene, "witcher_w2scene_show_unset_fields", False)),
+        "No set section fields.",
+    )
+
+
+def _draw_w2scene_actors_tab(layout, scene):
+    actors = list(getattr(scene, "witcher_w2scene_actor_items", []) or [])
+    if not actors:
+        layout.label(text="No scene actors.", icon='INFO')
+        return
+    layout.template_list(
+        "WITCH_UL_W2SceneActorList", "",
+        scene, "witcher_w2scene_actor_items",
+        scene, "witcher_w2scene_actor_index",
+        rows=min(len(actors), 8),
+    )
+    idx = int(getattr(scene, "witcher_w2scene_actor_index", 0) or 0)
+    if 0 <= idx < len(actors):
+        detail = layout.box()
+        detail.label(text=actors[idx].actor_id or f"Actor {idx + 1}", icon='ARMATURE_DATA')
+        _draw_w2scene_readonly_props(detail, actors[idx], [
+            ("actor_id", "id"),
+            ("alias", "alias"),
+            ("actor_tags", "actorTags"),
+            ("template_path", "entityTemplate"),
+            ("appearance_filter", "appearanceFilter"),
+            ("use_mimic", "useMimic"),
+            ("force_spawn", "forceSpawn"),
+            ("dont_search_by_voicetag", "dontSearchByVoicetag"),
+        ])
+
+
+def _draw_w2scene_dialogsets_tab(layout, scene):
+    dialogsets = list(getattr(scene, "witcher_w2scene_dialogset_items", []) or [])
+    if not dialogsets:
+        layout.label(text="No dialogsets.", icon='INFO')
+        return
+    layout.template_list(
+        "WITCH_UL_W2SceneDialogsetList", "",
+        scene, "witcher_w2scene_dialogset_items",
+        scene, "witcher_w2scene_dialogset_index",
+        rows=min(len(dialogsets), 6),
+    )
+    idx = int(getattr(scene, "witcher_w2scene_dialogset_index", 0) or 0)
+    if not (0 <= idx < len(dialogsets)):
+        return
+    dialogset = dialogsets[idx]
+    detail = layout.box()
+    detail.label(text=dialogset.name or f"Dialogset {idx + 1}", icon='OUTLINER_COLLECTION')
+    _draw_w2scene_readonly_props(detail, dialogset, [
+        ("name", "name"),
+        ("placement_tag", "placementTag"),
+        ("path", "path"),
+        ("slot_count", "slots"),
+        ("snap_to_terrain", "snapToTerrain"),
+        ("find_safe_placement", "findSafePlacement"),
+    ])
+    detail.separator(factor=0.5)
+    detail.label(text="Slots", icon='EMPTY_AXIS')
+    detail.template_list(
+        "WITCH_UL_W2SceneDialogsetSlotList", "",
+        scene, "witcher_w2scene_dialogset_slot_items",
+        scene, "witcher_w2scene_dialogset_slot_index",
+        rows=min(max(1, dialogset.slot_count), 8),
+    )
+    slot = _w2scene_selected_item(
+        getattr(scene, "witcher_w2scene_dialogset_slot_items", []),
+        int(getattr(scene, "witcher_w2scene_dialogset_slot_index", 0) or 0),
+        lambda item: int(getattr(item, "dialogset_index", -1)) == idx,
+    )
+    if slot is not None:
+        slot_box = detail.box()
+        slot_box.label(text=slot.slot_name or f"Slot {slot.slot_number}", icon='EMPTY_AXIS')
+        _draw_w2scene_readonly_props(slot_box, slot, [
+            ("slot_number", "slotNumber"),
+            ("slot_name", "slotName"),
+            ("actor_name", "actorName"),
+            ("actor_visibility", "actorVisibility"),
+            ("actor_status", "actorStatus"),
+            ("actor_pose_name", "actorPoseName"),
+            ("actor_emotional_state", "actorEmotionalState"),
+            ("actor_mimics_state", "actorMimicsEmotionalState"),
+            ("force_body_idle_animation", "forceBodyIdleAnimation"),
+        ])
+
+
+def _draw_w2scene_cameras_tab(layout, scene, context):
+    camera_arm = _w2scene_find_camera_armature(context)
+    rig_box = layout.box()
+    rig_box.label(text="Scene Camera Rig", icon='CAMERA_DATA')
+    if camera_arm is None:
+        rig_box.label(text="Load a section to import the scene camera rig.", icon='INFO')
+    else:
+        hdr = rig_box.row(align=True)
+        hdr.label(text=getattr(camera_arm, "name", "Scene Camera"), icon='ARMATURE_DATA')
+        preview_row = rig_box.row(align=True)
+        preview_row.operator("witcher.camera_setup_preview", text="Setup Preview", icon='CAMERA_DATA')
+        preview_row.operator("witcher.camera_set_scene_camera", text="Set Scene Camera", icon='VIEW_CAMERA')
+        key_row = rig_box.row(align=True)
+        key_row.operator("witcher.camera_key_rig_from_scene_camera", text="Key Rig + DOF", icon='KEY_HLT')
+        _draw_camera_track_controls(rig_box, camera_arm)
+
+    layout.separator(factor=0.5)
+    cameras = list(getattr(scene, "witcher_w2scene_camera_items", []) or [])
+    if not cameras:
+        layout.label(text="No camera definitions.", icon='INFO')
+        return
+    layout.template_list(
+        "WITCH_UL_W2SceneCameraList", "",
+        scene, "witcher_w2scene_camera_items",
+        scene, "witcher_w2scene_camera_index",
+        rows=min(len(cameras), 8),
+    )
+    idx = int(getattr(scene, "witcher_w2scene_camera_index", 0) or 0)
+    if 0 <= idx < len(cameras):
+        detail = layout.box()
+        detail.label(text=cameras[idx].camera_name or f"Camera {idx + 1}", icon='CAMERA_DATA')
+        _draw_w2scene_readonly_props(detail, cameras[idx], [
+            ("camera_name", "cameraName"),
+            ("fov", "cameraFov"),
+            ("zoom", "cameraZoom"),
+            ("source_slot_name", "sourceSlotName"),
+            ("target_slot_name", "targetSlotName"),
+            ("camera_adjust_version", "cameraAdjustVersion"),
+            ("dof_summary", "DOF"),
+        ])
+
+
+def _draw_w2scene_panel(layout, scene):
+    layout.label(text="Scene (.w2scene)", icon='WORLD')
+    action_row = layout.row(align=True)
+    action_row.operator(ButtonOperatorImportW2scene.bl_idname, text="Import Scene (.w2scene)", icon='IMPORT')
+    if getattr(scene, "witcher_loaded_w2scene_path", ""):
+        action_row.operator(Witcher_OT_load_section.bl_idname, text="Load Section", icon='SEQUENCE')
+    active_cutscene_path = str(getattr(scene, "witcher_w2scene_active_cutscene_path", "") or "").strip()
+    if active_cutscene_path:
+        layout.label(text=f"Active cutscene section: {os.path.basename(active_cutscene_path)}", icon='ACTION')
+
+    if not getattr(scene, "witcher_loaded_w2scene_path", ""):
+        if getattr(scene, "witcher_sections_filepath", ""):
+            layout.label(text=str(getattr(scene, "witcher_sections_filepath", "")), icon='FILE')
+        layout.label(text="Import a .w2scene to inspect sections, elements, events and dialogsets.", icon='INFO')
+        return
+
+    tab_row = layout.row(align=True)
+    tab_row.scale_y = 1.2
+    tab_row.prop_enum(scene, "witcher_w2scene_tab", 'SCENE')
+    tab_row.prop_enum(scene, "witcher_w2scene_tab", 'SECTIONS')
+    tab_row.prop_enum(scene, "witcher_w2scene_tab", 'ACTORS')
+    tab_row.prop_enum(scene, "witcher_w2scene_tab", 'DIALOGSETS')
+    tab_row.prop_enum(scene, "witcher_w2scene_tab", 'CAMERAS')
+    layout.separator(factor=0.5)
+
+    tab = str(getattr(scene, "witcher_w2scene_tab", "SECTIONS") or "SECTIONS")
+    if tab == 'SCENE':
+        _draw_w2scene_scene_tab(layout, scene)
+    elif tab == 'SECTIONS':
+        _draw_w2scene_sections_tab(layout, scene)
+    elif tab == 'ACTORS':
+        _draw_w2scene_actors_tab(layout, scene)
+    elif tab == 'DIALOGSETS':
+        _draw_w2scene_dialogsets_tab(layout, scene)
+    elif tab == 'CAMERAS':
+        _draw_w2scene_cameras_tab(layout, scene, bpy.context)
 
 
 _ACTOR_CUSTOM_PROPS_DEFAULTS = {
@@ -2489,6 +4074,19 @@ def _draw_cutscene_anims_tab(layout, scene, context=None):
             layout.label(text=line[:100], icon=ico)
 
 
+def _draw_camera_track_controls(layout, camera_arm):
+    camera_bone = ensure_camera_track_properties(camera_arm, track_names=CAMERA_TRACK_NAMES)
+    if camera_bone is None:
+        layout.label(text="Camera rig is missing Camera_Node track properties.", icon='ERROR')
+        return
+    tracks_box = layout.box()
+    tracks_box.label(text="Camera Tracks", icon='ANIM')
+    tracks_box.operator("witcher.camera_set_dof_from_selected", text="DOF From Selected", icon='CAMERA_DATA')
+    for track_name in CAMERA_TRACK_NAMES:
+        if track_name in camera_bone:
+            tracks_box.prop(camera_bone, f'["{track_name}"]', text=track_name)
+
+
 def _draw_cutscene_camera_tab(layout, scene, context):
     # ── Primary workflow: Blender-native shots ─────────────────────────────
     shots_box = layout.box()
@@ -2570,14 +4168,7 @@ def _draw_cutscene_camera_tab(layout, scene, context):
     marker_row.operator("witcher.camera_cut_sync_markers", text="Sync Markers", icon='MARKER')
     marker_row.operator("witcher.camera_cut_apply_markers", text="Apply Markers", icon='CHECKMARK')
 
-    camera_bone = ensure_camera_track_properties(camera_arm, track_names=CAMERA_TRACK_NAMES)
-    if camera_bone is not None:
-        tracks_box = rig_box.box()
-        tracks_box.label(text="Camera Tracks", icon='ANIM')
-        tracks_box.operator("witcher.camera_set_dof_from_selected", text="DOF From Selected", icon='CAMERA_DATA')
-        for track_name in CAMERA_TRACK_NAMES:
-            if track_name in camera_bone:
-                tracks_box.prop(camera_bone, f'["{track_name}"]', text=track_name)
+    _draw_camera_track_controls(rig_box, camera_arm)
 
 
 def _draw_event_schema_browser(layout, scene, cs_selected):
@@ -2779,24 +4370,32 @@ class WITCHER_PT_scene_panel(WITCH_PT_Base, Panel):
 
         self.layout.separator()
         w2s_box = self.layout.box()
-        w2s_box.label(text="Scene (.w2scene)", icon='WORLD')
-        w2s_box.operator(ButtonOperatorImportW2scene.bl_idname, text="Import Scene (.w2scene)", icon='IMPORT')
-
-        row = w2s_box.row()
-        col = row.column(align=True)
-        col.template_list("WITCHER_SECTIONS_UL_List", "", scene, "witcher_sections", scene, "witcher_sections_index")
-        col = row.column()
-        w2s_box.operator(Witcher_OT_load_section.bl_idname, text="Load Section")
+        _draw_w2scene_panel(w2s_box, scene)
 
 class WITCHER_SECTIONS_UL_List(UIList):
-    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        # Draw the scene section name
-        layout.label(text=item.name)
+    bl_idname = "WITCHER_SECTIONS_UL_List"
+    layout_type = "DEFAULT"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            type_name = str(getattr(item, "section_type", "") or "")
+            icon_name = 'ACTION' if type_name == "CStorySceneCutsceneSection" else 'SEQUENCE'
+            row.label(text=item.name or f"Section {index + 1}", icon=icon_name)
+            if item.duration > 0.0:
+                row.label(text=f"{item.duration:.2f}s")
+            row.label(text=f"{item.element_count} el")
+            row.label(text=f"{item.event_count} ev")
+            if item.dialogset_change:
+                row.label(text=item.dialogset_change, icon='OUTLINER_COLLECTION')
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="")
 
 class Witcher_OT_load_section(bpy.types.Operator):
     bl_idname = "witcher.load_section"
-    bl_label = "Print Selected Index"
-    bl_description = "Print the index of the selected scene section"
+    bl_label = "Load Scene Section"
+    bl_description = "Load the selected .w2scene section"
 
     def execute(self, context):
         # Get the scene object
@@ -2805,15 +4404,91 @@ class Witcher_OT_load_section(bpy.types.Operator):
         # Print the index of the selected scene section
         log.debug("Selected Index: %s", scene.witcher_sections_index)
 
-        sceneImporter = import_scene.import_w3_scene(context.scene.witcher_sections_filepath)
-        sceneImporter.load_sections()
-        this_section = sceneImporter.scene_sections[scene.witcher_sections_index]
-        log.debug("Section: %s", this_section.sectionName)
-        sceneImporter.load_section(this_section)
-        sceneImporter.execute()
+        try:
+            sceneImporter = import_scene.import_w3_scene(context.scene.witcher_sections_filepath)
+            sceneImporter.load_sections()
+            this_section = sceneImporter.scene_sections[scene.witcher_sections_index]
+        except Exception as exc:
+            log.exception("Failed to load selected .w2scene section.")
+            self.report({'ERROR'}, f"Failed to load section: {exc}")
+            return {'CANCELLED'}
 
+        section_name = str(getattr(this_section, "sectionName", "") or "")
+        log.debug("Section: %s", section_name)
+        if this_section.__class__.__name__ == "CStorySceneCutsceneSection":
+            try:
+                result = _load_w2scene_cutscene_section(context, sceneImporter, this_section)
+            except Exception as exc:
+                log.exception("Failed to load cutscene section %s", section_name)
+                self.report({'ERROR'}, f"Failed to load cutscene section: {exc}")
+                return {'CANCELLED'}
+
+            cutscene_name = os.path.basename(result.get("path", ""))
+            dialog_stats = dict(result.get("dialog_stats", {}) or {})
+            dialog_total = int(dialog_stats.get("total", 0) or 0)
+            dialog_loaded = int(dialog_stats.get("loaded", 0) or 0)
+            dialog_text = f", dialog {dialog_loaded}/{dialog_total}" if dialog_total else ""
+            self.report({'INFO'}, f"Loaded cutscene section '{section_name}' from {cutscene_name}{dialog_text}.")
+            return {'FINISHED'}
+
+        _w2scene_unload_active_cutscene_section(context)
+        try:
+            sceneImporter.load_section(this_section)
+            sceneImporter.execute()
+        except Exception as exc:
+            log.exception("Failed to load section %s", section_name)
+            self.report({'ERROR'}, f"Failed to load section: {exc}")
+            return {'CANCELLED'}
 
         return {'FINISHED'}
+
+
+class WITCH_OT_W2ScenePreviewCameraEvent(bpy.types.Operator):
+    bl_idname = "witcher.w2scene_preview_camera_event"
+    bl_label = "Preview Scene Camera Event"
+    bl_description = "Apply the selected .w2scene camera event to the scene camera rig for inspection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    section_index: IntProperty(default=-1)
+    source_index: IntProperty(default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        filepath = str(
+            getattr(scene, "witcher_sections_filepath", "")
+            or getattr(scene, "witcher_loaded_w2scene_path", "")
+            or ""
+        )
+        if not filepath:
+            self.report({'ERROR'}, "No .w2scene file is loaded.")
+            return {'CANCELLED'}
+
+        section_index = self.section_index
+        if section_index < 0:
+            section_index = int(getattr(scene, "witcher_sections_index", 0) or 0)
+
+        try:
+            scene_importer = import_scene.import_w3_scene(filepath)
+            scene_importer.load_sections()
+            if not (0 <= section_index < len(scene_importer.scene_sections)):
+                raise IndexError(f"Section index {section_index} is out of range")
+            scene_importer.load_section(scene_importer.scene_sections[section_index])
+            events = list(getattr(scene_importer, "_section_scene_event_elements", []) or [])
+            if not (0 <= self.source_index < len(events)):
+                raise IndexError(f"Event index {self.source_index} is out of range")
+            event = events[self.source_index]
+            if event.__class__.__name__ not in {"CStorySceneEventCustomCamera", "CStorySceneEventCustomCameraInstance"}:
+                self.report({'WARNING'}, f"{event.__class__.__name__} has no camera pose to preview.")
+                return {'CANCELLED'}
+            camera_name, event_frame = scene_importer.preview_camera_event(context, event)
+        except Exception as exc:
+            log.exception("Failed to preview .w2scene camera event")
+            self.report({'ERROR'}, f"Failed to preview camera event: {exc}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Previewed {camera_name} at frame {event_frame:.2f}.")
+        return {'FINISHED'}
+
 
 class WITCHER_PT_witcher_sections_panel(WITCH_PT_Base, Panel):
     bl_parent_id = "WITCHER_PT_scene_panel"
@@ -2872,6 +4547,13 @@ classes = [
     CutsceneEffectItem,
     CutsceneTemplateFieldItem,
     CutsceneDialogItem,
+    W2SceneFieldItem,
+    W2SceneActorItem,
+    W2SceneDialogsetItem,
+    W2SceneDialogsetSlotItem,
+    W2SceneCameraItem,
+    W2SceneSectionElementItem,
+    W2SceneSectionEventItem,
     WITCH_UL_CutsceneActorPreview,
     WITCH_UL_CutsceneAnimationPreview,
     WITCH_UL_CutsceneDialogList,
@@ -2880,6 +4562,12 @@ classes = [
     WITCH_UL_RootEventList,
     WITCH_UL_EntryEventList,
     WITCH_UL_ActorEntryEventList,
+    WITCH_UL_W2SceneActorList,
+    WITCH_UL_W2SceneDialogsetList,
+    WITCH_UL_W2SceneDialogsetSlotList,
+    WITCH_UL_W2SceneCameraList,
+    WITCH_UL_W2SceneElementList,
+    WITCH_UL_W2SceneEventList,
     WITCH_OT_CutsceneSelectActor,
     WITCH_OT_CutsceneRemoveActor,
     WITCH_OT_CutsceneRemoveAnimation,
@@ -2896,6 +4584,7 @@ classes = [
     WITCHER_PT_scene_panel,
     WITCHER_SECTIONS_UL_List,
     Witcher_OT_load_section,
+    WITCH_OT_W2ScenePreviewCameraEvent,
     #WITCHER_PT_witcher_sections_panel,
 ]
 
@@ -2908,6 +4597,37 @@ def register():
     bpy.types.Scene.witcher_sections = bpy.props.CollectionProperty(type=WitcherSection)
     bpy.types.Scene.witcher_sections_index = bpy.props.IntProperty(default=0)
     bpy.types.Scene.witcher_sections_filepath = bpy.props.StringProperty(default="")
+    bpy.types.Scene.witcher_loaded_w2scene_name = bpy.props.StringProperty(default="")
+    bpy.types.Scene.witcher_loaded_w2scene_path = bpy.props.StringProperty(default="")
+    bpy.types.Scene.witcher_w2scene_repo_path = bpy.props.StringProperty(default="")
+    bpy.types.Scene.witcher_w2scene_summary = bpy.props.StringProperty(default="")
+    bpy.types.Scene.witcher_w2scene_active_cutscene_path = bpy.props.StringProperty(default="")
+    bpy.types.Scene.witcher_w2scene_root_fields = bpy.props.CollectionProperty(type=W2SceneFieldItem)
+    bpy.types.Scene.witcher_w2scene_section_fields = bpy.props.CollectionProperty(type=W2SceneFieldItem)
+    bpy.types.Scene.witcher_w2scene_actor_items = bpy.props.CollectionProperty(type=W2SceneActorItem)
+    bpy.types.Scene.witcher_w2scene_dialogset_items = bpy.props.CollectionProperty(type=W2SceneDialogsetItem)
+    bpy.types.Scene.witcher_w2scene_dialogset_slot_items = bpy.props.CollectionProperty(type=W2SceneDialogsetSlotItem)
+    bpy.types.Scene.witcher_w2scene_camera_items = bpy.props.CollectionProperty(type=W2SceneCameraItem)
+    bpy.types.Scene.witcher_w2scene_section_element_items = bpy.props.CollectionProperty(type=W2SceneSectionElementItem)
+    bpy.types.Scene.witcher_w2scene_section_event_items = bpy.props.CollectionProperty(type=W2SceneSectionEventItem)
+    bpy.types.Scene.witcher_w2scene_actor_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.witcher_w2scene_dialogset_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.witcher_w2scene_dialogset_slot_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.witcher_w2scene_camera_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.witcher_w2scene_element_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.witcher_w2scene_event_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.witcher_w2scene_show_unset_fields = bpy.props.BoolProperty(name="Show Unset", default=False)
+    bpy.types.Scene.witcher_w2scene_tab = bpy.props.EnumProperty(
+        name="Scene Tab",
+        items=[
+            ('SCENE', 'Scene', 'Scene-level fields and file summary'),
+            ('SECTIONS', 'Sections', 'Sections, ordered elements and section events'),
+            ('ACTORS', 'Actors', 'Scene actor templates and appearances'),
+            ('DIALOGSETS', 'Dialogsets', 'Dialogset instances and slots'),
+            ('CAMERAS', 'Cameras', 'Camera definitions embedded in the scene'),
+        ],
+        default='SECTIONS',
+    )
     bpy.types.Scene.witcher_loaded_cutscene_name = bpy.props.StringProperty(default="")
     bpy.types.Scene.witcher_cutscene_last_import_seconds = bpy.props.FloatProperty(default=0.0)
     bpy.types.Scene.witcher_cutscene_actor_items = bpy.props.CollectionProperty(type=CutsceneLoadedActorItem)
@@ -2982,6 +4702,31 @@ def unregister():
         del bpy.types.Scene.witcher_sections_index
     if hasattr(bpy.types.Scene, "witcher_sections_filepath"):
         del bpy.types.Scene.witcher_sections_filepath
+    for prop in (
+        "witcher_loaded_w2scene_name",
+        "witcher_loaded_w2scene_path",
+        "witcher_w2scene_repo_path",
+        "witcher_w2scene_summary",
+        "witcher_w2scene_active_cutscene_path",
+        "witcher_w2scene_root_fields",
+        "witcher_w2scene_section_fields",
+        "witcher_w2scene_actor_items",
+        "witcher_w2scene_dialogset_items",
+        "witcher_w2scene_dialogset_slot_items",
+        "witcher_w2scene_camera_items",
+        "witcher_w2scene_section_element_items",
+        "witcher_w2scene_section_event_items",
+        "witcher_w2scene_actor_index",
+        "witcher_w2scene_dialogset_index",
+        "witcher_w2scene_dialogset_slot_index",
+        "witcher_w2scene_camera_index",
+        "witcher_w2scene_element_index",
+        "witcher_w2scene_event_index",
+        "witcher_w2scene_show_unset_fields",
+        "witcher_w2scene_tab",
+    ):
+        if hasattr(bpy.types.Scene, prop):
+            delattr(bpy.types.Scene, prop)
     if hasattr(bpy.types.Scene, "witcher_loaded_cutscene_name"):
         del bpy.types.Scene.witcher_loaded_cutscene_name
     if hasattr(bpy.types.Scene, "witcher_cutscene_last_import_seconds"):

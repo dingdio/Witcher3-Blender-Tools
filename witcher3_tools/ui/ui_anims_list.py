@@ -268,7 +268,7 @@ def resolve_owner_face_animation_context(context, main_arm_obj=None):
     return resolved_main_arm_obj, owner_armature, rig_path
 
 
-def ensure_face_animation_setup(context, main_arm_obj, target_armatures=None):
+def ensure_face_animation_setup(context, main_arm_obj, target_armatures=None, force=False):
     track_target_armature = _resolve_face_track_target_armature(main_arm_obj, target_armatures or [])
     if track_target_armature is None:
         return False, None
@@ -278,7 +278,7 @@ def ensure_face_animation_setup(context, main_arm_obj, target_armatures=None):
     try:
         from .ui_mimics import _ensure_face_morphs_loaded
 
-        return bool(_ensure_face_morphs_loaded(context, track_target_armature)), track_target_armature
+        return bool(_ensure_face_morphs_loaded(context, track_target_armature, force=force)), track_target_armature
     except Exception:
         log.warning(
             "Failed to ensure face morph setup on '%s'.",
@@ -288,12 +288,12 @@ def ensure_face_animation_setup(context, main_arm_obj, target_armatures=None):
         return False, track_target_armature
 
 
-def ensure_owner_face_animation_setup(context, main_arm_obj=None):
+def ensure_owner_face_animation_setup(context, main_arm_obj=None, force=False):
     _resolved_main_arm_obj, owner_armature, _rig_path = resolve_owner_face_animation_context(context, main_arm_obj)
     try:
         from .ui_mimics import _ensure_face_morphs_loaded
 
-        return bool(_ensure_face_morphs_loaded(context, owner_armature)), owner_armature
+        return bool(_ensure_face_morphs_loaded(context, owner_armature, force=force)), owner_armature
     except Exception:
         log.warning(
             "Failed to ensure face morph setup on '%s'.",

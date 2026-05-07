@@ -49,21 +49,76 @@ def read_skelly(skelly):
                 positions = [],
                 rotations = [],
                 scales = [])
+
+    def prop_entries(prop):
+        for attr in ("More", "value", "elements"):
+            entries = getattr(prop, attr, None)
+            if isinstance(entries, list):
+                return entries
+        return []
+
+    def entry_name(entry):
+        text = str(getattr(entry, "elementName", "") or "").strip()
+        if text:
+            return text
+        for prop_name in ("name", "m_name"):
+            prop = entry.GetVariableByName(prop_name) if hasattr(entry, "GetVariableByName") else None
+            if prop is None:
+                continue
+            for attr_path in (("Index", "String"), ("Value",), ("String",), ("value",)):
+                value = prop
+                for attr in attr_path:
+                    value = getattr(value, attr, None)
+                    if value is None:
+                        break
+                if hasattr(value, "ToString"):
+                    value = value.ToString()
+                elif hasattr(value, "String"):
+                    value = getattr(value, "String", "")
+                text = str(value or "").strip()
+                if text:
+                    return text
+        return ""
+
     for item in skelly.PROPS:
-        if item.theName == "bones":
-            for bone in item.More:
-                this_skeleton.names.append(bone.elementName)
-            this_skeleton.nbBones = len(item.More)
-        if item.theName == "tracks":
-            for track in item.More:
-                this_skeleton.tracks.append(track.elementName)
-        if item.theName == "parentIndices":
-            this_skeleton.parentIdx = item.value[:]
+        if item.theName in ("bones", "m_bones"):
+            for idx, bone in enumerate(prop_entries(item)):
+                this_skeleton.names.append(entry_name(bone) or str(idx))
+            this_skeleton.nbBones = len(this_skeleton.names)
+        if item.theName in ("tracks", "m_tracks"):
+            for track in prop_entries(item):
+                track_name = entry_name(track)
+                if track_name:
+                    this_skeleton.tracks.append(track_name)
+        if item.theName in ("parentIndices", "m_parentIndices"):
+            parent_indices = getattr(item, "value", None)
+            if isinstance(parent_indices, list):
+                this_skeleton.parentIdx = parent_indices[:]
     if hasattr(skelly, "rigData"):
-        for data in skelly.rigData.rigData:
+        rig_data = getattr(getattr(skelly, "rigData", None), "rigData", []) or []
+        for data in rig_data:
             this_skeleton.positions.append(data.position)
             this_skeleton.rotations.append(data.rotation)
             this_skeleton.scales.append(data.scale)
+    bone_count = len(this_skeleton.names)
+    if bone_count:
+        if len(this_skeleton.parentIdx) < bone_count:
+            this_skeleton.parentIdx.extend([-1] * (bone_count - len(this_skeleton.parentIdx)))
+        if len(this_skeleton.positions) < bone_count:
+            this_skeleton.positions.extend(
+                w3_types.Vector3D(0.0, 0.0, 0.0)
+                for _ in range(bone_count - len(this_skeleton.positions))
+            )
+        if len(this_skeleton.rotations) < bone_count:
+            this_skeleton.rotations.extend(
+                w3_types.Quaternion(0.0, 0.0, 0.0, 1.0)
+                for _ in range(bone_count - len(this_skeleton.rotations))
+            )
+        if len(this_skeleton.scales) < bone_count:
+            this_skeleton.scales.extend(
+                w3_types.Vector3D(1.0, 1.0, 1.0)
+                for _ in range(bone_count - len(this_skeleton.scales))
+            )
     return this_skeleton
 
 def create_CMimicFace(file):

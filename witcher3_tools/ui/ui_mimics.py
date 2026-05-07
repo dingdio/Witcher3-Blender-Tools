@@ -161,10 +161,10 @@ def _get_mimic_rig_path(armature_obj):
     return None
 
 
-def _ensure_face_morphs_loaded(context, armature_obj):
+def _ensure_face_morphs_loaded(context, armature_obj, force=False):
     if not armature_obj or armature_obj.type != 'ARMATURE':
         return False
-    if _has_face_morphs_loaded(armature_obj):
+    if not force and _has_face_morphs_loaded(armature_obj):
         return True
     if 'mimicFaceFile' not in armature_obj or 'mimicFace' not in armature_obj:
         return False

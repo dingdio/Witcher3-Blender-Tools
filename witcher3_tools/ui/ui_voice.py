@@ -1336,7 +1336,7 @@ radish_dirs = [
     d for d in get_dev_override_list("voice_radish_dirs", []) if isinstance(d, str) and d
 ]
 global_sound = None
-def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame = 0, recreate_phonemes = None):
+def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame = 0, recreate_phonemes = None, strip_props = None, nla_mode = None):
     unpadded_line_id = ''+voiceLineId
     if context == None:
         context = bpy.context
@@ -1391,7 +1391,7 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
     if cr2wPath.is_file():
         log.info('Importing Lipsync')
         _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
-        _nla_mode = _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+        _nla_mode = nla_mode or _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
         import_anims.import_lipsync(
             context,
             str(cr2wPath),
@@ -1460,10 +1460,17 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
             frame_start= math.ceil(at_frame)+1
         )
         soundstrip.frame_start = at_frame
+        for prop_name, prop_value in (strip_props or {}).items():
+            try:
+                soundstrip[prop_name] = prop_value
+            except Exception:
+                log.debug("Could not tag sound strip %s with %s", getattr(soundstrip, "name", ""), prop_name, exc_info=True)
         # Only extend frame_end, never shrink it
         strip_end = int(math.ceil(soundstrip.frame_final_end))
         if strip_end > scene.frame_end:
             scene.frame_end = strip_end
+        return soundstrip
+    return None
 
 class MyVoiceListItem_Debug(bpy.types.Operator):
     bl_idname = "witcher.quick_voice_debug"

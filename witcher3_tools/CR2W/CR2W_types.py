@@ -369,7 +369,13 @@ class PROPSTART:
                 self.name = CR2WFILE.CNAMES[self.strIdx.Index].name.value; #string
                 self.type = CR2WFILE.CNAMES[self.dataType.Index].name.value; #string
 
-                if CR2WFILE.HEADER.version <= 115:
+                if (
+                    CR2WFILE.HEADER.version <= 115
+                    or (
+                        is_old_version(CR2WFILE.HEADER.version)
+                        and readUShortCheck(f, f.tell()) == 0xFFFF
+                    )
+                ):
                     unk = readInt16(f)
                     if unk != -1:
                         self.type = CR2WFILE.CNAMES[unk].name.value; #string #!
@@ -1357,6 +1363,19 @@ class PROPERTY:
         elementType = theType
         if (arrayDataType == "array" and hasattr(theType, "rsplit") and "," in theType):
             elementType = theType.rsplit(",", 1)[-1]
+        if (
+            arrayDataType == "array"
+            and is_old_version(CR2WFILE.HEADER.version)
+            and count > 0
+            and f.tell() + 4 <= dataEnd
+        ):
+            element_type_idx = readUShortCheck(f, f.tell())
+            element_type_end = readUShortCheck(f, f.tell() + 2)
+            if (
+                0 < element_type_idx < len(CR2WFILE.CNAMES)
+                and element_type_end == 0xFFFF
+            ):
+                f.seek(4, os.SEEK_CUR)
 
         #parse data:
         if ("curveData" in arrayDataType):
@@ -2344,12 +2363,37 @@ class W_CLASS:
                     elif self.name == "CSkeletalAnimationSetEntry": #TODO FIX ENTRIES
                         f.seek(self.classEnd)
                     elif self.name == "CSkeleton":
+                        bonecount = 0
                         for item in self.PROPS:
-                            if item.theName == "bones":
-                                bonecount = len(item.More)
+                            if getattr(item, "theName", "") in {"bones", "m_bones"}:
+                                try:
+                                    bonecount = len(getattr(item, "More", []) or [])
+                                except Exception:
+                                    bonecount = 0
                                 break
-                        self.rigData = CCompressedBuffer(f, CR2WFILE, self, Name = "rigData")
-                        self.rigData.Read(f, bonecount * 48, bonecount)
+                        bytesleft = max(0, self.classEnd - f.tell())
+                        if bonecount > 0 and bytesleft >= (2 + bonecount * 48):
+                            self.rigData = CCompressedBuffer(f, CR2WFILE, self, Name = "rigData")
+                            try:
+                                self.rigData.Read(f, bonecount * 48, bonecount)
+                            except Exception as exc:
+                                log.warning(
+                                    "Failed to read CSkeleton rigData for %s; using parsed skeleton properties only: %s",
+                                    getattr(CR2WFILE, "fileName", ""),
+                                    exc,
+                                )
+                                self.rigData = None
+                                f.seek(self.classEnd)
+                        else:
+                            self.rigData = None
+                            if bonecount > 0:
+                                log.debug(
+                                    "CSkeleton has no cooked rigData payload for %s (bones=%s, bytesleft=%s).",
+                                    getattr(CR2WFILE, "fileName", ""),
+                                    bonecount,
+                                    bytesleft,
+                                )
+                            f.seek(self.classEnd)
                         #f.seek(self.classEnd)
                     elif self.name == "CFoliageResource":
                         self.Trees = CBufferVLQInt32(CR2WFILE, SFoliageResourceData)

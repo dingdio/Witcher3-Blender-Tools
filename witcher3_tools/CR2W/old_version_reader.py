@@ -55,6 +55,20 @@ def _normalize_depot_path(path):
     return path.replace("/", "\\").lower()
 
 
+def _normalize_old_version_name(name):
+    if "@*" in name:
+        return name.replace("@*", "array:2,0,handle:")
+    if "@#" in name:
+        return name.replace("@#", "array:2,0,handle:")
+    if "@" in name:
+        return name.replace("@", "array:2,0,")
+    if "*" in name:
+        return name.replace("*", "handle:")
+    if "#" in name:
+        return name.replace("#", "handle:")
+    return name
+
+
 def _remap_old_version_object_flags(flags):
     remapped = 0
     if flags & OLD_OBJECT_FLAG_INLINED:
@@ -120,7 +134,7 @@ def load_old_version_resource_tables(cr2w, f, start):
     if names_offset > 0:
         f.seek(names_offset + start)
         for _ in range(names_count):
-            name = _read_red_serialized_string(f)
+            name = _normalize_old_version_name(_read_red_serialized_string(f))
             cr2w.STRINGS.append(name)
             cr2w.CNAMES.append(NAME(name=name))
 
