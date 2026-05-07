@@ -11,7 +11,7 @@ from ..CR2W.common_blender import repo_file
 from ..CR2W.dc_scene import load_bin_scene
 from ..importers import import_entity
 from ..importers.import_helpers import set_blender_object_transform#, set_blender_pose_bone_transform
-from ..action_compat import assign_action, bind_strip_action_slot, new_action_fcurve, resolve_action_slot
+from ..action_compat import assign_action, bind_strip_action_slot, get_action_channelbag, iter_action_fcurves, new_action_fcurve, resolve_action_slot
 from .import_cutscene import (
     check_if_actor_already_in_scene,
     _ensure_cutscene_actor_appearance,
@@ -161,6 +161,8 @@ def clear_w2scene_actor_section_nla(context, actor_obj):
         track_names=W2SCENE_SECTION_NLA_TRACK_NAMES,
         track_prefixes=W2SCENE_SECTION_NLA_TRACK_PREFIXES,
     )
+    if actor_obj is not None and getattr(actor_obj, "type", None) == 'ARMATURE':
+        removed += clear_actor_lookat_constraints(actor_obj)
     mimic_name = str(actor_obj.get("mimicFace", "") or "") if actor_obj is not None else ""
     mimic_armature = bpy.data.objects.get(mimic_name) if mimic_name else None
     if mimic_armature is not None and mimic_armature is not actor_obj:
@@ -186,7 +188,7 @@ def clear_w2scene_actor_section_nla(context, actor_obj):
 def clear_w2scene_story_scene_actor_nla(context, story_scene, reset_actors=False):
     if story_scene is None:
         return 0
-    removed = 0
+    removed = clear_lookat_static_empties()
     for actor_ref in getattr(getattr(story_scene, "sceneTemplates", None), "value", []) or []:
         try:
             actor_template = story_scene.chunksRef[actor_ref - 1]
@@ -340,6 +342,200 @@ def _camera_preview_offset_matrix(camera_armature):
 def _camera_matrix_to_edit_bone_matrix(camera_armature, camera_matrix, preview_offset):
     desired_edit_world = camera_matrix @ preview_offset.inverted()
     return camera_armature.matrix_world.inverted() @ desired_edit_world
+
+
+# CStorySceneEventLookAt support: live constraints layered on top of body NLA.
+# The Damped Track constraint runs after pose evaluation each frame, so the
+# head bone tracks its target naturally during scrubbing/playback.
+LOOKAT_CONSTRAINT_PREFIX = "w3_lookat_"
+LOOKAT_STATIC_EMPTY_PREFIX = "w3_lookat_static_"
+# W3 head bone local frame: face direction is the bone's -X axis on this rig.
+LOOKAT_TRACK_AXIS = 'TRACK_NEGATIVE_X'
+LOOKAT_LEVEL_BONE = {
+    "LL_Body": "head",
+    "LL_Head": "head",
+    "LL_Eyes": "head",
+    "LL_Null": "head",
+}
+LOOKAT_DEFAULT_BONE = "head"
+LOOKAT_TARGET_SUBTARGET = "head"
+LOOKAT_LIMIT_PITCH_DEG = 60.0
+LOOKAT_LIMIT_YAW_DEG = 90.0
+LOOKAT_LIMIT_ROLL_DEG = 30.0
+LOOKAT_LIMIT_CONSTRAINT_SUFFIX = "_limit"
+
+
+def _lookat_actor_bone(level):
+    return LOOKAT_LEVEL_BONE.get(str(level or ""), LOOKAT_DEFAULT_BONE)
+
+
+def _enum_string(value, default=""):
+    """Extract a string from a CR2W enum property.
+
+    Enum-typed properties come through as PROPERTY objects whose .Value is a
+    CEnum with a .String attr. Plain strings (from primitives) pass through.
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    inner = getattr(value, "Value", None)
+    if inner is not None:
+        s = getattr(inner, "String", None)
+        if s:
+            return str(s)
+        if hasattr(inner, "ToString"):
+            try:
+                return str(inner.ToString())
+            except Exception:
+                pass
+    s = getattr(value, "String", None)
+    if s:
+        return str(s)
+    if hasattr(value, "ToString"):
+        try:
+            return str(value.ToString())
+        except Exception:
+            pass
+    return default
+
+
+def _force_fcurve_interp(armature_obj, data_path, frame, interp):
+    anim = getattr(armature_obj, "animation_data", None)
+    action = getattr(anim, "action", None) if anim is not None else None
+    if action is None:
+        return
+    for fc in iter_action_fcurves(action, target=armature_obj):
+        if fc.data_path != data_path:
+            continue
+        for kp in fc.keyframe_points:
+            if abs(kp.co[0] - frame) < 0.5:
+                kp.interpolation = interp
+                kp.handle_left_type = 'VECTOR'
+                kp.handle_right_type = 'VECTOR'
+
+
+def _keyframe_constraint_influence(armature_obj, bone_name, constraint_name, frame, value, interp='CONSTANT'):
+    pose_bone = armature_obj.pose.bones.get(bone_name) if getattr(armature_obj, "pose", None) else None
+    if pose_bone is None:
+        return False
+    constraint = pose_bone.constraints.get(constraint_name)
+    if constraint is None:
+        return False
+    constraint.influence = float(value)
+    data_path = f'pose.bones["{bone_name}"].constraints["{constraint_name}"].influence'
+    armature_obj.keyframe_insert(data_path=data_path, frame=int(frame))
+    _force_fcurve_interp(armature_obj, data_path, int(frame), interp)
+    return True
+
+
+def _add_lookat_damped_track(actor_obj, bone_name, target_obj, subtarget, constraint_name):
+    pose = getattr(actor_obj, "pose", None)
+    pose_bone = pose.bones.get(bone_name) if pose else None
+    if pose_bone is None:
+        log.warning("LookAt: actor '%s' has no '%s' bone; skipping", getattr(actor_obj, "name", "?"), bone_name)
+        return None
+    existing = pose_bone.constraints.get(constraint_name)
+    if existing is not None:
+        return existing
+    constraint = pose_bone.constraints.new('DAMPED_TRACK')
+    constraint.name = constraint_name
+    constraint.target = target_obj
+    constraint.subtarget = subtarget or ""
+    constraint.track_axis = LOOKAT_TRACK_AXIS
+    constraint.influence = 0.0
+
+    # Companion Limit Rotation clamps the head bone to a realistic neck range.
+    limit_name = constraint_name + LOOKAT_LIMIT_CONSTRAINT_SUFFIX
+    if pose_bone.constraints.get(limit_name) is None:
+        limit = pose_bone.constraints.new('LIMIT_ROTATION')
+        limit.name = limit_name
+        limit.use_limit_x = True
+        limit.use_limit_y = True
+        limit.use_limit_z = True
+        # Track axis is -X (face forward), so the head bone's local frame:
+        #   Y = up the skull  -> rotation around Y = yaw (left/right)
+        #   Z = side of head  -> rotation around Z = pitch (up/down)
+        #   X = forward axis  -> rotation around X = roll (head tilt)
+        limit.min_x = math.radians(-LOOKAT_LIMIT_ROLL_DEG)
+        limit.max_x = math.radians(LOOKAT_LIMIT_ROLL_DEG)
+        limit.min_y = math.radians(-LOOKAT_LIMIT_YAW_DEG)
+        limit.max_y = math.radians(LOOKAT_LIMIT_YAW_DEG)
+        limit.min_z = math.radians(-LOOKAT_LIMIT_PITCH_DEG)
+        limit.max_z = math.radians(LOOKAT_LIMIT_PITCH_DEG)
+        limit.owner_space = 'LOCAL'
+        limit.influence = 1.0
+    return constraint
+
+
+def _create_lookat_static_empty(name, local_pos, parent_obj=None, event_guid=None):
+    empty = bpy.data.objects.get(name)
+    if empty is None:
+        empty = bpy.data.objects.new(name, None)
+        empty.empty_display_type = 'SPHERE'
+        empty.empty_display_size = 0.1
+        bpy.context.collection.objects.link(empty)
+    empty["witcher_w2scene_lookat_static"] = True
+    if event_guid:
+        empty["witcher_w2scene_lookat_guid"] = str(event_guid)
+    if parent_obj is not None:
+        empty.parent = parent_obj
+        empty.matrix_parent_inverse = Matrix.Identity(4)
+    empty.location = (float(local_pos[0]), float(local_pos[1]), float(local_pos[2]))
+    return empty
+
+
+def clear_actor_lookat_constraints(actor_obj):
+    pose = getattr(actor_obj, "pose", None)
+    if pose is None:
+        return 0
+    removed = 0
+    action = None
+    anim = getattr(actor_obj, "animation_data", None)
+    if anim is not None:
+        action = getattr(anim, "action", None)
+    channelbag = None
+    if action is not None:
+        try:
+            channelbag = get_action_channelbag(action, target=actor_obj)
+        except Exception:
+            channelbag = None
+    fcurves_owner = channelbag if channelbag is not None else action
+    for pose_bone in pose.bones:
+        for constraint in list(pose_bone.constraints):
+            if not constraint.name.startswith(LOOKAT_CONSTRAINT_PREFIX):
+                continue
+            # Drop any influence f-curves that animate this constraint
+            data_path = f'pose.bones["{pose_bone.name}"].constraints["{constraint.name}"].influence'
+            if action is not None:
+                for fc in list(iter_action_fcurves(action, target=actor_obj)):
+                    if fc.data_path != data_path:
+                        continue
+                    try:
+                        fcurves_owner.fcurves.remove(fc)
+                    except Exception:
+                        log.debug("Could not remove lookat influence fcurve %s", data_path, exc_info=True)
+            try:
+                pose_bone.constraints.remove(constraint)
+                removed += 1
+            except Exception:
+                log.debug("Could not remove lookat constraint %s", constraint.name, exc_info=True)
+    return removed
+
+
+def clear_lookat_static_empties():
+    removed = 0
+    for obj in list(bpy.data.objects):
+        if not obj.name.startswith(LOOKAT_STATIC_EMPTY_PREFIX):
+            continue
+        if not obj.get("witcher_w2scene_lookat_static"):
+            continue
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed += 1
+        except Exception:
+            log.debug("Could not remove lookat static empty %s", obj.name, exc_info=True)
+    return removed
 
 
 _W2SCENE_CAMERA_TRACK_DEFAULTS = {
@@ -1355,7 +1551,8 @@ class SceneImporter():
 
         camera_shot_key_data = []
         placement_key_data_by_actor = {}
-        
+        lookat_state_by_actor = {}
+
         for key, shot in self.scene_element_dict.items():
             # if key != 7:
             #     break
@@ -1548,6 +1745,101 @@ class SceneImporter():
                     if scene_camera_preview_obj is not None:
                         marker.camera = scene_camera_preview_obj
                     camera_shot_key_data.append((marker_frame, camera_matrix, camera_tracks, event))
+
+                elif event.__class__.__name__ == "CStorySceneEventLookAt":
+                    actor_name = getattr(event, "actor", None)
+                    actor_obj = set_cur_actor_by_str(actor_name, actors_dict) if actor_name else None
+                    if actor_obj is None:
+                        continue
+
+                    trigger_frame = int(get_event_start_frame(shot, event))
+                    guid_full = get_w2scene_event_guid_string(event) or ""
+                    guid_short = "".join(c if c.isalnum() else "_" for c in guid_full[:12])
+                    if not guid_short:
+                        guid_short = f"f{trigger_frame:05d}"
+                    enabled = getattr(event, "enabled", None)
+                    enabled = True if enabled is None else bool(enabled)
+                    instant = bool(getattr(event, "instant", False) or False)
+                    speed = float(getattr(event, "speed", 0.0) or 0.0)
+                    level = _enum_string(getattr(event, "level", None), default="LL_Head") or "LL_Head"
+                    lookat_type = _enum_string(getattr(event, "type", None), default="DLT_Dynamic") or "DLT_Dynamic"
+                    bone_name = _lookat_actor_bone(level)
+                    log.info(
+                        "LookAt: actor=%s target=%s type=%s level=%s instant=%s speed=%.3f frame=%d",
+                        actor_name, getattr(event, "target", None), lookat_type, level, instant, speed, trigger_frame
+                    )
+
+                    actor_key = getattr(actor_obj, "name", str(actor_name))
+                    prev_constraint_name = lookat_state_by_actor.get(actor_key)
+
+                    if instant or speed <= 0.0:
+                        ramp_frames = 0
+                    else:
+                        ramp_frames = max(1, int(round(__fps / max(speed, 0.01))))
+
+                    if not enabled:
+                        if prev_constraint_name:
+                            _keyframe_constraint_influence(actor_obj, bone_name, prev_constraint_name, max(trigger_frame - 1, 0), 1.0, 'CONSTANT' if ramp_frames == 0 else 'LINEAR')
+                            _keyframe_constraint_influence(actor_obj, bone_name, prev_constraint_name, trigger_frame + ramp_frames, 0.0, 'CONSTANT')
+                        lookat_state_by_actor[actor_key] = None
+                        continue
+
+                    target_obj_for_constraint = None
+                    subtarget = ""
+                    if lookat_type == "DLT_StaticPoint":
+                        sp = getattr(event, "staticPoint", None)
+                        # staticPoint is a Vector struct PROPERTY whose X/Y/Z
+                        # live as named child PROPERTYs in .More, not direct attrs.
+                        sx = float(_prop_child_value(sp, "X", 0.0) or 0.0)
+                        sy = float(_prop_child_value(sp, "Y", 0.0) or 0.0)
+                        sz = float(_prop_child_value(sp, "Z", 0.0) or 0.0)
+                        local_pos = (sx, sy, sz)
+                        log.info("LookAt: staticPoint actor-local = (%.3f, %.3f, %.3f)", sx, sy, sz)
+                        empty_name = f"{LOOKAT_STATIC_EMPTY_PREFIX}{actor_name}_{guid_short}"
+                        target_obj_for_constraint = _create_lookat_static_empty(
+                            empty_name, local_pos, parent_obj=actor_obj, event_guid=guid_full
+                        )
+                        subtarget = ""
+                    else:
+                        target_name = getattr(event, "target", None)
+                        target_entry = actor_entry_by_str(target_name, actors_dict) if target_name else None
+                        target_armature = target_entry[0] if target_entry else None
+                        if target_armature is None:
+                            log.warning("LookAt target '%s' not found for actor '%s'; skipping event", target_name, actor_name)
+                            continue
+                        target_obj_for_constraint = target_armature
+                        subtarget = LOOKAT_TARGET_SUBTARGET
+
+                    constraint_name = f"{LOOKAT_CONSTRAINT_PREFIX}{guid_short}"
+                    new_constraint = _add_lookat_damped_track(actor_obj, bone_name, target_obj_for_constraint, subtarget, constraint_name)
+                    if new_constraint is None:
+                        log.warning("LookAt: failed to create constraint on %s.%s", actor_key, bone_name)
+                        continue
+                    log.info(
+                        "LookAt: created %s on %s.%s -> target=%s subtarget=%s ramp_frames=%d",
+                        constraint_name, actor_key, bone_name,
+                        getattr(target_obj_for_constraint, "name", "?"), subtarget, ramp_frames,
+                    )
+
+                    pre_frame = max(trigger_frame - 1, 0)
+                    _keyframe_constraint_influence(actor_obj, bone_name, constraint_name, 0, 0.0, 'CONSTANT')
+                    if ramp_frames == 0:
+                        _keyframe_constraint_influence(actor_obj, bone_name, constraint_name, pre_frame, 0.0, 'CONSTANT')
+                        _keyframe_constraint_influence(actor_obj, bone_name, constraint_name, trigger_frame, 1.0, 'CONSTANT')
+                    else:
+                        _keyframe_constraint_influence(actor_obj, bone_name, constraint_name, trigger_frame, 0.0, 'LINEAR')
+                        _keyframe_constraint_influence(actor_obj, bone_name, constraint_name, trigger_frame + ramp_frames, 1.0, 'CONSTANT')
+
+                    if prev_constraint_name and prev_constraint_name != constraint_name:
+                        if ramp_frames == 0:
+                            _keyframe_constraint_influence(actor_obj, bone_name, prev_constraint_name, pre_frame, 1.0, 'CONSTANT')
+                            _keyframe_constraint_influence(actor_obj, bone_name, prev_constraint_name, trigger_frame, 0.0, 'CONSTANT')
+                        else:
+                            _keyframe_constraint_influence(actor_obj, bone_name, prev_constraint_name, trigger_frame, 1.0, 'LINEAR')
+                            _keyframe_constraint_influence(actor_obj, bone_name, prev_constraint_name, trigger_frame + ramp_frames, 0.0, 'CONSTANT')
+
+                    lookat_state_by_actor[actor_key] = constraint_name
+
                 else:
                     log.debug("Unhandled event type: %s", event.__class__.__name__)
             

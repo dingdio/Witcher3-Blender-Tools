@@ -187,7 +187,8 @@ def getClass(f, CR2WFILE, self, idx):
             dzero2 = ReadBit6(f)
             log.debug("Witcher 2 class preamble used -128 sentinel.")
         else:
-            log.debug("Witcher 2 class preamble had non-zero leading byte: %s", zero)
+            f.seek(-1, os.SEEK_CUR)
+            log.debug("Class data starts without zero preamble; rewound leading byte: %s", zero)
     return W_CLASS(f, CR2WFILE, self, idx)
 
 class DATA:
@@ -231,7 +232,8 @@ class DATA:
                     dzero2 = ReadBit6(f)
                     log.debug("Witcher 2 class preamble used -128 sentinel.")
                 else:
-                    log.debug("Witcher 2 class preamble had non-zero leading byte: %s", zero)
+                    f.seek(-1, os.SEEK_CUR)
+                    log.debug("Class data starts without zero preamble; rewound leading byte: %s", zero)
             #self.Class = W_CLASS(f, CR2WFILE, self)
             start_time = time.time()
             self.CHUNKS.append(W_CLASS(f, CR2WFILE, self, i))

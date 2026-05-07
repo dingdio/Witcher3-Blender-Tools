@@ -1960,6 +1960,8 @@ def create_CEntity(file, _inherit_visited=None):
     mesh_import_cursor = 0
     top_level_template_includes = []
     top_level_template_include_set = set()
+    top_level_included_entity_cache = None
+    inherited_beh_paths = []
     pending_w2_appearances = []
     w2_body_part_chunk_indices = set()
     w2_body_part_component_names = set()
@@ -2069,10 +2071,14 @@ def create_CEntity(file, _inherit_visited=None):
             if not getattr(target_app, "headName", None) and getattr(source_app, "headName", None):
                 target_app.headName = source_app.headName
 
-    def _merge_inherited_coloring_entries():
+    def _iter_top_level_included_entities():
+        nonlocal top_level_included_entity_cache
         if file.HEADER.version <= 115 or not top_level_template_includes:
-            return
-        existing_keys = {_coloring_entry_key(e) for e in (this_Entity.coloringEntries or [])}
+            return []
+        if top_level_included_entity_cache is not None:
+            return top_level_included_entity_cache
+
+        included_entities = []
         for include_path in top_level_template_includes:
             depot_path = str(include_path or "").strip()
             if not depot_path or not depot_path.lower().endswith(".w2ent"):
@@ -2089,15 +2095,128 @@ def create_CEntity(file, _inherit_visited=None):
                 include_cr2w = read_CR2W(include_full_path)
                 include_entity = create_CEntity(include_cr2w, _inherit_visited=inherit_visited | {norm_include_path})
             except Exception as e:
-                log.debug(f"Failed to load included template '{depot_path}' for inherited coloringEntries: {e}")
+                log.debug(f"Failed to load included template '{depot_path}': {e}")
                 continue
+            included_entities.append((depot_path, include_entity))
+
+        top_level_included_entity_cache = included_entities
+        return top_level_included_entity_cache
+
+    def _append_inherited_animated_chunk(inherited_chunk):
+        converted_chunk = copy.deepcopy(inherited_chunk)
+        converted_chunk.type = getattr(converted_chunk, "type", "CAnimatedComponent")
+        converted_chunk.chunkIndex = getattr(converted_chunk, "chunkIndex", 0)
+        signature = _animated_chunk_signature(converted_chunk)
+        if signature in seen_animated_signatures:
+            return False
+        seen_animated_signatures.add(signature)
+        new_mesh.chunks.append(converted_chunk)
+        return True
+
+    def _merge_inherited_template_components():
+        nonlocal hasCMovingPhysicalAgentComponent
+        if file.HEADER.version <= 115:
+            return
+
+        needs_inherited_animated = not hasCMovingPhysicalAgentComponent and not any(
+            getattr(chunk, "type", None) == "CAnimatedComponent"
+            for chunk in getattr(new_mesh, "chunks", None) or []
+        )
+        beh_seen = {_repo_path_key(path) for path in inherited_beh_paths}
+        for depot_path, include_entity in _iter_top_level_included_entities():
+            inherited_component = getattr(include_entity, "MovingPhysicalAgentComponent", None)
+            if inherited_component and needs_inherited_animated and not hasCMovingPhysicalAgentComponent:
+                this_Entity.MovingPhysicalAgentComponent = copy.deepcopy(inherited_component)
+                hasCMovingPhysicalAgentComponent = True
+                log.debug("Inherited MovingPhysicalAgentComponent from template '%s'", depot_path)
+
+            if needs_inherited_animated:
+                for inherited_chunk in getattr(getattr(include_entity, "staticMeshes", None), "chunks", None) or []:
+                    if getattr(inherited_chunk, "type", None) != "CAnimatedComponent":
+                        continue
+                    if _append_inherited_animated_chunk(inherited_chunk):
+                        log.debug(
+                            "Inherited CAnimatedComponent '%s' from template '%s'",
+                            getattr(inherited_chunk, "name", ""),
+                            depot_path,
+                        )
+
+            for beh_path in getattr(include_entity, "beh_paths", None) or []:
+                beh_key = _repo_path_key(beh_path)
+                if not beh_key or beh_key in beh_seen:
+                    continue
+                beh_seen.add(beh_key)
+                inherited_beh_paths.append(beh_path)
+
+    def _merge_inherited_coloring_entries():
+        if file.HEADER.version <= 115 or not top_level_template_includes:
+            return
+        existing_keys = {_coloring_entry_key(e) for e in (this_Entity.coloringEntries or [])}
+        for _depot_path, include_entity in _iter_top_level_included_entities():
             for inherited_entry in getattr(include_entity, "coloringEntries", []) or []:
                 key = _coloring_entry_key(inherited_entry)
                 if key in existing_keys:
                     continue
                 this_Entity.coloringEntries.append(inherited_entry)
                 existing_keys.add(key)
-    
+
+    def _apply_external_proxy_attachments():
+        for proxy_chunk in CHUNKS:
+            if getattr(proxy_chunk, "Type", None) != "CExternalProxyAttachment":
+                continue
+            original_attachment = proxy_chunk.GetVariableByName("originalAttachment")
+            original_index = getattr(original_attachment, "Value", None)
+            if not isinstance(original_index, int) or original_index <= 0 or original_index > len(CHUNKS):
+                log.debug(
+                    "Skipping CExternalProxyAttachment with invalid originalAttachment=%s in %s",
+                    original_index,
+                    getattr(file, "fileName", ""),
+                )
+                continue
+
+            attachment_chunk = CHUNKS[original_index - 1]
+            existing_props = {
+                getattr(prop, "theName", None): idx
+                for idx, prop in enumerate(getattr(attachment_chunk, "PROPS", None) or [])
+                if getattr(prop, "theName", None)
+            }
+            for prop in getattr(proxy_chunk, "PROPS", None) or []:
+                prop_name = getattr(prop, "theName", None)
+                if not prop_name or prop_name == "originalAttachment":
+                    continue
+                if prop_name in existing_props:
+                    attachment_chunk.PROPS[existing_props[prop_name]] = prop
+                else:
+                    attachment_chunk.PROPS.append(prop)
+
+    def _synthesize_missing_transform_parents_from_hard_attachments():
+        child_to_attachment = {}
+        for chunk in getattr(new_mesh, "chunks", None) or []:
+            if getattr(chunk, "type", None) != "CHardAttachment":
+                continue
+            child_index = getattr(chunk, "child", None)
+            attachment_index = getattr(chunk, "chunkIndex", None)
+            if isinstance(child_index, int) and isinstance(attachment_index, int):
+                child_to_attachment.setdefault(child_index, attachment_index)
+
+        if not child_to_attachment:
+            return
+
+        for chunk in getattr(new_mesh, "chunks", None) or []:
+            if getattr(chunk, "type", None) not in {
+                "CMeshComponent",
+                "CStaticMeshComponent",
+                "CRigidMeshComponent",
+                "CRagdollMeshComponent",
+                "CFurComponent",
+            }:
+                continue
+            if getattr(chunk, "transformParent", None) is not None:
+                continue
+            attachment_index = child_to_attachment.get(getattr(chunk, "chunkIndex", None))
+            if attachment_index is not None:
+                chunk.transformParent = attachment_index
+
     #ReadTemplate(file, new_mesh, this_Entity)
     if file.HEADER.version <= 115:
         ## Witcher 2 has CExternalProxyComponent that replaces chunks with chunks in the templates include
@@ -2145,6 +2264,9 @@ def create_CEntity(file, _inherit_visited=None):
                 attachment = CHUNKS[chunk.GetVariableByName("originalAttachment").Value-1]
                 attachment.PROPS.extend(chunk.PROPS)
                 #CExternalProxyAttachments[chunk.ChunkIndex] = (chunk, attachment)
+
+    if file.HEADER.version > 115:
+        _apply_external_proxy_attachments()
 
     def _resolve_initializer_chunk(init_prop):
         if not init_prop:
@@ -2383,10 +2505,13 @@ def create_CEntity(file, _inherit_visited=None):
             if hasattr(chunk, 'Components'):
             #for staticChunkPtr in chunk.GetVariableByName("components").ToArray():
                 if not chunk.Components and mesh_import_paths:
-                    log_fn = log.debug if file.HEADER.version <= 115 else log.warning
+                    log_fn = log.debug if file.HEADER.version <= 115 or top_level_template_includes else log.warning
+                    fallback_note = "top-level mesh fallback"
+                    if top_level_template_includes:
+                        fallback_note += " plus inherited template components"
                     log_fn(
                         f"{chunk.Type} has empty Components list while mesh imports exist "
-                        f"({len(mesh_import_paths)}), using top-level mesh fallback: {file.fileName}"
+                        f"({len(mesh_import_paths)}), using {fallback_note}: {file.fileName}"
                     )
                 for chunk_idx in chunk.Components:
                     chunk = CHUNKS[chunk_idx-1] #staticChunkPtr.Reference
@@ -2555,6 +2680,18 @@ def create_CEntity(file, _inherit_visited=None):
         #
         #######
         # Only add top-level mesh chunks if they weren't already added via CEntity.Components
+        elif (chunk.Type == "CStaticMeshComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
+            mc = CStaticMeshComponent(chunk).convert_for_io()
+            mc.mesh = _resolve_mesh_path(chunk, mc.mesh)
+            if not mc.mesh:
+                mc.mesh = _next_mesh_import_path()
+            if mc.mesh:
+                _append_unique_chunk(chunk, mc, added_chunks)
+            else:
+                log.warning(
+                    f"Skipping top-level CStaticMeshComponent with invalid mesh ref at chunk {chunk.ChunkIndex}; "
+                    f"props={_chunk_props_summary(chunk)}"
+                )
         elif (chunk.Type == "CMeshComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
             mc = CMeshComponent(chunk).convert_for_io()
             mc.mesh = _resolve_mesh_path(chunk, mc.mesh)
@@ -2829,7 +2966,9 @@ def create_CEntity(file, _inherit_visited=None):
             if not getattr(new_mesh, "chunks", None) and getattr(getattr(related_entity, "staticMeshes", None), "chunks", None):
                 new_mesh.chunks = copy.deepcopy(related_entity.staticMeshes.chunks)
 
+    _merge_inherited_template_components()
     _merge_inherited_coloring_entries()
+    _synthesize_missing_transform_parents_from_hard_attachments()
 
     if not hasCMovingPhysicalAgentComponent:
         for ent in new_mesh.chunks:
@@ -2837,7 +2976,15 @@ def create_CEntity(file, _inherit_visited=None):
                 this_Entity.MovingPhysicalAgentComponent = ent
                 break
     this_Entity.staticMeshes = new_mesh
-    this_Entity.beh_paths = _collect_beh_import_paths(file)
+    beh_paths = _collect_beh_import_paths(file)
+    beh_seen = {_repo_path_key(path) for path in beh_paths}
+    for beh_path in inherited_beh_paths:
+        beh_key = _repo_path_key(beh_path)
+        if not beh_key or beh_key in beh_seen:
+            continue
+        beh_seen.add(beh_key)
+        beh_paths.append(beh_path)
+    this_Entity.beh_paths = beh_paths
     return this_Entity
 
 def load_bin_entity(fileName) -> w3_types.Entity:
