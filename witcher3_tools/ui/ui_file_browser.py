@@ -7337,16 +7337,11 @@ class FileActionOperatorImportToScene(Operator):
                 import_w2w.btn_import_w2w(world_file, abs_file_path)
             elif ext == ".w2scene":
                 from ..importers import import_scene
+                from .ui_scene import _w2scene_unload_active_cutscene_section, _w2scene_sync_loaded_state
+                _w2scene_unload_active_cutscene_section(context)
                 scene_importer = import_scene.import_w3_scene(abs_file_path)
-                if hasattr(scene_importer, "load_sections"):
-                    scene_importer.load_sections()
-                if hasattr(context.scene, "witcher_sections"):
-                    context.scene.witcher_sections.clear()
-                    context.scene.witcher_sections_filepath = abs_file_path
-                    for section in getattr(scene_importer, "scene_sections", []):
-                        item = context.scene.witcher_sections.add()
-                        item.name = getattr(section, "sectionName", str(section))
-                        item.json_data = "{}"
+                scene_importer.load_sections()
+                _w2scene_sync_loaded_state(context.scene, abs_file_path, scene_importer=scene_importer)
                 bpy.context.view_layer.update()
             elif ext == ".w2cutscene":
                 from ..importers import import_cutscene

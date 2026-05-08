@@ -7,7 +7,7 @@ from .. import get_uncook_path
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.CR2W_types import EngineTransform
-from ..CR2W.common_blender import repo_file
+from ..CR2W.common_blender import repo_file, redkit_repo_context
 from ..CR2W.dc_scene import load_bin_scene
 from ..importers import import_entity
 from ..importers.import_helpers import set_blender_object_transform#, set_blender_pose_bone_transform
@@ -60,6 +60,7 @@ W2SCENE_AUDIO_SECTION_PROP = "witcher_w2scene_section"
 W2SCENE_SECTION_NLA_TRACK_NAMES = {
     "SceneDialogsetIdle",
     "ScenePlacement",
+    "SceneVisibility",
     "voice_import",
     "voice_import_phoneme",
 }
@@ -185,6 +186,17 @@ def clear_w2scene_actor_section_nla(context, actor_obj):
     return removed
 
 
+def clear_w2scene_prop_section_nla(prop_obj):
+    return clear_nla_tracks(prop_obj, track_names=("ScenePlacement", "SceneVisibility"))
+
+
+def reset_w2scene_prop_visibility(prop_obj):
+    if prop_obj is None:
+        return
+    prop_obj.hide_viewport = False
+    prop_obj.hide_render = False
+
+
 def clear_w2scene_story_scene_actor_nla(context, story_scene, reset_actors=False):
     if story_scene is None:
         return 0
@@ -203,6 +215,28 @@ def clear_w2scene_story_scene_actor_nla(context, story_scene, reset_actors=False
                     reset_transforms(actor_obj)
                 except Exception:
                     log.debug("Could not reset .w2scene actor %s", getattr(actor_obj, "name", ""), exc_info=True)
+    return removed
+
+
+def clear_w2scene_story_scene_prop_nla(story_scene, reset_props=False):
+    if story_scene is None:
+        return 0
+    removed = 0
+    for prop_ref in getattr(getattr(story_scene, "sceneProps", None), "value", []) or []:
+        try:
+            prop_chunk = story_scene.chunksRef[prop_ref - 1]
+            prop = w3_types.CStorySceneProp(prop_chunk)
+            prop_obj = _find_scene_prop_object(getattr(prop, "id", ""))
+        except Exception:
+            prop_obj = None
+        if prop_obj:
+            removed += clear_w2scene_prop_section_nla(prop_obj)
+            if reset_props:
+                try:
+                    reset_transforms(prop_obj)
+                    reset_w2scene_prop_visibility(prop_obj)
+                except Exception:
+                    log.debug("Could not reset .w2scene prop %s", getattr(prop_obj, "name", ""), exc_info=True)
     return removed
 
 
@@ -228,11 +262,13 @@ def clear_w2scene_runtime_state(context, story_scene=None, reset_actors=False):
     removed = {
         "audio": 0,
         "actor_nla": 0,
+        "prop_nla": 0,
         "camera": 0,
     }
     if scene is not None:
         removed["audio"] = clear_w2scene_section_audio(scene)
     removed["actor_nla"] = clear_w2scene_story_scene_actor_nla(context, story_scene, reset_actors=reset_actors)
+    removed["prop_nla"] = clear_w2scene_story_scene_prop_nla(story_scene, reset_props=reset_actors)
     removed["camera"] = clear_w2scene_camera_runtime(context)
     return removed
 
@@ -263,6 +299,95 @@ class BlankEngineTransform:
         self.Scale_y = 1.0
         self.Scale_z = 1.0
 import time
+
+
+def _find_scene_prop_object(prop_id):
+    prop_id = str(prop_id or "").strip()
+    if not prop_id:
+        return None
+    for obj in bpy.context.scene.objects:
+        if str(obj.get("witcher_w2scene_prop_id", "") or "").strip() == prop_id:
+            return obj
+    return None
+
+
+def _resolve_w2scene_template_path(template_path, scene_filepath=""):
+    template_path = str(template_path or "").strip().replace("/", "\\")
+    if not template_path:
+        return ""
+    if os.path.isabs(template_path):
+        return template_path
+
+    source_path = Path(str(scene_filepath or ""))
+    if source_path:
+        for parent in source_path.parents:
+            candidate = parent / template_path
+            if candidate.exists():
+                return str(candidate)
+    with redkit_repo_context(scene_filepath):
+        return repo_file(template_path)
+
+
+def _create_scene_prop_empty(prop_id, template_path, context):
+    name = str(prop_id or "").strip() or Path(str(template_path or "SceneProp")).stem
+    prop_obj = bpy.data.objects.new(name, None)
+    prop_obj.empty_display_type = 'PLAIN_AXES'
+    prop_obj.empty_display_size = 0.25
+    collection = getattr(context, "collection", None) or getattr(getattr(context, "scene", None), "collection", None)
+    if collection is not None:
+        collection.objects.link(prop_obj)
+    else:
+        bpy.context.scene.collection.objects.link(prop_obj)
+    return prop_obj
+
+
+def _import_scene_prop_object(prop, context, scene_filepath=""):
+    prop_id = str(getattr(prop, "id", "") or "").strip()
+    template_path = str(getattr(prop, "entityTemplate", "") or "").strip()
+    prop_obj = _find_scene_prop_object(prop_id)
+    if prop_obj is not None:
+        return prop_obj
+    if not template_path:
+        log.warning("Skipping scene prop %s; no entity template", prop_id or "<unnamed>")
+        return None
+
+    before_ids = {id(obj) for obj in bpy.data.objects}
+    resolved_path = _resolve_w2scene_template_path(template_path, scene_filepath)
+    try:
+        prop_obj = import_entity.import_ent_template(resolved_path)
+    except Exception:
+        log.warning("Failed to import scene prop %s from %s", prop_id or "<unnamed>", resolved_path or template_path, exc_info=True)
+        prop_obj = None
+
+    if prop_obj is None:
+        new_objects = [obj for obj in bpy.data.objects if id(obj) not in before_ids]
+        new_ids = {id(obj) for obj in new_objects}
+        root_candidates = [
+            obj for obj in new_objects
+            if obj.parent is None or id(obj.parent) not in new_ids
+        ]
+        prop_obj = (root_candidates or new_objects or [None])[0]
+
+    if prop_obj is None:
+        log.warning(
+            "Scene prop %s produced no importable object from %s; creating placement empty",
+            prop_id or "<unnamed>",
+            resolved_path or template_path,
+        )
+        prop_obj = _create_scene_prop_empty(prop_id, template_path, context)
+
+    prop_obj["witcher_w2scene_prop_id"] = prop_id
+    prop_obj["witcher_w2scene_prop_template"] = template_path
+    prop_obj["witcher_scene_item_type"] = "PROP"
+    try:
+        child_objects = list(prop_obj.children_recursive)
+    except Exception:
+        child_objects = []
+    for child in child_objects:
+        child["witcher_w2scene_prop_id"] = prop_id
+        child["witcher_w2scene_prop_template"] = template_path
+        child["witcher_scene_item_type"] = "PROP"
+    return prop_obj
 
 def _cname_index_to_string(index_obj):
     if index_obj is None:
@@ -349,6 +474,7 @@ def _camera_matrix_to_edit_bone_matrix(camera_armature, camera_matrix, preview_o
 # head bone tracks its target naturally during scrubbing/playback.
 LOOKAT_CONSTRAINT_PREFIX = "w3_lookat_"
 LOOKAT_STATIC_EMPTY_PREFIX = "w3_lookat_static_"
+LOOKAT_ANCHOR_PREFIX = "w3_lookat_anchor_"
 # W3 head bone local frame: face direction is the bone's -X axis on this rig.
 LOOKAT_TRACK_AXIS = 'TRACK_NEGATIVE_X'
 LOOKAT_LEVEL_BONE = {
@@ -359,7 +485,7 @@ LOOKAT_LEVEL_BONE = {
 }
 LOOKAT_DEFAULT_BONE = "head"
 LOOKAT_TARGET_SUBTARGET = "head"
-LOOKAT_LIMIT_PITCH_DEG = 60.0
+LOOKAT_LIMIT_PITCH_DEG = 10.0 #setting to 10 seems to match what it looks like in editor
 LOOKAT_LIMIT_YAW_DEG = 90.0
 LOOKAT_LIMIT_ROLL_DEG = 30.0
 LOOKAT_LIMIT_CONSTRAINT_SUFFIX = "_limit"
@@ -429,12 +555,61 @@ def _keyframe_constraint_influence(armature_obj, bone_name, constraint_name, fra
     return True
 
 
+def _get_or_create_lookat_anchor(target_armature, target_bone_name):
+    if target_armature is None or not target_bone_name:
+        return None
+    pose = getattr(target_armature, "pose", None)
+    pose_bone = pose.bones.get(target_bone_name) if pose else None
+    if pose_bone is None or pose_bone.parent is None:
+        return None
+    parent_bone_name = pose_bone.parent.name
+    anchor_name = f"{LOOKAT_ANCHOR_PREFIX}{target_armature.name}_{target_bone_name}"
+    anchor = bpy.data.objects.get(anchor_name)
+    if anchor is None:
+        anchor = bpy.data.objects.new(anchor_name, None)
+        anchor.empty_display_type = 'PLAIN_AXES'
+        anchor.empty_display_size = 0.05
+        try:
+            bpy.context.collection.objects.link(anchor)
+        except Exception:
+            bpy.context.scene.collection.objects.link(anchor)
+        anchor.hide_viewport = True
+    anchor["witcher_w2scene_lookat_anchor"] = True
+    anchor["witcher_w2scene_lookat_anchor_armature"] = target_armature.name
+    anchor["witcher_w2scene_lookat_anchor_bone"] = target_bone_name
+    if (anchor.parent is not target_armature
+            or anchor.parent_type != 'BONE'
+            or anchor.parent_bone != parent_bone_name):
+        anchor.parent = target_armature
+        anchor.parent_type = 'BONE'
+        anchor.parent_bone = parent_bone_name
+        anchor.matrix_parent_inverse = Matrix.Identity(4)
+        anchor.matrix_basis = Matrix.Identity(4)
+    return anchor
+
+
 def _add_lookat_damped_track(actor_obj, bone_name, target_obj, subtarget, constraint_name):
     pose = getattr(actor_obj, "pose", None)
     pose_bone = pose.bones.get(bone_name) if pose else None
     if pose_bone is None:
         log.warning("LookAt: actor '%s' has no '%s' bone; skipping", getattr(actor_obj, "name", "?"), bone_name)
         return None
+
+    # Avoid mutual head-to-head Damped Track cycles by retargeting onto an
+    # anchor empty parented to the target bone's parent (see
+    # _get_or_create_lookat_anchor).  Self-look (same armature) does not need
+    # this - a bone tracking another bone on the same rig is a normal forward
+    # dependency.  Static-point lookats already use a parented empty.
+    if (
+        getattr(target_obj, "type", None) == 'ARMATURE'
+        and subtarget
+        and target_obj is not actor_obj
+    ):
+        anchor = _get_or_create_lookat_anchor(target_obj, subtarget)
+        if anchor is not None:
+            target_obj = anchor
+            subtarget = ""
+
     existing = pose_bone.constraints.get(constraint_name)
     if existing is not None:
         return existing
@@ -526,15 +701,15 @@ def clear_actor_lookat_constraints(actor_obj):
 def clear_lookat_static_empties():
     removed = 0
     for obj in list(bpy.data.objects):
-        if not obj.name.startswith(LOOKAT_STATIC_EMPTY_PREFIX):
-            continue
-        if not obj.get("witcher_w2scene_lookat_static"):
+        is_static = obj.name.startswith(LOOKAT_STATIC_EMPTY_PREFIX) and obj.get("witcher_w2scene_lookat_static")
+        is_anchor = obj.name.startswith(LOOKAT_ANCHOR_PREFIX) and obj.get("witcher_w2scene_lookat_anchor")
+        if not (is_static or is_anchor):
             continue
         try:
             bpy.data.objects.remove(obj, do_unlink=True)
             removed += 1
         except Exception:
-            log.debug("Could not remove lookat static empty %s", obj.name, exc_info=True)
+            log.debug("Could not remove lookat helper empty %s", obj.name, exc_info=True)
     return removed
 
 
@@ -1214,6 +1389,14 @@ class SceneImporter():
         return camera_name or event.__class__.__name__, event_frame
 
     def execute(self):
+        if not getattr(self, "_redkit_repo_context_active", False):
+            with redkit_repo_context(self._scene_filepath):
+                self._redkit_repo_context_active = True
+                try:
+                    return self.execute()
+                finally:
+                    self._redkit_repo_context_active = False
+
         s = time.time()
         _CStoryScene = self._CStoryScene
         context = bpy.context
@@ -1238,6 +1421,7 @@ class SceneImporter():
 
         camera_definitions = {}
         actors_dict= {}
+        props_dict = {}
         dialogset_idle_animations = []
 
         for actor in getattr(getattr(_CStoryScene, "sceneTemplates", None), "value", []) or []: #<array:2,0,ptr:CStorySceneActor>
@@ -1264,8 +1448,26 @@ class SceneImporter():
                 log.debug("Removed %d stale .w2scene NLA strip(s) from %s", removed_tracks, actor_obj.name)
             actors_dict[actor.id] = (actor_obj, actor)
 
+        for prop_ref in getattr(getattr(_CStoryScene, "sceneProps", None), "value", []) or []:
+            try:
+                prop_chunk = _CStoryScene.chunksRef[prop_ref - 1]
+                prop = w3_types.CStorySceneProp(prop_chunk)
+            except Exception:
+                log.debug("Could not parse scene prop definition %s", prop_ref, exc_info=True)
+                continue
+            prop_obj = _import_scene_prop_object(prop, context, self._scene_filepath)
+            if prop_obj is None:
+                continue
+            removed_tracks = clear_w2scene_prop_section_nla(prop_obj)
+            if removed_tracks:
+                log.debug("Removed %d stale .w2scene prop NLA strip(s) from %s", removed_tracks, prop_obj.name)
+            props_dict[str(getattr(prop, "id", "") or "")] = (prop_obj, prop)
+
         for actor_obj, _actor in actors_dict.values():
             reset_transforms(actor_obj)
+        for prop_obj, _prop in props_dict.values():
+            reset_transforms(prop_obj)
+            reset_w2scene_prop_visibility(prop_obj)
         context.view_layer.update()
 
         for di in getattr(getattr(_CStoryScene, "dialogsetInstances", None), "value", []) or []: #<array:2,0,ptr:CStorySceneActor>
@@ -1549,8 +1751,23 @@ class SceneImporter():
                     point.interpolation = interpolation
             return action
 
+        def create_object_visibility_action(action_name, target_obj, key_data, interpolation='CONSTANT'):
+            if target_obj is None or not key_data:
+                return None
+            action = bpy.data.actions.new(name=action_name)
+            hide_viewport_curve = new_action_fcurve(action, target_obj, data_path='hide_viewport', group_name="Visibility")
+            hide_render_curve = new_action_fcurve(action, target_obj, data_path='hide_render', group_name="Visibility")
+            for frame, is_visible, _event in key_data:
+                hidden_value = 0.0 if bool(is_visible) else 1.0
+                for curve in (hide_viewport_curve, hide_render_curve):
+                    point = curve.keyframe_points.insert(frame, hidden_value)
+                    point.interpolation = interpolation
+            return action
+
         camera_shot_key_data = []
         placement_key_data_by_actor = {}
+        placement_key_data_by_prop = {}
+        visibility_key_data_by_prop = {}
         lookat_state_by_actor = {}
 
         for key, shot in self.scene_element_dict.items():
@@ -1694,6 +1911,29 @@ class SceneImporter():
                         {"object": actor_obj, "keys": []},
                     )
                     placement_entry["keys"].append((placement_frame, placement_values, event))
+                elif event.__class__.__name__ == "CStorySceneEventScenePropPlacement":
+                    prop_id = str(getattr(event, "propId", "") or "").strip()
+                    prop_entry = props_dict.get(prop_id)
+                    if prop_entry is None:
+                        log.warning("Skipping scene prop placement for unknown prop '%s'", prop_id)
+                        continue
+                    prop_obj = prop_entry[0]
+                    engine_transform = event.placement.EngineTransform if event.placement else EngineTransform()
+                    placement_frame = get_event_start_frame(shot, event)
+                    placement_values = engine_transform_to_object_values(prop_obj, engine_transform, placeCube)
+                    prop_key = prop_id or getattr(prop_obj, "name", str(id(prop_obj)))
+                    placement_entry = placement_key_data_by_prop.setdefault(
+                        prop_key,
+                        {"object": prop_obj, "keys": []},
+                    )
+                    placement_entry["keys"].append((placement_frame, placement_values, event))
+
+                    is_visible = True if getattr(event, "showHide", None) is None else bool(getattr(event, "showHide", True))
+                    visibility_entry = visibility_key_data_by_prop.setdefault(
+                        prop_key,
+                        {"object": prop_obj, "keys": []},
+                    )
+                    visibility_entry["keys"].append((placement_frame, is_visible, event))
                 elif  event.__class__.__name__ ==  "CStorySceneEventCameraInterpolation":
                     keyGuidsObjs = []
                     for guid in _iter_prop_values(getattr(event, "keyGuids", None)):
@@ -1875,6 +2115,44 @@ class SceneImporter():
             if placement_action is not None:
                 self.__assign_action(actor_obj, placement_action, track_name="ScenePlacement", at_frame=0.0)
                 extend_nla_track_to_frame(actor_obj, "ScenePlacement", section_end_frame)
+
+        for placement_entry in placement_key_data_by_prop.values():
+            prop_obj = placement_entry["object"]
+            placement_keys = list(placement_entry["keys"])
+            if prop_obj is None or not placement_keys:
+                continue
+            placement_keys.sort(key=lambda item: item[0])
+            action_keys = []
+            if placement_keys[0][0] > 0.0:
+                action_keys.append((0.0, object_transform_values(prop_obj), None))
+            action_keys.extend(placement_keys)
+            last_frame, last_values, last_event = action_keys[-1]
+            if section_end_frame > last_frame:
+                action_keys.append((section_end_frame, last_values, last_event))
+            action_name = _safe_nla_track_name("ScenePlacement", getattr(prop_obj, "name", "Prop"))
+            placement_action = create_object_transform_action(action_name, prop_obj, action_keys, interpolation='CONSTANT')
+            if placement_action is not None:
+                self.__assign_action(prop_obj, placement_action, track_name="ScenePlacement", at_frame=0.0)
+                extend_nla_track_to_frame(prop_obj, "ScenePlacement", section_end_frame)
+
+        for visibility_entry in visibility_key_data_by_prop.values():
+            prop_obj = visibility_entry["object"]
+            visibility_keys = list(visibility_entry["keys"])
+            if prop_obj is None or not visibility_keys:
+                continue
+            visibility_keys.sort(key=lambda item: item[0])
+            action_keys = []
+            if visibility_keys[0][0] > 0.0:
+                action_keys.append((0.0, not bool(getattr(prop_obj, "hide_viewport", False)), None))
+            action_keys.extend(visibility_keys)
+            last_frame, last_visible, last_event = action_keys[-1]
+            if section_end_frame > last_frame:
+                action_keys.append((section_end_frame, last_visible, last_event))
+            action_name = _safe_nla_track_name("SceneVisibility", getattr(prop_obj, "name", "Prop"))
+            visibility_action = create_object_visibility_action(action_name, prop_obj, action_keys, interpolation='CONSTANT')
+            if visibility_action is not None:
+                self.__assign_action(prop_obj, visibility_action, track_name="SceneVisibility", at_frame=0.0)
+                extend_nla_track_to_frame(prop_obj, "SceneVisibility", section_end_frame)
 
         log.info(f'Loaded scene in {time.time() - s} seconds.')
 

@@ -280,6 +280,7 @@ class W2SceneFieldItem(PropertyGroup):
 
 
 class W2SceneActorItem(PropertyGroup):
+    item_type: StringProperty(default="ACTOR")
     source_index: IntProperty(default=-1)
     actor_id: StringProperty(default="")
     alias: StringProperty(default="")
@@ -289,6 +290,14 @@ class W2SceneActorItem(PropertyGroup):
     use_mimic: BoolProperty(default=False)
     force_spawn: BoolProperty(default=False)
     dont_search_by_voicetag: BoolProperty(default=False)
+    force_behavior_graph: StringProperty(default="")
+    reset_behavior_graph: BoolProperty(default=False)
+    light_type: StringProperty(default="")
+    shadow_casting_mode: StringProperty(default="")
+    inner_angle: FloatProperty(default=0.0)
+    outer_angle: FloatProperty(default=0.0)
+    softness: FloatProperty(default=0.0)
+    dimmer_type: StringProperty(default="")
 
 
 class W2SceneDialogsetItem(PropertyGroup):
@@ -882,6 +891,7 @@ def _w2scene_event_detail_text(event):
         "target",
         "bodyTarget",
         "eyesTarget",
+        "propId",
         "propID",
         "effectName",
         "animationName",
@@ -1023,7 +1033,12 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
             ev_item.start_time = element_start + (element_duration * start_position)
             ev_item.duration_raw = duration_raw
             ev_item.duration = duration
-            ev_item.actor = _w2scene_prop_text(getattr(event, "actor", None) or getattr(event, "actorName", None))
+            ev_item.actor = _w2scene_prop_text(
+                getattr(event, "actor", None)
+                or getattr(event, "actorName", None)
+                or getattr(event, "propId", None)
+                or getattr(event, "propID", None)
+            )
             ev_item.target = _w2scene_prop_text(
                 getattr(event, "target", None)
                 or getattr(event, "bodyTarget", None)
@@ -1043,6 +1058,7 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
         if actor is None:
             continue
         item = scene.witcher_w2scene_actor_items.add()
+        item.item_type = "ACTOR"
         item.source_index = actor_index
         item.actor_id = _w2scene_prop_text(getattr(actor, "id", None))
         item.alias = _w2scene_prop_text(getattr(actor, "alias", None))
@@ -1052,6 +1068,34 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
         item.use_mimic = bool(getattr(actor, "useMimic", False) or False)
         item.force_spawn = bool(getattr(actor, "forceSpawn", False) or False)
         item.dont_search_by_voicetag = bool(getattr(actor, "dontSearchByVoicetag", False) or False)
+
+    for prop_index, prop_ref in enumerate(getattr(getattr(story_scene, "sceneProps", None), "value", []) or []):
+        prop = _w2scene_load_chunk_object(story_scene, prop_ref)
+        if prop is None:
+            continue
+        item = scene.witcher_w2scene_actor_items.add()
+        item.item_type = "PROP"
+        item.source_index = prop_index
+        item.actor_id = _w2scene_prop_text(getattr(prop, "id", None))
+        item.template_path = _w2scene_prop_text(getattr(prop, "entityTemplate", None))
+        item.force_behavior_graph = _w2scene_prop_text(getattr(prop, "forceBehaviorGraph", None))
+        item.reset_behavior_graph = bool(getattr(prop, "resetBehaviorGraph", False) or False)
+        item.use_mimic = bool(getattr(prop, "useMimics", False) or False)
+
+    for light_index, light_ref in enumerate(getattr(getattr(story_scene, "sceneLights", None), "value", []) or []):
+        light = _w2scene_load_chunk_object(story_scene, light_ref)
+        if light is None:
+            continue
+        item = scene.witcher_w2scene_actor_items.add()
+        item.item_type = "LIGHT"
+        item.source_index = light_index
+        item.actor_id = _w2scene_prop_text(getattr(light, "id", None))
+        item.light_type = _w2scene_prop_text(getattr(light, "type", None))
+        item.shadow_casting_mode = _w2scene_prop_text(getattr(light, "shadowCastingMode", None))
+        item.inner_angle = _w2scene_as_float(getattr(light, "innerAngle", None), 0.0)
+        item.outer_angle = _w2scene_as_float(getattr(light, "outerAngle", None), 0.0)
+        item.softness = _w2scene_as_float(getattr(light, "softness", None), 0.0)
+        item.dimmer_type = _w2scene_prop_text(getattr(light, "dimmerType", None))
 
     for dialogset_index, dialogset_ref in enumerate(getattr(getattr(story_scene, "dialogsetInstances", None), "value", []) or []):
         dialogset = _w2scene_load_chunk_object(story_scene, dialogset_ref)
@@ -1108,7 +1152,9 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
     scene.witcher_w2scene_summary = (
         f"Sections: {len(sections)} ({len(sections) - cutscene_sections} dialog, {cutscene_sections} cutscene), "
         f"elements: {total_elements}, events: {total_events}, "
-        f"actors: {len(scene.witcher_w2scene_actor_items)}, "
+        f"actors: {sum(1 for item in scene.witcher_w2scene_actor_items if item.item_type == 'ACTOR')}, "
+        f"props: {sum(1 for item in scene.witcher_w2scene_actor_items if item.item_type == 'PROP')}, "
+        f"lights: {sum(1 for item in scene.witcher_w2scene_actor_items if item.item_type == 'LIGHT')}, "
         f"dialogsets: {len(scene.witcher_w2scene_dialogset_items)}, "
         f"cameras: {len(scene.witcher_w2scene_camera_items)}"
     )
@@ -3119,11 +3165,25 @@ class WITCH_UL_W2SceneActorList(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
-            row.label(text=item.actor_id or f"Actor {index + 1}", icon='ARMATURE_DATA')
-            if item.appearance_filter:
-                row.label(text=item.appearance_filter, icon='MATERIAL_DATA')
+            item_type = str(getattr(item, "item_type", "ACTOR") or "ACTOR")
+            icon_name = 'ARMATURE_DATA'
+            if item_type == "PROP":
+                icon_name = 'OUTLINER_OB_EMPTY'
+            elif item_type == "LIGHT":
+                icon_name = 'LIGHT_DATA'
+            split = row.split(factor=0.54)
+            split.label(text=item.actor_id or f"{item_type.title()} {index + 1}", icon=icon_name)
+            meta = split.row(align=True)
+            meta.alignment = 'RIGHT'
+            meta.label(text=item_type.title())
+            if item_type == "ACTOR" and item.appearance_filter:
+                meta.label(text=item.appearance_filter, icon='MATERIAL_DATA')
+            elif item_type == "PROP" and item.template_path:
+                meta.label(text=os.path.basename(item.template_path.replace("\\", "/")))
+            elif item_type == "LIGHT" and (item.light_type or item.shadow_casting_mode):
+                meta.label(text=item.light_type or item.shadow_casting_mode)
             if item.use_mimic:
-                row.label(text="mimic", icon='SHAPEKEY_DATA')
+                meta.label(text="mimic", icon='SHAPEKEY_DATA')
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text="")
@@ -3296,11 +3356,8 @@ def _draw_w2scene_sections_tab(layout, scene):
         layout.label(text="No .w2scene loaded.", icon='INFO')
         return
 
-    row = layout.row()
-    col = row.column(align=True)
-    col.template_list("WITCHER_SECTIONS_UL_List", "", scene, "witcher_sections", scene, "witcher_sections_index", rows=min(len(sections), 8))
-    ops_col = row.column(align=True)
-    ops_col.operator(Witcher_OT_load_section.bl_idname, text="", icon='IMPORT')
+    col = layout.column(align=True)
+    col.template_list("WITCHER_SECTIONS_UL_List", "", scene, "witcher_sections", scene, "witcher_sections_index", rows=min(len(sections), 10))
 
     active_idx = int(getattr(scene, "witcher_sections_index", 0) or 0)
     if not (0 <= active_idx < len(sections)):
@@ -3413,30 +3470,69 @@ def _draw_w2scene_sections_tab(layout, scene):
 
 
 def _draw_w2scene_actors_tab(layout, scene):
-    actors = list(getattr(scene, "witcher_w2scene_actor_items", []) or [])
-    if not actors:
-        layout.label(text="No scene actors.", icon='INFO')
+    items = list(getattr(scene, "witcher_w2scene_actor_items", []) or [])
+    if not items:
+        layout.label(text="No scene actors, props or lights.", icon='INFO')
         return
     layout.template_list(
         "WITCH_UL_W2SceneActorList", "",
         scene, "witcher_w2scene_actor_items",
         scene, "witcher_w2scene_actor_index",
-        rows=min(len(actors), 8),
+        rows=min(len(items), 10),
     )
     idx = int(getattr(scene, "witcher_w2scene_actor_index", 0) or 0)
-    if 0 <= idx < len(actors):
+    if 0 <= idx < len(items):
+        item = items[idx]
+        item_type = str(getattr(item, "item_type", "ACTOR") or "ACTOR")
         detail = layout.box()
-        detail.label(text=actors[idx].actor_id or f"Actor {idx + 1}", icon='ARMATURE_DATA')
-        _draw_w2scene_readonly_props(detail, actors[idx], [
-            ("actor_id", "id"),
-            ("alias", "alias"),
-            ("actor_tags", "actorTags"),
-            ("template_path", "entityTemplate"),
-            ("appearance_filter", "appearanceFilter"),
-            ("use_mimic", "useMimic"),
-            ("force_spawn", "forceSpawn"),
-            ("dont_search_by_voicetag", "dontSearchByVoicetag"),
-        ])
+        icon_name = 'ARMATURE_DATA'
+        if item_type == "PROP":
+            icon_name = 'OUTLINER_OB_EMPTY'
+        elif item_type == "LIGHT":
+            icon_name = 'LIGHT_DATA'
+        header_row = detail.row(align=True)
+        header_row.label(text=item.actor_id or f"{item_type.title()} {idx + 1}", icon=icon_name)
+        action_row = header_row.row(align=True)
+        action_row.alignment = 'RIGHT'
+        action_row.enabled = item_type in {"ACTOR", "PROP"} and bool(getattr(item, "template_path", ""))
+        op = action_row.operator(
+            WITCH_OT_W2SceneImportActorItem.bl_idname,
+            text="Import",
+            icon='IMPORT',
+        )
+        op.item_index = idx
+        if item_type == "ACTOR":
+            _draw_w2scene_readonly_props(detail, item, [
+                ("item_type", "kind"),
+                ("actor_id", "id"),
+                ("alias", "alias"),
+                ("actor_tags", "actorTags"),
+                ("template_path", "entityTemplate"),
+                ("appearance_filter", "appearanceFilter"),
+                ("use_mimic", "useMimic"),
+                ("force_spawn", "forceSpawn"),
+                ("dont_search_by_voicetag", "dontSearchByVoicetag"),
+            ])
+        elif item_type == "PROP":
+            _draw_w2scene_readonly_props(detail, item, [
+                ("item_type", "kind"),
+                ("actor_id", "id"),
+                ("template_path", "entityTemplate"),
+                ("force_behavior_graph", "forceBehaviorGraph"),
+                ("reset_behavior_graph", "resetBehaviorGraph"),
+                ("use_mimic", "useMimics"),
+            ])
+        elif item_type == "LIGHT":
+            _draw_w2scene_readonly_props(detail, item, [
+                ("item_type", "kind"),
+                ("actor_id", "id"),
+                ("light_type", "type"),
+                ("shadow_casting_mode", "shadowCastingMode"),
+                ("inner_angle", "innerAngle"),
+                ("outer_angle", "outerAngle"),
+                ("softness", "softness"),
+                ("dimmer_type", "dimmerType"),
+            ])
 
 
 def _draw_w2scene_dialogsets_tab(layout, scene):
@@ -4378,16 +4474,14 @@ class WITCHER_SECTIONS_UL_List(UIList):
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
-            row = layout.row(align=True)
+            row = layout.row(align=False)
             type_name = str(getattr(item, "section_type", "") or "")
             icon_name = 'ACTION' if type_name == "CStorySceneCutsceneSection" else 'SEQUENCE'
             row.label(text=item.name or f"Section {index + 1}", icon=icon_name)
-            if item.duration > 0.0:
-                row.label(text=f"{item.duration:.2f}s")
-            row.label(text=f"{item.element_count} el")
-            row.label(text=f"{item.event_count} ev")
-            if item.dialogset_change:
-                row.label(text=item.dialogset_change, icon='OUTLINER_COLLECTION')
+            dur = getattr(item, "duration", 0.0) or 0.0
+            right = row.row()
+            right.alignment = 'RIGHT'
+            right.label(text=f"{dur:.2f}s")
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text="")
@@ -4490,6 +4584,81 @@ class WITCH_OT_W2ScenePreviewCameraEvent(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WITCH_OT_W2SceneImportActorItem(bpy.types.Operator):
+    bl_idname = "witcher.w2scene_import_actor_item"
+    bl_label = "Import Selected"
+    bl_description = "Import the selected actor or prop's entity template into the scene"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    item_index: IntProperty(default=-1)
+
+    def execute(self, context):
+        from ..importers import import_entity
+        scene = context.scene
+        items = list(getattr(scene, "witcher_w2scene_actor_items", []) or [])
+        idx = self.item_index if self.item_index >= 0 else int(getattr(scene, "witcher_w2scene_actor_index", 0) or 0)
+        if not (0 <= idx < len(items)):
+            self.report({'ERROR'}, "No actor or prop selected.")
+            return {'CANCELLED'}
+        item = items[idx]
+        item_type = str(getattr(item, "item_type", "") or "ACTOR")
+        template_path = str(getattr(item, "template_path", "") or "").strip()
+        if not template_path:
+            self.report({'ERROR'}, f"Selected {item_type.lower()} has no entityTemplate path.")
+            return {'CANCELLED'}
+        if item_type == "LIGHT":
+            self.report({'WARNING'}, "Lights are placed by section load, not imported as entities.")
+            return {'CANCELLED'}
+
+        scene_filepath = str(getattr(scene, "witcher_loaded_w2scene_path", "") or "")
+        resolved_path = import_scene._resolve_w2scene_template_path(template_path, scene_filepath)
+        if not resolved_path or not os.path.isfile(resolved_path):
+            self.report({'ERROR'}, f"Could not resolve template path: {template_path}")
+            return {'CANCELLED'}
+
+        before_ids = {id(obj) for obj in bpy.data.objects}
+        try:
+            if item_type == "ACTOR":
+                appearance_filter = str(getattr(item, "appearance_filter", "") or "")
+                preferred_appearance = appearance_filter.split(",")[0].strip() if appearance_filter else ""
+                imported = import_entity.import_ent_template(
+                    resolved_path,
+                    load_face_poses=True,
+                    import_apperance=1,
+                    selected_appearance_name=preferred_appearance,
+                )
+            else:
+                imported = import_entity.import_ent_template(resolved_path)
+        except Exception as exc:
+            log.exception("Failed to import %s '%s' from %s", item_type.lower(), getattr(item, "actor_id", "?"), resolved_path)
+            self.report({'ERROR'}, f"Import failed: {exc}")
+            return {'CANCELLED'}
+
+        new_objects = [obj for obj in bpy.data.objects if id(obj) not in before_ids]
+        if imported is None and not new_objects:
+            self.report({'WARNING'}, f"No objects produced for {os.path.basename(resolved_path)}.")
+            return {'CANCELLED'}
+
+        # Stamp prop metadata so subsequent section loads recognize the existing object.
+        if item_type == "PROP":
+            prop_id = str(getattr(item, "actor_id", "") or "").strip()
+            target = imported if imported is not None else (new_objects[0] if new_objects else None)
+            if target is not None and prop_id:
+                target["witcher_w2scene_prop_id"] = prop_id
+                target["witcher_w2scene_prop_template"] = template_path
+                target["witcher_scene_item_type"] = "PROP"
+                try:
+                    for child in target.children_recursive:
+                        child["witcher_w2scene_prop_id"] = prop_id
+                        child["witcher_w2scene_prop_template"] = template_path
+                        child["witcher_scene_item_type"] = "PROP"
+                except Exception:
+                    pass
+
+        self.report({'INFO'}, f"Imported {item_type.lower()} {getattr(item, 'actor_id', '')} from {os.path.basename(resolved_path)}.")
+        return {'FINISHED'}
+
+
 class WITCHER_PT_witcher_sections_panel(WITCH_PT_Base, Panel):
     bl_parent_id = "WITCHER_PT_scene_panel"
     bl_idname = "WITCHER_PT_witcher_sections_panel"
@@ -4585,6 +4754,7 @@ classes = [
     WITCHER_SECTIONS_UL_List,
     Witcher_OT_load_section,
     WITCH_OT_W2ScenePreviewCameraEvent,
+    WITCH_OT_W2SceneImportActorItem,
     #WITCHER_PT_witcher_sections_panel,
 ]
 

@@ -8,7 +8,7 @@ log = logging.getLogger(__name__)
 import os
 from pathlib import Path
 
-from .common_blender import repo_file
+from .common_blender import repo_file, redkit_repo_context
 from .CR2W_file import create_level, read_CR2W
 from .CR2W_types import Entity_Type_List, getCR2W
 from .bStream import bStream
@@ -130,6 +130,8 @@ def _has_candidate_ext(path_value, expected_ext: str) -> bool:
 
 def _candidate_import_indices(import_index):
     try:
+        if hasattr(import_index, "Index"):
+            import_index = getattr(import_index, "Index")
         idx = int(import_index)
     except Exception:
         return []
@@ -1681,6 +1683,7 @@ _KNOWN_STRUCTURAL_CHUNKS = {
     "CMaterialInstance",
     "CMovingPhysicalAgentComponent",
     "CExternalProxyComponent",
+    "CExternalProxyAttachment",
     "CDropPhysicsSetup",
     "CDynamicColliderComponent",
     "CEffectDummyComponent",
@@ -1802,6 +1805,38 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
             f"props={_chunk_props_summary(streamed_chunk)}"
         )
         return False
+
+    def _apply_external_proxy_attachments():
+        for proxy_chunk in CHUNKS:
+            if getattr(proxy_chunk, "Type", None) != "CExternalProxyAttachment":
+                continue
+            original_attachment = proxy_chunk.GetVariableByName("originalAttachment")
+            original_index = getattr(original_attachment, "Value", None)
+            if not isinstance(original_index, int) or original_index <= 0 or original_index > len(CHUNKS):
+                log.debug(
+                    "Skipping CExternalProxyAttachment with invalid originalAttachment=%s in %s",
+                    original_index,
+                    getattr(CR2W_FILE, "fileName", ""),
+                )
+                continue
+
+            attachment_chunk = CHUNKS[original_index - 1]
+            existing_props = {
+                getattr(prop, "theName", None): idx
+                for idx, prop in enumerate(getattr(attachment_chunk, "PROPS", None) or [])
+                if getattr(prop, "theName", None)
+            }
+            for prop in getattr(proxy_chunk, "PROPS", None) or []:
+                prop_name = getattr(prop, "theName", None)
+                if not prop_name or prop_name == "originalAttachment":
+                    continue
+                if prop_name in existing_props:
+                    attachment_chunk.PROPS[existing_props[prop_name]] = prop
+                else:
+                    attachment_chunk.PROPS.append(prop)
+
+    if getattr(CR2W_FILE.HEADER, "version", 999) > 115:
+        _apply_external_proxy_attachments()
     
     for chunk in CHUNKS:
         if (chunk.Type == "CMeshComponent"):
@@ -1872,13 +1907,19 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
             #TODO GetFACE needed?
             #new_mesh.animation_face_object = GetFace(mimicFace)
         elif (chunk.Type == "CMeshSkinningAttachment"):
-            parent = chunk.GetVariableByName("parent").Value-1
-            child = chunk.GetVariableByName("child").Value-1
-            chunk_append(new_mesh, chunk, CMeshSkinningAttachment(parent, child))
+            parent_var = chunk.GetVariableByName("parent")
+            child_var = chunk.GetVariableByName("child")
+            if parent_var and child_var:
+                chunk_append(new_mesh, chunk, CMeshSkinningAttachment(parent_var.Value-1, child_var.Value-1))
+            else:
+                log.warning(f'CMeshSkinningAttachment missing parent or child at template chunk {chunk.ChunkIndex}')
         elif (chunk.Type == "CAnimatedAttachment"):
-            parent = chunk.GetVariableByName("parent").Value-1
-            child = chunk.GetVariableByName("child").Value-1
-            chunk_append(new_mesh, chunk, CAnimatedAttachment(parent, child))
+            parent_var = chunk.GetVariableByName("parent")
+            child_var = chunk.GetVariableByName("child")
+            if parent_var and child_var:
+                chunk_append(new_mesh, chunk, CAnimatedAttachment(parent_var.Value-1, child_var.Value-1))
+            else:
+                log.warning(f'CAnimatedAttachment missing parent or child at template chunk {chunk.ChunkIndex}')
         elif (chunk.Type == "CAnimDangleBufferComponent"):
             name = chunk.GetVariableByName("name").ToString()
             skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig")
@@ -1922,13 +1963,15 @@ def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:
     else:
         fileNameFull = repo_file(templateFilename)
     cr2w_file = read_CR2W(fileNameFull)
-    parsed_mesh, parsed_entity = ReadTemplate(cr2w_file, new_mesh)
+    with redkit_repo_context(fileNameFull):
+        parsed_mesh, parsed_entity = ReadTemplate(cr2w_file, new_mesh)
     has_mesh = any(getattr(c, "mesh", None) for c in getattr(parsed_mesh, "chunks", []))
     if has_mesh:
         _template_file_cache[cache_key] = (parsed_mesh, parsed_entity)
         return copy.deepcopy(_template_file_cache[cache_key])
 
-    full_entity = create_CEntity(cr2w_file)
+    with redkit_repo_context(fileNameFull):
+        full_entity = create_CEntity(cr2w_file)
     full_mesh = getattr(full_entity, "staticMeshes", None)
     if full_mesh and getattr(full_mesh, "chunks", None):
         has_full_mesh = any(getattr(c, "mesh", None) for c in full_mesh.chunks)
@@ -2124,6 +2167,8 @@ def create_CEntity(file, _inherit_visited=None):
         )
         beh_seen = {_repo_path_key(path) for path in inherited_beh_paths}
         for depot_path, include_entity in _iter_top_level_included_entities():
+            _merge_related_appearances(include_entity)
+
             inherited_component = getattr(include_entity, "MovingPhysicalAgentComponent", None)
             if inherited_component and needs_inherited_animated and not hasCMovingPhysicalAgentComponent:
                 this_Entity.MovingPhysicalAgentComponent = copy.deepcopy(inherited_component)
@@ -2594,53 +2639,60 @@ def create_CEntity(file, _inherit_visited=None):
                     elif (chunk.Type == "CCameraComponent"):
                         name = chunk.GetVariableByName("name").ToString()
                         chunk_append(new_mesh, chunk, CCameraComponent(name), added_chunks)
-            # Cooked item entities (Crossbow, CItemEntity, CWitcherSword, etc.) store
-            # their mesh inside a SharedDataBuffer rather than as a direct Component.
-            # Check the saved entity chunk for a streamingDataBuffer after processing Components.
-            if entity_chunk.Type in _STREAMED_ITEM_CHUNK_TYPES:
-                sdb = entity_chunk.GetVariableByName('streamingDataBuffer')
-                if sdb and hasattr(sdb, 'Bufferdata') and hasattr(sdb.Bufferdata, 'Bytes'):
-                    try:
-                        buf_stream = bStream(data=bytearray(sdb.Bufferdata.Bytes))
-                        buf_stream.name = 'streamingDataBuffer'
-                        buf_cr2w = getCR2W(buf_stream)
-                        for buf_chunk in buf_cr2w.CHUNKS.CHUNKS:
-                            if buf_chunk.Type == 'CMeshComponent':
-                                mc = CMeshComponent(buf_chunk).convert_for_io()
-                                mc.mesh = _resolve_mesh_path(buf_chunk, mc.mesh)
-                                if not mc.mesh:
-                                    mc.mesh = _next_mesh_import_path()
-                                if mc.mesh and mc.mesh not in seen_streamed_mesh_paths:
-                                    chunk_append(new_mesh, entity_chunk, mc, added_chunks)
-                                    new_mesh.chunks[-1].type = buf_chunk.Type
-                                    seen_streamed_mesh_paths.add(mc.mesh)
-                                    log.debug(
-                                        'Extracted CMeshComponent from streamingDataBuffer of %s #%s: %s',
-                                        entity_chunk.Type, entity_chunk.ChunkIndex, mc.mesh,
-                                    )
-                                    # Synthesize a CMeshSkinningAttachment to bind the rig
-                                    # (CAnimatedComponent) to this mesh, mirroring what lvl2/3
-                                    # have as explicit CR2W chunks.
-                                    if entity_animated_component_chunk_index is not None:
-                                        skinning = CMeshSkinningAttachment(
-                                            entity_animated_component_chunk_index,
-                                            entity_chunk.ChunkIndex,
-                                        )
-                                        skinning.type = 'CMeshSkinningAttachment'
-                                        skinning.chunkIndex = -1  # synthetic, no real CR2W chunk
-                                        new_mesh.chunks.append(skinning)
-                    except Exception as e:
-                        log.warning(
-                            'Failed to parse streamingDataBuffer for %s #%s: %s',
-                            entity_chunk.Type, entity_chunk.ChunkIndex, e,
-                        )
-                else:
-                    log.debug(
-                        '%s #%s: streamingDataBuffer not in PROPS or has no Bytes '
-                        '(sdb=%s, PROPS=%s); mesh sourced from flatCompiledData if available.',
-                        entity_chunk.Type, entity_chunk.ChunkIndex,
-                        sdb, _chunk_props_summary(entity_chunk),
+            # Cooked item entities (Crossbow, CItemEntity, CWitcherSword, etc.) and
+            # uncooked redkit *_dialogue.w2ent preview entities (a generic CEntity
+            # wrapper with empty Components) both park their visual components inside
+            # a SharedDataBuffer rather than as direct Components.  If the entity has
+            # one, parse it and extract every recognized mesh component type.
+            sdb = entity_chunk.GetVariableByName('streamingDataBuffer')
+            if sdb and hasattr(sdb, 'Bufferdata') and hasattr(sdb.Bufferdata, 'Bytes') and sdb.Bufferdata.Bytes:
+                try:
+                    buf_stream = bStream(data=bytearray(sdb.Bufferdata.Bytes))
+                    buf_stream.name = 'streamingDataBuffer'
+                    buf_cr2w = getCR2W(buf_stream)
+                    for buf_chunk in buf_cr2w.CHUNKS.CHUNKS:
+                        if buf_chunk.Type == 'CStaticMeshComponent':
+                            mc = CStaticMeshComponent(buf_chunk).convert_for_io()
+                        elif buf_chunk.Type == 'CMeshComponent':
+                            mc = CMeshComponent(buf_chunk).convert_for_io()
+                        elif buf_chunk.Type in ('CRigidMeshComponent', 'CRagdollMeshComponent'):
+                            mc = CMeshComponent(buf_chunk).convert_for_io()
+                        else:
+                            continue
+                        mc.mesh = _resolve_mesh_path(buf_chunk, mc.mesh)
+                        if not mc.mesh:
+                            mc.mesh = _next_mesh_import_path()
+                        if mc.mesh and mc.mesh not in seen_streamed_mesh_paths:
+                            chunk_append(new_mesh, entity_chunk, mc, added_chunks)
+                            new_mesh.chunks[-1].type = buf_chunk.Type
+                            seen_streamed_mesh_paths.add(mc.mesh)
+                            log.debug(
+                                'Extracted %s from streamingDataBuffer of %s #%s: %s',
+                                buf_chunk.Type, entity_chunk.Type, entity_chunk.ChunkIndex, mc.mesh,
+                            )
+                            # Bind the entity's rig (CAnimatedComponent) to skinned meshes
+                            # via a synthesized CMeshSkinningAttachment, like cooked levels do.
+                            if (entity_animated_component_chunk_index is not None
+                                    and buf_chunk.Type in ('CMeshComponent', 'CRigidMeshComponent', 'CRagdollMeshComponent')):
+                                skinning = CMeshSkinningAttachment(
+                                    entity_animated_component_chunk_index,
+                                    entity_chunk.ChunkIndex,
+                                )
+                                skinning.type = 'CMeshSkinningAttachment'
+                                skinning.chunkIndex = -1  # synthetic, no real CR2W chunk
+                                new_mesh.chunks.append(skinning)
+                except Exception as e:
+                    log.warning(
+                        'Failed to parse streamingDataBuffer for %s #%s: %s',
+                        entity_chunk.Type, entity_chunk.ChunkIndex, e,
                     )
+            elif entity_chunk.Type in _STREAMED_ITEM_CHUNK_TYPES:
+                log.debug(
+                    '%s #%s: streamingDataBuffer not in PROPS or has no Bytes '
+                    '(sdb=%s, PROPS=%s); mesh sourced from flatCompiledData if available.',
+                    entity_chunk.Type, entity_chunk.ChunkIndex,
+                    sdb, _chunk_props_summary(entity_chunk),
+                )
         elif (chunk.Type == "CHardAttachment"):
             #if (chunk.GetVariableByName("parentSlot")): 
             chunk_append(new_mesh, chunk, CHardAttachment(chunk).convert_for_io())
@@ -2816,7 +2868,24 @@ def create_CEntity(file, _inherit_visited=None):
             sub_chunks = chunk.flatCompiledData.CHUNKS.CHUNKS
             for sub_chunk in sub_chunks:
                 try:
-                    if sub_chunk.Type == "CMeshComponent":
+                    if sub_chunk.Type == "CStaticMeshComponent":
+                        # Uncooked redkit *_dialogue.w2ent items (e.g. weapon
+                        # preview entities) wrap a CStaticMeshComponent inside
+                        # flatCompiledData with no top-level Components and no
+                        # appearances.  Without this branch the mesh chunk is
+                        # silently dropped and import_ent_template returns None.
+                        mesh_component = CStaticMeshComponent(sub_chunk).convert_for_io()
+                        mesh_component.mesh = _resolve_mesh_path(sub_chunk, mesh_component.mesh)
+                        if not mesh_component.mesh:
+                            mesh_component.mesh = _next_mesh_import_path()
+                        if mesh_component.mesh and mesh_component.mesh not in seen_streamed_mesh_paths:
+                            _append_unique_chunk(sub_chunk, mesh_component)
+                        elif not mesh_component.mesh:
+                            log.warning(
+                                f"Skipping flatCompiledData CStaticMeshComponent with invalid mesh ref: {sub_chunk.ChunkIndex}; "
+                                f"props={_chunk_props_summary(sub_chunk)}"
+                            )
+                    elif sub_chunk.Type == "CMeshComponent":
                         mesh_component = CMeshComponent(sub_chunk).convert_for_io()
                         mesh_component.mesh = _resolve_mesh_path(sub_chunk, mesh_component.mesh)
                         if not mesh_component.mesh:
@@ -2882,11 +2951,12 @@ def create_CEntity(file, _inherit_visited=None):
                         _append_unique_light_chunk(sub_chunk, CPointLightComponent(sub_chunk).convert_for_io())
                     elif sub_chunk.Type == "CSpotLightComponent":
                         _append_unique_light_chunk(sub_chunk, CSpotLightComponent(sub_chunk).convert_for_io())
-                    elif sub_chunk.Type in _STREAMED_ITEM_CHUNK_TYPES:
-                        # Cooked item entities (Crossbow, CWitcherSword, etc.) store their
-                        # mesh component inside a SharedDataBuffer (streamingDataBuffer) rather
-                        # than as a direct CMeshComponent sub-chunk.  Parse the buffer and pull
-                        # out any CMeshComponent chunks found inside.
+                    elif sub_chunk.Type in _STREAMED_ITEM_CHUNK_TYPES or sub_chunk.Type == "CEntity":
+                        # Item entities (Crossbow, CWitcherSword, ...) and uncooked-redkit
+                        # *_dialogue.w2ent preview entities (a generic CEntity wrapper) both
+                        # park their visual components inside a SharedDataBuffer
+                        # (streamingDataBuffer) rather than as direct sub-chunks.  Parse the
+                        # buffer and pull out every recognized mesh component type.
                         sdb_var = sub_chunk.GetVariableByName("streamingDataBuffer")
                         if not sdb_var:
                             log.debug(
@@ -2901,23 +2971,29 @@ def create_CEntity(file, _inherit_visited=None):
                                 buf_stream.name = "streamingDataBuffer"
                                 buf_cr2w = getCR2W(buf_stream)
                                 for buf_chunk in buf_cr2w.CHUNKS.CHUNKS:
-                                    if buf_chunk.Type == "CMeshComponent":
-                                        mesh_component = CMeshComponent(buf_chunk).convert_for_io()
-                                        mesh_component.mesh = _resolve_mesh_path(buf_chunk, mesh_component.mesh)
-                                        if not mesh_component.mesh:
-                                            mesh_component.mesh = _next_mesh_import_path()
-                                        if mesh_component.mesh and mesh_component.mesh not in seen_streamed_mesh_paths:
-                                            chunk_append(new_mesh, buf_chunk, mesh_component)
-                                            seen_streamed_mesh_paths.add(mesh_component.mesh)
-                                            log.debug(
-                                                f"Extracted CMeshComponent from streamingDataBuffer "
-                                                f"of {sub_chunk.Type} #{sub_chunk.ChunkIndex}: {mesh_component.mesh}"
-                                            )
-                                        elif not mesh_component.mesh:
-                                            log.warning(
-                                                f"Skipping streamingDataBuffer CMeshComponent with "
-                                                f"invalid mesh ref inside {sub_chunk.Type} #{sub_chunk.ChunkIndex}"
-                                            )
+                                    if buf_chunk.Type == "CStaticMeshComponent":
+                                        component = CStaticMeshComponent(buf_chunk).convert_for_io()
+                                    elif buf_chunk.Type == "CMeshComponent":
+                                        component = CMeshComponent(buf_chunk).convert_for_io()
+                                    elif buf_chunk.Type in ("CRigidMeshComponent", "CRagdollMeshComponent"):
+                                        component = CMeshComponent(buf_chunk).convert_for_io()
+                                    else:
+                                        continue
+                                    component.mesh = _resolve_mesh_path(buf_chunk, component.mesh)
+                                    if not component.mesh:
+                                        component.mesh = _next_mesh_import_path()
+                                    if component.mesh and component.mesh not in seen_streamed_mesh_paths:
+                                        chunk_append(new_mesh, buf_chunk, component)
+                                        seen_streamed_mesh_paths.add(component.mesh)
+                                        log.debug(
+                                            f"Extracted {buf_chunk.Type} from streamingDataBuffer "
+                                            f"of {sub_chunk.Type} #{sub_chunk.ChunkIndex}: {component.mesh}"
+                                        )
+                                    elif not component.mesh:
+                                        log.warning(
+                                            f"Skipping streamingDataBuffer {buf_chunk.Type} with "
+                                            f"invalid mesh ref inside {sub_chunk.Type} #{sub_chunk.ChunkIndex}"
+                                        )
                             except Exception as e:
                                 log.warning(
                                     f"Failed to parse streamingDataBuffer for {sub_chunk.Type} "
@@ -2991,6 +3067,7 @@ def load_bin_entity(fileName) -> w3_types.Entity:
     with open(fileName,"rb") as f:
         theFile = getCR2W(f)
         f.close()
-        CEntity = create_CEntity(theFile)
+        with redkit_repo_context(fileName):
+            CEntity = create_CEntity(theFile)
         CEntity.version = theFile.HEADER.version
     return CEntity

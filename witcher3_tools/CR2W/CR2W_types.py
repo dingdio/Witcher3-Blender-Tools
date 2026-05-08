@@ -1631,9 +1631,7 @@ class PROPERTY:
                 #     buffers[self.ValueA-1] = i+1;
                 #     buffers2[self.ValueA-1] = Type.strIdx.Index;
             else:
-                #f.seek(Type.size -10, 1) #FSkip(Type.size -10);
-                # tell = f.tell()
-                f.seek(dataEnd)
+                self.Bufferdata = CByteArray().Read(f, 0)
         elif ("TagList" == theType):
             self.TagList = []
             count = ReadBit6(f)
