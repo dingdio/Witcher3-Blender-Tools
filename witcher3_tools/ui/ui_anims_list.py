@@ -602,7 +602,7 @@ def createCat(cat_name, dict):
 #             filtered_dictionary[value['cat'+str(cat_num+1)]] = get_filtered_dict()
 #     return filtered_dictionary
 
-from ..filtered_list.animations_manager import CModStoryBoardAnimationListsManager
+from ..filtered_list.animations_manager import CModStoryBoardAnimationListsManager, CModStoryBoardMimicsListsManager
 from ..filtered_list.storyboardasset import CModStoryBoardActor
 
 def GetAnimationInfoByName(anim_name):
@@ -620,7 +620,12 @@ def GetAnimationInfoByName(anim_name):
                     break
             if found:
                 break
-    if fdir == None:
+    if fdir is None:
+        for anim in CModStoryBoardMimicsListsManager.get_mimics_meta().animList:
+            if anim.id == anim_name:
+                fdir = anim.path
+                break
+    if fdir is None:
         log.critical('Did not find animation!')
         return (None, None)
     #(, ) = item.animLineId.split(';')
@@ -750,6 +755,19 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
     if not result or not result.animations:
         raise RuntimeError(f"Animation '{anim_name}' was not found in {fdir}")
     animation = result.animations[0]
+
+    try:
+        anim_data = getattr(animation, "animation", None)
+        scene = getattr(context, "scene", None)
+        if anim_data is not None and scene is not None:
+            scene["_w3_last_anim_name"] = str(getattr(anim_data, "name", anim_name) or anim_name)
+            scene["_w3_last_anim_type"] = str(getattr(anim_data, "SkeletalAnimationType", "") or "")
+            scene["_w3_last_anim_additive"] = str(getattr(anim_data, "AdditiveType", "") or "")
+            scene["_w3_last_anim_fps"] = float(getattr(anim_data, "framesPerSecond", 0.0) or 0.0)
+            scene["_w3_last_anim_duration"] = float(getattr(anim_data, "duration", 0.0) or 0.0)
+            scene["_w3_last_anim_path"] = str(fdir or "")
+    except Exception:
+        pass
 
     actual_target_armatures = target_armatures
     if face_target_mode == "owner" and face_animation:

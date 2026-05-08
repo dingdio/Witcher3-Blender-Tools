@@ -47,13 +47,7 @@ class SModUiFilteredListCatItem:
 
 
 def StrFindFirst(str, str2):
-    str = str.find(str2)
-    return str
-    if str2.lower() in str.lower():
-        return True
-    else:
-        return False
-    #return str2.find(str)
+    return str.lower().replace("_", " ").find(str2.lower().replace("_", " "))
 
 # -------------------------------------------------------------------------r---
 class CModUiFilteredList(ABC):

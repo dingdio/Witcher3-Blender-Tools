@@ -4697,6 +4697,29 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             act.operator("witcher.myanimlist_debug", text="Rebuild", icon='FILE_REFRESH').action = "reset3"
             act.operator("witcher.myanimlist_debug", text="Load", icon='PLAY').action = "load"
 
+            last_name = scene.get("_w3_last_anim_name", "")
+            if last_name:
+                info = col.box()
+                info.label(text="Last Loaded", icon='INFO')
+                info.label(text=f"Name: {last_name}")
+                anim_type = scene.get("_w3_last_anim_type", "")
+                if anim_type:
+                    info.label(text=f"Type: {anim_type}")
+                additive = scene.get("_w3_last_anim_additive", "")
+                if additive:
+                    info.label(text=f"Additive: {additive}")
+                fps = scene.get("_w3_last_anim_fps", 0.0)
+                duration = scene.get("_w3_last_anim_duration", 0.0)
+                if fps:
+                    info.label(text=f"FPS: {round(fps, 2)}")
+                if duration:
+                    frames = round(duration * fps) if fps else 0
+                    info.label(text=f"Frames: {frames}")
+                    info.label(text=f"Length: {round(duration, 2)} sec")
+                anim_path = scene.get("_w3_last_anim_path", "")
+                if anim_path:
+                    info.label(text=f"File: {os.path.basename(anim_path)}")
+
         body = section("witcher_pelvis_edit", "Bone Animation Offset Editor", 'BONE_DATA', default_closed=True) if anim_tab == "CLIPS" else None
         if body:
             col = body.column(align=True)
@@ -5902,7 +5925,7 @@ def register():
     bpy.types.Scene.witcher_pelvis_bone_name = StringProperty(
         name="Bone",
         description="Name of the bone to apply location/rotation offsets to",
-        default="Pelvis",
+        default="pelvis",
     )
     bpy.types.Scene.witcher_pelvis_offset_loc = FloatVectorProperty(
         name="Location Offset",

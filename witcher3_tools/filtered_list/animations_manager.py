@@ -289,16 +289,23 @@ class CModStoryBoardAnimationListsManager(object):
 
 class CModStoryBoardMimicsListsManager(CModStoryBoardAnimationListsManager):
     """docstring for CModStoryBoardMimicsListsManager."""
+    _shared_mimics_meta = None  # CSV loaded once, shared across all instances
+
+    @classmethod
+    def get_mimics_meta(cls) -> CStoryBoardAnimationMetaInfo:
+        if cls._shared_mimics_meta is None:
+            meta = CStoryBoardMimicsMetaInfo()
+            RES_DIR = str(Path(Path(__file__).parents[1]))
+            meta.loadCsv(os.path.join(RES_DIR, "CR2W\\data\\actor_mimics.csv"))
+            cls._shared_mimics_meta = meta
+        return cls._shared_mimics_meta
+
     def __init__(self):
         super(CModStoryBoardMimicsListsManager, self).__init__()
     # ------------------------------------------------------------------------
     def lazyLoad(self):
-        animMeta = CStoryBoardMimicsMetaInfo()
-        extraAnimCount = 0 #animMeta.addExtraAnimations(SBUI_getExtraMimics())
-        
-        RES_DIR = Path(__file__)
-        RES_DIR = str(Path(RES_DIR).parents[1])
-        animMeta.loadCsv(os.path.join(RES_DIR, "CR2W\\data\\actor_mimics.csv"))
-        dataLoaded = True
+        self._animMeta = CModStoryBoardMimicsListsManager.get_mimics_meta()
+        self._extraAnimCount = 0
+        self._dataLoaded = True
     # ------------------------------------------------------------------------
 # ----------------------------------------------------------------------------
