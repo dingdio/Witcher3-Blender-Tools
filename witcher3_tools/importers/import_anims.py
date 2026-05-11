@@ -23,7 +23,7 @@ from typing import Union
 import numpy as np
 
 import bpy
-from ..action_compat import assign_action, bind_strip_action_slot, new_action_fcurve, resolve_action_slot
+from ..action_compat import assign_action, bind_strip_action_slot, iter_action_fcurves, new_action_fcurve, resolve_action_slot
 matmul = (lambda a, b: a*b) if bpy.app.version < (2, 80, 0) else (lambda a, b: a.__matmul__(b))
 
 
@@ -60,6 +60,388 @@ def _safe_mode_set(mode, obj=None):
     except RuntimeError as exc:
         log.debug("Skipping mode_set(%s) on %s: %s", mode, getattr(active, "name", "<unknown>"), exc)
         return False
+
+
+def _nla_track_should_combine(track_name):
+    track_name = str(track_name or "")
+    if track_name.startswith('cutscene_import_body') or track_name.startswith('cutscene_import_pose'):
+        return False
+    return (
+        track_name in {'mimic_import', 'voice_import', 'anim_import'}
+        or track_name.startswith('cutscene_anim')
+        or track_name.startswith('cutscene_import')
+        or track_name.startswith('SceneDialogsetMimics')
+    )
+
+
+_MIMIC_POSE_WEIGHT_SOURCE_PROP = "_w3_mimic_pose_weight_source_action"
+_MIMIC_POSE_WEIGHT_VALUE_PROP = "_w3_mimic_pose_weight"
+_MIMIC_SCENE_WEIGHT_SOURCE_PROP = "_w3_mimic_scene_weight_source_action"
+_MIMIC_SCENE_WEIGHT_VALUE_PROP = "_w3_mimic_scene_weight"
+_GENERIC_SCENE_WEIGHT_SOURCE_PROP = "_w3_scene_additive_weight_source_action"
+_MIMIC_POSE_WEIGHT_TRACK_PREFIX = 'pose.bones["w3_face_poses"]["'
+_MIMIC_POSE_WEIGHT_TRACK_MARKER = 'w3_face_poses"]["'
+_MIMIC_HEAD_FLOAT_TRACKS = {"head1", "head2", "head3"}
+
+
+def _is_mimic_pose_weight_fcurve(fcurve):
+    data_path = str(getattr(fcurve, "data_path", "") or "")
+    return (
+        data_path.startswith(_MIMIC_POSE_WEIGHT_TRACK_PREFIX)
+        or (
+            data_path.startswith('pose.bones["')
+            and _MIMIC_POSE_WEIGHT_TRACK_MARKER in data_path
+        )
+    )
+
+
+def _append_unique_fcurves(out, seen, fcurves):
+    for fcurve in tuple(fcurves or ()):
+        try:
+            key = int(fcurve.as_pointer())
+        except Exception:
+            key = id(fcurve)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(fcurve)
+
+
+def _iter_action_fcurves_any(action, target=None, slot=None):
+    if action is None:
+        return ()
+
+    fcurves = []
+    seen = set()
+
+    try:
+        _append_unique_fcurves(fcurves, seen, getattr(action, "fcurves", None))
+    except Exception:
+        pass
+
+    try:
+        _append_unique_fcurves(fcurves, seen, iter_action_fcurves(action, target=target, slot=slot))
+    except Exception:
+        pass
+
+    slots = []
+    if slot is not None:
+        slots.append(slot)
+    try:
+        slots.extend([item for item in getattr(action, "slots", []) or [] if item not in slots])
+    except Exception:
+        pass
+
+    try:
+        layers = tuple(getattr(action, "layers", []) or [])
+    except Exception:
+        layers = ()
+    for layer in layers:
+        try:
+            action_strips = tuple(getattr(layer, "strips", []) or [])
+        except Exception:
+            action_strips = ()
+        for action_strip in action_strips:
+            try:
+                channelbags = tuple(getattr(action_strip, "channelbags", []) or [])
+            except Exception:
+                channelbags = ()
+            for channelbag in channelbags:
+                try:
+                    _append_unique_fcurves(fcurves, seen, getattr(channelbag, "fcurves", None))
+                except Exception:
+                    pass
+
+            channelbag_fn = getattr(action_strip, "channelbag", None)
+            if channelbag_fn is None:
+                continue
+            for slot_candidate in slots:
+                slot_refs = [slot_candidate]
+                slot_handle = getattr(slot_candidate, "handle", None)
+                if slot_handle is not None:
+                    slot_refs.append(slot_handle)
+                for slot_ref in slot_refs:
+                    try:
+                        channelbag = channelbag_fn(slot_ref)
+                    except Exception:
+                        channelbag = None
+                    if channelbag is not None:
+                        try:
+                            _append_unique_fcurves(fcurves, seen, getattr(channelbag, "fcurves", None))
+                        except Exception:
+                            pass
+    return tuple(fcurves)
+
+
+def _clamped_mimic_weight(value, default=1.0):
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except Exception:
+        return max(0.0, min(1.0, float(default)))
+
+
+def _mimic_weight_at_frame(weight_fn, frame, default):
+    if weight_fn is None:
+        return _clamped_mimic_weight(default)
+    try:
+        return _clamped_mimic_weight(weight_fn(float(frame)), default)
+    except Exception:
+        return _clamped_mimic_weight(default)
+
+
+def _copy_keyframe_shape(dst_key, src_key, weight, weight_fn=None):
+    key_weight = _mimic_weight_at_frame(weight_fn, src_key.co.x, weight)
+    left_weight = _mimic_weight_at_frame(weight_fn, src_key.handle_left.x, key_weight)
+    right_weight = _mimic_weight_at_frame(weight_fn, src_key.handle_right.x, key_weight)
+    dst_key.co = (float(src_key.co.x), float(src_key.co.y) * key_weight)
+    dst_key.handle_left = (float(src_key.handle_left.x), float(src_key.handle_left.y) * left_weight)
+    dst_key.handle_right = (float(src_key.handle_right.x), float(src_key.handle_right.y) * right_weight)
+    for attr_name in ("interpolation", "easing", "back", "amplitude", "period"):
+        try:
+            setattr(dst_key, attr_name, getattr(src_key, attr_name))
+        except Exception:
+            pass
+
+
+def _copy_fcurve_settings(dst_fcurve, src_fcurve):
+    for attr_name in ("extrapolation", "color_mode", "color"):
+        try:
+            setattr(dst_fcurve, attr_name, getattr(src_fcurve, attr_name))
+        except Exception:
+            pass
+
+
+def _ensure_mimic_pose_dest_fcurve(action, target, slot, source_curve):
+    data_path = str(getattr(source_curve, "data_path", "") or "")
+    if action is None or source_curve is None or not data_path:
+        return None
+    index = None if '"]["' in data_path else int(getattr(source_curve, "array_index", 0) or 0)
+    group_name = "w3_face_poses"
+    try:
+        group = getattr(source_curve, "group", None)
+        if group is not None and getattr(group, "name", None):
+            group_name = group.name
+    except Exception:
+        pass
+    try:
+        fcurve = new_action_fcurve(action, target, data_path=data_path, index=index, group_name=group_name, slot=slot)
+    except Exception:
+        return None
+    try:
+        fcurve.keyframe_points.add(len(source_curve.keyframe_points))
+    except Exception:
+        pass
+    _copy_fcurve_settings(fcurve, source_curve)
+    return fcurve
+
+
+def _mimic_weight_source_action(action, source_prop, source_suffix, source_for_prop):
+    if action is None:
+        return None
+    source_name = str(action.get(source_prop, "") or "")
+    source = bpy.data.actions.get(source_name) if source_name else None
+    if source is not None:
+        return source
+
+    generic_source_name = str(action.get(_GENERIC_SCENE_WEIGHT_SOURCE_PROP, "") or "")
+    generic_source = bpy.data.actions.get(generic_source_name) if generic_source_name else None
+    if generic_source is not None:
+        return generic_source
+
+    source = action.copy()
+    source.name = f"{action.name}_{source_suffix}"
+    source.use_fake_user = True
+    source[source_prop] = ""
+    source[source_for_prop] = action.name
+    action[source_prop] = source.name
+    return source
+
+
+def _mimic_pose_weight_source_action(action):
+    return _mimic_weight_source_action(
+        action,
+        _MIMIC_POSE_WEIGHT_SOURCE_PROP,
+        "poseWeightSource",
+        "_w3_mimic_pose_weight_source_for",
+    )
+
+
+def _mimic_scene_weight_source_action(action):
+    return _mimic_weight_source_action(
+        action,
+        _MIMIC_SCENE_WEIGHT_SOURCE_PROP,
+        "sceneWeightSource",
+        "_w3_mimic_scene_weight_source_for",
+    )
+
+
+def _apply_mimic_float_weight_to_action(action, weight, source_prop, value_prop, source_fn, log_label, target=None, slot=None, weight_fn=None):
+    if action is None:
+        return 0
+    try:
+        weight = max(0.0, min(1.0, float(weight)))
+    except Exception:
+        return 0
+
+    source_name = str(action.get(source_prop, "") or "")
+    if not source_name and weight_fn is None and abs(weight - 1.0) <= 0.000001:
+        return 0
+
+    source = source_fn(action)
+    if source is None:
+        return 0
+    source_curves = {
+        (fc.data_path, fc.array_index): fc
+        for fc in _iter_action_fcurves_any(source)
+        if _is_mimic_pose_weight_fcurve(fc)
+    }
+    if not source_curves:
+        log.warning("%s: no w3_face_poses fcurves found on source action '%s'.", log_label, action.name)
+        return 0
+
+    changed = 0
+    skipped_mismatch = 0
+    dest_curves = {
+        (fc.data_path, fc.array_index): fc
+        for fc in _iter_action_fcurves_any(action, target=target, slot=slot)
+        if _is_mimic_pose_weight_fcurve(fc)
+    }
+    for curve_key, source_curve in source_curves.items():
+        fcurve = dest_curves.get(curve_key)
+        if fcurve is None:
+            fcurve = _ensure_mimic_pose_dest_fcurve(action, target, slot, source_curve)
+            if fcurve is not None:
+                dest_curves[curve_key] = fcurve
+        if fcurve is None:
+            continue
+        if not _is_mimic_pose_weight_fcurve(fcurve):
+            continue
+        if len(fcurve.keyframe_points) != len(source_curve.keyframe_points):
+            skipped_mismatch += 1
+            continue
+        for dst_key, src_key in zip(fcurve.keyframe_points, source_curve.keyframe_points):
+            _copy_keyframe_shape(dst_key, src_key, weight, weight_fn=weight_fn)
+        fcurve.update()
+        changed += 1
+
+    if changed:
+        action[value_prop] = weight
+        if weight_fn is not None:
+            action[f"{value_prop}_animated"] = True
+        log.info(
+            "%s: baked weight into %d w3_face_poses fcurves on action '%s' weight=%.6f animated=%s.",
+            log_label,
+            changed,
+            action.name,
+            weight,
+            bool(weight_fn is not None),
+        )
+        try:
+            action.update_tag()
+        except Exception:
+            pass
+    else:
+        log.warning(
+            "%s: no editable w3_face_poses fcurves found on action '%s' sourceCurves=%d skippedMismatched=%d.",
+            log_label,
+            action.name,
+            len(source_curves),
+            skipped_mismatch,
+        )
+    return changed
+
+
+def apply_mimic_pose_weight_to_action(action, weight, target=None, slot=None):
+    return _apply_mimic_float_weight_to_action(
+        action,
+        weight,
+        _MIMIC_POSE_WEIGHT_SOURCE_PROP,
+        _MIMIC_POSE_WEIGHT_VALUE_PROP,
+        _mimic_pose_weight_source_action,
+        "Mimic pose weight",
+        target=target,
+        slot=slot,
+    )
+
+
+def apply_mimic_scene_weight_to_action(action, weight, target=None, slot=None, weight_fn=None):
+    return _apply_mimic_float_weight_to_action(
+        action,
+        weight,
+        _MIMIC_SCENE_WEIGHT_SOURCE_PROP,
+        _MIMIC_SCENE_WEIGHT_VALUE_PROP,
+        _mimic_scene_weight_source_action,
+        "Mimic scene weight",
+        target=target,
+        slot=slot,
+        weight_fn=weight_fn,
+    )
+
+
+def apply_mimic_pose_weight_to_strip(strip, weight):
+    try:
+        strip.influence = 1.0
+    except Exception:
+        pass
+    action = getattr(strip, "action", None)
+    slot = getattr(strip, "action_slot", None)
+    return apply_mimic_pose_weight_to_action(action, weight, slot=slot)
+
+
+def apply_mimic_scene_weight_to_strip(strip, weight, weight_fn=None, target=None):
+    action = getattr(strip, "action", None)
+    slot = getattr(strip, "action_slot", None)
+    changed = apply_mimic_scene_weight_to_action(action, weight, target=target, slot=slot, weight_fn=weight_fn)
+    if changed:
+        try:
+            strip.influence = 1.0
+        except Exception:
+            pass
+    return changed
+
+
+def apply_mimic_pose_weight_to_track(armatures, track_name, weight, nearest_frame=None, latest_only=False):
+    changed = 0
+    seen = set()
+    for armature_obj in armatures or []:
+        if armature_obj is None or getattr(armature_obj, "type", None) != "ARMATURE":
+            continue
+        obj_name = str(getattr(armature_obj, "name", "") or "")
+        if obj_name in seen:
+            continue
+        seen.add(obj_name)
+        anim_data = getattr(armature_obj, "animation_data", None)
+        track = getattr(anim_data, "nla_tracks", {}).get(track_name) if anim_data else None
+        if track is None or not getattr(track, "strips", None):
+            continue
+        strips = list(track.strips)
+        if nearest_frame is not None:
+            frame = float(nearest_frame)
+            strips = [min(strips, key=lambda item: abs(float(getattr(item, "frame_start", 0.0) or 0.0) - frame))]
+        elif latest_only:
+            strips = [max(strips, key=lambda item: float(getattr(item, "frame_start", 0.0) or 0.0))]
+        for strip in strips:
+            changed += apply_mimic_pose_weight_to_strip(strip, weight)
+    return changed
+
+
+def _ensure_control_float_property(control_bone, name, default=0.0):
+    try:
+        current = control_bone[name]
+    except Exception:
+        control_bone[name] = float(default)
+        current = control_bone[name]
+    try:
+        control_bone.id_properties_ui(name).update(
+            min=-1.0,
+            max=1.0,
+            soft_min=-1.0,
+            soft_max=1.0,
+            default=float(default),
+        )
+    except Exception:
+        pass
+    return current
 
 
 def _find_anim_bone(bones, *names):
@@ -107,6 +489,36 @@ def shouldIgnoreFrame(bone):
         return False
     x, y, z, _w = components
     return abs(x) < 0.5 and abs(y) < 0.5 and abs(z) < 0.5
+
+def _split_component_animation_name(anim_name):
+    parts = str(anim_name or "").split(":", 2)
+    if len(parts) >= 3:
+        return parts[0], parts[1], parts[2]
+    if len(parts) == 2:
+        return parts[0], "", parts[1]
+    return "", "", str(anim_name or "")
+
+def _is_cutscene_root_component_animation(filepath, anim_name):
+    if not str(filepath or "").lower().endswith(".w2cutscene"):
+        return False
+    _actor_name, component_name, _display_name = _split_component_animation_name(anim_name)
+    return component_name.strip().lower() == "root"
+
+def _pose_bone_base_names(arm_obj):
+    pose_bones = getattr(getattr(arm_obj, "pose", None), "bones", None)
+    if not pose_bones:
+        return set()
+    return {
+        rm_ns(str(getattr(pose_bone, "name", "") or "")).strip().lower()
+        for pose_bone in pose_bones
+    }
+
+def _is_standard_cutscene_root_motion_rig(arm_obj):
+    bone_names = _pose_bone_base_names(arm_obj)
+    return {"root", "trajectory", "pelvis"}.issubset(bone_names)
+
+def _base_bone_name(bone_name):
+    return rm_ns(str(bone_name or "")).strip()
 
 def slerp_quaternion(q1, q2, t):
     """Spherical linear interpolation between two Quaternion objects"""
@@ -484,7 +896,7 @@ class AnimImporter:
                                 self.__prepare_nla_append_at_cursor(target, target_track, cursor, total_insert_length)
                                 self.__nla_shifted_targets.add(nla_key)
                 else:  # 'replace'
-                    if self.__NLA_frame_margin == 0:
+                    if self.__NLA_frame_margin == 0 and not is_multi_subsequent:
                         for strip in target_track.strips:
                             target_track.strips.remove(strip)
             else:
@@ -507,12 +919,12 @@ class AnimImporter:
                 target_strip = target_track.strips.new(action.name, fallback_frame, action)
             target_strip.frame_start = frame_pos
             bind_strip_action_slot(target_strip, resolve_action_slot(action, target=target, ensure=True))
-            target_strip.frame_end = frame_pos + length
+            target_strip.frame_end = frame_pos + total_insert_length
             target_strip.blend_type = 'REPLACE'
 
             if self.__NLA_track:
                 track_name = str(self.__NLA_track or "")
-                if track_name in {'mimic_import', 'voice_import', 'anim_import'} or track_name.startswith('cutscene_anim') or track_name.startswith('cutscene_import'):
+                if _nla_track_should_combine(track_name):
                     target_strip.blend_type = 'COMBINE'
 
     def __assignPartToArmature(self, armObj, SkeletalAnimation, SkeletalAnimationData, armature_namespace, SkeletalAnimationType, scale):
@@ -536,8 +948,17 @@ class AnimImporter:
             default=get_do_fix_tail(bpy.context)
         )
 
+        cutscene_root_component = _is_cutscene_root_component_animation(
+            self.__animFile.filepath,
+            SkeletalAnimation.name,
+        ) and _is_standard_cutscene_root_motion_rig(armObj)
+        if cutscene_root_component:
+            log.info(
+                "Animation '%s': keeping cutscene Root bone identity.",
+                SkeletalAnimation.name,
+            )
 
-        use_root_source_bone = True
+        use_root_source_bone = not cutscene_root_component
         if use_root_source_bone:
             root_bone = _find_anim_bone(anim_desc.bones, "Root")
             # Prefer Trajectory
@@ -738,6 +1159,8 @@ class AnimImporter:
                         pos = pos_fix if mdl_bone.BoneName.lower() in ['Root', 'pelvis'] else Vector(( 0, 0, 0 ))
                     else:
                         pos = pos_fix
+                    if cutscene_root_component and _base_bone_name(mdl_bone.BoneName).lower() == "root":
+                        pos = Vector((0.0, 0.0, 0.0))
                     for i in range(3):
                         pos_curves[i].keyframe_points.add(1)
                         pos_curves[i].keyframe_points[-1].co = (loc_frame, pos[i])
@@ -817,6 +1240,9 @@ class AnimImporter:
                             fixed_rot = z_minus_90 @ fixed_rot @ z_plus_90
                             fixed_rot.normalize()
 
+                    if cutscene_root_component and _base_bone_name(mdl_bone.BoneName).lower() == "root":
+                        fixed_rot = Quaternion((1.0, 0.0, 0.0, 0.0))
+
                     for i in range(4):
                         rot_curves[i].keyframe_points.add(1)
                         rot_curves[i].keyframe_points[-1].co = (frame, fixed_rot[i])
@@ -862,8 +1288,12 @@ class AnimImporter:
                         continue
                     name = track.trackName
                     if name not in shapeKeyDict:
-                        log.warning('WARNING: not found shape key %s (%d frames)', name, len(keyFrames))
-                        continue
+                        if not camera_animation and control_bone_name == "w3_face_poses" and name in _MIMIC_HEAD_FLOAT_TRACKS:
+                            shapeKeyDict[name] = _ensure_control_float_property(control_bone, name)
+                            log.info('Created mimic float control property %s (%d frames)', name, len(keyFrames))
+                        else:
+                            log.warning('WARNING: not found shape key %s (%d frames)', name, len(keyFrames))
+                            continue
 
                     #Info
                     track_frames = len(track.trackFrames)

@@ -239,6 +239,20 @@ def redkit_repo_context(source_path=None, roots=None):
     finally:
         _redkit_repo_context_stack.pop()
 
+@contextmanager
+def vanilla_only_repo_context():
+    """Temporarily suppress REDkit roots so repo_file resolves only via vanilla
+    bundles/uncook. Used to load the cooked vanilla copy of an asset when its
+    REDkit-uncooked sibling is missing data that only exists post-cook (e.g.
+    CAnimAnimsetsParam baked into entity templates)."""
+    saved = list(_redkit_repo_context_stack)
+    _redkit_repo_context_stack.clear()
+    try:
+        yield
+    finally:
+        _redkit_repo_context_stack.clear()
+        _redkit_repo_context_stack.extend(saved)
+
 def _active_redkit_repo_roots():
     for roots in reversed(_redkit_repo_context_stack):
         if roots:

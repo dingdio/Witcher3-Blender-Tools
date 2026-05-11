@@ -389,6 +389,7 @@ from .ui import ui_re_anims
 from .ui import ui_anims_list
 from .ui import ui_texture_export
 from .ui import ui_import_menu
+from .ui import ui_cutscene
 from .ui import ui_scene
 from .ui import armature_context
 from .ui import ui_cache_export
@@ -1061,6 +1062,15 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
             "Has no effect if no w2beh or animation set is found."
         ),
     )
+    prefer_bundles_for_linked_assets: bpy.props.BoolProperty(
+        name="Load Linked Assets from Bundles",
+        default=False,
+        description=(
+            "When a .w2scene is loaded from a REDkit depot, resolve all linked assets "
+            "(entity templates, meshes, textures, etc.) from the vanilla bundle/uncook "
+            "instead of preferring REDkit paths."
+        ),
+    )
     mesh_import_do_import_mats: bpy.props.BoolProperty(
         name="Mesh Import: Apply Materials",
         default=True,
@@ -1291,6 +1301,7 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         common_box, common_col = section("Common Settings", 'TOOL_SETTINGS')
         common_col.prop(self, "tex_ext")
         common_col.prop(self, "import_idle_animation")
+        common_col.prop(self, "prefer_bundles_for_linked_assets")
         common_col.prop(self, "verbose_logging")
 
         # Asset Browser settings — dedicated section
@@ -3612,6 +3623,7 @@ def register():
     ui_anims.register()
     ui_speech.register()
     ui_scene.register()
+    ui_cutscene.register()
     bpy.utils.register_class(WITCHER_OT_cache_info)
     bpy.utils.register_class(WITCHER_OT_check_cache)
     bpy.utils.register_class(WITCHER_OT_refresh_cache_checked)
@@ -3680,6 +3692,7 @@ def unregister():
         unregister_class(cls)
     ui_import_menu.unregister()
     ui_texture_export.unregister()
+    ui_cutscene.unregister()
     ui_scene.unregister()
     ui_speech.unregister()
     ui_anims.unregister()

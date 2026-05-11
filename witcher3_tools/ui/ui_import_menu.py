@@ -27,7 +27,8 @@ from ..ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_w2mesh_export, WITCH_OT_apx,
                           WITCH_OT_create_sound_info, WITCH_OT_remove_sound_info,
                           PHYSICAL_MATERIAL_ENUM_ITEMS, DEFAULT_PHYSICAL_MATERIAL)
 from ..ui.ui_entity import WITCH_OT_w2ent, WITCH_OT_flyr, WITCH_OT_ENTITY_w2ent_chara, WITCH_OT_ENTITY_import_inventory
-from ..ui.ui_scene import ButtonOperatorImportW2scene, ButtonOperatorImportW2cutscene
+from ..ui.ui_cutscene import ButtonOperatorImportW2cutscene
+from ..ui.ui_scene import ButtonOperatorImportW2scene
 from ..ui.ui_speech import ButtonOperatorImportVoice, ImportWEM
 from ..ui.ui_material import WITCH_OT_w2mg, WITCH_OT_w2mi, WITCH_OT_xbm, WITCH_OT_w2cube
 from ..ui.ui_texture_export import WITCH_OT_xbm_export, WITCH_OT_dds_convert

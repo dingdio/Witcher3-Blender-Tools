@@ -14,11 +14,27 @@ from bpy.props import (
     CollectionProperty,
     IntProperty,
     BoolProperty,
+    EnumProperty,
     StringProperty,
     PointerProperty,
 )
 from .. import get_uncook_path
 from ..ui.armature_context import get_main_armature, set_main_armature
+from ..CR2W.scene_csv_utils import (
+    _lookup_dialogset_body_anim,
+    _parse_body_anim_csv,
+)
+
+
+DIALOGSET_BODY_STATUS_PROP = "witcher_quick_dialogset_body_status"
+DIALOGSET_BODY_EMOTIONAL_PROP = "witcher_quick_dialogset_body_emotional_state"
+DIALOGSET_BODY_POSE_PROP = "witcher_quick_dialogset_body_pose_name"
+DIALOGSET_BODY_RESOLVED_STATUS_PROP = "witcher_quick_dialogset_body_resolved_status"
+DIALOGSET_BODY_RESOLVED_ANIM_PROP = "witcher_quick_dialogset_body_resolved_animation"
+DIALOGSET_BODY_TRACK = "SceneDialogsetIdle"
+_DIALOGSET_BODY_ITEMS_CACHE = None
+_DIALOGSET_BODY_RESOLVE_CACHE = {}
+_UPDATING_DIALOGSET_BODY = False
 
 
 def _resolve_main_armature(context, main_arm_obj=None):
@@ -35,6 +51,310 @@ def _resolve_main_armature(context, main_arm_obj=None):
         fallback=True,
         allow_auxiliary_active=True,
     )
+
+
+def _dialogset_body_item_tuple(values, fallback):
+    clean_values = sorted({str(value or "").strip() for value in values or [] if str(value or "").strip()})
+    return tuple((value, value, "") for value in clean_values) or ((fallback, fallback, ""),)
+
+
+def _dialogset_body_items_cache():
+    global _DIALOGSET_BODY_ITEMS_CACHE
+    if _DIALOGSET_BODY_ITEMS_CACHE is not None:
+        return _DIALOGSET_BODY_ITEMS_CACHE
+
+    data = _parse_body_anim_csv()
+    statuses = set()
+    emotional_by_status = {}
+    poses_by_status_emotional = {}
+    all_emotional = set()
+    all_poses = set()
+
+    for (status_key, emotional_key, pose_key), entry in data.items():
+        if not (entry.get("idles") or []):
+            continue
+        status = str(entry.get("status_display", status_key) or status_key).strip()
+        emotional = str(entry.get("emotional_display", emotional_key) or emotional_key).strip()
+        pose = str(entry.get("pose_display", pose_key) or pose_key).strip()
+        if not status or not emotional or not pose:
+            continue
+        status_l = status.lower()
+        emotional_l = emotional.lower()
+        statuses.add(status)
+        all_emotional.add(emotional)
+        all_poses.add(pose)
+        emotional_by_status.setdefault(status_l, set()).add(emotional)
+        poses_by_status_emotional.setdefault((status_l, emotional_l), set()).add(pose)
+
+    _DIALOGSET_BODY_ITEMS_CACHE = {
+        "statuses": _dialogset_body_item_tuple(statuses, "High"),
+        "all_emotional": _dialogset_body_item_tuple(all_emotional, "Determined"),
+        "all_poses": _dialogset_body_item_tuple(all_poses, "Standing"),
+        "emotional_by_status": {
+            status: _dialogset_body_item_tuple(values, "Determined")
+            for status, values in emotional_by_status.items()
+        },
+        "poses_by_status_emotional": {
+            key: _dialogset_body_item_tuple(values, "Standing")
+            for key, values in poses_by_status_emotional.items()
+        },
+    }
+    return _DIALOGSET_BODY_ITEMS_CACHE
+
+
+def _enum_item_ids(items):
+    return {str(item[0]) for item in items or []}
+
+
+def _first_enum_item_id(items):
+    for item in items or []:
+        return str(item[0])
+    return ""
+
+
+def _dialogset_body_status_items(self, context):
+    return _dialogset_body_items_cache()["statuses"]
+
+
+def _dialogset_body_emotional_items(self, context):
+    scene = getattr(context, "scene", None) if context else None
+    status = str(getattr(scene, DIALOGSET_BODY_STATUS_PROP, "") or "").strip().lower()
+    cache = _dialogset_body_items_cache()
+    return cache["emotional_by_status"].get(status) or cache["all_emotional"]
+
+
+def _dialogset_body_pose_items(self, context):
+    scene = getattr(context, "scene", None) if context else None
+    status = str(getattr(scene, DIALOGSET_BODY_STATUS_PROP, "") or "").strip().lower()
+    emotional = str(getattr(scene, DIALOGSET_BODY_EMOTIONAL_PROP, "") or "").strip().lower()
+    cache = _dialogset_body_items_cache()
+    return cache["poses_by_status_emotional"].get((status, emotional)) or cache["all_poses"]
+
+
+def _set_scene_prop_if_changed(scene, prop_name, value):
+    if scene is None or not hasattr(scene, prop_name):
+        return
+    value = str(value or "")
+    if str(getattr(scene, prop_name, "") or "") != value:
+        setattr(scene, prop_name, value)
+
+
+def _clear_dialogset_body_preview(scene):
+    if scene is None:
+        return
+    if hasattr(scene, DIALOGSET_BODY_RESOLVED_STATUS_PROP):
+        setattr(scene, DIALOGSET_BODY_RESOLVED_STATUS_PROP, "Selection changed; resolve before loading.")
+    if hasattr(scene, DIALOGSET_BODY_RESOLVED_ANIM_PROP):
+        setattr(scene, DIALOGSET_BODY_RESOLVED_ANIM_PROP, "")
+
+
+def _sync_dialogset_body_selection(scene, context, sync_emotional=True):
+    global _UPDATING_DIALOGSET_BODY
+    if scene is None:
+        return
+    try:
+        _UPDATING_DIALOGSET_BODY = True
+        if sync_emotional:
+            emotional_items = _dialogset_body_emotional_items(None, context)
+            current_emotional = str(getattr(scene, DIALOGSET_BODY_EMOTIONAL_PROP, "") or "")
+            if current_emotional not in _enum_item_ids(emotional_items):
+                _set_scene_prop_if_changed(scene, DIALOGSET_BODY_EMOTIONAL_PROP, _first_enum_item_id(emotional_items))
+
+        pose_items = _dialogset_body_pose_items(None, context)
+        current_pose = str(getattr(scene, DIALOGSET_BODY_POSE_PROP, "") or "")
+        if current_pose not in _enum_item_ids(pose_items):
+            _set_scene_prop_if_changed(scene, DIALOGSET_BODY_POSE_PROP, _first_enum_item_id(pose_items))
+    finally:
+        _UPDATING_DIALOGSET_BODY = False
+
+
+def on_dialogset_body_status_changed(self, context):
+    if _UPDATING_DIALOGSET_BODY or context is None:
+        return
+    scene = getattr(context, "scene", None)
+    _sync_dialogset_body_selection(scene, context, sync_emotional=True)
+    _clear_dialogset_body_preview(scene)
+
+
+def on_dialogset_body_emotional_changed(self, context):
+    if _UPDATING_DIALOGSET_BODY or context is None:
+        return
+    scene = getattr(context, "scene", None)
+    _sync_dialogset_body_selection(scene, context, sync_emotional=False)
+    _clear_dialogset_body_preview(scene)
+
+
+def on_dialogset_body_pose_changed(self, context):
+    if _UPDATING_DIALOGSET_BODY or context is None:
+        return
+    _clear_dialogset_body_preview(getattr(context, "scene", None))
+
+
+def _dialogset_body_selection(scene):
+    return (
+        str(getattr(scene, DIALOGSET_BODY_STATUS_PROP, "") or "").strip(),
+        str(getattr(scene, DIALOGSET_BODY_EMOTIONAL_PROP, "") or "").strip(),
+        str(getattr(scene, DIALOGSET_BODY_POSE_PROP, "") or "").strip(),
+    )
+
+
+def _format_dialogset_body_resolved(info):
+    if not info:
+        return ""
+    anim_id = str(info.get("anim_id", "") or "").strip()
+    resolved_name = str(info.get("resolved_anim_name", "") or "").strip()
+    resolved_path = str(info.get("resolved_path", "") or "").strip()
+    if not anim_id:
+        return ""
+    if not resolved_name:
+        return f"{anim_id}: <not resolved>"
+    return f"{resolved_name} [{os.path.basename(resolved_path)}]"
+
+
+def _set_dialogset_body_preview(scene, info=None, status=""):
+    if scene is None:
+        return
+    if hasattr(scene, DIALOGSET_BODY_RESOLVED_STATUS_PROP):
+        setattr(scene, DIALOGSET_BODY_RESOLVED_STATUS_PROP, str(status or ""))
+    if hasattr(scene, DIALOGSET_BODY_RESOLVED_ANIM_PROP):
+        setattr(scene, DIALOGSET_BODY_RESOLVED_ANIM_PROP, _format_dialogset_body_resolved(info or {}))
+
+
+def resolve_quick_dialogset_body(context, force=False):
+    scene = getattr(context, "scene", None)
+    actor_obj = _resolve_main_armature(context)
+    if scene is None:
+        return None, {}
+
+    status, emotional, pose = _dialogset_body_selection(scene)
+    anim_id = _lookup_dialogset_body_anim(status, emotional, pose) or ""
+    info = {
+        "actor_status": status,
+        "actor_emotional_state": emotional,
+        "actor_pose_name": pose,
+        "anim_id": anim_id,
+        "resolved_anim_name": "",
+        "resolved_path": "",
+    }
+    if actor_obj is None or not anim_id:
+        return actor_obj, info
+
+    show_all = False
+    source_key = _get_quick_anim_source_key(actor_obj, show_all)
+    cache_key = (source_key, status.lower(), emotional.lower(), pose.lower(), anim_id)
+    cached = _DIALOGSET_BODY_RESOLVE_CACHE.get(cache_key)
+    if cached is not None and not force:
+        return actor_obj, dict(cached)
+
+    SetupActor(actor_obj, context=context, show_all=show_all)
+    resolved_anim_name, fdir = GetAnimationInfoByName(
+        anim_id,
+        actor_obj,
+        show_all=show_all,
+        quiet=True,
+        compatible_only=True,
+    )
+    if resolved_anim_name and fdir:
+        info["resolved_anim_name"] = str(resolved_anim_name)
+        info["resolved_path"] = str(fdir)
+
+    _DIALOGSET_BODY_RESOLVE_CACHE[cache_key] = dict(info)
+    if len(_DIALOGSET_BODY_RESOLVE_CACHE) > 256:
+        _DIALOGSET_BODY_RESOLVE_CACHE.clear()
+    return actor_obj, info
+
+
+def resolve_and_store_quick_dialogset_body(context):
+    scene = getattr(context, "scene", None)
+    actor_obj, info = resolve_quick_dialogset_body(context, force=True)
+    if scene is None:
+        return None, {}
+    if actor_obj is None:
+        _set_dialogset_body_preview(scene, info, status="No target character selected.")
+        return actor_obj, info
+    if not info.get("anim_id"):
+        _set_dialogset_body_preview(scene, info, status="No body animation found for this combination.")
+        return actor_obj, info
+    if not info.get("resolved_anim_name"):
+        _set_dialogset_body_preview(scene, info, status="Body animation is not compatible with the current character's animation sets.")
+        return actor_obj, info
+    _set_dialogset_body_preview(scene, info, status="Resolved.")
+    return actor_obj, info
+
+
+def load_quick_dialogset_body(context):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return False
+    actor_obj, info = resolve_quick_dialogset_body(context, force=True)
+    if actor_obj is None:
+        _set_dialogset_body_preview(scene, info, status="No target character selected.")
+        return False
+    if not info.get("anim_id"):
+        _set_dialogset_body_preview(scene, info, status="No body animation found for this combination.")
+        return False
+    if not info.get("resolved_anim_name") or not info.get("resolved_path"):
+        _set_dialogset_body_preview(scene, info, status="Body animation is not compatible with the current character's animation sets.")
+        return False
+    _set_dialogset_body_preview(scene, info, status="Resolved.")
+
+    mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
+    nla_mode = mode_map.get(getattr(scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+    load_anim_into_scene(
+        context,
+        info["resolved_anim_name"],
+        info["resolved_path"],
+        actor_obj,
+        NLA_track=DIALOGSET_BODY_TRACK,
+        at_frame=0,
+        nla_mode=nla_mode,
+    )
+    if getattr(scene, "witcher_auto_orient_root", True):
+        try:
+            from ..ui.ui_anims import apply_root_orientation
+            apply_root_orientation(actor_obj)
+        except Exception as exc:
+            log.warning("Dialogset body auto orient failed: %s", exc)
+    return True
+
+
+def _draw_resolved_dialogset_body(layout, context):
+    scene = getattr(context, "scene", None)
+    preview = layout.column(align=True)
+    preview.label(text="Resolved Animation", icon='PREVIEW_RANGE')
+    if scene is None:
+        return
+    status = str(getattr(scene, DIALOGSET_BODY_RESOLVED_STATUS_PROP, "") or "").strip()
+    resolved = str(getattr(scene, DIALOGSET_BODY_RESOLVED_ANIM_PROP, "") or "").strip()
+    if status:
+        preview.label(text=status, icon='INFO')
+    if resolved:
+        preview.label(text=f"{DIALOGSET_BODY_TRACK}: {resolved}", icon='ANIM_DATA')
+    if not status and not resolved:
+        preview.label(text="Use Resolve Body to preview before loading.", icon='INFO')
+
+
+def draw_quick_dialogset_body_controls(layout, context):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return
+    required = (
+        DIALOGSET_BODY_STATUS_PROP,
+        DIALOGSET_BODY_EMOTIONAL_PROP,
+        DIALOGSET_BODY_POSE_PROP,
+    )
+    if not all(hasattr(scene, prop) for prop in required):
+        layout.label(text="Dialogset body properties not registered.", icon='INFO')
+        return
+
+    col = layout.column(align=True)
+    col.prop(scene, DIALOGSET_BODY_STATUS_PROP, text="actorStatus")
+    col.prop(scene, DIALOGSET_BODY_EMOTIONAL_PROP, text="actorEmotionalState")
+    col.prop(scene, DIALOGSET_BODY_POSE_PROP, text="actorPoseName")
+    _draw_resolved_dialogset_body(col, context)
+    actions = col.row(align=True)
+    actions.operator("witcher.quick_dialogset_body_resolve", text="Resolve Body", icon='PREVIEW_RANGE')
+    actions.operator("witcher.quick_dialogset_body_load", text="Load Resolved", icon='PLAY')
 
 
 def is_face_animation(anim_name, fdir=""):
@@ -604,29 +924,100 @@ def createCat(cat_name, dict):
 
 from ..filtered_list.animations_manager import CModStoryBoardAnimationListsManager, CModStoryBoardMimicsListsManager
 from ..filtered_list.storyboardasset import CModStoryBoardActor
+from .mimic_compat import is_mimic_path_compatible
 
-def GetAnimationInfoByName(anim_name):
+
+def _get_mimic_animation_path_by_name(anim_name, main_arm_obj=None, show_all=False):
+    first_match = None
+    for anim in CModStoryBoardMimicsListsManager.get_mimics_meta().animList:
+        if anim.id != anim_name:
+            continue
+        if first_match is None:
+            first_match = anim.path
+        if is_mimic_path_compatible(anim.path, main_arm_obj, show_all=show_all):
+            return anim.path
+    if show_all or main_arm_obj is None:
+        return first_match
+    return None
+
+
+def _normalize_catalog_path(path):
+    return str(path or "").replace("/", "\\").strip().lower()
+
+
+def _actor_compatible_animation_paths(main_arm_obj):
+    if main_arm_obj is None or getattr(main_arm_obj, "type", None) != "ARMATURE":
+        return set(), set()
+    rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
+    if rig_settings is None:
+        return set(), set()
+
+    exact_paths = set()
+    normalized_paths = set()
+    for animset in getattr(rig_settings, "animset_list", []) or []:
+        path = str(getattr(animset, "path", "") or "").strip()
+        if not path or ":" in path:
+            continue
+        exact_paths.add(path)
+        normalized_paths.add(_normalize_catalog_path(path))
+    return exact_paths, normalized_paths
+
+
+def _normal_animation_manager(manager=None):
+    if manager is None or isinstance(manager, CModStoryBoardMimicsListsManager):
+        manager = CModStoryBoardAnimationListsManager()
+    if not getattr(manager, "_dataLoaded", False):
+        manager.lazyLoad()
+    return manager
+
+
+def _get_actor_compatible_animation_path_by_name(anim_name, main_arm_obj, manager=None):
+    exact_paths, normalized_paths = _actor_compatible_animation_paths(main_arm_obj)
+    if not exact_paths and not normalized_paths:
+        return None
+
+    try:
+        manager = _normal_animation_manager(manager)
+    except Exception:
+        return None
+
+    anim_meta = getattr(manager, "_animMeta", None)
+    for anim in getattr(anim_meta, "animList", []) or []:
+        if anim.id != anim_name:
+            continue
+        anim_path = str(getattr(anim, "path", "") or "")
+        if anim_path in exact_paths or _normalize_catalog_path(anim_path) in normalized_paths:
+            return anim_path
+    return None
+
+
+def GetAnimationInfoByName(anim_name, main_arm_obj=None, show_all=False, prefer_mimic=False, quiet=False, compatible_only=False):
     uncook_path = get_uncook_path(bpy.context)
-    manager = CModStoryBoardAnimationListsManager.active
     fdir = None
-    found = False
-    for anim in manager._animMeta.animList:
-        if anim.id == anim_name:
-            fdir = anim.path # animation might not be proper
-            for anim_active in manager.active.active_list._items:
-                if anim_active.id == anim.slotId:
-                    fdir = anim.path
-                    found = True
-                    break
-            if found:
-                break
+    if prefer_mimic:
+        fdir = _get_mimic_animation_path_by_name(anim_name, main_arm_obj=main_arm_obj, show_all=show_all)
+    if fdir is None and not prefer_mimic:
+        try:
+            manager = _normal_animation_manager(CModStoryBoardAnimationListsManager.active)
+        except Exception:
+            manager = None
+        actor_aware = main_arm_obj is not None and not show_all
+        if actor_aware:
+            fdir = _get_actor_compatible_animation_path_by_name(anim_name, main_arm_obj, manager=manager)
+        if fdir is None and manager is not None and getattr(manager, "_animMeta", None) is not None and not (compatible_only and actor_aware):
+            active_list = getattr(getattr(manager, "active", manager), "active_list", None)
+            active_items = getattr(active_list, "_items", []) or []
+            active_slot_ids = {getattr(anim_active, "id", None) for anim_active in active_items}
+            for anim in manager._animMeta.animList:
+                if anim.id == anim_name:
+                    if show_all or not compatible_only or getattr(anim, "slotId", None) in active_slot_ids:
+                        fdir = anim.path
+                        break
+    if fdir is None and not compatible_only:
+        fdir = _get_mimic_animation_path_by_name(anim_name, main_arm_obj=main_arm_obj, show_all=show_all)
     if fdir is None:
-        for anim in CModStoryBoardMimicsListsManager.get_mimics_meta().animList:
-            if anim.id == anim_name:
-                fdir = anim.path
-                break
-    if fdir is None:
-        log.critical('Did not find animation!')
+        if not quiet:
+            log.critical('Did not find animation!')
         return (None, None)
     #(, ) = item.animLineId.split(';')
     fdir = os.path.join(uncook_path, fdir)
@@ -860,6 +1251,49 @@ class MyAnimListItem_Debug(bpy.types.Operator):
         else:
             log.warning("unknown debug action: %s", action)
 
+        return {'FINISHED'}
+
+
+class WITCH_OT_QuickDialogsetBodyResolve(bpy.types.Operator):
+    bl_idname = "witcher.quick_dialogset_body_resolve"
+    bl_label = "Resolve Dialogset Body"
+    bl_description = "Resolve the selected dialogset body preset without importing it"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            actor_obj, info = resolve_and_store_quick_dialogset_body(context)
+            if actor_obj is None:
+                self.report({'WARNING'}, "No target character selected.")
+                return {'CANCELLED'}
+            if not info.get("anim_id"):
+                self.report({'WARNING'}, "No body animation found for this combination.")
+                return {'CANCELLED'}
+            if not info.get("resolved_anim_name"):
+                self.report({'WARNING'}, "Body animation is not compatible with the current character's animation sets.")
+                return {'CANCELLED'}
+        except Exception as exc:
+            log.error("Dialogset body resolve failed.", exc_info=True)
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class WITCH_OT_QuickDialogsetBodyLoad(bpy.types.Operator):
+    bl_idname = "witcher.quick_dialogset_body_load"
+    bl_label = "Load Dialogset Body"
+    bl_description = "Load the resolved dialogset body animation onto the current character"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        try:
+            if not load_quick_dialogset_body(context):
+                self.report({'WARNING'}, "No compatible dialogset body animation was loaded.")
+                return {'CANCELLED'}
+        except Exception as exc:
+            log.error("Dialogset body load failed.", exc_info=True)
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
         return {'FINISHED'}
 
 
@@ -1099,6 +1533,8 @@ class SCENE_PT_myanimlist(WITCH_PT_Base, bpy.types.Panel):
 classes = (
         MyAnimListItem,
         MyAnimListItem_Debug,
+        WITCH_OT_QuickDialogsetBodyResolve,
+        WITCH_OT_QuickDialogsetBodyLoad,
         OBJECT_OT_anims_skp_folder_toggle,
         OBJECT_OT_anims_category_bulk,
         MYANIMLISTITEM_UL_basic,
@@ -1189,11 +1625,50 @@ def register():
             default=False,
             update=lambda self, ctx: _schedule_deferred_quick_anim_setup(),
         )
+    if not hasattr(bpy.types.Scene, DIALOGSET_BODY_STATUS_PROP):
+        setattr(bpy.types.Scene, DIALOGSET_BODY_STATUS_PROP, EnumProperty(
+            name="actorStatus",
+            description="Actor status from scene_body_animations.csv",
+            items=_dialogset_body_status_items,
+            update=on_dialogset_body_status_changed,
+        ))
+    if not hasattr(bpy.types.Scene, DIALOGSET_BODY_EMOTIONAL_PROP):
+        setattr(bpy.types.Scene, DIALOGSET_BODY_EMOTIONAL_PROP, EnumProperty(
+            name="actorEmotionalState",
+            description="Actor emotional state filtered by actorStatus",
+            items=_dialogset_body_emotional_items,
+            update=on_dialogset_body_emotional_changed,
+        ))
+    if not hasattr(bpy.types.Scene, DIALOGSET_BODY_POSE_PROP):
+        setattr(bpy.types.Scene, DIALOGSET_BODY_POSE_PROP, EnumProperty(
+            name="actorPoseName",
+            description="Actor body pose filtered by actorStatus and actorEmotionalState",
+            items=_dialogset_body_pose_items,
+            update=on_dialogset_body_pose_changed,
+        ))
+    for prop_name in (
+        DIALOGSET_BODY_RESOLVED_STATUS_PROP,
+        DIALOGSET_BODY_RESOLVED_ANIM_PROP,
+    ):
+        if not hasattr(bpy.types.Scene, prop_name):
+            setattr(bpy.types.Scene, prop_name, StringProperty(default=""))
 
 def unregister():
+    global _DIALOGSET_BODY_ITEMS_CACHE
+    _DIALOGSET_BODY_ITEMS_CACHE = None
+    _DIALOGSET_BODY_RESOLVE_CACHE.clear()
     _QUICK_ANIM_FILTER_CACHE.clear()
     _ACTIVE_SOURCE_KEY_BY_SCENE.clear()
     _LAST_QUICK_ANIM_SEARCH_BY_SCENE.clear()
+    for prop_name in (
+        DIALOGSET_BODY_RESOLVED_ANIM_PROP,
+        DIALOGSET_BODY_RESOLVED_STATUS_PROP,
+        DIALOGSET_BODY_POSE_PROP,
+        DIALOGSET_BODY_EMOTIONAL_PROP,
+        DIALOGSET_BODY_STATUS_PROP,
+    ):
+        if hasattr(bpy.types.Scene, prop_name):
+            delattr(bpy.types.Scene, prop_name)
     if hasattr(bpy.types.Scene, "witcher_quick_anim_auto_collapse_categories"):
         del bpy.types.Scene.witcher_quick_anim_auto_collapse_categories
     if hasattr(bpy.types.Scene, "witcher_quick_anim_load_on_select"):

@@ -1966,7 +1966,23 @@ def initialize_entity_armature_state(armature_obj, entity, *, filename="", impor
 
         animset_list = rig_settings.animset_list
         animset_list.clear()
-        for group_name, paths in _collect_armature_animset_groups(entity, armature_obj):
+        fallback_path = (entity_state or {}).get("repo_path", "") if entity_state else ""
+        try:
+            _prefer_bundles = bool(get_all_addon_prefs(bpy.context).prefer_bundles_for_linked_assets)
+        except Exception:
+            _prefer_bundles = False
+        if _prefer_bundles and fallback_path:
+            # Preference enabled: load animsets from vanilla bundles first
+            groups = list(_collect_animset_groups_from_vanilla(fallback_path, armature_obj))
+            if not groups:
+                groups = list(_collect_armature_animset_groups(entity, armature_obj))
+        else:
+            groups = list(_collect_armature_animset_groups(entity, armature_obj))
+            if not groups and fallback_path:
+                # Silent fallback: entity had no animsets,
+                # try vanilla bundle copy without requiring the preference to be set.
+                groups = list(_collect_animset_groups_from_vanilla(fallback_path, armature_obj))
+        for group_name, paths in groups:
             NewAnimsetListItem(animset_list, f"{group_name}:", group_name)
             for path in paths:
                 NewAnimsetListItem(animset_list, path, group_name)
@@ -2774,6 +2790,33 @@ def _collect_armature_animset_groups(entity, armature_obj):
             _add_group(f"{_get_entry_attr(mimic_set, 'name', 'MimicSets')} (Mimic)", _get_entry_attr(mimic_set, "animationSets", []))
 
     return [(group_name, paths) for group_name, paths in groups if paths]
+
+
+def _collect_animset_groups_from_vanilla(repo_path, armature_obj):
+    """Load the cooked vanilla copy and return its animset groups. Used to recover animsets (When CAnimAnimsetsParam exists only in the cooked)."""
+    repo_path = str(repo_path or "").strip().replace("/", "\\")
+    if not repo_path:
+        return []
+    try:
+        from ..CR2W.common_blender import vanilla_only_repo_context, repo_file as _repo_file
+    except Exception:
+        return []
+    try:
+        with vanilla_only_repo_context():
+            abs_path = _repo_file(repo_path)
+            if not abs_path or not os.path.isfile(abs_path):
+                return []
+            vanilla_entity = test_load_entity(abs_path)
+        if vanilla_entity is None:
+            return []
+        groups = list(_collect_armature_animset_groups(vanilla_entity, armature_obj))
+        if groups:
+            log.info("Recovered %d animset group(s) for '%s' from vanilla copy at %s",
+                     len(groups), getattr(armature_obj, "name", "?"), abs_path)
+        return groups
+    except Exception:
+        log.debug("Vanilla animset fallback failed for %s", repo_path, exc_info=True)
+        return []
 
 
 def _populate_idle_animation(rig_settings, entity):

@@ -1,6 +1,7 @@
 import logging
 import os
 import math
+import json
 from pathlib import Path
 from mathutils import Quaternion as MQuaternion, Vector as MVector, Euler as MEuler, Matrix as MMatrix
 from ..CR2W.common_blender import repo_file
@@ -12,7 +13,7 @@ from .. import get_W3_VOICE_PATH
 from .. import get_W3_OGG_PATH
 from .. import get_rig_rot90_enabled
 from .. import get_all_addon_prefs
-from ..importers import import_anims, import_cutscene, import_entity, import_rig
+from ..importers import import_anims, import_cutscene, import_entity, import_rig, import_scene_animation
 from ..exporters import export_anims, export_cutscene
 from ..action_compat import (
     assign_action,
@@ -62,6 +63,338 @@ def _find_character_armature(context):
         fallback=True,
         allow_auxiliary_active=True,
     )
+
+
+W3_SCENE_WEIGHT_PROP = "w3_scene_additive_weight"
+W3_SCENE_WEIGHT_APPLIED_PROP = "w3_scene_additive_weight_applied"
+W3_SCENE_EVENT_WEIGHT_PROP = "w3_scene_event_weight"
+W3_SCENE_EVENT_WEIGHT_APPLIED_PROP = "w3_scene_event_weight_applied_to_strip"
+W3_SCENE_WEIGHT_SOURCE_PROP = "w3_scene_event_weight_source"
+W3_SCENE_EVENT_GUID_INDEX_PROP = "w3_scene_event_guid_index"
+W3_SCENE_ANIMATION_WARNINGS_PROP = "w3_scene_animation_warnings"
+W3_SCENE_EVENT_WEIGHT_CURVE_BAKED_PROP = "w3_scene_event_weight_curve_baked"
+W3_SCENE_EVENT_WEIGHT_CURVE_EDITS_PROP = "w3_scene_event_weight_curve_edits"
+
+
+def _idprop_get(id_block, prop_name, default=None):
+    if id_block is None:
+        return default
+    try:
+        return id_block.get(prop_name, default)
+    except Exception:
+        return default
+
+
+def _idprop_has(id_block, prop_name):
+    if id_block is None:
+        return False
+    try:
+        return prop_name in id_block
+    except Exception:
+        return False
+
+
+def _idprop_float(id_block, prop_name, default=None):
+    value = _idprop_get(id_block, prop_name, default)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _set_float_idprop_ui(id_block, prop_name, value, soft_min=0.0, soft_max=1.0):
+    if id_block is None:
+        return
+    try:
+        id_block[prop_name] = float(value)
+        ui = id_block.id_properties_ui(prop_name)
+        ui.update(min=float(soft_min), max=float(soft_max), soft_min=float(soft_min), soft_max=float(soft_max))
+    except Exception:
+        pass
+
+
+def _scene_weight_prop_target(strip, action):
+    if _idprop_has(strip, W3_SCENE_EVENT_WEIGHT_PROP):
+        return strip
+    if _idprop_has(action, W3_SCENE_EVENT_WEIGHT_PROP):
+        return action
+
+    fallback = strip if _idprop_has(strip, W3_SCENE_WEIGHT_PROP) else action
+    if fallback is None or not _idprop_has(fallback, W3_SCENE_WEIGHT_PROP):
+        return None
+    _set_float_idprop_ui(
+        fallback,
+        W3_SCENE_EVENT_WEIGHT_PROP,
+        _idprop_float(fallback, W3_SCENE_WEIGHT_PROP, 1.0),
+    )
+    return fallback
+
+
+def _iter_nla_strips_for_object(obj):
+    anim_data = getattr(obj, "animation_data", None)
+    if anim_data is None:
+        return
+    for track in getattr(anim_data, "nla_tracks", []) or []:
+        for strip in getattr(track, "strips", []) or []:
+            yield track, strip
+
+
+def _strip_scene_text(track, strip):
+    action = getattr(strip, "action", None)
+    return " ".join(
+        str(value or "")
+        for value in (
+            getattr(track, "name", ""),
+            getattr(strip, "name", ""),
+            getattr(action, "name", ""),
+            _idprop_get(strip, "w3_scene_requested_animation", ""),
+            _idprop_get(action, "w3_scene_requested_animation", ""),
+            _idprop_get(strip, "w3_scene_event_guid", ""),
+            _idprop_get(action, "w3_scene_event_guid", ""),
+        )
+    ).lower()
+
+
+def _strip_has_witcher_scene_data(strip):
+    action = getattr(strip, "action", None)
+    for prop_name in (
+        "w3_scene_section",
+        "w3_scene_event_name",
+        "w3_scene_requested_animation",
+        W3_SCENE_EVENT_WEIGHT_PROP,
+        W3_SCENE_WEIGHT_PROP,
+    ):
+        if _idprop_has(strip, prop_name) or _idprop_has(action, prop_name):
+            return True
+    return False
+
+
+def _strip_looks_like_witcher_scene(track, strip):
+    if _strip_has_witcher_scene_data(strip):
+        return True
+    text = _strip_scene_text(track, strip)
+    return (
+        "cutscene_import_body" in text
+        or "cutscene_import_pose" in text
+        or "cutscene_import_mimic" in text
+    )
+
+
+def _scene_event_index(context):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return {}
+    try:
+        data = json.loads(str(scene.get(W3_SCENE_EVENT_GUID_INDEX_PROP, "{}") or "{}"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _scene_event_index_entry_for_strip(context, track, strip):
+    index = _scene_event_index(context)
+    if not index:
+        return None
+    text = _strip_scene_text(track, strip)
+    for key, entry in index.items():
+        if key and str(key).lower() in text and isinstance(entry, dict):
+            return entry
+    return None
+
+
+def _ensure_scene_metadata_for_strip(context, track, strip):
+    action = getattr(strip, "action", None)
+    entry = _scene_event_index_entry_for_strip(context, track, strip)
+    if _strip_has_witcher_scene_data(strip):
+        if entry and not _idprop_has(strip, W3_SCENE_EVENT_WEIGHT_PROP) and not _idprop_has(action, W3_SCENE_EVENT_WEIGHT_PROP):
+            _write_scene_metadata_to_targets((strip, action), entry)
+        data_source = strip if _idprop_has(strip, "w3_scene_section") else action
+        _apply_imported_scene_weight_to_strip_once(strip, action, data_source)
+        return data_source
+    if not entry:
+        _apply_imported_scene_weight_to_strip_once(strip, action, action)
+        return action
+    _write_scene_metadata_to_targets((strip, action), entry)
+    _apply_scene_weight_to_strip(strip, entry.get(W3_SCENE_EVENT_WEIGHT_PROP, 1.0))
+    _mark_scene_weight_applied((strip, action))
+    return action if action is not None else strip
+
+
+def _write_scene_metadata_to_targets(targets, metadata):
+    for target in targets or ():
+        if target is None:
+            continue
+        for key, value in (metadata or {}).items():
+            if value is None:
+                continue
+            try:
+                target[key] = float(value) if isinstance(value, (int, float)) else str(value)
+            except Exception:
+                pass
+        if W3_SCENE_EVENT_WEIGHT_PROP in (metadata or {}):
+            _set_float_idprop_ui(target, W3_SCENE_EVENT_WEIGHT_PROP, metadata.get(W3_SCENE_EVENT_WEIGHT_PROP, 1.0))
+
+
+def _apply_scene_weight_to_strip(strip, weight):
+    if strip is None:
+        return
+    try:
+        strip.influence = max(0.0, min(1.0, float(weight)))
+    except Exception:
+        pass
+
+
+def _scene_strip_should_bake_weight(strip, action):
+    blend_type = str(getattr(strip, "blend_type", "") or "").upper()
+    animation_type = str(
+        _idprop_get(strip, "w3_scene_animation_type", "")
+        or _idprop_get(action, "w3_scene_animation_type", "")
+        or ""
+    ).upper()
+    additive_type = str(
+        _idprop_get(strip, "w3_scene_additive_type", "")
+        or _idprop_get(action, "w3_scene_additive_type", "")
+        or ""
+    ).upper()
+    return blend_type == "COMBINE" or "ADDITIVE" in animation_type or bool(additive_type)
+
+
+def _action_has_mimic_pose_property_curves(action, owner=None, strip=None):
+    if action is None:
+        return False
+    candidates = [action]
+    for prop_name in (
+        "_w3_mimic_scene_weight_source_action",
+        "_w3_scene_additive_weight_source_action",
+    ):
+        source_name = str(_idprop_get(action, prop_name, "") or "")
+        source = bpy.data.actions.get(source_name) if source_name else None
+        if source is not None and source not in candidates:
+            candidates.append(source)
+    for candidate in candidates:
+        slot = None
+        try:
+            slot = getattr(strip, "action_slot", None) if candidate is action else None
+            slot = resolve_action_slot(candidate, target=owner, slot=slot, ensure=False)
+        except Exception:
+            slot = None
+        try:
+            fcurves = import_anims._iter_action_fcurves_any(candidate, target=owner, slot=slot)
+        except Exception:
+            fcurves = iter_action_fcurves(candidate, target=owner, slot=slot)
+        for fcurve in fcurves:
+            try:
+                if import_anims._is_mimic_pose_weight_fcurve(fcurve):
+                    return True
+            except Exception:
+                data_path = str(getattr(fcurve, "data_path", "") or "")
+                if data_path.startswith('pose.bones["w3_face_poses"]["'):
+                    return True
+    return False
+
+
+def _mark_scene_weight_applied(targets):
+    for target in targets or ():
+        if target is None:
+            continue
+        try:
+            target[W3_SCENE_EVENT_WEIGHT_APPLIED_PROP] = True
+        except Exception:
+            pass
+
+
+def _scene_weight_applied_to_strip(strip, action):
+    return _idprop_has(strip, W3_SCENE_EVENT_WEIGHT_APPLIED_PROP) or _idprop_has(action, W3_SCENE_EVENT_WEIGHT_APPLIED_PROP)
+
+
+def _apply_imported_scene_weight_to_strip_once(strip, action, data_source):
+    weight = _idprop_float(data_source, W3_SCENE_EVENT_WEIGHT_PROP, None)
+    if weight is None:
+        return
+    # Only auto-apply if weight hasn't been applied yet (flag not set).
+    # If the flag IS set, trust that strip.influence was set correctly during import.
+    if _scene_weight_applied_to_strip(strip, action):
+        return
+    _apply_scene_weight_to_strip(strip, weight)
+    _mark_scene_weight_applied((strip, action))
+
+
+def _find_strip_owner(context, strip):
+    if strip is None:
+        return None, None
+    objects = []
+    for obj in list(getattr(context, "selected_objects", []) or []):
+        if obj not in objects:
+            objects.append(obj)
+    active = getattr(context, "object", None)
+    if active is not None and active not in objects:
+        objects.insert(0, active)
+    scene = getattr(context, "scene", None)
+    if scene is not None:
+        for obj in getattr(scene, "objects", []) or []:
+            if obj not in objects:
+                objects.append(obj)
+    for obj in objects:
+        for track, candidate in _iter_nla_strips_for_object(obj) or []:
+            if candidate == strip:
+                return obj, track
+    return None, None
+
+
+def _resolve_nla_strip(context, object_name="", track_name="", strip_name=""):
+    if object_name:
+        obj = bpy.data.objects.get(object_name)
+        if obj is not None:
+            anim_data = getattr(obj, "animation_data", None)
+            track = getattr(anim_data, "nla_tracks", {}).get(track_name) if anim_data is not None else None
+            if track is not None:
+                strip = getattr(track, "strips", {}).get(strip_name)
+                if strip is not None:
+                    return obj, track, strip
+
+    active_strip = getattr(context, "active_nla_strip", None)
+    selected_strips = list(getattr(context, "selected_nla_strips", []) or [])
+
+    if active_strip is not None:
+        obj, track = _find_strip_owner(context, active_strip)
+        if obj is not None and track is not None and _strip_looks_like_witcher_scene(track, active_strip):
+            return obj, track, active_strip
+
+    for selected_strip in reversed(selected_strips):
+        obj, track = _find_strip_owner(context, selected_strip)
+        if obj is not None and track is not None and _strip_looks_like_witcher_scene(track, selected_strip):
+            return obj, track, selected_strip
+
+    objects = []
+    active = getattr(context, "object", None)
+    if active is not None:
+        objects.append(active)
+    for obj in list(getattr(context, "selected_objects", []) or []):
+        if obj not in objects:
+            objects.append(obj)
+    scene = getattr(context, "scene", None)
+    if scene is not None:
+        for obj in getattr(scene, "objects", []) or []:
+            if obj not in objects:
+                objects.append(obj)
+    for obj in objects:
+        for track, strip in _iter_nla_strips_for_object(obj) or []:
+            if bool(getattr(strip, "select", False)) and _strip_looks_like_witcher_scene(track, strip):
+                return obj, track, strip
+
+    frame = float(getattr(getattr(context, "scene", None), "frame_current", 0.0) or 0.0)
+    for obj in objects:
+        for track, strip in _iter_nla_strips_for_object(obj) or []:
+            if (
+                _strip_has_witcher_scene_data(strip)
+                and float(getattr(strip, "frame_start", 0.0) or 0.0) <= frame
+                and frame <= float(getattr(strip, "frame_end", 0.0) or 0.0)
+            ):
+                return obj, track, strip
+
+    return None, None, None
 
 
 def _format_action_source_label(source):
@@ -4387,6 +4720,199 @@ class WITCH_OT_BakePelvisToTrajectory(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WITCH_OT_ApplySceneAdditiveWeight(bpy.types.Operator):
+    bl_idname = "witcher.apply_scene_additive_weight"
+    bl_label = "Apply Scene Animation Weight"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action_name: StringProperty(default="")
+    object_name: StringProperty(default="")
+    track_name: StringProperty(default="")
+    strip_name: StringProperty(default="")
+    weight: FloatProperty(default=-1.0, min=0.0, max=1.0, soft_min=0.0, soft_max=1.0)
+
+    def execute(self, context):
+        explicit_strip = bool(self.object_name and self.track_name and self.strip_name)
+        owner, _track, strip = _resolve_nla_strip(context, self.object_name, self.track_name, self.strip_name)
+        action = bpy.data.actions.get(self.action_name) if self.action_name else None
+        if action is None and strip is not None:
+            action = getattr(strip, "action", None)
+        if action is not None and strip is not None and not explicit_strip and getattr(strip, "action", None) != action:
+            owner = None
+            strip = None
+        if action is None:
+            self.report({'ERROR'}, "No action found.")
+            return {'CANCELLED'}
+
+        try:
+            if self.weight >= 0.0:
+                weight = float(self.weight)
+            elif strip is not None and _idprop_has(strip, W3_SCENE_EVENT_WEIGHT_PROP):
+                weight = float(_idprop_get(strip, W3_SCENE_EVENT_WEIGHT_PROP, 1.0))
+            else:
+                weight = float(action.get(W3_SCENE_EVENT_WEIGHT_PROP, getattr(strip, "influence", 1.0)))
+        except Exception:
+            weight = 1.0
+        weight = max(0.0, min(1.0, weight))
+
+        _set_float_idprop_ui(action, W3_SCENE_EVENT_WEIGHT_PROP, weight)
+        if strip is not None:
+            _set_float_idprop_ui(strip, W3_SCENE_EVENT_WEIGHT_PROP, weight)
+            curve_result = None
+            mimic_curve_edits = 0
+            if owner is not None and _scene_strip_should_bake_weight(strip, action):
+                curve_result = import_scene_animation.apply_scene_weight_to_strip(
+                    strip,
+                    owner,
+                    weight,
+                    section=str(_idprop_get(strip, "w3_scene_section", "") or _idprop_get(action, "w3_scene_section", "") or ""),
+                    track_name=str(getattr(_track, "name", "") or self.track_name or ""),
+                )
+                action = getattr(strip, "action", action)
+                if _action_has_mimic_pose_property_curves(action, owner=owner, strip=strip):
+                    try:
+                        mimic_curve_edits = import_anims.apply_mimic_scene_weight_to_strip(
+                            strip,
+                            weight,
+                            target=owner,
+                        )
+                        action = getattr(strip, "action", action)
+                    except Exception:
+                        log.warning(
+                            "Could not apply scene animation weight %.3f to w3_face_poses curves on %s.",
+                            weight,
+                            getattr(action, "name", "<action>"),
+                            exc_info=True,
+                        )
+            else:
+                _apply_scene_weight_to_strip(strip, weight)
+            _mark_scene_weight_applied((strip, action))
+            try:
+                current_frame = context.scene.frame_current
+                context.scene.frame_set(current_frame)
+                context.view_layer.update()
+            except Exception:
+                pass
+
+        changed = int((curve_result or {}).get("changed", 0) or 0) if strip is not None else 0
+        changed += int(mimic_curve_edits or 0) if strip is not None else 0
+        if changed:
+            self.report({'INFO'}, f"Applied scene animation weight factor {weight:.3f} to {action.name} ({changed} curve frames baked).")
+        else:
+            self.report({'INFO'}, f"Applied scene animation weight factor {weight:.3f} to {action.name}.")
+        return {'FINISHED'}
+
+
+class WITCHER_PT_NlaSceneStripSettings(bpy.types.Panel):
+    bl_idname = "WITCHER_PT_nla_scene_strip_settings"
+    bl_label = "Witcher Scene"
+    bl_space_type = 'NLA_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = 'Witcher'
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = False
+        layout.use_property_decorate = False
+
+        obj, track, strip = _resolve_nla_strip(context)
+        if strip is None:
+            layout.label(text="No Witcher scene strip selected.", icon='INFO')
+            return
+
+        action = getattr(strip, "action", None)
+        data_source = _ensure_scene_metadata_for_strip(context, track, strip)
+        if data_source is None:
+            data_source = strip if _idprop_has(strip, "w3_scene_section") else action
+
+        header = layout.row(align=True)
+        header.label(text=getattr(strip, "name", "Strip"), icon='NLA')
+        if obj is not None:
+            header.label(text=getattr(obj, "name", ""), icon='ARMATURE_DATA' if getattr(obj, "type", None) == 'ARMATURE' else 'OBJECT_DATA')
+
+        if track is not None:
+            layout.label(text="Track: " + str(getattr(track, "name", "")))
+        if action is not None:
+            layout.label(text="Action: " + str(getattr(action, "name", "")), icon='ACTION')
+
+        scene_section = _idprop_get(data_source, "w3_scene_section", "")
+        event_name = _idprop_get(data_source, "w3_scene_event_name", "")
+        requested_anim = _idprop_get(data_source, "w3_scene_requested_animation", "")
+        resolved_path = _idprop_get(data_source, "w3_scene_resolved_path", "")
+        if scene_section:
+            layout.label(text="Section: " + str(scene_section))
+        if event_name:
+            layout.label(text="Event: " + str(event_name))
+        if requested_anim:
+            layout.label(text="Anim: " + str(requested_anim))
+        if resolved_path:
+            layout.label(text="Resolved: " + os.path.basename(str(resolved_path)))
+
+        flags_box = layout.box()
+        motion_ex = bool(_idprop_get(data_source, "w3_scene_use_motion_extraction", False))
+        fake_motion = bool(_idprop_get(data_source, "w3_scene_use_fake_motion", False))
+        motion_to_pose = bool(_idprop_get(data_source, "w3_scene_motion_extraction_applied_to_pose", False))
+        root_oriented = bool(_idprop_get(data_source, "w3_scene_root_orientation_applied", False))
+        root_removed = _idprop_get(data_source, "w3_scene_root_orientation_removed_fcurves", "")
+        converted = bool(_idprop_get(data_source, "w3_scene_additive_converted", False))
+        blend_type = str(getattr(strip, "blend_type", _idprop_get(data_source, "w3_scene_blend_type", "")) or "")
+        flags_box.label(text=f"MotionEx {motion_ex}  Fake {fake_motion}  PoseExtract {motion_to_pose}")
+        root_text = f"RootClean {root_oriented}"
+        if root_removed != "":
+            root_text += f"  Removed {root_removed}"
+        flags_box.label(text=root_text)
+        flags_box.label(text=f"Blend {blend_type or 'Default'}  Additive {converted}")
+
+        warning_text = str(
+            _idprop_get(strip, W3_SCENE_ANIMATION_WARNINGS_PROP, "")
+            or _idprop_get(action, W3_SCENE_ANIMATION_WARNINGS_PROP, "")
+            or ""
+        ).strip()
+        if warning_text:
+            warning_box = layout.box()
+            warning_box.alert = True
+            warning_box.label(text="Scene Import Warnings", icon='ERROR')
+            for line in warning_text.splitlines()[-4:]:
+                warning_box.label(text=line[:180])
+
+        prop_target = _scene_weight_prop_target(strip, action)
+        if prop_target is not None and _idprop_has(prop_target, W3_SCENE_EVENT_WEIGHT_PROP):
+            weight_box = layout.box()
+            weight_box.label(text="Weight", icon='SETTINGS')
+            row = weight_box.row(align=True)
+            row.prop(prop_target, f'["{W3_SCENE_EVENT_WEIGHT_PROP}"]', text="Curve Weight", slider=True)
+
+            target_weight = _idprop_float(prop_target, W3_SCENE_EVENT_WEIGHT_PROP, 1.0)
+            strip_weight = float(getattr(strip, "influence", 1.0) or 0.0)
+            baked = bool(
+                _idprop_get(strip, W3_SCENE_EVENT_WEIGHT_CURVE_BAKED_PROP, False)
+                or _idprop_get(action, W3_SCENE_EVENT_WEIGHT_CURVE_BAKED_PROP, False)
+            )
+            curve_edits = _idprop_get(strip, W3_SCENE_EVENT_WEIGHT_CURVE_EDITS_PROP, _idprop_get(action, W3_SCENE_EVENT_WEIGHT_CURVE_EDITS_PROP, ""))
+
+            weight_state_row = weight_box.row(align=True)
+            mismatch = target_weight is not None and not baked and abs(float(target_weight) - strip_weight) > 0.0001
+            weight_state_row.alert = mismatch
+            source_text = f"{float(target_weight):.3f}" if target_weight is not None else "?"
+            state_text = f"Weight: {source_text}  Strip influence: {strip_weight:.3f}"
+            if baked:
+                state_text += f"  Baked: {curve_edits}"
+            weight_state_row.label(text=state_text)
+
+            op = weight_box.operator(WITCH_OT_ApplySceneAdditiveWeight.bl_idname, text="Apply Weight", icon='CHECKMARK')
+            op.action_name = getattr(action, "name", "") if action is not None else ""
+            op.object_name = getattr(obj, "name", "") if obj is not None else ""
+            op.track_name = getattr(track, "name", "") if track is not None else ""
+            op.strip_name = getattr(strip, "name", "") if strip is not None else ""
+            op.weight = float(target_weight) if target_weight is not None else strip_weight
+        else:
+            layout.label(text="No scene weight on this strip.", icon='INFO')
+
+
 class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
     # Promoted to top-level: no longer hidden inside Character Appearances.
     bl_idname = "WITCHER_PT_animset_panel"
@@ -4720,6 +5246,17 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 if anim_path:
                     info.label(text=f"File: {os.path.basename(anim_path)}")
 
+        dialogset_body = section("witcher_anim_dialogset_body_preset", "Dialogset Body Preset", 'ARMATURE_DATA') if anim_tab == "CLIPS" else None
+        if dialogset_body:
+            try:
+                from . import ui_anims_list as _ui_anims_list
+            except Exception:
+                _ui_anims_list = None
+            if _ui_anims_list and hasattr(_ui_anims_list, "draw_quick_dialogset_body_controls"):
+                _ui_anims_list.draw_quick_dialogset_body_controls(dialogset_body, context)
+            else:
+                dialogset_body.label(text="Dialogset body properties not registered.", icon='INFO')
+
         body = section("witcher_pelvis_edit", "Bone Animation Offset Editor", 'BONE_DATA', default_closed=True) if anim_tab == "CLIPS" else None
         if body:
             col = body.column(align=True)
@@ -4786,6 +5323,8 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
 
                 if hasattr(scene, _ui_mimics_dialog.MIMIC_AUTO_COLLAPSE_PROP):
                     mimic_col.prop(scene, _ui_mimics_dialog.MIMIC_AUTO_COLLAPSE_PROP, text="Auto Collapse Categories")
+                if hasattr(scene, _ui_mimics_dialog.MIMIC_SHOW_ALL_PROP):
+                    mimic_col.prop(scene, _ui_mimics_dialog.MIMIC_SHOW_ALL_PROP, text="Show All Mimics")
                 if hasattr(scene, "witcher_anim_nla_mode"):
                     mimic_col.prop(scene, "witcher_anim_nla_mode", text="NLA Load Mode")
 
@@ -4813,6 +5352,13 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 mimic_actions.operator("witcher.quick_mimic_debug", text="Load", icon='PLAY').action = "load"
             else:
                 mimic_col.label(text="Mimic properties not registered.", icon='INFO')
+
+        dialogset_mimic_body = section("witcher_anim_dialogset_mimic_preset", "Dialogset Mimic Preset", 'SHAPEKEY_DATA') if anim_tab == "SPEECH" else None
+        if dialogset_mimic_body:
+            if _ui_mimics_dialog and hasattr(_ui_mimics_dialog, "draw_quick_dialogset_mimic_controls"):
+                _ui_mimics_dialog.draw_quick_dialogset_mimic_controls(dialogset_mimic_body, context)
+            else:
+                dialogset_mimic_body.label(text="Mimic properties not registered.", icon='INFO')
 
         body = section("witcher_anim_dialogue_browser", "Dialogue Browser", 'TEXT', default_closed=False) if anim_tab == "SPEECH" else None
         if body:
@@ -5091,9 +5637,19 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
 
             col_main.operator(WITCH_OT_ResampleAnimation.bl_idname, text="Resample Animation", icon='TIME')
 
+            scene_strip_obj, scene_strip_track, scene_strip = _resolve_nla_strip(context)
+            if scene_strip is not None:
+                _ensure_scene_metadata_for_strip(context, scene_strip_track, scene_strip)
+            selected_scene_action = getattr(scene_strip, "action", None) if scene_strip is not None else None
+
             current_box = col_main.box()
             current_box.label(text="Current Animation", icon='ACTION')
             if display_armature:
+                if selected_scene_action is not None:
+                    selected_track_name = str(getattr(scene_strip_track, "name", "") or "")
+                    selected_strip_name = str(getattr(scene_strip, "name", "") or "")
+                    selected_extra = f" [{selected_track_name}/{selected_strip_name}]" if selected_track_name or selected_strip_name else ""
+                    current_box.label(text=f"NLA (Selected): {selected_scene_action.name}{selected_extra}")
                 frame = scene.frame_current
                 nla_action, nla_info = export_anims.get_nla_action_at_frame(display_armature, frame=frame)
                 if nla_action:
@@ -5167,7 +5723,15 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             action_info_box = col_main.box()
             action_info_box.label(text="Action Import Info", icon='INFO')
             action = None
-            if display_armature:
+            action_source_strip = None
+            action_source_obj = None
+            action_source_track = None
+            if selected_scene_action is not None:
+                action = selected_scene_action
+                action_source_strip = scene_strip
+                action_source_obj = scene_strip_obj
+                action_source_track = scene_strip_track
+            elif display_armature:
                 action, _ = export_anims.resolve_action(
                     display_armature,
                     context=context,
@@ -5177,12 +5741,60 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 source_file = action.get("w3_anim_source_file", "")
                 buffer_source = action.get("w3_anim_buffer_source", "")
                 buffer_detail = action.get("w3_anim_buffer_detail", "")
+                scene_data_source = action_source_strip if _idprop_has(action_source_strip, "w3_scene_section") else action
+                scene_section = _idprop_get(scene_data_source, "w3_scene_section", "")
+                scene_resolved_path = _idprop_get(scene_data_source, "w3_scene_resolved_path", "")
                 if source_file:
                     action_info_box.label(text="File: " + os.path.basename(source_file))
                 if buffer_source:
                     detail_text = f" ({buffer_detail})" if buffer_detail else ""
                     action_info_box.label(text="Buffer: " + buffer_source + detail_text)
-                if not source_file and not buffer_source:
+                if scene_section:
+                    action_info_box.label(text="Scene: " + str(scene_section))
+                    event_name = _idprop_get(scene_data_source, "w3_scene_event_name", "")
+                    if event_name:
+                        action_info_box.label(text="Event: " + str(event_name))
+                    requested_anim = _idprop_get(scene_data_source, "w3_scene_requested_animation", "")
+                    if requested_anim:
+                        action_info_box.label(text="Anim: " + str(requested_anim))
+                    if scene_resolved_path:
+                        action_info_box.label(text="Resolved: " + os.path.basename(str(scene_resolved_path)))
+                    motion_ex = bool(_idprop_get(scene_data_source, "w3_scene_use_motion_extraction", False))
+                    fake_motion = bool(_idprop_get(scene_data_source, "w3_scene_use_fake_motion", False))
+                    extracted = bool(_idprop_get(scene_data_source, "w3_scene_trajectory_extracted", False))
+                    trajectory_source = str(_idprop_get(scene_data_source, "w3_scene_trajectory_source", "") or "")
+                    root_oriented = bool(_idprop_get(scene_data_source, "w3_scene_root_orientation_applied", False))
+                    root_removed = _idprop_get(scene_data_source, "w3_scene_root_orientation_removed_fcurves", "")
+                    converted = bool(_idprop_get(scene_data_source, "w3_scene_additive_converted", False))
+                    source_text = f" ({trajectory_source})" if trajectory_source else ""
+                    action_info_box.label(text=f"MotionEx {motion_ex}  Fake {fake_motion}  Extracted {extracted}{source_text}  Additive {converted}")
+                    root_text = f"RootClean {root_oriented}"
+                    if root_removed != "":
+                        root_text += f"  Removed {root_removed}"
+                    action_info_box.label(text=root_text)
+                    warning_text = str(
+                        _idprop_get(action_source_strip, W3_SCENE_ANIMATION_WARNINGS_PROP, "")
+                        or _idprop_get(action, W3_SCENE_ANIMATION_WARNINGS_PROP, "")
+                        or ""
+                    ).strip()
+                    if warning_text:
+                        warning_row = action_info_box.row()
+                        warning_row.alert = True
+                        warning_row.label(text="Scene importer changed this animation; see NLA Witcher Scene panel.", icon='ERROR')
+                    weight_target = _scene_weight_prop_target(action_source_strip, action)
+                    if _idprop_has(weight_target, W3_SCENE_EVENT_WEIGHT_PROP):
+                        row = action_info_box.row(align=True)
+                        row.prop(action_source_strip, "influence", text="Weight", slider=True)
+                        op = row.operator(WITCH_OT_ApplySceneAdditiveWeight.bl_idname, text="", icon='CHECKMARK')
+                        op.action_name = action.name
+                        op.object_name = getattr(action_source_obj, "name", "") if action_source_obj is not None else ""
+                        op.track_name = getattr(action_source_track, "name", "") if action_source_track is not None else ""
+                        op.strip_name = getattr(action_source_strip, "name", "") if action_source_strip is not None else ""
+                        try:
+                            op.weight = float(getattr(action_source_strip, "influence", _idprop_get(weight_target, W3_SCENE_EVENT_WEIGHT_PROP, 1.0)))
+                        except Exception:
+                            op.weight = 1.0
+                if not source_file and not buffer_source and not scene_section:
                     action_info_box.label(text="No import metadata found.")
             else:
                 action_info_box.label(text="No action found.")
@@ -5675,6 +6287,8 @@ classes = [
     WITCH_OT_ApplyRootOrientation,
     WITCH_OT_ResampleAnimation,
     WITCH_OT_BakePelvisToTrajectory,
+    WITCH_OT_ApplySceneAdditiveWeight,
+    WITCHER_PT_NlaSceneStripSettings,
     ListItem,
     TOOL_UL_List,
     TOOL_OT_List_Add,

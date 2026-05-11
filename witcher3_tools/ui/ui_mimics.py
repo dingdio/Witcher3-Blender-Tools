@@ -21,6 +21,15 @@ from bpy.props import (
 )
 
 from .. import get_uncook_path
+from .mimic_compat import (
+    collect_actor_mimic_animset_paths,
+    get_quick_mimic_source_key,
+    normalize_animset_path,
+)
+from ..CR2W.scene_csv_utils import (
+    _parse_mimics_csv,
+    _resolve_mimic_layer_anim_candidates,
+)
 
 
 _MIMIC_NODE_CACHE = None
@@ -33,7 +42,29 @@ MIMIC_LIST_INDEX_PROP = "witcher_mimic_list_index"
 MIMIC_AUTO_LOAD_PROP = "witcher_quick_mimic_load_on_select"
 MIMIC_SEARCH_PROP = "witcher_quick_mimic_search"
 MIMIC_AUTO_COLLAPSE_PROP = "witcher_quick_mimic_auto_collapse_categories"
+MIMIC_SHOW_ALL_PROP = "witcher_quick_mimic_show_all"
+MIMIC_DIALOGSET_STATE_PROP = "witcher_quick_mimic_dialogset_state"
+MIMIC_DIALOGSET_EYES_PROP = "witcher_quick_mimic_dialogset_layer_eyes"
+MIMIC_DIALOGSET_POSE_PROP = "witcher_quick_mimic_dialogset_layer_pose"
+MIMIC_DIALOGSET_ANIM_PROP = "witcher_quick_mimic_dialogset_layer_animation"
+MIMIC_DIALOGSET_POSE_WEIGHT_PROP = "witcher_quick_mimic_dialogset_layer_pose_weight"
+MIMIC_DIALOGSET_EXPANDED_PROP = "witcher_quick_mimic_dialogset_expanded"
+MIMIC_DIALOGSET_RESOLVED_STATUS_PROP = "witcher_quick_mimic_dialogset_resolved_status"
+MIMIC_DIALOGSET_RESOLVED_EYES_PROP = "witcher_quick_mimic_dialogset_resolved_eyes"
+MIMIC_DIALOGSET_RESOLVED_POSE_PROP = "witcher_quick_mimic_dialogset_resolved_pose"
+MIMIC_DIALOGSET_RESOLVED_ANIM_PROP = "witcher_quick_mimic_dialogset_resolved_animation"
 _MIMIC_UNCATEGORIZED_LABEL = "Uncategorized"
+_ACTIVE_MIMIC_SOURCE_KEY_BY_SCENE = {}
+_ACTIVE_MIMIC_DRAW_KEY_BY_SCENE = {}
+_ACTIVE_MIMIC_SOURCE_KEY_SENTINEL = object()
+_UPDATING_DIALOGSET_MIMICS = False
+_DIALOGSET_MIMIC_RESOLVE_CACHE = {}
+_DIALOGSET_MIMIC_STATE_ITEMS = None
+_DIALOGSET_MIMIC_TRACKS = {
+    "eyes": "SceneDialogsetMimicsEyes",
+    "pose": "SceneDialogsetMimicsPose",
+    "animation": "SceneDialogsetMimicsAnim",
+}
 
 
 _MIMIC_BADGE_ABBREVIATIONS = {
@@ -66,6 +97,15 @@ def _resolve_scene(context=None):
     return getattr(bpy.context, "scene", None)
 
 
+def _scene_key(scene):
+    if scene is None:
+        return 0
+    try:
+        return int(scene.as_pointer())
+    except Exception:
+        return 0
+
+
 def _scene_has_mimic_props(scene):
     return bool(
         scene
@@ -73,6 +113,27 @@ def _scene_has_mimic_props(scene):
         and hasattr(scene, MIMIC_LIST_PROP)
         and hasattr(scene, MIMIC_LIST_INDEX_PROP)
     )
+
+
+def _armature_draw_key(armature_obj, show_all=False):
+    if armature_obj is None:
+        return (bool(show_all), 0, "")
+    try:
+        pointer = int(armature_obj.as_pointer())
+    except Exception:
+        pointer = 0
+    return (bool(show_all), pointer, str(getattr(armature_obj, "name", "") or ""))
+
+
+def _quick_mimic_draw_key(context, show_all=False):
+    scene = getattr(context, "scene", None)
+    active_obj = getattr(context, "object", None) or getattr(context, "active_object", None)
+    if active_obj is not None and getattr(active_obj, "type", None) == "ARMATURE":
+        return _armature_draw_key(active_obj, show_all=show_all)
+    scene_armature = getattr(scene, "witcher_main_armature", None) if scene is not None else None
+    if scene_armature is not None and getattr(scene_armature, "type", None) == "ARMATURE":
+        return _armature_draw_key(scene_armature, show_all=show_all)
+    return _armature_draw_key(None, show_all=show_all)
 
 
 def _is_id_write_context_error(exc):
@@ -286,12 +347,27 @@ def _iter_mimic_category_path(item_data):
     return path
 
 
-def _build_filtered_mimic_nodes(search_text):
+def _build_filtered_mimic_nodes(search_text, main_arm_obj=None, show_all=False):
     global _MIMIC_NODE_CACHE
     if _MIMIC_NODE_CACHE is None:
         _MIMIC_NODE_CACHE = _build_mimic_node_cache()
 
-    filtered_items = [item for item in _MIMIC_NODE_CACHE if _matches_mimic_search(item, search_text)]
+    compatible_paths = None
+    if not show_all and main_arm_obj is not None:
+        compatible_paths = set(collect_actor_mimic_animset_paths(main_arm_obj))
+
+    def _is_compatible(item_data):
+        if show_all or main_arm_obj is None:
+            return True
+        if not compatible_paths:
+            return False
+        return normalize_animset_path(item_data.get("filePath", "")) in compatible_paths
+
+    filtered_items = [
+        item for item in _MIMIC_NODE_CACHE
+        if _matches_mimic_search(item, search_text)
+        and _is_compatible(item)
+    ]
     filtered_items.sort(key=_mimic_sort_key)
 
     nodes = []
@@ -464,6 +540,373 @@ def _load_selected_mimic(context):
     return True
 
 
+def _is_none_choice(value):
+    return str(value or "").strip().upper() in ("", "NONE", "ZERO")
+
+
+def _iter_mimic_state_displays():
+    try:
+        data = _parse_mimics_csv()
+    except Exception:
+        data = {}
+    for state in data.values():
+        display = str(state.get("display", "") or "").strip()
+        if display:
+            yield display
+
+
+def _get_dialogset_mimic_state_items():
+    global _DIALOGSET_MIMIC_STATE_ITEMS
+    if _DIALOGSET_MIMIC_STATE_ITEMS is None:
+        items = [("None", "None", "")]
+        seen = {"none"}
+        for display in _iter_mimic_state_displays():
+            key = display.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append((display, display, ""))
+        _DIALOGSET_MIMIC_STATE_ITEMS = tuple(items)
+    return _DIALOGSET_MIMIC_STATE_ITEMS
+
+
+def _resolve_dialogset_mimic_layer_info(context, actor_obj, layer_value, layer_column):
+    info = {
+        "layer_column": layer_column,
+        "layer_label": layer_column.title() if layer_column != "animation" else "Animation",
+        "track_name": _DIALOGSET_MIMIC_TRACKS.get(layer_column, ""),
+        "state": str(layer_value or "").strip(),
+        "candidates": [],
+        "resolved_anim_name": "",
+        "resolved_path": "",
+        "catalog_id": "",
+    }
+    if actor_obj is None or _is_none_choice(layer_value):
+        return info
+
+    candidates = _resolve_mimic_layer_anim_candidates(layer_value, layer_column)
+    info["candidates"] = list(candidates)
+    if not candidates:
+        return info
+
+    from ..ui.ui_anims_list import GetAnimationInfoByName
+
+    for candidate in candidates:
+        resolved_anim_name, fdir = GetAnimationInfoByName(candidate, actor_obj, prefer_mimic=True, quiet=True)
+        if not resolved_anim_name or not fdir:
+            continue
+        info["resolved_anim_name"] = str(resolved_anim_name)
+        info["resolved_path"] = str(fdir)
+        info["catalog_id"] = str(candidate)
+        break
+    return info
+
+
+def _apply_latest_track_pose_weight(armatures, track_name, weight):
+    return import_anims.apply_mimic_pose_weight_to_track(
+        armatures,
+        track_name,
+        weight,
+        latest_only=True,
+    )
+
+
+def _iter_scene_armatures_with_track(scene, track_name):
+    for obj in getattr(scene, "objects", []) if scene is not None else []:
+        if getattr(obj, "type", None) != "ARMATURE":
+            continue
+        anim_data = getattr(obj, "animation_data", None)
+        if anim_data and getattr(anim_data, "nla_tracks", {}).get(track_name):
+            yield obj
+
+
+def set_dialogset_mimic_pose_weight(context, weight, actor_obj=None, fallback_to_scene=True):
+    scene = getattr(context, "scene", None) if context is not None else bpy.context.scene
+    track_name = _DIALOGSET_MIMIC_TRACKS["pose"]
+    targets = []
+    if actor_obj is not None:
+        targets.append(actor_obj)
+    try:
+        main_arm_obj = _resolve_main_armature(context or bpy.context)
+    except Exception:
+        main_arm_obj = None
+    if main_arm_obj is not None:
+        targets.append(main_arm_obj)
+
+    changed = import_anims.apply_mimic_pose_weight_to_track(targets, track_name, weight)
+    if changed == 0 and fallback_to_scene:
+        changed = import_anims.apply_mimic_pose_weight_to_track(
+            _iter_scene_armatures_with_track(scene, track_name),
+            track_name,
+            weight,
+        )
+    try:
+        view_layer = getattr(context or bpy.context, "view_layer", None)
+        if view_layer is not None:
+            view_layer.update()
+    except Exception:
+        pass
+    return changed
+
+
+def _load_resolved_dialogset_mimic_layer(context, actor_obj, info, nla_mode, pose_weight=1.0):
+    if not info.get("resolved_anim_name") or not info.get("resolved_path"):
+        return False
+
+    from ..ui.ui_anims_list import load_anim_into_scene
+
+    try:
+        target_armatures = load_anim_into_scene(
+            context,
+            info["resolved_anim_name"],
+            info["resolved_path"],
+            actor_obj,
+            NLA_track=info["track_name"],
+            at_frame=0,
+            face_target_mode="owner",
+            nla_mode=nla_mode,
+        )
+        if info.get("layer_column") == "pose":
+            changed = _apply_latest_track_pose_weight(target_armatures, info["track_name"], pose_weight)
+            if changed == 0 and abs(float(pose_weight) - 1.0) > 0.000001:
+                log.warning(
+                    "Dialogset mimic pose weight %.3f did not find any w3_face_poses curves to scale on '%s'.",
+                    float(pose_weight),
+                    info.get("resolved_anim_name", ""),
+                )
+        log.info(
+            "Loaded quick dialogset mimic layer '%s' using '%s' onto '%s'",
+            info.get("state", ""),
+            info.get("catalog_id", ""),
+            getattr(actor_obj, "name", "?"),
+        )
+        return True
+    except Exception as exc:
+        log.debug(
+            "Quick dialogset mimic candidate '%s' failed: %s",
+            info.get("catalog_id", ""),
+            exc,
+            exc_info=True,
+        )
+    return False
+
+
+def resolve_quick_dialogset_mimics(context):
+    scene = getattr(context, "scene", None)
+    actor_obj = _resolve_main_armature(context)
+    if scene is None:
+        return None, []
+
+    state_name = str(getattr(scene, MIMIC_DIALOGSET_STATE_PROP, "None") or "").strip()
+    layer_inputs = (
+        (getattr(scene, MIMIC_DIALOGSET_EYES_PROP, "None"), state_name, "eyes"),
+        (getattr(scene, MIMIC_DIALOGSET_POSE_PROP, "None"), state_name, "pose"),
+        (getattr(scene, MIMIC_DIALOGSET_ANIM_PROP, "None"), state_name, "animation"),
+    )
+    source_key = get_quick_mimic_source_key(actor_obj, show_all=False) if actor_obj is not None else ("__no_actor__",)
+    selection_key = tuple((str(value or ""), str(fallback or ""), layer) for value, fallback, layer in layer_inputs)
+    cache_key = (source_key, state_name, selection_key)
+    cached = _DIALOGSET_MIMIC_RESOLVE_CACHE.get(cache_key)
+    if cached is not None:
+        return actor_obj, [dict(item) for item in cached]
+
+    resolved = []
+    for override_value, fallback_state, layer_column in layer_inputs:
+        value = str(override_value or "").strip()
+        if _is_none_choice(value):
+            value = fallback_state
+        if _is_none_choice(value):
+            continue
+        resolved.append(_resolve_dialogset_mimic_layer_info(context, actor_obj, value, layer_column))
+    _DIALOGSET_MIMIC_RESOLVE_CACHE[cache_key] = [dict(item) for item in resolved]
+    if len(_DIALOGSET_MIMIC_RESOLVE_CACHE) > 256:
+        _DIALOGSET_MIMIC_RESOLVE_CACHE.clear()
+    return actor_obj, resolved
+
+
+def _report_unresolved_dialogset_mimics(actor_obj, resolved):
+    for info in resolved:
+        if info.get("resolved_anim_name"):
+            continue
+        log.warning(
+            "No compatible dialogset mimic found for layer %s='%s' on '%s' (tried: %s)",
+            info.get("layer_column", ""),
+            info.get("state", ""),
+            getattr(actor_obj, "name", "?"),
+            ", ".join(info.get("candidates", []) or []),
+        )
+
+
+def _format_resolved_dialogset_mimic(info):
+    if not info or not info.get("resolved_anim_name"):
+        state = str((info or {}).get("state", "") or "").strip()
+        return f"{state}: <not resolved>" if state else ""
+    resolved_file = os.path.basename(str(info.get("resolved_path", "") or ""))
+    return f"{info.get('state', '')}: {info.get('resolved_anim_name', '')} [{resolved_file}]"
+
+
+def _set_dialogset_resolved_preview(scene, resolved, status=""):
+    if scene is None:
+        return
+    by_layer = {str(info.get("layer_column", "")): info for info in (resolved or [])}
+    values = {
+        MIMIC_DIALOGSET_RESOLVED_STATUS_PROP: str(status or ""),
+        MIMIC_DIALOGSET_RESOLVED_EYES_PROP: _format_resolved_dialogset_mimic(by_layer.get("eyes")),
+        MIMIC_DIALOGSET_RESOLVED_POSE_PROP: _format_resolved_dialogset_mimic(by_layer.get("pose")),
+        MIMIC_DIALOGSET_RESOLVED_ANIM_PROP: _format_resolved_dialogset_mimic(by_layer.get("animation")),
+    }
+    for prop_name, value in values.items():
+        if hasattr(scene, prop_name):
+            setattr(scene, prop_name, value)
+
+
+def _clear_dialogset_resolved_preview(scene):
+    _set_dialogset_resolved_preview(scene, [], status="Selection changed; resolve before loading.")
+
+
+def _sync_dialogset_layers_from_state(scene, state_name):
+    for prop_name in (MIMIC_DIALOGSET_EYES_PROP, MIMIC_DIALOGSET_POSE_PROP, MIMIC_DIALOGSET_ANIM_PROP):
+        if hasattr(scene, prop_name):
+            setattr(scene, prop_name, state_name)
+
+
+def on_dialogset_mimic_state_changed(self, context):
+    global _UPDATING_DIALOGSET_MIMICS
+    if _UPDATING_DIALOGSET_MIMICS or context is None or getattr(context, "scene", None) is None:
+        return
+    state_name = str(getattr(context.scene, MIMIC_DIALOGSET_STATE_PROP, "None") or "").strip()
+    if _is_none_choice(state_name):
+        return
+    try:
+        _UPDATING_DIALOGSET_MIMICS = True
+        _sync_dialogset_layers_from_state(context.scene, state_name)
+        _clear_dialogset_resolved_preview(context.scene)
+    finally:
+        _UPDATING_DIALOGSET_MIMICS = False
+
+
+def on_dialogset_mimic_layer_changed(self, context):
+    global _UPDATING_DIALOGSET_MIMICS
+    if _UPDATING_DIALOGSET_MIMICS or context is None or getattr(context, "scene", None) is None:
+        return
+    if not hasattr(context.scene, MIMIC_DIALOGSET_STATE_PROP):
+        return
+    try:
+        _UPDATING_DIALOGSET_MIMICS = True
+        setattr(context.scene, MIMIC_DIALOGSET_STATE_PROP, "None")
+        _clear_dialogset_resolved_preview(context.scene)
+    finally:
+        _UPDATING_DIALOGSET_MIMICS = False
+
+
+def on_dialogset_mimic_pose_weight_changed(self, context):
+    if context is None or getattr(context, "scene", None) is None:
+        return
+    set_dialogset_mimic_pose_weight(
+        context,
+        getattr(context.scene, MIMIC_DIALOGSET_POSE_WEIGHT_PROP, 1.0),
+    )
+
+
+def resolve_and_store_quick_dialogset_mimics(context):
+    scene = getattr(context, "scene", None)
+    actor_obj, resolved = resolve_quick_dialogset_mimics(context)
+    if scene is None:
+        return None, []
+    if actor_obj is None:
+        _set_dialogset_resolved_preview(scene, [], status="No target character selected.")
+        return actor_obj, []
+    if not resolved:
+        _set_dialogset_resolved_preview(scene, [], status="No mimic layers selected.")
+        return actor_obj, []
+    unresolved = [info for info in resolved if not info.get("resolved_anim_name")]
+    status = "Resolve failed for one or more layers." if unresolved else "Resolved."
+    _set_dialogset_resolved_preview(scene, resolved, status=status)
+    return actor_obj, resolved
+
+
+def load_quick_dialogset_mimics(context):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return False
+    actor_obj, resolved = resolve_and_store_quick_dialogset_mimics(context)
+    if actor_obj is None:
+        log.warning("No target character armature available for dialogset mimic import.")
+        return False
+    if not resolved:
+        return False
+
+    from ..ui.ui_anims_list import SetupActor
+
+    SetupActor(actor_obj, context=context)
+    mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
+    nla_mode = mode_map.get(getattr(scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+
+    loaded_any = False
+    for info in resolved:
+        try:
+            pose_weight = float(getattr(scene, MIMIC_DIALOGSET_POSE_WEIGHT_PROP, 1.0))
+        except Exception:
+            pose_weight = 1.0
+        if _load_resolved_dialogset_mimic_layer(context, actor_obj, info, nla_mode, pose_weight=pose_weight):
+            loaded_any = True
+    if not loaded_any:
+        _report_unresolved_dialogset_mimics(actor_obj, resolved)
+    return loaded_any
+
+
+def _draw_resolved_dialogset_mimics(layout, context):
+    scene = getattr(context, "scene", None)
+    preview = layout.column(align=True)
+    preview.label(text="Resolved Animations", icon='PREVIEW_RANGE')
+    if scene is None:
+        return
+    status = str(getattr(scene, MIMIC_DIALOGSET_RESOLVED_STATUS_PROP, "") or "").strip()
+    if status:
+        preview.label(text=status, icon='INFO')
+    for prop_name, label in (
+        (MIMIC_DIALOGSET_RESOLVED_EYES_PROP, "actorMimicsLayer_Eyes"),
+        (MIMIC_DIALOGSET_RESOLVED_POSE_PROP, "actorMimicsLayer_Pose"),
+        (MIMIC_DIALOGSET_RESOLVED_ANIM_PROP, "actorMimicsLayer_Animation"),
+    ):
+        text = str(getattr(scene, prop_name, "") or "").strip()
+        if text:
+            preview.label(text=f"{label}: {text}", icon='ANIM_DATA')
+    if not status and not any(str(getattr(scene, prop, "") or "").strip() for prop in (
+        MIMIC_DIALOGSET_RESOLVED_EYES_PROP,
+        MIMIC_DIALOGSET_RESOLVED_POSE_PROP,
+        MIMIC_DIALOGSET_RESOLVED_ANIM_PROP,
+    )):
+        preview.label(text="Use Resolve Mimics to preview before loading.", icon='INFO')
+
+
+def draw_quick_dialogset_mimic_controls(layout, context):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return
+    required = (
+        MIMIC_DIALOGSET_STATE_PROP,
+        MIMIC_DIALOGSET_EYES_PROP,
+        MIMIC_DIALOGSET_POSE_PROP,
+        MIMIC_DIALOGSET_ANIM_PROP,
+    )
+    if not all(hasattr(scene, prop) for prop in required):
+        layout.label(text="Dialogset mimic properties not registered.", icon='INFO')
+        return
+
+    col = layout.column(align=True)
+    col.prop(scene, MIMIC_DIALOGSET_STATE_PROP, text="actorMimicsEmotionalState")
+    col.prop(scene, MIMIC_DIALOGSET_EYES_PROP, text="actorMimicsLayer_Eyes")
+    col.prop(scene, MIMIC_DIALOGSET_POSE_PROP, text="actorMimicsLayer_Pose")
+    col.prop(scene, MIMIC_DIALOGSET_ANIM_PROP, text="actorMimicsLayer_Animation")
+    if hasattr(scene, MIMIC_DIALOGSET_POSE_WEIGHT_PROP):
+        col.prop(scene, MIMIC_DIALOGSET_POSE_WEIGHT_PROP, text="actorMimicsLayer_Pose_Weight", slider=True)
+    _draw_resolved_dialogset_mimics(col, context)
+    actions = col.row(align=True)
+    actions.operator("witcher.quick_mimic_dialogset_resolve", text="Resolve Mimics", icon='PREVIEW_RANGE')
+    actions.operator("witcher.quick_mimic_dialogset_load", text="Load Resolved", icon='PLAY')
+
+
 class MimicsResourceManager:
     resourceManager = None
     def __init__(self):
@@ -549,7 +992,13 @@ def SetupNodeData(context=None):
 
     search_text = str(getattr(scene, MIMIC_SEARCH_PROP, "") or "").strip()
     auto_expand_for_search = bool(search_text)
-    node_data = _build_filtered_mimic_nodes(search_text)
+    ctx = context or bpy.context
+    show_all = bool(getattr(scene, MIMIC_SHOW_ALL_PROP, False))
+    main_arm_obj = _resolve_main_armature(ctx)
+    source_key = get_quick_mimic_source_key(main_arm_obj, show_all=show_all)
+    _ACTIVE_MIMIC_SOURCE_KEY_BY_SCENE[_scene_key(scene)] = source_key
+    _ACTIVE_MIMIC_DRAW_KEY_BY_SCENE[_scene_key(scene)] = _armature_draw_key(main_arm_obj, show_all=show_all)
+    node_data = _build_filtered_mimic_nodes(search_text, main_arm_obj=main_arm_obj, show_all=show_all)
 
     myNodes.clear()
     for item_data in node_data:
@@ -783,6 +1232,50 @@ class MyMimicListItem_Debug(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WITCH_OT_QuickMimicDialogsetLoad(bpy.types.Operator):
+    bl_idname = "witcher.quick_mimic_dialogset_load"
+    bl_label = "Load Dialogset Mimics"
+    bl_description = "Load dialogset-style mimic layers onto the current character"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        try:
+            if not load_quick_dialogset_mimics(context):
+                self.report({'WARNING'}, "No compatible dialogset mimics were loaded.")
+                return {'CANCELLED'}
+        except Exception as exc:
+            log.error("Quick dialogset mimic load failed.", exc_info=True)
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class WITCH_OT_QuickMimicDialogsetResolve(bpy.types.Operator):
+    bl_idname = "witcher.quick_mimic_dialogset_resolve"
+    bl_label = "Resolve Dialogset Mimics"
+    bl_description = "Resolve the selected dialogset mimic layers without importing them"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            actor_obj, resolved = resolve_and_store_quick_dialogset_mimics(context)
+            if actor_obj is None:
+                self.report({'WARNING'}, "No target character selected.")
+                return {'CANCELLED'}
+            if not resolved:
+                self.report({'WARNING'}, "No mimic layers selected.")
+                return {'CANCELLED'}
+            unresolved = [info for info in resolved if not info.get("resolved_anim_name")]
+            if unresolved:
+                self.report({'WARNING'}, "One or more mimic layers did not resolve.")
+                return {'CANCELLED'}
+        except Exception as exc:
+            log.error("Quick dialogset mimic resolve failed.", exc_info=True)
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 class OBJECT_OT_mimic_category_bulk(bpy.types.Operator):
     bl_idname = 'witcher.quick_mimic_category_bulk'
     bl_label = 'Category Bulk'
@@ -866,13 +1359,6 @@ class MYMIMICLISTITEM_UL_basic(bpy.types.UIList):
                 label_op.button_id = index
             else:
                 frame.label(text=item.name)
-                hint_text = (getattr(item, "hint", "") or "").strip()
-                match_icon = _get_mimic_match_icon(context, item)
-                if match_icon:
-                    frame.label(text="", icon=match_icon)
-                if hint_text:
-                    frame.label(text=hint_text)
-
                 anim_id = ""
                 if ";" in str(getattr(item, "mimicLineId", "")):
                     _file_name, anim_id = str(item.mimicLineId).split(";", 1)
@@ -904,7 +1390,10 @@ def ensure_mimic_list_initialized(context):
     items = getattr(scene, MIMIC_LIST_PROP, None)
     if nodes is None or items is None:
         return
-    if len(nodes) == 0 and len(items) == 0:
+    show_all = bool(getattr(scene, MIMIC_SHOW_ALL_PROP, False))
+    current_key = _quick_mimic_draw_key(context, show_all=show_all)
+    stored_key = _ACTIVE_MIMIC_DRAW_KEY_BY_SCENE.get(_scene_key(scene), _ACTIVE_MIMIC_SOURCE_KEY_SENTINEL)
+    if stored_key != current_key or (len(nodes) == 0 and len(items) == 0):
         _schedule_deferred_mimic_refresh()
 
 
@@ -927,6 +1416,8 @@ class SCENE_PT_witcher_mimic_list(WITCH_PT_Base, bpy.types.Panel):
 
         control_row = layout.row(align=True)
         control_row.prop(scn, MIMIC_AUTO_LOAD_PROP, text="Load on Select")
+        if hasattr(scn, MIMIC_SHOW_ALL_PROP):
+            control_row.prop(scn, MIMIC_SHOW_ALL_PROP, text="Show All Mimics", toggle=True)
         control_row.operator("witcher.quick_mimic_debug", text="Reset", icon='FILE_REFRESH').action = "reset3"
         control_row.operator("witcher.quick_mimic_debug", text="Load", icon='PLAY').action = "load"
 
@@ -955,6 +1446,8 @@ classes = (
         MyMimicListItem,
         MyMimicListItem_Expand,
         MyMimicListItem_Debug,
+        WITCH_OT_QuickMimicDialogsetLoad,
+        WITCH_OT_QuickMimicDialogsetResolve,
         OBJECT_OT_mimic_category_bulk,
         MyMimicListItem_Info,
         MYMIMICLISTITEM_UL_basic,
@@ -991,6 +1484,12 @@ def on_mimic_search_changed(self, context):
     RefreshMimicList(context=context)
 
 
+def on_mimic_show_all_changed(self, context):
+    if context is None or getattr(context, "scene", None) is None:
+        return
+    _schedule_deferred_mimic_refresh()
+
+
 def on_mimic_auto_collapse_categories_changed(self, context):
     if context is None or getattr(context, "scene", None) is None:
         return
@@ -1019,6 +1518,7 @@ def on_mimic_auto_collapse_categories_changed(self, context):
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    dialogset_mimic_items = _get_dialogset_mimic_state_items()
     if not hasattr(bpy.types.Scene, MIMIC_NODES_PROP):
         setattr(bpy.types.Scene, MIMIC_NODES_PROP, bpy.props.CollectionProperty(type=MyMimicListNode))
     if not hasattr(bpy.types.Scene, MIMIC_LIST_PROP):
@@ -1045,12 +1545,74 @@ def register():
             default="",
             update=on_mimic_search_changed,
         ))
+    if not hasattr(bpy.types.Scene, MIMIC_SHOW_ALL_PROP):
+        setattr(bpy.types.Scene, MIMIC_SHOW_ALL_PROP, BoolProperty(
+            name="Show All Mimics",
+            description="Show every mimic catalog entry instead of filtering by the selected character's mimic sets",
+            default=False,
+            update=on_mimic_show_all_changed,
+        ))
+    if not hasattr(bpy.types.Scene, MIMIC_DIALOGSET_EXPANDED_PROP):
+        setattr(bpy.types.Scene, MIMIC_DIALOGSET_EXPANDED_PROP, BoolProperty(
+            name="Dialogset Mimic Preset",
+            description="Show dialogset-style mimic preset controls",
+            default=True,
+        ))
+    if not hasattr(bpy.types.Scene, MIMIC_DIALOGSET_STATE_PROP):
+        setattr(bpy.types.Scene, MIMIC_DIALOGSET_STATE_PROP, bpy.props.EnumProperty(
+            name="State",
+            description="Overall dialogset mimic state. Selecting this fills all layer fields.",
+            items=dialogset_mimic_items,
+            update=on_dialogset_mimic_state_changed,
+        ))
+    if not hasattr(bpy.types.Scene, MIMIC_DIALOGSET_EYES_PROP):
+        setattr(bpy.types.Scene, MIMIC_DIALOGSET_EYES_PROP, bpy.props.EnumProperty(
+            name="Eyes",
+            description="Eyes layer state for dialogset-style mimic loading",
+            items=dialogset_mimic_items,
+            update=on_dialogset_mimic_layer_changed,
+        ))
+    if not hasattr(bpy.types.Scene, MIMIC_DIALOGSET_POSE_PROP):
+        setattr(bpy.types.Scene, MIMIC_DIALOGSET_POSE_PROP, bpy.props.EnumProperty(
+            name="Pose",
+            description="Pose layer state for dialogset-style mimic loading",
+            items=dialogset_mimic_items,
+            update=on_dialogset_mimic_layer_changed,
+        ))
+    if not hasattr(bpy.types.Scene, MIMIC_DIALOGSET_ANIM_PROP):
+        setattr(bpy.types.Scene, MIMIC_DIALOGSET_ANIM_PROP, bpy.props.EnumProperty(
+            name="Animation",
+            description="Animation layer state for dialogset-style mimic loading",
+            items=dialogset_mimic_items,
+            update=on_dialogset_mimic_layer_changed,
+        ))
+    if not hasattr(bpy.types.Scene, MIMIC_DIALOGSET_POSE_WEIGHT_PROP):
+        setattr(bpy.types.Scene, MIMIC_DIALOGSET_POSE_WEIGHT_PROP, bpy.props.FloatProperty(
+            name="actorMimicsLayer_Pose_Weight",
+            description="Blend weight for the dialogset mimic pose layer",
+            default=1.0,
+            min=0.0,
+            max=1.0,
+            update=on_dialogset_mimic_pose_weight_changed,
+        ))
+    for prop_name in (
+        MIMIC_DIALOGSET_RESOLVED_STATUS_PROP,
+        MIMIC_DIALOGSET_RESOLVED_EYES_PROP,
+        MIMIC_DIALOGSET_RESOLVED_POSE_PROP,
+        MIMIC_DIALOGSET_RESOLVED_ANIM_PROP,
+    ):
+        if not hasattr(bpy.types.Scene, prop_name):
+            setattr(bpy.types.Scene, prop_name, StringProperty(default=""))
 
 
 def unregister():
-    global _MIMIC_NODE_CACHE, _MIMIC_REFRESH_DEFERRED
+    global _MIMIC_NODE_CACHE, _MIMIC_REFRESH_DEFERRED, _DIALOGSET_MIMIC_STATE_ITEMS
     _MIMIC_NODE_CACHE = None
     _MIMIC_REFRESH_DEFERRED = False
+    _DIALOGSET_MIMIC_STATE_ITEMS = None
+    _ACTIVE_MIMIC_SOURCE_KEY_BY_SCENE.clear()
+    _ACTIVE_MIMIC_DRAW_KEY_BY_SCENE.clear()
+    _DIALOGSET_MIMIC_RESOLVE_CACHE.clear()
     try:
         if bpy.app.timers.is_registered(_deferred_refresh_mimic_list):
             bpy.app.timers.unregister(_deferred_refresh_mimic_list)
@@ -1058,6 +1620,22 @@ def unregister():
         pass
     if hasattr(bpy.types.Scene, MIMIC_SEARCH_PROP):
         delattr(bpy.types.Scene, MIMIC_SEARCH_PROP)
+    if hasattr(bpy.types.Scene, MIMIC_SHOW_ALL_PROP):
+        delattr(bpy.types.Scene, MIMIC_SHOW_ALL_PROP)
+    for prop_name in (
+        MIMIC_DIALOGSET_ANIM_PROP,
+        MIMIC_DIALOGSET_POSE_WEIGHT_PROP,
+        MIMIC_DIALOGSET_RESOLVED_ANIM_PROP,
+        MIMIC_DIALOGSET_RESOLVED_POSE_PROP,
+        MIMIC_DIALOGSET_RESOLVED_EYES_PROP,
+        MIMIC_DIALOGSET_RESOLVED_STATUS_PROP,
+        MIMIC_DIALOGSET_POSE_PROP,
+        MIMIC_DIALOGSET_EYES_PROP,
+        MIMIC_DIALOGSET_STATE_PROP,
+        MIMIC_DIALOGSET_EXPANDED_PROP,
+    ):
+        if hasattr(bpy.types.Scene, prop_name):
+            delattr(bpy.types.Scene, prop_name)
     if hasattr(bpy.types.Scene, MIMIC_AUTO_COLLAPSE_PROP):
         delattr(bpy.types.Scene, MIMIC_AUTO_COLLAPSE_PROP)
     if hasattr(bpy.types.Scene, MIMIC_AUTO_LOAD_PROP):
