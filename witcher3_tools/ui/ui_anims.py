@@ -74,6 +74,9 @@ W3_SCENE_EVENT_GUID_INDEX_PROP = "w3_scene_event_guid_index"
 W3_SCENE_ANIMATION_WARNINGS_PROP = "w3_scene_animation_warnings"
 W3_SCENE_EVENT_WEIGHT_CURVE_BAKED_PROP = "w3_scene_event_weight_curve_baked"
 W3_SCENE_EVENT_WEIGHT_CURVE_EDITS_PROP = "w3_scene_event_weight_curve_edits"
+W3_SCENE_MIMIC_POSE_WEIGHT_PROP = "w3_scene_mimic_pose_weight"
+W3_SCENE_MIMIC_POSE_WEIGHT_CURVE_EDITS_PROP = "w3_scene_mimic_pose_weight_curve_edits"
+W3_SCENE_MIMIC_WEIGHT_CURVE_EDITS_PROP = "w3_scene_mimic_weight_curve_edits"
 
 
 def _idprop_get(id_block, prop_name, default=None):
@@ -130,6 +133,14 @@ def _scene_weight_prop_target(strip, action):
         _idprop_float(fallback, W3_SCENE_WEIGHT_PROP, 1.0),
     )
     return fallback
+
+
+def _mimic_pose_weight_prop_target(strip, action):
+    if _idprop_has(strip, W3_SCENE_MIMIC_POSE_WEIGHT_PROP):
+        return strip
+    if _idprop_has(action, W3_SCENE_MIMIC_POSE_WEIGHT_PROP):
+        return action
+    return None
 
 
 def _iter_nla_strips_for_object(obj):
@@ -235,6 +246,8 @@ def _write_scene_metadata_to_targets(targets, metadata):
                 pass
         if W3_SCENE_EVENT_WEIGHT_PROP in (metadata or {}):
             _set_float_idprop_ui(target, W3_SCENE_EVENT_WEIGHT_PROP, metadata.get(W3_SCENE_EVENT_WEIGHT_PROP, 1.0))
+        if W3_SCENE_MIMIC_POSE_WEIGHT_PROP in (metadata or {}):
+            _set_float_idprop_ui(target, W3_SCENE_MIMIC_POSE_WEIGHT_PROP, metadata.get(W3_SCENE_MIMIC_POSE_WEIGHT_PROP, 1.0))
 
 
 def _apply_scene_weight_to_strip(strip, weight):
@@ -4803,6 +4816,74 @@ class WITCH_OT_ApplySceneAdditiveWeight(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WITCH_OT_ApplySceneMimicPoseWeight(bpy.types.Operator):
+    bl_idname = "witcher.apply_scene_mimic_pose_weight"
+    bl_label = "Apply Scene Mimic Pose Weight"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action_name: StringProperty(default="")
+    object_name: StringProperty(default="")
+    track_name: StringProperty(default="")
+    strip_name: StringProperty(default="")
+    weight: FloatProperty(default=-1.0, min=0.0, max=1.0, soft_min=0.0, soft_max=1.0)
+
+    def execute(self, context):
+        explicit_strip = bool(self.object_name and self.track_name and self.strip_name)
+        _owner, _track, strip = _resolve_nla_strip(context, self.object_name, self.track_name, self.strip_name)
+        action = bpy.data.actions.get(self.action_name) if self.action_name else None
+        if action is None and strip is not None:
+            action = getattr(strip, "action", None)
+        if action is not None and strip is not None and not explicit_strip and getattr(strip, "action", None) != action:
+            strip = None
+        if action is None or strip is None:
+            self.report({'ERROR'}, "No scene mimic pose strip found.")
+            return {'CANCELLED'}
+
+        prop_target = _mimic_pose_weight_prop_target(strip, action)
+        try:
+            if self.weight >= 0.0:
+                weight = float(self.weight)
+            elif prop_target is not None:
+                weight = float(_idprop_get(prop_target, W3_SCENE_MIMIC_POSE_WEIGHT_PROP, 1.0))
+            else:
+                weight = float(action.get("_w3_mimic_pose_weight", 1.0))
+        except Exception:
+            weight = 1.0
+        weight = max(0.0, min(1.0, weight))
+
+        _set_float_idprop_ui(action, W3_SCENE_MIMIC_POSE_WEIGHT_PROP, weight)
+        _set_float_idprop_ui(strip, W3_SCENE_MIMIC_POSE_WEIGHT_PROP, weight)
+        try:
+            changed = import_anims.apply_mimic_pose_weight_to_strip(strip, weight)
+        except Exception:
+            log.warning(
+                "Could not apply mimic pose weight %.3f to %s.",
+                weight,
+                getattr(action, "name", "<action>"),
+                exc_info=True,
+            )
+            changed = 0
+        action = getattr(strip, "action", action)
+        if action is not None:
+            _set_float_idprop_ui(action, W3_SCENE_MIMIC_POSE_WEIGHT_PROP, weight)
+        try:
+            strip[W3_SCENE_MIMIC_POSE_WEIGHT_CURVE_EDITS_PROP] = int(changed or 0)
+        except Exception:
+            pass
+        try:
+            current_frame = context.scene.frame_current
+            context.scene.frame_set(current_frame)
+            context.view_layer.update()
+        except Exception:
+            pass
+
+        if changed:
+            self.report({'INFO'}, f"Applied mimic pose weight {weight:.3f} to {action.name} ({changed} curves baked).")
+        else:
+            self.report({'INFO'}, f"Applied mimic pose weight {weight:.3f} to {action.name}.")
+        return {'FINISHED'}
+
+
 class WITCHER_PT_NlaSceneStripSettings(bpy.types.Panel):
     bl_idname = "WITCHER_PT_nla_scene_strip_settings"
     bl_label = "Witcher Scene"
@@ -4911,6 +4992,38 @@ class WITCHER_PT_NlaSceneStripSettings(bpy.types.Panel):
             op.weight = float(target_weight) if target_weight is not None else strip_weight
         else:
             layout.label(text="No scene weight on this strip.", icon='INFO')
+
+        pose_prop_target = _mimic_pose_weight_prop_target(strip, action)
+        if pose_prop_target is not None and _idprop_has(pose_prop_target, W3_SCENE_MIMIC_POSE_WEIGHT_PROP):
+            pose_box = layout.box()
+            pose_box.label(text="Mimic Pose", icon='SHAPEKEY_DATA')
+            row = pose_box.row(align=True)
+            row.prop(pose_prop_target, f'["{W3_SCENE_MIMIC_POSE_WEIGHT_PROP}"]', text="Pose Weight", slider=True)
+
+            pose_weight = _idprop_float(pose_prop_target, W3_SCENE_MIMIC_POSE_WEIGHT_PROP, 1.0)
+            baked_weight = _idprop_float(action, "_w3_mimic_pose_weight", None)
+            pose_edits = _idprop_get(
+                strip,
+                W3_SCENE_MIMIC_POSE_WEIGHT_CURVE_EDITS_PROP,
+                _idprop_get(action, W3_SCENE_MIMIC_POSE_WEIGHT_CURVE_EDITS_PROP, ""),
+            )
+            if pose_edits == "":
+                pose_edits = _idprop_get(strip, W3_SCENE_MIMIC_WEIGHT_CURVE_EDITS_PROP, _idprop_get(action, W3_SCENE_MIMIC_WEIGHT_CURVE_EDITS_PROP, ""))
+            state_row = pose_box.row(align=True)
+            source_text = f"{float(pose_weight):.3f}" if pose_weight is not None else "?"
+            state_text = f"Pose weight: {source_text}"
+            if baked_weight is not None:
+                state_text += f"  Baked: {float(baked_weight):.3f}"
+            if pose_edits != "":
+                state_text += f"  Curves: {pose_edits}"
+            state_row.label(text=state_text)
+
+            op = pose_box.operator(WITCH_OT_ApplySceneMimicPoseWeight.bl_idname, text="Apply Pose Weight", icon='CHECKMARK')
+            op.action_name = getattr(action, "name", "") if action is not None else ""
+            op.object_name = getattr(obj, "name", "") if obj is not None else ""
+            op.track_name = getattr(track, "name", "") if track is not None else ""
+            op.strip_name = getattr(strip, "name", "") if strip is not None else ""
+            op.weight = float(pose_weight) if pose_weight is not None else 1.0
 
 
 class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
@@ -5794,6 +5907,19 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                             op.weight = float(getattr(action_source_strip, "influence", _idprop_get(weight_target, W3_SCENE_EVENT_WEIGHT_PROP, 1.0)))
                         except Exception:
                             op.weight = 1.0
+                    pose_weight_target = _mimic_pose_weight_prop_target(action_source_strip, action)
+                    if _idprop_has(pose_weight_target, W3_SCENE_MIMIC_POSE_WEIGHT_PROP):
+                        row = action_info_box.row(align=True)
+                        row.prop(pose_weight_target, f'["{W3_SCENE_MIMIC_POSE_WEIGHT_PROP}"]', text="Pose", slider=True)
+                        op = row.operator(WITCH_OT_ApplySceneMimicPoseWeight.bl_idname, text="", icon='CHECKMARK')
+                        op.action_name = action.name
+                        op.object_name = getattr(action_source_obj, "name", "") if action_source_obj is not None else ""
+                        op.track_name = getattr(action_source_track, "name", "") if action_source_track is not None else ""
+                        op.strip_name = getattr(action_source_strip, "name", "") if action_source_strip is not None else ""
+                        try:
+                            op.weight = float(_idprop_get(pose_weight_target, W3_SCENE_MIMIC_POSE_WEIGHT_PROP, 1.0))
+                        except Exception:
+                            op.weight = 1.0
                 if not source_file and not buffer_source and not scene_section:
                     action_info_box.label(text="No import metadata found.")
             else:
@@ -6288,6 +6414,7 @@ classes = [
     WITCH_OT_ResampleAnimation,
     WITCH_OT_BakePelvisToTrajectory,
     WITCH_OT_ApplySceneAdditiveWeight,
+    WITCH_OT_ApplySceneMimicPoseWeight,
     WITCHER_PT_NlaSceneStripSettings,
     ListItem,
     TOOL_UL_List,
