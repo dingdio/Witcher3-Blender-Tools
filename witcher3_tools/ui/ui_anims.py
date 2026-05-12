@@ -4338,6 +4338,11 @@ class WITCH_OT_RemoveRootMotionDrivers(bpy.types.Operator):
 # CONTROLLER EMPTY APPROACH (Recommended)
 # =============================================================================
 
+def _active_motion_armature(context):
+    from ..importers.motion_tools import resolve_motion_controller_armature
+    return resolve_motion_controller_armature(getattr(context, "active_object", None))
+
+
 class WITCH_OT_SetupRootMotionController(bpy.types.Operator):
     """Create a controller empty that follows Trajectory for root motion control"""
     bl_idname = "witcher.setup_root_motion_controller"
@@ -4346,14 +4351,18 @@ class WITCH_OT_SetupRootMotionController(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        if not context.active_object or context.active_object.type != 'ARMATURE':
+        armature = _active_motion_armature(context)
+        if not armature:
             return False
         from ..importers.motion_tools import has_root_motion_controller
-        return not has_root_motion_controller(context.active_object)
+        return not has_root_motion_controller(armature)
 
     def execute(self, context):
         from ..importers.motion_tools import setup_root_motion_controller
-        armature = context.active_object
+        armature = _active_motion_armature(context)
+        if not armature:
+            self.report({'ERROR'}, "Select a character armature or motion controller")
+            return {'CANCELLED'}
 
         controller = setup_root_motion_controller(armature)
         if not controller:
@@ -4372,14 +4381,18 @@ class WITCH_OT_RemoveRootMotionController(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        if not context.active_object or context.active_object.type != 'ARMATURE':
+        armature = _active_motion_armature(context)
+        if not armature:
             return False
         from ..importers.motion_tools import has_root_motion_controller
-        return has_root_motion_controller(context.active_object)
+        return has_root_motion_controller(armature)
 
     def execute(self, context):
         from ..importers.motion_tools import remove_root_motion_controller
-        armature = context.active_object
+        armature = _active_motion_armature(context)
+        if not armature:
+            self.report({'ERROR'}, "Select a character armature or motion controller")
+            return {'CANCELLED'}
 
         if remove_root_motion_controller(armature):
             self.report({'INFO'}, "Root motion controller removed")
@@ -4397,14 +4410,18 @@ class WITCH_OT_ToggleRootMotionController(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        if not context.active_object or context.active_object.type != 'ARMATURE':
+        armature = _active_motion_armature(context)
+        if not armature:
             return False
         from ..importers.motion_tools import has_root_motion_controller
-        return has_root_motion_controller(context.active_object)
+        return has_root_motion_controller(armature)
 
     def execute(self, context):
         from ..importers.motion_tools import toggle_controller_mode
-        armature = context.active_object
+        armature = _active_motion_armature(context)
+        if not armature:
+            self.report({'ERROR'}, "Select a character armature or motion controller")
+            return {'CANCELLED'}
 
         success, new_mode = toggle_controller_mode(armature)
         if success:
@@ -4414,6 +4431,80 @@ class WITCH_OT_ToggleRootMotionController(bpy.types.Operator):
         else:
             self.report({'ERROR'}, "Could not toggle mode")
             return {'CANCELLED'}
+
+
+class WITCH_OT_ToggleAutoMotionController(bpy.types.Operator):
+    """Toggle automatic actor motion preview from motion extraction data"""
+    bl_idname = "witcher.toggle_auto_motion_controller"
+    bl_label = "Toggle Auto Motion"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _active_motion_armature(context) is not None
+
+    def execute(self, context):
+        from ..importers.motion_tools import toggle_auto_motion_enabled, get_auto_motion_source_label
+        armature = _active_motion_armature(context)
+        if not armature:
+            self.report({'ERROR'}, "Select a character armature or motion controller")
+            return {'CANCELLED'}
+        success, enabled = toggle_auto_motion_enabled(armature)
+        if not success:
+            self.report({'ERROR'}, "Could not enable Auto Motion - no motion extraction or Trajectory curves")
+            return {'CANCELLED'}
+        source = get_auto_motion_source_label(armature) or "motion"
+        state = "ON" if enabled else "OFF"
+        self.report({'INFO'}, f"Auto Motion {state} ({source})")
+        return {'FINISHED'}
+
+
+class WITCH_OT_ResetAutoMotionController(bpy.types.Operator):
+    """Reset automatic motion loop accumulation"""
+    bl_idname = "witcher.reset_auto_motion_controller"
+    bl_label = "Reset Auto Motion"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        armature = _active_motion_armature(context)
+        if not armature:
+            return False
+        from ..importers.motion_tools import has_auto_motion_controller
+        return has_auto_motion_controller(armature)
+
+    def execute(self, context):
+        from ..importers.motion_tools import reset_auto_motion_controller
+        armature = _active_motion_armature(context)
+        if armature and reset_auto_motion_controller(armature):
+            self.report({'INFO'}, "Auto Motion reset")
+            return {'FINISHED'}
+        self.report({'ERROR'}, "Could not reset Auto Motion")
+        return {'CANCELLED'}
+
+
+class WITCH_OT_RemoveAutoMotionController(bpy.types.Operator):
+    """Remove automatic motion controller"""
+    bl_idname = "witcher.remove_auto_motion_controller"
+    bl_label = "Remove Auto Motion"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        armature = _active_motion_armature(context)
+        if not armature:
+            return False
+        from ..importers.motion_tools import has_auto_motion_controller
+        return has_auto_motion_controller(armature)
+
+    def execute(self, context):
+        from ..importers.motion_tools import remove_auto_motion_controller
+        armature = _active_motion_armature(context)
+        if armature and remove_auto_motion_controller(armature):
+            self.report({'INFO'}, "Auto Motion controller removed")
+            return {'FINISHED'}
+        self.report({'ERROR'}, "Could not remove Auto Motion controller")
+        return {'CANCELLED'}
 
 
 def apply_root_orientation(armature_obj):
@@ -5704,11 +5795,19 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             root_motion_box = col_main.box()
             root_motion_box.label(text="Root Motion", icon='CON_LOCLIKE')
 
-            active_armature = display_armature if (display_armature and display_armature.type == 'ARMATURE') else context.active_object
+            from ..importers.motion_tools import resolve_motion_controller_armature
+            active_motion_armature = resolve_motion_controller_armature(context.active_object)
+            active_armature = (
+                active_motion_armature
+                if active_motion_armature
+                else display_armature if (display_armature and display_armature.type == 'ARMATURE') else None
+            )
             if active_armature and active_armature.type == 'ARMATURE':
                 from ..importers.motion_tools import (
                     has_root_motion_controller, get_controller_mode,
-                    has_root_motion_drivers, get_root_motion_mode
+                    has_root_motion_drivers, get_root_motion_mode,
+                    has_auto_motion_controller, get_auto_motion_enabled,
+                    get_auto_motion_source_label, get_motion_direction_controller
                 )
 
                 has_controller = has_root_motion_controller(active_armature)
@@ -5730,6 +5829,30 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                         icon='EMPTY_ARROWS',
                     )
 
+                auto_box = root_motion_box.box()
+                auto_box.label(text="Auto Motion", icon='PLAY')
+                has_auto_controller = has_auto_motion_controller(active_armature)
+                auto_enabled = get_auto_motion_enabled(active_armature)
+                auto_source = get_auto_motion_source_label(active_armature)
+                auto_row = auto_box.row(align=True)
+                auto_row.operator(
+                    WITCH_OT_ToggleAutoMotionController.bl_idname,
+                    text=("Auto Motion On" if auto_enabled else "Auto Motion Off"),
+                    icon=('PLAY' if auto_enabled else 'PAUSE'),
+                )
+                if has_auto_controller:
+                    auto_row.operator(WITCH_OT_ResetAutoMotionController.bl_idname, text="", icon='FILE_REFRESH')
+                    auto_row.operator(WITCH_OT_RemoveAutoMotionController.bl_idname, text="", icon='X')
+                    direction_controller = get_motion_direction_controller(active_armature)
+                    if direction_controller:
+                        auto_box.label(text=f"Direction: {direction_controller.name}", icon='EMPTY_ARROWS')
+                if auto_source:
+                    auto_box.label(text=f"Source: {auto_source}", icon='INFO')
+                else:
+                    auto_box.label(text="Needs motion extraction or Trajectory curves", icon='ERROR')
+                if auto_enabled and (not has_controller or get_controller_mode(active_armature) != 'IN_PLACE'):
+                    auto_box.label(text="In-Place is off: visible pose motion may double.", icon='ERROR')
+
                 alt_box = root_motion_box.box()
                 alt_box.label(text="Alternatives", icon='DOWNARROW_HLT')
                 has_drivers = has_root_motion_drivers(active_armature)
@@ -5746,7 +5869,7 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                     alt_box.operator(WITCH_OT_ToggleRootMotionDrivers.bl_idname, text="Setup Drivers (Root bone)", icon='DRIVER')
                 alt_box.operator(ButtonOperatorToggloRootMotion.bl_idname, text="Toggle RootMotion Bone", icon='BONE_DATA')
             else:
-                root_motion_box.label(text="Select a character armature", icon='INFO')
+                root_motion_box.label(text="Select a character armature or motion controller", icon='INFO')
 
             col_main.operator(WITCH_OT_ResampleAnimation.bl_idname, text="Resample Animation", icon='TIME')
 
@@ -6410,6 +6533,9 @@ classes = [
     WITCH_OT_SetupRootMotionController,
     WITCH_OT_RemoveRootMotionController,
     WITCH_OT_ToggleRootMotionController,
+    WITCH_OT_ToggleAutoMotionController,
+    WITCH_OT_ResetAutoMotionController,
+    WITCH_OT_RemoveAutoMotionController,
     WITCH_OT_ApplyRootOrientation,
     WITCH_OT_ResampleAnimation,
     WITCH_OT_BakePelvisToTrajectory,
@@ -6702,6 +6828,11 @@ def register():
 
 
 def unregister():
+    try:
+        from ..importers.motion_tools import remove_auto_motion_handler
+        remove_auto_motion_handler()
+    except Exception:
+        pass
     for prop_name in (
         "witcher_anim_tab",
         "witcher_w2anims_list",

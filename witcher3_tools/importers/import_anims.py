@@ -15,6 +15,7 @@ from .. import get_do_fix_tail, get_rig_rot90_enabled
 
 import json
 import copy
+import base64
 import math
 from mathutils import Vector, Quaternion, Euler, Matrix
 import os
@@ -25,6 +26,104 @@ import numpy as np
 import bpy
 from ..action_compat import assign_action, bind_strip_action_slot, iter_action_fcurves, new_action_fcurve, resolve_action_slot
 matmul = (lambda a, b: a*b) if bpy.app.version < (2, 80, 0) else (lambda a, b: a.__matmul__(b))
+
+W3_MOTION_EXTRACTION_FINAL_LOCATION_PROP = "w3_motion_extraction_final_location"
+W3_MOTION_EXTRACTION_FINAL_YAW_PROP = "w3_motion_extraction_final_yaw"
+W3_MOTION_EXTRACTION_FINAL_FRAME_PROP = "w3_motion_extraction_final_frame"
+W3_MOTION_EXTRACTION_FLAGS_PROP = "w3_motion_extraction_flags"
+W3_MOTION_EXTRACTION_SAMPLE_COUNT_PROP = "w3_motion_extraction_sample_count"
+W3_MOTION_EXTRACTION_DATA_PROP = "w3_motion_extraction_data"
+
+
+def _motion_extraction_delta_times(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            return [int(item) for item in base64.b64decode(value)]
+        except Exception:
+            return []
+    if isinstance(value, (bytes, bytearray)):
+        return [int(item) for item in value]
+    try:
+        return [int(item) for item in value]
+    except Exception:
+        return []
+
+
+def _motion_extraction_payload(motion_data):
+    if not motion_data:
+        return None
+    try:
+        flags = int(motion_data.get("flags", 0) or 0)
+        frame_values = list(motion_data.get("frames") or [])
+    except Exception:
+        return None
+    axis_count = sum(1 for bit in (1, 2, 4, 8) if flags & bit)
+    if flags == 0 or axis_count <= 0 or len(frame_values) < axis_count:
+        return None
+
+    sample_count = len(frame_values) // axis_count
+    if sample_count <= 0:
+        return None
+    delta_times = _motion_extraction_delta_times(motion_data.get("deltaTimes", None))
+    try:
+        duration = float(motion_data.get("duration", 0.0) or 0.0)
+    except Exception:
+        duration = 0.0
+    return {
+        "duration": duration,
+        "deltaTimes": delta_times[:max(0, sample_count - 1)],
+        "frames": [float(value) for value in frame_values[:sample_count * axis_count]],
+        "flags": flags,
+        "sample_count": sample_count,
+    }
+
+
+def _motion_extraction_terminal_values(motion_data):
+    payload = _motion_extraction_payload(motion_data)
+    if not payload:
+        return None
+    flags = int(payload["flags"])
+    frame_values = list(payload["frames"])
+    axis_count = sum(1 for bit in (1, 2, 4, 8) if flags & bit)
+    sample_count = int(payload["sample_count"])
+    sample_start = (sample_count - 1) * axis_count
+    sample = frame_values[sample_start:sample_start + axis_count]
+
+    index = 0
+    x = y = z = yaw = 0.0
+    try:
+        if flags & 1:
+            x = float(sample[index])
+            index += 1
+        if flags & 2:
+            # Same REDengine-to-Blender axis mapping used by apply_motion().
+            y = float(sample[index])
+            index += 1
+        if flags & 4:
+            z = float(sample[index])
+            index += 1
+        if flags & 8:
+            yaw = float(sample[index])
+    except Exception:
+        return None
+
+    final_frame = 0.0
+    try:
+        delta_times = list(payload.get("deltaTimes") or [])
+        for value in delta_times[:max(0, sample_count - 1)]:
+            final_frame += float(value)
+    except Exception:
+        final_frame = 0.0
+
+    return {
+        "flags": flags,
+        "location": (x, y, z),
+        "yaw": yaw,
+        "frame": final_frame,
+        "sample_count": sample_count,
+    }
 
 
 def _set_active_object(obj):
@@ -995,8 +1094,35 @@ class AnimImporter:
                 action["w3_anim_buffer_detail"] = detail
             if source:
                 log.info(f"Animation buffer source: {source}{' (' + detail + ')' if detail else ''}")
+            raw_motion_data = getattr(SkeletalAnimation, "motionExtraction", None)
+            motion_payload = _motion_extraction_payload(raw_motion_data)
+            motion_terminal = _motion_extraction_terminal_values(raw_motion_data)
+            if motion_terminal:
+                action[W3_MOTION_EXTRACTION_FLAGS_PROP] = int(motion_terminal["flags"])
+                action[W3_MOTION_EXTRACTION_FINAL_LOCATION_PROP] = json.dumps([
+                    float(value) for value in motion_terminal["location"]
+                ])
+                action[W3_MOTION_EXTRACTION_FINAL_YAW_PROP] = float(motion_terminal["yaw"])
+                action[W3_MOTION_EXTRACTION_FINAL_FRAME_PROP] = float(motion_terminal["frame"])
+                action[W3_MOTION_EXTRACTION_SAMPLE_COUNT_PROP] = int(motion_terminal["sample_count"])
+                if motion_payload:
+                    action[W3_MOTION_EXTRACTION_DATA_PROP] = json.dumps({
+                        "duration": float(motion_payload.get("duration", 0.0) or 0.0),
+                        "deltaTimes": [int(value) for value in (motion_payload.get("deltaTimes") or [])],
+                        "frames": [float(value) for value in (motion_payload.get("frames") or [])],
+                        "flags": int(motion_payload.get("flags", 0) or 0),
+                    })
+                loc = motion_terminal.get("location", (0.0, 0.0, 0.0))
+                log.info(
+                    "Stored motion extraction metadata: action=%s flags=%s samples=%s finalFrame=%.3f xyDelta=%.6f",
+                    action.name,
+                    motion_terminal.get("flags", 0),
+                    motion_terminal.get("sample_count", 0),
+                    float(motion_terminal.get("frame", 0.0) or 0.0),
+                    math.sqrt((float(loc[0]) ** 2) + (float(loc[1]) ** 2)),
+                )
         except Exception:
-            pass
+            log.debug("Could not store motion extraction metadata for %s", action_name, exc_info=True)
 
         curr_action = (armObj.animation_data.action
             if armObj.animation_data is not None and

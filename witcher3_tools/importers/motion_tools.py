@@ -2,13 +2,17 @@
 import logging
 from mathutils import Vector, Quaternion, Euler, Matrix
 import base64
+import json
 import math
 from ..CR2W import w3_types
 from ..CR2W.om import MQuaternion
 from ..action_compat import assign_action, iter_action_fcurves, new_action_fcurve
 import bpy
+from bpy.app.handlers import persistent
 
 log = logging.getLogger(__name__)
+
+W3_MOTION_EXTRACTION_DATA_PROP = "w3_motion_extraction_data"
 
 class MotionExtraction:
     def __init__(self, duration, delta_times, frames, flags):
@@ -854,9 +858,9 @@ def get_root_motion_mode(armature_obj):
 # =============================================================================
 # ROOT MOTION CONTROLLER EMPTY SYSTEM
 # =============================================================================
-# This approach creates a separate Empty object that follows Trajectory
-# bones via constraints. The armature is parented to the empty, so toggling
-# the constraint influence switches between root motion and in-place modes.
+# This approach creates a separate Empty object that counteracts Trajectory
+# movement. The armature is parented to the empty, so toggling switches
+# between root motion and in-place modes without a parent-to-child constraint.
 
 CONTROLLER_EMPTY_NAME = "RootMotionController"
 
@@ -875,11 +879,116 @@ def get_controller_empty(armature_obj):
     return bpy.data.objects.get(controller_name)
 
 
+def _parent_keep_world(child_obj, parent_obj):
+    """Parent an object while preserving its world transform."""
+    if child_obj is None:
+        return
+    world_matrix = child_obj.matrix_world.copy()
+    child_obj.parent = parent_obj
+    if parent_obj is not None:
+        child_obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
+    else:
+        child_obj.matrix_parent_inverse = Matrix.Identity(4)
+    child_obj.matrix_world = world_matrix
+
+
+def _link_object_like(obj, reference_obj):
+    collections = list(getattr(reference_obj, "users_collection", []) or [])
+    if collections:
+        collections[0].objects.link(obj)
+    else:
+        bpy.context.collection.objects.link(obj)
+
+
+def _object_local_matrix(obj):
+    try:
+        return obj.matrix_basis.copy()
+    except Exception:
+        try:
+            return obj.matrix_local.copy()
+        except Exception:
+            return Matrix.Identity(4)
+
+
+def _set_object_local_matrix(obj, matrix):
+    try:
+        obj.matrix_basis = matrix
+    except Exception:
+        obj.matrix_local = matrix
+
+
+def _parent_direct_local(child_obj, parent_obj, local_matrix):
+    if child_obj is None:
+        return
+    child_obj.parent = parent_obj
+    child_obj.matrix_parent_inverse = Matrix.Identity(4)
+    _set_object_local_matrix(child_obj, local_matrix)
+
+
+def _clear_root_motion_controller_dependencies(controller):
+    if controller is None:
+        return
+    for constraint in list(getattr(controller, "constraints", []) or []):
+        if str(getattr(constraint, "name", "") or "").startswith("RootMotion_"):
+            controller.constraints.remove(constraint)
+    try:
+        controller.driver_remove('rotation_euler', 2)
+    except Exception:
+        pass
+
+
+def _pose_bone_local_yaw(pose_bone):
+    if pose_bone is None:
+        return 0.0
+    try:
+        if pose_bone.rotation_mode == 'QUATERNION':
+            quat = pose_bone.rotation_quaternion.copy()
+            if quat.dot(quat) > 1e-12:
+                quat.normalize()
+                return float(quat.to_euler('XYZ').z)
+        if pose_bone.rotation_mode == 'AXIS_ANGLE':
+            values = pose_bone.rotation_axis_angle
+            axis = Vector((values[1], values[2], values[3]))
+            if axis.length > 1e-8:
+                return float(Quaternion(axis.normalized(), values[0]).to_euler('XYZ').z)
+        return float(pose_bone.rotation_euler.z)
+    except Exception:
+        return 0.0
+
+
+def _trajectory_counter_matrix(armature_obj):
+    trajectory_bone = getattr(getattr(armature_obj, "pose", None), "bones", {}).get("Trajectory")
+    if trajectory_bone is None:
+        return Matrix.Identity(4)
+    try:
+        loc = trajectory_bone.matrix.to_translation()
+    except Exception:
+        loc = Vector((0.0, 0.0, 0.0))
+    yaw = _pose_bone_local_yaw(trajectory_bone)
+    trajectory_matrix = Matrix.Translation(loc) @ Matrix.Rotation(float(yaw), 4, 'Z')
+    return trajectory_matrix.inverted_safe()
+
+
+def _update_root_motion_controller(armature_obj):
+    if get_controller_mode(armature_obj) != 'IN_PLACE':
+        return
+    controller = get_controller_empty(armature_obj)
+    if controller is None:
+        return
+    _clear_root_motion_controller_dependencies(controller)
+    rest_matrix = _matrix_from_flat(controller.get(
+        "w3_root_motion_rest_local_matrix",
+        _flatten_matrix(_object_local_matrix(controller)),
+    ))
+    counter_matrix = _trajectory_counter_matrix(armature_obj)
+    _set_object_local_matrix(controller, rest_matrix @ counter_matrix)
+
+
 def setup_root_motion_controller(armature_obj):
     """
     Create a controller empty that counteracts Trajectory bone movement.
 
-    The empty uses a COPY_LOCATION constraint with INVERT on all axes.
+    The empty is updated from the Trajectory bone by the frame handler.
     When enabled (In-Place mode), it counteracts the Pelvis movement 
     baked into the Trajectory bone, keeping the character stationary.
     When disabled (Root Motion mode), the character moves naturally.
@@ -900,6 +1009,10 @@ def setup_root_motion_controller(armature_obj):
     # Check if controller already exists
     existing = get_controller_empty(armature_obj)
     if existing:
+        _clear_root_motion_controller_dependencies(existing)
+        if "w3_root_motion_rest_local_matrix" not in existing:
+            existing["w3_root_motion_rest_local_matrix"] = _flatten_matrix(_object_local_matrix(existing))
+        existing["w3_root_motion_armature"] = armature_obj.name
         log.debug("Controller empty already exists: %s", existing.name)
         return existing
 
@@ -913,34 +1026,25 @@ def setup_root_motion_controller(armature_obj):
     controller.empty_display_size = 0.5
 
     # Link to same collection as armature
-    for collection in armature_obj.users_collection:
-        collection.objects.link(controller)
-        break
+    _link_object_like(controller, armature_obj)
 
     # Position controller at armature location
     controller.matrix_world = armature_world_matrix
 
-    # Add COPY_LOCATION constraint with INVERT on all axes
-    # This counteracts the Trajectory/Pelvis movement when enabled
-    loc_constraint = controller.constraints.new('COPY_LOCATION')
-    loc_constraint.name = "RootMotion_InPlace"
-    loc_constraint.target = armature_obj
-    loc_constraint.subtarget = "Trajectory"
-    loc_constraint.use_x = True
-    loc_constraint.use_y = True
-    loc_constraint.use_z = True
-    # INVERT on all axes to counteract Trajectory movement
-    loc_constraint.invert_x = True
-    loc_constraint.invert_y = True
-    loc_constraint.invert_z = True
-    loc_constraint.target_space = 'POSE'
-    loc_constraint.owner_space = 'WORLD'
-    # Start with constraint OFF = Root Motion mode (natural movement)
-    loc_constraint.influence = 0.0
+    armature_obj.data['root_motion_controller_factor'] = 0.0
+    controller.rotation_mode = 'XYZ'
+
+    auto_controller = get_auto_motion_controller(armature_obj)
+    if auto_controller is not None and armature_obj.parent == auto_controller:
+        local_matrix = auto_controller.matrix_world.inverted_safe() @ armature_world_matrix
+        _parent_direct_local(controller, auto_controller, local_matrix)
+    else:
+        _set_object_local_matrix(controller, armature_world_matrix)
+    controller["w3_root_motion_rest_local_matrix"] = _flatten_matrix(_object_local_matrix(controller))
+    controller["w3_root_motion_armature"] = armature_obj.name
 
     # Parent armature to controller (keep transform)
-    armature_obj.parent = controller
-    armature_obj.matrix_parent_inverse = controller.matrix_world.inverted()
+    _parent_keep_world(armature_obj, controller)
 
     # Store reference to controller on armature
     armature_obj.data['root_motion_controller'] = controller.name
@@ -963,25 +1067,34 @@ def remove_root_motion_controller(armature_obj):
         log.debug("No controller empty found")
         return False
 
-    # Get original position if stored, otherwise use origin
-    original_loc = armature_obj.data.get('root_motion_original_loc', [0.0, 0.0, 0.0])
+    parent = controller.parent
+    if parent is not None and parent.name.startswith(AUTO_MOTION_CONTROLLER_NAME):
+        _parent_keep_world(armature_obj, parent)
+    else:
+        # Get original position if stored, otherwise use origin
+        original_loc = armature_obj.data.get('root_motion_original_loc', [0.0, 0.0, 0.0])
 
-    # Unparent armature first
-    armature_obj.parent = None
+        # Unparent armature first
+        armature_obj.parent = None
 
-    # Reset armature to original position (or origin)
-    armature_obj.location = (original_loc[0], original_loc[1], original_loc[2])
+        # Reset armature to original position (or origin)
+        armature_obj.location = (original_loc[0], original_loc[1], original_loc[2])
 
     # Remove controller
     bpy.data.objects.remove(controller, do_unlink=True)
 
     # Clean up ALL stored references
-    props_to_remove = ['root_motion_controller', 'root_motion_mode', 'root_motion_original_loc']
+    props_to_remove = [
+        'root_motion_controller',
+        'root_motion_mode',
+        'root_motion_original_loc',
+        'root_motion_controller_factor',
+    ]
     for prop in props_to_remove:
         if prop in armature_obj.data:
             del armature_obj.data[prop]
 
-    log.info("Removed root motion controller from %s, reset to position %s", armature_obj.name, original_loc)
+    log.info("Removed root motion controller from %s", armature_obj.name)
     return True
 
 
@@ -992,12 +1105,12 @@ def has_root_motion_controller(armature_obj):
 
 def set_controller_mode(armature_obj, mode):
     """
-    Set the root motion mode via controller constraints.
+    Set the root motion mode via the controller empty.
 
     Args:
         armature_obj: The armature object
-        mode: 'ROOT_MOTION' (constraints OFF, natural movement) or 
-              'IN_PLACE' (constraints ON with invert, counteracts movement)
+        mode: 'ROOT_MOTION' (natural movement) or
+              'IN_PLACE' (counteracts movement)
 
     Returns True if successful.
     """
@@ -1005,15 +1118,21 @@ def set_controller_mode(armature_obj, mode):
     if not controller:
         return False
 
-    # In-Place mode: constraints ON (inverted) to counteract Trajectory movement
-    # Root Motion mode: constraints OFF, character moves naturally
+    _clear_root_motion_controller_dependencies(controller)
     influence = 1.0 if mode == 'IN_PLACE' else 0.0
 
-    for constraint in controller.constraints:
-        if constraint.name.startswith("RootMotion_"):
-            constraint.influence = influence
-
     armature_obj.data['root_motion_mode'] = mode
+    armature_obj.data['root_motion_controller_factor'] = influence
+    if mode == 'IN_PLACE':
+        _update_root_motion_controller(armature_obj)
+        ensure_auto_motion_handler()
+    else:
+        rest_matrix = _matrix_from_flat(controller.get(
+            "w3_root_motion_rest_local_matrix",
+            _flatten_matrix(_object_local_matrix(controller)),
+        ))
+        _set_object_local_matrix(controller, rest_matrix)
+        maybe_remove_auto_motion_handler()
 
     log.info("Root motion mode set to %s (influence=%s)", mode, influence)
     return True
@@ -1032,3 +1151,815 @@ def toggle_controller_mode(armature_obj):
     current = get_controller_mode(armature_obj)
     new_mode = 'IN_PLACE' if current == 'ROOT_MOTION' else 'ROOT_MOTION'
     return set_controller_mode(armature_obj, new_mode), new_mode
+
+
+# =============================================================================
+# AUTO MOTION CONTROLLER SYSTEM
+# =============================================================================
+
+AUTO_MOTION_CONTROLLER_NAME = "AutoMotionController"
+MOTION_DIRECTION_CONTROLLER_NAME = "MotionDirectionController"
+_AUTO_MOTION_HANDLER_ACTIVE = False
+_AUTO_MOTION_UPDATING = False
+
+
+def get_auto_motion_controller(armature_obj):
+    """Get the outer auto-motion controller for an armature, if it exists."""
+    if not armature_obj:
+        return None
+    try:
+        controller_name = armature_obj.data.get('auto_motion_controller', "")
+    except Exception:
+        controller_name = ""
+    if controller_name:
+        controller = bpy.data.objects.get(controller_name)
+        if controller:
+            return controller
+    controller_name = f"{AUTO_MOTION_CONTROLLER_NAME}_{armature_obj.name}"
+    return bpy.data.objects.get(controller_name)
+
+
+def get_motion_direction_controller(armature_obj):
+    """Get the steering parent for Auto Motion, if it exists."""
+    if not armature_obj:
+        return None
+    try:
+        controller_name = armature_obj.data.get('motion_direction_controller', "")
+    except Exception:
+        controller_name = ""
+    if controller_name:
+        controller = bpy.data.objects.get(controller_name)
+        if controller:
+            return controller
+    controller_name = f"{MOTION_DIRECTION_CONTROLLER_NAME}_{armature_obj.name}"
+    return bpy.data.objects.get(controller_name)
+
+
+def _is_motion_direction_controller(obj):
+    return obj is not None and str(getattr(obj, "name", "") or "").startswith(MOTION_DIRECTION_CONTROLLER_NAME)
+
+
+def _armature_for_stored_controller(prop_name, controller_name):
+    if not controller_name:
+        return None
+    for obj in bpy.data.objects:
+        if getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        try:
+            if obj.data.get(prop_name, "") == controller_name:
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+def _armature_from_controller_prop(controller):
+    if controller is None:
+        return None
+    for prop_name in ("w3_root_motion_armature", "w3_auto_motion_armature"):
+        armature_name = str(controller.get(prop_name, "") or "")
+        if not armature_name:
+            continue
+        armature = bpy.data.objects.get(armature_name)
+        if armature is not None and getattr(armature, "type", None) == 'ARMATURE':
+            return armature
+    return None
+
+
+def _child_armature_recursive(obj):
+    if obj is None:
+        return None
+    stack = list(getattr(obj, "children", []) or [])
+    while stack:
+        child = stack.pop(0)
+        if getattr(child, "type", None) == 'ARMATURE':
+            return child
+        stack.extend(list(getattr(child, "children", []) or []))
+    return None
+
+
+def resolve_motion_controller_armature(obj):
+    """Resolve an armature from the armature itself or one of its motion controller empties."""
+    if obj is None:
+        return None
+    if getattr(obj, "type", None) == 'ARMATURE':
+        return obj
+
+    controller_name = str(getattr(obj, "name", "") or "")
+    controller_prefixes = (CONTROLLER_EMPTY_NAME, AUTO_MOTION_CONTROLLER_NAME, MOTION_DIRECTION_CONTROLLER_NAME)
+    is_controller_name = any(controller_name.startswith(f"{prefix}_") for prefix in controller_prefixes)
+    armature = (
+        _armature_from_controller_prop(obj)
+        or _armature_for_stored_controller('root_motion_controller', controller_name)
+        or _armature_for_stored_controller('auto_motion_controller', controller_name)
+        or _armature_for_stored_controller('motion_direction_controller', controller_name)
+    )
+    if armature is not None:
+        return armature
+
+    if is_controller_name:
+        armature = _child_armature_recursive(obj)
+        if armature is not None:
+            return armature
+
+    for prefix in controller_prefixes:
+        expected = f"{prefix}_"
+        if controller_name.startswith(expected):
+            candidate = bpy.data.objects.get(controller_name[len(expected):])
+            if candidate is not None and getattr(candidate, "type", None) == 'ARMATURE':
+                return candidate
+    return None
+
+
+def has_auto_motion_controller(armature_obj):
+    return get_auto_motion_controller(armature_obj) is not None
+
+
+def get_auto_motion_enabled(armature_obj):
+    if not armature_obj or armature_obj.type != 'ARMATURE':
+        return False
+    return bool(armature_obj.data.get('auto_motion_enabled', False))
+
+
+def _flatten_matrix(matrix):
+    return [float(matrix[row][col]) for row in range(4) for col in range(4)]
+
+
+def _matrix_from_flat(value):
+    try:
+        values = [float(v) for v in value]
+        if len(values) == 16:
+            return Matrix((
+                values[0:4],
+                values[4:8],
+                values[8:12],
+                values[12:16],
+            ))
+    except Exception:
+        pass
+    return Matrix.Identity(4)
+
+
+def _matrix_power(matrix, count):
+    result = Matrix.Identity(4)
+    for _i in range(max(0, int(count))):
+        result = matrix @ result
+    return result
+
+
+def _motion_delta_times(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            return [int(item) for item in base64.b64decode(value)]
+        except Exception:
+            try:
+                decoded = json.loads(value)
+                return [int(item) for item in decoded]
+            except Exception:
+                return []
+    if isinstance(value, (bytes, bytearray)):
+        return [int(item) for item in value]
+    try:
+        return [int(item) for item in value]
+    except Exception:
+        return []
+
+
+def _read_action_motion_data(action):
+    if action is None:
+        return None
+    try:
+        raw_data = action.get(W3_MOTION_EXTRACTION_DATA_PROP, None)
+    except Exception:
+        raw_data = None
+    if raw_data is None:
+        return None
+    if isinstance(raw_data, str):
+        try:
+            raw_data = json.loads(raw_data)
+        except Exception:
+            return None
+    if not isinstance(raw_data, dict):
+        return None
+    try:
+        flags = int(raw_data.get("flags", 0) or 0)
+        frames = [float(value) for value in (raw_data.get("frames") or [])]
+        delta_times = _motion_delta_times(raw_data.get("deltaTimes", None))
+    except Exception:
+        return None
+    axis_count = sum(1 for bit in (1, 2, 4, 8) if flags & bit)
+    if flags == 0 or axis_count <= 0 or len(frames) < axis_count:
+        return None
+    sample_count = len(frames) // axis_count
+    if sample_count < 2:
+        return None
+    return {
+        "flags": flags,
+        "frames": frames[:sample_count * axis_count],
+        "delta_times": delta_times[:max(0, sample_count - 1)],
+        "sample_count": sample_count,
+    }
+
+
+def _motion_axis_order(flags):
+    axis_order = []
+    if flags & 1:
+        axis_order.append("x")
+    if flags & 2:
+        axis_order.append("y")
+    if flags & 4:
+        axis_order.append("z")
+    if flags & 8:
+        axis_order.append("yaw")
+    return axis_order
+
+
+def _motion_keyframes_from_data(motion_data):
+    if not motion_data:
+        return []
+    flags = int(motion_data.get("flags", 0) or 0)
+    axis_order = _motion_axis_order(flags)
+    axis_count = len(axis_order)
+    frames = list(motion_data.get("frames") or [])
+    sample_count = int(motion_data.get("sample_count", 0) or 0)
+    if axis_count <= 0 or sample_count <= 0:
+        return []
+    delta_times = list(motion_data.get("delta_times") or [])
+    keyframes = []
+    action_frame = 0.0
+    for sample_index in range(sample_count):
+        sample = frames[sample_index * axis_count:(sample_index + 1) * axis_count]
+        values = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
+        for axis, value in zip(axis_order, sample):
+            values[axis] = float(value)
+        keyframes.append((
+            float(action_frame),
+            Vector((values["x"], values["y"], values["z"])),
+            float(values["yaw"]),
+        ))
+        if sample_index < len(delta_times):
+            action_frame += float(delta_times[sample_index])
+    return keyframes
+
+
+def _motion_value_at_frame(keyframes, action_frame):
+    if not keyframes:
+        return Vector((0.0, 0.0, 0.0)), 0.0
+    frame = float(action_frame)
+    first_frame, first_loc, first_yaw = keyframes[0]
+    if frame <= float(first_frame):
+        return first_loc.copy(), float(first_yaw)
+    last_frame, last_loc, last_yaw = keyframes[-1]
+    if frame >= float(last_frame):
+        return last_loc.copy(), float(last_yaw)
+    for left, right in zip(keyframes[:-1], keyframes[1:]):
+        left_frame, left_loc, left_yaw = left
+        right_frame, right_loc, right_yaw = right
+        if float(left_frame) <= frame <= float(right_frame):
+            span = max(1e-6, float(right_frame) - float(left_frame))
+            factor = max(0.0, min(1.0, (frame - float(left_frame)) / span))
+            loc = left_loc.lerp(right_loc, factor)
+            yaw = float(left_yaw) + ((float(right_yaw) - float(left_yaw)) * factor)
+            return loc, yaw
+    return last_loc.copy(), float(last_yaw)
+
+
+def _motion_matrix_from_keyframes(keyframes, action_frame):
+    loc, yaw = _motion_value_at_frame(keyframes, action_frame)
+    return Matrix.Translation(loc) @ Matrix.Rotation(float(yaw), 4, 'Z')
+
+
+def _find_pose_bone_name(armature_obj, wanted_name):
+    bones = getattr(getattr(armature_obj, "pose", None), "bones", None)
+    if not bones:
+        return ""
+    wanted_lower = str(wanted_name or "").lower()
+    for pose_bone in bones:
+        if str(pose_bone.name).lower() == wanted_lower:
+            return pose_bone.name
+    return ""
+
+
+def _trajectory_curve_source(action, armature_obj):
+    trajectory_name = _find_pose_bone_name(armature_obj, "Trajectory")
+    if not action or not trajectory_name:
+        return None
+    prefix = f'pose.bones["{trajectory_name}"].'
+    curves = {
+        "location": {},
+        "rotation_euler": {},
+        "rotation_quaternion": {},
+        "rotation_axis_angle": {},
+    }
+    for fcurve in iter_action_fcurves(action, target=armature_obj):
+        data_path = str(getattr(fcurve, "data_path", "") or "")
+        if not data_path.startswith(prefix):
+            continue
+        prop_name = data_path[len(prefix):]
+        if prop_name in curves:
+            curves[prop_name][int(getattr(fcurve, "array_index", 0))] = fcurve
+    if not any(curves[prop] for prop in curves):
+        return None
+    start_frame, end_frame = [float(value) for value in action.frame_range]
+    duration = max(0.0, end_frame - start_frame)
+    if duration <= 0.0:
+        return None
+    return {
+        "type": "trajectory",
+        "label": "Trajectory",
+        "action_start": start_frame,
+        "duration": duration,
+        "curves": curves,
+    }
+
+
+def _eval_curve(curves_by_index, index, frame, default=0.0):
+    fcurve = curves_by_index.get(index)
+    if fcurve is None:
+        return float(default)
+    try:
+        return float(fcurve.evaluate(frame))
+    except Exception:
+        return float(default)
+
+
+def _trajectory_matrix_at_frame(source, action_frame):
+    curves = source.get("curves") or {}
+    frame = float(source.get("action_start", 0.0)) + float(action_frame)
+    loc_curves = curves.get("location") or {}
+    loc = Vector((
+        _eval_curve(loc_curves, 0, frame, 0.0),
+        _eval_curve(loc_curves, 1, frame, 0.0),
+        _eval_curve(loc_curves, 2, frame, 0.0),
+    ))
+
+    yaw = 0.0
+    quat_curves = curves.get("rotation_quaternion") or {}
+    if quat_curves:
+        quat = Quaternion((
+            _eval_curve(quat_curves, 0, frame, 1.0),
+            _eval_curve(quat_curves, 1, frame, 0.0),
+            _eval_curve(quat_curves, 2, frame, 0.0),
+            _eval_curve(quat_curves, 3, frame, 0.0),
+        ))
+        if quat.dot(quat) > 1e-12:
+            quat.normalize()
+            yaw = quat.to_euler("XYZ").z
+    else:
+        euler_curves = curves.get("rotation_euler") or {}
+        if euler_curves:
+            yaw = _eval_curve(euler_curves, 2, frame, 0.0)
+        else:
+            axis_curves = curves.get("rotation_axis_angle") or {}
+            if axis_curves:
+                angle = _eval_curve(axis_curves, 0, frame, 0.0)
+                axis = Vector((
+                    _eval_curve(axis_curves, 1, frame, 0.0),
+                    _eval_curve(axis_curves, 2, frame, 0.0),
+                    _eval_curve(axis_curves, 3, frame, 1.0),
+                ))
+                if axis.length > 1e-8:
+                    quat = Quaternion(axis.normalized(), angle)
+                    yaw = quat.to_euler("XYZ").z
+
+    return Matrix.Translation(loc) @ Matrix.Rotation(float(yaw), 4, 'Z')
+
+
+def _auto_motion_source_for_action(action, armature_obj):
+    motion_data = _read_action_motion_data(action)
+    keyframes = _motion_keyframes_from_data(motion_data)
+    if len(keyframes) >= 2 and keyframes[-1][0] > 0.0:
+        action_start = float(action.frame_range[0]) if action is not None else 0.0
+        return {
+            "type": "motion_extraction",
+            "label": "Motion Extraction",
+            "action_start": action_start,
+            "duration": float(keyframes[-1][0]),
+            "keyframes": keyframes,
+        }
+    return _trajectory_curve_source(action, armature_obj)
+
+
+def _auto_motion_source_matrix(source, action_frame):
+    duration = max(0.0, float(source.get("duration", 0.0) or 0.0))
+    frame = max(0.0, min(float(action_frame), duration))
+    if source.get("type") == "motion_extraction":
+        return _motion_matrix_from_keyframes(source.get("keyframes") or [], frame)
+    if source.get("type") == "trajectory":
+        return _trajectory_matrix_at_frame(source, frame)
+    return Matrix.Identity(4)
+
+
+def _ordered_nla_tracks(tracks, prefer_tracks=None):
+    ordered = []
+    seen_ids = set()
+    if prefer_tracks:
+        for name in prefer_tracks:
+            for track in tracks:
+                if getattr(track, "name", "") == name:
+                    track_id = id(track)
+                    if track_id not in seen_ids:
+                        ordered.append(track)
+                        seen_ids.add(track_id)
+                    break
+    for track in tracks:
+        track_id = id(track)
+        if track_id not in seen_ids:
+            ordered.append(track)
+            seen_ids.add(track_id)
+    return ordered
+
+
+def _filter_solo_nla_tracks(tracks):
+    solo_tracks = [track for track in tracks if getattr(track, "is_solo", False)]
+    return solo_tracks if solo_tracks else list(tracks)
+
+
+def _nla_action_at_frame(armature_obj, frame=None, prefer_tracks=("anim_import",)):
+    animation_data = getattr(armature_obj, "animation_data", None)
+    if not animation_data or not getattr(animation_data, "nla_tracks", None):
+        return None
+    if frame is None:
+        try:
+            frame = float(bpy.context.scene.frame_current)
+        except Exception:
+            frame = None
+    if frame is None:
+        return None
+    tracks = _ordered_nla_tracks(_filter_solo_nla_tracks(list(animation_data.nla_tracks)), prefer_tracks=prefer_tracks)
+    for track in tracks:
+        if getattr(track, "mute", False):
+            continue
+        for strip in reversed(track.strips):
+            if getattr(strip, "mute", False) or getattr(strip, "action", None) is None:
+                continue
+            if float(strip.frame_start) <= frame <= float(strip.frame_end):
+                return strip.action
+    return None
+
+
+def _nla_last_action(armature_obj, prefer_tracks=("anim_import",)):
+    animation_data = getattr(armature_obj, "animation_data", None)
+    if not animation_data or not getattr(animation_data, "nla_tracks", None):
+        return None
+    tracks = _ordered_nla_tracks(_filter_solo_nla_tracks(list(animation_data.nla_tracks)), prefer_tracks=prefer_tracks)
+    for track in tracks:
+        if getattr(track, "mute", False):
+            continue
+        for strip in reversed(track.strips):
+            if not getattr(strip, "mute", False) and getattr(strip, "action", None) is not None:
+                return strip.action
+    return None
+
+
+def _action_has_auto_motion_source(action, armature_obj):
+    return _auto_motion_source_for_action(action, armature_obj) is not None
+
+
+def _active_armature_action(armature_obj):
+    animation_data = getattr(armature_obj, "animation_data", None)
+    if not animation_data:
+        return None
+
+    nla_action = _nla_action_at_frame(armature_obj)
+    if _action_has_auto_motion_source(nla_action, armature_obj):
+        return nla_action
+
+    action = getattr(animation_data, "action", None)
+    if _action_has_auto_motion_source(action, armature_obj):
+        return action
+
+    nla_last = _nla_last_action(armature_obj)
+    if _action_has_auto_motion_source(nla_last, armature_obj):
+        return nla_last
+
+    return nla_action or action or nla_last
+
+
+def get_auto_motion_source_label(armature_obj):
+    action = _active_armature_action(armature_obj)
+    source = _auto_motion_source_for_action(action, armature_obj)
+    return source.get("label", "") if source else ""
+
+
+def _auto_motion_base_local_matrix(controller):
+    return _matrix_from_flat(controller.get(
+        "w3_auto_motion_base_local_matrix",
+        _flatten_matrix(_object_local_matrix(controller)),
+    ))
+
+
+def _auto_motion_rest_local_matrix(controller):
+    return _matrix_from_flat(controller.get(
+        "w3_auto_motion_rest_local_matrix",
+        _flatten_matrix(_object_local_matrix(controller)),
+    ))
+
+
+def _store_auto_motion_base_local(controller, matrix):
+    controller["w3_auto_motion_base_local_matrix"] = _flatten_matrix(matrix)
+
+
+def _store_auto_motion_rest_local(controller, matrix):
+    controller["w3_auto_motion_rest_local_matrix"] = _flatten_matrix(matrix)
+
+
+def _ensure_motion_direction_controller(armature_obj, auto_controller, reference_obj=None):
+    """Ensure Auto Motion has a steerable parent empty."""
+    if auto_controller is None:
+        return None
+
+    reference_obj = reference_obj or auto_controller
+    direction = get_motion_direction_controller(armature_obj)
+    if direction is None and _is_motion_direction_controller(auto_controller.parent):
+        direction = auto_controller.parent
+
+    old_parent = auto_controller.parent
+    auto_world = auto_controller.matrix_world.copy()
+    if direction is None:
+        direction_name = f"{MOTION_DIRECTION_CONTROLLER_NAME}_{armature_obj.name}"
+        direction = bpy.data.objects.new(direction_name, None)
+        direction.empty_display_type = 'ARROWS'
+        direction.empty_display_size = 1.2
+        direction.matrix_world = auto_world
+        direction["w3_auto_motion_armature"] = armature_obj.name
+        _link_object_like(direction, reference_obj)
+        if old_parent is not None:
+            _parent_keep_world(direction, old_parent)
+
+    if auto_controller.parent != direction:
+        local_matrix = direction.matrix_world.inverted_safe() @ auto_world
+        _parent_direct_local(auto_controller, direction, local_matrix)
+
+    armature_obj.data['motion_direction_controller'] = direction.name
+    direction["w3_auto_motion_armature"] = armature_obj.name
+    return direction
+
+
+def _ensure_auto_motion_controller_state(armature_obj, controller, reference_obj=None):
+    if controller is None:
+        return
+    _ensure_motion_direction_controller(armature_obj, controller, reference_obj=reference_obj)
+    local_matrix = _object_local_matrix(controller)
+    if "w3_auto_motion_rest_local_matrix" not in controller:
+        _store_auto_motion_rest_local(controller, local_matrix)
+    if "w3_auto_motion_base_local_matrix" not in controller:
+        _store_auto_motion_base_local(controller, local_matrix)
+
+
+def _is_scene_playing():
+    try:
+        screen = bpy.context.screen
+        return bool(getattr(screen, "is_animation_playing", False))
+    except Exception:
+        return False
+
+
+def _auto_motion_controller_child(armature_obj):
+    root_controller = get_controller_empty(armature_obj)
+    if root_controller is not None:
+        _clear_root_motion_controller_dependencies(root_controller)
+        return root_controller
+    return armature_obj
+
+
+def setup_auto_motion_controller(armature_obj):
+    """Create the outer controller that accumulates extracted actor motion."""
+    if not armature_obj or armature_obj.type != 'ARMATURE':
+        log.warning("setup_auto_motion_controller: Invalid armature object")
+        return None
+    existing = get_auto_motion_controller(armature_obj)
+    if existing:
+        _ensure_auto_motion_controller_state(armature_obj, existing, reference_obj=existing)
+        return existing
+    action = _active_armature_action(armature_obj)
+    if _auto_motion_source_for_action(action, armature_obj) is None:
+        log.warning("setup_auto_motion_controller: No motion extraction or Trajectory curves found")
+        return None
+
+    child = _auto_motion_controller_child(armature_obj)
+    child_world_matrix = child.matrix_world.copy()
+    direction_name = f"{MOTION_DIRECTION_CONTROLLER_NAME}_{armature_obj.name}"
+    direction = bpy.data.objects.new(direction_name, None)
+    direction.empty_display_type = 'ARROWS'
+    direction.empty_display_size = 1.2
+    direction.matrix_world = child_world_matrix
+    direction["w3_auto_motion_armature"] = armature_obj.name
+    _link_object_like(direction, child)
+
+    controller_name = f"{AUTO_MOTION_CONTROLLER_NAME}_{armature_obj.name}"
+    controller = bpy.data.objects.new(controller_name, None)
+    controller.empty_display_type = 'SINGLE_ARROW'
+    controller.empty_display_size = 0.8
+    _link_object_like(controller, child)
+    _parent_direct_local(controller, direction, Matrix.Identity(4))
+
+    _parent_keep_world(child, controller)
+
+    rest_matrix = Matrix.Identity(4)
+    _store_auto_motion_rest_local(controller, rest_matrix)
+    _store_auto_motion_base_local(controller, rest_matrix)
+    controller["w3_auto_motion_armature"] = armature_obj.name
+    armature_obj.data['motion_direction_controller'] = direction.name
+    armature_obj.data['auto_motion_controller'] = controller.name
+    armature_obj.data['auto_motion_enabled'] = False
+    armature_obj.data['auto_motion_loop_count'] = 0
+    armature_obj.data['auto_motion_last_frame'] = float(getattr(bpy.context.scene, "frame_current", 0.0))
+    armature_obj.data['auto_motion_last_action'] = getattr(action, "name", "")
+    return controller
+
+
+def remove_auto_motion_controller(armature_obj):
+    """Remove the auto-motion controller while preserving child world transforms."""
+    if not armature_obj or armature_obj.type != 'ARMATURE':
+        return False
+    controller = get_auto_motion_controller(armature_obj)
+    if not controller:
+        return False
+    direction = get_motion_direction_controller(armature_obj)
+    if direction is None and _is_motion_direction_controller(controller.parent):
+        direction = controller.parent
+    parent = direction.parent if direction is not None and controller.parent == direction else controller.parent
+    children = list(controller.children)
+    for child in children:
+        _parent_keep_world(child, parent)
+    bpy.data.objects.remove(controller, do_unlink=True)
+    if direction is not None and _is_motion_direction_controller(direction) and not list(direction.children):
+        bpy.data.objects.remove(direction, do_unlink=True)
+    for prop in (
+        'auto_motion_controller',
+        'motion_direction_controller',
+        'auto_motion_enabled',
+        'auto_motion_loop_count',
+        'auto_motion_last_frame',
+        'auto_motion_last_action',
+        'auto_motion_source',
+    ):
+        if prop in armature_obj.data:
+            del armature_obj.data[prop]
+    maybe_remove_auto_motion_handler()
+    return True
+
+
+def set_auto_motion_enabled(armature_obj, enabled):
+    controller = get_auto_motion_controller(armature_obj)
+    if controller is None:
+        controller = setup_auto_motion_controller(armature_obj)
+    if controller is None:
+        return False
+    _ensure_auto_motion_controller_state(armature_obj, controller, reference_obj=armature_obj)
+    if not enabled:
+        armature_obj.data['auto_motion_loop_count'] = 0
+        armature_obj.data['auto_motion_enabled'] = False
+        maybe_remove_auto_motion_handler()
+        return True
+
+    action = _active_armature_action(armature_obj)
+    source = _auto_motion_source_for_action(action, armature_obj)
+    if source is None:
+        return False
+
+    scene = bpy.context.scene
+    current_frame = float(getattr(scene, "frame_current", 0.0) or 0.0)
+    try:
+        current_frame += float(getattr(scene, "frame_subframe", 0.0) or 0.0)
+    except Exception:
+        pass
+    action_start = float(source.get("action_start", 0.0) or 0.0)
+    duration = max(0.0, float(source.get("duration", 0.0) or 0.0))
+    relative_frame = max(0.0, min(current_frame - action_start, duration))
+    current_motion = _auto_motion_source_matrix(source, relative_frame)
+    base_matrix = _object_local_matrix(controller) @ current_motion.inverted_safe()
+    _store_auto_motion_base_local(controller, base_matrix)
+    armature_obj.data['auto_motion_loop_count'] = 0
+    armature_obj.data['auto_motion_last_frame'] = current_frame
+    armature_obj.data['auto_motion_last_action'] = getattr(action, "name", "")
+    armature_obj.data['auto_motion_source'] = source.get("label", "")
+    armature_obj.data['auto_motion_enabled'] = True
+    ensure_auto_motion_handler()
+    return True
+
+
+def toggle_auto_motion_enabled(armature_obj):
+    new_state = not get_auto_motion_enabled(armature_obj)
+    return set_auto_motion_enabled(armature_obj, new_state), new_state
+
+
+def reset_auto_motion_controller(armature_obj):
+    controller = get_auto_motion_controller(armature_obj)
+    if controller is None:
+        return False
+    _ensure_auto_motion_controller_state(armature_obj, controller, reference_obj=armature_obj)
+    rest_matrix = _auto_motion_rest_local_matrix(controller)
+    _store_auto_motion_base_local(controller, rest_matrix)
+    _set_object_local_matrix(controller, rest_matrix)
+    armature_obj.data['auto_motion_loop_count'] = 0
+    scene = getattr(bpy.context, "scene", None)
+    armature_obj.data['auto_motion_last_frame'] = float(getattr(scene, "frame_current", 0.0) or 0.0)
+    if scene is not None and get_auto_motion_enabled(armature_obj):
+        _update_auto_motion_for_armature(scene, armature_obj)
+    return True
+
+
+def _update_auto_motion_for_armature(scene, armature_obj):
+    if not get_auto_motion_enabled(armature_obj):
+        return
+    controller = get_auto_motion_controller(armature_obj)
+    if controller is None:
+        armature_obj.data['auto_motion_enabled'] = False
+        return
+    _ensure_auto_motion_controller_state(armature_obj, controller, reference_obj=armature_obj)
+    action = _active_armature_action(armature_obj)
+    source = _auto_motion_source_for_action(action, armature_obj)
+    if source is None:
+        return
+
+    current_frame = float(getattr(scene, "frame_current", 0.0) or 0.0)
+    try:
+        current_frame += float(getattr(scene, "frame_subframe", 0.0) or 0.0)
+    except Exception:
+        pass
+    last_frame = float(armature_obj.data.get('auto_motion_last_frame', current_frame))
+    last_action = str(armature_obj.data.get('auto_motion_last_action', ""))
+    action_name = getattr(action, "name", "")
+    loop_count = int(armature_obj.data.get('auto_motion_loop_count', 0) or 0)
+
+    action_start = float(source.get("action_start", 0.0) or 0.0)
+    duration = max(0.0, float(source.get("duration", 0.0) or 0.0))
+    action_end = action_start + duration
+    scene_start = float(getattr(scene, "frame_start", action_start) or action_start)
+    loop_start = max(action_start, scene_start)
+    playing = _is_scene_playing()
+
+    relative_frame = max(0.0, min(current_frame - action_start, duration))
+
+    if action_name != last_action:
+        loop_count = 0
+        current_motion = _auto_motion_source_matrix(source, relative_frame)
+        _store_auto_motion_base_local(
+            controller,
+            _object_local_matrix(controller) @ current_motion.inverted_safe(),
+        )
+    elif current_frame < last_frame - 0.1:
+        if playing and last_frame >= action_end - 0.5 and current_frame <= loop_start + 0.5:
+            loop_count += 1
+        else:
+            loop_count = 0
+
+    current_motion = _auto_motion_source_matrix(source, relative_frame)
+    cycle_motion = _auto_motion_source_matrix(source, duration)
+    base_matrix = _auto_motion_base_local_matrix(controller)
+    _set_object_local_matrix(controller, base_matrix @ (_matrix_power(cycle_motion, loop_count) @ current_motion))
+
+    armature_obj.data['auto_motion_loop_count'] = int(loop_count)
+    armature_obj.data['auto_motion_last_frame'] = float(current_frame)
+    armature_obj.data['auto_motion_last_action'] = action_name
+    armature_obj.data['auto_motion_source'] = source.get("label", "")
+
+
+@persistent
+def _auto_motion_frame_change_handler(scene, depsgraph=None):
+    global _AUTO_MOTION_UPDATING
+    if _AUTO_MOTION_UPDATING:
+        return
+    _AUTO_MOTION_UPDATING = True
+    try:
+        for obj in list(bpy.data.objects):
+            if getattr(obj, "type", None) != 'ARMATURE':
+                continue
+            if get_controller_mode(obj) == 'IN_PLACE':
+                _update_root_motion_controller(obj)
+            if get_auto_motion_enabled(obj):
+                _update_auto_motion_for_armature(scene, obj)
+    except Exception:
+        log.debug("Auto motion frame update failed", exc_info=True)
+    finally:
+        _AUTO_MOTION_UPDATING = False
+
+
+def ensure_auto_motion_handler():
+    global _AUTO_MOTION_HANDLER_ACTIVE
+    if _auto_motion_frame_change_handler not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_auto_motion_frame_change_handler)
+    _AUTO_MOTION_HANDLER_ACTIVE = True
+
+
+def maybe_remove_auto_motion_handler():
+    global _AUTO_MOTION_HANDLER_ACTIVE
+    for obj in bpy.data.objects:
+        if getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        if get_auto_motion_enabled(obj) or get_controller_mode(obj) == 'IN_PLACE':
+            return
+    if _auto_motion_frame_change_handler in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_auto_motion_frame_change_handler)
+    _AUTO_MOTION_HANDLER_ACTIVE = False
+
+
+def remove_auto_motion_handler():
+    global _AUTO_MOTION_HANDLER_ACTIVE
+    if _auto_motion_frame_change_handler in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_auto_motion_frame_change_handler)
+    _AUTO_MOTION_HANDLER_ACTIVE = False

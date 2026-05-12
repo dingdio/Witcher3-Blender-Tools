@@ -2,6 +2,7 @@ import logging
 log = logging.getLogger(__name__)
 import os
 import json
+import importlib
 from collections import deque
 from pathlib import Path
 from .. import get_uncook_path, get_rig_rot90_enabled
@@ -17,6 +18,7 @@ from ..CR2W.dc_scene import load_bin_scene
 from ..importers import import_entity
 from ..importers import import_scene_animation
 from ..importers import import_scene_motion
+import_scene_motion = importlib.reload(import_scene_motion)
 from ..importers.import_helpers import set_blender_object_transform#, set_blender_pose_bone_transform
 from ..action_compat import assign_action, bind_strip_action_slot, get_action_channelbag, iter_action_fcurves, new_action_fcurve, resolve_action_slot
 from .import_cutscene import (
@@ -3174,6 +3176,11 @@ class SceneImporter():
         return (element_start + (element_duration * start_position)) * fps
 
     def load_section(self, section):
+        global import_scene_motion
+        try:
+            import_scene_motion = importlib.reload(import_scene_motion)
+        except Exception:
+            log.debug("Could not reload import_scene_motion before scene import", exc_info=True)
         self.scene_element_dict = {}
         self._section_name = str(getattr(section, "sectionName", "") or "")
         self._section_chunk_index = _as_int(getattr(section, "_w3_chunk_index", 0), 0)
@@ -5373,7 +5380,7 @@ class SceneImporter():
                     obj.rotation_axis_angle[axis_i] = value
                 obj.scale = saved_scale
 
-        def create_object_transform_action(action_name, target_obj, key_data, interpolation='CONSTANT'):
+        def create_object_transform_action(action_name, target_obj, key_data, interpolation='CONSTANT', extra_details=None):
             if target_obj is None or not key_data:
                 return None
             data_path_rot = key_data[0][1][3]
@@ -5439,6 +5446,8 @@ class SceneImporter():
                     "yawDeltaDeg": round(((rotation_yaws[-1] - rotation_yaws[0] + 180.0) % 360.0) - 180.0, 3),
                     "yawSpanDeg": round(max(relative_yaws) - min(relative_yaws), 3),
                 })
+            if extra_details:
+                placement_details.update(extra_details)
             import_scene_animation.warn_scene_animation_edit(
                 "created scene placement transform action",
                 action=action,
@@ -6822,6 +6831,95 @@ class SceneImporter():
             if not has_frame_start_key:
                 placement_keys.append((float(frame_offset), initial_values, None))
 
+        def placement_yaw_from_transform_values(target_obj, values):
+            try:
+                _location_values, rotation_values, _scale_values, rot_path = values
+            except Exception:
+                return None
+            try:
+                if rot_path == "rotation_quaternion" and len(rotation_values) >= 4:
+                    return float(Quaternion(rotation_values[:4]).to_euler("XYZ").z)
+                if rot_path == "rotation_axis_angle" and len(rotation_values) >= 4:
+                    axis = Vector((rotation_values[1], rotation_values[2], rotation_values[3]))
+                    if axis.length > 0.0:
+                        return float(Quaternion(axis.normalized(), float(rotation_values[0])).to_euler("XYZ").z)
+                    return 0.0
+                if len(rotation_values) >= 3:
+                    euler_order = getattr(target_obj, "rotation_mode", "XYZ")
+                    if euler_order in {"QUATERNION", "AXIS_ANGLE"}:
+                        euler_order = "XYZ"
+                    return float(Euler(rotation_values[:3], euler_order).z)
+            except Exception:
+                return None
+            return None
+
+        placement_defer_windows_by_actor = scene_motion_accumulator.placement_defer_windows_by_actor()
+
+        def actor_root_motion_defer_windows(actor_obj):
+            if actor_obj is None or not placement_defer_windows_by_actor:
+                return []
+            actor_name = getattr(actor_obj, "name", "") or str(id(actor_obj))
+            windows = placement_defer_windows_by_actor.get(actor_name)
+            if windows is None:
+                windows = placement_defer_windows_by_actor.get(str(id(actor_obj)))
+            return list(windows or [])
+
+        def defer_actor_placement_action_keys(actor_obj, action_keys):
+            windows = actor_root_motion_defer_windows(actor_obj)
+            if not windows or not action_keys:
+                return list(action_keys or []), {}
+
+            # While a body strip keeps visible root motion in NLA, an immediate
+            # object placement key would double-apply the motion and cause a jump.
+            # Keep the reset time for the accumulator, but show the placement only
+            # when the root-motion strip releases back to object-space carry.
+            deferred_keys = []
+            mappings = []
+            tolerance = 1e-4
+            for frame, values, event in action_keys:
+                try:
+                    frame_value = float(frame)
+                except Exception:
+                    deferred_keys.append((frame, values, event))
+                    continue
+                display_frame = frame_value
+                for window in windows:
+                    try:
+                        start_frame = float(window.get("startFrame", 0.0) or 0.0)
+                        end_frame = float(window.get("endFrame", start_frame) or start_frame)
+                        transfer_frame = float(window.get("transferFrame", end_frame) or end_frame)
+                    except Exception:
+                        continue
+                    inside_visible_root = start_frame + tolerance < frame_value <= end_frame + tolerance
+                    transfer_after_key = transfer_frame > frame_value + tolerance
+                    if inside_visible_root and transfer_after_key:
+                        display_frame = transfer_frame
+                        mappings.append((frame_value, display_frame))
+                        break
+                deferred_keys.append((display_frame, values, event))
+
+            if not mappings:
+                return list(action_keys), {}
+
+            by_frame = {}
+            for frame, values, event in deferred_keys:
+                try:
+                    key = round(float(frame), 4)
+                except Exception:
+                    key = frame
+                by_frame[key] = (frame, values, event)
+            result = sorted(by_frame.values(), key=lambda item: float(item[0]))
+            details = {
+                "deferredRootMotionPlacements": len(mappings),
+                "deferredPlacementFrames": ",".join(
+                    f"{round(float(src), 3)}->{round(float(dst), 3)}"
+                    for src, dst in mappings[:8]
+                ),
+            }
+            return result, details
+
+        placement_yaws_by_actor = {}
+        placement_reset_frames_by_actor = {}
         for placement_entry in placement_key_data_by_actor.values():
             actor_obj = placement_entry["object"]
             placement_keys = list(placement_entry["keys"])
@@ -6834,32 +6932,46 @@ class SceneImporter():
             action_keys.extend(placement_keys)
             last_frame, last_values, last_event = action_keys[-1]
             if section_end_frame > last_frame:
-                action_keys.append((section_end_frame, last_values, last_event))
+                action_keys.append((section_end_frame, last_values, None))
+            placement_yaw_keys = []
+            for key_frame, key_values, _key_event in action_keys:
+                key_yaw = placement_yaw_from_transform_values(actor_obj, key_values)
+                if key_yaw is not None:
+                    placement_yaw_keys.append((float(key_frame), float(key_yaw)))
+            if placement_yaw_keys:
+                placement_yaw_keys = sorted(placement_yaw_keys)
+                placement_yaws_by_actor[getattr(actor_obj, "name", str(id(actor_obj)))] = placement_yaw_keys
+                placement_yaws_by_actor[str(id(actor_obj))] = placement_yaw_keys
+            placement_action_keys, placement_extra_details = defer_actor_placement_action_keys(actor_obj, action_keys)
+            reset_frames = []
+            for key_frame, _key_values, key_event in placement_action_keys:
+                if key_event is None:
+                    continue
+                try:
+                    reset_frame = float(key_frame)
+                except Exception:
+                    continue
+                if reset_frame > float(frame_offset) + 1e-4:
+                    reset_frames.append(reset_frame)
+            if reset_frames:
+                placement_reset_frames_by_actor[getattr(actor_obj, "name", str(id(actor_obj)))] = sorted(set(reset_frames))
             action_name = _safe_nla_track_name("ScenePlacement", getattr(actor_obj, "name", "Actor"))
-            placement_action = create_object_transform_action(action_name, actor_obj, action_keys, interpolation='CONSTANT')
+            placement_action = create_object_transform_action(
+                action_name,
+                actor_obj,
+                placement_action_keys,
+                interpolation='CONSTANT',
+                extra_details=placement_extra_details,
+            )
             if placement_action is not None:
                 self.__assign_action(actor_obj, placement_action, track_name="ScenePlacement", at_frame=float(frame_offset))
                 extend_nla_track_to_frame(actor_obj, "ScenePlacement", section_end_frame)
 
-        placement_reset_frames_by_actor = {}
-        for placement_entry in placement_key_data_by_actor.values():
-            actor_obj = placement_entry.get("object")
-            if actor_obj is None:
-                continue
-            placement_frames = []
-            for key in placement_entry.get("keys", []) or []:
-                try:
-                    key_frame = float(key[0])
-                except Exception:
-                    continue
-                if key_frame > float(frame_offset) + 1e-4:
-                    placement_frames.append(key_frame)
-            if placement_frames:
-                placement_reset_frames_by_actor[getattr(actor_obj, "name", str(id(actor_obj)))] = sorted(set(placement_frames))
         for motion_entry in scene_motion_accumulator.build_actor_motion_actions(
             action_name_factory=lambda actor_obj: _safe_nla_track_name("SceneMotionExtraction", getattr(actor_obj, "name", "Actor")),
-            playback_mode="animated",
+            playback_mode="carry",
             reset_frames_by_actor=placement_reset_frames_by_actor,
+            placement_yaws_by_actor=placement_yaws_by_actor,
         ):
             actor_obj = motion_entry.get("actor_obj")
             motion_action = motion_entry.get("action")
@@ -6913,11 +7025,17 @@ class SceneImporter():
                     "frameStart": round(float(frame_offset), 3),
                     "frameEnd": round(float(section_end_frame), 3),
                     "xyDelta": round(float(motion_entry.get("xy_delta", 0.0) or 0.0), 6),
+                    "xySpan": round(float(motion_entry.get("xy_span", 0.0) or 0.0), 6),
                     "yawDeltaDeg": round(float(motion_entry.get("yaw_delta_deg", 0.0) or 0.0), 3),
                     "rotationPath": motion_entry.get("rotation_path", ""),
                     "locationSpace": motion_entry.get("location_space", ""),
+                    "sceneMotionVersion": getattr(import_scene_motion, "SCENE_MOTION_IMPORTER_VERSION", ""),
                     "placementYawDeg": round(float(motion_entry.get("placement_yaw_deg", 0.0) or 0.0), 3),
                     "playbackMode": motion_entry.get("playback_mode", ""),
+                    "animatedObjectMotion": bool(motion_entry.get("has_animated_object_motion", False)),
+                    "motionSources": ",".join(motion_entry.get("motion_sources", []) or []),
+                    "objectPlaybacks": ",".join(motion_entry.get("object_playbacks", []) or []),
+                    "selectionReasons": ",".join(motion_entry.get("selection_reasons", []) or []),
                     "resetFrame": round(float(motion_entry.get("reset_frame")), 3) if motion_entry.get("reset_frame") is not None else "",
                     "resetFrames": ",".join(str(round(float(frame), 3)) for frame in (motion_entry.get("reset_frames", []) or [])[:8]),
                     "resetReason": motion_entry.get("reset_reason", ""),

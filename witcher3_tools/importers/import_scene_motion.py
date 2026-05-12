@@ -1,11 +1,12 @@
 import logging
+import json
+import base64
 import math
 from dataclasses import dataclass, field
 
 from mathutils import Matrix, Quaternion, Vector
 
 from ..action_compat import (
-    bind_strip_action_slot,
     iter_action_fcurves,
     new_action_fcurve,
     resolve_action_slot,
@@ -13,9 +14,7 @@ from ..action_compat import (
 from . import import_scene_animation
 from .import_scene_fcurves import (
     collect_pose_transform_curves as _collect_pose_transform_curves,
-    ensure_pose_transform_fcurves as _ensure_pose_transform_fcurves,
     find_pose_bone_name as _find_pose_bone_name,
-    keyframe_frames as _keyframe_frames,
     set_fcurve_value_at_frame as _set_scene_fcurve_value_at_frame,
     transform_matrix_from_curve_groups as _transform_matrix_from_curve_groups,
 )
@@ -23,10 +22,8 @@ from .import_scene_fcurves import (
 log = logging.getLogger(__name__)
 
 SCENE_MOTION_TRACK_NAME = "SceneMotionExtraction"
+SCENE_MOTION_IMPORTER_VERSION = "action_motion_extraction_handoff_v4"
 
-W2SCENE_ACTION_SCENE_COPY_PROP = "_w3_scene_action_copy"
-W2SCENE_ACTION_SCENE_COPY_SOURCE_PROP = "_w3_scene_action_copy_source"
-W2SCENE_MOTION_SOURCE_ACTION_PROP = "_w3_scene_motion_source_action"
 W2SCENE_MOTION_POSE_POLICY_PROP = "w3_scene_motion_pose_policy"
 W2SCENE_MOTION_HAS_EXTRACTION_PROP = "w3_scene_motion_extraction_created"
 W2SCENE_MOTION_POSE_NEUTRALIZED_PROP = "w3_scene_pose_trajectory_neutralized"
@@ -34,6 +31,15 @@ W2SCENE_EVENT_WEIGHT_PROP = "w3_scene_event_weight"
 W2SCENE_EVENT_WEIGHT_CURVE_BAKED_PROP = "w3_scene_event_weight_curve_baked"
 W2SCENE_ACTION_WEIGHT_PROP = "w3_scene_additive_weight"
 W2SCENE_ACTION_WEIGHT_APPLIED_PROP = "w3_scene_additive_weight_applied"
+
+W3_MOTION_EXTRACTION_FINAL_LOCATION_PROP = "w3_motion_extraction_final_location"
+W3_MOTION_EXTRACTION_FINAL_YAW_PROP = "w3_motion_extraction_final_yaw"
+W3_MOTION_EXTRACTION_FINAL_FRAME_PROP = "w3_motion_extraction_final_frame"
+W3_MOTION_EXTRACTION_FLAGS_PROP = "w3_motion_extraction_flags"
+W3_MOTION_EXTRACTION_SAMPLE_COUNT_PROP = "w3_motion_extraction_sample_count"
+W3_MOTION_EXTRACTION_DATA_PROP = "w3_motion_extraction_data"
+
+_MOTION_EXTRACTION_DATA_CACHE = {}
 
 
 def _target_name(target):
@@ -71,20 +77,6 @@ def _wrap_radians(value):
     return (float(value) + math.pi) % (math.pi * 2.0) - math.pi
 
 
-def _wrap_degrees(value):
-    return (float(value) + 180.0) % 360.0 - 180.0
-
-
-def _set_fcurve_value_at_frame(fcurve, frame, value, interpolation='LINEAR'):
-    _set_scene_fcurve_value_at_frame(
-        fcurve,
-        frame,
-        value,
-        interpolation=interpolation,
-        update_existing_interpolation=True,
-    )
-
-
 def _yaw_from_matrix(matrix):
     try:
         return float(matrix.to_euler("XYZ").z)
@@ -95,12 +87,22 @@ def _yaw_from_matrix(matrix):
 def _xy_delta_from_matrices(prev_matrix, curr_matrix):
     delta_matrix = prev_matrix.inverted_safe() @ curr_matrix
     delta_loc = delta_matrix.to_translation()
-    return Vector((float(delta_loc.x), float(delta_loc.y), 0.0))
+    return Vector((float(delta_loc.x), float(delta_loc.y), float(delta_loc.z)))
 
 
 def _yaw_delta_from_matrices(prev_matrix, curr_matrix):
     delta_matrix = prev_matrix.inverted_safe() @ curr_matrix
     return _wrap_radians(_yaw_from_matrix(delta_matrix))
+
+
+def _set_fcurve_value_at_frame(fcurve, frame, value, interpolation='LINEAR'):
+    _set_scene_fcurve_value_at_frame(
+        fcurve,
+        frame,
+        value,
+        interpolation=interpolation,
+        update_existing_interpolation=True,
+    )
 
 
 def _event_uses_motion_extraction(event):
@@ -194,165 +196,300 @@ def _sample_scene_frames(strip, section_start_frame, section_end_frame):
     return sorted(frames)
 
 
-def _ensure_motion_edit_action(strip, armature_obj, *, event=None, section="", track_name="", reason="motion"):
-    action = getattr(strip, "action", None) if strip is not None else None
+def _read_action_motion_extraction_terminal(action):
     if action is None:
         return None
     try:
-        if bool(action.get(W2SCENE_ACTION_SCENE_COPY_PROP, False)):
-            return action
+        raw_location = action.get(W3_MOTION_EXTRACTION_FINAL_LOCATION_PROP, None)
     except Exception:
-        pass
-    try:
-        copied_action = action.copy()
-    except Exception:
-        log.debug("Could not copy scene action %s for %s", _target_name(action), reason, exc_info=True)
-        return action
-    try:
-        copied_action.name = f"{action.name}_{reason}"
-        copied_action[W2SCENE_ACTION_SCENE_COPY_PROP] = True
-        copied_action[W2SCENE_ACTION_SCENE_COPY_SOURCE_PROP] = action.name
-        copied_action[W2SCENE_MOTION_SOURCE_ACTION_PROP] = action.name
-        strip.action = copied_action
-        bind_strip_action_slot(strip, resolve_action_slot(copied_action, target=armature_obj, ensure=True))
-    except Exception:
-        log.debug("Could not assign scene motion action copy to strip %s", _target_name(strip), exc_info=True)
-    import_scene_animation.warn_scene_animation_edit(
-        "copied action for scene-only preprocessing",
-        action=copied_action,
-        strip=strip,
-        armature_obj=armature_obj,
-        event=event,
-        section=section,
-        track_name=track_name,
-        details={
-            "sourceAction": _target_name(action),
-            "newAction": _target_name(copied_action),
-            "reason": reason,
-        },
-    )
-    return copied_action
-
-
-def counteract_pose_trajectory_with_root(strip, armature_obj, *, event=None, section="", track_name=""):
-    action = _ensure_motion_edit_action(
-        strip,
-        armature_obj,
-        event=event,
-        section=section,
-        track_name=track_name,
-        reason="scene_motion_root_counter",
-    )
-    if action is None or armature_obj is None:
-        return {"changed": 0, "rootBone": "", "trajectoryBone": "", "frames": 0}
-
-    root_name = _find_pose_bone_name(armature_obj, "Root")
-    trajectory_name = _find_pose_bone_name(armature_obj, "Trajectory")
-    if not root_name or not trajectory_name:
-        return {"changed": 0, "rootBone": root_name or "", "trajectoryBone": trajectory_name or "", "frames": 0}
-
-    slot = resolve_action_slot(action, target=armature_obj, ensure=True)
-    curves_by_bone = _collect_pose_transform_curves(action, armature_obj, slot)
-    trajectory_curves = curves_by_bone.get(trajectory_name)
-    if not trajectory_curves:
-        return {"changed": 0, "rootBone": root_name, "trajectoryBone": trajectory_name, "frames": 0}
-
-    root_curves = curves_by_bone.setdefault(root_name, {
-        "location": {},
-        "rotation_quaternion": {},
-        "rotation_euler": {},
-        "scale": {},
-    })
-    _ensure_pose_transform_fcurves(action, armature_obj, slot, root_name, "location", root_curves["location"], create_if_empty=True)
-    _ensure_pose_transform_fcurves(action, armature_obj, slot, root_name, "rotation_quaternion", root_curves["rotation_quaternion"], create_if_empty=True)
-    _ensure_pose_transform_fcurves(action, armature_obj, slot, root_name, "scale", root_curves["scale"], create_if_empty=True)
-
-    frames = set()
-    for curves in trajectory_curves.values():
-        for fcurve in curves.values():
-            frames.update(_keyframe_frames(fcurve))
-    if not frames:
-        return {"changed": 0, "rootBone": root_name, "trajectoryBone": trajectory_name, "frames": 0}
-
-    sorted_frames = sorted(frames)
-    root_static = _transform_matrix_from_curve_groups(root_curves, sorted_frames[0])
-    changed = 0
-    yaw_values = []
-    for frame in sorted_frames:
-        trajectory_matrix = _transform_matrix_from_curve_groups(trajectory_curves, frame)
-        counter_matrix = root_static @ trajectory_matrix.inverted_safe()
-        loc, rot, scale = counter_matrix.decompose()
-        rot.normalize()
-        yaw_values.append(math.degrees(_yaw_from_matrix(trajectory_matrix)))
-        for axis_i, value in enumerate((loc.x, loc.y, loc.z)):
-            _set_fcurve_value_at_frame(root_curves["location"][axis_i], frame, value)
-            changed += 1
-        for axis_i, value in enumerate((rot.w, rot.x, rot.y, rot.z)):
-            _set_fcurve_value_at_frame(root_curves["rotation_quaternion"][axis_i], frame, value)
-            changed += 1
-        for axis_i, value in enumerate((scale.x, scale.y, scale.z)):
-            _set_fcurve_value_at_frame(root_curves["scale"][axis_i], frame, value)
-            changed += 1
-
-    try:
-        pose_bone = armature_obj.pose.bones.get(root_name)
-        if pose_bone is not None:
-            pose_bone.rotation_mode = "QUATERNION"
-    except Exception:
-        pass
-    for fcurve in iter_action_fcurves(action, target=armature_obj, slot=slot):
+        raw_location = None
+    if raw_location is None:
+        return None
+    if isinstance(raw_location, str):
         try:
-            fcurve.update()
+            raw_location = json.loads(raw_location)
         except Exception:
-            pass
+            return None
+    if not isinstance(raw_location, (list, tuple)) or len(raw_location) < 3:
+        return None
     try:
-        action[W2SCENE_MOTION_POSE_POLICY_PROP] = "counteract_pose_trajectory_with_root"
-        action[W2SCENE_MOTION_POSE_NEUTRALIZED_PROP] = True
-        action["w3_scene_pose_trajectory_counteracted"] = True
-        action["w3_scene_pose_trajectory_counter_frames"] = len(sorted_frames)
-        action["w3_scene_pose_trajectory_counter_root_bone"] = root_name
-        action["w3_scene_pose_trajectory_counter_trajectory_bone"] = trajectory_name
-        action.update_tag()
+        location = Vector((
+            float(raw_location[0]),
+            float(raw_location[1]),
+            float(raw_location[2]),
+        ))
     except Exception:
-        pass
-    if strip is not None:
-        try:
-            strip[W2SCENE_MOTION_POSE_POLICY_PROP] = "counteract_pose_trajectory_with_root"
-            strip[W2SCENE_MOTION_POSE_NEUTRALIZED_PROP] = True
-            strip["w3_scene_pose_trajectory_counteracted"] = True
-        except Exception:
-            pass
-
-    details = {
-        "reason": "useMotionExtraction_true_useFakeMotion_false",
-        "rootBone": root_name,
-        "trajectoryBone": trajectory_name,
-        "frames": len(sorted_frames),
-        "curveEdits": changed,
-    }
-    if yaw_values:
-        first_yaw = yaw_values[0]
-        rel_yaws = [_wrap_degrees(yaw - first_yaw) for yaw in yaw_values]
-        details.update({
-            "trajectoryYawDeltaDeg": round(_wrap_degrees(yaw_values[-1] - first_yaw), 3),
-            "trajectoryYawSpanDeg": round(max(rel_yaws) - min(rel_yaws), 3),
-        })
-    import_scene_animation.warn_scene_animation_edit(
-        "counteracted pose Trajectory motion with Root inverse for scene motion extraction",
-        action=action,
-        strip=strip,
-        armature_obj=armature_obj,
-        event=event,
-        section=section,
-        track_name=track_name,
-        details=details,
-    )
+        return None
+    try:
+        yaw = _as_float(action.get(W3_MOTION_EXTRACTION_FINAL_YAW_PROP, 0.0), 0.0)
+    except Exception:
+        yaw = 0.0
+    try:
+        flags = int(action.get(W3_MOTION_EXTRACTION_FLAGS_PROP, 0) or 0)
+    except Exception:
+        flags = 0
+    try:
+        final_frame = _as_float(action.get(W3_MOTION_EXTRACTION_FINAL_FRAME_PROP, 0.0), 0.0)
+    except Exception:
+        final_frame = 0.0
+    try:
+        sample_count = int(action.get(W3_MOTION_EXTRACTION_SAMPLE_COUNT_PROP, 0) or 0)
+    except Exception:
+        sample_count = 0
     return {
-        "changed": changed,
-        "rootBone": root_name,
-        "trajectoryBone": trajectory_name,
-        "frames": len(sorted_frames),
+        "location": location,
+        "yaw": float(yaw),
+        "flags": flags,
+        "finalFrame": float(final_frame),
+        "sampleCount": sample_count,
     }
+
+
+def _motion_extraction_delta_times(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            return [int(item) for item in base64.b64decode(value)]
+        except Exception:
+            return []
+    if isinstance(value, (bytes, bytearray)):
+        return [int(item) for item in value]
+    try:
+        return [int(item) for item in value]
+    except Exception:
+        return []
+
+
+def _normalize_motion_extraction_data(raw_data):
+    if isinstance(raw_data, str):
+        try:
+            raw_data = json.loads(raw_data)
+        except Exception:
+            return None
+    if not isinstance(raw_data, dict):
+        return None
+    try:
+        flags = int(raw_data.get("flags", 0) or 0)
+        frames = [float(value) for value in (raw_data.get("frames") or [])]
+        delta_times = _motion_extraction_delta_times(raw_data.get("deltaTimes", None))
+        duration = _as_float(raw_data.get("duration", 0.0), 0.0)
+    except Exception:
+        return None
+    axis_count = sum(1 for bit in (1, 2, 4, 8) if flags & bit)
+    if flags == 0 or axis_count <= 0 or len(frames) < axis_count:
+        return None
+    sample_count = len(frames) // axis_count
+    if sample_count <= 0:
+        return None
+    return {
+        "duration": float(duration),
+        "deltaTimes": delta_times[:max(0, sample_count - 1)],
+        "frames": frames[:sample_count * axis_count],
+        "flags": flags,
+        "sampleCount": sample_count,
+        "axisCount": axis_count,
+    }
+
+
+def _motion_extraction_terminal_from_data(motion_data):
+    keyframes = _motion_extraction_keyframes(motion_data)
+    if not keyframes:
+        return None
+    final_frame, final_loc, final_yaw = keyframes[-1]
+    return {
+        "location": final_loc,
+        "yaw": float(final_yaw),
+        "flags": int(motion_data.get("flags", 0) or 0),
+        "finalFrame": float(final_frame),
+        "sampleCount": int(motion_data.get("sampleCount", 0) or 0),
+    }
+
+
+def _write_action_motion_extraction_data(action, motion_data):
+    if action is None or not motion_data:
+        return
+    try:
+        action[W3_MOTION_EXTRACTION_DATA_PROP] = json.dumps({
+            "duration": float(motion_data.get("duration", 0.0) or 0.0),
+            "deltaTimes": [int(value) for value in (motion_data.get("deltaTimes") or [])],
+            "frames": [float(value) for value in (motion_data.get("frames") or [])],
+            "flags": int(motion_data.get("flags", 0) or 0),
+        })
+        terminal = _motion_extraction_terminal_from_data(motion_data)
+        if terminal:
+            loc = terminal["location"]
+            action[W3_MOTION_EXTRACTION_FLAGS_PROP] = int(terminal["flags"])
+            action[W3_MOTION_EXTRACTION_FINAL_LOCATION_PROP] = json.dumps([
+                float(loc.x),
+                float(loc.y),
+                float(loc.z),
+            ])
+            action[W3_MOTION_EXTRACTION_FINAL_YAW_PROP] = float(terminal["yaw"])
+            action[W3_MOTION_EXTRACTION_FINAL_FRAME_PROP] = float(terminal["finalFrame"])
+            action[W3_MOTION_EXTRACTION_SAMPLE_COUNT_PROP] = int(terminal["sampleCount"])
+    except Exception:
+        pass
+
+
+def _action_scene_motion_source(action):
+    if action is None:
+        return "", ""
+    source_path = ""
+    anim_name = ""
+    for prop_name in ("w3_anim_source_file", "w3_scene_resolved_path"):
+        try:
+            source_path = str(action.get(prop_name, "") or "").strip()
+        except Exception:
+            source_path = ""
+        if source_path:
+            break
+    for prop_name in ("w3_scene_resolved_animation", "w3_scene_requested_animation"):
+        try:
+            anim_name = str(action.get(prop_name, "") or "").strip()
+        except Exception:
+            anim_name = ""
+        if anim_name:
+            break
+    if not anim_name:
+        action_name = _target_name(action)
+        base_name, dot, suffix = action_name.rpartition(".")
+        anim_name = base_name if dot and suffix.isdigit() else action_name
+    return source_path, anim_name
+
+
+def _load_action_motion_extraction_data(action):
+    source_path, anim_name = _action_scene_motion_source(action)
+    if not source_path or not anim_name:
+        return None
+    cache_key = (source_path.lower(), anim_name.lower())
+    if cache_key in _MOTION_EXTRACTION_DATA_CACHE:
+        return _MOTION_EXTRACTION_DATA_CACHE[cache_key]
+    motion_data = None
+    try:
+        from ..CR2W.dc_anims import load_bin_anims_single
+        anim_set = load_bin_anims_single(source_path, anim_name, rigPath=None)
+        entry = (anim_set.animations[0] if anim_set and anim_set.animations else None)
+        animation = getattr(entry, "animation", None)
+        motion_data = _normalize_motion_extraction_data(getattr(animation, "motionExtraction", None))
+    except Exception:
+        log.debug("Could not lazily load motion extraction for %s from %s", anim_name, source_path, exc_info=True)
+        motion_data = None
+    _MOTION_EXTRACTION_DATA_CACHE[cache_key] = motion_data
+    if motion_data:
+        _write_action_motion_extraction_data(action, motion_data)
+        log.info(
+            "Loaded scene motion extraction metadata on demand: action=%s animation=%s samples=%s flags=%s",
+            _target_name(action),
+            anim_name,
+            motion_data.get("sampleCount", 0),
+            motion_data.get("flags", 0),
+        )
+    return motion_data
+
+
+def _read_action_motion_extraction_data(action):
+    if action is None:
+        return None
+    try:
+        raw_data = action.get(W3_MOTION_EXTRACTION_DATA_PROP, None)
+    except Exception:
+        raw_data = None
+    motion_data = _normalize_motion_extraction_data(raw_data) if raw_data is not None else None
+    if motion_data is not None:
+        return motion_data
+    return _load_action_motion_extraction_data(action)
+
+
+def _motion_extraction_axis_order(flags):
+    axis_order = []
+    if flags & 1:
+        axis_order.append("x")
+    if flags & 2:
+        axis_order.append("y")
+    if flags & 4:
+        axis_order.append("z")
+    if flags & 8:
+        axis_order.append("yaw")
+    return axis_order
+
+
+def _motion_extraction_keyframes(motion_data):
+    if not motion_data:
+        return []
+    flags = int(motion_data.get("flags", 0) or 0)
+    axis_order = _motion_extraction_axis_order(flags)
+    axis_count = len(axis_order)
+    frames = list(motion_data.get("frames") or [])
+    if axis_count <= 0 or not frames:
+        return []
+    sample_count = int(motion_data.get("sampleCount", 0) or 0)
+    if sample_count <= 0:
+        sample_count = len(frames) // axis_count
+    delta_times = list(motion_data.get("deltaTimes") or [])
+    keyframes = []
+    action_frame = 0.0
+    for sample_index in range(sample_count):
+        sample = frames[sample_index * axis_count:(sample_index + 1) * axis_count]
+        values = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
+        for axis, value in zip(axis_order, sample):
+            values[axis] = float(value)
+        keyframes.append((
+            float(action_frame),
+            Vector((values["x"], values["y"], values["z"])),
+            float(values["yaw"]),
+        ))
+        if sample_index < len(delta_times):
+            action_frame += float(delta_times[sample_index])
+    return keyframes
+
+
+def _motion_extraction_value_at_frame(keyframes, action_frame):
+    if not keyframes:
+        return Vector((0.0, 0.0, 0.0)), 0.0
+    frame = float(action_frame)
+    first_frame, first_loc, first_yaw = keyframes[0]
+    if frame <= float(first_frame):
+        return first_loc.copy(), float(first_yaw)
+    last_frame, last_loc, last_yaw = keyframes[-1]
+    if frame >= float(last_frame):
+        return last_loc.copy(), float(last_yaw)
+    for left, right in zip(keyframes[:-1], keyframes[1:]):
+        left_frame, left_loc, left_yaw = left
+        right_frame, right_loc, right_yaw = right
+        if float(left_frame) <= frame <= float(right_frame):
+            span = max(1e-6, float(right_frame) - float(left_frame))
+            factor = max(0.0, min(1.0, (frame - float(left_frame)) / span))
+            loc = left_loc.lerp(right_loc, factor)
+            yaw = float(left_yaw) + ((float(right_yaw) - float(left_yaw)) * factor)
+            return loc, yaw
+    return last_loc.copy(), float(last_yaw)
+
+
+def _motion_extraction_matrix_at_frame(keyframes, action_frame):
+    loc, yaw = _motion_extraction_value_at_frame(keyframes, action_frame)
+    return Matrix.Translation(loc) @ Matrix.Rotation(float(yaw), 4, 'Z')
+
+
+def _collect_visible_root_motion_curves(action, armature_obj):
+    if action is None or armature_obj is None:
+        return None
+    try:
+        slot = resolve_action_slot(action, target=armature_obj, ensure=True)
+        curves_by_bone = _collect_pose_transform_curves(action, armature_obj, slot)
+    except Exception:
+        log.debug("Could not collect pose root motion curves from %s", _target_name(action), exc_info=True)
+        return None
+
+    source_name = None
+    for wanted_name in ("Trajectory", "Root", "Reference"):
+        bone_name = _find_pose_bone_name(armature_obj, wanted_name)
+        if bone_name and bone_name in curves_by_bone:
+            source_name = bone_name
+            break
+    if not source_name:
+        return None
+    return source_name, curves_by_bone.get(source_name) or {}
 
 
 @dataclass
@@ -383,30 +520,15 @@ class SceneMotionEvent:
     diagnostic: dict = field(default_factory=dict)
 
 
-def _trajectory_diagnostic(curves_by_prop, frames):
-    if not curves_by_prop or not frames:
-        return {
-            "xyDelta": 0.0,
-            "yawDeltaDeg": 0.0,
-            "yawSpanDeg": 0.0,
-            "samples": 0,
-        }
-    sorted_frames = sorted(frames)
-    first_matrix = _transform_matrix_from_curve_groups(curves_by_prop, sorted_frames[0])
-    first_loc = first_matrix.to_translation()
-    first_yaw = _yaw_from_matrix(first_matrix)
-    last_matrix = _transform_matrix_from_curve_groups(curves_by_prop, sorted_frames[-1])
-    last_loc = last_matrix.to_translation()
-    yaws = [_wrap_radians(_yaw_from_matrix(_transform_matrix_from_curve_groups(curves_by_prop, frame)) - first_yaw) for frame in sorted_frames]
-    return {
-        "xyDelta": round(math.sqrt((last_loc.x - first_loc.x) ** 2 + (last_loc.y - first_loc.y) ** 2), 6),
-        "yawDeltaDeg": round(math.degrees(_wrap_radians(_yaw_from_matrix(last_matrix) - first_yaw)), 3),
-        "yawSpanDeg": round(math.degrees(max(yaws) - min(yaws)), 3) if yaws else 0.0,
-        "samples": len(sorted_frames),
-    }
+def _strip_transfer_frame(strip, section_end_frame=0.0):
+    try:
+        end_frame = float(getattr(strip, "frame_end", 0.0) or 0.0)
+    except Exception:
+        end_frame = 0.0
+    return end_frame
 
 
-def build_motion_event_from_strip(
+def build_sampled_root_motion_carry_event_from_strip(
     actor_obj,
     armature_obj,
     strip,
@@ -421,12 +543,10 @@ def build_motion_event_from_strip(
     if actor_obj is None or armature_obj is None or strip is None or action is None:
         return None
 
-    slot = resolve_action_slot(action, target=armature_obj, ensure=True)
-    curves_by_bone = _collect_pose_transform_curves(action, armature_obj, slot)
-    trajectory_name = _find_pose_bone_name(armature_obj, "Trajectory")
-    if not trajectory_name or trajectory_name not in curves_by_bone:
+    source_data = _collect_visible_root_motion_curves(action, armature_obj)
+    if source_data is None:
         import_scene_animation.warn_scene_animation_debug(
-            "scene motion extraction skipped; action has no Trajectory curves",
+            "scene motion extraction skipped; action has no visible root motion curves",
             action=action,
             strip=strip,
             armature_obj=armature_obj,
@@ -438,6 +558,106 @@ def build_motion_event_from_strip(
                 "useFakeMotion": _event_uses_fake_motion(event),
             },
         )
+        return None
+
+    source_name, curves = source_data
+    scene_frames = _sample_scene_frames(strip, section_start_frame, section_end_frame)
+    if len(scene_frames) < 2:
+        return None
+
+    try:
+        action_frame_start = float(getattr(strip, "action_frame_start", action.frame_range[0]) or action.frame_range[0])
+    except Exception:
+        action_frame_start = 0.0
+
+    event_weight = _event_weight(event, strip=strip, action=action)
+    weight_baked = _event_weight_is_baked(strip=strip, action=action)
+    motion_weight = 1.0 if weight_baked else event_weight
+
+    action_frames = [_strip_action_frame(strip, frame, action_frame_start) for frame in scene_frames]
+    intervals = []
+    for prev_scene_frame, curr_scene_frame, prev_action_frame, curr_action_frame in zip(
+        scene_frames[:-1],
+        scene_frames[1:],
+        action_frames[:-1],
+        action_frames[1:],
+    ):
+        prev_matrix = _transform_matrix_from_curve_groups(curves, prev_action_frame)
+        curr_matrix = _transform_matrix_from_curve_groups(curves, curr_action_frame)
+        delta_loc = _xy_delta_from_matrices(prev_matrix, curr_matrix)
+        dyaw = _yaw_delta_from_matrices(prev_matrix, curr_matrix)
+        blend_factor = _strip_blend_factor(strip, curr_scene_frame)
+        interval_weight = max(0.0, min(1.0, motion_weight * blend_factor))
+        if interval_weight <= 0.0:
+            continue
+        intervals.append(SceneMotionInterval(
+            start_frame=float(prev_scene_frame),
+            end_frame=float(curr_scene_frame),
+            dx=float(delta_loc.x),
+            dy=float(delta_loc.y),
+            dz=float(delta_loc.z),
+            dyaw=float(dyaw),
+            weight=float(interval_weight),
+        ))
+
+    if not intervals:
+        return None
+
+    start_frame = scene_frames[0]
+    end_frame = scene_frames[-1]
+    first_matrix = _transform_matrix_from_curve_groups(curves, action_frames[0])
+    last_matrix = _transform_matrix_from_curve_groups(curves, action_frames[-1])
+    total_delta = first_matrix.inverted_safe() @ last_matrix
+    total_loc = total_delta.to_translation()
+    transfer_frame = _strip_transfer_frame(strip, section_end_frame=section_end_frame)
+    return SceneMotionEvent(
+        actor_obj=actor_obj,
+        armature_obj=armature_obj,
+        event=event,
+        action_name=_target_name(action),
+        track_name=track_name,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        event_weight=event_weight,
+        motion_weight=motion_weight,
+        weight_baked=weight_baked,
+        trajectory_bone=source_name,
+        intervals=intervals,
+        diagnostic={
+            "source": "visible_pose_root_sampled",
+            "sourceBone": source_name,
+            "objectPlayback": "carry",
+            "xyDelta": round(math.sqrt((total_loc.x ** 2) + (total_loc.y ** 2)), 6),
+            "zDelta": round(float(total_loc.z), 6),
+            "yawDeltaDeg": round(math.degrees(_wrap_radians(_yaw_from_matrix(total_delta))), 3),
+            "transferFrame": float(transfer_frame),
+            "actionStart": round(float(action_frames[0]), 3),
+            "actionEnd": round(float(action_frames[-1]), 3),
+            "sampleCount": len(intervals) + 1,
+        },
+    )
+
+
+def build_sampled_motion_extraction_event_from_strip(
+    actor_obj,
+    armature_obj,
+    strip,
+    *,
+    event=None,
+    section="",
+    track_name="",
+    section_start_frame=0.0,
+    section_end_frame=0.0,
+):
+    action = getattr(strip, "action", None) if strip is not None else None
+    if actor_obj is None or armature_obj is None or strip is None or action is None:
+        return None
+
+    motion_data = _read_action_motion_extraction_data(action)
+    if motion_data is None:
+        return None
+    motion_keyframes = _motion_extraction_keyframes(motion_data)
+    if len(motion_keyframes) < 2:
         return None
 
     scene_frames = _sample_scene_frames(strip, section_start_frame, section_end_frame)
@@ -453,9 +673,7 @@ def build_motion_event_from_strip(
     weight_baked = _event_weight_is_baked(strip=strip, action=action)
     motion_weight = 1.0 if weight_baked else event_weight
 
-    trajectory_curves = curves_by_bone.get(trajectory_name) or {}
     action_frames = [_strip_action_frame(strip, frame, action_frame_start) for frame in scene_frames]
-    diagnostic = _trajectory_diagnostic(trajectory_curves, action_frames)
     intervals = []
     for prev_scene_frame, curr_scene_frame, prev_action_frame, curr_action_frame in zip(
         scene_frames[:-1],
@@ -463,8 +681,8 @@ def build_motion_event_from_strip(
         action_frames[:-1],
         action_frames[1:],
     ):
-        prev_matrix = _transform_matrix_from_curve_groups(trajectory_curves, prev_action_frame)
-        curr_matrix = _transform_matrix_from_curve_groups(trajectory_curves, curr_action_frame)
+        prev_matrix = _motion_extraction_matrix_at_frame(motion_keyframes, prev_action_frame)
+        curr_matrix = _motion_extraction_matrix_at_frame(motion_keyframes, curr_action_frame)
         delta_loc = _xy_delta_from_matrices(prev_matrix, curr_matrix)
         dyaw = _yaw_delta_from_matrices(prev_matrix, curr_matrix)
         blend_factor = _strip_blend_factor(strip, curr_scene_frame)
@@ -476,7 +694,7 @@ def build_motion_event_from_strip(
             end_frame=float(curr_scene_frame),
             dx=float(delta_loc.x),
             dy=float(delta_loc.y),
-            dz=0.0,
+            dz=float(delta_loc.z),
             dyaw=float(dyaw),
             weight=float(interval_weight),
         ))
@@ -484,13 +702,73 @@ def build_motion_event_from_strip(
     if not intervals:
         return None
 
-    try:
-        start_frame = float(getattr(strip, "frame_start", scene_frames[0]) or scene_frames[0])
-        end_frame = float(getattr(strip, "frame_end", scene_frames[-1]) or scene_frames[-1])
-    except Exception:
-        start_frame = scene_frames[0]
-        end_frame = scene_frames[-1]
+    first_matrix = _motion_extraction_matrix_at_frame(motion_keyframes, action_frames[0])
+    last_matrix = _motion_extraction_matrix_at_frame(motion_keyframes, action_frames[-1])
+    total_delta = first_matrix.inverted_safe() @ last_matrix
+    total_loc = total_delta.to_translation()
+    transfer_frame = _strip_transfer_frame(strip, section_end_frame=section_end_frame)
+    return SceneMotionEvent(
+        actor_obj=actor_obj,
+        armature_obj=armature_obj,
+        event=event,
+        action_name=_target_name(action),
+        track_name=track_name,
+        start_frame=scene_frames[0],
+        end_frame=scene_frames[-1],
+        event_weight=event_weight,
+        motion_weight=motion_weight,
+        weight_baked=weight_baked,
+        trajectory_bone="",
+        intervals=intervals,
+        diagnostic={
+            "source": "action_motion_extraction_sampled",
+            "sourceBone": "",
+            "objectPlayback": "carry",
+            "xyDelta": round(math.sqrt((total_loc.x ** 2) + (total_loc.y ** 2)), 6),
+            "zDelta": round(float(total_loc.z), 6),
+            "yawDeltaDeg": round(math.degrees(_wrap_radians(_yaw_from_matrix(total_delta))), 3),
+            "transferFrame": float(transfer_frame),
+            "actionStart": round(float(action_frames[0]), 3),
+            "actionEnd": round(float(action_frames[-1]), 3),
+            "flags": int(motion_data.get("flags", 0) or 0),
+            "sourceMotionSamples": int(motion_data.get("sampleCount", 0) or 0),
+            "sampleCount": len(intervals) + 1,
+        },
+    )
 
+
+def build_terminal_motion_extraction_event_from_strip(
+    actor_obj,
+    armature_obj,
+    strip,
+    *,
+    event=None,
+    section="",
+    track_name="",
+    section_end_frame=0.0,
+):
+    action = getattr(strip, "action", None) if strip is not None else None
+    if actor_obj is None or armature_obj is None or strip is None or action is None:
+        return None
+
+    terminal = _read_action_motion_extraction_terminal(action)
+    if terminal is None:
+        return None
+
+    try:
+        start_frame = float(getattr(strip, "frame_start", 0.0) or 0.0)
+        end_frame = float(getattr(strip, "frame_end", start_frame) or start_frame)
+    except Exception:
+        start_frame = 0.0
+        end_frame = 0.0
+    if end_frame <= start_frame:
+        return None
+
+    event_weight = _event_weight(event, strip=strip, action=action)
+    weight_baked = _event_weight_is_baked(strip=strip, action=action)
+    motion_weight = 1.0 if weight_baked else event_weight
+    location = terminal["location"]
+    yaw = float(terminal["yaw"])
     return SceneMotionEvent(
         actor_obj=actor_obj,
         armature_obj=armature_obj,
@@ -502,10 +780,35 @@ def build_motion_event_from_strip(
         event_weight=event_weight,
         motion_weight=motion_weight,
         weight_baked=weight_baked,
-        trajectory_bone=trajectory_name,
-        intervals=intervals,
-        diagnostic=diagnostic,
+        trajectory_bone="",
+        intervals=[
+            SceneMotionInterval(
+                start_frame=float(start_frame),
+                end_frame=float(end_frame),
+                dx=float(location.x),
+                dy=float(location.y),
+                dz=float(location.z),
+                dyaw=float(yaw),
+                weight=float(motion_weight),
+            )
+        ],
+        diagnostic={
+            "source": "action_motion_extraction_terminal",
+            "sourceBone": "",
+            "objectPlayback": "carry",
+            "xyDelta": round(math.sqrt((location.x ** 2) + (location.y ** 2)), 6),
+            "zDelta": round(float(location.z), 6),
+            "yawDeltaDeg": round(math.degrees(_wrap_radians(yaw)), 3),
+            "transferFrame": float(end_frame),
+            "flags": int(terminal.get("flags", 0) or 0),
+            "sampleCount": int(terminal.get("sampleCount", 0) or 0),
+            "motionFinalFrame": round(float(terminal.get("finalFrame", 0.0) or 0.0), 3),
+        },
     )
+
+
+def build_terminal_root_motion_carry_event_from_strip(*args, **kwargs):
+    return build_terminal_motion_extraction_event_from_strip(*args, **kwargs)
 
 
 class SceneMotionAccumulator:
@@ -530,6 +833,49 @@ class SceneMotionAccumulator:
 
     def event_count(self):
         return sum(len(entry.get("events", [])) for entry in self._events_by_actor.values())
+
+    def placement_defer_windows_by_actor(self):
+        windows_by_actor = {}
+        for key, entry in self._events_by_actor.items():
+            actor_obj = entry.get("object")
+            actor_key = getattr(actor_obj, "name", "") or key or str(id(actor_obj))
+            windows = []
+            for motion_event in entry.get("events", []) or []:
+                if motion_event is None:
+                    continue
+                diagnostic = motion_event.diagnostic or {}
+                source = str(diagnostic.get("source", "") or "")
+                object_playback = str(diagnostic.get("objectPlayback", "") or "")
+                if source not in {
+                    "visible_pose_root_sampled",
+                    "action_motion_extraction_sampled",
+                    "action_motion_extraction_terminal",
+                }:
+                    continue
+                if object_playback not in {"carry", "animated"}:
+                    continue
+                try:
+                    start_frame = float(motion_event.start_frame)
+                    end_frame = float(motion_event.end_frame)
+                    transfer_frame = float((motion_event.diagnostic or {}).get("transferFrame", end_frame))
+                except Exception:
+                    continue
+                if end_frame <= start_frame or transfer_frame <= start_frame:
+                    continue
+                windows.append({
+                    "startFrame": start_frame,
+                    "endFrame": end_frame,
+                    "transferFrame": transfer_frame,
+                    "action": str(motion_event.action_name or ""),
+                    "source": source,
+                })
+            if not windows:
+                continue
+            windows.sort(key=lambda item: (item["startFrame"], item["endFrame"], item["transferFrame"]))
+            windows_by_actor[actor_key] = windows
+            if actor_obj is not None:
+                windows_by_actor[str(id(actor_obj))] = windows
+        return windows_by_actor
 
     def _actor_keyframes(self, entry, reset_frames=None):
         events = list(entry.get("events", []) or [])
@@ -609,7 +955,31 @@ class SceneMotionAccumulator:
                 frames.append(frame)
         return sorted(set(frames))
 
-    def build_actor_motion_actions(self, *, action_name_factory=None, playback_mode="carry", reset_frames_by_actor=None):
+    def _actor_placement_yaw_keys(self, actor_obj, actor_name, placement_yaws_by_actor):
+        if not placement_yaws_by_actor:
+            return []
+        raw_keys = placement_yaws_by_actor.get(actor_name)
+        if raw_keys is None:
+            raw_keys = placement_yaws_by_actor.get(str(id(actor_obj)))
+        if raw_keys is None:
+            return []
+        keys = []
+        for item in raw_keys:
+            try:
+                frame, yaw = item
+                keys.append((float(frame), float(yaw)))
+            except Exception:
+                continue
+        return sorted(keys)
+
+    def build_actor_motion_actions(
+        self,
+        *,
+        action_name_factory=None,
+        playback_mode="carry",
+        reset_frames_by_actor=None,
+        placement_yaws_by_actor=None,
+    ):
         actions = []
         try:
             import bpy
@@ -617,14 +987,21 @@ class SceneMotionAccumulator:
             return actions
 
         reset_frames_by_actor = reset_frames_by_actor or {}
+        placement_yaws_by_actor = placement_yaws_by_actor or {}
         default_playback_mode = _strip_text(playback_mode, "carry")
         for entry in self._events_by_actor.values():
             actor_obj = entry.get("object")
             actor_name = getattr(actor_obj, "name", "") or str(id(actor_obj))
             reset_frames = self._actor_reset_frames(actor_obj, actor_name, reset_frames_by_actor)
+            placement_yaw_keys = self._actor_placement_yaw_keys(actor_obj, actor_name, placement_yaws_by_actor)
             sampled_keyframes = self._actor_keyframes(entry, reset_frames=reset_frames)
             if actor_obj is None or len(sampled_keyframes) < 2:
                 continue
+            events = list(entry.get("events", []) or [])
+            has_animated_object_motion = any(
+                str((motion_event.diagnostic or {}).get("objectPlayback", "") or "") == "animated"
+                for motion_event in events
+            )
             actor_playback_mode = default_playback_mode
             if actor_playback_mode == "animated":
                 keyframes = [(float(frame), loc.copy(), float(yaw)) for frame, loc, yaw in sampled_keyframes]
@@ -632,18 +1009,45 @@ class SceneMotionAccumulator:
             else:
                 state_frames = {self.section_start_frame, self.section_end_frame}
                 state_frames.update(reset_frames)
-                for motion_event in entry.get("events", []) or []:
-                    state_frames.add(float(motion_event.end_frame))
+                if has_animated_object_motion:
+                    for reset_frame_value in reset_frames:
+                        before_reset = max(self.section_start_frame, float(reset_frame_value) - 0.001)
+                        if before_reset < float(reset_frame_value) - 1e-6:
+                            state_frames.add(before_reset)
+                for motion_event in events:
+                    object_playback = str((motion_event.diagnostic or {}).get("objectPlayback", "") or "")
+                    if object_playback == "animated":
+                        for interval in motion_event.intervals:
+                            state_frames.add(float(interval.start_frame))
+                            state_frames.add(float(interval.end_frame))
+                    else:
+                        transfer_frame = motion_event.diagnostic.get("transferFrame", motion_event.end_frame)
+                        state_frames.add(float(transfer_frame))
                 keyframes = []
                 for state_frame in sorted(frame for frame in state_frames if self.section_start_frame <= frame <= self.section_end_frame):
                     candidates = [item for item in sampled_keyframes if float(item[0]) <= float(state_frame) + 1e-4]
                     chosen = candidates[-1] if candidates else sampled_keyframes[0]
                     keyframes.append((float(state_frame), chosen[1].copy(), float(chosen[2])))
-                interpolation = 'CONSTANT'
+                interpolation = 'LINEAR' if has_animated_object_motion else 'CONSTANT'
             reset_frame = reset_frames[0] if reset_frames else None
             reset_reason = "explicitScenePlacement" if reset_frames else ""
             if len(keyframes) < 2:
                 continue
+            motion_sources = sorted({
+                str((motion_event.diagnostic or {}).get("source", "") or "")
+                for motion_event in events
+                if str((motion_event.diagnostic or {}).get("source", "") or "")
+            })
+            object_playbacks = sorted({
+                str((motion_event.diagnostic or {}).get("objectPlayback", "") or "")
+                for motion_event in events
+                if str((motion_event.diagnostic or {}).get("objectPlayback", "") or "")
+            })
+            selection_reasons = sorted({
+                str((motion_event.diagnostic or {}).get("selectionReason", "") or "")
+                for motion_event in events
+                if str((motion_event.diagnostic or {}).get("selectionReason", "") or "")
+            })
             action_name = (
                 action_name_factory(actor_obj)
                 if action_name_factory is not None
@@ -675,12 +1079,23 @@ class SceneMotionAccumulator:
                     placement_yaw = float(actor_obj.rotation_euler.z)
                 except Exception:
                     placement_yaw = 0.0
+
+            def placement_yaw_at(frame):
+                yaw_value = placement_yaw
+                for key_frame, key_yaw in placement_yaw_keys:
+                    if float(key_frame) <= float(frame) + 1e-4:
+                        yaw_value = float(key_yaw)
+                    else:
+                        break
+                return yaw_value
+
             for frame, loc, yaw in keyframes:
-                # Trajectory curves have already gone through the animation import
-                # rot90 axis conversion. Key the extracted object offset in those
-                # same Blender scene axes; rotating by actor placement yaw turns a
-                # forward scene +Y step into actor-local sideways motion.
-                keyed_loc = loc
+                # Engine scene motion is accumulated in actor-local space, then
+                # multiplied by the actor placement. Object location F-curves are
+                # keyed in parent/scene axes, so rotate the carried offset by the
+                # current placement yaw before adding it to ScenePlacement.
+                placement_rot = Matrix.Rotation(placement_yaw_at(frame), 4, 'Z')
+                keyed_loc = placement_rot @ loc
                 for axis_i, value in enumerate((keyed_loc.x, keyed_loc.y, keyed_loc.z)):
                     _set_fcurve_value_at_frame(loc_curves[axis_i], frame, value, interpolation=interpolation)
                 if rot_path == "rotation_quaternion":
@@ -698,9 +1113,14 @@ class SceneMotionAccumulator:
                 except Exception:
                     pass
             total_xy = 0.0
+            span_xy = 0.0
             total_yaw = 0.0
             if sampled_keyframes:
                 total_xy = math.sqrt(sampled_keyframes[-1][1].x ** 2 + sampled_keyframes[-1][1].y ** 2)
+                span_xy = max(
+                    math.sqrt(item[1].x ** 2 + item[1].y ** 2)
+                    for item in sampled_keyframes
+                )
                 total_yaw = math.degrees(_wrap_radians(sampled_keyframes[-1][2] - sampled_keyframes[0][2]))
             try:
                 action[W2SCENE_MOTION_HAS_EXTRACTION_PROP] = True
@@ -708,10 +1128,19 @@ class SceneMotionAccumulator:
                 action["w3_scene_motion_key_count"] = len(keyframes)
                 action["w3_scene_motion_sample_key_count"] = len(sampled_keyframes)
                 action["w3_scene_motion_xy_delta"] = float(total_xy)
+                action["w3_scene_motion_xy_span"] = float(span_xy)
                 action["w3_scene_motion_yaw_delta_deg"] = float(total_yaw)
                 action["w3_scene_motion_rotation_path"] = rot_path
                 action["w3_scene_motion_location_space"] = "blender_scene_axes"
                 action["w3_scene_motion_placement_yaw_deg"] = math.degrees(placement_yaw)
+                action["w3_scene_motion_has_animated_object_motion"] = bool(has_animated_object_motion)
+                action["w3_scene_motion_sources"] = ",".join(motion_sources)
+                action["w3_scene_motion_object_playbacks"] = ",".join(object_playbacks)
+                action["w3_scene_motion_selection_reasons"] = ",".join(selection_reasons)
+                action["w3_scene_motion_placement_yaw_keys"] = ",".join(
+                    f"{round(float(frame), 3)}:{round(math.degrees(float(yaw)), 3)}"
+                    for frame, yaw in placement_yaw_keys[:8]
+                )
                 action["w3_scene_motion_playback_mode"] = actor_playback_mode
                 action["w3_scene_motion_reset_count"] = len(reset_frames)
                 if reset_frame is not None:
@@ -727,11 +1156,16 @@ class SceneMotionAccumulator:
                 "sample_keyframes": sampled_keyframes,
                 "event_count": len(entry.get("events", []) or []),
                 "xy_delta": total_xy,
+                "xy_span": span_xy,
                 "yaw_delta_deg": total_yaw,
                 "rotation_path": rot_path,
                 "location_space": "blender_scene_axes",
                 "placement_yaw_deg": math.degrees(placement_yaw),
                 "playback_mode": actor_playback_mode,
+                "has_animated_object_motion": bool(has_animated_object_motion),
+                "motion_sources": motion_sources,
+                "object_playbacks": object_playbacks,
+                "selection_reasons": selection_reasons,
                 "reset_frame": reset_frame,
                 "reset_frames": list(reset_frames),
                 "reset_reason": reset_reason,
@@ -764,8 +1198,8 @@ def process_body_strip_motion(
     pose_policy = "keep_fake_motion" if use_fake_motion else "keep_pose_motion_record_actor_state"
 
     motion_event = None
-    if use_motion_extraction or not use_fake_motion:
-        motion_event = build_motion_event_from_strip(
+    if use_motion_extraction:
+        extracted_motion_event = build_sampled_motion_extraction_event_from_strip(
             actor_obj,
             armature_obj,
             strip,
@@ -775,25 +1209,59 @@ def process_body_strip_motion(
             section_start_frame=section_start_frame,
             section_end_frame=section_end_frame,
         )
-    motion_event_added = False
-    if use_motion_extraction and motion_event is not None and accumulator is not None:
-        motion_event_added = accumulator.add_event(motion_event)
-
-    neutralize_result = {"changed": 0, "bone": ""}
-    if use_motion_extraction and not use_fake_motion and motion_event is not None:
-        neutralize_result = counteract_pose_trajectory_with_root(
-            strip,
+        terminal_motion_event = build_terminal_motion_extraction_event_from_strip(
+            actor_obj,
             armature_obj,
+            strip,
             event=event,
             section=section,
             track_name=track_name,
+            section_end_frame=section_end_frame,
         )
-        if int(neutralize_result.get("changed", 0) or 0) > 0:
-            pose_policy = "actor_motion_counteract_pose_trajectory"
+        visible_motion_event = None
+        if extracted_motion_event is not None:
+            motion_event = extracted_motion_event
+            try:
+                motion_event.diagnostic["selectionReason"] = "action_motion_extraction_handoff"
+            except Exception:
+                pass
+        elif terminal_motion_event is not None:
+            motion_event = terminal_motion_event
+            try:
+                motion_event.diagnostic["selectionReason"] = "terminal_motion_extraction_handoff_fallback"
+            except Exception:
+                pass
         else:
-            pose_policy = "actor_motion_no_pose_trajectory"
-    if use_motion_extraction and use_fake_motion:
-        pose_policy = "keep_fake_motion_record_actor_state"
+            visible_motion_event = build_sampled_root_motion_carry_event_from_strip(
+                actor_obj,
+                armature_obj,
+                strip,
+                event=event,
+                section=section,
+                track_name=track_name,
+                section_start_frame=section_start_frame,
+                section_end_frame=section_end_frame,
+            )
+            motion_event = visible_motion_event
+            try:
+                if motion_event is not None:
+                    motion_event.diagnostic["selectionReason"] = "visible_root_fallback_no_action_motion_extraction"
+            except Exception:
+                pass
+    motion_event_added = False
+    if use_motion_extraction and motion_event is not None and accumulator is not None:
+        motion_event_added = accumulator.add_event(motion_event)
+    pose_neutralized = False
+    if use_motion_extraction:
+        if motion_event_added:
+            object_playback = str((motion_event.diagnostic or {}).get("objectPlayback", "") or "") if motion_event is not None else ""
+            pose_policy = (
+                "animate_actor_motion_extraction_keep_pose"
+                if object_playback == "animated"
+                else "keep_nla_root_motion_carry_actor_state"
+            )
+        else:
+            pose_policy = "keep_nla_root_motion_no_actor_carry"
 
     final_action = getattr(strip, "action", action) if strip is not None else action
     for id_block in (final_action, strip):
@@ -802,7 +1270,7 @@ def process_body_strip_motion(
         try:
             id_block[W2SCENE_MOTION_POSE_POLICY_PROP] = pose_policy
             id_block[W2SCENE_MOTION_HAS_EXTRACTION_PROP] = bool(motion_event_added)
-            id_block[W2SCENE_MOTION_POSE_NEUTRALIZED_PROP] = bool(neutralize_result.get("changed", 0))
+            id_block[W2SCENE_MOTION_POSE_NEUTRALIZED_PROP] = bool(pose_neutralized)
         except Exception:
             pass
 
@@ -811,12 +1279,8 @@ def process_body_strip_motion(
         "useFakeMotion": bool(use_fake_motion),
         "posePolicy": pose_policy,
         "actorMotion": bool(motion_event_added),
-        "poseNeutralized": bool(neutralize_result.get("changed", 0)),
-        "trajectoryBone": (
-            motion_event.trajectory_bone
-            if motion_event is not None
-            else neutralize_result.get("trajectoryBone", neutralize_result.get("bone", ""))
-        ),
+        "poseNeutralized": bool(pose_neutralized),
+        "trajectoryBone": motion_event.trajectory_bone if motion_event is not None else "",
     }
     if motion_event is not None:
         details.update({
@@ -824,9 +1288,30 @@ def process_body_strip_motion(
             "motionWeight": round(float(motion_event.motion_weight), 6),
             "weightBaked": bool(motion_event.weight_baked),
             "intervals": len(motion_event.intervals),
-            "trajectoryXYDelta": motion_event.diagnostic.get("xyDelta", 0.0),
-            "trajectoryYawDeltaDeg": motion_event.diagnostic.get("yawDeltaDeg", 0.0),
-            "trajectoryYawSpanDeg": motion_event.diagnostic.get("yawSpanDeg", 0.0),
+            "motionSource": motion_event.diagnostic.get("source", ""),
+            "motionSourceBone": motion_event.diagnostic.get("sourceBone", ""),
+            "objectPlayback": motion_event.diagnostic.get("objectPlayback", ""),
+            "selectionReason": motion_event.diagnostic.get("selectionReason", ""),
+            "visibleRootXYDelta": motion_event.diagnostic.get("visibleRootXYDelta", 0.0),
+            "extractedXYDelta": motion_event.diagnostic.get("extractedXYDelta", 0.0),
+            "terminalXYDelta": motion_event.diagnostic.get("xyDelta", 0.0),
+            "terminalZDelta": motion_event.diagnostic.get("zDelta", 0.0),
+            "terminalYawDeltaDeg": motion_event.diagnostic.get("yawDeltaDeg", 0.0),
+            "transferFrame": motion_event.diagnostic.get("transferFrame", 0.0),
+            "actionStart": motion_event.diagnostic.get("actionStart", 0.0),
+            "actionEnd": motion_event.diagnostic.get("actionEnd", 0.0),
+            "motionFlags": motion_event.diagnostic.get("flags", 0),
+            "motionSamples": motion_event.diagnostic.get("sampleCount", 0),
+            "sourceMotionSamples": motion_event.diagnostic.get("sourceMotionSamples", 0),
+            "motionFinalFrame": motion_event.diagnostic.get("motionFinalFrame", 0.0),
+        })
+    if use_motion_extraction:
+        action_motion_data = _read_action_motion_extraction_data(action)
+        action_motion_terminal = _read_action_motion_extraction_terminal(action)
+        details.update({
+            "hasActionMotionExtractionData": bool(action_motion_data),
+            "hasActionMotionExtractionTerminal": bool(action_motion_terminal),
+            "actionMotionExtractionSamples": int((action_motion_data or {}).get("sampleCount", 0) or 0),
         })
     if use_motion_extraction or not use_fake_motion or motion_event is not None:
         try:
@@ -846,6 +1331,6 @@ def process_body_strip_motion(
     return {
         "motionEventAdded": bool(motion_event_added),
         "posePolicy": pose_policy,
-        "poseNeutralized": bool(neutralize_result.get("changed", 0)),
+        "poseNeutralized": bool(pose_neutralized),
         "motionEvent": motion_event,
     }
