@@ -6,6 +6,92 @@ from .prop_utils import prop_to_string as _prop_to_str
 
 log = logging.getLogger(__name__)
 
+_SCENE_W3STRINGS_CACHE = {}
+
+
+def _scene_source_root_candidates(scene_filepath):
+    source_path = str(scene_filepath or "").strip().replace("/", "\\")
+    if not source_path or not os.path.isabs(source_path):
+        return []
+
+    roots = []
+    normalized = os.path.normpath(source_path)
+    lowered = normalized.lower()
+    for marker in ("\\r4data\\", "\\workspace\\", "\\content\\content0\\"):
+        marker_idx = lowered.find(marker)
+        if marker_idx >= 0:
+            root = normalized[:marker_idx + len(marker) - 1]
+            if os.path.isdir(root):
+                roots.append(root)
+    return roots
+
+
+def _load_w3strings_map(strings_path):
+    strings_path = os.path.normpath(str(strings_path or ""))
+    if not strings_path:
+        return {}
+    strings_key = os.path.normcase(strings_path)
+    cached = _SCENE_W3STRINGS_CACHE.get(strings_key)
+    if cached is not None:
+        return cached
+
+    lines = {}
+    try:
+        from .witcher_cache.W3Strings.W3StringFile import W3StringFile
+        from .bStream import bStream
+
+        string_file = W3StringFile()
+        with open(strings_path, "rb") as reader:
+            stream = bStream(path=strings_path, reader=reader)
+            string_file.Read(stream)
+        for item in string_file.block1:
+            lines[int(item.str_id)] = item.str
+    except Exception:
+        log.debug("Could not read scene string table: %s", strings_path, exc_info=True)
+
+    _SCENE_W3STRINGS_CACHE[strings_key] = lines
+    return lines
+
+
+def _scene_localized_text(line_id, scene_filepath):
+    try:
+        line_key = int(str(line_id or "").strip())
+    except (TypeError, ValueError):
+        return ""
+    if not line_key:
+        return ""
+
+    try:
+        from .witcher_cache.W3Strings.W3StringManager import Configuration
+        language = str(getattr(Configuration, "TextLanguage", "en") or "en").strip()
+    except Exception:
+        language = "en"
+    if not language:
+        language = "en"
+
+    for root in _scene_source_root_candidates(scene_filepath):
+        strings_path = os.path.join(root, f"{language}.w3strings")
+        if os.path.isfile(strings_path):
+            text = _load_w3strings_map(strings_path).get(line_key, "")
+            if text:
+                return text
+    return ""
+
+
+def _localized_string_id_and_text(prop, scene_filepath=""):
+    string_obj = getattr(prop, 'String', None) if prop is not None else None
+    if string_obj is None:
+        return "", ""
+
+    line_id = str(getattr(string_obj, 'val', "") or "").strip()
+    text = ""
+    try:
+        text = str(getattr(string_obj, 'text', "") or "").strip()
+    except Exception:
+        log.debug("Could not resolve localized dialog string %s", line_id, exc_info=True)
+    if not text:
+        text = _scene_localized_text(line_id, scene_filepath)
+    return line_id, text
 
 
 def create_scene(file):
@@ -35,7 +121,8 @@ def get_cutscene_dialog_lines(scene_filepath, cutscene_path):
     matches cutscene_path (compared by basename), then extracts CStorySceneLine
     data from that section's sceneElements array.
 
-    Returns a list of dicts with keys: actor, voice_file, sound_event, line_index.
+    Returns a list of dicts with keys: actor, voice_file, sound_event, line_id,
+    line_index, line_text.
     """
     try:
         with open(scene_filepath, "rb") as f:
@@ -82,25 +169,21 @@ def get_cutscene_dialog_lines(scene_filepath, cutscene_path):
             voice    = _prop_to_str(el_chunk.GetVariableByName('voiceFileName'))
             snd_evt  = _prop_to_str(el_chunk.GetVariableByName('soundEventName'))
 
-            line_idx = 0
             dl_prop = el_chunk.GetVariableByName('dialogLine')
-            if dl_prop is not None:
-                ls = getattr(dl_prop, 'String', None)
-                if ls is not None:
-                    try:
-                        line_idx = int(getattr(ls, 'val', 0) or 0)
-                    except (ValueError, TypeError):
-                        line_idx = 0
+            line_id, line_text = _localized_string_id_and_text(dl_prop, scene_filepath)
+            try:
+                line_idx = int(line_id or 0)
+            except (ValueError, TypeError):
+                line_idx = 0
 
             lines.append({
                 "actor":       actor,
                 "voice_file":  voice,
                 "sound_event": snd_evt,
+                "line_id":     line_id,
                 "line_index":  line_idx,
+                "line_text":   line_text,
             })
-
-        # Only process the first matching section per file
-        break
 
     log.info("Loaded %d dialog lines from %s", len(lines), os.path.basename(scene_filepath))
     return lines

@@ -1,7 +1,9 @@
 import logging
+import math
 import os
 
 import bpy
+import blf
 from bpy.types import Panel, Operator, UIList, PropertyGroup
 from bpy.props import (
     BoolProperty,
@@ -38,6 +40,119 @@ _CUTSCENE_IMPORT_NLA_TRACK_COMPONENTS = {
     "anim_import": "Root",
     "mimic_import": "face",
 }
+_subtitle_draw_handle = None
+
+
+def _cutscene_get_active_subtitle(scene, frame):
+    if scene is None or not bool(getattr(scene, "witcher_cutscene_show_dialog_subtitles", True)):
+        return None
+    for item in getattr(scene, "witcher_cutscene_dialog_items", []) or []:
+        text = str(getattr(item, "line_text", "") or "").strip()
+        if not text:
+            continue
+        try:
+            start_frame = int(getattr(item, "start_frame", 0) or 0)
+            end_frame = int(getattr(item, "end_frame", 0) or 0)
+        except Exception:
+            continue
+        if start_frame <= int(frame) <= end_frame:
+            return text
+    return None
+
+
+def _set_blf_size(font_id, font_size):
+    try:
+        blf.size(font_id, font_size)
+    except TypeError:
+        blf.size(font_id, font_size, 72)
+
+
+def _wrap_subtitle_text(font_id, text, max_width):
+    words = str(text or "").split()
+    if not words:
+        return []
+
+    lines = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        width, _height = blf.dimensions(font_id, candidate)
+        if current and width > max_width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def draw_cutscene_subtitle():
+    context = bpy.context
+    scene = getattr(context, "scene", None)
+    region = getattr(context, "region", None)
+    if scene is None or region is None:
+        return
+
+    text = _cutscene_get_active_subtitle(scene, getattr(scene, "frame_current", 0))
+    if not text:
+        return
+
+    font_id = 0
+    font_size = int(getattr(scene, "witcher_cutscene_subtitle_font_size", 28) or 28)
+    font_size = max(12, min(72, font_size))
+    _set_blf_size(font_id, font_size)
+
+    max_width = max(120.0, float(getattr(region, "width", 0) or 0) * 0.82)
+    lines = _wrap_subtitle_text(font_id, text, max_width) or [text]
+    line_height = font_size * 1.25
+    base_y = 60.0
+
+    for idx, line in enumerate(reversed(lines)):
+        text_width, _text_height = blf.dimensions(font_id, line)
+        x = (float(region.width) - text_width) / 2.0
+        y = base_y + (idx * line_height)
+
+        try:
+            blf.color(font_id, 0.0, 0.0, 0.0, 0.85)
+        except Exception:
+            pass
+        blf.position(font_id, x + 2.0, y - 2.0, 0)
+        blf.draw(font_id, line)
+
+        try:
+            blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+        except Exception:
+            pass
+        blf.position(font_id, x, y, 0)
+        blf.draw(font_id, line)
+
+
+def enable_cutscene_subtitles():
+    global _subtitle_draw_handle
+    if _subtitle_draw_handle is not None:
+        return
+    try:
+        _subtitle_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            draw_cutscene_subtitle,
+            (),
+            'WINDOW',
+            'POST_PIXEL',
+        )
+    except Exception:
+        _subtitle_draw_handle = None
+        log.debug("Could not register cutscene subtitle draw handler.", exc_info=True)
+
+
+def disable_cutscene_subtitles():
+    global _subtitle_draw_handle
+    if _subtitle_draw_handle is None:
+        return
+    try:
+        bpy.types.SpaceView3D.draw_handler_remove(_subtitle_draw_handle, 'WINDOW')
+    except Exception:
+        log.debug("Could not remove cutscene subtitle draw handler.", exc_info=True)
+    _subtitle_draw_handle = None
 
 
 def _cs_text(value):
@@ -234,11 +349,16 @@ class CutsceneTemplateFieldItem(PropertyGroup):
     is_set: BoolProperty(default=False)
 
 class CutsceneDialogItem(PropertyGroup):
-    actor: StringProperty(default="")
-    voice_file: StringProperty(default="")
-    sound_event: StringProperty(default="")
-    line_index: IntProperty(default=0)
-    scene_path: StringProperty(default="")
+    actor: StringProperty(name="voicetag", default="")
+    voice_file: StringProperty(name="voiceFileName", default="")
+    sound_event: StringProperty(name="soundEventName", default="")
+    line_id: StringProperty(name="dialogLine", default="")
+    line_index: IntProperty(name="dialogLine Int32", default=0)
+    line_text: StringProperty(name="LocalizedString.text", default="")
+    scene_path: StringProperty(name="source .w2scene", default="")
+    start_frame: IntProperty(name="computed start frame", default=0)
+    end_frame: IntProperty(name="computed end frame", default=0)
+    imported_sound: BoolProperty(name="imported audio strip", default=False)
 
 def _set_cutscene_burned_audio_scene_state(scene, event_name="", item_path=""):
     if hasattr(scene, "witcher_cutscene_burned_audio_event"):
@@ -528,10 +648,18 @@ class WITCH_UL_CutsceneDialogList(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
-            row.label(text=item.actor or "?", icon='OUTLINER_OB_SPEAKER')
-            row.label(text=item.voice_file or item.sound_event or "")
-            if item.line_index:
-                row.label(text=str(item.line_index))
+            actor_split = row.split(factor=0.16, align=True)
+            actor_split.label(text=item.actor or "?", icon='OUTLINER_OB_SPEAKER')
+
+            text_split = actor_split.split(factor=0.86, align=True)
+            text_split.label(text=item.line_text or "<text not resolved>", icon='FONT_DATA', translate=False)
+
+            frame_row = text_split.row(align=True)
+            frame_row.alignment = 'RIGHT'
+            if item.start_frame or item.end_frame:
+                frame_row.label(text=f"{item.start_frame}-{item.end_frame}")
+            if item.imported_sound:
+                frame_row.label(text="", icon='SOUND')
         elif self.layout_type in {'GRID'}:
             layout.alignment = 'CENTER'
             layout.label(text="")
@@ -627,6 +755,198 @@ def _find_actor_obj_by_voicetag(scene, voicetag):
     return None
 
 
+def _cutscene_scene_fps(scene):
+    render = getattr(scene, "render", None)
+    fps = float(getattr(render, "fps", 30.0) or 30.0)
+    fps_base = float(getattr(render, "fps_base", 1.0) or 1.0)
+    if fps_base <= 0.0:
+        fps_base = 1.0
+    return fps / fps_base
+
+
+def _dialog_default_duration_frames(line_text, fps):
+    text_len = len(str(line_text or "").strip())
+    if text_len <= 0:
+        return int(round(max(1.0, fps * 2.5)))
+    seconds = max(1.5, min(8.0, text_len / 14.0))
+    return int(round(max(1.0, seconds * fps)))
+
+
+def _cutscene_dialog_line_id(dialog_data):
+    line_id = str(dialog_data.get("line_id", "") or "").strip()
+    if line_id:
+        return line_id
+    try:
+        line_index = int(dialog_data.get("line_index", 0) or 0)
+    except (TypeError, ValueError):
+        line_index = 0
+    return str(line_index) if line_index else ""
+
+
+def _cutscene_dialog_int32(value):
+    try:
+        int_value = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if int_value < -2147483648 or int_value > 2147483647:
+        return 0
+    return int_value
+
+
+def _numeric_voice_candidate(value):
+    value = str(value or "").strip().replace("\\", "/")
+    if not value:
+        return ""
+    stem = os.path.splitext(os.path.basename(value))[0]
+    return stem if stem.isdigit() else ""
+
+
+def _cutscene_dialog_voice_id_candidates(dialog_data):
+    candidates = []
+    for value in (
+        _numeric_voice_candidate(dialog_data.get("voice_file", "")),
+        _cutscene_dialog_line_id(dialog_data),
+    ):
+        value = str(value or "").strip()
+        if value and value.isdigit() and value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def _cutscene_dialog_strip_props(filepath, dialog_data, item=None):
+    line_id = str(getattr(item, "line_id", "") or _cutscene_dialog_line_id(dialog_data))
+    line_text = str(getattr(item, "line_text", "") or dialog_data.get("line_text", "") or "")
+    sound_event = str(getattr(item, "sound_event", "") or dialog_data.get("sound_event", "") or "")
+    return {
+        import_cutscene.CUTSCENE_DIALOG_AUDIO_PROP: True,
+        import_cutscene.CUTSCENE_DIALOG_LINE_ID_PROP: line_id,
+        import_cutscene.CUTSCENE_DIALOG_TEXT_PROP: line_text,
+        import_cutscene.CUTSCENE_DIALOG_SOUND_EVENT_PROP: sound_event,
+        import_cutscene.CUTSCENE_DIALOG_SOURCE_PATH_PROP: str(filepath or ""),
+    }
+
+
+def _find_cutscene_animation_strip_start(scene, animation_entry):
+    if animation_entry is None:
+        return None
+    try:
+        source_index = int(getattr(animation_entry, "source_index", -1))
+    except Exception:
+        source_index = -1
+    full_name = str(getattr(animation_entry, "full_name", "") or "").strip()
+    filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+    track_names = {import_cutscene.CUTSCENE_TRACK_NAME, import_cutscene.CUTSCENE_FACE_TRACK_NAME}
+    starts = []
+
+    for obj in getattr(scene, "objects", []) or []:
+        if getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        anim_data = getattr(obj, "animation_data", None)
+        if anim_data is None:
+            continue
+        for track in getattr(anim_data, "nla_tracks", []) or []:
+            if str(getattr(track, "name", "") or "") not in track_names:
+                continue
+            for strip in getattr(track, "strips", []) or []:
+                action = getattr(strip, "action", None)
+                if action is None:
+                    continue
+                try:
+                    action_index = int(action.get(import_cutscene.CUTSCENE_SOURCE_INDEX_PROP, -1) or -1)
+                except Exception:
+                    action_index = -1
+                if action_index != source_index:
+                    continue
+                action_name = str(action.get(import_cutscene.CUTSCENE_ANIMATION_NAME_PROP, "") or "").strip()
+                if full_name and action_name and action_name != full_name:
+                    continue
+                action_path = str(action.get(import_cutscene.CUTSCENE_SOURCE_PATH_PROP, "") or "").strip()
+                if filepath and action_path and not _same_filesystem_path(action_path, filepath):
+                    continue
+                starts.append(float(getattr(strip, "frame_start", 0.0) or 0.0))
+
+    return min(starts) if starts else None
+
+
+def _collect_cutscene_dialog_event_frames(scene):
+    fps = _cutscene_scene_fps(scene)
+    dialog_events = []
+    for event in list(getattr(scene, "witcher_cutscene_event_items", [])):
+        if "DialogEvent" not in str(getattr(event, "event_type", "") or ""):
+            continue
+
+        event_scope = str(getattr(event, "event_scope", "") or "").upper()
+        event_fps = fps
+        start_frame = float(getattr(event, "start_time", 0.0) or 0.0) * fps
+        source_index = int(getattr(event, "source_index", -1) or -1)
+        if event_scope == "ENTRY" and source_index >= 0:
+            animation_entry = _find_loaded_cutscene_animation_entry(scene, source_index)
+            if animation_entry is not None:
+                anim_fps = float(getattr(animation_entry, "frames_per_second", 0.0) or 0.0)
+                if anim_fps > 0.0:
+                    event_fps = anim_fps
+                strip_start = _find_cutscene_animation_strip_start(scene, animation_entry)
+                start_frame = float(strip_start or 0.0) + (float(getattr(event, "start_time", 0.0) or 0.0) * event_fps)
+
+        duration_frames = int(round(float(getattr(event, "duration", 0.0) or 0.0) * event_fps))
+        dialog_events.append({
+            "frame": int(round(start_frame)),
+            "duration_frames": max(0, duration_frames),
+            "source_index": source_index,
+            "event": event,
+        })
+
+    dialog_events.sort(key=lambda item: (int(item["frame"]), int(item["source_index"])))
+    return dialog_events
+
+
+def _finalize_cutscene_dialog_item_ranges(scene):
+    fps = _cutscene_scene_fps(scene)
+    items = sorted(
+        list(getattr(scene, "witcher_cutscene_dialog_items", [])),
+        key=lambda item: int(getattr(item, "start_frame", 0) or 0),
+    )
+    for idx, item in enumerate(items):
+        start_frame = int(getattr(item, "start_frame", 0) or 0)
+        end_frame = int(getattr(item, "end_frame", 0) or 0)
+        default_end = start_frame + _dialog_default_duration_frames(getattr(item, "line_text", ""), fps)
+        if end_frame <= start_frame:
+            end_frame = default_end
+
+        if not bool(getattr(item, "imported_sound", False)) and idx + 1 < len(items):
+            next_start = int(getattr(items[idx + 1], "start_frame", 0) or 0)
+            if next_start > start_frame:
+                end_frame = min(end_frame, next_start - 1)
+
+        item.end_frame = max(start_frame, int(end_frame))
+
+
+def _populate_cutscene_dialog_items(scene, dialog_items, dialog_events):
+    scene.witcher_cutscene_dialog_items.clear()
+    fps = _cutscene_scene_fps(scene)
+    for idx, dialog_data in enumerate(dialog_items):
+        event_info = dialog_events[idx] if idx < len(dialog_events) else None
+        start_frame = int(event_info["frame"]) if event_info is not None else 0
+        duration_frames = int(event_info["duration_frames"]) if event_info is not None else 0
+        line_text = str(dialog_data.get("line_text", "") or "")
+        if duration_frames <= 0:
+            duration_frames = _dialog_default_duration_frames(line_text, fps)
+
+        item = scene.witcher_cutscene_dialog_items.add()
+        item.actor = str(dialog_data.get("actor", "") or "")
+        item.voice_file = str(dialog_data.get("voice_file", "") or "")
+        item.sound_event = str(dialog_data.get("sound_event", "") or "")
+        item.line_id = _cutscene_dialog_line_id(dialog_data)
+        item.line_index = _cutscene_dialog_int32(dialog_data.get("line_index", 0))
+        item.line_text = line_text
+        item.scene_path = str(dialog_data.get("scene_path", "") or "")
+        item.start_frame = start_frame
+        item.end_frame = start_frame + max(1, duration_frames)
+        item.imported_sound = False
+
+    _finalize_cutscene_dialog_item_ranges(scene)
+
+
 def _load_cutscene_dialogs_into_scene(context):
     from ..ui.ui_voice import load_voice_and_lipsync
 
@@ -635,67 +955,97 @@ def _load_cutscene_dialogs_into_scene(context):
     if not filepath:
         raise RuntimeError("No cutscene loaded.")
 
-    scene.witcher_cutscene_dialog_items.clear()
     dialog_items = import_cutscene.load_cutscene_dialog_items(filepath)
-
-    for dialog_data in dialog_items:
-        item = scene.witcher_cutscene_dialog_items.add()
-        item.actor = str(dialog_data.get("actor", "") or "")
-        item.voice_file = str(dialog_data.get("voice_file", "") or "")
-        item.sound_event = str(dialog_data.get("sound_event", "") or "")
-        item.line_index = int(dialog_data.get("line_index", 0) or 0)
-        item.scene_path = str(dialog_data.get("scene_path", "") or "")
+    dialog_events = _collect_cutscene_dialog_event_frames(scene)
+    _populate_cutscene_dialog_items(scene, dialog_items, dialog_events)
 
     if not dialog_items:
-        return {"loaded": 0, "skipped": 0, "total": 0}
+        return {"loaded": 0, "skipped": 0, "total": 0, "sound_loaded": 0}
 
-    dialog_events = sorted(
-        [
-            event
-            for event in list(getattr(scene, "witcher_cutscene_event_items", []))
-            if "DialogEvent" in str(getattr(event, "event_type", "") or "")
-            and str(getattr(event, "event_scope", "") or "").upper() == "ROOT"
-        ],
-        key=lambda event: float(getattr(event, "start_time", 0.0) or 0.0),
-    )
-
-    fps = float(scene.render.fps)
     loaded = 0
     skipped = 0
+    sound_loaded = 0
     for idx, dialog_data in enumerate(dialog_items):
-        line_index = int(dialog_data.get("line_index", 0) or 0)
-        if not line_index:
-            skipped += 1
-            continue
+        item = scene.witcher_cutscene_dialog_items[idx] if idx < len(scene.witcher_cutscene_dialog_items) else None
+        line_id = str(getattr(item, "line_id", "") or _cutscene_dialog_line_id(dialog_data)).strip()
 
         voicetag = str(dialog_data.get("actor", "") or "")
         actor_obj = _find_actor_obj_by_voicetag(scene, voicetag)
+        at_frame = float(getattr(item, "start_frame", 0) if item is not None else 0)
+        strip_props = _cutscene_dialog_strip_props(filepath, dialog_data, item=item)
 
-        at_frame = 0.0
-        if idx < len(dialog_events):
-            at_frame = float(getattr(dialog_events[idx], "start_time", 0.0) or 0.0) * fps
-
+        imported_line = False
+        soundstrip = None
         try:
-            load_voice_and_lipsync(
-                str(line_index),
-                actor=actor_obj,
-                context=context,
-                at_frame=at_frame,
-            )
+            if line_id:
+                import_cutscene.remove_cutscene_dialog_audio_strips(
+                    scene,
+                    source_path=filepath,
+                    line_id=line_id,
+                )
+        except Exception:
+            log.debug("Could not remove existing dialog audio for line %s", line_id, exc_info=True)
+
+        for voice_id in _cutscene_dialog_voice_id_candidates(dialog_data):
+            try:
+                soundstrip = load_voice_and_lipsync(
+                    str(voice_id),
+                    actor=actor_obj,
+                    context=context,
+                    at_frame=at_frame,
+                    strip_props=strip_props,
+                )
+                imported_line = True
+                break
+            except Exception as exc:
+                log.warning("Failed to load voice line %s for actor %s: %s", voice_id, voicetag, exc)
+
+        if soundstrip is None and str(dialog_data.get("sound_event", "") or "").strip():
+            try:
+                soundstrip = import_cutscene.import_sound_event_to_timeline(
+                    context,
+                    str(dialog_data.get("sound_event", "") or ""),
+                    frame_start=at_frame,
+                    source_path=filepath,
+                    line_id=line_id,
+                    line_text=str(dialog_data.get("line_text", "") or ""),
+                    strip_props=strip_props,
+                )
+                imported_line = imported_line or soundstrip is not None
+            except Exception as exc:
+                log.warning(
+                    "Failed to load dialog sound event %s for actor %s: %s",
+                    dialog_data.get("sound_event", ""),
+                    voicetag,
+                    exc,
+                )
+
+        if soundstrip is not None and item is not None:
+            item.imported_sound = True
+            sound_loaded += 1
+            try:
+                item.end_frame = max(
+                    int(getattr(item, "end_frame", 0) or 0),
+                    int(math.ceil(float(getattr(soundstrip, "frame_final_end", at_frame) or at_frame))),
+                )
+            except Exception:
+                pass
+
+        if imported_line:
             loaded += 1
-        except Exception as exc:
-            log.warning("Failed to load voice line %s for actor %s: %s", line_index, voicetag, exc)
+        else:
             skipped += 1
 
-    return {"loaded": loaded, "skipped": skipped, "total": len(dialog_items)}
+    _finalize_cutscene_dialog_item_ranges(scene)
+    return {"loaded": loaded, "skipped": skipped, "total": len(dialog_items), "sound_loaded": sound_loaded}
 
 
 class WITCH_OT_LoadCutsceneDialogs(Operator):
     bl_idname = "witcher.load_cutscene_dialogs"
     bl_label = "Load Dialogs"
     bl_description = (
-        "Reverse-lookup dialog lines from the linked .w2scene, then load each voice "
-        "line + lipsync onto the matching actor at the time given by the cutscene's "
+        "Read CStorySceneLine fields from the linked .w2scene, then load each "
+        "voiceFileName/dialogLine + lipsync onto the matching voicetag at the time given by the cutscene's "
         "CExtAnimCutsceneDialogEvent markers"
     )
 
@@ -716,11 +1066,14 @@ class WITCH_OT_LoadCutsceneDialogs(Operator):
         loaded = int(stats.get("loaded", 0) or 0)
         skipped = int(stats.get("skipped", 0) or 0)
         total = int(stats.get("total", 0) or 0)
+        sound_loaded = int(stats.get("sound_loaded", 0) or 0)
         if total <= 0:
             self.report({'INFO'}, "No dialog lines found in linked .w2scene.")
             return {'FINISHED'}
 
         msg = f"Loaded {loaded} voice line(s)"
+        if sound_loaded:
+            msg += f", {sound_loaded} sound strip(s)"
         if skipped:
             msg += f" ({skipped} skipped)"
         self.report({'INFO'}, msg)
@@ -1384,12 +1737,14 @@ class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
         dialog_loaded_count = 0
         dialog_skipped_count = 0
         dialog_total_count = 0
+        dialog_sound_loaded_count = 0
         if self.auto_apply_dialog:
             try:
                 dialog_stats = _load_cutscene_dialogs_into_scene(context)
                 dialog_loaded_count = int(dialog_stats.get("loaded", 0) or 0)
                 dialog_skipped_count = int(dialog_stats.get("skipped", 0) or 0)
                 dialog_total_count = int(dialog_stats.get("total", 0) or 0)
+                dialog_sound_loaded_count = int(dialog_stats.get("sound_loaded", 0) or 0)
             except Exception as exc:
                 log.exception("Failed to auto-apply cutscene dialog for %s", self.filepath)
                 self.report({'WARNING'}, f"Cutscene imported, but dialog auto-apply failed: {exc}")
@@ -1398,6 +1753,8 @@ class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
         if self.auto_apply_dialog:
             if dialog_total_count > 0:
                 dialog_text = f"loaded {dialog_loaded_count} dialog line(s)"
+                if dialog_sound_loaded_count:
+                    dialog_text += f", {dialog_sound_loaded_count} sound strip(s)"
                 if dialog_skipped_count:
                     dialog_text += f" ({dialog_skipped_count} skipped)"
                 status_parts.append(dialog_text)
@@ -2360,10 +2717,15 @@ def _draw_cutscene_events_tab(layout, scene):
     if bool(getattr(scene, "witcher_cs_show_event_schema", False)):
         _draw_event_schema_browser(add_box, scene, cs_selected)
 
-    layout.separator()
-    dialog_header = layout.row(align=True)
-    dialog_header.label(text="Dialogs", icon='OUTLINER_OB_SPEAKER')
-    dialog_header.operator(WITCH_OT_LoadCutsceneDialogs.bl_idname, text="Load", icon='FILE_REFRESH')
+
+def _draw_cutscene_dialogs_tab(layout, scene):
+    header = layout.row(align=True)
+    header.label(text="CStorySceneLine Dialogs", icon='OUTLINER_OB_SPEAKER')
+    header.operator(WITCH_OT_LoadCutsceneDialogs.bl_idname, text="Import/Refresh", icon='SOUND')
+
+    display_row = layout.row(align=True)
+    display_row.prop(scene, "witcher_cutscene_show_dialog_subtitles", text="Viewport Subtitles", toggle=True, icon='FONT_DATA')
+    display_row.prop(scene, "witcher_cutscene_subtitle_font_size", text="Size")
 
     dialog_items = list(getattr(scene, "witcher_cutscene_dialog_items", []))
     if dialog_items:
@@ -2377,15 +2739,21 @@ def _draw_cutscene_events_tab(layout, scene):
         if 0 <= sel_idx < len(dialog_items):
             sel = dialog_items[sel_idx]
             detail = layout.box()
-            detail.label(text=sel.actor or "?", icon='OUTLINER_OB_SPEAKER')
+            detail.label(text="CStorySceneLine", icon='OUTLINER_OB_SPEAKER')
             col = detail.column(align=True)
+            if sel.line_text:
+                col.label(text=f"LocalizedString.text: {sel.line_text}", icon='FONT_DATA', translate=False)
+            else:
+                col.label(text="LocalizedString.text: <not resolved>", icon='FONT_DATA')
+            col.label(text=f"voicetag: {sel.actor or '<unset>'}")
+            col.label(text=f"dialogLine: {sel.line_id or '<unset>'}")
+            col.label(text=f"voiceFileName: {sel.voice_file or '<unset>'}")
+            col.label(text=f"soundEventName: {sel.sound_event or '<unset>'}")
             if sel.scene_path:
-                col.label(text=f"Scene: {sel.scene_path}", icon='FILE')
-            col.label(text=f"Voice: {sel.voice_file or '-'}")
-            col.label(text=f"Sound: {sel.sound_event or '-'}")
-            col.label(text=f"Line: {sel.line_index}")
+                col.label(text=f"source .w2scene: {sel.scene_path}", icon='FILE')
+            col.label(text=f"computed frame range: {sel.start_frame}-{sel.end_frame}")
     else:
-        layout.label(text="Press 'Load' to fetch dialog lines from linked .w2scene.", icon='INFO')
+        layout.label(text="Press Import/Refresh to read CStorySceneLine fields from linked .w2scene.", icon='INFO')
 
 class WITCH_OT_CutsceneCreateNew(Operator):
     """Set up a fresh cutscene with a default repo path, clearing any previously imported file"""
@@ -2451,12 +2819,15 @@ class WITCHER_PT_cutscene_panel(WITCH_PT_Base, Panel):
         prev_split = layout.use_property_split
         layout.use_property_split = False
         tab_row = layout.row(align=True)
-        tab_row.scale_y = 1.3
+        tab_row.scale_y = 1.2
         tab_row.prop_enum(scene, "witcher_cs_tab", 'TEMPLATE')
         tab_row.prop_enum(scene, "witcher_cs_tab", 'ACTORS')
         tab_row.prop_enum(scene, "witcher_cs_tab", 'ANIMS')
+        tab_row = layout.row(align=True)
+        tab_row.scale_y = 1.2
         tab_row.prop_enum(scene, "witcher_cs_tab", 'CAMERA')
         tab_row.prop_enum(scene, "witcher_cs_tab", 'EVENTS')
+        tab_row.prop_enum(scene, "witcher_cs_tab", 'DIALOGS')
         layout.use_property_split = prev_split
         layout.separator(factor=0.5)
 
@@ -2471,6 +2842,8 @@ class WITCHER_PT_cutscene_panel(WITCH_PT_Base, Panel):
             _draw_cutscene_camera_tab(layout, scene, context)
         elif tab == 'EVENTS':
             _draw_cutscene_events_tab(layout, scene)
+        elif tab == 'DIALOGS':
+            _draw_cutscene_dialogs_tab(layout, scene)
 
 
 classes = [
@@ -2525,7 +2898,8 @@ def register():
             ('ACTORS', 'Actors', 'Manage cutscene actors'),
             ('ANIMS', 'Animations', 'Add animations and manage cutscene animation strips'),
             ('CAMERA', 'Camera', 'Camera entity, cut creation and camera rig tools'),
-            ('EVENTS', 'Events', 'Cutscene events and dialog lines'),
+            ('EVENTS', 'Events', 'Cutscene events'),
+            ('DIALOGS', 'Dialogs', 'Linked scene dialog lines, audio and viewport subtitles'),
         ],
         default='ACTORS',
     )
@@ -2561,6 +2935,18 @@ def register():
     bpy.types.Scene.witcher_cutscene_effect_items = CollectionProperty(type=CutsceneEffectItem)
     bpy.types.Scene.witcher_cutscene_dialog_items = CollectionProperty(type=CutsceneDialogItem)
     bpy.types.Scene.witcher_cutscene_dialog_index = IntProperty(default=0)
+    bpy.types.Scene.witcher_cutscene_show_dialog_subtitles = BoolProperty(
+        name="Viewport Subtitles",
+        default=True,
+        description="Show active cutscene dialog text in the 3D Viewport",
+    )
+    bpy.types.Scene.witcher_cutscene_subtitle_font_size = IntProperty(
+        name="Subtitle Size",
+        default=28,
+        min=12,
+        max=72,
+        description="3D Viewport subtitle font size",
+    )
     bpy.types.Scene.witcher_cutscene_selected_actor_obj = StringProperty(
         name="Selected Cutscene Actor",
         description="Name of the Blender object currently selected in the Actors tab",
@@ -2574,9 +2960,11 @@ def register():
         get=_actor_type_get,
         set=_actor_type_set,
     )
+    enable_cutscene_subtitles()
 
 
 def unregister():
+    disable_cutscene_subtitles()
     for prop in (
         "witcher_loaded_cutscene_name",
         "witcher_cutscene_last_import_seconds",
@@ -2618,6 +3006,8 @@ def unregister():
         "witcher_cutscene_effect_items",
         "witcher_cutscene_dialog_items",
         "witcher_cutscene_dialog_index",
+        "witcher_cutscene_show_dialog_subtitles",
+        "witcher_cutscene_subtitle_font_size",
     ):
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)

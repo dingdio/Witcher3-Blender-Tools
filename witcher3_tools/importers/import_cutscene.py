@@ -7,7 +7,7 @@ from ..CR2W.prop_utils import read_enum_prop
 from ..importers import import_entity
 from ..action_compat import iter_action_fcurves, remove_action_fcurve
 from ..CR2W.dc_anims import load_bin_cutscene
-from ..CR2W.common_blender import repo_file
+from ..CR2W.common_blender import repo_file, redkit_repo_context, win_path_isfile
 from ..duplication import duplicate_character_hierarchy
 
 log = logging.getLogger(__name__)
@@ -26,6 +26,12 @@ CUTSCENE_BURNED_AUDIO_EVENT_PROP = "witcher_cutscene_burned_audio_event"
 CUTSCENE_BURNED_AUDIO_ITEM_PATH_PROP = "witcher_cutscene_burned_audio_item_path"
 CUTSCENE_BURNED_AUDIO_SOURCE_PATH_PROP = "witcher_cutscene_burned_audio_source_path"
 CUTSCENE_BURNED_AUDIO_DEFAULT_VOLUME = 0.35
+CUTSCENE_DIALOG_AUDIO_PROP = "witcher_cutscene_dialog_audio"
+CUTSCENE_DIALOG_LINE_ID_PROP = "witcher_cutscene_dialog_line_id"
+CUTSCENE_DIALOG_TEXT_PROP = "witcher_cutscene_dialog_text"
+CUTSCENE_DIALOG_SOUND_EVENT_PROP = "witcher_cutscene_dialog_sound_event"
+CUTSCENE_DIALOG_ITEM_PATH_PROP = "witcher_cutscene_dialog_item_path"
+CUTSCENE_DIALOG_SOURCE_PATH_PROP = "witcher_cutscene_dialog_source_path"
 
 def loadCutsceneFile(filename):
     ext = os.path.splitext(filename)[1]
@@ -189,6 +195,203 @@ def _resolve_cutscene_burned_audio_item(cutscene_template, filename="", loadmods
 
 def resolve_cutscene_burned_audio_item(cutscene_template, filename="", loadmods=False):
     return _resolve_cutscene_burned_audio_item(cutscene_template, filename=filename, loadmods=loadmods)
+
+
+def resolve_cutscene_sound_event_item(sound_event_name, loadmods=False):
+    from ..CR2W.witcher_cache.SoundCache import LoadSoundManager
+
+    sound_event_name = str(sound_event_name or "").strip()
+    if not sound_event_name:
+        return None
+
+    manager = LoadSoundManager(loadmods=loadmods)
+    soundbanks_info = getattr(manager, "soundBanksInfo", None)
+    if soundbanks_info is None or not hasattr(soundbanks_info, "resolve_event_name"):
+        return None
+
+    resolved_paths = [
+        str(path or "").replace("/", "\\")
+        for path in (soundbanks_info.resolve_event_name(sound_event_name) or [])
+        if str(path or "").strip()
+    ]
+    if not resolved_paths:
+        metadata_path = str(getattr(soundbanks_info, "filename", "") or "").strip()
+        if metadata_path and os.path.exists(metadata_path):
+            try:
+                refreshed_info = soundbanks_info.__class__(metadata_path)
+                manager.soundBanksInfo = refreshed_info
+                soundbanks_info = refreshed_info
+                resolved_paths = [
+                    str(path or "").replace("/", "\\")
+                    for path in (soundbanks_info.resolve_event_name(sound_event_name) or [])
+                    if str(path or "").strip()
+                ]
+            except Exception:
+                log.debug(
+                    "Failed to refresh soundbanks metadata before resolving dialog sound '%s'.",
+                    sound_event_name,
+                    exc_info=True,
+                )
+
+    if not resolved_paths:
+        log.info(
+            "Dialog sound event '%s' did not resolve in soundbanks metadata '%s'.",
+            sound_event_name,
+            getattr(soundbanks_info, "filename", ""),
+        )
+        return None
+
+    preferred_path = next((path for path in resolved_paths if path.lower().endswith(".wem")), resolved_paths[0])
+    return {
+        "event_name": sound_event_name,
+        "item_path": preferred_path,
+        "candidate_paths": resolved_paths,
+    }
+
+
+def _iter_cutscene_dialog_audio_strips(scene, source_path="", line_id="", sound_event=""):
+    from ..ui.ui_voice import _get_sequence_editor_strips
+
+    strips = _get_sequence_editor_strips(getattr(scene, "sequence_editor", None))
+    if strips is None:
+        return []
+
+    normalized_source_path = _normalize_filesystem_path(source_path)
+    line_id = str(line_id or "").strip()
+    sound_event = str(sound_event or "").strip()
+    matching = []
+    for strip in list(strips):
+        if getattr(strip, "type", None) != 'SOUND':
+            continue
+        try:
+            is_dialog_audio = bool(strip.get(CUTSCENE_DIALOG_AUDIO_PROP, False))
+        except Exception:
+            is_dialog_audio = False
+        if not is_dialog_audio:
+            continue
+
+        if normalized_source_path:
+            strip_source_path = ""
+            try:
+                strip_source_path = _normalize_filesystem_path(strip.get(CUTSCENE_DIALOG_SOURCE_PATH_PROP, ""))
+            except Exception:
+                strip_source_path = ""
+            if strip_source_path != normalized_source_path:
+                continue
+
+        if line_id:
+            try:
+                strip_line_id = str(strip.get(CUTSCENE_DIALOG_LINE_ID_PROP, "") or "").strip()
+            except Exception:
+                strip_line_id = ""
+            if strip_line_id != line_id:
+                continue
+
+        if sound_event:
+            try:
+                strip_sound_event = str(strip.get(CUTSCENE_DIALOG_SOUND_EVENT_PROP, "") or "").strip()
+            except Exception:
+                strip_sound_event = ""
+            if strip_sound_event != sound_event:
+                continue
+
+        matching.append(strip)
+    return matching
+
+
+def remove_cutscene_dialog_audio_strips(scene, source_path="", line_id="", sound_event=""):
+    from ..ui.ui_voice import _get_sequence_editor_strips
+
+    strips = _get_sequence_editor_strips(getattr(scene, "sequence_editor", None))
+    if strips is None:
+        return 0
+    strips_to_remove = _iter_cutscene_dialog_audio_strips(
+        scene,
+        source_path=source_path,
+        line_id=line_id,
+        sound_event=sound_event,
+    )
+    for strip in strips_to_remove:
+        strips.remove(strip)
+    return len(strips_to_remove)
+
+
+def import_sound_event_to_timeline(context, sound_event_name, frame_start=0.0, source_path="", line_id="",
+                                   line_text="", strip_props=None, loadmods=False, volume=None):
+    from ..ui.ui_file_browser import ensure_sound_item_extracted, ensure_sound_wav
+    from ..ui.ui_voice import _get_next_sound_channel, _get_sequence_editor_strips
+
+    resolved_audio = resolve_cutscene_sound_event_item(sound_event_name, loadmods=loadmods)
+    if not resolved_audio:
+        return None
+
+    item_path = str(resolved_audio.get("item_path", "") or "").replace("/", "\\").lstrip("\\")
+    if not item_path:
+        return None
+
+    sound_abs_path = ensure_sound_item_extracted(context, item_path, loadmods=loadmods)
+    if not sound_abs_path:
+        raise RuntimeError(f"Sound cache item not found: {item_path}")
+
+    wav_path = ensure_sound_wav(context, sound_abs_path, item_path)
+    scene = context.scene
+    if not scene.sequence_editor:
+        scene.sequence_editor_create()
+    strips = _get_sequence_editor_strips(scene.sequence_editor)
+    if strips is None:
+        raise RuntimeError("Blender sequence editor strips API is unavailable")
+
+    line_id = str(line_id or "").strip()
+    sound_event_name = str(sound_event_name or "").strip()
+    if line_id or sound_event_name:
+        remove_cutscene_dialog_audio_strips(
+            scene,
+            source_path=source_path,
+            line_id=line_id,
+            sound_event=sound_event_name,
+        )
+
+    channel = _get_next_sound_channel(scene)
+    strip_name = sound_event_name or os.path.splitext(os.path.basename(item_path))[0] or "cutscene_dialog"
+    frame_start_value = float(frame_start or 0.0)
+    soundstrip = strips.new_sound(
+        strip_name,
+        wav_path,
+        channel=channel,
+        frame_start=int(round(frame_start_value)),
+    )
+    soundstrip.frame_start = frame_start_value
+    if volume is not None:
+        try:
+            soundstrip.volume = max(0.0, float(volume))
+        except Exception:
+            pass
+
+    strip_end = int(getattr(soundstrip, "frame_final_end", frame_start_value))
+    if strip_end > scene.frame_end:
+        scene.frame_end = strip_end
+
+    tag_props = {
+        CUTSCENE_DIALOG_AUDIO_PROP: True,
+        CUTSCENE_DIALOG_LINE_ID_PROP: line_id,
+        CUTSCENE_DIALOG_TEXT_PROP: str(line_text or ""),
+        CUTSCENE_DIALOG_SOUND_EVENT_PROP: sound_event_name,
+        CUTSCENE_DIALOG_ITEM_PATH_PROP: item_path,
+        CUTSCENE_DIALOG_SOURCE_PATH_PROP: str(source_path or ""),
+    }
+    tag_props.update(strip_props or {})
+    for prop_name, prop_value in tag_props.items():
+        try:
+            soundstrip[prop_name] = prop_value
+        except Exception:
+            log.debug(
+                "Could not tag dialog sound strip %s with %s",
+                getattr(soundstrip, "name", ""),
+                prop_name,
+                exc_info=True,
+            )
+
+    return soundstrip
 
 
 def _iter_cutscene_burned_audio_strips(scene, source_path=""):
@@ -1055,6 +1258,65 @@ def _append_cutscene_preview_event(event_items, ev, event_scope, source_index=-1
     })
 
 
+def _append_unique_existing_dir(roots, root):
+    root = str(root or "").strip()
+    if not root:
+        return
+    root = os.path.normpath(root)
+    if not os.path.isdir(root):
+        return
+    root_key = os.path.normcase(root)
+    if all(os.path.normcase(existing) != root_key for existing in roots):
+        roots.append(root)
+
+
+def _cutscene_source_root_candidates(cutscene_filepath):
+    roots = []
+    source_path = str(cutscene_filepath or "").strip().replace("/", "\\")
+    if not source_path or not os.path.isabs(source_path):
+        return roots
+
+    normalized = os.path.normpath(source_path)
+    lowered = normalized.lower()
+    for marker in ("\\r4data\\", "\\workspace\\", "\\content\\content0\\"):
+        marker_idx = lowered.find(marker)
+        if marker_idx >= 0:
+            _append_unique_existing_dir(roots, normalized[:marker_idx + len(marker) - 1])
+
+    parent = os.path.dirname(normalized)
+    previous = ""
+    while parent and parent != previous:
+        _append_unique_existing_dir(roots, parent)
+        previous = parent
+        parent = os.path.dirname(parent)
+
+    return roots
+
+
+def _resolve_cutscene_linked_scene_file(depot_path, cutscene_filepath):
+    raw_path = str(depot_path or "").strip().replace("/", "\\")
+    if not raw_path:
+        return ""
+    if os.path.isabs(raw_path):
+        return raw_path if win_path_isfile(raw_path) else ""
+
+    rel_path = raw_path.lstrip("\\")
+    for root in _cutscene_source_root_candidates(cutscene_filepath):
+        candidate = os.path.normpath(os.path.join(root, rel_path))
+        if win_path_isfile(candidate):
+            return candidate
+
+    try:
+        with redkit_repo_context(cutscene_filepath):
+            candidate = repo_file(rel_path)
+        if win_path_isfile(candidate):
+            return candidate
+    except Exception:
+        log.debug("repo_file failed while resolving linked cutscene scene: %s", depot_path, exc_info=True)
+
+    return ""
+
+
 def _build_cutscene_animation_contexts(cutscene_template, animation_indices, actor_name="", actor_key=""):
     try:
         selected_animation_indices = {int(idx) for idx in (animation_indices or [])}
@@ -1454,7 +1716,8 @@ def collect_cutscene_preview(filename, cutscene_template=None):
 def load_cutscene_dialog_items(cutscene_filepath):
     """Do the reverse lookup from the linked .w2scene list.
 
-    Returns a list of dicts {actor, voice_file, sound_event, line_index, scene_path}.
+    Returns a list of dicts {actor, voice_file, sound_event, line_id,
+    line_index, line_text, scene_path}.
     """
     from ..CR2W.dc_scene import get_cutscene_dialog_lines
 
@@ -1475,16 +1738,14 @@ def load_cutscene_dialog_items(cutscene_filepath):
     dialog_items = []
 
     for idx, depot_path in enumerate(ordered_scene_paths):
-        try:
-            scene_abs = repo_file(depot_path)
-        except Exception:
-            scene_abs = None
-        if not scene_abs or not os.path.isfile(scene_abs):
+        scene_abs = _resolve_cutscene_linked_scene_file(depot_path, cutscene_filepath)
+        if not scene_abs:
             log.debug("Could not resolve scene file for dialog lookup: %s", depot_path)
             continue
 
         try:
-            lines = get_cutscene_dialog_lines(scene_abs, cutscene_filepath)
+            with redkit_repo_context(cutscene_filepath):
+                lines = get_cutscene_dialog_lines(scene_abs, cutscene_filepath)
         except Exception:
             log.exception("Dialog lookup failed for %s in %s", cutscene_filepath, scene_abs)
             continue
@@ -1493,11 +1754,17 @@ def load_cutscene_dialog_items(cutscene_filepath):
             continue
 
         for line in lines:
+            try:
+                line_index = int(line.get("line_index", 0) or 0)
+            except (TypeError, ValueError):
+                line_index = 0
             dialog_items.append({
                 "actor":       str(line.get("actor", "") or ""),
                 "voice_file":  str(line.get("voice_file", "") or ""),
                 "sound_event": str(line.get("sound_event", "") or ""),
-                "line_index":  int(line.get("line_index", 0) or 0),
+                "line_id":     str(line.get("line_id", "") or ""),
+                "line_index":  line_index,
+                "line_text":   str(line.get("line_text", "") or ""),
                 "scene_path":  depot_path,
             })
 
