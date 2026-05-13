@@ -51,6 +51,99 @@ class CVector3D:
     def getList(self):
         return [self.x, self.y, self.z]
 
+
+def _read_source_anim_data_header(embedded_data):
+    """Validate source animation data and return its header."""
+    if not embedded_data:
+        return None
+
+    data = bytes(embedded_data)
+    payload_offsets = []
+    if len(data) >= 6:
+        prefix_zero = struct.unpack_from('<H', data, 0)[0]
+        prefixed_size = struct.unpack_from('<I', data, 2)[0]
+        if prefix_zero == 0 and prefixed_size == len(data) - 6:
+            payload_offsets.append(6)
+
+    if len(data) >= 4:
+        first_size = struct.unpack_from('<I', data, 0)[0]
+        if first_size in (len(data) - 4, len(data)):
+            payload_offsets.append(4)
+
+    payload_offsets.append(0)
+
+    for payload_offset in dict.fromkeys(payload_offsets):
+        payload_end = len(data)
+        pos = payload_offset
+
+        def read(fmt):
+            nonlocal pos
+            size = struct.calcsize(fmt)
+            if pos + size > payload_end:
+                raise ValueError
+            values = struct.unpack_from(fmt, data, pos)
+            pos += size
+            return values[0] if len(values) == 1 else values
+
+        def skip_track(num_frames):
+            nonlocal pos
+            track_type = read('<B')
+            if track_type == 0:
+                pos += 4 * num_frames
+            elif track_type == 1:
+                pos += 4
+            else:
+                raise ValueError
+            if pos > payload_end:
+                raise ValueError
+
+        try:
+            version = read('<I')
+            if not (1 <= version <= 3):
+                continue
+
+            dt = read('<f')
+            num_bones = read('<I')
+            num_tracks = read('<I')
+            if version < 3 and num_tracks:
+                continue
+
+            total_duration = read('<f')
+            has_ref_ik_bones = read('<?') if version >= 2 else False
+            parts_count = read('<I')
+            part_frames = []
+            part_data_offsets = []
+            component_count = (num_bones * 10) + num_tracks
+
+            for _ in range(parts_count):
+                num_frames = read('<I')
+                part_frames.append(num_frames)
+                part_data_offsets.append(pos)
+
+                for _ in range(component_count):
+                    skip_track(num_frames)
+
+            if pos != payload_end:
+                continue
+
+            return {
+                "payload_offset": payload_offset,
+                "payload_end": payload_end,
+                "version": version,
+                "dt": dt,
+                "num_bones": num_bones,
+                "num_tracks": num_tracks,
+                "total_duration": total_duration,
+                "has_ref_ik_bones": has_ref_ik_bones,
+                "part_frames": part_frames,
+                "part_data_offsets": part_data_offsets,
+            }
+        except (struct.error, ValueError, OverflowError):
+            continue
+
+    return None
+
+
 class ReadCompressFloat():
     def __init__(self, f, compression):
         val = 0
@@ -65,6 +158,9 @@ class ReadCompressFloat():
 def _has_valid_embedded_anim_data(embedded_data) -> bool:
     if not embedded_data or len(embedded_data) < 34:
         return False
+
+    if _read_source_anim_data_header(embedded_data) is not None:
+        return True
 
     data = bytes(embedded_data)
     for data_offset in (0, 2, 4, 6, 8):
@@ -216,9 +312,21 @@ def read_uncooked_anim_buffer(embedded_data, CAnimationBufferBitwiseCompressed, 
     first_uint = struct.unpack_from('<I', embedded_data, 0)[0]
     log.info(f"First uint32: {first_uint} (data size: {len(embedded_data)})")
 
+    source_header = _read_source_anim_data_header(embedded_data)
+    if source_header is not None:
+        log.info(
+            "Validated source animation data: "
+            f"offset={source_header['payload_offset']}, "
+            f"bones={source_header['num_bones']}, "
+            f"tracks={source_header['num_tracks']}, "
+            f"parts={len(source_header['part_frames'])}"
+        )
+
     # Parse header - check if we need to skip a length prefix
     data_offset = 0
-    if first_uint == len(embedded_data) - 4 or first_uint == len(embedded_data):
+    if source_header is not None:
+        data_offset = source_header["payload_offset"]
+    elif first_uint == len(embedded_data) - 4 or first_uint == len(embedded_data):
         # First 4 bytes are a length prefix, skip them
         data_offset = 4
         log.info(f"Detected length prefix, adjusting offset to {data_offset}")
@@ -245,14 +353,21 @@ def read_uncooked_anim_buffer(embedded_data, CAnimationBufferBitwiseCompressed, 
     #   22-24: padding (3 bytes)
     #   25-28: numFrames (uint32) - ACTUAL frame count for multi-frame data
 
-    version = struct.unpack_from('<I', embedded_data, data_offset)[0]
-    dt = struct.unpack_from('<f', embedded_data, data_offset + 4)[0]
+    if source_header is not None:
+        version = source_header["version"]
+        dt = source_header["dt"]
+    else:
+        version = struct.unpack_from('<I', embedded_data, data_offset)[0]
+        dt = struct.unpack_from('<f', embedded_data, data_offset + 4)[0]
     if dt <= 0 or dt > 1.0:
         dt = 0.0333333  # Default to ~30fps
 
     # Read numFrames from embedded header at offset 25 - this is the authoritative value
     # The CR2W chunk metadata may have different (compressed) frame counts
-    buffer_numFrames = struct.unpack_from('<I', embedded_data, data_offset + 25)[0]
+    if source_header is not None and source_header["part_frames"]:
+        buffer_numFrames = int(source_header["part_frames"][0])
+    else:
+        buffer_numFrames = struct.unpack_from('<I', embedded_data, data_offset + 25)[0]
 
     # Sanity check - if embedded numFrames seems wrong, fall back to chunk metadata
     if buffer_numFrames == 0 or buffer_numFrames > 10000:
@@ -265,6 +380,9 @@ def read_uncooked_anim_buffer(embedded_data, CAnimationBufferBitwiseCompressed, 
             buffer_numFrames = int(duration / dt) + 1 if dt > 0 else 30
 
     log.info(f"Uncooked animation: version={version}, dt={dt:.6f}, duration={duration}, frames={buffer_numFrames}, data size={len(embedded_data)} bytes")
+
+    source_blob_bone_count = source_header["num_bones"] if source_header is not None else None
+    source_blob_track_count = source_header["num_tracks"] if source_header is not None else None
 
     bones = []
     tracks = []
@@ -410,9 +528,11 @@ def read_uncooked_anim_buffer(embedded_data, CAnimationBufferBitwiseCompressed, 
 
         return frames, pos, max_frames, all_success
 
-    # Bone data starts at fixed offset 29 from data_offset
-    # Header structure is fixed: 20 bytes header + 9 bytes metadata = 29 bytes
-    curr_off = data_offset + 29
+    # Bone data starts after the source-data header and the first part frame count.
+    if source_header is not None and source_header["part_data_offsets"]:
+        curr_off = source_header["part_data_offsets"][0]
+    else:
+        curr_off = data_offset + 29
 
     # Validate: first byte should be 0x00 (multi-frame) or 0x01 (single-frame)
     if curr_off < len(embedded_data):
@@ -421,17 +541,28 @@ def read_uncooked_anim_buffer(embedded_data, CAnimationBufferBitwiseCompressed, 
             log.warning(f"Unexpected first marker 0x{first_marker:02x} at offset {curr_off}, expected 0x00 or 0x01")
     log.info(f"Starting bone data at offset {curr_off}")
 
-    # Process each bone - data is sequential: pos, ori, scale for each bone
-    for (idx, bone_meta) in enumerate(bones_prop.More):
-        if Skeleton_file and idx >= Skeleton_file.nbBones:
-            break
+    # Process each bone - data is sequential: pos, ori, scale for each bone.
+    # Source-data blobs carry their own validated transform-bone count.
+    # Consume those records before reading float tracks, even when the selected
+    # import skeleton exposes fewer display bones.
+    bone_meta_items = list(bones_prop.More)
+    if source_blob_bone_count is not None:
+        consume_bone_count = int(source_blob_bone_count)
+    else:
+        consume_bone_count = len(bone_meta_items)
+    append_bone_count = consume_bone_count
+    if Skeleton_file:
+        append_bone_count = min(append_bone_count, int(getattr(Skeleton_file, "nbBones", 0) or 0))
 
-        bone_name = Skeleton_file.names[idx] if Skeleton_file else f"Bone_{idx}"
+    for idx in range(consume_bone_count):
+        bone_meta = bone_meta_items[idx] if idx < len(bone_meta_items) else None
+
+        bone_name = Skeleton_file.names[idx] if Skeleton_file and idx < append_bone_count else f"Bone_{idx}"
 
         # Get track metadata from chunk (WARNING: these are for COMPRESSED data!)
-        pos_meta = getattr(bone_meta, 'position', None)
-        ori_meta = getattr(bone_meta, 'orientation', None)
-        scale_meta = getattr(bone_meta, 'scale', None)
+        pos_meta = getattr(bone_meta, 'position', None) if bone_meta is not None else None
+        ori_meta = getattr(bone_meta, 'orientation', None) if bone_meta is not None else None
+        scale_meta = getattr(bone_meta, 'scale', None) if bone_meta is not None else None
 
         # The chunk metadata has numFrames for the COMPRESSED format (e.g., 13 frames at dt=0.1)
         # But the embedded uncompressed data uses DIFFERENT frame counts (e.g., 35 frames at dt=0.033)
@@ -536,28 +667,34 @@ def read_uncooked_anim_buffer(embedded_data, CAnimationBufferBitwiseCompressed, 
         if not temp_scale_frames:
             temp_scale_frames = [[1.0, 1.0, 1.0]]
 
-        # Create bone animation data
-        this_bone = w2AnimsFrames(
-            id=idx,
-            BoneName=bone_name,
-            position_dt=pos_dt,
-            position_numFrames=len(temp_pos_frames),
-            positionFrames=temp_pos_frames,
-            rotation_dt=ori_dt,
-            rotation_numFrames=len(temp_rot_frames),
-            rotationFrames=temp_rot_frames,
-            scale_dt=scale_dt,
-            scale_numFrames=len(temp_scale_frames),
-            scaleFrames=temp_scale_frames,
-            rotationFramesQuat=temp_rot_frames
-        )
+        if idx < append_bone_count:
+            this_bone = w2AnimsFrames(
+                id=idx,
+                BoneName=bone_name,
+                position_dt=pos_dt,
+                position_numFrames=len(temp_pos_frames),
+                positionFrames=temp_pos_frames,
+                rotation_dt=ori_dt,
+                rotation_numFrames=len(temp_rot_frames),
+                rotationFrames=temp_rot_frames,
+                scale_dt=scale_dt,
+                scale_numFrames=len(temp_scale_frames),
+                scaleFrames=temp_scale_frames,
+                rotationFramesQuat=temp_rot_frames
+            )
 
-        bones.append(this_bone)
+            bones.append(this_bone)
 
     tracks_prop = CAnimationBufferBitwiseCompressed.GetVariableByName('tracks')
     if tracks_prop is not None and hasattr(tracks_prop, 'More'):
-        for (idx, track_meta) in enumerate(tracks_prop.More):
-            chunk_track_nf = track_meta.GetVariableByName('numFrames').Value if track_meta.GetVariableByName('numFrames') else 1
+        track_meta_items = list(tracks_prop.More)
+        if source_blob_track_count is not None:
+            consume_track_count = int(source_blob_track_count)
+        else:
+            consume_track_count = len(track_meta_items)
+        for idx in range(consume_track_count):
+            track_meta = track_meta_items[idx] if idx < len(track_meta_items) else None
+            chunk_track_nf = track_meta.GetVariableByName('numFrames').Value if track_meta and track_meta.GetVariableByName('numFrames') else 1
             track_nf = buffer_numFrames if chunk_track_nf > 1 else 1
             temp_track_frames, curr_off, actual_track_nf, track_ok = read_track_values(
                 embedded_data,

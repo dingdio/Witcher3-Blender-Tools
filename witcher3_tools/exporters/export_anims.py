@@ -1097,11 +1097,17 @@ def _load_face_mimic_bone_names(face_file_path: str) -> List[str]:
     bone_names: List[str] = []
     try:
         from ..CR2W.common_blender import repo_file
-        from ..importers.import_rig import loadFaceFile
+        from ..CR2W.dc_anims import load_base_skeleton
 
-        face_data = loadFaceFile(repo_file(face_file_path))
-        mimic_skeleton = getattr(face_data, "mimicSkeleton", None)
-        raw_bone_names = getattr(mimic_skeleton, "names", None) or []
+        resolved_face_path = repo_file(face_file_path)
+        float_track_skeleton = load_base_skeleton(resolved_face_path)
+        raw_bone_names = getattr(float_track_skeleton, "names", None) or []
+        if not raw_bone_names:
+            from ..importers.import_rig import loadFaceFile
+
+            face_data = loadFaceFile(resolved_face_path)
+            mimic_skeleton = getattr(face_data, "mimicSkeleton", None)
+            raw_bone_names = getattr(mimic_skeleton, "names", None) or []
         bone_names = [_strip_text(bone_name) for bone_name in raw_bone_names if _strip_text(bone_name)]
     except Exception:
         log.warning("Failed to load mimic bone names from '%s' while exporting cutscene.", face_file_path, exc_info=True)
