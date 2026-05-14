@@ -977,7 +977,8 @@ class AnimImporter:
 
             start_frame, end_frame = action.frame_range
             length = end_frame - start_frame
-            total_insert_length = max(1.0, float(length))
+            strip_length = max(1.0, float(length))
+            total_insert_length = strip_length
             if self.__AnimationBufferType == AnimationBufferType.Multi:
                 anim_buffer = getattr(getattr(self.__SetEntry, "animation", None), "animBuffer", None)
                 total_insert_length = max(
@@ -1030,7 +1031,7 @@ class AnimImporter:
                 target_strip = target_track.strips.new(action.name, fallback_frame, action)
             target_strip.frame_start = frame_pos
             bind_strip_action_slot(target_strip, resolve_action_slot(action, target=target, ensure=True))
-            target_strip.frame_end = frame_pos + total_insert_length
+            target_strip.frame_end = frame_pos + strip_length
             target_strip.blend_type = 'REPLACE'
 
             if self.__NLA_track:
