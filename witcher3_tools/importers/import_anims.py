@@ -1065,7 +1065,7 @@ class AnimImporter:
             SkeletalAnimation.name,
         ) and _is_standard_cutscene_root_motion_rig(armObj)
         if cutscene_root_component:
-            log.info(
+            log.debug(
                 "Animation '%s': keeping cutscene Root bone identity.",
                 SkeletalAnimation.name,
             )
@@ -1077,7 +1077,7 @@ class AnimImporter:
             source_bone = _find_anim_bone(anim_desc.bones, "Trajectory", "Reference")
             if root_bone and source_bone:
                 if source_bone.BoneName != "Trajectory":
-                    log.info("Animation '%s': using '%s' as Root fallback", SkeletalAnimation.name, source_bone.BoneName)
+                    log.debug("Animation '%s': using '%s' as Root fallback", SkeletalAnimation.name, source_bone.BoneName)
                 root_bone.positionFrames = [[0.0, 0.0, 0.0]]
                 root_bone.position_dt = source_bone.position_dt
                 root_bone.position_numFrames = 1
@@ -1109,7 +1109,7 @@ class AnimImporter:
             if detail:
                 action["w3_anim_buffer_detail"] = detail
             if source:
-                log.info(f"Animation buffer source: {source}{' (' + detail + ')' if detail else ''}")
+                log.debug(f"Animation buffer source: {source}{' (' + detail + ')' if detail else ''}")
             raw_motion_data = getattr(SkeletalAnimation, "motionExtraction", None)
             motion_payload = _motion_extraction_payload(raw_motion_data)
             motion_terminal = _motion_extraction_terminal_values(raw_motion_data)
@@ -1129,7 +1129,7 @@ class AnimImporter:
                         "flags": int(motion_payload.get("flags", 0) or 0),
                     })
                 loc = motion_terminal.get("location", (0.0, 0.0, 0.0))
-                log.info(
+                log.debug(
                     "Stored motion extraction metadata: action=%s flags=%s samples=%s finalFrame=%.3f xyDelta=%.6f",
                     action.name,
                     motion_terminal.get("flags", 0),
@@ -1399,7 +1399,7 @@ class AnimImporter:
                         rot_curves[i].keyframe_points[-1].co = (frame, fixed_rot[i])
                         rot_curves[i].keyframe_points[-1].interpolation = 'LINEAR'
         _safe_mode_set('OBJECT', armObj)
-        log.info(' Finished adding keyframes in %f seconds.', time.time() - start_time)
+        log.debug(' Finished adding keyframes in %f seconds.', time.time() - start_time)
 
         control_bone_name = "w3_face_poses"
         if camera_animation:
@@ -1407,7 +1407,7 @@ class AnimImporter:
         AnimTracks = SkeletalAnimationData.tracks
         morph_action_target = None
         if AnimTracks:
-            log.info('---- morph animations:%5d  target: %s', len(AnimTracks), armObj.name)
+            log.debug('---- morph animations:%5d  target: %s', len(AnimTracks), armObj.name)
 
             control_arm_obj = armObj
             if camera_animation:
@@ -1441,7 +1441,7 @@ class AnimImporter:
                     if name not in shapeKeyDict:
                         if not camera_animation and control_bone_name == "w3_face_poses" and name in _MIMIC_HEAD_FLOAT_TRACKS:
                             shapeKeyDict[name] = _ensure_control_float_property(control_bone, name)
-                            log.info('Created mimic float control property %s (%d frames)', name, len(keyFrames))
+                            log.debug('Created mimic float control property %s (%d frames)', name, len(keyFrames))
                         else:
                             log.warning('WARNING: not found shape key %s (%d frames)', name, len(keyFrames))
                             continue
@@ -1455,7 +1455,7 @@ class AnimImporter:
                     #frame_skip = round(float(total_frames)/float(track_frames))
                     frame_skip = float(total_frames)/float(track_frames) if track_frames > 0 else 1.0
 
-                    log.info('(mesh) frames:%5d  name: %s', len(keyFrames), name)
+                    log.debug('(mesh) frames:%5d  name: %s', len(keyFrames), name)
                     shapeKey = shapeKeyDict[name]
                     fcurve = new_action_fcurve(action, control_arm_obj, data_path='pose.bones["%s"]["%s"]'% (control_bone_name, name))#  (data_path='key_blocks["%s"].value'%shapeKey.name)
                     fcurve.keyframe_points.add(len(keyFrames))
@@ -1524,7 +1524,7 @@ class AnimImporter:
         SkeletalAnimationData = SkeletalAnimation.animBuffer
 
         shapeKeyAnim = SkeletalAnimationData.tracks
-        log.info('---- morph animations:%5d  target: %s', len(shapeKeyAnim), meshObj.name)
+        log.debug('---- morph animations:%5d  target: %s', len(shapeKeyAnim), meshObj.name)
         if len(shapeKeyAnim) < 1:
             return
 
@@ -1544,7 +1544,7 @@ class AnimImporter:
             if name not in shapeKeyDict:
                 log.warning('WARNING: not found shape key %s (%d frames)', name, len(keyFrames))
                 continue
-            log.info('(mesh) frames:%5d  name: %s', len(keyFrames), name)
+            log.debug('(mesh) frames:%5d  name: %s', len(keyFrames), name)
             shapeKey = shapeKeyDict[name]
             fcurve = new_action_fcurve(action, meshObj.data.shape_keys, data_path='key_blocks["%s"].value'%shapeKey.name)
             fcurve.keyframe_points.add(len(keyFrames))
@@ -1860,7 +1860,7 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
                 flags=motion_data['flags']
             )
 
-            log.info(f"Motion extraction (compressed): frames={len(motion_data['frames'])}, deltaTimes={motion_data['deltaTimes']}, flags={motion_data['flags']}")
+            log.debug(f"Motion extraction (compressed): frames={len(motion_data['frames'])}, deltaTimes={motion_data['deltaTimes']}, flags={motion_data['flags']}")
             apply_motion(cube, motion_extraction)
         finally:
             bpy.ops.object.select_all(action='DESELECT')
@@ -1902,7 +1902,7 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
                         cube = create_lopsided_cube()
                         cube.show_axis = True
                         cube.name = AnimationSetEntry.animation.name + "_motion_uncompressed"
-                        log.info(f"Motion extraction (uncompressed): frames={len(frames)}, flags={motion_extraction.flags}, mapping={mapping}")
+                        log.debug(f"Motion extraction (uncompressed): frames={len(frames)}, flags={motion_extraction.flags}, mapping={mapping}")
                         apply_motion(cube, motion_extraction)
                     finally:
                         bpy.ops.object.select_all(action='DESELECT')
@@ -1910,7 +1910,7 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
                             obj.select_set(True)
                             bpy.context.view_layer.objects.active = obj
         else:
-            log.info("No uncompressed motion extraction data found.")
+            log.debug("No uncompressed motion extraction data found.")
 
         if False:
             #! IMPORT AN OBJECT TO DEBUG
@@ -1943,7 +1943,7 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
     importer = AnimImporter(fileName, AnimationSetEntry, use_NLA=use_NLA, facePose=facePose, NLA_track = NLA_track, at_frame=at_frame, nla_mode=nla_mode)
     for i in selected_objects:
         importer.assign(i)
-    log.info(' Finished importing motion in %f seconds.', time.time() - start_time)
+    log.debug(' Finished importing motion in %f seconds.', time.time() - start_time)
 
     #update_scene_settings = True # MAKE BLEND IMPORT PROP
     if update_scene_settings:

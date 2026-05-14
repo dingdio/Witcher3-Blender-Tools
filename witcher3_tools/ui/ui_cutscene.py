@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import time
 
 import bpy
 import blf
@@ -1841,6 +1842,7 @@ class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
         return _update_cutscene_preview(self)
 
     def execute(self, context):
+        operation_started = time.perf_counter()
         if os.path.isdir(self.filepath):
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
             return {'CANCELLED'}
@@ -1885,7 +1887,6 @@ class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
             return {'CANCELLED'}
 
         auto_loaded_count = int(getattr(cutscene_data, "auto_applied_animation_count", 0) or 0)
-        import_duration_seconds = float(getattr(cutscene_data, "import_duration_seconds", 0.0) or 0.0)
         _sync_loaded_cutscene_state(context.scene, self.filepath, cutscene_data=cutscene_data)
         if hasattr(context.scene, "witcher_w2scene_active_cutscene_path"):
             context.scene.witcher_w2scene_active_cutscene_path = ""
@@ -1917,15 +1918,17 @@ class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
                 status_parts.append("no dialog lines found")
         if self.import_burned_audio and burned_audio_info:
             status_parts.append("burned track imported")
+        total_elapsed = time.perf_counter() - operation_started
+        log.info("Imported .w2cutscene '%s' in %.2fs.", os.path.basename(self.filepath), total_elapsed)
         self.report(
             {'INFO'},
             (
                 f"Imported {len(selected_actor_indices)} actor(s) and auto-loaded "
-                f"{auto_loaded_count}/{len(selected_animation_indices)} animation(s) in {import_duration_seconds:.2f}s."
+                f"{auto_loaded_count}/{len(selected_animation_indices)} animation(s) in {total_elapsed:.2f}s."
                 if self.auto_apply_animations
                 else (
                     f"Imported {len(selected_actor_indices)} actor(s) and listed "
-                    f"{len(selected_animation_indices)} animation(s) from cutscene in {import_duration_seconds:.2f}s."
+                    f"{len(selected_animation_indices)} animation(s) from cutscene in {total_elapsed:.2f}s."
                 )
             ) + (f" {'; '.join(status_parts)}." if status_parts else ""),
         )

@@ -118,6 +118,8 @@ def _should_suppress_cname_warning(cr2w_file=None, *, prop_name="", parent=None)
         return prop_name == "basedOnEvent" and str(parent_name) == "CBehaviorGraphAdjustDirectionNode"
     if file_name.endswith("location_name_triggers.w2l"):
         return prop_name == "settlementName" and str(parent_name) == "W3SettlementTrigger"
+    if file_name.endswith(".w2scene"):
+        return prop_name == "actorMimicsEmotionalState" and str(parent_name) == "CStorySceneDialogsetSlot"
     return False
 
 
@@ -1196,7 +1198,7 @@ class PROPERTY:
             except Exception as e:
                 raise e
         else:
-            log.warning("Returned None PROP string")
+            log.debug("Returned None PROP string")
             return None
 
     def ToArray(self):
@@ -2104,7 +2106,7 @@ class W_CLASS:
                 size = self.classEnd - startofthis
                 endPos = f.tell()
                 bytesleft = size - (endPos - startofthis)
-                log.info(self.name)
+                log.debug(self.name)
                 if (not self.isCreatedFromTemplate):
                     f.seek(63,1)
                     if bytesleft > 0:
@@ -2116,7 +2118,7 @@ class W_CLASS:
                         else:
                             log.critical('Waring found too many Components')
                 else:
-                    log.info(f'Found {self.name} Template')
+                    log.debug(f'Found {self.name} Template')
                     pass #template buffers??
                 
                 endPos = f.tell()
@@ -2303,7 +2305,7 @@ class W_CLASS:
                         size = self.classEnd - startofthis
                         endPos = f.tell()
                         bytesleft = size - (endPos - startofthis)
-                        log.info(self.name)
+                        log.debug(self.name)
                         if (not self.isCreatedFromTemplate):
                             if bytesleft > 0:
                                 elementcount = ReadBit6(f)
@@ -2488,7 +2490,7 @@ class W_CLASS:
                 f.seek(startofthis + 4)
             if self.name == "CSkeletalAnimation" and len(self.PROPS):
                 parent.animCount+=1
-                log.info(str(parent.animCount)+": "+self.GetVariableByName("name").Index.String)
+                log.debug(str(parent.animCount)+": "+self.GetVariableByName("name").Index.String)
         else:
             log.debug("dummy readUByte")
             dummy = readUByte(f)

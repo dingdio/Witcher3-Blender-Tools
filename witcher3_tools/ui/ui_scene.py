@@ -1,6 +1,7 @@
 
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 log = logging.getLogger(__name__)
@@ -104,8 +105,19 @@ def _w2scene_import_profile_logger_names():
         f"{root_name}.importers.motion_tools",
         f"{root_name}.importers.import_anims",
         f"{root_name}.importers.import_cutscene",
-        f"{root_name}.CR2W.CR2W_types",
     )
+
+
+def _w2scene_import_profile_logger_level(logger_name):
+    debug_suffixes = (
+        ".ui.ui_scene",
+        ".importers.import_scene",
+        ".importers.import_scene_animation",
+        ".importers.import_scene_motion",
+        ".importers.motion_tools",
+        ".importers.import_cutscene",
+    )
+    return logging.DEBUG if any(str(logger_name).endswith(suffix) for suffix in debug_suffixes) else logging.INFO
 
 
 def _enable_w2scene_import_profile_loggers(job):
@@ -113,8 +125,9 @@ def _enable_w2scene_import_profile_loggers(job):
     for logger_name in _w2scene_import_profile_logger_names():
         logger_obj = logging.getLogger(logger_name)
         previous_level = logger_obj.level
-        if previous_level == logging.NOTSET or previous_level > logging.INFO:
-            logger_obj.setLevel(logging.INFO)
+        target_level = _w2scene_import_profile_logger_level(logger_name)
+        if previous_level == logging.NOTSET or previous_level > target_level:
+            logger_obj.setLevel(target_level)
         changes.append((logger_obj, previous_level))
     job["profile_log_level_changes"] = changes
 
@@ -181,11 +194,12 @@ def _stop_w2scene_import_profile_log(job, completion_message=""):
         return ""
     handler = job.get("profile_log_handler")
     log_path = str(job.get("profile_log_path", "") or "")
+    if completion_message:
+        log.info("%s", completion_message)
     if handler is None:
         return log_path
     try:
-        if completion_message:
-            log.info("%s", completion_message)
+        pass
     finally:
         try:
             _w2scene_import_profile_logger().removeHandler(handler)
@@ -2355,6 +2369,7 @@ class Witcher_OT_load_section(bpy.types.Operator):
     bl_description = "Load the selected .w2scene section"
 
     def execute(self, context):
+        operation_started = time.perf_counter()
         # Get the scene object
         scene = context.scene
 
@@ -2379,7 +2394,7 @@ class Witcher_OT_load_section(bpy.types.Operator):
         ))
         _w2scene_set_active_subtitle_section(scene, -1, 0.0)
         profile_job = _new_w2scene_import_profile_job_state()
-        if bool(getattr(scene, "witcher_w2scene_write_profile_log", True)):
+        if bool(getattr(scene, "witcher_w2scene_write_profile_log", False)):
             _start_w2scene_import_profile_log(
                 profile_job,
                 scene_path=context.scene.witcher_sections_filepath,
@@ -2389,18 +2404,20 @@ class Witcher_OT_load_section(bpy.types.Operator):
             try:
                 result = _load_w2scene_cutscene_section(context, sceneImporter, this_section)
             except Exception as exc:
+                elapsed = time.perf_counter() - operation_started
                 log.exception("Failed to load cutscene section %s", section_name)
-                _stop_w2scene_import_profile_log(profile_job, f".w2scene cutscene section import failed: {section_name}")
+                _stop_w2scene_import_profile_log(profile_job, f".w2scene cutscene section import failed after {elapsed:.2f}s: {section_name}")
                 self.report({'ERROR'}, f"Failed to load cutscene section: {exc}")
                 return {'CANCELLED'}
 
+            elapsed = time.perf_counter() - operation_started
             cutscene_name = os.path.basename(result.get("path", ""))
             dialog_stats = dict(result.get("dialog_stats", {}) or {})
             dialog_total = int(dialog_stats.get("total", 0) or 0)
             dialog_loaded = int(dialog_stats.get("loaded", 0) or 0)
             dialog_text = f", dialog {dialog_loaded}/{dialog_total}" if dialog_total else ""
-            _stop_w2scene_import_profile_log(profile_job, f".w2scene cutscene section import completed: {section_name}")
-            self.report({'INFO'}, f"Loaded cutscene section '{section_name}' from {cutscene_name}{dialog_text}.")
+            _stop_w2scene_import_profile_log(profile_job, f".w2scene cutscene section import completed in {elapsed:.2f}s: {section_name}")
+            self.report({'INFO'}, f"Loaded cutscene section '{section_name}' from {cutscene_name}{dialog_text} in {elapsed:.2f}s.")
             return {'FINISHED'}
 
         _w2scene_unload_active_cutscene_section(context)
@@ -2409,12 +2426,15 @@ class Witcher_OT_load_section(bpy.types.Operator):
             sceneImporter.execute()
             _w2scene_set_active_subtitle_section(scene, active_section_index, 0.0)
         except Exception as exc:
+            elapsed = time.perf_counter() - operation_started
             log.exception("Failed to load section %s", section_name)
-            _stop_w2scene_import_profile_log(profile_job, f".w2scene section import failed: {section_name}")
+            _stop_w2scene_import_profile_log(profile_job, f".w2scene section import failed after {elapsed:.2f}s: {section_name}")
             self.report({'ERROR'}, f"Failed to load section: {exc}")
             return {'CANCELLED'}
 
-        _stop_w2scene_import_profile_log(profile_job, f".w2scene section import completed: {section_name}")
+        elapsed = time.perf_counter() - operation_started
+        _stop_w2scene_import_profile_log(profile_job, f".w2scene section import completed in {elapsed:.2f}s: {section_name}")
+        self.report({'INFO'}, f"Loaded section '{section_name}' in {elapsed:.2f}s.")
         return {'FINISHED'}
 
 
@@ -2924,7 +2944,7 @@ def register():
     bpy.types.Scene.witcher_w2scene_write_profile_log = bpy.props.BoolProperty(
         name="Write Scene Profile Log",
         description="Write a timestamped .w2scene section import profile log to the extension cache log folder",
-        default=True,
+        default=False,
     )
     bpy.types.Scene.witcher_w2scene_create_debug_markers = bpy.props.BoolProperty(
         name="Create Scene Debug Markers",

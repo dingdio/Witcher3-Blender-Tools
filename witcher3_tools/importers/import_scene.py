@@ -4514,7 +4514,7 @@ class SceneImporter():
                         "candidates": ",".join(candidates[:8]),
                     },
                 )
-                log.warning(
+                log.debug(
                     "No mimic animation found for layer %s='%s' on actor '%s' (tried: %s)",
                     layer_column, layer_value, getattr(actor_obj, "name", "?"), ", ".join(candidates),
                 )
@@ -4916,9 +4916,13 @@ class SceneImporter():
             dialogset_idle_change_counts_by_actor[state_key] = index
             return f"{W2SCENE_DIALOGSET_IDLE_CHANGE_TRACK_PREFIX}{index:02d}"
 
-        def _change_pose_idle_start_frame(event, event_start_frame, transition_armatures=None, transition_track_name=""):
+        def _change_pose_idle_timing(event, event_start_frame, transition_armatures=None, transition_track_name=""):
             event_start_frame = float(event_start_frame)
-            fallback_frame = event_start_frame + max(
+            transition_blend_out_frames = max(
+                0.0,
+                _as_float(getattr(event, "blendOut", None), W2SCENE_ANIM_CLIP_DEFAULT_BLEND_OUT) * __fps,
+            )
+            transition_end_frame = event_start_frame + max(
                 0.0,
                 _as_float(getattr(event, "duration", None), 0.0) * __fps,
             )
@@ -4934,12 +4938,29 @@ class SceneImporter():
                             track.strips,
                             key=lambda s: abs(float(getattr(s, "frame_start", 0.0) or 0.0) - event_start_frame),
                         )
-                        return max(event_start_frame, float(getattr(strip, "frame_end", fallback_frame) or fallback_frame))
+                        transition_end_frame = max(
+                            transition_end_frame,
+                            float(getattr(strip, "frame_end", transition_end_frame) or transition_end_frame),
+                        )
+                        strip_start = float(getattr(strip, "frame_start", event_start_frame) or event_start_frame)
+                        strip_end = float(getattr(strip, "frame_end", transition_end_frame) or transition_end_frame)
+                        strip_duration = max(0.0, strip_end - strip_start)
+                        transition_blend_out_frames = min(
+                            max(0.0, float(getattr(strip, "blend_out", transition_blend_out_frames) or 0.0)),
+                            strip_duration,
+                        )
+                        break
                     except Exception:
                         log.debug("Could not read change-pose transition strip end frame.", exc_info=True)
-            return fallback_frame
+            transition_end_frame = max(event_start_frame, float(transition_end_frame))
+            transition_blend_out_frames = min(
+                max(0.0, float(transition_blend_out_frames)),
+                max(0.0, transition_end_frame - event_start_frame),
+            )
+            idle_start_frame = max(event_start_frame, transition_end_frame - transition_blend_out_frames)
+            return idle_start_frame, transition_end_frame
 
-        def load_change_pose_dialogset_idle(event, actor_obj, at_frame):
+        def load_change_pose_dialogset_idle(event, actor_obj, at_frame, transition_end_frame=None):
             at_frame = float(at_frame)
             if at_frame >= float(section_end_frame) - 1e-4:
                 return []
@@ -4986,6 +5007,7 @@ class SceneImporter():
                 "w3_scene_change_pose_emotional_state": state.get("emotional_state", ""),
                 "w3_scene_change_pose_pose_name": state.get("pose_name", ""),
                 "w3_scene_change_pose_idle_start_frame": float(at_frame),
+                "w3_scene_change_pose_transition_end_frame": float(transition_end_frame if transition_end_frame is not None else at_frame),
             }
             for arm_obj in list(loaded or []):
                 if arm_obj is None or getattr(arm_obj, "animation_data", None) is None:
@@ -5942,8 +5964,13 @@ class SceneImporter():
                         _loaded = load_scene_animation_by_name(anim_name, curr_actor, _pose_track, _pose_frame, event=event)
                         if _loaded:
                             apply_anim_clip_event_strip_props(_loaded, _pose_track, _pose_frame, event)
-                    _idle_frame = _change_pose_idle_start_frame(event, _pose_frame, _loaded, _pose_track)
-                    load_change_pose_dialogset_idle(event, curr_actor, _idle_frame)
+                    _idle_frame, _idle_transition_end = _change_pose_idle_timing(event, _pose_frame, _loaded, _pose_track)
+                    load_change_pose_dialogset_idle(
+                        event,
+                        curr_actor,
+                        _idle_frame,
+                        transition_end_frame=_idle_transition_end,
+                    )
                 elif event.__class__.__name__ == "CStorySceneEventMimics":
                     event: w3_types.CStorySceneEventMimics
                     actor_name = getattr(event, "actor", None)

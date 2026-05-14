@@ -40,6 +40,8 @@ W2SCENE_EVENT_WEIGHT_PROP = "w3_scene_event_weight"
 W2SCENE_EVENT_WEIGHT_APPLIED_PROP = "w3_scene_event_weight_applied_to_strip"
 W2SCENE_EVENT_WEIGHT_CURVE_BAKED_PROP = "w3_scene_event_weight_curve_baked"
 W2SCENE_EVENT_WEIGHT_CURVE_EDITS_PROP = "w3_scene_event_weight_curve_edits"
+W2SCENE_QUATERNION_NORMALIZE_EPSILON = 1e-6
+W2SCENE_QUATERNION_KEY_WRITE_EPSILON = 1e-7
 
 
 def _target_name(target):
@@ -99,7 +101,7 @@ def warn_scene_animation_edit(operation, *, action=None, strip=None, armature_ob
     if context:
         message = f"{message} {context}"
     message = f"{message}{detail_text}"
-    log.warning(message)
+    log.debug(message)
     _append_warning_prop(action, message)
     _append_warning_prop(strip, message)
 
@@ -120,7 +122,7 @@ def warn_scene_animation_lookup(*, requested="", resolved="", path="", armature_
     ]
     if frame is not None:
         parts.append(f"frame={frame}")
-    log.warning(" ".join(str(part) for part in parts if part))
+    log.debug(" ".join(str(part) for part in parts if part))
 
 
 def warn_scene_animation_skip(reason, *, event=None, section="", track_name="", details=None):
@@ -131,7 +133,7 @@ def warn_scene_animation_skip(reason, *, event=None, section="", track_name="", 
     message = f"W2SCENE SKIP: scene section importer skipped animation event: {reason}"
     if context:
         message = f"{message} {context}"
-    log.warning(f"{message}{detail_text}")
+    log.debug(f"{message}{detail_text}")
 
 
 def warn_scene_animation_debug(message, *, event=None, section="", track_name="", action=None, armature_obj=None, details=None):
@@ -148,7 +150,7 @@ def warn_scene_animation_debug(message, *, event=None, section="", track_name=""
     text = f"W2SCENE DEBUG: {message}"
     if context:
         text = f"{text} {context}"
-    log.warning(f"{text}{detail_text}")
+    log.debug(f"{text}{detail_text}")
 
 
 def _set_float_idprop_ui(id_block, prop_name, value, soft_min=0.0, soft_max=1.0):
@@ -746,6 +748,218 @@ def _w2scene_quat_key_frames(quat_curves):
     return sorted(frames)
 
 
+def _w2scene_keyframe_points(fcurve):
+    try:
+        return list(getattr(fcurve, "keyframe_points", []) or [])
+    except Exception:
+        return []
+
+
+def _w2scene_keyframe_frame(keyframe):
+    try:
+        return float(keyframe.co.x)
+    except Exception:
+        try:
+            return float(keyframe.co[0])
+        except Exception:
+            return 0.0
+
+
+def _w2scene_keyframe_value(keyframe):
+    try:
+        return float(keyframe.co.y)
+    except Exception:
+        try:
+            return float(keyframe.co[1])
+        except Exception:
+            return 0.0
+
+
+def _w2scene_set_keyframe_point_value(keyframe, value, *, epsilon=W2SCENE_QUATERNION_KEY_WRITE_EPSILON):
+    try:
+        value = float(value)
+        old_value = _w2scene_keyframe_value(keyframe)
+        if abs(old_value - value) <= float(epsilon):
+            return False
+        delta = value - old_value
+        try:
+            keyframe.co.y = value
+        except Exception:
+            keyframe.co[1] = value
+        try:
+            keyframe.handle_left.y = float(keyframe.handle_left.y) + delta
+            keyframe.handle_right.y = float(keyframe.handle_right.y) + delta
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _w2scene_frame_key(frame):
+    return round(float(frame), 4)
+
+
+def _w2scene_quat_values_for_continuity(raw_values, prev_values):
+    values = tuple(float(value) for value in raw_values)
+    norm_sq = sum(value * value for value in values)
+    needs_normalize = norm_sq <= 1e-12 or abs(norm_sq - 1.0) > W2SCENE_QUATERNION_NORMALIZE_EPSILON
+    if norm_sq <= 1e-12:
+        values = (1.0, 0.0, 0.0, 0.0)
+    elif needs_normalize:
+        inv_norm = 1.0 / math.sqrt(norm_sq)
+        values = tuple(value * inv_norm for value in values)
+
+    flipped = False
+    if prev_values is not None:
+        dot = sum(float(prev_values[index]) * values[index] for index in range(4))
+        if dot < 0.0:
+            values = tuple(-value for value in values)
+            flipped = True
+    return values, needs_normalize, flipped
+
+
+def _w2scene_quat_curve_points_by_index(quat_curves):
+    points_by_index = {}
+    for index in range(4):
+        fcurve = (quat_curves or {}).get(index)
+        if fcurve is None or not _fcurve_has_keys(fcurve):
+            return None
+        points = _w2scene_keyframe_points(fcurve)
+        if not points:
+            return None
+        points_by_index[index] = points
+    return points_by_index
+
+
+def _w2scene_quat_points_are_synchronized(points_by_index):
+    if not points_by_index:
+        return False
+    count = len(points_by_index.get(0, ()))
+    if count <= 0:
+        return False
+    base_frames = [_w2scene_keyframe_frame(point) for point in points_by_index[0]]
+    for index in range(1, 4):
+        points = points_by_index.get(index, ())
+        if len(points) != count:
+            return False
+        for base_frame, point in zip(base_frames, points):
+            if abs(base_frame - _w2scene_keyframe_frame(point)) > 1e-4:
+                return False
+    return True
+
+
+def _w2scene_make_synced_quat_curves_continuous(quat_curves):
+    points_by_index = _w2scene_quat_curve_points_by_index(quat_curves)
+    if not _w2scene_quat_points_are_synchronized(points_by_index):
+        return None
+
+    changed = False
+    bone_flipped = False
+    flipped_keys = 0
+    normalized_keys = 0
+    changed_fcurves = {}
+    prev_values = None
+    for keyframes in zip(points_by_index[0], points_by_index[1], points_by_index[2], points_by_index[3]):
+        raw_values = tuple(_w2scene_keyframe_value(keyframe) for keyframe in keyframes)
+        values, normalized, flipped = _w2scene_quat_values_for_continuity(raw_values, prev_values)
+        if normalized:
+            normalized_keys += 1
+        if flipped:
+            flipped_keys += 1
+            bone_flipped = True
+        if normalized or flipped:
+            for index, value in enumerate(values):
+                if _w2scene_set_keyframe_point_value(keyframes[index], value):
+                    changed = True
+                    fcurve = quat_curves.get(index)
+                    if fcurve is not None:
+                        changed_fcurves[id(fcurve)] = fcurve
+        prev_values = values
+
+    return {
+        "changed": changed,
+        "bone_flipped": bone_flipped,
+        "flipped_keys": flipped_keys,
+        "normalized_keys": normalized_keys,
+        "changed_fcurves": changed_fcurves,
+    }
+
+
+def _w2scene_make_sparse_quat_curves_continuous(quat_curves):
+    frames = _w2scene_quat_key_frames(quat_curves)
+    if not frames:
+        return {
+            "changed": False,
+            "bone_flipped": False,
+            "flipped_keys": 0,
+            "normalized_keys": 0,
+            "changed_fcurves": {},
+        }
+
+    point_maps = {}
+    for index, fcurve in (quat_curves or {}).items():
+        point_maps[index] = {
+            _w2scene_frame_key(_w2scene_keyframe_frame(point)): point
+            for point in _w2scene_keyframe_points(fcurve)
+        }
+
+    changed = False
+    bone_flipped = False
+    flipped_keys = 0
+    normalized_keys = 0
+    changed_fcurves = {}
+    prev_values = None
+    defaults = (1.0, 0.0, 0.0, 0.0)
+    for frame in frames:
+        frame_key = _w2scene_frame_key(frame)
+        raw_values = []
+        key_points = []
+        for index in range(4):
+            fcurve = (quat_curves or {}).get(index)
+            point = point_maps.get(index, {}).get(frame_key)
+            key_points.append(point)
+            if point is not None:
+                raw_values.append(_w2scene_keyframe_value(point))
+            elif fcurve is not None and _fcurve_has_keys(fcurve):
+                try:
+                    raw_values.append(float(fcurve.evaluate(frame)))
+                except Exception:
+                    raw_values.append(defaults[index])
+            else:
+                raw_values.append(defaults[index])
+
+        values, normalized, flipped = _w2scene_quat_values_for_continuity(raw_values, prev_values)
+        if normalized:
+            normalized_keys += 1
+        if flipped:
+            flipped_keys += 1
+            bone_flipped = True
+        if normalized or flipped:
+            for index, value in enumerate(values):
+                fcurve = (quat_curves or {}).get(index)
+                if fcurve is None:
+                    continue
+                point = key_points[index]
+                if point is not None:
+                    if _w2scene_set_keyframe_point_value(point, value):
+                        changed = True
+                        changed_fcurves[id(fcurve)] = fcurve
+                else:
+                    _set_fcurve_value_at_frame(fcurve, frame, value)
+                    changed = True
+                    changed_fcurves[id(fcurve)] = fcurve
+        prev_values = values
+
+    return {
+        "changed": changed,
+        "bone_flipped": bone_flipped,
+        "flipped_keys": flipped_keys,
+        "normalized_keys": normalized_keys,
+        "changed_fcurves": changed_fcurves,
+    }
+
+
 def _w2scene_set_keyframe_value(fcurve, frame, value, *, epsilon=1e-10):
     if fcurve is None:
         return False
@@ -760,17 +974,7 @@ def _w2scene_set_keyframe_value(fcurve, frame, value, *, epsilon=1e-10):
         try:
             if abs(float(keyframe.co.x) - frame) > 1e-4:
                 continue
-            old_value = float(keyframe.co.y)
-            if abs(old_value - value) <= epsilon:
-                return False
-            delta = value - old_value
-            keyframe.co.y = value
-            try:
-                keyframe.handle_left.y = float(keyframe.handle_left.y) + delta
-                keyframe.handle_right.y = float(keyframe.handle_right.y) + delta
-            except Exception:
-                pass
-            return True
+            return _w2scene_set_keyframe_point_value(keyframe, value, epsilon=epsilon)
         except Exception:
             continue
 
@@ -809,40 +1013,24 @@ def make_action_quaternion_keys_continuous(
     flipped_bone_names = []
     flipped_keys = 0
     normalized_keys = 0
+    changed_fcurves = {}
     for bone_name, curves_by_prop in curves_by_bone.items():
         quat_curves = curves_by_prop.get("rotation_quaternion") or {}
-        frames = _w2scene_quat_key_frames(quat_curves)
-        if not frames:
-            continue
+        outcome = _w2scene_make_synced_quat_curves_continuous(quat_curves)
+        if outcome is None:
+            outcome = _w2scene_make_sparse_quat_curves_continuous(quat_curves)
 
-        prev_quat = None
-        bone_changed = False
-        bone_flipped = False
-        for frame in frames:
-            try:
-                raw_values = _evaluate_fcurve_group(quat_curves, (1.0, 0.0, 0.0, 0.0), frame)
-                raw_norm_sq = sum(float(value) * float(value) for value in raw_values)
-                quat = _quat_from_curve_values(raw_values)
-            except Exception:
-                continue
-
-            if raw_norm_sq <= 1e-12 or abs(raw_norm_sq - 1.0) > 1e-6:
-                normalized_keys += 1
-            if prev_quat is not None and prev_quat.dot(quat) < 0.0:
-                quat = -quat
-                flipped_keys += 1
-                bone_flipped = True
-            if _w2scene_set_quat_key(quat_curves, frame, quat):
-                bone_changed = True
-            prev_quat = quat.copy()
-
-        if bone_changed:
+        flipped_keys += int(outcome.get("flipped_keys", 0) or 0)
+        normalized_keys += int(outcome.get("normalized_keys", 0) or 0)
+        for key, fcurve in (outcome.get("changed_fcurves", {}) or {}).items():
+            changed_fcurves[key] = fcurve
+        if bool(outcome.get("changed", False)):
             changed_bones.append(bone_name)
-        if bone_flipped:
+        if bool(outcome.get("bone_flipped", False)):
             flipped_bone_names.append(bone_name)
 
     if changed_bones:
-        for fcurve in iter_action_fcurves(action, target=armature_obj, slot=slot):
+        for fcurve in changed_fcurves.values():
             try:
                 fcurve.update()
             except Exception:
