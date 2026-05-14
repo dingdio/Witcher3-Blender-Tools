@@ -4532,8 +4532,7 @@ def apply_root_orientation(armature_obj):
 
     root_bone = pose_bones["Root"]
 
-    # The swap copies the Trajectory bone's rotation onto Root keeping the world-space movement direction identical to the motion extraction.
-    initial_quat = _read_root_first_frame_quat(action, armature_obj)
+    initial_quat, source_bone, source_up_dot = _select_root_orientation_quat(action, armature_obj)
 
     # Step 2: Remove ALL fcurves for Root bone (rotation, location, scale)
     root_data_paths = [
@@ -4574,22 +4573,37 @@ def apply_root_orientation(armature_obj):
 
     # Mark as applied
     action["root_orientation_applied"] = True
+    action["root_orientation_source_bone"] = source_bone
+    action["root_orientation_source_up_dot"] = float(source_up_dot)
 
     log.info(f"Applied root orientation to {action.name}")
-    log.info(f"  Root initial quaternion: {initial_quat}")
+    log.info(f"  Root initial quaternion: {initial_quat} source={source_bone} upDot={source_up_dot:.4f}")
 
     return True
 
 
-def _read_root_first_frame_quat(action, armature_obj=None):
-    """Read Root bone's rotation at its first keyframe, returned as a Quaternion.
+def _quat_world_up_dot(quat):
+    if quat is None:
+        return -1.0
+    try:
+        test_quat = quat.copy()
+        test_quat.normalize()
+        up = test_quat.to_matrix() @ mathutils.Vector((0.0, 0.0, 1.0))
+        if up.length <= 1e-8:
+            return -1.0
+        return float(up.normalized().dot(mathutils.Vector((0.0, 0.0, 1.0))))
+    except Exception:
+        return -1.0
+
+
+def _read_bone_first_frame_quat(action, armature_obj=None, bone_name="Root", default=None):
+    """Read a pose bone's rotation at its first keyframe, returned as a Quaternion.
 
     Reads fcurve values directly (no frame_set overhead) and handles both
-    quaternion and euler rotation modes.  Returns identity if no Root rotation
-    fcurves exist.
+    quaternion and euler rotation modes.
     """
-    quat_path = 'pose.bones["Root"].rotation_quaternion'
-    euler_path = 'pose.bones["Root"].rotation_euler'
+    quat_path = f'pose.bones["{bone_name}"].rotation_quaternion'
+    euler_path = f'pose.bones["{bone_name}"].rotation_euler'
 
     first_frame = None
     quat_curves = {}   # array_index → fcurve
@@ -4611,8 +4625,7 @@ def _read_root_first_frame_quat(action, armature_obj=None):
             euler_curves[fc.array_index] = fc
 
     if first_frame is None:
-        log.info("_read_root_first_frame_quat: no Root rotation fcurves, returning identity")
-        return mathutils.Quaternion()
+        return default
 
     if quat_curves:
         w = quat_curves[0].evaluate(first_frame) if 0 in quat_curves else 1.0
@@ -4626,6 +4639,39 @@ def _read_root_first_frame_quat(action, armature_obj=None):
     ey = euler_curves[1].evaluate(first_frame) if 1 in euler_curves else 0.0
     ez = euler_curves[2].evaluate(first_frame) if 2 in euler_curves else 0.0
     return mathutils.Euler((ex, ey, ez), euler_order).to_quaternion()
+
+
+def _read_root_first_frame_quat(action, armature_obj=None):
+    quat = _read_bone_first_frame_quat(action, armature_obj, "Root", default=None)
+    if quat is None:
+        log.info("_read_root_first_frame_quat: no Root rotation fcurves, returning identity")
+        return mathutils.Quaternion()
+    return quat
+
+
+def _select_root_orientation_quat(action, armature_obj):
+    root_quat = _read_bone_first_frame_quat(action, armature_obj, "Root", default=None)
+    root_up_dot = _quat_world_up_dot(root_quat)
+    if root_quat is not None and root_up_dot >= 0.5:
+        return root_quat, "Root", root_up_dot
+
+    best_quat = root_quat or mathutils.Quaternion()
+    best_bone = "Root"
+    best_up_dot = root_up_dot
+    pose_bones = getattr(getattr(armature_obj, "pose", None), "bones", {}) or {}
+    for bone_name in ("Trajectory", "Reference"):
+        if bone_name not in pose_bones:
+            continue
+        candidate = _read_bone_first_frame_quat(action, armature_obj, bone_name, default=None)
+        candidate_up_dot = _quat_world_up_dot(candidate)
+        if candidate is not None and candidate_up_dot > best_up_dot:
+            best_quat = candidate
+            best_bone = bone_name
+            best_up_dot = candidate_up_dot
+        if candidate is not None and candidate_up_dot >= 0.5:
+            return candidate, bone_name, candidate_up_dot
+
+    return best_quat, best_bone, best_up_dot
 
 
 class WITCH_OT_ApplyRootOrientation(bpy.types.Operator):

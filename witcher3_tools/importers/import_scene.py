@@ -1198,6 +1198,53 @@ def _sort_w2scene_nla_tracks_for_actor(target_obj):
     return 0
 
 
+def _post_make_w2scene_strip_quaternion_keys_continuous(target_obj):
+    anim_data = getattr(target_obj, "animation_data", None) if target_obj is not None else None
+    tracks = getattr(anim_data, "nla_tracks", None)
+    if tracks is None:
+        return 0
+
+    body_tracks = []
+    for track in list(tracks):
+        track_name = str(getattr(track, "name", "") or "")
+        if not _w2scene_track_is_body_layer(track_name):
+            continue
+        strips = list(getattr(track, "strips", []) or [])
+        if strips:
+            body_tracks.append((track_name, track, strips))
+    if not body_tracks:
+        return 0
+
+    changed = 0
+    processed_actions = set()
+    for track_name, _track, strips in body_tracks:
+        for strip in strips:
+            action = getattr(strip, "action", None)
+            if action is None:
+                continue
+            action_key = id(action)
+            if action_key in processed_actions:
+                continue
+            processed_actions.add(action_key)
+            try:
+                outcome = import_scene_animation.make_strip_quaternion_keys_continuous(
+                    strip,
+                    target_obj,
+                    track_name=track_name,
+                )
+            except Exception:
+                log.debug(
+                    "Could not make quaternion keys continuous for strip %s on %s",
+                    getattr(strip, "name", ""),
+                    getattr(target_obj, "name", ""),
+                    exc_info=True,
+                )
+                continue
+            if int((outcome or {}).get("changed_bones", 0) or 0) > 0:
+                changed += 1
+    return changed
+
+
 def _remove_orphan_action(action):
     if action is not None and getattr(action, "users", 0) == 0:
         try:
@@ -7154,6 +7201,7 @@ class SceneImporter():
         for target_obj in section_nla_targets:
             normalize_dialogset_mimic_state_ranges(target_obj, float(frame_offset), mimic_state_end_frame)
             _sort_w2scene_nla_tracks_for_actor(target_obj)
+            _post_make_w2scene_strip_quaternion_keys_continuous(target_obj)
 
         if default_range is not None:
             log.info(

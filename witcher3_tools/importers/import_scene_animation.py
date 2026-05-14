@@ -162,9 +162,23 @@ def _set_float_idprop_ui(id_block, prop_name, value, soft_min=0.0, soft_max=1.0)
         pass
 
 
-def _read_root_first_frame_quat(action, armature_obj, root_bone_name):
-    quat_path = _pose_bone_data_path(armature_obj, root_bone_name, "rotation_quaternion")
-    euler_path = _pose_bone_data_path(armature_obj, root_bone_name, "rotation_euler")
+def _quat_world_up_dot(quat):
+    if quat is None:
+        return -1.0
+    try:
+        test_quat = quat.copy()
+        test_quat.normalize()
+        up = test_quat.to_matrix() @ Vector((0.0, 0.0, 1.0))
+        if up.length <= 1e-8:
+            return -1.0
+        return float(up.normalized().dot(Vector((0.0, 0.0, 1.0))))
+    except Exception:
+        return -1.0
+
+
+def _read_bone_first_frame_quat(action, armature_obj, bone_name, default=None):
+    quat_path = _pose_bone_data_path(armature_obj, bone_name, "rotation_quaternion")
+    euler_path = _pose_bone_data_path(armature_obj, bone_name, "rotation_euler")
 
     first_frame = None
     quat_curves = {}
@@ -184,7 +198,7 @@ def _read_root_first_frame_quat(action, armature_obj, root_bone_name):
             euler_curves[int(getattr(fcurve, "array_index", 0) or 0)] = fcurve
 
     if first_frame is None:
-        return Quaternion((1.0, 0.0, 0.0, 0.0))
+        return default
 
     if quat_curves:
         quat = Quaternion((
@@ -203,6 +217,40 @@ def _read_root_first_frame_quat(action, armature_obj, root_bone_name):
         euler_curves[1].evaluate(first_frame) if 1 in euler_curves else 0.0,
         euler_curves[2].evaluate(first_frame) if 2 in euler_curves else 0.0,
     ), "XYZ").to_quaternion()
+
+
+def _read_root_first_frame_quat(action, armature_obj, root_bone_name):
+    return _read_bone_first_frame_quat(
+        action,
+        armature_obj,
+        root_bone_name,
+        default=Quaternion((1.0, 0.0, 0.0, 0.0)),
+    )
+
+
+def _select_root_orientation_quat(action, armature_obj, root_bone_name):
+    root_quat = _read_bone_first_frame_quat(action, armature_obj, root_bone_name, default=None)
+    root_up_dot = _quat_world_up_dot(root_quat)
+    if root_quat is not None and root_up_dot >= 0.5:
+        return root_quat, root_bone_name, root_up_dot
+
+    best_quat = root_quat or Quaternion((1.0, 0.0, 0.0, 0.0))
+    best_bone = root_bone_name
+    best_up_dot = root_up_dot
+    for base_name in ("Trajectory", "Reference"):
+        candidate_name = _find_w2scene_pose_bone_name(armature_obj, base_name)
+        if not candidate_name:
+            continue
+        candidate = _read_bone_first_frame_quat(action, armature_obj, candidate_name, default=None)
+        candidate_up_dot = _quat_world_up_dot(candidate)
+        if candidate is not None and candidate_up_dot > best_up_dot:
+            best_quat = candidate
+            best_bone = candidate_name
+            best_up_dot = candidate_up_dot
+        if candidate is not None and candidate_up_dot >= 0.5:
+            return candidate, candidate_name, candidate_up_dot
+
+    return best_quat, best_bone, best_up_dot
 
 
 def _rotation_curves(action, armature_obj, bone_name):
@@ -617,7 +665,7 @@ def apply_scene_root_orientation_to_action(action, armature_obj, *, event=None, 
             },
         )
 
-    initial_quat = _read_root_first_frame_quat(action, armature_obj, root_bone_name)
+    initial_quat, source_bone_name, source_up_dot = _select_root_orientation_quat(action, armature_obj, root_bone_name)
     root_data_paths = {
         _pose_bone_data_path(armature_obj, root_bone_name, "location"),
         _pose_bone_data_path(armature_obj, root_bone_name, "rotation_quaternion"),
@@ -667,6 +715,8 @@ def apply_scene_root_orientation_to_action(action, armature_obj, *, event=None, 
         action["root_orientation_applied"] = True
         action[W2SCENE_ACTION_ROOT_ORIENTATION_PROP] = True
         action["w3_scene_root_orientation_removed_fcurves"] = len(fcurves_to_remove)
+        action["w3_scene_root_orientation_source_bone"] = source_bone_name
+        action["w3_scene_root_orientation_source_up_dot"] = float(source_up_dot)
     except Exception:
         pass
 
@@ -681,6 +731,153 @@ def apply_scene_root_orientation_to_action(action, armature_obj, *, event=None, 
         details={
             "removedFcurves": len(fcurves_to_remove),
             "rootBone": root_bone_name,
+            "sourceBone": source_bone_name,
+            "sourceUpDot": round(float(source_up_dot), 4),
         },
     )
     return True
+
+
+def _w2scene_quat_key_frames(quat_curves):
+    frames = set()
+    for fcurve in (quat_curves or {}).values():
+        if _fcurve_has_keys(fcurve):
+            frames.update(_keyframe_frames(fcurve))
+    return sorted(frames)
+
+
+def _w2scene_set_keyframe_value(fcurve, frame, value, *, epsilon=1e-10):
+    if fcurve is None:
+        return False
+    frame = float(frame)
+    value = float(value)
+    try:
+        keyframes = getattr(fcurve, "keyframe_points", []) or []
+    except Exception:
+        keyframes = []
+
+    for keyframe in keyframes:
+        try:
+            if abs(float(keyframe.co.x) - frame) > 1e-4:
+                continue
+            old_value = float(keyframe.co.y)
+            if abs(old_value - value) <= epsilon:
+                return False
+            delta = value - old_value
+            keyframe.co.y = value
+            try:
+                keyframe.handle_left.y = float(keyframe.handle_left.y) + delta
+                keyframe.handle_right.y = float(keyframe.handle_right.y) + delta
+            except Exception:
+                pass
+            return True
+        except Exception:
+            continue
+
+    _set_fcurve_value_at_frame(fcurve, frame, value)
+    return True
+
+
+def _w2scene_set_quat_key(quat_curves, frame, quat):
+    changed = False
+    for index, value in enumerate((quat.w, quat.x, quat.y, quat.z)):
+        fcurve = (quat_curves or {}).get(index)
+        if fcurve is not None and _w2scene_set_keyframe_value(fcurve, frame, value):
+            changed = True
+    return changed
+
+
+def make_action_quaternion_keys_continuous(
+    action,
+    armature_obj,
+    *,
+    strip=None,
+    event=None,
+    section="",
+    track_name="",
+):
+    result = {"changed_bones": 0, "flipped_bones": 0, "flipped_keys": 0, "normalized_keys": 0, "bones": []}
+    if action is None or armature_obj is None or getattr(armature_obj, "type", None) != "ARMATURE":
+        return result
+    try:
+        slot = resolve_action_slot(action, target=armature_obj, ensure=True)
+    except Exception:
+        return result
+
+    curves_by_bone = _collect_pose_transform_curves(action, armature_obj, slot, include_euler=False)
+    changed_bones = []
+    flipped_bone_names = []
+    flipped_keys = 0
+    normalized_keys = 0
+    for bone_name, curves_by_prop in curves_by_bone.items():
+        quat_curves = curves_by_prop.get("rotation_quaternion") or {}
+        frames = _w2scene_quat_key_frames(quat_curves)
+        if not frames:
+            continue
+
+        prev_quat = None
+        bone_changed = False
+        bone_flipped = False
+        for frame in frames:
+            try:
+                raw_values = _evaluate_fcurve_group(quat_curves, (1.0, 0.0, 0.0, 0.0), frame)
+                raw_norm_sq = sum(float(value) * float(value) for value in raw_values)
+                quat = _quat_from_curve_values(raw_values)
+            except Exception:
+                continue
+
+            if raw_norm_sq <= 1e-12 or abs(raw_norm_sq - 1.0) > 1e-6:
+                normalized_keys += 1
+            if prev_quat is not None and prev_quat.dot(quat) < 0.0:
+                quat = -quat
+                flipped_keys += 1
+                bone_flipped = True
+            if _w2scene_set_quat_key(quat_curves, frame, quat):
+                bone_changed = True
+            prev_quat = quat.copy()
+
+        if bone_changed:
+            changed_bones.append(bone_name)
+        if bone_flipped:
+            flipped_bone_names.append(bone_name)
+
+    if changed_bones:
+        for fcurve in iter_action_fcurves(action, target=armature_obj, slot=slot):
+            try:
+                fcurve.update()
+            except Exception:
+                pass
+        warn_scene_animation_edit(
+            "made quaternion keys continuous per bone track",
+            action=action,
+            strip=strip,
+            armature_obj=armature_obj,
+            event=event,
+            section=section,
+            track_name=track_name,
+            details={
+                "changedBones": len(changed_bones),
+                "flippedBones": len(flipped_bone_names),
+                "flippedKeys": flipped_keys,
+                "normalizedKeys": normalized_keys,
+                "bones": ",".join(changed_bones[:32]),
+            },
+        )
+
+    result["changed_bones"] = len(changed_bones)
+    result["flipped_bones"] = len(flipped_bone_names)
+    result["flipped_keys"] = flipped_keys
+    result["normalized_keys"] = normalized_keys
+    result["bones"] = changed_bones
+    return result
+
+
+def make_strip_quaternion_keys_continuous(strip, armature_obj, *, event=None, section="", track_name=""):
+    return make_action_quaternion_keys_continuous(
+        getattr(strip, "action", None),
+        armature_obj,
+        strip=strip,
+        event=event,
+        section=section,
+        track_name=track_name,
+    )

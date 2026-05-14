@@ -551,6 +551,18 @@ def _find_anim_bone(bones, *names):
                 return bone
     return None
 
+def _anim_bone_has_track_frames(bone, frames_attr, count_attr):
+    frames = getattr(bone, frames_attr, None)
+    try:
+        if len(frames) > 0:
+            return True
+    except TypeError:
+        pass
+    try:
+        return int(getattr(bone, count_attr, 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
 def _get_quaternion_components(value):
     if value is None:
         return None
@@ -1068,10 +1080,13 @@ class AnimImporter:
                 root_bone.positionFrames = [[0.0, 0.0, 0.0]]
                 root_bone.position_dt = source_bone.position_dt
                 root_bone.position_numFrames = 1
-                root_bone.rotationFrames = source_bone.rotationFrames
-                root_bone.rotationFramesQuat = source_bone.rotationFramesQuat
-                root_bone.rotation_dt = source_bone.rotation_dt
-                root_bone.rotation_numFrames = source_bone.rotation_numFrames
+                # Keep authored Root rotation. Trajectory/Reference carry their
+                # own yaw and can be opposite to Root in dialog clips.
+                if not _anim_bone_has_track_frames(root_bone, "rotationFramesQuat", "rotation_numFrames"):
+                    root_bone.rotationFrames = source_bone.rotationFrames
+                    root_bone.rotationFramesQuat = source_bone.rotationFramesQuat
+                    root_bone.rotation_dt = source_bone.rotation_dt
+                    root_bone.rotation_numFrames = source_bone.rotation_numFrames
                 root_bone.scaleFrames = [[1.0, 1.0, 1.0]]
                 root_bone.scale_dt = source_bone.scale_dt
                 root_bone.scale_numFrames = 1
@@ -1311,6 +1326,7 @@ class AnimImporter:
                 num_rot_frames = len(rot_frames)
                 
                 prev_rot_frame = None
+                prev_fixed_rot = None
                 last_frame = total_frames - 1
                 for n, rot_frame in enumerate(rot_frames):
                     if witcher_bake_every_frame:
@@ -1368,6 +1384,14 @@ class AnimImporter:
 
                     if cutscene_root_component and _base_bone_name(mdl_bone.BoneName).lower() == "root":
                         fixed_rot = Quaternion((1.0, 0.0, 0.0, 0.0))
+
+                    if fixed_rot.dot(fixed_rot) <= 1e-12:
+                        fixed_rot = Quaternion((1.0, 0.0, 0.0, 0.0))
+                    else:
+                        fixed_rot.normalize()
+                    if prev_fixed_rot is not None and prev_fixed_rot.dot(fixed_rot) < 0.0:
+                        fixed_rot = -fixed_rot
+                    prev_fixed_rot = fixed_rot.copy()
 
                     for i in range(4):
                         rot_curves[i].keyframe_points.add(1)
