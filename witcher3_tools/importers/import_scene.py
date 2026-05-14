@@ -1310,11 +1310,31 @@ def clear_w2scene_actor_section_nla(context, actor_obj):
     return removed
 
 
+def _w2scene_prop_object_tree(prop_obj):
+    if prop_obj is None:
+        return []
+    targets = [prop_obj]
+    try:
+        targets.extend(list(prop_obj.children_recursive))
+    except Exception:
+        pass
+    seen = set()
+    unique = []
+    for target in targets:
+        if target is None or id(target) in seen:
+            continue
+        seen.add(id(target))
+        unique.append(target)
+    return unique
+
+
 def clear_w2scene_prop_section_nla(prop_obj):
-    removed = clear_nla_tracks(
-        prop_obj,
-        track_names=("ScenePlacement", "SceneVisibility", W2SCENE_ATTACH_TRACK_NAME),
-    )
+    removed = 0
+    for target in _w2scene_prop_object_tree(prop_obj):
+        removed += clear_nla_tracks(
+            target,
+            track_names=("ScenePlacement", "SceneVisibility", W2SCENE_ATTACH_TRACK_NAME),
+        )
     removed += clear_w2scene_prop_attach_state(prop_obj)
     return removed
 
@@ -1322,7 +1342,7 @@ def clear_w2scene_prop_section_nla(prop_obj):
 def reset_w2scene_prop_visibility(prop_obj):
     if prop_obj is None:
         return
-    for obj in [prop_obj] + _iter_w2scene_entity_descendants(prop_obj):
+    for obj in _w2scene_prop_object_tree(prop_obj):
         try:
             obj.hide_viewport = False
             obj.hide_render = False
@@ -1643,14 +1663,70 @@ def _create_w2scene_debug_empty(
     return empty
 
 
+def _w2scene_scene_prop_attachment_root(obj):
+    if obj is None:
+        return None
+    current = obj
+    visited = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        try:
+            if bool(current.get("witcher_entity_root", False)):
+                return current
+        except Exception:
+            pass
+        current = getattr(current, "parent", None)
+    return obj
+
+
+def _stamp_w2scene_scene_prop_object(obj, prop_id, template_path="", *, include_descendants=True):
+    if obj is None:
+        return
+    targets = [obj]
+    if include_descendants:
+        try:
+            targets.extend(list(obj.children_recursive))
+        except Exception:
+            pass
+    for target in targets:
+        try:
+            target["witcher_w2scene_prop_id"] = prop_id
+            target["witcher_scene_item_type"] = "PROP"
+            if template_path:
+                target["witcher_w2scene_prop_template"] = template_path
+        except Exception:
+            pass
+
+
 def _find_scene_prop_object(prop_id):
     prop_id = str(prop_id or "").strip()
     if not prop_id:
         return None
+    matches = []
     for obj in bpy.context.scene.objects:
-        if str(obj.get("witcher_w2scene_prop_id", "") or "").strip() == prop_id:
-            return obj
-    return None
+        try:
+            if str(obj.get("witcher_w2scene_prop_id", "") or "").strip() != prop_id:
+                continue
+        except Exception:
+            continue
+        candidate = _w2scene_scene_prop_attachment_root(obj)
+        score = 0
+        try:
+            if bool(candidate.get("witcher_entity_root", False)):
+                score += 32
+        except Exception:
+            pass
+        if getattr(candidate, "parent", None) is None:
+            score += 8
+        if getattr(candidate, "type", None) == 'EMPTY':
+            score += 4
+        matches.append((score, candidate))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    selected = matches[0][1]
+    _stamp_w2scene_scene_prop_object(selected, prop_id, include_descendants=False)
+    return selected
 
 
 def _resolve_w2scene_template_path(template_path, scene_filepath=""):
@@ -1708,6 +1784,8 @@ def _import_scene_prop_object(prop, context, scene_filepath=""):
         log.warning("Failed to import scene prop %s from %s", prop_id or "<unnamed>", resolved_path or template_path, exc_info=True)
         prop_obj = None
 
+    prop_obj = _w2scene_scene_prop_attachment_root(prop_obj)
+
     if prop_obj is None:
         new_objects = [obj for obj in bpy.data.objects if id(obj) not in before_ids]
         new_ids = {id(obj) for obj in new_objects}
@@ -1725,17 +1803,7 @@ def _import_scene_prop_object(prop, context, scene_filepath=""):
         )
         prop_obj = _create_scene_prop_empty(prop_id, template_path, context)
 
-    prop_obj["witcher_w2scene_prop_id"] = prop_id
-    prop_obj["witcher_w2scene_prop_template"] = template_path
-    prop_obj["witcher_scene_item_type"] = "PROP"
-    try:
-        child_objects = list(prop_obj.children_recursive)
-    except Exception:
-        child_objects = []
-    for child in child_objects:
-        child["witcher_w2scene_prop_id"] = prop_id
-        child["witcher_w2scene_prop_template"] = template_path
-        child["witcher_scene_item_type"] = "PROP"
+    _stamp_w2scene_scene_prop_object(prop_obj, prop_id, template_path)
     return prop_obj
 
 def _cname_index_to_string(index_obj):
@@ -1773,6 +1841,7 @@ def _scene_actor_preferred_appearance(actor):
 def _transform_real(transform, name, default=0.0):
     if transform is None:
         return default
+    transform = _engine_transform_value(transform)
     value = transform.get(name, default) if isinstance(transform, dict) else getattr(transform, name, default)
     try:
         return float(value)
@@ -1780,7 +1849,14 @@ def _transform_real(transform, name, default=0.0):
         return default
 
 
+def _engine_transform_value(transform):
+    if transform is None:
+        return None
+    return getattr(transform, "EngineTransform", None) or transform
+
+
 def _engine_transform_matrix(engine_transform, from_this_object=None):
+    engine_transform = _engine_transform_value(engine_transform)
     base_matrix = from_this_object.matrix_world.copy() if from_this_object else Matrix.Identity(4)
     yaw = _transform_real(engine_transform, "Yaw", 0.0)
     pitch = _transform_real(engine_transform, "Pitch", 0.0)
@@ -1794,6 +1870,12 @@ def _engine_transform_matrix(engine_transform, from_this_object=None):
         local_matrix = Euler((radians(yaw), radians(pitch), radians(roll)), 'YXZ').to_matrix().to_4x4()
     local_matrix.translation = (loc_x, loc_y, loc_z)
     return base_matrix @ local_matrix
+
+
+def _w2scene_attach_offset_matrix(engine_transform):
+    if engine_transform is None:
+        return Matrix.Identity(4)
+    return _engine_transform_matrix(engine_transform)
 
 
 def _pose_bone_world_matrix(armature_obj, bone_name):
@@ -1893,24 +1975,32 @@ def clear_w2scene_prop_attach_state(prop_obj):
     if prop_obj is None:
         return 0
     removed = 0
-    for constraint in list(getattr(prop_obj, "constraints", []) or []):
-        if str(getattr(constraint, "name", "") or "").startswith(W2SCENE_ATTACH_CONSTRAINT_PREFIX):
-            try:
-                prop_obj.constraints.remove(constraint)
-                removed += 1
-            except Exception:
-                log.debug("Could not remove .w2scene attach constraint from %s", getattr(prop_obj, "name", ""), exc_info=True)
+    targets = _w2scene_prop_object_tree(prop_obj)
+    for target in targets:
+        for constraint in list(getattr(target, "constraints", []) or []):
+            if str(getattr(constraint, "name", "") or "").startswith(W2SCENE_ATTACH_CONSTRAINT_PREFIX):
+                try:
+                    target.constraints.remove(constraint)
+                    removed += 1
+                except Exception:
+                    log.debug("Could not remove .w2scene attach constraint from %s", getattr(target, "name", ""), exc_info=True)
 
-    try:
-        prop_id = str(prop_obj.get("witcher_w2scene_prop_id", "") or "").strip()
-    except Exception:
-        prop_id = ""
+    prop_id = ""
+    for target in targets:
+        try:
+            prop_id = str(target.get("witcher_w2scene_prop_id", "") or "").strip()
+        except Exception:
+            prop_id = ""
+        if prop_id:
+            break
+    if not prop_id:
+        return removed
     for obj in list(bpy.data.objects):
         try:
             if not bool(obj.get(W2SCENE_ATTACH_HELPER_PROP, False)):
                 continue
             helper_prop_id = str(obj.get(W2SCENE_ATTACH_PROP_ID_PROP, "") or "").strip()
-            if prop_id and helper_prop_id != prop_id:
+            if helper_prop_id != prop_id:
                 continue
             bpy.data.objects.remove(obj, do_unlink=True)
             removed += 1
@@ -2209,7 +2299,7 @@ def _create_w2scene_attach_target_helper(context, prop_obj, event, target_obj, s
         helper.parent = slot_empty
         helper.parent_type = 'OBJECT'
         helper.matrix_parent_inverse = Matrix.Identity(4)
-        helper.matrix_local = _engine_transform_matrix(offset) if offset is not None else Matrix.Identity(4)
+        helper.matrix_local = _w2scene_attach_offset_matrix(offset)
         return helper, f"slot:{getattr(slot_empty, 'name', slot_name)}"
 
     if kind == "bone" and target_info.get("armature") is not None:
@@ -2246,7 +2336,7 @@ def _create_w2scene_attach_target_helper(context, prop_obj, event, target_obj, s
             helper.parent = slot_anchor
             helper.parent_type = 'OBJECT'
             helper.matrix_parent_inverse = Matrix.Identity(4)
-            helper.matrix_local = _engine_transform_matrix(offset) if offset is not None else Matrix.Identity(4)
+            helper.matrix_local = _w2scene_attach_offset_matrix(offset)
             return helper, f"slot:{getattr(slot_entry, 'slot_name', slot_name)}->{getattr(armature, 'name', '')}.{bone_name}"
         import_entity.set_empty_bone_offset(
             helper,
@@ -2263,7 +2353,7 @@ def _create_w2scene_attach_target_helper(context, prop_obj, event, target_obj, s
         helper.parent = fallback_obj
         helper.parent_type = 'OBJECT'
         helper.matrix_parent_inverse = Matrix.Identity(4)
-        helper.matrix_local = _engine_transform_matrix(offset) if offset is not None else Matrix.Identity(4)
+        helper.matrix_local = _w2scene_attach_offset_matrix(offset)
         return helper, f"object:{getattr(fallback_obj, 'name', target_name)}"
     return helper, "unresolved"
 
