@@ -157,6 +157,45 @@ def _cutscene_get_active_subtitle(scene, frame):
     return None
 
 
+def _active_w2scene_choices(scene, frame):
+    if scene is None or not bool(getattr(scene, "witcher_cutscene_show_dialog_subtitles", True)):
+        return []
+    try:
+        active_section_index = int(getattr(scene, "witcher_w2scene_active_subtitle_section_index", -1))
+    except Exception:
+        active_section_index = -1
+    if active_section_index < 0:
+        return []
+
+    fps = _scene_fps(scene)
+    frame_offset = float(getattr(scene, "witcher_w2scene_section_subtitle_frame_offset", 0.0) or 0.0)
+    frame = float(frame)
+    choices = []
+    for item in getattr(scene, "witcher_w2scene_choice_items", []) or []:
+        try:
+            if int(getattr(item, "section_index", -1)) != active_section_index:
+                continue
+        except Exception:
+            continue
+        try:
+            start_frame = frame_offset + (float(getattr(item, "start_time", 0.0) or 0.0) * fps)
+            duration_frames = max(1.0, float(getattr(item, "duration", 0.0) or 0.0) * fps)
+        except Exception:
+            continue
+        if not (start_frame <= frame <= (start_frame + duration_frames)):
+            continue
+        text = str(getattr(item, "choice_text", "") or "").strip()
+        if not text:
+            continue
+        choices.append({
+            "index": int(getattr(item, "choice_index", len(choices)) or 0),
+            "text": text,
+            "emphasis": bool(getattr(item, "is_emphasized", False) or False),
+        })
+    choices.sort(key=lambda item: item["index"])
+    return choices
+
+
 def _set_blf_size(font_id, font_size):
     try:
         blf.size(font_id, font_size)
@@ -184,6 +223,22 @@ def _wrap_subtitle_text(font_id, text, max_width):
     return lines
 
 
+def _draw_blf_text_with_shadow(font_id, text, x, y, color=(1.0, 1.0, 1.0, 1.0)):
+    try:
+        blf.color(font_id, 0.0, 0.0, 0.0, 0.85)
+    except Exception:
+        pass
+    blf.position(font_id, x + 2.0, y - 2.0, 0)
+    blf.draw(font_id, text)
+
+    try:
+        blf.color(font_id, *color)
+    except Exception:
+        pass
+    blf.position(font_id, x, y, 0)
+    blf.draw(font_id, text)
+
+
 def draw_cutscene_subtitle():
     context = bpy.context
     scene = getattr(context, "scene", None)
@@ -191,8 +246,10 @@ def draw_cutscene_subtitle():
     if scene is None or region is None:
         return
 
-    text = _cutscene_get_active_subtitle(scene, getattr(scene, "frame_current", 0))
-    if not text:
+    current_frame = getattr(scene, "frame_current", 0)
+    text = _cutscene_get_active_subtitle(scene, current_frame)
+    choices = _active_w2scene_choices(scene, current_frame)
+    if not text and not choices:
         return
 
     font_id = 0
@@ -201,7 +258,7 @@ def draw_cutscene_subtitle():
     _set_blf_size(font_id, font_size)
 
     max_width = max(120.0, float(getattr(region, "width", 0) or 0) * 0.82)
-    lines = _wrap_subtitle_text(font_id, text, max_width) or [text]
+    lines = _wrap_subtitle_text(font_id, text, max_width) if text else []
     line_height = font_size * 1.25
     base_y = 60.0
 
@@ -209,20 +266,43 @@ def draw_cutscene_subtitle():
         text_width, _text_height = blf.dimensions(font_id, line)
         x = (float(region.width) - text_width) / 2.0
         y = base_y + (idx * line_height)
+        _draw_blf_text_with_shadow(font_id, line, x, y)
 
-        try:
-            blf.color(font_id, 0.0, 0.0, 0.0, 0.85)
-        except Exception:
-            pass
-        blf.position(font_id, x + 2.0, y - 2.0, 0)
-        blf.draw(font_id, line)
+    if not choices:
+        return
 
-        try:
-            blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
-        except Exception:
-            pass
-        blf.position(font_id, x, y, 0)
-        blf.draw(font_id, line)
+    choice_font_size = font_size
+    _set_blf_size(font_id, choice_font_size)
+    region_width = float(getattr(region, "width", 0) or 0)
+    region_height = float(getattr(region, "height", 0) or 0)
+    choice_max_width = max(120.0, region_width * 0.62)
+    choice_line_height = choice_font_size * 1.22
+    choice_lines = []
+    for display_index, choice in enumerate(choices, start=1):
+        wrapped = _wrap_subtitle_text(font_id, f"{display_index}. {choice['text']}", choice_max_width)
+        if not wrapped:
+            continue
+        for line in wrapped:
+            choice_lines.append((line, bool(choice.get("emphasis", False))))
+    if not choice_lines:
+        return
+
+    choice_block_width = min(
+        choice_max_width,
+        max(blf.dimensions(font_id, line)[0] for line, _emphasized in choice_lines),
+    )
+    choice_left = max(24.0, (region_width - choice_block_width) / 2.0)
+    subtitle_top_y = base_y + ((len(lines) - 1) * line_height if lines else 0.0)
+    choice_bottom_y = subtitle_top_y + (line_height + 16.0 if lines else 0.0)
+    choice_top_y = choice_bottom_y + ((len(choice_lines) - 1) * choice_line_height)
+    max_top_y = max(40.0, region_height - 48.0)
+    if choice_top_y > max_top_y:
+        choice_top_y = max_top_y
+
+    for idx, (line, emphasized) in enumerate(choice_lines):
+        y = choice_top_y - (idx * choice_line_height)
+        color = (1.0, 0.88, 0.42, 1.0) if emphasized else (1.0, 1.0, 1.0, 1.0)
+        _draw_blf_text_with_shadow(font_id, line, choice_left, y, color=color)
 
 
 def enable_cutscene_subtitles():

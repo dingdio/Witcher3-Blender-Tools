@@ -2,6 +2,7 @@
 import logging
 import os
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 log = logging.getLogger(__name__)
@@ -306,6 +307,9 @@ class WitcherSection(bpy.types.PropertyGroup):
     duration: FloatProperty(default=0.0)
     dialogset_change: StringProperty(default="")
     linked_cutscene: StringProperty(default="")
+    next_section_index: IntProperty(default=-1)
+    next_section_name: StringProperty(default="")
+    next_chunk_index: IntProperty(default=0)
     is_gameplay: BoolProperty(default=False)
     is_important: BoolProperty(default=False)
 
@@ -421,6 +425,22 @@ class W2SceneSectionEventItem(PropertyGroup):
     detail_text: StringProperty(default="")
 
 
+class W2SceneChoiceItem(PropertyGroup):
+    section_index: IntProperty(default=-1)
+    source_index: IntProperty(default=-1)
+    choice_index: IntProperty(default=-1)
+    choice_text: StringProperty(default="")
+    choice_line_id: StringProperty(default="")
+    comment_text: StringProperty(default="")
+    start_time: FloatProperty(default=0.0)
+    duration: FloatProperty(default=0.0)
+    target_section_index: IntProperty(default=-1)
+    target_section_name: StringProperty(default="")
+    target_chunk_index: IntProperty(default=0)
+    is_emphasized: BoolProperty(default=False)
+    is_single_use: BoolProperty(default=False)
+
+
 _W2SCENE_ROOT_FIELD_SCHEMA = [
     ("CStoryScene", [
         ("sceneId", None),
@@ -502,6 +522,7 @@ def _w2scene_clear_loaded_state(scene):
         "witcher_w2scene_camera_items",
         "witcher_w2scene_section_element_items",
         "witcher_w2scene_section_event_items",
+        "witcher_w2scene_choice_items",
     ):
         collection = getattr(scene, prop_name, None)
         if collection is not None:
@@ -701,6 +722,62 @@ def _w2scene_load_chunk_object(story_scene, ptr_value):
         return None
 
 
+def _w2scene_chunk_name(chunk):
+    return str(getattr(chunk, "Type", None) or getattr(chunk, "name", "") or "")
+
+
+def _w2scene_section_display_index_by_chunk(sections):
+    result = {}
+    for section_index, section in enumerate(sections or []):
+        chunk_index = _w2scene_as_int(getattr(section, "_w3_chunk_index", 0), 0)
+        if chunk_index:
+            result[chunk_index] = section_index
+    return result
+
+
+def _w2scene_first_reachable_section_chunk(story_scene, start_ptr):
+    start_ptr = _w2scene_as_int(_w2scene_ptr_value(start_ptr), 0)
+    if not start_ptr:
+        return 0
+
+    chunks = getattr(story_scene, "chunksRef", None) or []
+    section_chunks = {
+        _w2scene_as_int(_w2scene_ptr_value(ptr), 0)
+        for ptr in _w2scene_iter_values(getattr(story_scene, "sections", None))
+    }
+    queue = deque([start_ptr])
+    visited = set()
+    while queue:
+        ptr = queue.popleft()
+        if ptr in visited or ptr <= 0 or ptr > len(chunks):
+            continue
+        visited.add(ptr)
+        chunk = chunks[ptr - 1]
+        if ptr in section_chunks or _w2scene_chunk_name(chunk) in {
+            "CStorySceneSection",
+            "CStorySceneCutsceneSection",
+            "CStorySceneVideoSection",
+        }:
+            return ptr
+        try:
+            for next_ptr in import_scene._w2scene_flow_outgoing_indices(chunks, ptr):
+                if next_ptr not in visited:
+                    queue.append(next_ptr)
+        except Exception:
+            log.debug("Could not resolve .w2scene choice link from chunk %s", ptr, exc_info=True)
+    return 0
+
+
+def _w2scene_localized_text(prop, filepath="", context=None):
+    line_id = dialog_language.localized_string_id(prop)
+    text = ""
+    if line_id:
+        text = _w2scene_resolve_line_text(line_id, filepath, context)
+    if not text:
+        text = _w2scene_prop_text(prop)
+    return str(line_id or "").strip(), str(text or "").strip()
+
+
 def _w2scene_element_label(element):
     element_type = element.__class__.__name__ if element is not None else "CStorySceneElement"
     element_id = _w2scene_prop_text(getattr(element, "elementID", None))
@@ -801,6 +878,7 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
 
     story_scene = scene_importer._CStoryScene
     sections = list(getattr(scene_importer, "scene_sections", []) or [])
+    section_index_by_chunk = _w2scene_section_display_index_by_chunk(sections)
     scene.witcher_sections_filepath = filepath
     scene.witcher_loaded_w2scene_path = filepath
     scene.witcher_loaded_w2scene_name = os.path.basename(filepath)
@@ -887,6 +965,69 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
         sec_item.linked_cutscene = prop_to_string(getattr(section, "cutscene", None))
         sec_item.is_gameplay = bool(getattr(section, "isGameplay", False) or False)
         sec_item.is_important = bool(getattr(section, "isImportant", False) or False)
+
+        next_ptr = _w2scene_ptr_value(getattr(section, "nextLinkElement", None))
+        next_chunk_index = _w2scene_first_reachable_section_chunk(story_scene, next_ptr)
+        next_section_index = int(section_index_by_chunk.get(next_chunk_index, -1))
+        if 0 <= next_section_index < len(sections):
+            next_section = sections[next_section_index]
+            sec_item.next_section_index = next_section_index
+            sec_item.next_section_name = (
+                _w2scene_prop_text(getattr(next_section, "sectionName", None))
+                or f"Section {next_section_index + 1}"
+            )
+            sec_item.next_chunk_index = next_chunk_index
+
+        choice_obj = _w2scene_load_chunk_object(story_scene, getattr(section, "choice", None))
+        choice_lines = list(_w2scene_iter_values(getattr(choice_obj, "choiceLines", None))) if choice_obj is not None else []
+        choice_start_time = section_duration
+        choice_duration = 0.0
+        if choice_obj is not None:
+            choice_element_id = str(getattr(choice_obj, "elementID", "") or "")
+            choice_duration = duration_overrides.get(
+                choice_element_id,
+                import_scene._dialog_script_duration(choice_obj),
+            )
+        for choice_index, choice_line_ref in enumerate(choice_lines):
+            choice_line = _w2scene_load_chunk_object(story_scene, choice_line_ref)
+            if choice_line is None:
+                continue
+
+            next_ptr = _w2scene_ptr_value(getattr(choice_line, "nextLinkElement", None))
+            target_chunk_index = _w2scene_first_reachable_section_chunk(story_scene, next_ptr)
+            target_section_index = int(section_index_by_chunk.get(target_chunk_index, -1))
+            target_section_name = ""
+            if 0 <= target_section_index < len(sections):
+                target_section = sections[target_section_index]
+                target_section_name = (
+                    _w2scene_prop_text(getattr(target_section, "sectionName", None))
+                    or f"Section {target_section_index + 1}"
+                )
+
+            line_id, choice_text = _w2scene_localized_text(getattr(choice_line, "choiceLine", None), filepath, bpy.context)
+            _comment_id, comment_text = _w2scene_localized_text(getattr(choice_line, "choiceComment", None), filepath, bpy.context)
+            if not choice_text:
+                choice_text = f"Option {choice_index + 1}"
+                if target_section_name:
+                    choice_text = f"{choice_text}: {target_section_name}"
+
+            choice_item = scene.witcher_w2scene_choice_items.add()
+            choice_item.section_index = section_index
+            choice_item.source_index = _w2scene_ptr_value(choice_line_ref) or -1
+            choice_item.choice_index = choice_index
+            choice_item.choice_text = choice_text
+            choice_item.choice_line_id = line_id
+            choice_item.comment_text = comment_text
+            choice_item.start_time = choice_start_time
+            choice_item.duration = choice_duration
+            choice_item.target_section_index = target_section_index
+            choice_item.target_section_name = target_section_name
+            choice_item.target_chunk_index = target_chunk_index
+            choice_item.is_emphasized = bool(getattr(choice_line, "emphasisLine", False) or False)
+            choice_item.is_single_use = bool(getattr(choice_line, "singleUseChoice", False) or False)
+        if choice_lines and choice_duration > 0.0:
+            section_duration += choice_duration
+            sec_item.duration = section_duration
 
         _w2scene_fill_field_items(scene.witcher_w2scene_section_fields, section, _W2SCENE_SECTION_FIELD_SCHEMA, section_index=section_index)
 
@@ -1909,6 +2050,52 @@ def _draw_w2scene_scene_tab(layout, scene):
     )
 
 
+def _w2scene_choice_items_for_section(scene, section_index):
+    result = []
+    for item in getattr(scene, "witcher_w2scene_choice_items", []) or []:
+        try:
+            if int(getattr(item, "section_index", -1)) == int(section_index):
+                result.append(item)
+        except Exception:
+            continue
+    result.sort(key=lambda item: int(getattr(item, "choice_index", 0) or 0))
+    return result
+
+
+def _draw_w2scene_link_buttons(layout, scene, section):
+    section_index = int(getattr(section, "section_index", -1))
+    choice_items = _w2scene_choice_items_for_section(scene, section_index)
+    if choice_items:
+        choice_box = layout.box()
+        choice_box.label(text="Choices", icon='QUESTION')
+        for item in choice_items:
+            target_index = int(getattr(item, "target_section_index", -1))
+            row = choice_box.row(align=True)
+            row.enabled = target_index >= 0
+            label = str(getattr(item, "choice_text", "") or "").strip() or f"Option {int(getattr(item, 'choice_index', 0) or 0) + 1}"
+            op = row.operator(WITCH_OT_W2SceneLoadChoice.bl_idname, text=label, icon='PLAY')
+            op.target_section_index = target_index
+            op.choice_index = int(getattr(item, "choice_index", -1))
+            target_name = str(getattr(item, "target_section_name", "") or "").strip()
+            if target_name:
+                target = row.row(align=True)
+                target.alignment = 'RIGHT'
+                target.enabled = False
+                target.label(text=target_name, icon='SEQUENCE')
+        return
+
+    target_index = int(getattr(section, "next_section_index", -1))
+    if target_index < 0:
+        return
+
+    link_box = layout.box()
+    link_box.label(text="Next Link", icon='FORWARD')
+    target_name = str(getattr(section, "next_section_name", "") or "").strip() or "Next Section"
+    op = link_box.operator(WITCH_OT_W2SceneLoadChoice.bl_idname, text=target_name, icon='PLAY')
+    op.target_section_index = target_index
+    op.choice_index = -1
+
+
 def _draw_w2scene_sections_tab(layout, scene):
     sections = list(getattr(scene, "witcher_sections", []) or [])
     if not sections:
@@ -1923,6 +2110,8 @@ def _draw_w2scene_sections_tab(layout, scene):
         return
     section = sections[active_idx]
     section_index = int(getattr(section, "section_index", active_idx))
+    choice_count = len(_w2scene_choice_items_for_section(scene, section_index))
+    _draw_w2scene_link_buttons(layout, scene, section)
 
     detail = layout.box()
     hdr = detail.row(align=True)
@@ -1930,11 +2119,14 @@ def _draw_w2scene_sections_tab(layout, scene):
     hdr.label(text=section.section_type or "CStorySceneSection")
     if section.linked_cutscene:
         detail.label(text=f"Linked cutscene: {section.linked_cutscene}", icon='ACTION')
+    detail_counts = (
+        f"Duration {section.duration:.3f}s  "
+        f"Elements {section.element_count}  Events {section.event_count}"
+    )
+    if choice_count:
+        detail_counts = f"{detail_counts}  Choices {choice_count}"
     detail.label(
-        text=(
-            f"Duration {section.duration:.3f}s  "
-            f"Elements {section.element_count}  Events {section.event_count}"
-        ),
+        text=detail_counts,
         icon='TIME',
     )
     flag_row = detail.row(align=True)
@@ -2438,6 +2630,30 @@ class Witcher_OT_load_section(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WITCH_OT_W2SceneLoadChoice(bpy.types.Operator):
+    bl_idname = "witcher.w2scene_load_choice"
+    bl_label = "Load Linked Scene Section"
+    bl_description = "Load the .w2scene section linked by this choice or next section link"
+
+    target_section_index: IntProperty(default=-1)
+    choice_index: IntProperty(default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        sections = getattr(scene, "witcher_sections", None)
+        target_index = int(getattr(self, "target_section_index", -1))
+        if sections is None or not (0 <= target_index < len(sections)):
+            self.report({'ERROR'}, "Choice target section could not be resolved.")
+            return {'CANCELLED'}
+
+        try:
+            scene.witcher_sections_index = target_index
+            scene.witcher_w2scene_tab = 'SECTIONS'
+        except Exception:
+            pass
+        return bpy.ops.witcher.load_section()
+
+
 
 class WITCH_OT_W2ScenePreviewCameraEvent(bpy.types.Operator):
     bl_idname = "witcher.w2scene_preview_camera_event"
@@ -2895,6 +3111,7 @@ classes = [
     W2SceneCameraItem,
     W2SceneSectionElementItem,
     W2SceneSectionEventItem,
+    W2SceneChoiceItem,
     WITCH_UL_W2SceneActorList,
     WITCH_UL_W2SceneDialogsetList,
     WITCH_UL_W2SceneDialogsetSlotList,
@@ -2905,6 +3122,7 @@ classes = [
     WITCHER_PT_scene_panel,
     WITCHER_SECTIONS_UL_List,
     Witcher_OT_load_section,
+    WITCH_OT_W2SceneLoadChoice,
     WITCH_OT_W2ScenePreviewCameraEvent,
     WITCH_OT_W2SceneImportActorItem,
     WITCH_OT_LoadDialogsetSlotActor,
@@ -2934,6 +3152,7 @@ def register():
     bpy.types.Scene.witcher_w2scene_camera_items = bpy.props.CollectionProperty(type=W2SceneCameraItem)
     bpy.types.Scene.witcher_w2scene_section_element_items = bpy.props.CollectionProperty(type=W2SceneSectionElementItem)
     bpy.types.Scene.witcher_w2scene_section_event_items = bpy.props.CollectionProperty(type=W2SceneSectionEventItem)
+    bpy.types.Scene.witcher_w2scene_choice_items = bpy.props.CollectionProperty(type=W2SceneChoiceItem)
     bpy.types.Scene.witcher_w2scene_actor_index = bpy.props.IntProperty(default=0)
     bpy.types.Scene.witcher_w2scene_dialogset_index = bpy.props.IntProperty(default=0)
     bpy.types.Scene.witcher_w2scene_dialogset_slot_index = bpy.props.IntProperty(default=0)
@@ -3050,6 +3269,7 @@ def unregister():
         "witcher_w2scene_camera_items",
         "witcher_w2scene_section_element_items",
         "witcher_w2scene_section_event_items",
+        "witcher_w2scene_choice_items",
         "witcher_w2scene_actor_index",
         "witcher_w2scene_dialogset_index",
         "witcher_w2scene_dialogset_slot_index",
