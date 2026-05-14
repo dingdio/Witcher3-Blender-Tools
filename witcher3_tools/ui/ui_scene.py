@@ -100,6 +100,8 @@ def _w2scene_import_profile_logger_names():
         f"{root_name}.ui.ui_anims_list",
         f"{root_name}.importers.import_scene",
         f"{root_name}.importers.import_scene_animation",
+        f"{root_name}.importers.import_scene_motion",
+        f"{root_name}.importers.motion_tools",
         f"{root_name}.importers.import_anims",
         f"{root_name}.importers.import_cutscene",
         f"{root_name}.CR2W.CR2W_types",
@@ -503,6 +505,26 @@ def _w2scene_clear_loaded_state(scene):
     scene.witcher_w2scene_camera_index = 0
     scene.witcher_w2scene_element_index = 0
     scene.witcher_w2scene_event_index = 0
+    _w2scene_set_active_subtitle_section(scene, -1, 0.0)
+
+
+def _w2scene_set_active_subtitle_section(scene, section_index=-1, frame_offset=0.0):
+    if scene is None:
+        return
+    try:
+        scene.witcher_w2scene_active_subtitle_section_index = int(section_index)
+    except Exception:
+        try:
+            scene["witcher_w2scene_active_subtitle_section_index"] = int(section_index)
+        except Exception:
+            pass
+    try:
+        scene.witcher_w2scene_section_subtitle_frame_offset = float(frame_offset)
+    except Exception:
+        try:
+            scene["witcher_w2scene_section_subtitle_frame_offset"] = float(frame_offset)
+        except Exception:
+            pass
 
 
 def _w2scene_as_float(value, default=0.0):
@@ -2350,6 +2372,12 @@ class Witcher_OT_load_section(bpy.types.Operator):
 
         section_name = str(getattr(this_section, "sectionName", "") or "")
         log.debug("Section: %s", section_name)
+        active_section_index = int(getattr(
+            scene.witcher_sections[scene.witcher_sections_index],
+            "section_index",
+            scene.witcher_sections_index,
+        ))
+        _w2scene_set_active_subtitle_section(scene, -1, 0.0)
         profile_job = _new_w2scene_import_profile_job_state()
         if bool(getattr(scene, "witcher_w2scene_write_profile_log", True)):
             _start_w2scene_import_profile_log(
@@ -2379,6 +2407,7 @@ class Witcher_OT_load_section(bpy.types.Operator):
         try:
             sceneImporter.load_section(this_section)
             sceneImporter.execute()
+            _w2scene_set_active_subtitle_section(scene, active_section_index, 0.0)
         except Exception as exc:
             log.exception("Failed to load section %s", section_name)
             _stop_w2scene_import_profile_log(profile_job, f".w2scene section import failed: {section_name}")
@@ -2902,6 +2931,16 @@ def register():
         description="Create visible .w2scene dialogset and placement marker empties while loading a section",
         default=True,
     )
+    bpy.types.Scene.witcher_w2scene_active_subtitle_section_index = bpy.props.IntProperty(
+        name="Active Scene Subtitle Section",
+        description=".w2scene section whose dialogue subtitles are currently active in the viewport",
+        default=-1,
+    )
+    bpy.types.Scene.witcher_w2scene_section_subtitle_frame_offset = bpy.props.FloatProperty(
+        name="Scene Subtitle Frame Offset",
+        description="Frame offset applied to the active .w2scene section subtitle timings",
+        default=0.0,
+    )
     bpy.types.Scene.witcher_w2scene_tab = bpy.props.EnumProperty(
         name="Scene Tab",
         items=[
@@ -3000,6 +3039,8 @@ def unregister():
         "witcher_w2scene_show_unset_fields",
         "witcher_w2scene_write_profile_log",
         "witcher_w2scene_create_debug_markers",
+        "witcher_w2scene_active_subtitle_section_index",
+        "witcher_w2scene_section_subtitle_frame_offset",
         "witcher_w2scene_tab",
     ):
         if hasattr(bpy.types.Scene, prop):

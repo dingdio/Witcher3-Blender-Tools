@@ -112,10 +112,21 @@ def _active_subtitle_from_cutscene_items(scene, frame):
 
 
 def _active_subtitle_from_w2scene_elements(scene, frame):
+    try:
+        active_section_index = int(getattr(scene, "witcher_w2scene_active_subtitle_section_index", -1))
+    except Exception:
+        active_section_index = -1
+    if active_section_index < 0:
+        return None
     fps = _scene_fps(scene)
     frame_offset = float(getattr(scene, "witcher_w2scene_section_subtitle_frame_offset", 0.0) or 0.0)
     frame = float(frame)
     for item in getattr(scene, "witcher_w2scene_section_element_items", []) or []:
+        try:
+            if int(getattr(item, "section_index", -1)) != active_section_index:
+                continue
+        except Exception:
+            continue
         if str(getattr(item, "element_type", "") or "") != "CStorySceneLine":
             continue
         text = str(getattr(item, "line_text", "") or "").strip()
