@@ -102,20 +102,39 @@ def _on_voice_language_update(self, context):
         _LANGUAGE_REFRESHING = False
 
 
-def draw_dialog_language_selector(layout, context, text="Language"):
+def draw_dialog_language_selector(
+    layout,
+    context,
+    text="Language",
+    *,
+    heading="",
+    icon='WORLD',
+    use_property_split=True,
+):
     scene = getattr(context, "scene", None) if context is not None else None
     if scene is None:
-        return
-    row = layout.row(align=True)
-    drew = False
+        return False
+
+    props = []
     if hasattr(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP):
-        row.prop(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP, text="Text")
-        drew = True
+        props.append((dialog_language.DIALOG_TEXT_LANGUAGE_PROP, "Text"))
     if hasattr(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP):
-        row.prop(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP, text="Voice")
-        drew = True
-    if not drew and hasattr(scene, dialog_language.DIALOG_LEGACY_LANGUAGE_PROP):
-        row.prop(scene, dialog_language.DIALOG_LEGACY_LANGUAGE_PROP, text=text)
+        props.append((dialog_language.DIALOG_VOICE_LANGUAGE_PROP, "Voice"))
+    if not props and hasattr(scene, dialog_language.DIALOG_LEGACY_LANGUAGE_PROP):
+        props.append((dialog_language.DIALOG_LEGACY_LANGUAGE_PROP, text))
+
+    if not props:
+        return False
+
+    if heading:
+        layout.label(text=heading, icon=icon)
+
+    col = layout.column(align=True)
+    col.use_property_split = use_property_split
+    col.use_property_decorate = False
+    for prop_name, label in props:
+        col.prop(scene, prop_name, text=label)
+    return True
 
 
 def _migrate_legacy_language():

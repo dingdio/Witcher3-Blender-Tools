@@ -36,6 +36,7 @@ from .ui_cr2w_fields import (
     _get_imported_field_value,
     _get_present_imported_fields,
 )
+from . import ui_dialog_language
 from .ui_utils import WITCH_PT_Base
 from ..camera_tracks import (
     CAMERA_CONTROL_BONE,
@@ -2227,20 +2228,39 @@ def _draw_w2scene_cameras_tab(layout, scene, context):
         ])
 
 
-def _draw_w2scene_panel(layout, scene):
+def _draw_w2scene_panel(layout, scene, context=None):
+    context = context or bpy.context
     layout.label(text="Scene (.w2scene)", icon='WORLD')
-    action_row = layout.row(align=True)
-    action_row.operator(ButtonOperatorImportW2scene.bl_idname, text="Import Scene (.w2scene)", icon='IMPORT')
-    if hasattr(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP):
-        action_row.prop(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP, text="Text")
-    if hasattr(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP):
-        action_row.prop(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP, text="Voice")
-    if hasattr(scene, "witcher_cutscene_show_dialog_subtitles"):
-        action_row.prop(scene, "witcher_cutscene_show_dialog_subtitles", text="Subtitles")
-    if getattr(scene, "witcher_loaded_w2scene_path", ""):
-        action_row.operator(Witcher_OT_load_section.bl_idname, text="Load Section", icon='SEQUENCE')
-        action_row.prop(scene, "witcher_w2scene_write_profile_log", text="Profile Log")
-        action_row.prop(scene, "witcher_w2scene_create_debug_markers", text="Debug Markers")
+    layout.operator(ButtonOperatorImportW2scene.bl_idname, text="Import Scene (.w2scene)", icon='IMPORT')
+
+    has_dialog_settings = (
+        hasattr(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP)
+        or hasattr(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP)
+        or hasattr(scene, dialog_language.DIALOG_LEGACY_LANGUAGE_PROP)
+        or hasattr(scene, "witcher_cutscene_show_dialog_subtitles")
+    )
+    if has_dialog_settings:
+        settings_box = layout.box()
+        settings_box.label(text="Dialog Settings", icon='TEXT')
+        ui_dialog_language.draw_dialog_language_selector(settings_box, context)
+        if hasattr(scene, "witcher_cutscene_show_dialog_subtitles"):
+            settings_col = settings_box.column(align=True)
+            settings_col.use_property_split = True
+            settings_col.use_property_decorate = False
+            settings_col.prop(scene, "witcher_cutscene_show_dialog_subtitles", text="Show Subtitles")
+
+    loaded_scene_path = str(getattr(scene, "witcher_loaded_w2scene_path", "") or "").strip()
+    if loaded_scene_path:
+        section_box = layout.box()
+        section_box.label(text="Loaded Scene", icon='SEQUENCE')
+        section_box.label(text=os.path.basename(loaded_scene_path) or loaded_scene_path, icon='FILE')
+        section_box.operator(Witcher_OT_load_section.bl_idname, text="Load Selected Section", icon='SEQUENCE')
+
+        debug_col = section_box.column(align=True)
+        debug_col.use_property_split = True
+        debug_col.use_property_decorate = False
+        debug_col.prop(scene, "witcher_w2scene_write_profile_log", text="Profile Log")
+        debug_col.prop(scene, "witcher_w2scene_create_debug_markers", text="Debug Markers")
 
     active_cutscene_path = str(getattr(scene, "witcher_w2scene_active_cutscene_path", "") or "").strip()
     if active_cutscene_path:
@@ -2287,7 +2307,7 @@ class WITCHER_PT_scene_panel(WITCH_PT_Base, Panel):
         scene = context.scene
         if scene is None:
             return
-        _draw_w2scene_panel(self.layout, scene)
+        _draw_w2scene_panel(self.layout, scene, context)
 
 class WITCHER_SECTIONS_UL_List(UIList):
     bl_idname = "WITCHER_SECTIONS_UL_List"

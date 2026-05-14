@@ -14,6 +14,7 @@ from .. import get_W3_OGG_PATH
 from .. import get_rig_rot90_enabled
 from .. import get_all_addon_prefs
 from .. import dialog_language
+from . import ui_dialog_language
 from ..importers import import_anims, import_cutscene, import_entity, import_rig, import_scene_animation
 from ..exporters import export_anims, export_cutscene
 from ..action_compat import (
@@ -5571,25 +5572,32 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             if _ui_voice and hasattr(_ui_voice, "ensure_voice_list_initialized"):
                 _ui_voice.ensure_voice_list_initialized(context)
 
-            # --- Options row (compact) ---
-            option_row = col.row(align=True)
-            if hasattr(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP):
-                option_row.prop(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP, text="Text")
-            if hasattr(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP):
-                option_row.prop(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP, text="Voice")
-            if hasattr(scene, "witcher_voice_show_details"):
-                option_row.prop(scene, "witcher_voice_show_details", text="IDs/dur")
-            if hasattr(scene, "witcher_voice_replace_audio"):
-                option_row.prop(scene, "witcher_voice_replace_audio", text="Replace")
-            if hasattr(scene, "witcher_voice_recreate_phonemes"):
-                option_row.prop(scene, "witcher_voice_recreate_phonemes", text="Phonemes")
+            settings_box = col.box()
+            settings_box.label(text="Dialogue Settings", icon='SETTINGS')
+            settings_col = settings_box.column(align=True)
+            settings_col.use_property_split = True
+            settings_col.use_property_decorate = False
+            ui_dialog_language.draw_dialog_language_selector(
+                settings_col,
+                context,
+                heading="Languages",
+                icon='WORLD',
+            )
             if hasattr(scene, "witcher_cutscene_show_dialog_subtitles"):
-                option_row.prop(scene, "witcher_cutscene_show_dialog_subtitles", text="Subtitles")
+                settings_col.prop(scene, "witcher_cutscene_show_dialog_subtitles", text="Show Subtitles")
+            if hasattr(scene, "witcher_voice_show_details"):
+                settings_col.prop(scene, "witcher_voice_show_details", text="Show IDs and Duration")
+            if hasattr(scene, "witcher_voice_replace_audio"):
+                settings_col.prop(scene, "witcher_voice_replace_audio", text="Replace Audio")
+            if hasattr(scene, "witcher_voice_recreate_phonemes"):
+                settings_col.prop(scene, "witcher_voice_recreate_phonemes", text="Recreate Phonemes")
             if getattr(scene, "witcher_voice_recreate_phonemes", False):
                 if hasattr(scene, "witcher_voice_phoneme_accuracy"):
-                    col.prop(scene, "witcher_voice_phoneme_accuracy", text="Accuracy", slider=True)
+                    settings_col.prop(scene, "witcher_voice_phoneme_accuracy", text="Phoneme Accuracy", slider=True)
             if hasattr(scene, "witcher_anim_nla_mode"):
-                col.prop(scene, "witcher_anim_nla_mode", text="NLA Load Mode")
+                settings_col.prop(scene, "witcher_anim_nla_mode", text="NLA Load Mode")
+            if hasattr(scene, "witcher_voice_load_on_select"):
+                settings_col.prop(scene, "witcher_voice_load_on_select", text="Load on Select")
 
             # --- Loaded lipsync status ---
             _arm = _find_character_armature(context)
@@ -5607,13 +5615,64 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                         status_box.label(text=f"{_label}: {_aname}  [{int(_fs)}-{int(_fe)}]", icon='NLA')
                     status_box.operator("witcher.clear_lipsync", text="Clear Lipsync", icon='TRASH')
 
+            filter_box = col.box()
+            filter_box.label(text="Search and Speaker Filters", icon='VIEWZOOM')
+            raw_search = ""
+            eff_speaker = ""
+            if _ui_voice and hasattr(_ui_voice, "_get_effective_speaker"):
+                try:
+                    eff_speaker = _ui_voice._get_effective_speaker(scene)
+                except Exception:
+                    eff_speaker = ""
+            if hasattr(scene, "witcher_voice_search_text"):
+                raw_search = getattr(scene, "witcher_voice_search_text", "").strip()
+                search_row = filter_box.row(align=True)
+                search_row.prop(scene, "witcher_voice_search_text", text="", icon='VIEWZOOM')
+                clear_btn = search_row.row(align=True)
+                clear_btn.enabled = bool(raw_search or eff_speaker)
+                clear_btn.operator("witcher.quick_voice_clear_filter", text="", icon='X')
+
+                hint_parts = []
+                if eff_speaker:
+                    hint_parts.append(f"speaker={eff_speaker}")
+                if raw_search and _ui_voice and hasattr(_ui_voice, "_parse_search_tokens"):
+                    try:
+                        _toks, _sp = _ui_voice._parse_search_tokens(raw_search)
+                        id_toks = [t for t in _toks if t['type'] == 'id']
+                        text_toks = [t for t in _toks if t['type'] != 'id']
+                        if id_toks:
+                            hint_parts.append(f"id:{id_toks[0]['terms'][0]}")
+                        if text_toks:
+                            parts = []
+                            c = {tt: sum(1 for t in text_toks if t['type'] == tt) for tt in ('and', 'phrase', 'not', 'or')}
+                            if c['and']:
+                                parts.append(f"{c['and']} word(s)")
+                            if c['phrase']:
+                                parts.append(f"{c['phrase']} phrase(s)")
+                            if c['not']:
+                                parts.append(f"{c['not']} excluded")
+                            if c['or']:
+                                parts.append(f"{c['or']} OR-group(s)")
+                            if parts:
+                                hint_parts.append("text: " + ", ".join(parts))
+                    except Exception:
+                        pass
+                if hint_parts:
+                    filter_box.label(text="Filtering: " + " | ".join(hint_parts), icon='VIEWZOOM')
+                else:
+                    filter_box.label(
+                        text='Tip: words  "phrase"  -exclude  id:NNN  @SPEAKER  w1|w2',
+                        icon='INFO',
+                    )
+
             # --- Popular / pinned speaker quick-filters ---
             popular_speakers = []
             if _ui_voice and hasattr(_ui_voice, "_voice_popular_speakers_cache"):
                 popular_speakers = list(getattr(_ui_voice, "_voice_popular_speakers_cache", []))
             if popular_speakers:
-                col.label(text="Popular speakers", icon='COMMUNITY')
-                popular_grid = col.grid_flow(columns=4, align=True)
+                filter_box.separator(factor=0.5)
+                filter_box.label(text="Popular Speakers", icon='COMMUNITY')
+                popular_grid = filter_box.grid_flow(columns=0, align=True)
                 for speaker in popular_speakers:
                     op = popular_grid.operator(
                         "witcher.quick_voice_filter_speaker",
@@ -5628,8 +5687,9 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                             pass
 
             if hasattr(scene, "witcher_voice_pinned_speakers") and scene.witcher_voice_pinned_speakers:
-                col.label(text="Pinned", icon='BOOKMARKS')
-                pinned_grid = col.grid_flow(columns=4, align=True)
+                filter_box.separator(factor=0.5)
+                filter_box.label(text="Pinned Speakers", icon='BOOKMARKS')
+                pinned_grid = filter_box.grid_flow(columns=0, align=True)
                 for pin in scene.witcher_voice_pinned_speakers:
                     pin_name = getattr(pin, "name", "")
                     if not pin_name:
@@ -5665,7 +5725,8 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                                 speaker_is_pinned = bool(_ui_voice._is_pinned(scene, speaker))
                             except Exception:
                                 speaker_is_pinned = False
-                        chip_row = col.row(align=True)
+                        filter_box.separator(factor=0.5)
+                        chip_row = filter_box.row(align=True)
                         chip_row.operator("witcher.quick_voice_filter_speaker", text=f"Only [{speaker}]", icon='FILTER').speaker = speaker
                         chip_row.operator("witcher.quick_voice_pin_speaker", text="", icon='BOOKMARKS').speaker = speaker
                         if speaker_is_pinned and hasattr(bpy.ops.witcher, "quick_voice_unpin_speaker"):
@@ -5673,18 +5734,22 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                         if effective_speaker:
                             chip_row.operator("witcher.quick_voice_clear_speaker", text="Clear", icon='PANEL_CLOSE')
 
+                list_box = col.box()
+                list_box.label(text="Dialogue Lines", icon='TEXT')
+
                 # --- Pager ---
                 if _ui_voice and hasattr(_ui_voice, "get_voice_browser_stats"):
                     stats = _ui_voice.get_voice_browser_stats(scene)
                     if all(hasattr(scene, p) for p in ("witcher_voice_page_size", "witcher_voice_page_index")):
-                        pager = col.row(align=True)
+                        pager = list_box.row(align=True)
                         pager.prop(scene, "witcher_voice_page_size", text="Rows")
-                        pager.operator("witcher.quick_voice_page", text="<<").action = "first"
-                        pager.operator("witcher.quick_voice_page", text="<").action = "prev"
-                        pager.label(text=f"{stats['page_index'] + 1}/{stats['total_pages']}")
-                        pager.operator("witcher.quick_voice_page", text=">").action = "next"
-                        pager.operator("witcher.quick_voice_page", text=">>").action = "last"
-                    col.label(
+                        nav = list_box.row(align=True)
+                        nav.operator("witcher.quick_voice_page", text="<<").action = "first"
+                        nav.operator("witcher.quick_voice_page", text="<").action = "prev"
+                        nav.label(text=f"{stats['page_index'] + 1}/{stats['total_pages']}")
+                        nav.operator("witcher.quick_voice_page", text=">").action = "next"
+                        nav.operator("witcher.quick_voice_page", text=">>").action = "last"
+                    list_box.label(
                         text=(
                             f"Showing {stats['visible_start']}-{stats['visible_end']} "
                             f"of {stats['filtered']} filtered  ({stats['total']} total)"
@@ -5693,10 +5758,10 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                     )
                 else:
                     total_nodes = _ui_voice.get_voice_node_count() if _ui_voice else 0
-                    col.label(text=f"Showing {len(scene.witcher_voice_list)} of {total_nodes} lines", icon='INFO')
+                    list_box.label(text=f"Showing {len(scene.witcher_voice_list)} of {total_nodes} lines", icon='INFO')
 
                 # --- The actual list ---
-                col.template_list(
+                list_box.template_list(
                     "MYVOICELISTITEM_UL_basic",
                     "",
                     scene,
@@ -5708,59 +5773,12 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 )
 
                 # --- Actions (first thing under the list) ---
-                act_row = col.row(align=True)
-                if hasattr(scene, "witcher_voice_load_on_select"):
-                    act_row.prop(scene, "witcher_voice_load_on_select", text="Load on Select")
-                act_row.operator("witcher.quick_voice_debug", text="Rebuild", icon='FILE_REFRESH').action = "reset3"
+                act_row = list_box.row(align=True)
                 act_row.operator("witcher.quick_voice_debug", text="Load", icon='PLAY').action = "load"
-
-                # --- Search bar ---
-                if hasattr(scene, "witcher_voice_search_text"):
-                    search_row = col.row(align=True)
-                    search_row.prop(scene, "witcher_voice_search_text", text="", icon='VIEWZOOM')
-                    search_row.operator("witcher.quick_voice_clear_filter", text="", icon='X')
-
-                    # Search status / syntax hint
-                    raw_search = getattr(scene, "witcher_voice_search_text", "").strip()
-                    eff_speaker = ""
-                    if _ui_voice and hasattr(_ui_voice, "_get_effective_speaker"):
-                        try:
-                            eff_speaker = _ui_voice._get_effective_speaker(scene)
-                        except Exception:
-                            pass
-                    if raw_search or eff_speaker:
-                        hint_parts = []
-                        if eff_speaker:
-                            hint_parts.append(f"speaker={eff_speaker}")
-                        if raw_search and _ui_voice and hasattr(_ui_voice, "_parse_search_tokens"):
-                            try:
-                                _toks, _sp = _ui_voice._parse_search_tokens(raw_search)
-                                id_toks   = [t for t in _toks if t['type'] == 'id']
-                                text_toks = [t for t in _toks if t['type'] != 'id']
-                                if id_toks:
-                                    hint_parts.append(f"id:{id_toks[0]['terms'][0]}")
-                                if text_toks:
-                                    parts = []
-                                    c = {tt: sum(1 for t in text_toks if t['type'] == tt) for tt in ('and','phrase','not','or')}
-                                    if c['and']:    parts.append(f"{c['and']} word(s)")
-                                    if c['phrase']: parts.append(f"{c['phrase']} phrase(s)")
-                                    if c['not']:    parts.append(f"{c['not']} excluded")
-                                    if c['or']:     parts.append(f"{c['or']} OR-group(s)")
-                                    if parts:
-                                        hint_parts.append("text: " + ", ".join(parts))
-                            except Exception:
-                                pass
-                        if hint_parts:
-                            col.label(text="Filtering: " + " | ".join(hint_parts), icon='VIEWZOOM')
-                    else:
-                        col.label(
-                            text='Tip: words  "phrase"  -exclude  id:NNN  @SPEAKER  w1|w2',
-                            icon='INFO',
-                        )
+                act_row.operator("witcher.quick_voice_debug", text="Rebuild", icon='FILE_REFRESH').action = "reset3"
 
                 # --- Utility row (visually separated) ---
-                col.separator(factor=0.5)
-                util_row = col.row(align=True)
+                util_row = list_box.row(align=True)
                 util_row.scale_y = 0.85
                 util_row.operator("witcher.quick_voice_copy", text="Copy Selected", icon='COPYDOWN').scope = "selected"
                 util_row.operator("witcher.quick_voice_copy", text="Copy All", icon='COPYDOWN').scope = "all"
