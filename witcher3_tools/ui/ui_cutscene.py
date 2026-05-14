@@ -15,6 +15,7 @@ from bpy.props import (
 )
 from bpy_extras.io_utils import ImportHelper
 
+from .. import dialog_language
 from .. import get_uncook_path
 from ..CR2W import w3_types
 from ..importers import import_cutscene
@@ -43,9 +44,59 @@ _CUTSCENE_IMPORT_NLA_TRACK_COMPONENTS = {
 _subtitle_draw_handle = None
 
 
-def _cutscene_get_active_subtitle(scene, frame):
-    if scene is None or not bool(getattr(scene, "witcher_cutscene_show_dialog_subtitles", True)):
+def _scene_fps(scene):
+    render = getattr(scene, "render", None)
+    fps = float(getattr(render, "fps", 30.0) or 30.0)
+    fps_base = float(getattr(render, "fps_base", 1.0) or 1.0)
+    return fps / fps_base if fps_base else fps
+
+
+def _strip_get(strip, prop_name, default=""):
+    try:
+        return strip.get(prop_name, default)
+    except Exception:
+        return default
+
+
+def _subtitle_text_from_strip(strip):
+    for prop_name in (
+        dialog_language.DIALOG_SUBTITLE_TEXT_PROP,
+        import_cutscene.CUTSCENE_DIALOG_TEXT_PROP,
+        "witcher_w2scene_dialog_text",
+    ):
+        text = str(_strip_get(strip, prop_name, "") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _active_subtitle_from_sound_strips(scene, frame):
+    try:
+        from .ui_voice import _get_sequence_editor_strips
+    except Exception:
         return None
+
+    strips = _get_sequence_editor_strips(getattr(scene, "sequence_editor", None))
+    if strips is None:
+        return None
+
+    frame = float(frame)
+    for strip in list(strips):
+        if getattr(strip, "type", None) != 'SOUND':
+            continue
+        text = _subtitle_text_from_strip(strip)
+        if not text:
+            continue
+        start = float(getattr(strip, "frame_final_start", getattr(strip, "frame_start", 0.0)) or 0.0)
+        end = float(getattr(strip, "frame_final_end", start) or start)
+        if end <= start:
+            end = start + 1.0
+        if start <= frame <= end:
+            return text
+    return None
+
+
+def _active_subtitle_from_cutscene_items(scene, frame):
     for item in getattr(scene, "witcher_cutscene_dialog_items", []) or []:
         text = str(getattr(item, "line_text", "") or "").strip()
         if not text:
@@ -56,6 +107,40 @@ def _cutscene_get_active_subtitle(scene, frame):
         except Exception:
             continue
         if start_frame <= int(frame) <= end_frame:
+            return text
+    return None
+
+
+def _active_subtitle_from_w2scene_elements(scene, frame):
+    fps = _scene_fps(scene)
+    frame_offset = float(getattr(scene, "witcher_w2scene_section_subtitle_frame_offset", 0.0) or 0.0)
+    frame = float(frame)
+    for item in getattr(scene, "witcher_w2scene_section_element_items", []) or []:
+        if str(getattr(item, "element_type", "") or "") != "CStorySceneLine":
+            continue
+        text = str(getattr(item, "line_text", "") or "").strip()
+        if not text:
+            continue
+        try:
+            start_frame = frame_offset + (float(getattr(item, "start_time", 0.0) or 0.0) * fps)
+            duration_frames = max(1.0, float(getattr(item, "duration", 0.0) or 0.0) * fps)
+        except Exception:
+            continue
+        if start_frame <= frame <= (start_frame + duration_frames):
+            return text
+    return None
+
+
+def _cutscene_get_active_subtitle(scene, frame):
+    if scene is None or not bool(getattr(scene, "witcher_cutscene_show_dialog_subtitles", True)):
+        return None
+    for getter in (
+        _active_subtitle_from_cutscene_items,
+        _active_subtitle_from_sound_strips,
+        _active_subtitle_from_w2scene_elements,
+    ):
+        text = getter(scene, frame)
+        if text:
             return text
     return None
 
@@ -817,7 +902,13 @@ def _cutscene_dialog_strip_props(filepath, dialog_data, item=None):
     line_id = str(getattr(item, "line_id", "") or _cutscene_dialog_line_id(dialog_data))
     line_text = str(getattr(item, "line_text", "") or dialog_data.get("line_text", "") or "")
     sound_event = str(getattr(item, "sound_event", "") or dialog_data.get("sound_event", "") or "")
+    text_language = dialog_language.get_active_text_language()
     return {
+        dialog_language.DIALOG_SUBTITLE_TEXT_PROP: line_text,
+        dialog_language.DIALOG_SUBTITLE_LINE_ID_PROP: line_id,
+        dialog_language.DIALOG_SUBTITLE_SOURCE_PROP: "w2cutscene",
+        dialog_language.DIALOG_SUBTITLE_SOURCE_PATH_PROP: str(filepath or ""),
+        dialog_language.DIALOG_SUBTITLE_LANGUAGE_PROP: text_language,
         import_cutscene.CUTSCENE_DIALOG_AUDIO_PROP: True,
         import_cutscene.CUTSCENE_DIALOG_LINE_ID_PROP: line_id,
         import_cutscene.CUTSCENE_DIALOG_TEXT_PROP: line_text,
@@ -945,6 +1036,59 @@ def _populate_cutscene_dialog_items(scene, dialog_items, dialog_events):
         item.imported_sound = False
 
     _finalize_cutscene_dialog_item_ranges(scene)
+
+
+def _resolve_cutscene_dialog_item_text(scene, item, language=""):
+    line_id = str(getattr(item, "line_id", "") or getattr(item, "line_index", "") or "").strip()
+    if not line_id:
+        return ""
+
+    cutscene_filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+    source_scene_path = ""
+    linked_scene_path = str(getattr(item, "scene_path", "") or "").strip()
+    if linked_scene_path:
+        try:
+            source_scene_path = import_cutscene.resolve_cutscene_linked_scene_file(linked_scene_path, cutscene_filepath)
+        except Exception:
+            log.debug("Could not resolve linked scene path for dialog text: %s", linked_scene_path, exc_info=True)
+    return dialog_language.resolve_localized_text(line_id, source_scene_path or cutscene_filepath, language=language)
+
+
+def refresh_cutscene_dialog_language(context, refresh_audio=False):
+    scene = getattr(context, "scene", None) if context is not None else None
+    if scene is None:
+        return 0
+
+    language = dialog_language.get_active_text_language(context)
+    updated = 0
+    for item in getattr(scene, "witcher_cutscene_dialog_items", []) or []:
+        text = _resolve_cutscene_dialog_item_text(scene, item, language=language)
+        if str(getattr(item, "line_text", "") or "") != text:
+            item.line_text = text
+            updated += 1
+
+        line_id = str(getattr(item, "line_id", "") or "").strip()
+        if line_id:
+            try:
+                for strip in import_cutscene._iter_cutscene_dialog_audio_strips(
+                    scene,
+                    source_path=str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or ""),
+                    line_id=line_id,
+                ):
+                    strip[dialog_language.DIALOG_SUBTITLE_TEXT_PROP] = text
+                    strip[dialog_language.DIALOG_SUBTITLE_LANGUAGE_PROP] = language
+                    strip[import_cutscene.CUTSCENE_DIALOG_TEXT_PROP] = text
+            except Exception:
+                log.debug("Could not update dialog strip text for line %s.", line_id, exc_info=True)
+
+    if refresh_audio and str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip():
+        try:
+            result = _load_cutscene_dialogs_into_scene(context)
+            updated += int(result.get("loaded", 0) or 0) + int(result.get("sound_loaded", 0) or 0)
+        except Exception:
+            log.warning("Could not refresh cutscene dialog audio/lipsync for the new language.", exc_info=True)
+
+    return updated
 
 
 def _load_cutscene_dialogs_into_scene(context):
@@ -2721,6 +2865,10 @@ def _draw_cutscene_events_tab(layout, scene):
 def _draw_cutscene_dialogs_tab(layout, scene):
     header = layout.row(align=True)
     header.label(text="CStorySceneLine Dialogs", icon='OUTLINER_OB_SPEAKER')
+    if hasattr(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP):
+        header.prop(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP, text="Text")
+    if hasattr(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP):
+        header.prop(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP, text="Voice")
     header.operator(WITCH_OT_LoadCutsceneDialogs.bl_idname, text="Import/Refresh", icon='SOUND')
 
     display_row = layout.row(align=True)
@@ -2938,7 +3086,7 @@ def register():
     bpy.types.Scene.witcher_cutscene_show_dialog_subtitles = BoolProperty(
         name="Viewport Subtitles",
         default=True,
-        description="Show active cutscene dialog text in the 3D Viewport",
+        description="Show active dialog text in the 3D Viewport",
     )
     bpy.types.Scene.witcher_cutscene_subtitle_font_size = IntProperty(
         name="Subtitle Size",

@@ -140,7 +140,7 @@ def get_mod_dirs(mods_root: str) -> List[str]:
 
 
 def signature_w3strings(base_path: str, language: str) -> Tuple[Dict, Dict]:
-    subdirs = ["content", "dlc", "mod", "DLC", "MOD"]
+    subdirs = ["content", "dlc", "mods", "mod", "DLC", "MOD"]
     roots = []
     for subdir in subdirs:
         folder = os.path.join(base_path, subdir)
@@ -160,18 +160,33 @@ def signature_w3strings(base_path: str, language: str) -> Tuple[Dict, Dict]:
     return signature, source
 
 
-def signature_w3speech(base_path: str, vanilla_dlc_list: List[str]) -> Tuple[Dict, Dict]:
+def signature_w3speech(base_path: str, vanilla_dlc_list: List[str], language: str = "en") -> Tuple[Dict, Dict]:
     roots = get_content_patch_dirs(base_path)
-    roots.extend(get_dlc_dirs(base_path, vanilla_only=True, vanilla_list=vanilla_dlc_list))
+    roots.extend(get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=vanilla_dlc_list))
+    roots.extend(get_mod_dirs(os.path.join(base_path, "mods")))
+    roots.extend(get_mod_dirs(os.path.join(base_path, "mod")))
+    suffix = f"{str(language or 'en').lower()}pc.w3speech"
+    direct_files = []
+    if base_path and os.path.isdir(base_path):
+        try:
+            direct_files = [
+                os.path.join(base_path, name)
+                for name in os.listdir(base_path)
+                if os.path.isfile(os.path.join(base_path, name)) and name.lower().endswith(suffix)
+            ]
+        except OSError:
+            direct_files = []
 
     def _predicate(path: str) -> bool:
-        return path.lower().endswith("enpc.w3speech")
+        return path.lower().endswith(suffix)
 
-    signature = compute_signature(iter_files(roots, _predicate))
+    signature = compute_signature(list(iter_files(roots, _predicate)) + direct_files)
     source = {
         "type": "w3speech",
+        "language": language,
         "base_path": base_path,
         "roots": roots,
+        "direct_files": direct_files,
     }
     return signature, source
 

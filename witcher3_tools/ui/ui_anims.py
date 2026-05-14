@@ -13,6 +13,7 @@ from .. import get_W3_VOICE_PATH
 from .. import get_W3_OGG_PATH
 from .. import get_rig_rot90_enabled
 from .. import get_all_addon_prefs
+from .. import dialog_language
 from ..importers import import_anims, import_cutscene, import_entity, import_rig, import_scene_animation
 from ..exporters import export_anims, export_cutscene
 from ..action_compat import (
@@ -5572,12 +5573,18 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
 
             # --- Options row (compact) ---
             option_row = col.row(align=True)
+            if hasattr(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP):
+                option_row.prop(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP, text="Text")
+            if hasattr(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP):
+                option_row.prop(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP, text="Voice")
             if hasattr(scene, "witcher_voice_show_details"):
                 option_row.prop(scene, "witcher_voice_show_details", text="IDs/dur")
             if hasattr(scene, "witcher_voice_replace_audio"):
                 option_row.prop(scene, "witcher_voice_replace_audio", text="Replace")
             if hasattr(scene, "witcher_voice_recreate_phonemes"):
                 option_row.prop(scene, "witcher_voice_recreate_phonemes", text="Phonemes")
+            if hasattr(scene, "witcher_cutscene_show_dialog_subtitles"):
+                option_row.prop(scene, "witcher_cutscene_show_dialog_subtitles", text="Subtitles")
             if getattr(scene, "witcher_voice_recreate_phonemes", False):
                 if hasattr(scene, "witcher_voice_phoneme_accuracy"):
                     col.prop(scene, "witcher_voice_phoneme_accuracy", text="Accuracy", slider=True)

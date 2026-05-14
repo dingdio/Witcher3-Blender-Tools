@@ -95,8 +95,9 @@ class SpeechEntry:
                 mm.seek(self.page_offset)
                 output.write(mm.read(self.z_size))
 
-    def extract_to_file(self, file_name):
-        base_path = get_W3_VOICE_PATH()
+    def extract_to_file(self, file_name, output_dir=None):
+        base_path = output_dir or get_W3_VOICE_PATH()
+        os.makedirs(base_path, exist_ok=True)
         base_file_name = os.path.splitext(os.path.basename(file_name))[0]
         base_file_name = pad_filename(base_file_name)
 

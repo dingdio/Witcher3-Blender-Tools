@@ -5,7 +5,7 @@ import json
 import importlib
 from collections import deque
 from pathlib import Path
-from .. import get_uncook_path, get_rig_rot90_enabled
+from .. import dialog_language, get_uncook_path, get_rig_rot90_enabled
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.CR2W_types import EngineTransform
@@ -3099,8 +3099,8 @@ class SceneImporter():
         self._scene_filepath = str(filePath or "")
         self._CStoryScene:w3_types.CStoryScene = loadSceneFile(filePath)
 
-    def _section_variant_duration_overrides(self, section):
-        duration_by_element_id = {}
+    def _section_variants(self, section):
+        variants = []
         for variant_ptr in _iter_prop_values(getattr(section, "variants", None)):
             try:
                 variant_chunk = self._CStoryScene.chunksRef[variant_ptr - 1]
@@ -3108,7 +3108,45 @@ class SceneImporter():
             except Exception:
                 log.debug("Could not parse story scene section variant", exc_info=True)
                 continue
+            variants.append(variant)
+        return variants
 
+    def _section_locale_variant_map(self, section):
+        locale_variant_by_id = {}
+        for mapping_ptr in _iter_prop_values(getattr(section, "localeVariantMappings", None)):
+            try:
+                mapping_chunk = self._CStoryScene.chunksRef[mapping_ptr - 1]
+                mapping = w3_types.CStorySceneLocaleVariantMapping(mapping_chunk)
+            except Exception:
+                log.debug("Could not parse story scene locale variant mapping", exc_info=True)
+                continue
+            locale_id = _as_int(getattr(mapping, "localeId", None), -1)
+            variant_id = _as_int(getattr(mapping, "variantId", None), -1)
+            if locale_id >= 0 and variant_id >= 0:
+                locale_variant_by_id[locale_id] = variant_id
+        return locale_variant_by_id
+
+    def _section_variant_id_for_language(self, section, language=None):
+        default_variant_id = self._section_default_variant_id(section)
+        locale_id = dialog_language.language_locale_id(language or dialog_language.get_active_voice_language(bpy.context))
+        if locale_id is None:
+            return default_variant_id
+
+        locale_variant_by_id = self._section_locale_variant_map(section)
+        if locale_id in locale_variant_by_id:
+            return locale_variant_by_id[locale_id]
+
+        for variant in self._section_variants(section):
+            if _as_int(getattr(variant, "localeId", None), -1) == locale_id:
+                return _as_int(getattr(variant, "id", default_variant_id), default_variant_id)
+
+        return default_variant_id
+
+    def _section_variant_duration_overrides(self, section, variant_id=None):
+        duration_by_element_id = {}
+        for variant in self._section_variants(section):
+            if variant_id is not None and _as_int(getattr(variant, "id", None), -1) != variant_id:
+                continue
             for element_info_prop in _iter_prop_values(getattr(variant, "elementInfo", None)):
                 try:
                     element_info = w3_types.CStorySceneSectionVariantElementInfo(element_info_prop)
@@ -3128,13 +3166,8 @@ class SceneImporter():
         default_variant_id = getattr(section, "defaultVariantId", None)
         if default_variant_id is not None:
             return _as_int(default_variant_id, 0)
-        for variant_ptr in _iter_prop_values(getattr(section, "variants", None)):
-            try:
-                variant_chunk = self._CStoryScene.chunksRef[variant_ptr - 1]
-                variant = w3_types.CStorySceneSectionVariant(variant_chunk)
-                return _as_int(getattr(variant, "id", 0), 0)
-            except Exception:
-                log.debug("Could not parse story scene section variant id", exc_info=True)
+        for variant in self._section_variants(section):
+            return _as_int(getattr(variant, "id", 0), 0)
         return None
 
     def _section_event_variant_map(self, section):
@@ -3198,12 +3231,18 @@ class SceneImporter():
                     self._section_name or self._section_chunk_index,
                 )
         self._section_scene_event_elements = list(getattr(section, "sceneEventElements", []) or [])
-        self._section_active_variant_id = self._section_default_variant_id(section)
+        self._section_active_variant_id = self._section_variant_id_for_language(
+            section,
+            dialog_language.get_active_voice_language(bpy.context),
+        )
         self._section_event_variant_by_guid = self._section_event_variant_map(section)
         self._section_element_start_seconds = {}
         self._section_element_duration_seconds = {}
         self._section_duration_seconds = 0.0
-        duration_overrides = self._section_variant_duration_overrides(section)
+        duration_overrides = self._section_variant_duration_overrides(
+            section,
+            variant_id=self._section_active_variant_id,
+        )
 
         section_time_seconds = 0.0
         for el in getattr(getattr(section, "sceneElements", None), "value", []) or []:
@@ -5695,19 +5734,35 @@ class SceneImporter():
                 curr_actor = set_cur_actor_by_str(dialogscript.voicetag, actors_dict)
                 if curr_actor is not None:
                     _ensure_cutscene_face_setup(curr_actor)
-                    load_voice_and_lipsync(
-                        dialogscript.dialogLine.String.val,
-                        curr_actor,
-                        context=context,
-                        at_frame=self.__frame_current,
-                        nla_mode='replace',
-                        strip_props={
-                            W2SCENE_AUDIO_STRIP_PROP: True,
-                            W2SCENE_AUDIO_SOURCE_PROP: self._scene_filepath,
-                            W2SCENE_AUDIO_SECTION_PROP: self._section_name,
-                        },
+                    dialog_line_prop = getattr(getattr(dialogscript, "dialogLine", None), "String", None)
+                    dialog_line_id = str(getattr(dialog_line_prop, "val", "") or "").strip()
+                    text_language = dialog_language.get_active_text_language(context)
+                    dialog_line_text = dialog_language.resolve_localized_text(
+                        dialog_line_id,
+                        self._scene_filepath,
+                        language=text_language,
                     )
-                    remember_section_nla_targets([curr_actor])
+                    if dialog_line_id:
+                        load_voice_and_lipsync(
+                            dialog_line_id,
+                            curr_actor,
+                            context=context,
+                            at_frame=self.__frame_current,
+                            nla_mode='replace',
+                            strip_props={
+                                dialog_language.DIALOG_SUBTITLE_TEXT_PROP: dialog_line_text,
+                                dialog_language.DIALOG_SUBTITLE_LINE_ID_PROP: dialog_line_id,
+                                dialog_language.DIALOG_SUBTITLE_SPEAKER_PROP: str(dialogscript.voicetag or ""),
+                                dialog_language.DIALOG_SUBTITLE_SOURCE_PROP: "w2scene",
+                                dialog_language.DIALOG_SUBTITLE_SOURCE_PATH_PROP: self._scene_filepath,
+                                dialog_language.DIALOG_SUBTITLE_LANGUAGE_PROP: text_language,
+                                "witcher_w2scene_dialog_text": dialog_line_text,
+                                W2SCENE_AUDIO_STRIP_PROP: True,
+                                W2SCENE_AUDIO_SOURCE_PROP: self._scene_filepath,
+                                W2SCENE_AUDIO_SECTION_PROP: self._section_name,
+                            },
+                        )
+                        remember_section_nla_targets([curr_actor])
                 duration_frames = _dialog_script_duration(dialogscript) * __fps
                 dialogframe = self.__frame_current + duration_frames
                 action = create_default_timeline_action("dialogLine", default_timeline_obj, duration_frames, group_name="dialogLine")

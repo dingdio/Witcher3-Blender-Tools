@@ -19,6 +19,20 @@ class Configuration:
     ExecutablePath = get_game_path()
 
 
+_LANGUAGE_DECODER_CACHE_VERSION = {
+    "ar": 1,
+    "br": 1,
+    "cn": 1,
+    "esMX": 2,
+    "kr": 1,
+    "tr": 1,
+}
+
+
+def _decoder_cache_version(language: str):
+    return _LANGUAGE_DECODER_CACHE_VERSION.get(str(language or "en"))
+
+
 def _refresh_strings_configuration_path() -> str:
     current_path = normalize_game_path(get_game_path())
     Configuration.ExecutablePath = current_path
@@ -35,6 +49,7 @@ class W3StringManager():
         self.base_path = ""
         self.Lines:dict = {}
         self.Keys:dict = {}
+        self.decoder_cache_version = _decoder_cache_version(self.Language)
         #self.importedStrings = {} #TODO
     def _looks_corrupted(self, sample_size: int = 200) -> bool:
         checked = 0
@@ -61,6 +76,7 @@ class W3StringManager():
         self.base_path = normalize_game_path(path)
         self.Lines:dict = {}
         self.Keys:dict = {}
+        self.decoder_cache_version = _decoder_cache_version(newlanguage)
 
         if not _has_string_source_root(self.base_path):
             log.info("String cache skipped: Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
@@ -72,7 +88,7 @@ class W3StringManager():
         #     self.OpenFile(file)
         gamedir = Path(self.base_path)
         # Define specific subdirectories to search
-        subdirs = ['content', 'dlc', 'mod', 'DLC', 'MOD']
+        subdirs = ['content', 'dlc', 'mods', 'mod', 'DLC', 'MOD']
         
         for subdir in subdirs:
             folder = gamedir / subdir
@@ -87,12 +103,14 @@ class W3StringManager():
             stream = bStream(path = filePath.absolute())
             stringFile.Read(stream)
         except Exception as e:
-            raise e
+            log.warning("Could not read W3 strings file %s: %s", filePath, e)
+            return False
         for item in stringFile.block1:
             self.Lines[item.str_id] = item.str
         for item in stringFile.block2:
             if item.str_id not in self.Keys:
                 self.Keys[item.str_id] = True
+        return True
 
     def GetString(self, id: int):
         return self.Lines.get(id)
@@ -102,6 +120,7 @@ class W3StringManager():
         t_class = cls()
         t_class.Language = data['Language']
         t_class.base_path = normalize_game_path(data.get('base_path', ""))
+        t_class.decoder_cache_version = data.get('decoder_cache_version')
         for key, val in data['Lines'].items():
             t_class.Lines[int(key)] = val
         for line in data['Keys'].items():
@@ -121,7 +140,9 @@ class W3StringManager():
             cache_root = get_cache_root(create=True)
             cache_dir = os.path.join(cache_root, "W3Strings")
             os.makedirs(cache_dir, exist_ok=True)
-            filename = os.path.join(cache_dir, "string_cache.pkl")
+            cache_language = Configuration.TextLanguage
+            required_decoder_version = _decoder_cache_version(cache_language)
+            filename = os.path.join(cache_dir, f"string_cache_{cache_language}.pkl")
             meta_path = cache_meta.get_meta_path(filename)
 
             start_time = time.time()
@@ -139,7 +160,7 @@ class W3StringManager():
                     pickle.dump(w3StringManager, file, protocol=pickle.HIGHEST_PROTOCOL)
 
                 signature, source = cache_meta.signature_w3strings(current_base_path, Configuration.TextLanguage)
-                meta = cache_meta.make_meta("string_cache.pkl", filename, signature, source)
+                meta = cache_meta.make_meta(f"string_cache_{cache_language}.pkl", filename, signature, source)
                 cache_meta.save_meta(meta_path, meta)
                 return w3StringManager
 
@@ -156,6 +177,15 @@ class W3StringManager():
                         w3StringManager = pickle.load(f)
                     if getattr(w3StringManager, "base_path", "") != current_base_path:
                         load_reason = "rebuilt (game path changed)"
+                        w3StringManager = build_from_game()
+                    elif getattr(w3StringManager, "Language", "") != cache_language:
+                        load_reason = "rebuilt (language changed)"
+                        w3StringManager = build_from_game()
+                    elif (
+                        required_decoder_version is not None
+                        and getattr(w3StringManager, "decoder_cache_version", None) != required_decoder_version
+                    ):
+                        load_reason = "rebuilt (decoder changed)"
                         w3StringManager = build_from_game()
                     elif w3StringManager._looks_corrupted():
                         load_reason = "rebuilt (corrupted cache)"

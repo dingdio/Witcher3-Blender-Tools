@@ -12,6 +12,7 @@ from . import phoneme_helper
 from .ui_morphs import get_face_meshs
 
 import csv
+import json
 import os
 import bpy
 import math
@@ -24,6 +25,7 @@ from bpy.props import (
     BoolProperty,
     StringProperty,
 )
+from .. import dialog_language
 
 VOICE_LIST_PROP = "witcher_voice_list"
 VOICE_LIST_INDEX_PROP = "witcher_voice_list_index"
@@ -32,12 +34,19 @@ _voice_node_cache = []   # list[dict] — the full 64k voice line dataset
 _voice_cache_loaded = False
 _voice_filtered_indices = []
 _VOICE_LIST_DEFERRED = False
+_VOICE_BROWSER_INDEX_LANGUAGE = "en"
+
+
+def _voice_browser_index_language():
+    return _VOICE_BROWSER_INDEX_LANGUAGE
 
 def _voice_cache_path():
     """Return the writable user-cache path for the voice cache JSON file."""
     cache_dir = Path(get_cache_root(create=True)) / "Voice"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return str(cache_dir / "voice_cache.json")
+    text_language = dialog_language.get_active_text_language()
+    index_language = _voice_browser_index_language()
+    return str(cache_dir / f"voice_cache_index_{index_language}_{text_language}.json")
 
 def _save_voice_cache():
     """Write _voice_node_cache to disk as JSON."""
@@ -46,7 +55,9 @@ def _save_voice_cache():
     try:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({
-                'version': 1,
+                'version': 2,
+                'text_language': dialog_language.get_active_text_language(),
+                'index_language': _voice_browser_index_language(),
                 'count': len(_voice_node_cache),
                 'nodes': _voice_node_cache,
             }, f, ensure_ascii=False)
@@ -64,7 +75,13 @@ def _load_voice_cache():
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get('nodes'), list):
+            if int(data.get('version') or 0) < 2:
+                return False
             _voice_node_cache = data['nodes']
+            if not _voice_node_cache:
+                _voice_cache_loaded = False
+                _voice_filtered_indices = []
+                return False
             _voice_cache_loaded = True
             _voice_filtered_indices = list(range(len(_voice_node_cache)))
             _refresh_speaker_stats(_voice_node_cache)
@@ -77,7 +94,7 @@ def _load_voice_cache():
 def _cache_is_stale():
     """Check if the cached data is stale compared to the speech manager."""
     try:
-        speech_manager = LoadSpeechManager()
+        speech_manager = LoadSpeechManager(language=_voice_browser_index_language())
         live_count = len(speech_manager.Items)
         cached_count = len(_voice_node_cache)
         if cached_count == 0:
@@ -91,11 +108,12 @@ def get_voice_node_count():
     return len(_voice_node_cache)
 
 def ensure_voice_cache():
-    """Load the voice cache from disk if not already loaded. Does NOT rebuild."""
+    """Load the voice cache from disk, rebuilding when the cached language list is empty."""
     global _voice_cache_loaded
     if _voice_cache_loaded and _voice_node_cache:
         return
-    _load_voice_cache()
+    if not _load_voice_cache() and not _voice_node_cache:
+        SetupNodeData(do_reload_strings=False)
 
 
 def _deferred_apply_voice_filter():
@@ -593,7 +611,8 @@ class VoiceLineResourceManager:
 def _make_voice_node(*, name="", selfIndex=-1, parentIndex=-1, childCount=0,
                      voiceLineId="0000000000", speaker="", line_id="",
                      duration="", text="", display_full="",
-                     display_compact="", search_blob=""):
+                     display_compact="", search_blob="", text_language="",
+                     voice_language=""):
     """Create a voice node dict (replaces the old MyVoiceListNode PropertyGroup)."""
     return {
         'name': name,
@@ -608,6 +627,8 @@ def _make_voice_node(*, name="", selfIndex=-1, parentIndex=-1, childCount=0,
         'display_full': display_full,
         'display_compact': display_compact,
         'search_blob': search_blob,
+        'text_language': text_language,
+        'voice_language': voice_language,
     }
 
 class MyVoiceListItem(bpy.types.PropertyGroup):
@@ -1056,6 +1077,48 @@ def _on_voice_page_size_update(self, context):
         _apply_voice_filter(context)
 
 
+def _voice_dialog_strip_props(line_id, text="", speaker="", source="voice_browser", context=None):
+    line_id = str(line_id or "").strip()
+    text_language = dialog_language.get_active_text_language(context)
+    text = str(text or "").strip()
+    if not text and line_id:
+        text = dialog_language.resolve_localized_text(line_id, language=text_language)
+    return {
+        dialog_language.DIALOG_SUBTITLE_TEXT_PROP: text,
+        dialog_language.DIALOG_SUBTITLE_LINE_ID_PROP: line_id,
+        dialog_language.DIALOG_SUBTITLE_SPEAKER_PROP: str(speaker or ""),
+        dialog_language.DIALOG_SUBTITLE_SOURCE_PROP: source,
+        dialog_language.DIALOG_SUBTITLE_LANGUAGE_PROP: text_language,
+    }
+
+
+def _merge_voice_dialog_strip_props(line_id, strip_props=None, context=None):
+    props = dict(strip_props or {})
+    text_language = dialog_language.get_active_text_language(context)
+    text = str(
+        props.get(dialog_language.DIALOG_SUBTITLE_TEXT_PROP, "")
+        or props.get("witcher_cutscene_dialog_text", "")
+        or props.get("witcher_w2scene_dialog_text", "")
+        or ""
+    ).strip()
+    subtitle_line_id = str(
+        props.get(dialog_language.DIALOG_SUBTITLE_LINE_ID_PROP, "")
+        or props.get("witcher_cutscene_dialog_line_id", "")
+        or line_id
+        or ""
+    ).strip()
+    defaults = _voice_dialog_strip_props(
+        subtitle_line_id,
+        text=text,
+        speaker=props.get(dialog_language.DIALOG_SUBTITLE_SPEAKER_PROP, ""),
+        source=props.get(dialog_language.DIALOG_SUBTITLE_SOURCE_PROP, "voice"),
+        context=context,
+    )
+    defaults[dialog_language.DIALOG_SUBTITLE_LANGUAGE_PROP] = text_language
+    defaults.update(props)
+    return defaults
+
+
 def _on_voice_list_index_update(self, context):
     if context is None or getattr(context, "scene", None) is None:
         return
@@ -1074,7 +1137,19 @@ def _on_voice_list_index_update(self, context):
     if active_arm and not _armature_has_face_morphs(active_arm):
         _auto_load_face_morphs(context, active_arm)
     _at_frame = context.scene.frame_current if getattr(scene, 'witcher_anim_nla_mode', 'REPLACE') == 'APPEND_AT_CURSOR' else 0
-    load_voice_and_lipsync(item.voiceLineId, actor=active_arm, context=context, at_frame=_at_frame)
+    load_voice_and_lipsync(
+        item.voiceLineId,
+        actor=active_arm,
+        context=context,
+        at_frame=_at_frame,
+        strip_props=_voice_dialog_strip_props(
+            item.voiceLineId,
+            text=getattr(item, "text", ""),
+            speaker=getattr(item, "speaker", ""),
+            source="voice_browser",
+            context=context,
+        ),
+    )
 
 
 def has_invalid_surrogates(s):
@@ -1083,9 +1158,6 @@ def has_invalid_surrogates(s):
         if 0xD800 <= ord(char) <= 0xDFFF:
             return True
     return False
-
-import json
-
 def _load_voice_name_map():
     candidate_paths = []
 
@@ -1156,7 +1228,24 @@ def _fallback_speaker_from_csv_row(row: dict) -> str:
 
 def SetupNodeData(do_reload_strings = False):
     global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices
-    speech_manager = LoadSpeechManager()
+    text_language = dialog_language.get_active_text_language(bpy.context)
+    voice_language = dialog_language.get_active_voice_language(bpy.context)
+    index_language = _voice_browser_index_language()
+    dialog_language.set_active_dialog_languages(
+        text_language=text_language,
+        voice_language=voice_language,
+        reset_string_manager=do_reload_strings,
+    )
+    speech_manager = LoadSpeechManager(language=index_language)
+    effective_voice_language = index_language
+    if not getattr(speech_manager, "Items", None) and index_language != "en":
+        log.warning(
+            "No %s speech resources found; Dialogue Browser is using English speech ids with %s text.",
+            index_language.upper(),
+            text_language.upper(),
+        )
+        speech_manager = LoadSpeechManager(language="en")
+        effective_voice_language = "en"
     strings_manager = LoadStringsManager(do_reload = do_reload_strings)
     voice_data = _load_voice_name_map()
     voiceList = VoiceLineResourceManager().Get()
@@ -1209,6 +1298,8 @@ def SetupNodeData(do_reload_strings = False):
             display_full=display_full,
             display_compact=display_compact,
             search_blob=search_blob,
+            text_language=text_language,
+            voice_language=effective_voice_language,
         )
         _voice_node_cache.append(node)
         idx += 1
@@ -1222,10 +1313,11 @@ def SetupNodeData(do_reload_strings = False):
     log.debug("++++ SetupNodeData ++++")
     log.debug("Node count: %d", len(_voice_node_cache))
     _refresh_speaker_stats(_voice_node_cache)
-    _voice_cache_loaded = True
+    _voice_cache_loaded = bool(_voice_node_cache)
     
     # Persist to addon-managed JSON file
-    _save_voice_cache()
+    if _voice_node_cache:
+        _save_voice_cache()
         
 
 def NewListItem( voiceList, node):
@@ -1265,6 +1357,35 @@ def SetupListFromNodeData():
         except Exception:
             pass
     _apply_voice_filter(bpy.context)
+
+
+def refresh_voice_dialog_language(context, refresh_audio=False):
+    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices
+
+    scene = getattr(context, "scene", None) if context is not None else None
+    selected_id = _get_selected_voice_id(scene) if scene is not None else ""
+    text_language = dialog_language.get_active_text_language(context)
+    try:
+        from ..CR2W.witcher_cache.W3Strings.W3StringManager import W3StringManager
+        current_string_language = dialog_language.normalize_dialog_language(getattr(W3StringManager.InstanceManager, "Language", "") or "")
+    except Exception:
+        current_string_language = ""
+    dialog_language.set_active_dialog_languages(
+        text_language=text_language,
+        voice_language=dialog_language.get_active_voice_language(context),
+        reset_string_manager=current_string_language != text_language,
+    )
+    _voice_node_cache = []
+    _voice_filtered_indices = []
+    _voice_cache_loaded = False
+    loaded_cache = _load_voice_cache()
+    if not loaded_cache:
+        SetupNodeData(do_reload_strings=True)
+    if scene is not None:
+        _apply_voice_filter(context)
+        if selected_id:
+            _refresh_voice_page(scene, selected_id=selected_id)
+    return len(_voice_node_cache)
 
 #
 #   Inserts a new item into myVoiceList at position item_index
@@ -1336,6 +1457,17 @@ radish_dirs = [
     d for d in get_dev_override_list("voice_radish_dirs", []) if isinstance(d, str) and d
 ]
 global_sound = None
+
+
+def _voice_language_asset_dir(base_path, context=None, language=None):
+    base_path = str(base_path or "").strip()
+    base_dir = Path(base_path) if base_path else Path()
+    language = dialog_language.normalize_dialog_language(language or dialog_language.get_active_voice_language(context))
+    if base_path and language and language != "en":
+        return base_dir / language
+    return base_dir
+
+
 def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame = 0, recreate_phonemes = None, strip_props = None, nla_mode = None):
     unpadded_line_id = ''+voiceLineId
     if context == None:
@@ -1348,8 +1480,14 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
         zeros = "0000000000"
         num_of_zeros = 10 - namelen
         voiceLineId = zeros[:num_of_zeros] + voiceLineId
-    sound_directory_to_check: Path = Path(get_W3_OGG_PATH(context))
-    cr2w_directory_to_check: Path =  Path(get_W3_VOICE_PATH(context))
+    requested_voice_language = dialog_language.get_active_voice_language(context)
+    language = requested_voice_language
+    sound_directory_to_check: Path = _voice_language_asset_dir(get_W3_OGG_PATH(context), context, language=language)
+    cr2w_directory_to_check: Path = _voice_language_asset_dir(get_W3_VOICE_PATH(context), context, language=language)
+    if str(get_W3_OGG_PATH(context) or "").strip():
+        sound_directory_to_check.mkdir(parents=True, exist_ok=True)
+    if str(get_W3_VOICE_PATH(context) or "").strip():
+        cr2w_directory_to_check.mkdir(parents=True, exist_ok=True)
     
     soundPath: Path = sound_directory_to_check / f"{voiceLineId}.ogg"
     soundPath_wav: Path = sound_directory_to_check / f"{voiceLineId}.wav"
@@ -1360,7 +1498,7 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
     ##? RADISH CHECKING
     if not cr2wPath.is_file():
         for dir in radish_dirs:
-            dir = Path(dir) / "speech/speech.en.wem"
+            dir = Path(dir) / f"speech/speech.{language}.wem"
             files = Path(dir).glob('*')
             for file in files:
                 if file.suffix == ".cr2w" and unpadded_line_id in file.stem:
@@ -1384,9 +1522,33 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
     ##? RADISH CHECKING
     
     if not cr2wPath.is_file():
-        speech_manager = LoadSpeechManager()
-        item:SpeechEntry = speech_manager.find_item_by_hash(unpadded_line_id)[0]
-        item.extract_to_file(str(item.id))
+        speech_manager = LoadSpeechManager(language=language)
+        speech_matches = speech_manager.find_item_by_hash(unpadded_line_id) or []
+        if not speech_matches and language != "en":
+            fallback_manager = LoadSpeechManager(language="en")
+            fallback_matches = fallback_manager.find_item_by_hash(unpadded_line_id) or []
+            if fallback_matches:
+                log.warning(
+                    "Voice line %s was not found in %s speech resources; loading English audio/lipsync fallback.",
+                    unpadded_line_id,
+                    requested_voice_language.upper(),
+                )
+                language = "en"
+                sound_directory_to_check = _voice_language_asset_dir(get_W3_OGG_PATH(context), context, language=language)
+                cr2w_directory_to_check = _voice_language_asset_dir(get_W3_VOICE_PATH(context), context, language=language)
+                if str(get_W3_OGG_PATH(context) or "").strip():
+                    sound_directory_to_check.mkdir(parents=True, exist_ok=True)
+                if str(get_W3_VOICE_PATH(context) or "").strip():
+                    cr2w_directory_to_check.mkdir(parents=True, exist_ok=True)
+                soundPath = sound_directory_to_check / f"{voiceLineId}.ogg"
+                soundPath_wav = sound_directory_to_check / f"{voiceLineId}.wav"
+                cr2wPath = cr2w_directory_to_check / f"{voiceLineId}.cr2w"
+                wemPath = cr2w_directory_to_check / f"{voiceLineId}.wem"
+                speech_matches = fallback_matches
+        if not speech_matches:
+            raise FileNotFoundError(f"Voice line {unpadded_line_id} was not found in {language.upper()} speech resources")
+        item:SpeechEntry = speech_matches[0]
+        item.extract_to_file(str(item.id), output_dir=str(cr2w_directory_to_check))
 
     if cr2wPath.is_file():
         log.info('Importing Lipsync')
@@ -1418,10 +1580,11 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
 
     if not soundPath.is_file() and not soundPath_wav.is_file():
         vgmstream_path = get_vgmstream_path(context)
-        output_folder = get_W3_OGG_PATH(context)
+        output_folder = str(sound_directory_to_check)
         if wemPath.is_file() and os.path.isfile(vgmstream_path):
             if not output_folder:
                 output_folder = bpy.app.tempdir
+            os.makedirs(output_folder, exist_ok=True)
 
             output_wav = os.path.join(output_folder, os.path.basename(str(wemPath)).replace('.wem', '.wav'))
             command = [vgmstream_path, "-o", output_wav, str(wemPath)]
@@ -1431,6 +1594,13 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
                 # Here you might want to add the WAV to Blender's sequencer
             except subprocess.CalledProcessError as e:
                 log.error("vgmstream conversion failed: %s", e)
+        elif wemPath.is_file():
+            log.warning(
+                "Extracted %s audio for voice line %s, but no WAV/OGG was created because vgmstream is not configured: %s",
+                language.upper(),
+                unpadded_line_id,
+                vgmstream_path or "<unset>",
+            )
         
     if soundPath.is_file() or soundPath_wav.is_file():
         if not soundPath.is_file() and soundPath_wav.is_file():
@@ -1460,7 +1630,9 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
             frame_start= math.ceil(at_frame)+1
         )
         soundstrip.frame_start = at_frame
-        for prop_name, prop_value in (strip_props or {}).items():
+        tag_props = _merge_voice_dialog_strip_props(unpadded_line_id, strip_props=strip_props, context=context)
+        tag_props[dialog_language.DIALOG_AUDIO_LANGUAGE_PROP] = language
+        for prop_name, prop_value in tag_props.items():
             try:
                 soundstrip[prop_name] = prop_value
             except Exception:
@@ -1504,7 +1676,30 @@ class MyVoiceListItem_Debug(bpy.types.Operator):
 
                 filename = item.voiceLineId
                 _at_frame = context.scene.frame_current if getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE') == 'APPEND_AT_CURSOR' else 0
-                load_voice_and_lipsync(filename, actor=active_arm, context=context, at_frame=_at_frame)
+                try:
+                    soundstrip = load_voice_and_lipsync(
+                        filename,
+                        actor=active_arm,
+                        context=context,
+                        at_frame=_at_frame,
+                        strip_props=_voice_dialog_strip_props(
+                            item.voiceLineId,
+                            text=getattr(item, "text", ""),
+                            speaker=getattr(item, "speaker", ""),
+                            source="voice_browser",
+                            context=context,
+                        ),
+                    )
+                except Exception as exc:
+                    self.report({'ERROR'}, f"Failed to load voice line {filename}: {exc}")
+                    return {'CANCELLED'}
+                if soundstrip is None:
+                    self.report({'WARNING'}, f"No playable audio was imported for voice line {filename}; check vgmstream and language speech resources.")
+                else:
+                    active_voice_language = dialog_language.get_active_voice_language(context)
+                    audio_language = str(soundstrip.get(dialog_language.DIALOG_AUDIO_LANGUAGE_PROP, active_voice_language) or active_voice_language)
+                    if dialog_language.normalize_dialog_language(audio_language) != dialog_language.normalize_dialog_language(active_voice_language):
+                        self.report({'WARNING'}, f"Loaded {audio_language.upper()} audio because {active_voice_language.upper()} speech was not found for {filename}.")
                 
         elif "reset3" == action:
             log.debug("=== Debug Reset ====")

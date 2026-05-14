@@ -3,7 +3,7 @@ import os
 import numpy as np
 from ...bStream import *
 from ...bin_helpers import ReadBit6, FileSize
-from .W3Language import W3Language, languages
+from .W3Language import W3Language, W3LanguageKey, W3LanguageMagic, languages
 from .W3StringBlock1 import *
 from .W3StringBlock2 import *
 
@@ -39,7 +39,28 @@ class W3StringFile(object):
         key2 = stream.readUInt16()
         key = (key1 << 16 | key2)
         
-        language = next((lang for lang in languages if lang.Key.value == key), None)
+        filename_handle = ""
+        try:
+            filename_handle = os.path.splitext(os.path.basename(str(getattr(stream, "name", "") or "")))[0]
+        except Exception:
+            filename_handle = ""
+        filename_language = next(
+            (
+                lang for lang in languages
+                if filename_handle and str(getattr(lang, "Handle", "") or "").lower() == filename_handle.lower()
+            ),
+            None,
+        )
+        key_language = next((lang for lang in languages if lang.Key.value == key), None)
+
+        if key == 0:
+            language = filename_language or W3Language(W3LanguageKey(key), W3LanguageMagic(0x00000000), filename_handle or "unknown")
+        elif filename_language is not None and filename_language.Key.value == key:
+            language = filename_language
+        else:
+            language = key_language
+        if language is None:
+            language = W3Language(W3LanguageKey(key), W3LanguageMagic(0x00000000), filename_handle or "unknown")
         
         stream.seek(10, os.SEEK_SET)
         # Read block 1
@@ -69,6 +90,14 @@ class W3StringFile(object):
             printable = sum(1 for ch in s if ch.isprintable())
             return printable / max(len(s), 1)
 
+        def decode_single_bytes(raw: bytes) -> str:
+            if not raw:
+                return ""
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return raw.decode("cp1252", errors="replace")
+
         def decode_sample(block, use_single: bool, max_chars: int = 64) -> str:
             if use_single:
                 offset = block.offset + str_start
@@ -83,21 +112,23 @@ class W3StringFile(object):
             string_key = (language.Magic.value >> 8) & 0xffff
             out = []
             limit = min(block.strlen, max_chars)
-            for _ in range(limit):
-                if use_single:
+            if use_single:
+                raw = bytearray()
+                for _ in range(limit):
                     b = stream.readUByte()
                     char_key = (((block.strlen + 1) * string_key) & 0xffff)
                     b ^= (char_key & 0xff)
                     string_key = (((string_key << 1) | (string_key >> 15)) & 0xffff)
-                    out.append(chr(b))
-                else:
-                    b1 = stream.readUByte()
-                    b2 = stream.readUByte()
-                    char_key = (((block.strlen + 1) * string_key) & 0xffff)
-                    b1 = (b1 ^ ((char_key >> 0) & 0xff))
-                    b2 = (b2 ^ ((char_key >> 8) & 0xff))
-                    string_key = (((string_key << 1) | (string_key >> 15)) & 0xffff)
-                    out.append(chr(b1 + (b2 << 8)))
+                    raw.append(b)
+                return decode_single_bytes(bytes(raw))
+            for _ in range(limit):
+                b1 = stream.readUByte()
+                b2 = stream.readUByte()
+                char_key = (((block.strlen + 1) * string_key) & 0xffff)
+                b1 = (b1 ^ ((char_key >> 0) & 0xff))
+                b2 = (b2 ^ ((char_key >> 8) & 0xff))
+                string_key = (((string_key << 1) | (string_key >> 15)) & 0xffff)
+                out.append(chr(b1 + (b2 << 8)))
             return "".join(out)
 
         # Detect encoding: use bounds + sample decode to decide single-byte vs two-byte strings
@@ -133,12 +164,14 @@ class W3StringFile(object):
             string_key = (language.Magic.value >> 8) & 0xffff
 
             if use_single:
+                raw = bytearray()
                 for _ in range(block.strlen):
                     b = stream.readUByte()
                     char_key = (((block.strlen + 1) * string_key) & 0xffff)
                     b ^= (char_key & 0xff)
                     string_key = (((string_key << 1) | (string_key >> 15)) & 0xffff)
-                    block.str += chr(b)
+                    raw.append(b)
+                block.str += decode_single_bytes(bytes(raw))
             else:
                 for _ in range(block.strlen):
                     b1 = stream.readUByte()

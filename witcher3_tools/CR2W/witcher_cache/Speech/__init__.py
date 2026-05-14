@@ -1,6 +1,6 @@
 from .SpeechManager import SpeechManager
-def LoadSpeechManager():
+def LoadSpeechManager(language=None):
     try:
-        return SpeechManager.Get()
+        return SpeechManager.Get(language=language)
     except Exception as e:
         raise e

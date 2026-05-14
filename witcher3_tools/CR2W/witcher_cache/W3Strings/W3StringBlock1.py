@@ -10,7 +10,7 @@ class W3StringBlock1(object):
         self.str_id: np.uint = 0
         self.str_id_hashed: np.uint = 0
         self.strlen: np.uint = 0
-        if stream and magic:
+        if stream is not None and magic is not None:
             self._construct(stream, magic)
     def _construct(self, stream:bStream, magic: np.uint):
         self.Read(stream, magic)

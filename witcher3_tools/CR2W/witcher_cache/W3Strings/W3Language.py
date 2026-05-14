@@ -24,11 +24,12 @@ class W3Language(object):
 languages = [
     W3Language(W3LanguageKey(0x00000000), W3LanguageMagic(0x00000000), "ar"),
     W3Language(W3LanguageKey(0x00000000), W3LanguageMagic(0x00000000), "br"),
-    W3Language(W3LanguageKey(0x00000000), W3LanguageMagic(0x00000000), "esMX"),
+    W3Language(W3LanguageKey(0x00000000), W3LanguageMagic(0x00000000), "cn"),
     W3Language(W3LanguageKey(0x00000000), W3LanguageMagic(0x00000000), "kr"),
     W3Language(W3LanguageKey(0x00000000), W3LanguageMagic(0x00000000), "tr"),
     W3Language(W3LanguageKey(0x83496237), W3LanguageMagic(0x73946816), "pl"),
     W3Language(W3LanguageKey(0x43975139), W3LanguageMagic(0x79321793), "en"),
+    W3Language(W3LanguageKey(0x00000000), W3LanguageMagic(0x00000000), "esMX"),
     W3Language(W3LanguageKey(0x75886138), W3LanguageMagic(0x42791159), "de"),
     W3Language(W3LanguageKey(0x45931894), W3LanguageMagic(0x12375973), "it"),
     W3Language(W3LanguageKey(0x23863176), W3LanguageMagic(0x75921975), "fr"),

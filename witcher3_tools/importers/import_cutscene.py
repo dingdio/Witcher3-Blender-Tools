@@ -1317,6 +1317,10 @@ def _resolve_cutscene_linked_scene_file(depot_path, cutscene_filepath):
     return ""
 
 
+def resolve_cutscene_linked_scene_file(depot_path, cutscene_filepath):
+    return _resolve_cutscene_linked_scene_file(depot_path, cutscene_filepath)
+
+
 def _build_cutscene_animation_contexts(cutscene_template, animation_indices, actor_name="", actor_key=""):
     try:
         selected_animation_indices = {int(idx) for idx in (animation_indices or [])}

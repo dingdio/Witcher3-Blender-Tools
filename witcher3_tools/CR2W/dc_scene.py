@@ -3,79 +3,9 @@ import logging
 from .w3_types import CStoryScene
 from .CR2W_types import getCR2W, W_CLASS
 from .prop_utils import prop_to_string as _prop_to_str
+from ..dialog_language import resolve_localized_text
 
 log = logging.getLogger(__name__)
-
-_SCENE_W3STRINGS_CACHE = {}
-
-
-def _scene_source_root_candidates(scene_filepath):
-    source_path = str(scene_filepath or "").strip().replace("/", "\\")
-    if not source_path or not os.path.isabs(source_path):
-        return []
-
-    roots = []
-    normalized = os.path.normpath(source_path)
-    lowered = normalized.lower()
-    for marker in ("\\r4data\\", "\\workspace\\", "\\content\\content0\\"):
-        marker_idx = lowered.find(marker)
-        if marker_idx >= 0:
-            root = normalized[:marker_idx + len(marker) - 1]
-            if os.path.isdir(root):
-                roots.append(root)
-    return roots
-
-
-def _load_w3strings_map(strings_path):
-    strings_path = os.path.normpath(str(strings_path or ""))
-    if not strings_path:
-        return {}
-    strings_key = os.path.normcase(strings_path)
-    cached = _SCENE_W3STRINGS_CACHE.get(strings_key)
-    if cached is not None:
-        return cached
-
-    lines = {}
-    try:
-        from .witcher_cache.W3Strings.W3StringFile import W3StringFile
-        from .bStream import bStream
-
-        string_file = W3StringFile()
-        with open(strings_path, "rb") as reader:
-            stream = bStream(path=strings_path, reader=reader)
-            string_file.Read(stream)
-        for item in string_file.block1:
-            lines[int(item.str_id)] = item.str
-    except Exception:
-        log.debug("Could not read scene string table: %s", strings_path, exc_info=True)
-
-    _SCENE_W3STRINGS_CACHE[strings_key] = lines
-    return lines
-
-
-def _scene_localized_text(line_id, scene_filepath):
-    try:
-        line_key = int(str(line_id or "").strip())
-    except (TypeError, ValueError):
-        return ""
-    if not line_key:
-        return ""
-
-    try:
-        from .witcher_cache.W3Strings.W3StringManager import Configuration
-        language = str(getattr(Configuration, "TextLanguage", "en") or "en").strip()
-    except Exception:
-        language = "en"
-    if not language:
-        language = "en"
-
-    for root in _scene_source_root_candidates(scene_filepath):
-        strings_path = os.path.join(root, f"{language}.w3strings")
-        if os.path.isfile(strings_path):
-            text = _load_w3strings_map(strings_path).get(line_key, "")
-            if text:
-                return text
-    return ""
 
 
 def _localized_string_id_and_text(prop, scene_filepath=""):
@@ -90,7 +20,7 @@ def _localized_string_id_and_text(prop, scene_filepath=""):
     except Exception:
         log.debug("Could not resolve localized dialog string %s", line_id, exc_info=True)
     if not text:
-        text = _scene_localized_text(line_id, scene_filepath)
+        text = resolve_localized_text(line_id, scene_filepath)
     return line_id, text
 
 

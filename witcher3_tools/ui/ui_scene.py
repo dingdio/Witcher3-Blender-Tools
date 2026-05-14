@@ -8,6 +8,7 @@ log = logging.getLogger(__name__)
 from ..CR2W import w3_types
 from ..CR2W.prop_utils import prop_to_string
 from ..CR2W.common_blender import get_repo_override_state, repo_file, set_repo_override_roots
+from .. import dialog_language
 from ..importers import import_cutscene
 from ..importers import import_scene
 from .. import setup_logging_bl
@@ -378,6 +379,7 @@ class W2SceneSectionElementItem(PropertyGroup):
     actor: StringProperty(default="")
     target: StringProperty(default="")
     line_id: StringProperty(default="")
+    line_text: StringProperty(default="")
     detail_text: StringProperty(default="")
 
 
@@ -582,6 +584,26 @@ def _w2scene_prop_text(value, default=""):
     return default
 
 
+def _w2scene_localized_line_id(prop):
+    line_id = dialog_language.localized_string_id(prop)
+    if line_id:
+        return line_id
+    return _w2scene_prop_text(prop)
+
+
+def _w2scene_resolve_line_text(line_id, scene_filepath="", context=None):
+    language = dialog_language.get_active_text_language(context)
+    return dialog_language.resolve_localized_text(line_id, scene_filepath, language=language)
+
+
+def _w2scene_dialog_display_name(actor, line_text, line_id, fallback="CStorySceneLine"):
+    actor = str(actor or "").strip()
+    label_text = str(line_text or line_id or "").strip()
+    if actor and label_text:
+        return f"{actor}: {label_text}"
+    return label_text or actor or fallback
+
+
 def _w2scene_join_values(value):
     if value is None:
         return ""
@@ -762,7 +784,14 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
 
         duration_overrides = {}
         try:
-            duration_overrides = scene_importer._section_variant_duration_overrides(section)
+            variant_id = scene_importer._section_variant_id_for_language(
+                section,
+                dialog_language.get_active_voice_language(bpy.context),
+            )
+            duration_overrides = scene_importer._section_variant_duration_overrides(
+                section,
+                variant_id=variant_id,
+            )
         except Exception:
             log.debug("Could not read section duration overrides", exc_info=True)
 
@@ -797,7 +826,15 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
             el_item.duration = duration
             el_item.actor = _w2scene_prop_text(getattr(element, "voicetag", None))
             el_item.target = _w2scene_prop_text(getattr(element, "speakingTo", None))
-            el_item.line_id = _w2scene_prop_text(getattr(element, "dialogLine", None))
+            el_item.line_id = _w2scene_localized_line_id(getattr(element, "dialogLine", None))
+            if el_item.element_type == "CStorySceneLine" and el_item.line_id:
+                el_item.line_text = _w2scene_resolve_line_text(el_item.line_id, filepath, bpy.context)
+                el_item.display_name = _w2scene_dialog_display_name(
+                    el_item.actor,
+                    el_item.line_text,
+                    el_item.line_id,
+                    fallback=el_item.display_name,
+                )
             if getattr(element, "soundEventName", None):
                 el_item.detail_text = f"sound={_w2scene_prop_text(getattr(element, 'soundEventName', None))}"
             section_duration += duration
@@ -993,15 +1030,73 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
     return scene_importer
 
 
+def refresh_w2scene_dialog_language(context, refresh_audio=False):
+    scene = getattr(context, "scene", None) if context is not None else None
+    if scene is None:
+        return 0
 
-    path_a = str(path_a or "").strip()
-    path_b = str(path_b or "").strip()
-    if not path_a or not path_b:
-        return False
-    try:
-        return os.path.normcase(os.path.normpath(path_a)) == os.path.normcase(os.path.normpath(path_b))
-    except Exception:
-        return path_a == path_b
+    scene_filepath = str(
+        getattr(scene, "witcher_loaded_w2scene_path", "")
+        or getattr(scene, "witcher_sections_filepath", "")
+        or ""
+    ).strip()
+    updated = 0
+    for item in getattr(scene, "witcher_w2scene_section_element_items", []) or []:
+        if str(getattr(item, "element_type", "") or "") != "CStorySceneLine":
+            continue
+        line_id = str(getattr(item, "line_id", "") or "").strip()
+        if not line_id:
+            continue
+        text = _w2scene_resolve_line_text(line_id, scene_filepath, context)
+        if str(getattr(item, "line_text", "") or "") != text:
+            item.line_text = text
+            updated += 1
+        item.display_name = _w2scene_dialog_display_name(
+            getattr(item, "actor", ""),
+            text,
+            line_id,
+            fallback=getattr(item, "display_name", "") or "CStorySceneLine",
+        )
+
+        try:
+            from .ui_voice import _get_sequence_editor_strips
+
+            strips = _get_sequence_editor_strips(getattr(scene, "sequence_editor", None))
+            if strips is not None:
+                line_id_int = int(line_id)
+                for strip in list(strips):
+                    if getattr(strip, "type", None) != 'SOUND':
+                        continue
+                    strip_line_id = str(
+                        strip.get(dialog_language.DIALOG_SUBTITLE_LINE_ID_PROP, "")
+                        or strip.get("witcher_cutscene_dialog_line_id", "")
+                        or getattr(strip, "name", "")
+                        or ""
+                    ).split(".", 1)[0].strip()
+                    try:
+                        if int(strip_line_id) != line_id_int:
+                            continue
+                    except Exception:
+                        continue
+                    strip[dialog_language.DIALOG_SUBTITLE_TEXT_PROP] = text
+                    strip[dialog_language.DIALOG_SUBTITLE_LINE_ID_PROP] = line_id
+                    strip[dialog_language.DIALOG_SUBTITLE_SPEAKER_PROP] = str(getattr(item, "actor", "") or "")
+                    strip[dialog_language.DIALOG_SUBTITLE_SOURCE_PROP] = "w2scene"
+                    strip[dialog_language.DIALOG_SUBTITLE_SOURCE_PATH_PROP] = scene_filepath
+                    strip[dialog_language.DIALOG_SUBTITLE_LANGUAGE_PROP] = dialog_language.get_active_text_language(context)
+                    strip["witcher_w2scene_dialog_text"] = text
+        except Exception:
+            log.debug("Could not update .w2scene audio strip subtitle text for line %s.", line_id, exc_info=True)
+    if (
+        refresh_audio
+        and str(getattr(scene, "witcher_loaded_w2scene_path", "") or "").strip()
+        and not str(getattr(scene, "witcher_w2scene_active_cutscene_path", "") or "").strip()
+    ):
+        try:
+            bpy.ops.witcher.load_section()
+        except Exception:
+            log.warning("Could not refresh .w2scene section audio/lipsync for the new language.", exc_info=True)
+    return updated
 
 
 def _w2scene_is_under_root(path, root):
@@ -1836,6 +1931,7 @@ def _draw_w2scene_sections_tab(layout, scene):
             ("duration", "duration"),
             ("actor", "actor"),
             ("target", "target"),
+            ("line_text", "LocalizedString.text"),
             ("line_id", "dialogLine"),
             ("detail_text", "details"),
         ])
@@ -2135,6 +2231,12 @@ def _draw_w2scene_panel(layout, scene):
     layout.label(text="Scene (.w2scene)", icon='WORLD')
     action_row = layout.row(align=True)
     action_row.operator(ButtonOperatorImportW2scene.bl_idname, text="Import Scene (.w2scene)", icon='IMPORT')
+    if hasattr(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP):
+        action_row.prop(scene, dialog_language.DIALOG_TEXT_LANGUAGE_PROP, text="Text")
+    if hasattr(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP):
+        action_row.prop(scene, dialog_language.DIALOG_VOICE_LANGUAGE_PROP, text="Voice")
+    if hasattr(scene, "witcher_cutscene_show_dialog_subtitles"):
+        action_row.prop(scene, "witcher_cutscene_show_dialog_subtitles", text="Subtitles")
     if getattr(scene, "witcher_loaded_w2scene_path", ""):
         action_row.operator(Witcher_OT_load_section.bl_idname, text="Load Section", icon='SEQUENCE')
         action_row.prop(scene, "witcher_w2scene_write_profile_log", text="Profile Log")

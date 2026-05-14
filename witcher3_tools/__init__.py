@@ -389,6 +389,7 @@ from .ui import ui_re_anims
 from .ui import ui_anims_list
 from .ui import ui_texture_export
 from .ui import ui_import_menu
+from .ui import ui_dialog_language
 from .ui import ui_cutscene
 from .ui import ui_scene
 from .ui import armature_context
@@ -3620,6 +3621,7 @@ def register():
     ui_morphs.register()
     ui_texture_export.register()
     ui_import_menu.register()
+    ui_dialog_language.register()
     ui_anims.register()
     ui_speech.register()
     ui_scene.register()
@@ -3696,6 +3698,7 @@ def unregister():
     ui_scene.unregister()
     ui_speech.unregister()
     ui_anims.unregister()
+    ui_dialog_language.unregister()
     ui_material.unregister()
     ui_entity.unregister()
     ui_morphs.unregister()
