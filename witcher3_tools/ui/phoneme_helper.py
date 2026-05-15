@@ -100,6 +100,43 @@ def _build_phoneme_expression(terms, manual_var=None, toggle_var=None, max_len=2
 
     return expression
 
+def _build_driver_expression(
+    phoneme_terms,
+    facs_terms=None,
+    manual_var=None,
+    phoneme_toggle_var=None,
+    facs_toggle_var=None,
+    max_len=256,
+):
+    facs_terms = facs_terms or []
+    if not phoneme_terms and not facs_terms:
+        return manual_var or "0.0"
+
+    expression = ""
+    precision = 6
+    while precision >= 0:
+        parts = []
+        if manual_var:
+            parts.append(manual_var)
+        if phoneme_terms:
+            terms_str = "+".join(f"{_format_weight(weight, precision)}*{var}" for weight, var, _ in phoneme_terms)
+            if phoneme_toggle_var:
+                parts.append(f"({phoneme_toggle_var}*({terms_str}))")
+            else:
+                parts.append(f"({terms_str})")
+        if facs_terms:
+            terms_str = "+".join(f"{_format_weight(weight, precision)}*{var}" for weight, var, _ in facs_terms)
+            if facs_toggle_var:
+                parts.append(f"({facs_toggle_var}*({terms_str}))")
+            else:
+                parts.append(f"({terms_str})")
+        expression = "+".join(parts) if parts else "0.0"
+        if len(expression) <= max_len:
+            return expression
+        precision -= 1
+
+    return expression
+
 def setup_phoneme_shape_key_drivers(obj, armature_obj, pose_bone_name, phoneme_list):
     shape_keys = obj.data.shape_keys
     if shape_keys is None:
@@ -130,11 +167,21 @@ def setup_phoneme_shape_key_drivers(obj, armature_obj, pose_bone_name, phoneme_l
 
         driver.expression = var.name
 
-def setup_morph_shape_key_drivers(obj, armature_obj, pose_bone_name, morphs_data, phoneme_list, toggle_pose_prop=None):
+def setup_morph_shape_key_drivers(
+    obj,
+    armature_obj,
+    pose_bone_name,
+    morphs_data,
+    phoneme_list,
+    toggle_pose_prop=None,
+    extra_pose_terms=None,
+    extra_shape_key_terms=None,
+    extra_toggle_pose_prop=None,
+):
     """Set up shape key drivers on morph keys.
 
-    Each morph driver evaluates:
-        shape_key[morph].value = pose_bone[morph] + (toggle * weighted_sum_of_phoneme_channels)
+    Each morph driver evaluates the manual Witcher morph value, optional phoneme terms,
+    and optional extra terms such as ARKit/FACS controls.
 
     ``toggle_pose_prop`` is the name of a float custom property on the pose bone that acts as
     the on/off switch (0.0 = off, 1.0 = on).  Using an OBJECT → pose-bone path here mirrors the
@@ -142,9 +189,8 @@ def setup_morph_shape_key_drivers(obj, armature_obj, pose_bone_name, morphs_data
     ARMATURE → PointerProperty sub-path approach was unreliable in Blender's driver evaluation
     and caused the toggle to always evaluate as 0.
 
-    Phoneme terms read directly from pose-bone custom properties.  This avoids a dependency chain
-    (pose-bone -> phoneme shape key -> morph shape key) that can become stale in Blender until the
-    driver expression is manually re-entered.
+    Phoneme terms read from same-mesh shape key values, which avoids extra armature dependency
+    variables during playback. Extra pose-bone terms are used for control channels such as FACS.
     """
     shape_keys = obj.data.shape_keys
     if shape_keys is None:
@@ -178,19 +224,31 @@ def setup_morph_shape_key_drivers(obj, armature_obj, pose_bone_name, morphs_data
 
         # Toggle: stored as a float custom property on the pose bone so it can be read
         # via the same reliable OBJECT → pose-bone path used by the manual variable.
-        toggle_var = None
+        phoneme_toggle_var = None
         if toggle_pose_prop:
-            toggle_var = 't'
+            phoneme_toggle_var = 't'
             toggle = driver.variables.new()
-            toggle.name = toggle_var
+            toggle.name = phoneme_toggle_var
             toggle.type = 'SINGLE_PROP'
             toggle.targets[0].id_type = 'OBJECT'
             toggle.targets[0].id = armature_obj
             toggle.targets[0].data_path = f'pose.bones["{pose_bone_name}"]["{toggle_pose_prop}"]'
 
+        facs_toggle_var = None
+        if extra_toggle_pose_prop:
+            facs_toggle_var = 'f'
+            toggle = driver.variables.new()
+            toggle.name = facs_toggle_var
+            toggle.type = 'SINGLE_PROP'
+            toggle.targets[0].id_type = 'OBJECT'
+            toggle.targets[0].id = armature_obj
+            toggle.targets[0].data_path = f'pose.bones["{pose_bone_name}"]["{extra_toggle_pose_prop}"]'
+
         reserved = {manual_var}
-        if toggle_var:
-            reserved.add(toggle_var)
+        if phoneme_toggle_var:
+            reserved.add(phoneme_toggle_var)
+        if facs_toggle_var:
+            reserved.add(facs_toggle_var)
 
         # Phoneme terms: read from intermediate phoneme shape keys (KEY type).
         # These shape keys are driven from pose_bone[phoneme] by
@@ -203,7 +261,9 @@ def setup_morph_shape_key_drivers(obj, armature_obj, pose_bone_name, morphs_data
         # rig → face mesh = cycle).  Same-datablock KEY reads are resolved in a
         # single evaluation pass with no cycle.
         terms = _build_phoneme_terms(phoneme_weights, phoneme_list, reserved=reserved)
+        used_var_names = set(reserved)
         for weight, var_name, phoneme in terms:
+            used_var_names.add(var_name)
             var = driver.variables.new()
             var.name = var_name
             var.type = 'SINGLE_PROP'
@@ -211,7 +271,41 @@ def setup_morph_shape_key_drivers(obj, armature_obj, pose_bone_name, morphs_data
             var.targets[0].id = shape_keys
             var.targets[0].data_path = f'key_blocks["{phoneme}"].value'
 
-        driver.expression = _build_phoneme_expression(terms, manual_var=manual_var, toggle_var=toggle_var)
+        extra_terms = []
+        name_iter = _iter_driver_var_names(used_var_names)
+        for prop_name, weight in (extra_pose_terms or {}).get(morph_name, {}).items():
+            if weight == 0.0:
+                continue
+            var_name = next(name_iter)
+            used_var_names.add(var_name)
+            extra_terms.append((weight, var_name, prop_name))
+            var = driver.variables.new()
+            var.name = var_name
+            var.type = 'SINGLE_PROP'
+            var.targets[0].id_type = 'OBJECT'
+            var.targets[0].id = armature_obj
+            var.targets[0].data_path = f'pose.bones["{pose_bone_name}"]["{prop_name}"]'
+
+        for shape_key_name, weight in (extra_shape_key_terms or {}).get(morph_name, {}).items():
+            if weight == 0.0 or shape_key_name not in key_blocks:
+                continue
+            var_name = next(name_iter)
+            used_var_names.add(var_name)
+            extra_terms.append((weight, var_name, shape_key_name))
+            var = driver.variables.new()
+            var.name = var_name
+            var.type = 'SINGLE_PROP'
+            var.targets[0].id_type = 'KEY'
+            var.targets[0].id = shape_keys
+            var.targets[0].data_path = f'key_blocks["{shape_key_name}"].value'
+
+        driver.expression = _build_driver_expression(
+            terms,
+            facs_terms=extra_terms,
+            manual_var=manual_var,
+            phoneme_toggle_var=phoneme_toggle_var,
+            facs_toggle_var=facs_toggle_var,
+        )
 
 def create_phoneme_shape_keys(obj, phoneme_list):
     ensure_shape_keys(obj, phoneme_list)

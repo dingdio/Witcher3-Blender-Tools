@@ -502,6 +502,22 @@ def _phoneme_enabled_update_callback(self, context):
                 pb["phoneme_enabled"] = 1.0 if self.phoneme_enabled else 0.0
             break
 
+def _facs_enabled_update_callback(self, context):
+    """Sync the FACS toggle to the pose bone float property used by drivers."""
+    arm_data = self.id_data
+    if arm_data is None:
+        return
+    for arm_obj in bpy.data.objects:
+        if arm_obj.type == 'ARMATURE' and arm_obj.data is arm_data:
+            pb = arm_obj.pose.bones.get("w3_face_poses")
+            if pb is not None:
+                if "facs_enabled" not in pb:
+                    pb["facs_enabled"] = 1.0
+                    prop_ui = pb.id_properties_ui("facs_enabled")
+                    prop_ui.update(min=0.0, max=1.0)
+                pb["facs_enabled"] = 1.0 if self.facs_enabled else 0.0
+            break
+
 def _get_master_equipment_appearances(self, context):
     import json
     apps = set()
@@ -577,15 +593,25 @@ class witcherui_RigSettings(bpy.types.PropertyGroup):
 
     witcher_morphs_number: bpy.props.IntProperty(default = 0,
                         name = "")
+    active_face_morphs_index: bpy.props.IntProperty(default = 0,
+                        name = "")
     witcher_face_morphs: bpy.props.BoolProperty(default = True,
                         name = "Morphs from mimic poses",
                         description = "Search for witcher Body morphs")
     witcher_morphs_collapse: bpy.props.BoolProperty(default = True)
     witcher_morphs_collapse2: bpy.props.BoolProperty(default = True)
+    face_active_morphs_collapse: bpy.props.BoolProperty(default = False)
+    face_facs_morphs_collapse: bpy.props.BoolProperty(default = False)
+    face_phoneme_morphs_collapse: bpy.props.BoolProperty(default = False)
+    face_native_morphs_collapse: bpy.props.BoolProperty(default = False)
     phoneme_enabled: bpy.props.BoolProperty(default = True,
                         name = "Phoneme Control",
                         description = "Enable phoneme-driven control of face morphs",
                         update = _phoneme_enabled_update_callback)
+    facs_enabled: bpy.props.BoolProperty(default = True,
+                        name = "FACS Control",
+                        description = "Enable ARKit/FACS-driven control of face morphs",
+                        update = _facs_enabled_update_callback)
     morph_search_filter: bpy.props.StringProperty(default = "",
                         name = "",
                         description = "Morph Seach Filter")
@@ -694,6 +720,7 @@ class WITCH_PT_WitcherMorphs(WITCH_PT_Base, bpy.types.Panel):
         #     box.label(text = "No active object")
         box.operator(WITCH_OT_morphs.bl_idname, text="Load Face Morphs", icon='SHAPEKEY_DATA')
         box.operator(WITCH_OT_phonemes.bl_idname, text="Create Phonemes", icon='SHAPEKEY_DATA')
+        box.operator(WITCH_OT_facs.bl_idname, text="Create FACS", icon='SHAPEKEY_DATA')
 
         # --- Loaded lipsync status ---
         pre_arm_obj = get_main_armature_and_rig_settings(
@@ -728,54 +755,120 @@ class WITCH_PT_WitcherMorphs(WITCH_PT_Base, bpy.types.Panel):
                 row.prop(rig_settings, "witcher_morphs_collapse", icon="TRIA_DOWN" if not rig_settings.witcher_morphs_collapse else "TRIA_RIGHT", icon_only=True, emboss=False)
                 face_morphs = [x for x in rig_settings.witcher_morphs_list if x.type == 4 and rig_settings.morph_search_filter.lower() in x.name.lower()]
                 face_phonemes = [x for x in rig_settings.witcher_morphs_list if x.type == 5 and rig_settings.morph_search_filter.lower() in x.name.lower()]
-                face_total = len(face_morphs) + len(face_phonemes)
+                face_facs = [x for x in rig_settings.witcher_morphs_list if x.type == 6 and rig_settings.morph_search_filter.lower() in x.name.lower()]
+                face_total = len(face_morphs) + len(face_phonemes) + len(face_facs)
 
                 row.label(text="Face (" + str(face_total) + ")")
                 box.prop(rig_settings, "phoneme_enabled", text="Phoneme Control")
+                box.prop(rig_settings, "facs_enabled", text="FACS Control")
                 if not rig_settings.witcher_morphs_collapse:
                     the_data = control_arm_obj.pose.bones.get("w3_face_poses")
                     if the_data is None:
                         box.label(text="Missing w3_face_poses control bone. Reload face morphs.", icon='ERROR')
                         return
 
-                    ref_keys = None
-                    if rig_settings.phoneme_enabled:
-                        face_rig_name = main_arm_obj.get('mimicFace')
-                        if face_rig_name:
-                            face_meshes = _resolve_face_mesh_names(main_arm_obj, face_rig_name)
-                            if face_meshes:
-                                ref_mesh = scn.objects.get(face_meshes[0])
-                                if ref_mesh and ref_mesh.data.shape_keys:
-                                    ref_keys = ref_mesh.data.shape_keys.key_blocks
+                    face_mesh_objs, _face_rig = _resolve_face_mesh_objects_for_face_setup(context, main_arm_obj, None)
+                    ref_keys = _get_first_shape_key_blocks(face_mesh_objs)
+                    available_native_morphs = _get_available_native_morphs_from_settings(rig_settings)
+                    search = (rig_settings.morph_search_filter or "").lower()
+                    active_face_count = sum(
+                        1 for morph in rig_settings.witcher_morphs_list
+                        if morph.type in (FACE_MORPH_TYPE_NATIVE, FACE_MORPH_TYPE_PHONEME, FACE_MORPH_TYPE_FACS)
+                        and (not search or search in morph.name.lower())
+                        and _is_active_face_control(morph, the_data, face_mesh_objs)
+                    )
+
+                    def _draw_section_header(parent, label, count, clear_section, collapse_prop):
+                        is_collapsed = bool(getattr(rig_settings, collapse_prop))
+                        row = parent.row(align=True)
+                        row.prop(
+                            rig_settings,
+                            collapse_prop,
+                            icon="TRIA_RIGHT" if is_collapsed else "TRIA_DOWN",
+                            icon_only=True,
+                            emboss=False,
+                        )
+                        row.label(text=f"{label} ({count})")
+                        op = row.operator(WITCH_OT_clear_face_controls.bl_idname, text="Clear", icon='X')
+                        op.section = clear_section
+                        return is_collapsed
+
+                    def _draw_active_section():
+                        active_box = box.box()
+                        if _draw_section_header(active_box, "Active", active_face_count, 'ACTIVE', "face_active_morphs_collapse"):
+                            return
+                        active_box.template_list(
+                            "WITCH_UL_ActiveFaceMorphs",
+                            "",
+                            rig_settings,
+                            "witcher_morphs_list",
+                            rig_settings,
+                            "active_face_morphs_index",
+                            rows=5,
+                        )
+
+                        selected_entry = None
+                        selected_index = rig_settings.active_face_morphs_index
+                        if 0 <= selected_index < len(rig_settings.witcher_morphs_list):
+                            candidate = rig_settings.witcher_morphs_list[selected_index]
+                            if (
+                                candidate.type in (FACE_MORPH_TYPE_NATIVE, FACE_MORPH_TYPE_PHONEME, FACE_MORPH_TYPE_FACS)
+                                and (not search or search in candidate.name.lower())
+                                and _is_active_face_control(candidate, the_data, face_mesh_objs)
+                            ):
+                                selected_entry = candidate
+
+                        detail_row = active_box.row()
+                        if selected_entry:
+                            driven_text = _format_driven_terms(
+                                _get_driven_terms_for_entry(selected_entry, available_native_morphs),
+                                max_items=12,
+                            )
+                            if driven_text:
+                                detail_row.label(text="Selected drives: " + driven_text, icon='DRIVER')
+                            else:
+                                detail_row.label(text="Selected: " + selected_entry.name)
+                        elif active_face_count:
+                            detail_row.label(text="Select an active FACS or phoneme to inspect")
+                        else:
+                            detail_row.label(text="No active face controls")
 
                     def _draw_morphs_section():
-                        if not face_morphs:
+                        morph_box = box.box()
+                        if _draw_section_header(morph_box, "Native Morphs", len(face_morphs), 'NATIVE', "face_native_morphs_collapse"):
                             return
-                        box.label(text="Morphs (" + str(len(face_morphs)) + ")")
                         for morph in face_morphs:
                             if _pose_bone_has_custom_prop(the_data, morph.path):
-                                box.prop(the_data, '[\"' + morph.path + '\"]', text = morph.name)
-                            elif rig_settings.phoneme_enabled and ref_keys and morph.path in ref_keys:
-                                morph_col = box.column()
+                                morph_box.prop(the_data, '[\"' + morph.path + '\"]', text = morph.name)
+                            elif ref_keys and morph.path in ref_keys:
+                                morph_col = morph_box.column()
                                 morph_col.enabled = False
                                 morph_col.prop(ref_keys[morph.path], "value", text = morph.name)
 
                     def _draw_phonemes_section():
-                        if not face_phonemes:
+                        phoneme_box = box.box()
+                        if _draw_section_header(phoneme_box, "Phonemes", len(face_phonemes), 'PHONEME', "face_phoneme_morphs_collapse"):
                             return
-                        box.label(text="Phonemes (" + str(len(face_phonemes)) + ")")
-                        phoneme_col = box.column()
+                        phoneme_col = phoneme_box.column()
                         phoneme_col.enabled = rig_settings.phoneme_enabled
                         for morph in face_phonemes:
                             if _pose_bone_has_custom_prop(the_data, morph.path):
                                 phoneme_col.prop(the_data, '[\"' + morph.path + '\"]', text = morph.name)
 
-                    if rig_settings.phoneme_enabled:
-                        _draw_phonemes_section()
-                        _draw_morphs_section()
-                    else:
-                        _draw_morphs_section()
-                        _draw_phonemes_section()
+                    def _draw_facs_section():
+                        facs_box = box.box()
+                        if _draw_section_header(facs_box, "FACS / ARKit", len(face_facs), 'FACS', "face_facs_morphs_collapse"):
+                            return
+                        facs_col = facs_box.column()
+                        facs_col.enabled = rig_settings.facs_enabled
+                        for morph in face_facs:
+                            if _pose_bone_has_custom_prop(the_data, morph.path):
+                                facs_col.prop(the_data, '[\"' + morph.path + '\"]', text = morph.name)
+
+                    _draw_active_section()
+                    _draw_facs_section()
+                    _draw_phonemes_section()
+                    _draw_morphs_section()
 
                 box = layout.box()
                 row = box.row(align=False)
@@ -1138,6 +1231,161 @@ def witcherui_add_redmorph(collection, item, value = 0.0, existing_keys=None):
     if existing_keys is not None:
         existing_keys.add(key)
     return add_item
+
+FACE_MORPH_TYPE_NATIVE = 4
+FACE_MORPH_TYPE_PHONEME = 5
+FACE_MORPH_TYPE_FACS = 6
+FACE_ACTIVE_EPSILON = 0.0001
+_PHONEME_DRIVEN_UI_CACHE = {}
+
+
+def _get_armature_object_from_armature_data(arm_data):
+    if arm_data is None:
+        return None
+    for obj in bpy.data.objects:
+        if getattr(obj, "type", None) == 'ARMATURE' and getattr(obj, "data", None) is arm_data:
+            return obj
+    return None
+
+
+def _get_first_shape_key_blocks(face_mesh_objs):
+    for mesh_obj in face_mesh_objs or []:
+        shape_keys = getattr(getattr(mesh_obj, "data", None), "shape_keys", None)
+        key_blocks = getattr(shape_keys, "key_blocks", None) if shape_keys is not None else None
+        if key_blocks:
+            return key_blocks
+    return None
+
+
+def _get_shape_key_value(face_mesh_objs, key_name, default=0.0):
+    for mesh_obj in face_mesh_objs or []:
+        shape_keys = getattr(getattr(mesh_obj, "data", None), "shape_keys", None)
+        key_blocks = getattr(shape_keys, "key_blocks", None) if shape_keys is not None else None
+        if key_blocks and key_name in key_blocks:
+            try:
+                return float(key_blocks[key_name].value)
+            except Exception:
+                return float(default)
+    return float(default)
+
+
+def _get_face_control_value(entry, pose_bone, face_mesh_objs=None):
+    value = 0.0
+    if pose_bone is not None and entry.path in pose_bone:
+        try:
+            value = float(pose_bone.get(entry.path, 0.0))
+        except Exception:
+            value = 0.0
+    if abs(value) <= FACE_ACTIVE_EPSILON and entry.type == FACE_MORPH_TYPE_NATIVE:
+        value = _get_shape_key_value(face_mesh_objs, entry.path, value)
+    return value
+
+
+def _is_active_face_control(entry, pose_bone, face_mesh_objs=None):
+    return abs(_get_face_control_value(entry, pose_bone, face_mesh_objs)) > FACE_ACTIVE_EPSILON
+
+
+def _format_driven_terms(terms, max_items=6):
+    names = []
+    for morph_name, weight in terms or []:
+        if abs(weight - 1.0) <= 0.001:
+            names.append(morph_name)
+        else:
+            names.append(f"{morph_name} x{weight:.2g}")
+    if len(names) > max_items:
+        return ", ".join(names[:max_items]) + f", +{len(names) - max_items} more"
+    return ", ".join(names)
+
+
+def _build_phoneme_driven_map(morphs_data, available_morphs=None):
+    available = set(available_morphs or [])
+    driven = {}
+    for morph_name, weights in (morphs_data or {}).items():
+        if available and morph_name not in available:
+            continue
+        for phoneme, weight in (weights or {}).items():
+            if abs(float(weight)) <= FACE_ACTIVE_EPSILON:
+                continue
+            driven.setdefault(phoneme, []).append((morph_name, float(weight)))
+    for terms in driven.values():
+        terms.sort(key=lambda item: (-abs(item[1]), item[0]))
+    return driven
+
+
+def _get_available_native_morphs_from_settings(rig_settings):
+    return {entry.path for entry in getattr(rig_settings, "witcher_morphs_list", []) if entry.type == FACE_MORPH_TYPE_NATIVE and entry.path}
+
+
+def _get_phoneme_driven_map_cached(available_native_morphs):
+    key = tuple(sorted(available_native_morphs or []))
+    if key in _PHONEME_DRIVEN_UI_CACHE:
+        return _PHONEME_DRIVEN_UI_CACHE[key]
+    try:
+        _phonemes_data, morphs_data, _phoneme_list, _morph_list = phoneme_helper.read_phoneme_weights()
+        driven_map = _build_phoneme_driven_map(morphs_data, key)
+    except Exception as exc:
+        log.warning("Failed to build phoneme active-morph details: %s", exc)
+        driven_map = {}
+    _PHONEME_DRIVEN_UI_CACHE[key] = driven_map
+    return driven_map
+
+
+def _get_driven_terms_for_entry(entry, available_native_morphs):
+    if entry is None:
+        return []
+    if entry.type == FACE_MORPH_TYPE_FACS:
+        return facs_helper.get_witcher_morphs_for_facs(entry.path, available_native_morphs)
+    if entry.type == FACE_MORPH_TYPE_PHONEME:
+        return _get_phoneme_driven_map_cached(available_native_morphs).get(entry.path, [])
+    return []
+
+
+class WITCH_UL_ActiveFaceMorphs(bpy.types.UIList):
+    def filter_items(self, context, data, propname):
+        collection = getattr(data, propname, [])
+        arm_obj = _get_armature_object_from_armature_data(getattr(data, "id_data", None))
+        pose_bone = None
+        face_mesh_objs = []
+        if arm_obj and getattr(arm_obj, "pose", None):
+            pose_bone = arm_obj.pose.bones.get("w3_face_poses")
+            face_mesh_objs, _face_rig = _resolve_face_mesh_objects_for_face_setup(context, arm_obj, None)
+
+        search = (getattr(data, "morph_search_filter", "") or "").lower()
+        flags = []
+        for item in collection:
+            show = (
+                item.type in (FACE_MORPH_TYPE_NATIVE, FACE_MORPH_TYPE_PHONEME, FACE_MORPH_TYPE_FACS)
+                and (not search or search in item.name.lower())
+                and _is_active_face_control(item, pose_bone, face_mesh_objs)
+            )
+            flags.append(self.bitflag_filter_item if show else 0)
+        return flags, []
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
+        if self.layout_type not in {'DEFAULT', 'COMPACT'}:
+            layout.label(text=item.name)
+            return
+
+        arm_obj = _get_armature_object_from_armature_data(getattr(data, "id_data", None))
+        pose_bone = arm_obj.pose.bones.get("w3_face_poses") if arm_obj and getattr(arm_obj, "pose", None) else None
+        face_mesh_objs, _face_rig = _resolve_face_mesh_objects_for_face_setup(context, arm_obj, None) if arm_obj else ([], None)
+
+        split = layout.split(factor=0.42)
+        left = split.row(align=True)
+        if pose_bone and _pose_bone_has_custom_prop(pose_bone, item.path):
+            left.prop(pose_bone, '[\"' + item.path + '\"]', text=item.name)
+        else:
+            value = _get_face_control_value(item, pose_bone, face_mesh_objs)
+            left.label(text=f"{item.name}: {value:.3f}")
+
+        available_native_morphs = _get_available_native_morphs_from_settings(data)
+        driven_text = _format_driven_terms(_get_driven_terms_for_entry(item, available_native_morphs))
+        right = split.row()
+        if driven_text:
+            right.label(text=driven_text, icon='DRIVER')
+        else:
+            right.label(text="")
+
 
 def get_face_meshs(mimicFace: str) -> Tuple:
     face_arms = []
@@ -2201,7 +2449,40 @@ class WITCH_OT_morphs(bpy.types.Operator):
         #bpy.ops.object.modifier_apply_as_shapekey(keep_modifier=True, modifier="Armature")
 
 
-from . import phoneme_helper
+from . import phoneme_helper, facs_helper
+
+
+def _resolve_face_mesh_objects_for_face_setup(context, main_obj, faceData=None):
+    scene = context.scene
+    face_rig_name = main_obj.get('mimicFace')
+    if not face_rig_name:
+        return [], None
+
+    face_rig = scene.objects.get(face_rig_name)
+    if not face_rig:
+        face_bone_names = _get_mimic_skeleton_bone_names(faceData)
+        if face_bone_names and any(main_obj.pose.bones.get(bn) for bn in face_bone_names):
+            face_rig = main_obj
+        elif face_rig_name == main_obj.name:
+            face_rig = main_obj
+        else:
+            return [], None
+
+    if face_rig == main_obj and faceData:
+        face_meshes, _face_arms = _get_face_meshs_merged(main_obj, faceData)
+    else:
+        face_meshes, _face_arms = get_face_meshs(face_rig.name)
+    if not face_meshes:
+        face_meshes = _get_skinned_meshes_for_armature(main_obj)
+
+    face_mesh_objs = []
+    for mesh_name in face_meshes:
+        mesh_obj = scene.objects.get(mesh_name)
+        if mesh_obj:
+            face_mesh_objs.append(mesh_obj)
+    return face_mesh_objs, face_rig
+
+
 class WITCH_OT_phonemes(bpy.types.Operator):
     bl_idname = "witcher.load_face_phonemes"
     bl_label = "Create phonemes"
@@ -2315,6 +2596,13 @@ class WITCH_OT_phonemes(bpy.types.Operator):
         else:
             pose_bone["phoneme_enabled"] = 1.0 if rig_settings.phoneme_enabled else 0.0
 
+        existing_facs_props = [name for name in facs_helper.get_facs_channels() if name in pose_bone]
+        facs_terms = facs_helper.build_witcher_morph_terms(
+            available_morphs=morph_list,
+            existing_facs_props=existing_facs_props,
+        )
+        facs_toggle_prop = "facs_enabled" if facs_terms and "facs_enabled" in pose_bone else None
+
         try:
             for mesh_obj in face_mesh_objs:
                 context.view_layer.objects.active = mesh_obj
@@ -2328,6 +2616,8 @@ class WITCH_OT_phonemes(bpy.types.Operator):
                     morphs_data,
                     phoneme_list,
                     toggle_pose_prop="phoneme_enabled",
+                    extra_pose_terms=facs_terms,
+                    extra_toggle_pose_prop=facs_toggle_prop,
                 )
             for mesh_obj in face_mesh_objs:
                 shape_keys = mesh_obj.data.shape_keys
@@ -2354,8 +2644,237 @@ class WITCH_OT_phonemes(bpy.types.Operator):
         context.scene.frame_set(context.scene.frame_current)
         return {'FINISHED'}
 
+class WITCH_OT_facs(bpy.types.Operator):
+    bl_idname = "witcher.create_facs"
+    bl_label = "Create FACS"
+
+    def execute(self, context):
+        main_obj:bpy.types.Object = _resolve_target_armature(context)
+        if not main_obj:
+            self.report({'WARNING'}, "No character target armature found. Set the Character target armature first.")
+            return {'CANCELLED'}
+        if 'mimicFaceFile' not in main_obj or 'mimicFace' not in main_obj:
+            self.report({'WARNING'}, "Please load Face Morphs before creating FACS controls.")
+            return {'CANCELLED'}
+        if getattr(context, "scene", None):
+            set_main_armature(context.scene, main_obj)
+
+        pose_bone = main_obj.pose.bones.get('w3_face_poses')
+        if pose_bone is None:
+            self.report({'WARNING'}, "Please load Face Morphs before creating FACS controls (missing w3_face_poses).")
+            return {'CANCELLED'}
+
+        rig_settings = main_obj.data.witcherui_RigSettings
+        rig_settings.model_armature_object = main_obj
+
+        faceData = None
+        try:
+            face_file = main_obj.get('mimicFaceFile')
+            if face_file:
+                faceData = import_rig.loadFaceFile(repo_file(face_file))
+        except Exception as exc:
+            log.warning("Failed to read mimic face data for FACS setup: %s", exc)
+
+        face_mesh_objs, face_rig = _resolve_face_mesh_objects_for_face_setup(context, main_obj, faceData)
+        if not face_rig:
+            self.report({'WARNING'}, f"Could not find face rig '{main_obj.get('mimicFace')}' in the scene.")
+            return {'CANCELLED'}
+        if not face_mesh_objs:
+            self.report({'WARNING'}, "No face meshes found for the mimic face rig.")
+            return {'CANCELLED'}
+
+        available_morphs = set()
+        if faceData:
+            available_morphs.update(pose.name for pose in getattr(faceData, "mimicPoses", []) or [] if getattr(pose, "name", ""))
+        for entry in rig_settings.witcher_morphs_list:
+            if entry.type in (3, 4) and entry.path:
+                available_morphs.add(entry.path)
+
+        facs_channels = facs_helper.get_facs_channels()
+        facs_terms = facs_helper.build_witcher_morph_terms(available_morphs=available_morphs)
+        if not facs_terms:
+            self.report({'WARNING'}, "No matching Witcher face morphs found for the FACS mapping.")
+            return {'CANCELLED'}
+
+        morph_list_collection = rig_settings.witcher_morphs_list
+        existing_by_key = {(el.name, el.path, el.type): el for el in morph_list_collection}
+
+        def ensure_pose_property(prop_name, default=0.0):
+            if prop_name not in pose_bone:
+                pose_bone[prop_name] = float(default)
+            prop_ui = pose_bone.id_properties_ui(prop_name)
+            prop_ui.update(min=0.0, max=1.0, soft_min=0.0, soft_max=1.0)
+
+        if "facs_enabled" not in pose_bone:
+            pose_bone["facs_enabled"] = 1.0 if rig_settings.facs_enabled else 0.0
+            pose_bone.id_properties_ui("facs_enabled").update(min=0.0, max=1.0)
+        else:
+            pose_bone["facs_enabled"] = 1.0 if rig_settings.facs_enabled else 0.0
+
+        for facs_name in facs_channels:
+            ensure_pose_property(facs_name)
+            key = (facs_name, facs_name, 6)
+            if key not in existing_by_key:
+                added = witcherui_add_redmorph(morph_list_collection, [facs_name, facs_name, 6])
+                if added is not None:
+                    existing_by_key[key] = added
+
+        for morph_name in facs_terms.keys():
+            ensure_pose_property(morph_name)
+
+        try:
+            _phonemes_data, morphs_data, phoneme_list, _morph_list = phoneme_helper.read_phoneme_weights()
+        except Exception as exc:
+            log.warning("Failed to read phonemes.txt while creating FACS controls: %s", exc)
+            morphs_data = {}
+            phoneme_list = []
+
+        prev_active = context.view_layer.objects.active
+        prev_mode = main_obj.mode
+        if prev_mode != 'OBJECT':
+            _safe_mode_set('OBJECT', main_obj)
+
+        try:
+            for mesh_obj in face_mesh_objs:
+                context.view_layer.objects.active = mesh_obj
+                phoneme_helper.ensure_shape_keys(mesh_obj, facs_channels)
+
+                shape_keys = mesh_obj.data.shape_keys
+                key_blocks = shape_keys.key_blocks if shape_keys else None
+                existing_phonemes = []
+                if key_blocks:
+                    existing_phonemes = [phoneme for phoneme in phoneme_list if phoneme in key_blocks]
+
+                driver_morphs_data = {}
+                for morph_name in facs_terms.keys():
+                    weights = morphs_data.get(morph_name, {})
+                    if existing_phonemes:
+                        weights = {phoneme: weight for phoneme, weight in weights.items() if phoneme in existing_phonemes}
+                    else:
+                        weights = {}
+                    driver_morphs_data[morph_name] = weights
+
+                phoneme_helper.setup_morph_shape_key_drivers(
+                    mesh_obj,
+                    main_obj,
+                    pose_bone.name,
+                    driver_morphs_data,
+                    existing_phonemes,
+                    toggle_pose_prop="phoneme_enabled" if existing_phonemes and "phoneme_enabled" in pose_bone else None,
+                    extra_pose_terms=facs_terms,
+                    extra_toggle_pose_prop="facs_enabled",
+                )
+
+            for mesh_obj in face_mesh_objs:
+                shape_keys = mesh_obj.data.shape_keys
+                if not shape_keys or not shape_keys.animation_data:
+                    continue
+                for fcurve in shape_keys.animation_data.drivers:
+                    driver = fcurve.driver
+                    if driver:
+                        _refresh_driver_expression(driver)
+        finally:
+            if prev_active and prev_active.name in bpy.data.objects:
+                context.view_layer.objects.active = prev_active
+            if prev_mode != 'OBJECT' and main_obj.name in bpy.data.objects:
+                context.view_layer.objects.active = main_obj
+                _safe_mode_set(prev_mode, main_obj)
+
+        for mesh_obj in face_mesh_objs:
+            mesh_obj.update_tag()
+        main_obj.update_tag()
+        context.scene.frame_set(context.scene.frame_current)
+
+        self.report(
+            {'INFO'},
+            f"Created {len(facs_channels)} FACS controls mapped to {len(facs_terms)} Witcher morphs.",
+        )
+        return {'FINISHED'}
+
+class WITCH_OT_clear_face_controls(bpy.types.Operator):
+    """Reset face control values in the Morphs UI."""
+    bl_idname = "witcher.clear_face_controls"
+    bl_label = "Clear Face Controls"
+    bl_options = {'UNDO'}
+
+    section: EnumProperty(
+        name="Section",
+        items=[
+            ('ACTIVE', "Active", "Clear currently active face controls"),
+            ('FACS', "FACS", "Clear FACS / ARKit controls"),
+            ('PHONEME', "Phonemes", "Clear phoneme controls"),
+            ('NATIVE', "Native Morphs", "Clear native Witcher morph controls"),
+            ('ALL', "All", "Clear all face controls"),
+        ],
+        default='ACTIVE',
+    )
+
+    def execute(self, context):
+        main_obj = _resolve_target_armature(context)
+        if not main_obj:
+            self.report({'WARNING'}, "No character armature found.")
+            return {'CANCELLED'}
+
+        pose_bone = main_obj.pose.bones.get("w3_face_poses")
+        rig_settings = getattr(main_obj.data, "witcherui_RigSettings", None)
+        if pose_bone is None or rig_settings is None:
+            self.report({'WARNING'}, "No face controls found. Load Face Morphs first.")
+            return {'CANCELLED'}
+
+        face_mesh_objs, _face_rig = _resolve_face_mesh_objects_for_face_setup(context, main_obj, None)
+
+        type_by_section = {
+            'FACS': {FACE_MORPH_TYPE_FACS},
+            'PHONEME': {FACE_MORPH_TYPE_PHONEME},
+            'NATIVE': {FACE_MORPH_TYPE_NATIVE},
+            'ALL': {FACE_MORPH_TYPE_NATIVE, FACE_MORPH_TYPE_PHONEME, FACE_MORPH_TYPE_FACS},
+        }
+
+        entries = [
+            entry for entry in rig_settings.witcher_morphs_list
+            if entry.type in (FACE_MORPH_TYPE_NATIVE, FACE_MORPH_TYPE_PHONEME, FACE_MORPH_TYPE_FACS)
+        ]
+        if self.section == 'ACTIVE':
+            entries = [
+                entry for entry in entries
+                if _is_active_face_control(entry, pose_bone, face_mesh_objs)
+            ]
+        else:
+            wanted_types = type_by_section.get(self.section, set())
+            entries = [entry for entry in entries if entry.type in wanted_types]
+
+        reset_controls = 0
+        reset_shape_keys = 0
+        for entry in entries:
+            if entry.path in pose_bone:
+                try:
+                    pose_bone[entry.path] = 0.0
+                    reset_controls += 1
+                except Exception:
+                    pass
+            for mesh_obj in face_mesh_objs:
+                shape_keys = getattr(getattr(mesh_obj, "data", None), "shape_keys", None)
+                key_blocks = getattr(shape_keys, "key_blocks", None) if shape_keys is not None else None
+                if key_blocks and entry.path in key_blocks:
+                    try:
+                        key_blocks[entry.path].value = 0.0
+                        reset_shape_keys += 1
+                    except Exception:
+                        pass
+
+        for mesh_obj in face_mesh_objs:
+            mesh_obj.update_tag()
+        main_obj.update_tag()
+        context.scene.frame_set(context.scene.frame_current)
+
+        self.report(
+            {'INFO'},
+            f"Cleared {reset_controls} control value(s) and {reset_shape_keys} shape key value(s).",
+        )
+        return {'FINISHED'}
+
 class WITCH_OT_clear_lipsync(bpy.types.Operator):
-    """Remove all voice/lipsync NLA tracks and reset face morph & phoneme values to zero"""
+    """Remove voice/lipsync NLA tracks and reset face morph, phoneme, and FACS values."""
     bl_idname = "witcher.clear_lipsync"
     bl_label = "Clear Lipsync"
     bl_options = {'UNDO'}
@@ -2442,8 +2961,11 @@ def _get_loaded_voice_tracks(armature):
 from bpy.utils import (register_class, unregister_class)
 
 _classes = [
+    WITCH_UL_ActiveFaceMorphs,
     WITCH_PT_WitcherMorphs,
     WITCH_OT_phonemes,
+    WITCH_OT_facs,
+    WITCH_OT_clear_face_controls,
     WITCH_OT_clear_lipsync,
 ]
 

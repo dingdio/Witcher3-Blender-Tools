@@ -183,7 +183,7 @@ def _has_face_morphs_loaded(armature_obj):
     if rig_settings:
         try:
             for morph in rig_settings.witcher_morphs_list:
-                if morph.type in (4, 5):
+                if morph.type in (4, 5, 6):
                     return True
         except Exception:
             pass
