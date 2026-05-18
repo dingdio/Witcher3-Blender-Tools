@@ -394,6 +394,7 @@ from .ui import ui_cutscene
 from .ui import ui_scene
 from .ui import armature_context
 from .ui import ui_cache_export
+from . import livelink_face
 from .ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_apx, WITCH_OT_redcloth, WITCH_OT_redapex, WITCH_OT_w2mesh_export, WITCH_OT_nxs,
                          WITCH_OT_export_goto_project_path,
                          WITCH_OT_create_sound_info, WITCH_OT_remove_sound_info,
@@ -3619,6 +3620,7 @@ def register():
     ui_entity.register()
     ui_material.register()
     ui_morphs.register()
+    livelink_face.register()
     ui_texture_export.register()
     ui_import_menu.register()
     ui_dialog_language.register()
@@ -3701,6 +3703,7 @@ def unregister():
     ui_dialog_language.unregister()
     ui_material.unregister()
     ui_entity.unregister()
+    livelink_face.unregister()
     ui_morphs.unregister()
     ui_voice.unregister()
     ui_mimics.unregister()

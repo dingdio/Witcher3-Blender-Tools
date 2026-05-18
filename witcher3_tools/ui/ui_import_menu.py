@@ -169,6 +169,7 @@ class WITCH_MT_Menu(bpy.types.Menu):
         layout.separator()
         layout.operator(WITCH_OT_ImportW2Rig.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
         layout.operator(ButtonOperatorImportW2Anims.bl_idname, text="Animation (.w2anims)", icon='ARMATURE_DATA')
+        layout.operator("witcher.import_livelinkface_csv", text="Live Link Face CSV (.csv)", icon='SHAPEKEY_DATA')
         layout.separator()
         layout.operator(ButtonOperatorImportVoice.bl_idname, text="Voiceline Pair (.cr2w)", icon='SPEAKER')
         layout.operator(ImportWEM.bl_idname, text="Audio (.wem)", icon='SOUND')

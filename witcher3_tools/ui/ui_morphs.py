@@ -721,6 +721,11 @@ class WITCH_PT_WitcherMorphs(WITCH_PT_Base, bpy.types.Panel):
         box.operator(WITCH_OT_morphs.bl_idname, text="Load Face Morphs", icon='SHAPEKEY_DATA')
         box.operator(WITCH_OT_phonemes.bl_idname, text="Create Phonemes", icon='SHAPEKEY_DATA')
         box.operator(WITCH_OT_facs.bl_idname, text="Create FACS", icon='SHAPEKEY_DATA')
+        try:
+            from .. import livelink_face
+            livelink_face.draw_morph_panel(box, context)
+        except Exception as exc:
+            log.warning("Failed to draw Live Link Face controls: %s", exc)
 
         # --- Loaded lipsync status ---
         pre_arm_obj = get_main_armature_and_rig_settings(
