@@ -2329,7 +2329,7 @@ class Entity(base_w3):
         self.appearances = appearances
         self.staticMeshes = staticMeshes
         self.CAnimAnimsetsParam = CAnimAnimsetsParam
-        self.CAnimMimicParam = CAnimMimicParam,
+        self.CAnimMimicParam = CAnimMimicParam
         self.coloringEntries: List[SEntityTemplateColoringEntry] = coloringEntries
         self.slots: List[EntitySlot] = slots
         self.version:int = version

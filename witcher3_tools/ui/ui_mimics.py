@@ -513,9 +513,23 @@ def _load_selected_mimic(context):
 
     rig_path = _get_mimic_rig_path(target_armature)
 
-    uncook_path = get_uncook_path(context)
     fileName, anim_name = item.mimicLineId.split(';', 1)
-    fileName = os.path.join(uncook_path, fileName)
+    fileName = os.path.join(get_uncook_path(context), fileName)
+    show_all = bool(getattr(context.scene, MIMIC_SHOW_ALL_PROP, False))
+    if not show_all:
+        try:
+            from ..ui.ui_anims_list import GetAnimationInfoByName
+            _resolved_name, resolved_path = GetAnimationInfoByName(
+                anim_name,
+                target_armature,
+                show_all=False,
+                prefer_mimic=True,
+                quiet=True,
+            )
+            if resolved_path:
+                fileName = resolved_path
+        except Exception:
+            log.debug("Failed to resolve mimic '%s' against actor animset order.", anim_name, exc_info=True)
     result = load_bin_anims_single(fileName, anim_name, rigPath=rig_path)
     if not result or not result.animations:
         return False

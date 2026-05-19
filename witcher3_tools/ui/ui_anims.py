@@ -5547,9 +5547,21 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             except Exception:
                 _ui_voice = None
             try:
+                from .. import lipsync as _lipsync
+            except Exception:
+                _lipsync = None
+            try:
                 from . import ui_mimics as _ui_mimics_dialog
             except Exception:
                 _ui_mimics_dialog = None
+
+        # --- WAV Lipsync Import ---
+        lipsync_body = section("witcher_anim_wav_lipsync", "WAV Lipsync", 'SOUND') if anim_tab == "SPEECH" else None
+        if lipsync_body:
+            if _lipsync and hasattr(_lipsync, "draw_panel"):
+                _lipsync.draw_panel(lipsync_body, context)
+            else:
+                lipsync_body.label(text="WAV lipsync module is unavailable.", icon='ERROR')
 
         # --- Quick Mimic Import (own section, above Dialogue Browser) ---
         mimic_body = section("witcher_anim_quick_mimic", "Quick Mimic Import", 'SHAPEKEY_DATA') if anim_tab == "SPEECH" else None

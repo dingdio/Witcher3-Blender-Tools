@@ -2325,6 +2325,19 @@ def _get_entry_attr(entry, key, default=None):
     return getattr(entry, key, default)
 
 
+def _iter_entity_mimic_animset_params(entity):
+    raw_params = getattr(entity, "CAnimMimicParam", []) or []
+    if isinstance(raw_params, dict):
+        raw_params = [raw_params]
+    for mimic_param in raw_params:
+        if isinstance(mimic_param, (list, tuple, set)):
+            for nested_param in mimic_param:
+                if nested_param:
+                    yield nested_param
+        elif mimic_param:
+            yield mimic_param
+
+
 def _get_entry_component_type(entry, fallback="") -> str:
     component_type = str(_get_entry_attr(entry, "type", "") or "").strip()
     if component_type:
@@ -2785,8 +2798,13 @@ def _collect_armature_animset_groups(entity, armature_obj):
         for animset_param in animset_params:
             _add_group(_get_entry_attr(animset_param, "name", "AnimSets"), _get_entry_attr(animset_param, "animationSets", []))
 
-    if component_type == "CMimicComponent":
-        for mimic_set in getattr(entity, "CAnimMimicParam", []) or []:
+    include_mimic_sets = component_type == "CMimicComponent" or bool(
+        str(getattr(armature_obj, "get", lambda *_args, **_kwargs: "")("mimicFaceFile", "") or "").strip()
+    )
+    if not include_mimic_sets and component_type in {"", "CMovingPhysicalAgentComponent", "CAnimatedComponent"}:
+        include_mimic_sets = bool(list(_iter_entity_mimic_animset_params(entity)))
+    if include_mimic_sets:
+        for mimic_set in _iter_entity_mimic_animset_params(entity):
             _add_group(f"{_get_entry_attr(mimic_set, 'name', 'MimicSets')} (Mimic)", _get_entry_attr(mimic_set, "animationSets", []))
 
     return [(group_name, paths) for group_name, paths in groups if paths]

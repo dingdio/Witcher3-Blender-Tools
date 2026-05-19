@@ -924,10 +924,20 @@ def createCat(cat_name, dict):
 
 from ..filtered_list.animations_manager import CModStoryBoardAnimationListsManager, CModStoryBoardMimicsListsManager
 from ..filtered_list.storyboardasset import CModStoryBoardActor
-from .mimic_compat import is_mimic_path_compatible
+from .mimic_compat import (
+    collect_actor_mimic_animset_paths,
+    is_mimic_path_compatible,
+    normalize_animset_path,
+)
+
+_MIMIC_ANIMSET_NAME_CACHE = {}
 
 
 def _get_mimic_animation_path_by_name(anim_name, main_arm_obj=None, show_all=False):
+    actor_path = _get_actor_mimic_animation_path_by_name(anim_name, main_arm_obj=main_arm_obj, show_all=show_all)
+    if actor_path is not None:
+        return actor_path
+
     first_match = None
     for anim in CModStoryBoardMimicsListsManager.get_mimics_meta().animList:
         if anim.id != anim_name:
@@ -938,6 +948,95 @@ def _get_mimic_animation_path_by_name(anim_name, main_arm_obj=None, show_all=Fal
             return anim.path
     if show_all or main_arm_obj is None:
         return first_match
+    return None
+
+
+def _anim_entry_name(entry):
+    return str(getattr(getattr(entry, "animation", None), "name", "") or getattr(entry, "name", "") or "")
+
+
+def _face_rig_path_for_armature(main_arm_obj):
+    if main_arm_obj is None or getattr(main_arm_obj, "type", None) != "ARMATURE":
+        return None
+    rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
+    face_skeleton = str(getattr(rig_settings, "main_face_skeleton", "") or "").strip() if rig_settings else ""
+    if not face_skeleton:
+        face_skeleton = str(main_arm_obj.get("mimicFaceFile", "") or "").strip()
+    if not face_skeleton:
+        return None
+    try:
+        return repo_file(face_skeleton)
+    except Exception:
+        return None
+
+
+def _resolve_animset_abs_path(repo_path):
+    repo_path = str(repo_path or "").strip()
+    if not repo_path:
+        return None
+    try:
+        abs_path = repo_file(repo_path)
+    except Exception:
+        abs_path = ""
+    if not abs_path:
+        abs_path = os.path.join(get_uncook_path(bpy.context), repo_path)
+    if os.path.exists(abs_path + ".json"):
+        return abs_path + ".json"
+    return abs_path if os.path.exists(abs_path) else None
+
+
+def _load_mimic_animset_name_lookup(repo_path, main_arm_obj=None):
+    norm_path = normalize_animset_path(repo_path)
+    abs_path = _resolve_animset_abs_path(repo_path)
+    if not abs_path:
+        return {}
+    try:
+        stat = os.stat(abs_path)
+        token = (norm_path, abs_path, int(stat.st_mtime), int(stat.st_size))
+    except Exception:
+        token = (norm_path, abs_path, 0, 0)
+    cached = _MIMIC_ANIMSET_NAME_CACHE.get(token)
+    if cached is not None:
+        return cached
+
+    stale_keys = [key for key in _MIMIC_ANIMSET_NAME_CACHE if key[0] == norm_path and key != token]
+    for key in stale_keys:
+        _MIMIC_ANIMSET_NAME_CACHE.pop(key, None)
+
+    lookup = {}
+    try:
+        anim_set = import_anims.import_w3_animSet(abs_path, rigPath=_face_rig_path_for_armature(main_arm_obj))
+        for entry in getattr(anim_set, "animations", []) or []:
+            name = _anim_entry_name(entry)
+            if name:
+                lookup.setdefault(name.lower(), name)
+    except Exception:
+        log.debug("Failed to scan mimic animset '%s' for animation-name fallback.", repo_path, exc_info=True)
+
+    _MIMIC_ANIMSET_NAME_CACHE[token] = lookup
+    if len(_MIMIC_ANIMSET_NAME_CACHE) > 64:
+        oldest_key = next(iter(_MIMIC_ANIMSET_NAME_CACHE.keys()))
+        _MIMIC_ANIMSET_NAME_CACHE.pop(oldest_key, None)
+    return lookup
+
+
+def _get_actor_mimic_animation_path_by_name(anim_name, main_arm_obj=None, show_all=False):
+    if show_all or main_arm_obj is None:
+        return None
+    target = str(anim_name or "").strip().lower()
+    if not target:
+        return None
+    for repo_path in collect_actor_mimic_animset_paths(main_arm_obj):
+        meta_has_name = False
+        for anim in CModStoryBoardMimicsListsManager.get_mimics_meta().animList:
+            if str(anim.id).strip().lower() == target and normalize_animset_path(anim.path) == repo_path:
+                meta_has_name = True
+                break
+        if meta_has_name:
+            return repo_path
+        lookup = _load_mimic_animset_name_lookup(repo_path, main_arm_obj=main_arm_obj)
+        if target in lookup:
+            return repo_path
     return None
 
 
@@ -996,6 +1095,8 @@ def GetAnimationInfoByName(anim_name, main_arm_obj=None, show_all=False, prefer_
     fdir = None
     if prefer_mimic:
         fdir = _get_mimic_animation_path_by_name(anim_name, main_arm_obj=main_arm_obj, show_all=show_all)
+        if fdir is None:
+            fdir = _get_actor_mimic_animation_path_by_name(anim_name, main_arm_obj=main_arm_obj, show_all=show_all)
     if fdir is None and not prefer_mimic:
         try:
             manager = _normal_animation_manager(CModStoryBoardAnimationListsManager.active)

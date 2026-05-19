@@ -2205,6 +2205,34 @@ def create_CEntity(file, _inherit_visited=None):
                 this_Entity.coloringEntries.append(inherited_entry)
                 existing_keys.add(key)
 
+    def _anim_param_signature(param):
+        if isinstance(param, dict):
+            name = str(param.get("name", "") or "")
+            component_name = str(param.get("componentName", "") or "")
+            animsets = tuple(str(path or "").replace("/", "\\").lower() for path in (param.get("animationSets", []) or []))
+        else:
+            name = str(getattr(param, "name", "") or "")
+            component_name = str(getattr(param, "componentName", "") or "")
+            animsets = tuple(str(path or "").replace("/", "\\").lower() for path in (getattr(param, "animationSets", []) or []))
+        return name.lower(), component_name.lower(), animsets
+
+    def _merge_inherited_anim_params():
+        if file.HEADER.version <= 115 or not top_level_template_includes:
+            return
+        for attr_name in ("CAnimAnimsetsParam", "CAnimMimicParam"):
+            current_params = getattr(this_Entity, attr_name, None)
+            if current_params is None:
+                current_params = []
+                setattr(this_Entity, attr_name, current_params)
+            existing_keys = {_anim_param_signature(param) for param in current_params}
+            for _depot_path, include_entity in _iter_top_level_included_entities():
+                for inherited_param in getattr(include_entity, attr_name, None) or []:
+                    key = _anim_param_signature(inherited_param)
+                    if key in existing_keys:
+                        continue
+                    current_params.append(copy.deepcopy(inherited_param))
+                    existing_keys.add(key)
+
     def _apply_external_proxy_attachments():
         for proxy_chunk in CHUNKS:
             if getattr(proxy_chunk, "Type", None) != "CExternalProxyAttachment":
@@ -3044,6 +3072,7 @@ def create_CEntity(file, _inherit_visited=None):
 
     _merge_inherited_template_components()
     _merge_inherited_coloring_entries()
+    _merge_inherited_anim_params()
     _synthesize_missing_transform_parents_from_hard_attachments()
 
     if not hasCMovingPhysicalAgentComponent:
