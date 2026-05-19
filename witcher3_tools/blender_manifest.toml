@@ -9,9 +9,22 @@ blender_version_min = "4.5.0"
 license = ["SPDX:GPL-3.0-or-later"]
 website = "https://github.com/dingdio/Witcher3_Blender_Tools"
 wheels = [
+  "wheels/certifi-2026.4.22-py3-none-any.whl",
+  "wheels/charset_normalizer-3.4.7-cp311-cp311-win_amd64.whl",
+  "wheels/charset_normalizer-3.4.7-cp313-cp313-win_amd64.whl",
+  "wheels/colorama-0.4.6-py2.py3-none-any.whl",
   "wheels/cramjam-2.9.1-cp310-cp310-win_amd64.whl",
   "wheels/cramjam-2.9.1-cp311-cp311-win_amd64.whl",
   "wheels/cramjam-2.9.1-cp313-cp313-win_amd64.whl",
+  "wheels/idna-3.15-py3-none-any.whl",
+  "wheels/numpy-2.4.4-cp311-cp311-win_amd64.whl",
+  "wheels/numpy-2.4.4-cp313-cp313-win_amd64.whl",
+  "wheels/platformdirs-4.9.6-py3-none-any.whl",
+  "wheels/pywhispercpp-1.4.1-cp311-cp311-win_amd64.whl",
+  "wheels/pywhispercpp-1.4.1-cp313-cp313-win_amd64.whl",
+  "wheels/requests-2.34.2-py3-none-any.whl",
+  "wheels/tqdm-4.67.3-py3-none-any.whl",
+  "wheels/urllib3-2.7.0-py3-none-any.whl",
 ]
 
 [permissions]

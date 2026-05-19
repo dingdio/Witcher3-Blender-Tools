@@ -228,6 +228,10 @@ def get_wolvenkit(context) -> str:
     wolvenkit = addon_prefs.wolvenkit
     return wolvenkit
 
+def get_radish_tools_path(context) -> str:
+    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    return addon_prefs.radish_tools_path
+
 def get_fbx_uncook_path(context) -> str:
     addon_prefs = context.preferences.addons[ADDON_NAME].preferences
     fbx_uncook_path = addon_prefs.fbx_uncook_path
@@ -394,6 +398,7 @@ from .ui import ui_cutscene
 from .ui import ui_scene
 from .ui import armature_context
 from .ui import ui_cache_export
+from . import lipsync
 from . import livelink_face
 from .ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_apx, WITCH_OT_redcloth, WITCH_OT_redapex, WITCH_OT_w2mesh_export, WITCH_OT_nxs,
                          WITCH_OT_export_goto_project_path,
@@ -801,6 +806,18 @@ class WITCHER_OT_pref_help_popup(bpy.types.Operator):
                 "warnings": [],
             }
 
+        if topic == "radish_tools":
+            return {
+                "title": "Radish Tools",
+                "icon": 'TOOL_SETTINGS',
+                "lines": [
+                    "Set this to the external radish-tools folder.",
+                    "It must contain the w3speech executables and data folder.",
+                    "Lipsync generation uses this path from add-on preferences.",
+                ],
+                "warnings": [],
+            }
+
         kind_label = "file" if self.is_file else "folder"
         return {
             "title": title_text or "Path Help",
@@ -821,6 +838,8 @@ class WITCHER_OT_pref_help_popup(bpy.types.Operator):
             return "What the Uncook Path is used for and why a separate working folder is recommended."
         if topic == "speech_path":
             return "What the Speech Audio Path stores for lipsync and audio conversion workflows."
+        if topic == "radish_tools":
+            return "Where the external Radish w3speech lipsync tools are installed."
         return "Show help for this setting."
 
     def invoke(self, context, event):
@@ -899,6 +918,12 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         subtype='FILE_PATH',
         default="",
         description="Wolvenkit .exe."
+    )
+    radish_tools_path: StringProperty(
+        name="Radish Tools Path",
+        subtype='DIR_PATH',
+        default="",
+        description="External radish-tools folder containing the w3speech lipsync tools."
     )
     mod_directory: StringProperty(
         name="Wolvenkit Project Path",
@@ -1408,6 +1433,11 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         layout_col.prop(self, "browser_grid_max_rows", text="Grid Rows Per Page")
         layout_col.prop(self, "browser_file_page_size", text="List Files Per Page")
 
+        # External command-line tool paths
+        _tools_box, tools_col = section("External Tools", 'TOOL_SETTINGS')
+        draw_path_prop(tools_col, "wolvenkit", is_file=True)
+        draw_path_prop(tools_col, "radish_tools_path", help_topic="radish_tools")
+
         # External importer add-on status (APX / SRT / RE)
         ext_addons_box, ext_addons_col = section("External Addons", 'PLUGIN')
         ext_info_row = ext_addons_col.row(align=True)
@@ -1462,7 +1492,6 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
 
         # Modding/work project paths
         mod_box, mod_col = section("Mod Paths", 'FILE_FOLDER')
-        draw_path_prop(mod_col, "wolvenkit", is_file=True)
         draw_path_prop(mod_col, "mod_directory")
         draw_path_prop(mod_col, "tex_mod_uncook_path")
 
@@ -2367,6 +2396,7 @@ def _draw_external_path_sections(layout, addon_prefs, section_prefix="witcher_ex
     if body:
         col = body.column(align=True)
         add_row(col, "WolvenKit CLI", addon_prefs.wolvenkit, is_file=True)
+        add_row(col, "Radish Tools", getattr(addon_prefs, "radish_tools_path", ""))
         add_row(col, "WolvenKit Project", addon_prefs.mod_directory)
         add_row(col, "Mod Textures", addon_prefs.tex_mod_uncook_path)
 
@@ -3636,6 +3666,7 @@ def register():
     ui_cache_export.register()
     register_class(WITCH_PT_Quick)
     ui_voice.register()
+    lipsync.register()
     ui_mimics.register()
     ui_re_anims.register()
     ui_anims_list.register()
@@ -3705,6 +3736,7 @@ def unregister():
     ui_entity.unregister()
     livelink_face.unregister()
     ui_morphs.unregister()
+    lipsync.unregister()
     ui_voice.unregister()
     ui_mimics.unregister()
     ui_re_anims.unregister()
