@@ -7,6 +7,7 @@ from pathlib import Path
 from .extension_paths import (
     get_audio_root,
     get_cache_root,
+    get_extension_user_dir,
     get_temp_root,
     get_texture_root,
     get_uncook_root,
@@ -15,6 +16,11 @@ from .lod_utils import lod_level_from_name
 
 LEGACY_ADDON_NAME = "io_import_w2l"
 ADDON_NAME = __package__ or __name__
+WOLVENKIT_CLI_DOWNLOAD_URL = "https://github.com/WolvenKit/WolvenKit-7-nightly/releases/"
+WOLVENKIT_CLI_RELEASES_API = "https://api.github.com/repos/WolvenKit/WolvenKit-7-nightly/releases"
+RADISH_LIPSYNC_REDKIT_URL = "https://www.nexusmods.com/witcher3/mods/9914"
+WWISE_DOWNLOAD_URL = "https://www.audiokinetic.com/en/download/"
+WWISE_INSTALL_DOC_URL = "https://www.audiokinetic.com/en/library/wwise_launcher/?id=install_wwise_through_launcher&source=InstallGuide"
 
 # Extension builds run under the bl_ext namespace; avoid registering top-level aliases there.
 def _is_extension_context() -> bool:
@@ -231,6 +237,10 @@ def get_wolvenkit(context) -> str:
 def get_radish_tools_path(context) -> str:
     addon_prefs = context.preferences.addons[ADDON_NAME].preferences
     return addon_prefs.radish_tools_path
+
+def get_wwise_console_path(context) -> str:
+    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    return getattr(addon_prefs, "wwise_console_path", "")
 
 def get_fbx_uncook_path(context) -> str:
     addon_prefs = context.preferences.addons[ADDON_NAME].preferences
@@ -702,6 +712,248 @@ class WITCHER_OT_autofind_w2_path(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _safe_storage_name(value, fallback="download"):
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip()).strip("._-")
+    return name or fallback
+
+
+def _request_github_json(url):
+    import json
+    import urllib.request
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "witcher3-blender-tools",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def _select_wolvenkit_nightly_asset(assets):
+    candidates = []
+    for asset in assets or []:
+        name = str(asset.get("name") or "").strip()
+        url = str(asset.get("browser_download_url") or "").strip()
+        if not name.lower().endswith(".zip") or not url:
+            continue
+        lower = name.lower()
+        score = 0
+        if "wolvenkit" in lower:
+            score -= 20
+        if "nightly" in lower:
+            score -= 10
+        if "cli" in lower:
+            score -= 2
+        if any(token in lower for token in ("source", "symbols", "pdb", "debug")):
+            score += 50
+        candidates.append((score, name.casefold(), asset))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2] if candidates else None
+
+
+def _find_latest_wolvenkit_nightly_release():
+    releases = _request_github_json(WOLVENKIT_CLI_RELEASES_API)
+    if not isinstance(releases, list):
+        raise RuntimeError("GitHub releases response was not a list.")
+    for release in releases:
+        if release.get("draft"):
+            continue
+        asset = _select_wolvenkit_nightly_asset(release.get("assets") or [])
+        if asset:
+            return release, asset
+    raise RuntimeError("No WolvenKit nightly zip asset was found in GitHub releases.")
+
+
+def _download_file(url, destination, expected_size=0, progress_callback=None):
+    import urllib.request
+
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_name(destination.name + ".download")
+    if temp_path.exists():
+        temp_path.unlink()
+
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "witcher3-blender-tools"},
+    )
+    downloaded = 0
+    with urllib.request.urlopen(request, timeout=60) as response:
+        total = int(response.headers.get("Content-Length") or expected_size or 0)
+        with temp_path.open("wb") as handle:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback:
+                    progress_callback(downloaded, total)
+
+    if expected_size and downloaded != int(expected_size):
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(f"Downloaded size mismatch: expected {expected_size}, got {downloaded}.")
+
+    temp_path.replace(destination)
+    return destination
+
+
+def _assert_path_inside(path, root):
+    path = Path(path).resolve(strict=False)
+    root = Path(root).resolve(strict=False)
+    if path == root or root in path.parents:
+        return path
+    raise RuntimeError(f"Unsafe path outside extension storage: {path}")
+
+
+def _remove_tree_inside(path, root):
+    path = _assert_path_inside(path, root)
+    root = Path(root).resolve(strict=False)
+    if path == root:
+        raise RuntimeError(f"Refusing to remove storage root: {root}")
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def _extract_zip_safe(zip_path, destination, progress_callback=None):
+    import zipfile
+
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    destination_resolved = destination.resolve(strict=False)
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        members = archive.infolist()
+        total = len(members)
+        for index, member in enumerate(members, 1):
+            member_path = destination / member.filename
+            _assert_path_inside(member_path, destination_resolved)
+            archive.extract(member, destination)
+            if progress_callback:
+                progress_callback(index, total)
+
+
+def _find_wolvenkit_cli(root):
+    candidates = sorted(
+        (item for item in Path(root).rglob("*.exe") if item.name.casefold() == "wolvenkit.cli.exe"),
+        key=lambda item: (len(item.parts), str(item).casefold()),
+    )
+    return candidates[0] if candidates else None
+
+
+class WITCHER_OT_download_wolvenkit_cli_nightly(bpy.types.Operator):
+    bl_idname = "witcher.download_wolvenkit_cli_nightly"
+    bl_label = "Install WolvenKit Nightly"
+    bl_description = "Download the latest WolvenKit-7 nightly zip, extract it into extension storage, and set WolvenKit.CLI.exe"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        addon_prefs = get_all_addon_prefs(context)
+        wm = context.window_manager
+
+        try:
+            wm.progress_begin(0, 100)
+        except Exception:
+            pass
+
+        try:
+            release, asset = _find_latest_wolvenkit_nightly_release()
+            tag = _safe_storage_name(
+                release.get("tag_name") or release.get("name") or release.get("published_at"),
+                fallback="latest",
+            )
+            asset_name = _safe_storage_name(asset.get("name"), fallback="WolvenKit-nightly.zip")
+            storage_root = Path(get_extension_user_dir(create=True)) / "external_tools" / "wolvenkit_7_nightly"
+            downloads_dir = storage_root / "downloads"
+            install_dir = storage_root / tag
+            staging_dir = storage_root / f".{tag}.extracting"
+            zip_path = downloads_dir / asset_name
+
+            def download_progress(downloaded, total):
+                if not total:
+                    return
+                try:
+                    wm.progress_update(max(1, min(70, int((downloaded / total) * 70))))
+                except Exception:
+                    pass
+
+            _download_file(
+                asset.get("browser_download_url"),
+                zip_path,
+                expected_size=int(asset.get("size") or 0),
+                progress_callback=download_progress,
+            )
+
+            storage_root.mkdir(parents=True, exist_ok=True)
+            _remove_tree_inside(staging_dir, storage_root)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+
+            def extract_progress(done, total):
+                if not total:
+                    return
+                try:
+                    wm.progress_update(70 + max(1, min(25, int((done / total) * 25))))
+                except Exception:
+                    pass
+
+            _extract_zip_safe(zip_path, staging_dir, progress_callback=extract_progress)
+            cli_path = _find_wolvenkit_cli(staging_dir)
+            if not cli_path:
+                raise RuntimeError("Downloaded nightly did not contain WolvenKit.CLI.exe.")
+
+            _remove_tree_inside(install_dir, storage_root)
+            staging_dir.replace(install_dir)
+            final_cli_path = install_dir / cli_path.relative_to(staging_dir)
+            if not final_cli_path.is_file():
+                raise RuntimeError("WolvenKit.CLI.exe was not found after install.")
+
+            addon_prefs.wolvenkit = str(final_cli_path)
+            try:
+                wm.progress_update(100)
+            except Exception:
+                pass
+            self.report({'INFO'}, f"WolvenKit CLI set: {final_cli_path}")
+            return {'FINISHED'}
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc).splitlines()[0][:240])
+            return {'CANCELLED'}
+        finally:
+            try:
+                wm.progress_end()
+            except Exception:
+                pass
+
+
+class WITCHER_OT_autofind_wwise_console(bpy.types.Operator):
+    bl_idname = "witcher.autofind_wwise_console"
+    bl_label = "Auto Find Wwise Console"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        addon_prefs = get_all_addon_prefs(context)
+        try:
+            from .lipsync import radish_runner as _lipsync_radish_runner
+            detected_path = _lipsync_radish_runner.auto_detect_wwise_console(
+                tools_dir=getattr(addon_prefs, "radish_tools_path", ""),
+            )
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not auto-find Wwise Console: {exc}")
+            return {'CANCELLED'}
+
+        if not detected_path:
+            self.report({'WARNING'}, "Could not auto-find Wwise 2021.1.x.")
+            return {'CANCELLED'}
+
+        addon_prefs.wwise_console_path = str(detected_path)
+        self.report({'INFO'}, f"Wwise Console set: {detected_path}")
+        return {'FINISHED'}
+
+
 class WITCHER_OT_open_pref_path(bpy.types.Operator):
     bl_idname = "witcher.open_pref_path"
     bl_label = "Open Path in Explorer"
@@ -808,12 +1060,40 @@ class WITCHER_OT_pref_help_popup(bpy.types.Operator):
 
         if topic == "radish_tools":
             return {
-                "title": "Radish Tools",
+                "title": "Radish Lipsync 4 REDkit",
                 "icon": 'TOOL_SETTINGS',
                 "lines": [
-                    "Set this to the external radish-tools folder.",
-                    "It must contain the w3speech executables and data folder.",
-                    "Lipsync generation uses this path from add-on preferences.",
+                    "Set this to the radish-tools folder from Radish Lipsync 4 REDkit.",
+                    "The normal Radish Modding Tools package is not enough for WAV lipsync.",
+                    "It must contain w3speech phoneme, creator, converter, and repo.lipsync files.",
+                    "Download: Nexus Mods mod 9914.",
+                ],
+                "warnings": [],
+            }
+
+        if topic == "wolvenkit_cli":
+            return {
+                "title": "WolvenKit 7 CLI",
+                "icon": 'CONSOLE',
+                "lines": [
+                    "Set this to WolvenKit.CLI.exe.",
+                    "The Install Nightly button downloads the newest WolvenKit-7 nightly zip.",
+                    "It extracts into this extension's user storage and sets this path automatically.",
+                    "Manual download: WolvenKit/WolvenKit-7-nightly releases on GitHub.",
+                ],
+                "warnings": [],
+            }
+
+        if topic == "wwise_console":
+            return {
+                "title": "Wwise Console",
+                "icon": 'SOUND',
+                "lines": [
+                    "WEM generation requires Audiokinetic Wwise 2021.1.x.",
+                    "Radish docs recommend v2021.1.14 for REDkit lipsync.",
+                    "Set this to WwiseConsole.exe or its Authoring x64 Release bin folder.",
+                    "If empty, the add-on checks Radish _settings_.bat, environment variables, PATH, and Program Files.",
+                    "vgmstream can decode .wem files, but it cannot encode them.",
                 ],
                 "warnings": [],
             }
@@ -839,7 +1119,11 @@ class WITCHER_OT_pref_help_popup(bpy.types.Operator):
         if topic == "speech_path":
             return "What the Speech Audio Path stores for lipsync and audio conversion workflows."
         if topic == "radish_tools":
-            return "Where the external Radish w3speech lipsync tools are installed."
+            return "Where the Radish Lipsync 4 REDkit w3speech tools are installed."
+        if topic == "wolvenkit_cli":
+            return "Download or set WolvenKit.CLI.exe for CR2W conversion."
+        if topic == "wwise_console":
+            return "Where WwiseConsole.exe is installed for REDkit-compatible .wem generation."
         return "Show help for this setting."
 
     def invoke(self, context, event):
@@ -920,10 +1204,16 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         description="Wolvenkit .exe."
     )
     radish_tools_path: StringProperty(
-        name="Radish Tools Path",
+        name="Radish Lipsync 4 REDkit",
         subtype='DIR_PATH',
         default="",
-        description="External radish-tools folder containing the w3speech lipsync tools."
+        description="radish-tools folder from Radish Lipsync 4 REDkit, not the normal Radish Modding Tools package."
+    )
+    wwise_console_path: StringProperty(
+        name="Wwise Console",
+        subtype='FILE_PATH',
+        default="",
+        description="Optional path to WwiseConsole.exe or its bin folder. WEM generation requires Wwise 2021.1.x; v2021.1.14 is recommended by Radish."
     )
     mod_directory: StringProperty(
         name="Wolvenkit Project Path",
@@ -1435,8 +1725,74 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
 
         # External command-line tool paths
         _tools_box, tools_col = section("External Tools", 'TOOL_SETTINGS')
-        draw_path_prop(tools_col, "wolvenkit", is_file=True)
-        draw_path_prop(tools_col, "radish_tools_path", help_topic="radish_tools")
+        wolvenkit_row = tools_col.row(align=True)
+        wolvenkit_row.prop(self, "wolvenkit")
+        wolvenkit_row.operator("witcher.download_wolvenkit_cli_nightly", text="Install Nightly", icon='IMPORT')
+        wolvenkit_row.operator("wm.url_open", text="", icon='URL').url = WOLVENKIT_CLI_DOWNLOAD_URL
+        help_op = wolvenkit_row.operator("witcher.pref_help_popup", text="", icon='QUESTION')
+        help_op.topic = "wolvenkit_cli"
+        help_op.path = getattr(self, "wolvenkit", "")
+        help_op.is_file = True
+        help_op.title_text = "WolvenKit 7 CLI"
+
+        radish_path_row = tools_col.row(align=True)
+        radish_path_row.prop(self, "radish_tools_path")
+        radish_path_row.operator("wm.url_open", text="Website", icon='URL').url = RADISH_LIPSYNC_REDKIT_URL
+        help_op = radish_path_row.operator("witcher.pref_help_popup", text="", icon='QUESTION')
+        help_op.topic = "radish_tools"
+        help_op.path = getattr(self, "radish_tools_path", "")
+        help_op.is_file = False
+        help_op.title_text = "Radish Lipsync 4 REDkit"
+
+        wwise_path_row = tools_col.row(align=True)
+        wwise_path_row.prop(self, "wwise_console_path")
+        wwise_path_row.operator("witcher.autofind_wwise_console", text="Auto Find", icon='VIEWZOOM')
+        help_op = wwise_path_row.operator("witcher.pref_help_popup", text="", icon='QUESTION')
+        help_op.topic = "wwise_console"
+        help_op.path = getattr(self, "wwise_console_path", "")
+        help_op.is_file = True
+        help_op.title_text = "Wwise Console"
+
+        lipsync_box = _tools_box.box()
+        lipsync_box.label(text="REDkit Lipsync", icon='SOUND')
+        try:
+            from .lipsync import radish_runner as _lipsync_radish_runner
+        except Exception:
+            _lipsync_radish_runner = None
+
+        if _lipsync_radish_runner is not None:
+            tools_dir, missing_tools = _lipsync_radish_runner.get_full_tool_status(
+                getattr(self, "radish_tools_path", ""),
+                include_converter=True,
+            )
+            radish_row = lipsync_box.row(align=True)
+            radish_row.alert = not bool(tools_dir)
+            if tools_dir:
+                radish_row.label(text=f"Radish ready: {Path(tools_dir).name}", icon='CHECKMARK')
+            else:
+                radish_row.label(text="Radish Lipsync 4 REDkit missing", icon='ERROR')
+                if missing_tools:
+                    missing_text = ", ".join(missing_tools[:2])
+                    if len(missing_tools) > 2:
+                        missing_text += ", ..."
+                    radish_row.label(text=missing_text)
+
+            wwise_console, _missing_wwise = _lipsync_radish_runner.get_wwise_status(
+                getattr(self, "wwise_console_path", ""),
+                tools_dir=tools_dir or getattr(self, "radish_tools_path", ""),
+            )
+            wwise_row = lipsync_box.row(align=True)
+            wwise_row.alert = not bool(wwise_console)
+            if wwise_console:
+                wwise_row.label(text=f"Wwise ready: {Path(wwise_console).parent.name}", icon='CHECKMARK')
+            else:
+                wwise_row.label(text="Wwise 2021.1.x missing", icon='ERROR')
+        else:
+            lipsync_box.label(text="Lipsync status unavailable", icon='ERROR')
+
+        links_row = lipsync_box.row(align=True)
+        links_row.operator("wm.url_open", text="Wwise 2021.1.x", icon='URL').url = WWISE_DOWNLOAD_URL
+        links_row.operator("wm.url_open", text="Wwise Docs", icon='HELP').url = WWISE_INSTALL_DOC_URL
 
         # External importer add-on status (APX / SRT / RE)
         ext_addons_box, ext_addons_col = section("External Addons", 'PLUGIN')
@@ -2396,7 +2752,8 @@ def _draw_external_path_sections(layout, addon_prefs, section_prefix="witcher_ex
     if body:
         col = body.column(align=True)
         add_row(col, "WolvenKit CLI", addon_prefs.wolvenkit, is_file=True)
-        add_row(col, "Radish Tools", getattr(addon_prefs, "radish_tools_path", ""))
+        add_row(col, "Radish Lipsync 4 REDkit", getattr(addon_prefs, "radish_tools_path", ""))
+        add_row(col, "Wwise Console", getattr(addon_prefs, "wwise_console_path", ""))
         add_row(col, "WolvenKit Project", addon_prefs.mod_directory)
         add_row(col, "Mod Textures", addon_prefs.tex_mod_uncook_path)
 
@@ -3625,6 +3982,8 @@ def register():
     bpy.utils.register_class(WITCHER_OT_reset_browser_popup_width)
     bpy.utils.register_class(WITCHER_OT_autofind_w3_path)
     bpy.utils.register_class(WITCHER_OT_autofind_w2_path)
+    bpy.utils.register_class(WITCHER_OT_download_wolvenkit_cli_nightly)
+    bpy.utils.register_class(WITCHER_OT_autofind_wwise_console)
     bpy.utils.register_class(WITCHER_OT_open_pref_path)
     bpy.utils.register_class(WITCHER_OT_pref_help_popup)
 
@@ -3703,6 +4062,8 @@ def unregister():
     bpy.utils.unregister_class(AddRedkitProjectOperator)
     bpy.utils.unregister_class(RemovePathOperator)
     bpy.utils.unregister_class(AddPathOperator)
+    bpy.utils.unregister_class(WITCHER_OT_autofind_wwise_console)
+    bpy.utils.unregister_class(WITCHER_OT_download_wolvenkit_cli_nightly)
     bpy.utils.unregister_class(WITCHER_OT_autofind_w2_path)
     bpy.utils.unregister_class(WITCHER_OT_autofind_w3_path)
     bpy.utils.unregister_class(WITCHER_OT_reset_browser_popup_width)

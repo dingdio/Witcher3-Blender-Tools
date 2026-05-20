@@ -2025,7 +2025,7 @@ def import_lipsync(context, fileName = False, load_from_data = False, use_NLA=Tr
     if fileName:
         dirpath, file = os.path.split(fileName)
         basename, ext = os.path.splitext(file)
-        if ext.lower().endswith('.cr2w'):
+        if ext.lower() in {'.cr2w', '.re'}:
             lipsync_CSkeletalAnimation =  load_lipsync_file(fileName)
             anim_set_entry = w3_types.CSkeletalAnimationSetEntry()
             lipsync_CSkeletalAnimation.name = getFilenameFile(lipsync_CSkeletalAnimation.name)

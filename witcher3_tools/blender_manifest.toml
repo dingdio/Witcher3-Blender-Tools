@@ -16,6 +16,8 @@ wheels = [
   "wheels/cramjam-2.9.1-cp310-cp310-win_amd64.whl",
   "wheels/cramjam-2.9.1-cp311-cp311-win_amd64.whl",
   "wheels/cramjam-2.9.1-cp313-cp313-win_amd64.whl",
+  "wheels/h5py-3.16.0-cp311-cp311-win_amd64.whl",
+  "wheels/h5py-3.16.0-cp313-cp313-win_amd64.whl",
   "wheels/idna-3.15-py3-none-any.whl",
   "wheels/numpy-2.4.4-cp311-cp311-win_amd64.whl",
   "wheels/numpy-2.4.4-cp313-cp313-win_amd64.whl",

@@ -1,4 +1,4 @@
-Wheels for compiled Python deps (Windows, Blender 4.5 / CP311).
+Wheels for compiled Python deps (Windows, Blender 4.5+).
 
 To add compiled deps:
 1) Drop the wheel file in this folder.
@@ -7,3 +7,4 @@ To add compiled deps:
 Notes:
 - Wheels must be unmodified.
 - Blender installs these into the extension's site-packages at enable time.
+- Include every Python ABI tag currently supported by the manifest, such as CP311 and CP313.

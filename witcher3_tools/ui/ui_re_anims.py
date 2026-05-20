@@ -8,6 +8,8 @@ Export: Samples w3_face_poses per frame -> temporary mesh + armature -> RE expor
 """
 
 import os
+import site
+import sys
 import bpy
 import logging
 from ..action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
@@ -24,12 +26,32 @@ _RE_PLUGIN_PATCHED = False
 #  Helpers
 # ---------------------------------------------------------------------------
 
+def _ensure_user_site_on_path():
+    user_site = getattr(site, "USER_SITE", "") or ""
+    if user_site and user_site not in sys.path:
+        sys.path.insert(0, user_site)
+
+
 def _is_re_plugin_available():
+    _ensure_user_site_on_path()
     try:
         from blender_re_animations_plugin import hdf_manager  # noqa: F401
         return True
     except Exception:
         return False
+
+
+def _is_h5py_available():
+    _ensure_user_site_on_path()
+    try:
+        import h5py  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _is_re_import_available():
+    return _is_h5py_available() or _is_re_plugin_available()
 
 
 def _is_main_armature(obj):
@@ -159,6 +181,269 @@ def _restore_re_phoneme_headers(orig_read):
 #  Import .re -> w3_face_poses
 # ---------------------------------------------------------------------------
 
+def _decode_h5_text(value):
+    try:
+        if hasattr(value, "item"):
+            value = value.item()
+    except Exception:
+        pass
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip("\x00")
+    return str(value or "").strip().strip("\x00")
+
+
+def _find_h5_dataset(hdf, dataset_name):
+    direct_path = f".re_curve_node/{dataset_name}"
+    if direct_path in hdf:
+        return hdf[direct_path]
+    if dataset_name in hdf:
+        return hdf[dataset_name]
+
+    found = None
+
+    def _visit(name, obj):
+        nonlocal found
+        if found is not None:
+            return
+        if name.rsplit("/", 1)[-1] == dataset_name and hasattr(obj, "dtype") and hasattr(obj, "shape"):
+            found = obj
+
+    hdf.visititems(_visit)
+    return found
+
+
+def _read_compound_trackdata(trackdata):
+    data = trackdata[()]
+    names = [str(name) for name in (getattr(data.dtype, "names", None) or [])]
+    if not names:
+        return None
+
+    frame_count = int(data.shape[0]) if getattr(data, "shape", None) else 0
+    if frame_count <= 0:
+        raise RuntimeError("RE trackdata has no frames")
+
+    normalised = []
+    field_values = {}
+    for name in names:
+        field_values[name] = data[name].reshape(frame_count, -1)
+
+    for frame in range(frame_count):
+        row = {}
+        for name in names:
+            row[name] = float(field_values[name][frame][0])
+        normalised.append(row)
+    return names, normalised
+
+
+def _read_curvekeys_trackdata(curvekeys, tracknames):
+    names = [_decode_h5_text(value) for value in tracknames[()].reshape(-1)]
+    names = [name for name in names if name]
+    if not names:
+        raise RuntimeError("RE tracknames dataset is empty")
+
+    values = curvekeys[()].reshape(-1)
+    try:
+        frame_count = int(curvekeys.parent.attrs.get(".numkeys", 0) or 0)
+    except Exception:
+        frame_count = 0
+    if frame_count <= 0:
+        if len(values) % len(names):
+            raise RuntimeError("RE curvekeys size does not match tracknames")
+        frame_count = len(values) // len(names)
+    if frame_count <= 0:
+        raise RuntimeError("RE curvekeys dataset has no frames")
+
+    expected = frame_count * len(names)
+    if len(values) < expected:
+        raise RuntimeError("RE curvekeys dataset is shorter than expected")
+    values = values[:expected].reshape(frame_count, len(names))
+    normalised = []
+    for frame in range(frame_count):
+        normalised.append({name: float(values[frame][index]) for index, name in enumerate(names)})
+    return names, normalised
+
+
+def _read_re_shape_key_frames_h5py(resolved_path):
+    _ensure_user_site_on_path()
+    try:
+        import h5py
+    except ImportError as exc:
+        raise RuntimeError("Python h5py is not available for direct .re reading") from exc
+
+    with h5py.File(resolved_path, "r") as hdf:
+        trackdata = _find_h5_dataset(hdf, "trackdata")
+        if trackdata is not None and getattr(trackdata.dtype, "names", None):
+            result = _read_compound_trackdata(trackdata)
+            if result is not None:
+                return result
+
+        curvekeys = _find_h5_dataset(hdf, "curvekeys")
+        tracknames = _find_h5_dataset(hdf, "tracknames")
+        if curvekeys is not None and tracknames is not None:
+            return _read_curvekeys_trackdata(curvekeys, tracknames)
+
+    raise RuntimeError("No supported RE curve dataset found")
+
+
+def _read_re_shape_key_frames_bridge(resolved_path):
+    _ensure_user_site_on_path()
+    try:
+        from blender_re_animations_plugin.hdf_manager import HdfManager
+        from blender_re_animations_plugin.asset_node import ReAssetNode
+    except ImportError:
+        raise RuntimeError("RE Animations Plugin not available")
+
+    if not resolved_path or not os.path.isfile(resolved_path):
+        raise FileNotFoundError(f".re file not found: {resolved_path}")
+
+    hdf = HdfManager()
+    try:
+        hdf.read_hdf_file(resolved_path)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read .re file: {exc} ({resolved_path})") from exc
+
+    shape_keys_data = None
+    for node in hdf.get_nodes():
+        if isinstance(node, ReAssetNode):
+            shape_key_container = getattr(node, 'shape_key_container', None)
+            if shape_key_container:
+                shape_keys_data = shape_key_container.shape_keys
+
+    if not shape_keys_data:
+        raise RuntimeError("No mimic / shape-key data in .re file")
+
+    all_morphs = set()
+    normalised = []
+    for frame_data in shape_keys_data:
+        merged = {}
+        if isinstance(frame_data, dict):
+            merged = frame_data
+        elif isinstance(frame_data, (list, tuple)):
+            for item in frame_data:
+                if isinstance(item, dict):
+                    merged.update(item)
+        all_morphs.update(merged.keys())
+        normalised.append(merged)
+
+    if not all_morphs:
+        raise RuntimeError("Shape-key data is empty")
+    return sorted(all_morphs), normalised
+
+
+def _read_re_shape_key_frames(resolved_path):
+    direct_error = None
+    try:
+        return _read_re_shape_key_frames_h5py(resolved_path)
+    except Exception as exc:
+        direct_error = exc
+        log.debug("Direct h5py .re read failed for %s: %s", resolved_path, exc)
+
+    try:
+        return _read_re_shape_key_frames_bridge(resolved_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read .re file. Bundled h5py: {direct_error}; RE bridge: {exc}"
+        ) from exc
+
+
+def import_re_mimic_file(context, filepath, armature, nla_track_name="mimic_import", start_frame=0.0, nla_mode="append"):
+    """Import an RE Animations/HDF .re file onto an armature's w3_face_poses bone."""
+    if not _is_main_armature(armature):
+        raise RuntimeError("Target must be the main armature with w3_face_poses")
+
+    resolved_path = _resolve_filepath(filepath)
+    morph_names, normalised = _read_re_shape_key_frames(resolved_path)
+    pose_bone = armature.pose.bones[CONTROL_BONE]
+
+    for name in morph_names:
+        if name not in pose_bone:
+            pose_bone[name] = 0.0
+            try:
+                pose_bone.id_properties_ui(name).update(
+                    min=0.0, max=1.0, soft_min=0.0, soft_max=1.0)
+            except Exception:
+                pass
+
+    base = os.path.splitext(os.path.basename(resolved_path))[0]
+    action = bpy.data.actions.new(name=f"{base}_mimic")
+    fcurves = {}
+    for name in morph_names:
+        data_path = f'pose.bones["{CONTROL_BONE}"]["{name}"]'
+        fcurves[name] = new_action_fcurve(action, armature, data_path=data_path)
+
+    nonzero_key_count = 0
+    max_abs_value = 0.0
+    for frame, values in enumerate(normalised):
+        for name, value in values.items():
+            fcurve = fcurves.get(name)
+            if fcurve is None:
+                continue
+            numeric_value = float(value)
+            abs_value = abs(numeric_value)
+            if abs_value > 1e-6:
+                nonzero_key_count += 1
+                max_abs_value = max(max_abs_value, abs_value)
+            fcurve.keyframe_points.add(1)
+            key = fcurve.keyframe_points[-1]
+            key.co = (frame, numeric_value)
+            key.interpolation = 'LINEAR'
+
+    keyed_fcurves = 0
+    for fcurve in fcurves.values():
+        if fcurve is None:
+            continue
+        if len(fcurve.keyframe_points):
+            keyed_fcurves += 1
+        fcurve.update()
+    if keyed_fcurves == 0:
+        raise RuntimeError("No usable morph curves were found in the .re file")
+
+    if armature.animation_data is None:
+        armature.animation_data_create()
+    armature.animation_data.use_nla = True
+    track = armature.animation_data.nla_tracks.get(nla_track_name)
+    if track is None:
+        track = armature.animation_data.nla_tracks.new()
+        track.name = nla_track_name
+
+    nla_mode = str(nla_mode or "append").lower()
+    insert = float(start_frame or 0.0)
+    if nla_mode == "replace":
+        for strip in list(track.strips):
+            track.strips.remove(strip)
+    elif nla_mode == "append":
+        for strip in track.strips:
+            insert = max(insert, float(getattr(strip, "frame_end", insert) or insert))
+
+    frame_count = max(1, len(normalised))
+    try:
+        strip = track.strips.new(action.name, int(round(insert)), action)
+        bind_strip_action_slot(strip, resolve_action_slot(action, target=armature, ensure=True))
+        strip.frame_start = insert
+        strip.frame_end = insert + frame_count
+        strip.blend_type = 'COMBINE'
+    except Exception:
+        armature.animation_data.action = action
+        if hasattr(armature.animation_data, "action_slot"):
+            slot = resolve_action_slot(action, target=armature, ensure=True)
+            if slot is not None:
+                armature.animation_data.action_slot = slot
+
+    try:
+        context.scene.frame_set(context.scene.frame_current)
+    except Exception:
+        pass
+
+    return {
+        "morph_count": keyed_fcurves,
+        "frame_count": frame_count,
+        "nonzero_key_count": nonzero_key_count,
+        "max_abs_value": max_abs_value,
+        "action": action.name,
+        "track": nla_track_name,
+    }
+
+
 class WITCH_OT_ImportREMimic(bpy.types.Operator, ImportHelper):
     """Import .re mimic animation onto w3_face_poses (Witcher 3 Tools)"""
     bl_idname = "witcher.import_re_mimic"
@@ -180,7 +465,7 @@ class WITCH_OT_ImportREMimic(bpy.types.Operator, ImportHelper):
     @classmethod
     def poll(cls, context):
         try:
-            return _is_re_plugin_available() and _is_main_armature(context.active_object)
+            return _is_re_import_available() and _is_main_armature(context.active_object)
         except Exception:
             return False
 
@@ -194,112 +479,23 @@ class WITCH_OT_ImportREMimic(bpy.types.Operator, ImportHelper):
             self.report({'ERROR'}, "Active object must be the main armature with w3_face_poses")
             return {'CANCELLED'}
 
-        pose_bone = armature.pose.bones[CONTROL_BONE]
-
-        # --- Read .re via RE plugin's HdfManager ---
         try:
-            from blender_re_animations_plugin.hdf_manager import HdfManager
-            from blender_re_animations_plugin.asset_node import ReAssetNode
-        except ImportError:
-            self.report({'ERROR'}, "RE Animations Plugin not available")
+            stats = import_re_mimic_file(
+                context,
+                self.filepath,
+                armature,
+                nla_track_name=self.nla_track_name,
+                start_frame=0.0,
+                nla_mode="append",
+            )
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
 
-        resolved_path = _resolve_filepath(self.filepath)
-        if not resolved_path or not os.path.isfile(resolved_path):
-            self.report({'ERROR'}, f".re file not found: {resolved_path or self.filepath}")
-            return {'CANCELLED'}
-
-        hdf = HdfManager()
-        try:
-            hdf.read_hdf_file(resolved_path)
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to read .re file: {e} ({resolved_path})")
-            return {'CANCELLED'}
-
-        # Extract shape-key frames
-        shape_keys_data = None
-        for n in hdf.get_nodes():
-            if isinstance(n, ReAssetNode):
-                skc = getattr(n, 'shape_key_container', None)
-                if skc:
-                    shape_keys_data = skc.shape_keys
-
-        if not shape_keys_data:
-            self.report({'ERROR'}, "No mimic / shape-key data in .re file")
-            return {'CANCELLED'}
-
-        # Collect morph names and normalise frame dicts
-        all_morphs = set()
-        normalised = []  # list[dict[str,float]]
-        for frame_data in shape_keys_data:
-            merged = {}
-            if isinstance(frame_data, dict):
-                merged = frame_data
-            elif isinstance(frame_data, (list, tuple)):
-                for d in frame_data:
-                    if isinstance(d, dict):
-                        merged.update(d)
-            all_morphs.update(merged.keys())
-            normalised.append(merged)
-
-        if not all_morphs:
-            self.report({'WARNING'}, "Shape-key data is empty")
-            return {'CANCELLED'}
-
-        # Ensure custom props exist on w3_face_poses
-        for name in all_morphs:
-            if name not in pose_bone:
-                pose_bone[name] = 0.0
-                try:
-                    pose_bone.id_properties_ui(name).update(
-                        min=0.0, max=1.0, soft_min=0.0, soft_max=1.0)
-                except Exception:
-                    pass
-
-        # Build action
-        base = os.path.splitext(os.path.basename(resolved_path))[0]
-        action = bpy.data.actions.new(name=f"{base}_mimic")
-        fcs = {}
-        for name in all_morphs:
-            dp = f'pose.bones["{CONTROL_BONE}"]["{name}"]'
-            fcs[name] = new_action_fcurve(action, armature, data_path=dp)
-
-        for f, vals in enumerate(normalised):
-            for name, value in vals.items():
-                fc = fcs.get(name)
-                if fc:
-                    fc.keyframe_points.add(1)
-                    kp = fc.keyframe_points[-1]
-                    kp.co = (f, float(value))
-                    kp.interpolation = 'LINEAR'
-
-        for fc in fcs.values():
-            fc.update()
-
-        # Push to NLA
-        if armature.animation_data is None:
-            armature.animation_data_create()
-        track = armature.animation_data.nla_tracks.get(self.nla_track_name)
-        if track is None:
-            track = armature.animation_data.nla_tracks.new()
-            track.name = self.nla_track_name
-
-        insert = 0
-        for s in track.strips:
-            insert = max(insert, int(s.frame_end) + 1)
-        try:
-            strip = track.strips.new(action.name, insert, action)
-            bind_strip_action_slot(strip, resolve_action_slot(action, target=armature, ensure=True))
-            strip.blend_type = 'COMBINE'
-        except Exception:
-            armature.animation_data.action = action
-            if hasattr(armature.animation_data, "action_slot"):
-                slot = resolve_action_slot(action, target=armature, ensure=True)
-                if slot is not None:
-                    armature.animation_data.action_slot = slot
-
-        self.report({'INFO'},
-                    f"Imported {len(all_morphs)} morphs x {len(normalised)} frames")
+        base = os.path.splitext(os.path.basename(_resolve_filepath(self.filepath)))[0]
+        silent = int(stats.get("nonzero_key_count", 0) or 0) <= 0
+        self.report({'WARNING'} if silent else {'INFO'},
+                    f"Imported {stats['morph_count']} morphs x {stats['frame_count']} frames{' (silent)' if silent else ''}")
 
         # Phoneme approximation
         if self.recreate_phonemes:
@@ -634,31 +830,35 @@ def _draw_viewport_menu(self, context):
     """3D viewport right-click -- only for main armature."""
     if not _is_main_armature(context.active_object):
         return
-    if not _is_re_plugin_available():
+    if not _is_re_import_available() and not _is_re_plugin_available():
         return
     layout = self.layout
     prev_ctx = layout.operator_context
     layout.operator_context = 'INVOKE_DEFAULT'
     layout.separator()
-    layout.operator(WITCH_OT_ImportREMimic.bl_idname,
-                    text="W3 Tools: Import .re Mimic", icon='IMPORT')
-    layout.operator(WITCH_OT_ExportREMimic.bl_idname,
-                    text="W3 Tools: Export .re Mimic", icon='EXPORT')
+    if _is_re_import_available():
+        layout.operator(WITCH_OT_ImportREMimic.bl_idname,
+                        text="W3 Tools: Import .re Mimic", icon='IMPORT')
+    if _is_re_plugin_available():
+        layout.operator(WITCH_OT_ExportREMimic.bl_idname,
+                        text="W3 Tools: Export .re Mimic", icon='EXPORT')
     layout.operator_context = prev_ctx
 
 
 def _draw_outliner_menu(self, context):
     """Outliner right-click -- show RE mimic import/export when available."""
-    if not _is_re_plugin_available():
+    if not _is_re_import_available() and not _is_re_plugin_available():
         return
     layout = self.layout
     prev_ctx = layout.operator_context
     layout.operator_context = 'INVOKE_DEFAULT'
     layout.separator()
-    layout.operator(WITCH_OT_ImportREMimic.bl_idname,
-                    text="W3 Tools: Import .re Mimic", icon='IMPORT')
-    layout.operator(WITCH_OT_ExportREMimic.bl_idname,
-                    text="W3 Tools: Export .re Mimic", icon='EXPORT')
+    if _is_re_import_available():
+        layout.operator(WITCH_OT_ImportREMimic.bl_idname,
+                        text="W3 Tools: Import .re Mimic", icon='IMPORT')
+    if _is_re_plugin_available():
+        layout.operator(WITCH_OT_ExportREMimic.bl_idname,
+                        text="W3 Tools: Export .re Mimic", icon='EXPORT')
     layout.operator_context = prev_ctx
 
 
