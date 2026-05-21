@@ -1,6 +1,8 @@
 
 import logging
+import inspect
 import os
+import re
 import time
 from collections import deque
 from datetime import datetime
@@ -33,8 +35,10 @@ from .ui_cutscene import (
     _sync_loaded_cutscene_state,
 )
 from .ui_cr2w_fields import (
+    WITCH_OT_ImportedFieldInfo,
     _draw_imported_class_sections,
     _format_imported_field_value,
+    _get_imported_field_type,
     _get_imported_field_value,
     _get_present_imported_fields,
 )
@@ -61,6 +65,17 @@ _DIALOGSET_EMOTIONAL_ITEM_CACHE = {}
 _DIALOGSET_POSE_ITEM_CACHE = {}
 _DIALOGSET_MIMICS_STATE_ITEM_CACHE = []
 _DIALOGSET_SYNCING_SLOT_PROPS = False
+_W2SCENE_ELEMENT_LIST_MAX_ROWS = 5
+_W2SCENE_EVENT_LIST_MAX_ROWS = 6
+_W2SCENE_SCHEMA_ATTR_SKIP = {
+    "importedClassFieldSchema",
+    "originalEventType",
+    "presentPropertyNames",
+    "presentTemplateProps",
+}
+_W2SCENE_CLASS_FIELD_SCHEMA_CACHE = {}
+_W2SCENE_CLASS_FIELD_TYPE_CACHE = {}
+_W2SCENE_NESTED_FIELD_MAX_DEPTH = 4
 
 
 class _W2SceneImportProfileLogFormatter(logging.Formatter):
@@ -313,12 +328,29 @@ class WitcherSection(bpy.types.PropertyGroup):
     is_gameplay: BoolProperty(default=False)
     is_important: BoolProperty(default=False)
 
+
+class W2SceneFieldNestedItem(PropertyGroup):
+    parent_key: StringProperty(default="")
+    item_key: StringProperty(default="")
+    label: StringProperty(default="")
+    type_text: StringProperty(default="")
+    value_text: StringProperty(default="")
+    depth: IntProperty(default=0)
+    has_children: BoolProperty(default=False)
+    show_children: BoolProperty(default=False)
+
+
 class W2SceneFieldItem(PropertyGroup):
     section_index: IntProperty(default=-1)
     class_name: StringProperty(default="")
     field_name: StringProperty(default="")
+    type_text: StringProperty(default="")
     value_text: StringProperty(default="")
     is_set: BoolProperty(default=False)
+    show_unset: BoolProperty(name="Show Unset", default=False)
+    has_children: BoolProperty(default=False)
+    show_children: BoolProperty(default=False)
+    children: CollectionProperty(type=W2SceneFieldNestedItem)
 
 
 class W2SceneActorItem(PropertyGroup):
@@ -393,6 +425,7 @@ class W2SceneSectionElementItem(PropertyGroup):
     section_index: IntProperty(default=-1)
     source_index: IntProperty(default=-1)
     element_type: StringProperty(default="")
+    class_hierarchy: StringProperty(default="")
     element_id: StringProperty(default="")
     display_name: StringProperty(default="")
     start_time: FloatProperty(default=0.0)
@@ -402,12 +435,14 @@ class W2SceneSectionElementItem(PropertyGroup):
     line_id: StringProperty(default="")
     line_text: StringProperty(default="")
     detail_text: StringProperty(default="")
+    class_fields: CollectionProperty(type=W2SceneFieldItem)
 
 
 class W2SceneSectionEventItem(PropertyGroup):
     section_index: IntProperty(default=-1)
     source_index: IntProperty(default=-1)
     event_type: StringProperty(default="")
+    class_hierarchy: StringProperty(default="")
     event_name: StringProperty(name="Event Name", default="")
     start_time: FloatProperty(name="Start Time", default=0.0)
     start_position: FloatProperty(name="Start Position", default=0.0)
@@ -423,6 +458,7 @@ class W2SceneSectionEventItem(PropertyGroup):
     guid: StringProperty(name="GUID", default="")
     is_muted: BoolProperty(name="Muted", default=False)
     detail_text: StringProperty(default="")
+    class_fields: CollectionProperty(type=W2SceneFieldItem)
 
 
 class W2SceneChoiceItem(PropertyGroup):
@@ -597,13 +633,18 @@ def _w2scene_ptr_value(ptr):
     return value if isinstance(value, int) else None
 
 
+def _w2scene_clean_text(value):
+    text = str(value or "").strip()
+    return "" if " object at 0x" in text else text
+
+
 def _w2scene_prop_text(value, default=""):
     if value is None:
         return default
     if isinstance(value, bool):
         return "True" if value else "False"
     if isinstance(value, (int, float, str)):
-        text = str(value).strip()
+        text = _w2scene_clean_text(value)
         return text or default
     guid = getattr(value, "GUID", None)
     guid_text = str(getattr(guid, "GuidString", "") or "").strip()
@@ -611,7 +652,7 @@ def _w2scene_prop_text(value, default=""):
         return guid_text
     try:
         text = prop_to_string(value)
-        if text:
+        if text and _w2scene_clean_text(text):
             return text
     except Exception:
         pass
@@ -636,16 +677,33 @@ def _w2scene_prop_text(value, default=""):
             attr = getattr(attr, "val", "")
         if hasattr(attr, "String"):
             attr = getattr(attr, "String", "")
-        text = str(attr or "").strip()
+        text = _w2scene_clean_text(attr)
         if text:
             return text
     return default
 
 
+def _w2scene_localized_string_object(prop):
+    if prop is None:
+        return None
+    if hasattr(prop, "val") and hasattr(prop, "text"):
+        return prop
+    string_obj = getattr(prop, "String", None)
+    if string_obj is not None and hasattr(string_obj, "val") and hasattr(string_obj, "text"):
+        return string_obj
+    return None
+
+
 def _w2scene_localized_line_id(prop):
+    string_obj = _w2scene_localized_string_object(prop)
+    if string_obj is not None:
+        return str(getattr(string_obj, "val", "") or "").strip()
+
     line_id = dialog_language.localized_string_id(prop)
     if line_id:
         return line_id
+    if str(getattr(prop, "theType", "") or "") == "LocalizedString":
+        return ""
     return _w2scene_prop_text(prop)
 
 
@@ -692,21 +750,262 @@ def _w2scene_is_set(value):
     return True
 
 
-def _w2scene_fill_field_items(collection, imported_data, schema, section_index=-1):
+def _w2scene_type_class(class_name):
+    cls = getattr(w3_types, str(class_name or ""), None)
+    return cls if isinstance(cls, type) else None
+
+
+def _w2scene_schema_attr_names(imported_data):
+    if imported_data is None:
+        return []
+    result = []
+    for name in vars(imported_data).keys():
+        if not name or name.startswith("_") or name in _W2SCENE_SCHEMA_ATTR_SKIP:
+            continue
+        result.append(name)
+    return result
+
+
+def _w2scene_class_attr_names(cls):
+    if not isinstance(cls, type):
+        return ()
+    try:
+        imported_data = cls()
+    except Exception:
+        return ()
+    return tuple(_w2scene_schema_attr_names(imported_data))
+
+
+def _w2scene_class_field_types(cls):
+    if not isinstance(cls, type):
+        return {}
+    if cls in _W2SCENE_CLASS_FIELD_TYPE_CACHE:
+        return _W2SCENE_CLASS_FIELD_TYPE_CACHE[cls]
+
+    result = {}
+    try:
+        source = inspect.getsource(cls.__init__)
+    except Exception:
+        source = ""
+
+    for line in source.splitlines():
+        attr_match = re.search(r"\bself\.([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if not attr_match or "#" not in line:
+            continue
+
+        field_name = attr_match.group(1)
+        comment = line.split("#", 1)[1].strip()
+        type_match = re.search(r'Type="([^"]+)"', comment)
+        if type_match:
+            result[field_name] = type_match.group(1).strip()
+            continue
+
+        type_text = comment.strip().strip('/>" ')
+        if type_text and not type_text.startswith("<"):
+            result[field_name] = type_text
+
+    _W2SCENE_CLASS_FIELD_TYPE_CACHE[cls] = result
+    return result
+
+
+def _w2scene_own_class_fields(cls):
+    attr_names = _w2scene_class_attr_names(cls)
+    inherited = set()
+    for base_cls in getattr(cls, "__bases__", ()) or ():
+        inherited.update(_w2scene_class_attr_names(base_cls))
+
+    field_types = _w2scene_class_field_types(cls)
+    return tuple((name, field_types.get(name, "")) for name in attr_names if name not in inherited)
+
+
+def _w2scene_class_chain(cls, root_class_name):
+    root_cls = _w2scene_type_class(root_class_name)
+    if not isinstance(cls, type) or root_cls is None:
+        return ()
+    mro = list(getattr(cls, "__mro__", ()) or ())
+    if root_cls in mro:
+        return tuple(reversed(mro[:mro.index(root_cls) + 1]))
+    if issubclass(cls, root_cls):
+        return (root_cls, cls)
+    return ()
+
+
+def _w2scene_class_schema(class_name, root_class_name):
+    cache_key = (str(class_name or ""), str(root_class_name or ""))
+    if cache_key in _W2SCENE_CLASS_FIELD_SCHEMA_CACHE:
+        return _W2SCENE_CLASS_FIELD_SCHEMA_CACHE[cache_key]
+
+    cls = _w2scene_type_class(class_name)
+    schema = []
+    for schema_cls in _w2scene_class_chain(cls, root_class_name):
+        fields = _w2scene_own_class_fields(schema_cls)
+        if fields or schema_cls.__name__ == root_class_name:
+            schema.append((schema_cls.__name__, fields))
+
+    result = tuple(schema)
+    _W2SCENE_CLASS_FIELD_SCHEMA_CACHE[cache_key] = result
+    return result
+
+
+def _w2scene_schema_for_imported_data(imported_data, root_class_name):
+    class_name = imported_data.__class__.__name__ if imported_data is not None else str(root_class_name or "")
+    schema = list(_w2scene_class_schema(class_name, root_class_name))
+    if not schema:
+        schema = [(class_name, ())]
+
+    known_fields = {
+        field_name
+        for _class_name, fields in schema
+        for field_name, _default in fields
+    }
+    extra_fields = [
+        name for name in _w2scene_schema_attr_names(imported_data)
+        if name not in known_fields
+    ]
+    if extra_fields:
+        class_name, fields = schema[-1]
+        schema[-1] = (
+            class_name,
+            tuple(fields) + tuple((name, None) for name in extra_fields),
+        )
+    return tuple(schema)
+
+
+def _w2scene_schema_hierarchy_label(schema):
+    return " > ".join(class_name for class_name, _fields in schema if class_name)
+
+
+def _w2scene_schema_from_field_items(field_items):
+    schema = []
+    class_indexes = {}
+    for item in field_items or []:
+        class_name = str(getattr(item, "class_name", "") or "").strip()
+        field_name = str(getattr(item, "field_name", "") or "").strip()
+        if not class_name or not field_name:
+            continue
+        if class_name not in class_indexes:
+            class_indexes[class_name] = len(schema)
+            schema.append((class_name, []))
+        schema[class_indexes[class_name]][1].append((field_name, None))
+    return tuple((class_name, tuple(fields)) for class_name, fields in schema)
+
+
+def _w2scene_schema_with_field_types(schema):
+    typed_schema = []
+    for class_name, fields in schema or []:
+        field_types = _w2scene_class_field_types(_w2scene_type_class(class_name))
+        typed_fields = []
+        for field_entry in fields or []:
+            field_name = field_entry[0] if field_entry else ""
+            schema_type = field_entry[1] if len(field_entry) > 1 else ""
+            typed_fields.append((
+                field_name,
+                str(schema_type or "").strip() or field_types.get(field_name, ""),
+            ))
+        typed_schema.append((class_name, tuple(typed_fields)))
+    return tuple(typed_schema)
+
+
+def _w2scene_schema_class_applies(imported_data, class_name):
+    if imported_data is None:
+        return False
+    if class_name == imported_data.__class__.__name__:
+        return True
+    cls = _w2scene_type_class(class_name)
+    return cls is not None and isinstance(imported_data, cls)
+
+
+def _w2scene_nested_label(value, index):
+    name = (
+        str(getattr(value, "theName", "") or "").strip()
+        or str(getattr(value, "elementName", "") or "").strip()
+    )
+    if name:
+        return name
+    return f"[{index}]"
+
+
+def _w2scene_nested_pairs(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return []
+
+    if isinstance(value, dict):
+        return [(str(key), item_value) for key, item_value in value.items()]
+
+    if isinstance(value, (list, tuple, set)):
+        return [(f"[{index}]", item_value) for index, item_value in enumerate(list(value))]
+
+    for attr_name in ("MoreProps", "More", "PROPS"):
+        items = getattr(value, attr_name, None)
+        if items:
+            return [
+                (_w2scene_nested_label(item_value, index), item_value)
+                for index, item_value in enumerate(list(items))
+            ]
+
+    for attr_name in ("value", "elements", "Handles"):
+        values = getattr(value, attr_name, None)
+        if isinstance(values, (list, tuple, set)):
+            return [(f"[{index}]", item_value) for index, item_value in enumerate(list(values))]
+
+    return []
+
+
+def _w2scene_field_value_summary(value, source_filepath="", context=None):
+    localized_text = _w2scene_localized_field_display(value, source_filepath, context)
+    if localized_text:
+        return localized_text
+
+    child_pairs = _w2scene_nested_pairs(value)
+    if child_pairs:
+        scalar_summary = _format_imported_field_value(value)
+        if scalar_summary and scalar_summary != "\"\"":
+            return scalar_summary
+        if all(label.startswith("[") for label, _value in child_pairs):
+            return f"{len(child_pairs)} items"
+        return f"{len(child_pairs)} fields"
+    return _format_imported_field_value(value)
+
+
+def _w2scene_fill_nested_field_entries(collection, value, parent_key="", depth=0, source_filepath="", context=None):
+    if depth > _W2SCENE_NESTED_FIELD_MAX_DEPTH:
+        return
+
+    for index, (label, child_value) in enumerate(_w2scene_nested_pairs(value)):
+        item_key = f"{parent_key}/{index}" if parent_key else str(index)
+        child_pairs = _w2scene_nested_pairs(child_value)
+
+        entry = collection.add()
+        entry.parent_key = parent_key
+        entry.item_key = item_key
+        entry.label = str(label or f"[{index}]")
+        entry.type_text = _get_imported_field_type(child_value)
+        entry.value_text = _w2scene_field_value_summary(child_value, source_filepath, context)
+        entry.depth = int(depth)
+        entry.has_children = bool(child_pairs) and depth < _W2SCENE_NESTED_FIELD_MAX_DEPTH
+
+        if entry.has_children:
+            _w2scene_fill_nested_field_entries(collection, child_value, item_key, depth + 1, source_filepath, context)
+
+
+def _w2scene_fill_field_items(collection, imported_data, schema, section_index=-1, source_filepath="", context=None):
     if imported_data is None:
         return
     for class_name, fields in schema:
-        if class_name != imported_data.__class__.__name__ and not isinstance(imported_data, getattr(w3_types, class_name, object)):
-            if class_name not in ("CStorySceneSection", "CStoryScene"):
-                continue
-        for field_name, _default in fields:
+        if not _w2scene_schema_class_applies(imported_data, class_name):
+            continue
+        for field_name, schema_type in fields:
             value = getattr(imported_data, field_name, None)
             item = collection.add()
             item.section_index = int(section_index)
             item.class_name = class_name
             item.field_name = field_name
+            item.type_text = str(schema_type or "").strip() or _get_imported_field_type(value)
             item.is_set = _w2scene_is_set(value)
-            item.value_text = _format_imported_field_value(value) if item.is_set else "<unset>"
+            item.value_text = _w2scene_field_value_summary(value, source_filepath, context) if item.is_set else "<unset>"
+            if item.is_set:
+                _w2scene_fill_nested_field_entries(item.children, value, source_filepath=source_filepath, context=context)
+                item.has_children = len(item.children) > 0
 
 
 def _w2scene_load_chunk_object(story_scene, ptr_value):
@@ -770,12 +1069,38 @@ def _w2scene_first_reachable_section_chunk(story_scene, start_ptr):
 
 def _w2scene_localized_text(prop, filepath="", context=None):
     line_id = dialog_language.localized_string_id(prop)
+    if not line_id:
+        line_id = _w2scene_localized_line_id(prop)
     text = ""
     if line_id:
         text = _w2scene_resolve_line_text(line_id, filepath, context)
     if not text:
-        text = _w2scene_prop_text(prop)
+        string_obj = _w2scene_localized_string_object(prop)
+        if string_obj is not None:
+            try:
+                text = str(getattr(string_obj, "text", "") or "").strip()
+            except Exception:
+                text = ""
+            if text == str(line_id or "").strip():
+                text = ""
+        elif str(getattr(prop, "theType", "") or "") != "LocalizedString":
+            text = _w2scene_prop_text(prop)
     return str(line_id or "").strip(), str(text or "").strip()
+
+
+def _w2scene_localized_field_display(prop, filepath="", context=None):
+    string_obj = _w2scene_localized_string_object(prop)
+    if string_obj is None and str(getattr(prop, "theType", "") or "") != "LocalizedString":
+        return ""
+
+    line_id, text = _w2scene_localized_text(prop, filepath, context)
+    if text and line_id and text != line_id:
+        return f"{text} ({line_id})"
+    if text:
+        return text
+    if line_id:
+        return f"Unresolved LocalizedString: {line_id}"
+    return "\"\""
 
 
 def _w2scene_element_label(element):
@@ -883,8 +1208,16 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
     scene.witcher_loaded_w2scene_path = filepath
     scene.witcher_loaded_w2scene_name = os.path.basename(filepath)
     scene.witcher_w2scene_repo_path = _derive_w2scene_repo_path(bpy.context, filepath)
+    root_field_schema = _w2scene_schema_with_field_types(_W2SCENE_ROOT_FIELD_SCHEMA)
+    section_field_schema = _w2scene_schema_with_field_types(_W2SCENE_SECTION_FIELD_SCHEMA)
 
-    _w2scene_fill_field_items(scene.witcher_w2scene_root_fields, story_scene, _W2SCENE_ROOT_FIELD_SCHEMA)
+    _w2scene_fill_field_items(
+        scene.witcher_w2scene_root_fields,
+        story_scene,
+        root_field_schema,
+        source_filepath=filepath,
+        context=bpy.context,
+    )
 
     total_elements = 0
     total_events = 0
@@ -935,6 +1268,16 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
             el_item.section_index = section_index
             el_item.source_index = ptr or -1
             el_item.element_type = element.__class__.__name__ if element is not None else "Unknown"
+            element_schema = _w2scene_schema_for_imported_data(element, "CStorySceneElement")
+            el_item.class_hierarchy = _w2scene_schema_hierarchy_label(element_schema)
+            _w2scene_fill_field_items(
+                el_item.class_fields,
+                element,
+                element_schema,
+                section_index=section_index,
+                source_filepath=filepath,
+                context=bpy.context,
+            )
             el_item.element_id = element_id
             el_item.display_name = element_meta_by_ptr[ptr]["label"]
             el_item.start_time = section_duration
@@ -1029,7 +1372,14 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
             section_duration += choice_duration
             sec_item.duration = section_duration
 
-        _w2scene_fill_field_items(scene.witcher_w2scene_section_fields, section, _W2SCENE_SECTION_FIELD_SCHEMA, section_index=section_index)
+        _w2scene_fill_field_items(
+            scene.witcher_w2scene_section_fields,
+            section,
+            section_field_schema,
+            section_index=section_index,
+            source_filepath=filepath,
+            context=bpy.context,
+        )
 
         for event_index, event in enumerate(events):
             event_type = event.__class__.__name__
@@ -1047,6 +1397,16 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
             ev_item.section_index = section_index
             ev_item.source_index = event_index
             ev_item.event_type = event_type
+            event_schema = _w2scene_schema_for_imported_data(event, "CStorySceneEvent")
+            ev_item.class_hierarchy = _w2scene_schema_hierarchy_label(event_schema)
+            _w2scene_fill_field_items(
+                ev_item.class_fields,
+                event,
+                event_schema,
+                section_index=section_index,
+                source_filepath=filepath,
+                context=bpy.context,
+            )
             ev_item.event_name = _w2scene_prop_text(getattr(event, "eventName", None))
             ev_item.start_position = start_position
             ev_item.start_time = element_start + (element_duration * start_position)
@@ -1858,6 +2218,19 @@ def _w2scene_element_icon(element_type):
     return "TEXT"
 
 
+def _w2scene_compact_class_name(class_name, *prefixes):
+    text = str(class_name or "").strip()
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text or "Item"
+
+
+def _w2scene_list_rows(item_count, max_rows):
+    return min(max(1, int(item_count or 0)), max_rows)
+
+
 class WITCH_UL_W2SceneActorList(UIList):
     bl_idname = "WITCH_UL_W2SceneActorList"
     layout_type = "DEFAULT"
@@ -1958,14 +2331,13 @@ class WITCH_UL_W2SceneElementList(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
-            row.label(text=item.display_name or item.element_id or item.element_type, icon=_w2scene_element_icon(item.element_type))
-            cls_badge = row.row(align=True)
-            cls_badge.enabled = False
-            cls_badge.scale_x = 0.75
-            cls_badge.label(text=item.element_type.replace("CStoryScene", ""))
-            row.label(text=f"{item.start_time:.2f}s")
-            if item.duration > 0.0:
-                row.label(text=f"+{item.duration:.2f}s")
+            element_type = str(getattr(item, "element_type", "") or "")
+            label = (
+                str(getattr(item, "display_name", "") or "").strip()
+                or str(getattr(item, "element_id", "") or "").strip()
+                or _w2scene_compact_class_name(element_type, "CStoryScene")
+            )
+            row.label(text=label, icon=_w2scene_element_icon(element_type), translate=False)
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text="")
@@ -1989,18 +2361,12 @@ class WITCH_UL_W2SceneEventList(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
-            row.label(text=_w2scene_event_label(item), icon=_w2scene_event_icon(item.event_type))
-            cls_badge = row.row(align=True)
-            cls_badge.enabled = False
-            cls_badge.scale_x = 0.75
-            cls_badge.label(text=item.event_type.replace("CStorySceneEvent", "").replace("CStoryScene", ""))
-            if item.actor:
-                row.label(text=item.actor, icon='ARMATURE_DATA')
-            if item.target:
-                row.label(text=f"-> {item.target}")
-            row.label(text=f"{item.start_time:.2f}s")
-            if item.duration > 0.0:
-                row.label(text=f"+{item.duration:.2f}s")
+            event_type = str(getattr(item, "event_type", "") or "")
+            row.label(text="", icon='HIDE_ON' if bool(getattr(item, "is_muted", False)) else 'BLANK1')
+            label = str(_w2scene_event_label(item) or "").strip()
+            if label == event_type:
+                label = _w2scene_compact_class_name(event_type, "CStorySceneEvent", "CStoryScene")
+            row.label(text=label or "Event", icon=_w2scene_event_icon(event_type), translate=False)
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text="")
@@ -2026,6 +2392,15 @@ def _draw_w2scene_readonly_props(layout, item, fields):
             col.prop(item, prop_name, text=label)
 
 
+def _draw_w2scene_copyable_props(layout, item, fields):
+    col = layout.column(align=True)
+    col.use_property_split = True
+    col.use_property_decorate = False
+    for prop_name, label in fields:
+        if hasattr(item, prop_name):
+            col.prop(item, prop_name, text=label)
+
+
 def _draw_w2scene_scene_tab(layout, scene):
     path = str(getattr(scene, "witcher_loaded_w2scene_path", "") or "").strip()
     repo_path = str(getattr(scene, "witcher_w2scene_repo_path", "") or "").strip()
@@ -2040,13 +2415,13 @@ def _draw_w2scene_scene_tab(layout, scene):
     field_box = layout.box()
     header = field_box.row(align=True)
     header.label(text="Scene Fields", icon='PROPERTIES')
-    header.prop(scene, "witcher_w2scene_show_unset_fields", text="Show Unset", toggle=True)
     _draw_imported_class_sections(
         field_box,
         list(getattr(scene, "witcher_w2scene_root_fields", [])),
         _W2SCENE_ROOT_FIELD_SCHEMA,
-        bool(getattr(scene, "witcher_w2scene_show_unset_fields", False)),
+        False,
         "No scene fields loaded.",
+        per_class_show_unset=True,
     )
 
 
@@ -2144,7 +2519,7 @@ def _draw_w2scene_sections_tab(layout, scene):
         "WITCH_UL_W2SceneElementList", "",
         scene, "witcher_w2scene_section_element_items",
         scene, "witcher_w2scene_element_index",
-        rows=min(max(1, section.element_count), 7),
+        rows=_w2scene_list_rows(section.element_count, _W2SCENE_ELEMENT_LIST_MAX_ROWS),
     )
     elem = _w2scene_selected_item(
         getattr(scene, "witcher_w2scene_section_element_items", []),
@@ -2152,18 +2527,32 @@ def _draw_w2scene_sections_tab(layout, scene):
         lambda item: int(getattr(item, "section_index", -1)) == section_index,
     )
     if elem is not None:
-        _draw_w2scene_readonly_props(elem_box, elem, [
-            ("element_type", "type"),
-            ("element_id", "elementID"),
+        elem_detail = elem_box.box()
+        elem_header = elem_detail.row(align=True)
+        elem_header.label(text=elem.element_type or "Element", icon=_w2scene_element_icon(elem.element_type))
+        elem_meta = elem_detail.column(align=True)
+        elem_meta.use_property_split = True
+        elem_meta.use_property_decorate = False
+        elem_meta.prop(elem, "class_hierarchy", text="Inheritance")
+        elem_detail.separator(factor=0.3)
+        elem_detail.label(text="Resolved", icon='INFO')
+        _draw_w2scene_copyable_props(elem_detail, elem, [
             ("display_name", "name"),
             ("start_time", "start"),
             ("duration", "duration"),
-            ("actor", "actor"),
-            ("target", "target"),
             ("line_text", "LocalizedString.text"),
             ("line_id", "dialogLine"),
             ("detail_text", "details"),
         ])
+        elem_fields = list(getattr(elem, "class_fields", []) or [])
+        _draw_imported_class_sections(
+            elem_detail,
+            elem_fields,
+            _w2scene_schema_from_field_items(elem_fields),
+            False,
+            "No set element fields.",
+            per_class_show_unset=True,
+        )
 
     event_box = detail.box()
     event_box.label(text="Events", icon='KEYFRAME')
@@ -2171,7 +2560,7 @@ def _draw_w2scene_sections_tab(layout, scene):
         "WITCH_UL_W2SceneEventList", "",
         scene, "witcher_w2scene_section_event_items",
         scene, "witcher_w2scene_event_index",
-        rows=min(max(1, section.event_count), 9),
+        rows=_w2scene_list_rows(section.event_count, _W2SCENE_EVENT_LIST_MAX_ROWS),
     )
     event = _w2scene_selected_item(
         getattr(scene, "witcher_w2scene_section_event_items", []),
@@ -2186,23 +2575,29 @@ def _draw_w2scene_sections_tab(layout, scene):
             op = ev_header.operator(WITCH_OT_W2ScenePreviewCameraEvent.bl_idname, text="Preview", icon='VIEW_CAMERA')
             op.section_index = section_index
             op.source_index = int(getattr(event, "source_index", -1))
-        _draw_w2scene_readonly_props(ev_detail, event, [
-            ("event_name", "eventName"),
+        ev_meta = ev_detail.column(align=True)
+        ev_meta.use_property_split = True
+        ev_meta.use_property_decorate = False
+        ev_meta.prop(event, "class_hierarchy", text="Inheritance")
+        ev_detail.separator(factor=0.3)
+        ev_detail.label(text="Resolved", icon='INFO')
+        _draw_w2scene_copyable_props(ev_detail, event, [
             ("scene_element_id", "sceneElement"),
             ("start_time", "start"),
-            ("start_position", "startPosition"),
             ("duration", "duration"),
             ("duration_raw", "rawDuration"),
-            ("actor", "actor"),
-            ("target", "target"),
-            ("track_name", "track"),
-            ("animation_name", "animation"),
             ("camera_name", "camera"),
-            ("effect_name", "effect"),
-            ("guid", "GUID"),
-            ("is_muted", "muted"),
             ("detail_text", "details"),
         ])
+        event_fields = list(getattr(event, "class_fields", []) or [])
+        _draw_imported_class_sections(
+            ev_detail,
+            event_fields,
+            _w2scene_schema_from_field_items(event_fields),
+            False,
+            "No set event fields.",
+            per_class_show_unset=True,
+        )
 
     fields = [
         item for item in getattr(scene, "witcher_w2scene_section_fields", [])
@@ -2211,13 +2606,13 @@ def _draw_w2scene_sections_tab(layout, scene):
     fields_box = detail.box()
     header = fields_box.row(align=True)
     header.label(text="Section Fields", icon='PROPERTIES')
-    header.prop(scene, "witcher_w2scene_show_unset_fields", text="Show Unset", toggle=True)
     _draw_imported_class_sections(
         fields_box,
         fields,
         _W2SCENE_SECTION_FIELD_SCHEMA,
-        bool(getattr(scene, "witcher_w2scene_show_unset_fields", False)),
+        False,
         "No set section fields.",
+        per_class_show_unset=True,
     )
 
 
@@ -3104,6 +3499,8 @@ class WITCH_OT_ApplyDialogsetSlotMimics(bpy.types.Operator):
 
 classes = [
     WitcherSection,
+    WITCH_OT_ImportedFieldInfo,
+    W2SceneFieldNestedItem,
     W2SceneFieldItem,
     W2SceneActorItem,
     W2SceneDialogsetItem,

@@ -1,7 +1,10 @@
 import logging
+import csv
 import os
 import re
+import sqlite3
 import time
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +99,12 @@ _VOICE_LANGUAGE_ORDER = (
 _KNOWN_LANGUAGE_ORDER = tuple(dict.fromkeys(_TEXT_LANGUAGE_ORDER + _VOICE_LANGUAGE_ORDER + tuple(_LANGUAGE_LABELS)))
 
 _W3STRINGS_CACHE = {}
+_REDKIT_PROJECT_STRINGS_CACHE = {}
+_REDKIT_EDITOR_DB_CACHE = {}
+_REDKIT_EDITOR_DB_NAMES = (
+    "LocalEditorStringDataBaseW3_UTF8_mod.db",
+    "LocalEditorStringDataBaseW3_UTF8.db",
+)
 _LANGUAGE_SCAN_CACHE = {
     "base_path": None,
     "scanned_at": 0.0,
@@ -526,6 +535,221 @@ def _resolve_from_source_table(line_key, source_filepath, language):
     return ""
 
 
+def _redkit_project_string_roots(source_filepath=""):
+    roots = []
+
+    source_path = str(source_filepath or "").strip()
+    if source_path and os.path.isabs(source_path):
+        try:
+            path = Path(source_path)
+            parent = path if path.is_dir() else path.parent
+            for candidate in (parent, *parent.parents):
+                if (candidate / "LocalEditorStringDataBaseW3_UTF8_mod_export.csv").is_file():
+                    roots.append(candidate)
+                    break
+        except Exception:
+            log.debug("Could not inspect REDkit string roots for %s", source_filepath, exc_info=True)
+
+    try:
+        import bpy
+        from . import get_all_addon_prefs
+
+        prefs = get_all_addon_prefs(getattr(bpy, "context", None))
+        for item in getattr(prefs, "redkit_projects", []) or []:
+            path = str(getattr(item, "path", "") or "").strip()
+            if not path:
+                continue
+            try:
+                path = bpy.path.abspath(path)
+            except Exception:
+                pass
+            candidate = Path(os.path.normpath(path))
+            if (candidate / "LocalEditorStringDataBaseW3_UTF8_mod_export.csv").is_file():
+                roots.append(candidate)
+    except Exception:
+        pass
+
+    unique = []
+    seen = set()
+    for root in roots:
+        key = os.path.normcase(os.path.normpath(str(root)))
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def _load_redkit_project_strings_map(project_root, language):
+    try:
+        from .lipsync import redkit_project
+
+        csv_name = redkit_project.PROJECT_STRINGS_CSV
+        language_column = redkit_project._language_column(language)
+    except Exception:
+        csv_name = "LocalEditorStringDataBaseW3_UTF8_mod_export.csv"
+        language_column = str(language or "en").strip().upper() or "EN"
+
+    csv_path = Path(project_root) / csv_name
+    try:
+        mtime = csv_path.stat().st_mtime
+    except OSError:
+        return {}
+
+    cache_key = (os.path.normcase(os.path.normpath(str(csv_path))), mtime, language_column)
+    cached = _REDKIT_PROJECT_STRINGS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    strings = {}
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter=";")
+            for row in reader:
+                try:
+                    line_key = int(str(row.get("ID", "") or "").strip())
+                except (TypeError, ValueError):
+                    continue
+                text = str(row.get(language_column, "") or row.get("EN", "") or "").strip()
+                if text:
+                    strings[line_key] = text
+    except Exception:
+        log.debug("Could not read REDkit project strings: %s", csv_path, exc_info=True)
+
+    _REDKIT_PROJECT_STRINGS_CACHE[cache_key] = strings
+    return strings
+
+
+def _resolve_from_redkit_project_strings(line_key, source_filepath, language):
+    for root in _redkit_project_string_roots(source_filepath):
+        text = _load_redkit_project_strings_map(root, language).get(line_key, "")
+        if text:
+            return text
+    return ""
+
+
+def _redkit_editor_db_roots(source_filepath=""):
+    roots = []
+
+    source_path = str(source_filepath or "").strip()
+    if source_path and os.path.isabs(source_path):
+        try:
+            path = Path(source_path)
+            parent = path if path.is_dir() else path.parent
+            for candidate in (parent, *parent.parents):
+                if any((candidate / db_name).is_file() for db_name in _REDKIT_EDITOR_DB_NAMES):
+                    roots.append(candidate)
+                    break
+        except Exception:
+            log.debug("Could not inspect REDkit DB roots for %s", source_filepath, exc_info=True)
+
+    for root in _source_root_candidates(source_filepath):
+        candidate = Path(root)
+        if any((candidate / db_name).is_file() for db_name in _REDKIT_EDITOR_DB_NAMES):
+            roots.append(candidate)
+
+    try:
+        import bpy
+        from . import get_all_addon_prefs
+
+        prefs = get_all_addon_prefs(getattr(bpy, "context", None))
+        depot_path = str(getattr(prefs, "redkit_depot_path", "") or "").strip()
+        if depot_path:
+            try:
+                depot_path = bpy.path.abspath(depot_path)
+            except Exception:
+                pass
+            candidate = Path(os.path.normpath(depot_path))
+            if any((candidate / db_name).is_file() for db_name in _REDKIT_EDITOR_DB_NAMES):
+                roots.append(candidate)
+    except Exception:
+        pass
+
+    unique = []
+    seen = set()
+    for root in roots:
+        key = os.path.normcase(os.path.normpath(str(root)))
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def _redkit_editor_db_language_chain(cursor, language):
+    rows = cursor.execute("SELECT ID, LANG, FALLBACK FROM LANGUAGES").fetchall()
+    id_by_lang = {str(lang or "").strip().upper(): lang_id for lang_id, lang, _fallback in rows}
+    fallback_by_id = {lang_id: fallback for lang_id, _lang, fallback in rows}
+
+    requested = str(language or "en").strip().upper()
+    start_id = id_by_lang.get(requested) or id_by_lang.get("EN")
+    chain = []
+    seen = set()
+    current_id = start_id
+    while current_id and current_id not in seen:
+        seen.add(current_id)
+        chain.append(current_id)
+        current_id = fallback_by_id.get(current_id)
+
+    for fallback_lang in ("EN", "PL", "DEBUG"):
+        fallback_id = id_by_lang.get(fallback_lang)
+        if fallback_id and fallback_id not in seen:
+            chain.append(fallback_id)
+            seen.add(fallback_id)
+    return chain
+
+
+def _query_redkit_editor_db(db_path, line_key, language):
+    db_path = Path(db_path)
+    try:
+        mtime = db_path.stat().st_mtime
+    except OSError:
+        return ""
+
+    cache_key = (
+        os.path.normcase(os.path.normpath(str(db_path))),
+        mtime,
+        normalize_dialog_language(language),
+        int(line_key),
+    )
+    if cache_key in _REDKIT_EDITOR_DB_CACHE:
+        return _REDKIT_EDITOR_DB_CACHE[cache_key]
+
+    text = ""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        try:
+            cursor = conn.cursor()
+            for lang_id in _redkit_editor_db_language_chain(cursor, language):
+                row = cursor.execute(
+                    """
+                    SELECT TEXT
+                    FROM LATEST_STRINGS
+                    WHERE STRING_ID = ? AND LANG = ? AND TEXT IS NOT NULL AND TRIM(TEXT) != ''
+                    ORDER BY VERSION DESC
+                    LIMIT 1
+                    """,
+                    (int(line_key), int(lang_id)),
+                ).fetchone()
+                if row and str(row[0] or "").strip():
+                    text = str(row[0] or "").strip()
+                    break
+        finally:
+            conn.close()
+    except Exception:
+        log.debug("Could not query REDkit editor string DB: %s", db_path, exc_info=True)
+
+    _REDKIT_EDITOR_DB_CACHE[cache_key] = text
+    return text
+
+
+def _resolve_from_redkit_editor_dbs(line_key, source_filepath, language):
+    for root in _redkit_editor_db_roots(source_filepath):
+        for db_name in _REDKIT_EDITOR_DB_NAMES:
+            text = _query_redkit_editor_db(root / db_name, line_key, language)
+            if text:
+                return text
+    return ""
+
+
 def _resolve_from_string_manager(line_key, language):
     try:
         from .CR2W.witcher_cache.W3Strings import LoadStringsManager
@@ -549,7 +773,13 @@ def resolve_localized_text(line_id, source_filepath="", language=None):
         return ""
 
     language = normalize_dialog_language(language or get_active_text_language())
+    text = _resolve_from_redkit_project_strings(line_key, source_filepath, language)
+    if text:
+        return text
     text = _resolve_from_source_table(line_key, source_filepath, language)
     if text:
         return text
-    return _resolve_from_string_manager(line_key, language)
+    text = _resolve_from_string_manager(line_key, language)
+    if text:
+        return text
+    return _resolve_from_redkit_editor_dbs(line_key, source_filepath, language)

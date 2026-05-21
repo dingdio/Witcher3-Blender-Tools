@@ -28,6 +28,7 @@ from ..camera_tracks import (
 from .ui_cr2w_fields import (
     _draw_imported_class_sections,
     _format_imported_field_value,
+    _get_imported_field_type,
     _get_imported_field_schema,
     _get_imported_field_value,
     _get_present_imported_fields,
@@ -522,8 +523,10 @@ class CutsceneEffectItem(PropertyGroup):
 class CutsceneTemplateFieldItem(PropertyGroup):
     class_name: StringProperty(default="")
     field_name: StringProperty(default="")
+    type_text: StringProperty(default="")
     value_text: StringProperty(default="")
     is_set: BoolProperty(default=False)
+    show_unset: BoolProperty(name="Show Unset", default=False)
 
 class CutsceneDialogItem(PropertyGroup):
     actor: StringProperty(name="voicetag", default="")
@@ -588,13 +591,15 @@ def _sync_cutscene_template_fields(scene, cutscene):
     schema = _get_imported_field_schema(cutscene, fallback_schema=w3_types.CUTSCENE_CLASS_FIELD_SCHEMA)
     present_fields = _get_present_imported_fields(cutscene)
     for class_name, fields in schema:
-        for field_name, _default in fields:
+        for field_name, default_value in fields:
             item = scene.witcher_cutscene_template_fields.add()
             item.class_name = class_name
             item.field_name = field_name
+            item.type_text = _get_imported_field_type(default_value)
             item.is_set = field_name in present_fields
             if item.is_set:
                 value = _get_imported_field_value(cutscene, field_name)
+                item.type_text = _get_imported_field_type(value)
                 item.value_text = _format_imported_field_value(value)
             else:
                 item.value_text = "<unset>"
@@ -2537,14 +2542,14 @@ def _draw_cutscene_template_tab(layout, scene):
     template_box = layout.box()
     header = template_box.row(align=True)
     header.label(text="Template Fields", icon='PROPERTIES')
-    header.prop(scene, "witcher_cutscene_show_unset_template_fields", text="Show Unset", toggle=True)
 
     _draw_imported_class_sections(
         template_box,
         list(getattr(scene, "witcher_cutscene_template_fields", [])),
         w3_types.CUTSCENE_CLASS_FIELD_SCHEMA,
-        bool(getattr(scene, "witcher_cutscene_show_unset_template_fields", False)),
+        False,
         "No set imported values.",
+        per_class_show_unset=True,
     )
 
 
