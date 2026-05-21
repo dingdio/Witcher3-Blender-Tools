@@ -44,6 +44,10 @@ from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
 from ..CR2W.common_blender import repo_file
 from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
+from .dlc_mounters import (
+    append_dlc_external_appearances,
+    get_dlc_external_appearance_names_for_entity,
+)
 from .. import get_do_fix_tail
 from ..ui.ui_equipment import (
     generate_guid, tag_new_objects_with_guid, remove_objects_by_guid,
@@ -1359,15 +1363,23 @@ def get_entity_appearance_metadata(filename: str) -> dict:
             log.debug("Failed to read JSON entity appearance metadata for %s", filename, exc_info=True)
             return empty_result
 
-        return normalize_entity_appearance_metadata({
+        metadata = normalize_entity_appearance_metadata({
             "all_names": [
                 str((appearance or {}).get("name", "") or "").strip()
                 for appearance in data.get("appearances", []) or []
             ],
             "used_names": data.get("usedAppearances", []) or [],
         })
+        dlc_names = get_dlc_external_appearance_names_for_entity(filename)
+        if dlc_names:
+            metadata["all_names"] = _dedupe_entity_appearance_names(metadata.get("all_names", []) + dlc_names)
+        return normalize_entity_appearance_metadata(metadata)
 
-    return normalize_entity_appearance_metadata(_read_entity_template_appearance_metadata(filename))
+    metadata = normalize_entity_appearance_metadata(_read_entity_template_appearance_metadata(filename))
+    dlc_names = get_dlc_external_appearance_names_for_entity(filename)
+    if dlc_names:
+        metadata["all_names"] = _dedupe_entity_appearance_names(metadata.get("all_names", []) + dlc_names)
+    return normalize_entity_appearance_metadata(metadata)
 
 
 def classify_entity_import_metadata(metadata: dict | None, context=None) -> str:
@@ -1482,6 +1494,8 @@ def test_load_entity(filename) ->  w3_types.Entity:
         entity = load_bin_entity(filename)
     else:
         entity = None
+    if entity is not None:
+        append_dlc_external_appearances(entity, filename)
     return entity
 
 def _try_import_armature_from_item_appearances(entity, parent_transform=None, source_game="", target_collection=None,
@@ -2109,6 +2123,83 @@ def create_on_prop(armobj: bpy.types.Armature,
     target.data_path = "witcherui_RigSettings.app_list_index"
     target.id = armobj.data
 
+
+def _ensure_app_visibility_driver(armobj, obj_to_hide, prop_name: str, expression: str):
+    if armobj is None or obj_to_hide is None:
+        return
+    has_driver = False
+    if obj_to_hide.animation_data and obj_to_hide.animation_data.drivers:
+        for driver_curve in obj_to_hide.animation_data.drivers:
+            if driver_curve.data_path != prop_name:
+                continue
+            driver_curve.driver.expression = expression
+            var = driver_curve.driver.variables.get("idx_on_app_list")
+            if var is None:
+                var = driver_curve.driver.variables.new()
+            var.type = "SINGLE_PROP"
+            var.name = "idx_on_app_list"
+            target = var.targets[0]
+            target.id_type = "ARMATURE"
+            target.data_path = "witcherui_RigSettings.app_list_index"
+            target.id = armobj.data
+            has_driver = True
+    if has_driver:
+        return
+
+    driver_curve = obj_to_hide.driver_add(prop_name)
+    driver = driver_curve.driver
+    driver.expression = expression
+    var = driver.variables.new()
+    var.type = "SINGLE_PROP"
+    var.name = "idx_on_app_list"
+    target = var.targets[0]
+    target.id_type = "ARMATURE"
+    target.data_path = "witcherui_RigSettings.app_list_index"
+    target.id = armobj.data
+
+
+def _get_object_redcloth_resource_key(obj) -> str:
+    current = obj
+    seen = set()
+    while current is not None:
+        obj_id = id(current)
+        if obj_id in seen:
+            break
+        seen.add(obj_id)
+        try:
+            resource_key = str(current.get("witcher_redcloth_resource_key", "") or "").strip()
+        except Exception:
+            resource_key = ""
+        if resource_key:
+            return resource_key
+        current = getattr(current, "parent", None)
+    return ""
+
+
+def _get_visibility_appearance_indices_for_object(armobj, obj_to_hide, fallback_indices=None):
+    appearance_indices = fallback_indices
+    resource_key = _get_object_redcloth_resource_key(obj_to_hide)
+    if resource_key and armobj is not None and getattr(armobj, "type", "") == 'ARMATURE':
+        rig_settings = getattr(armobj.data, "witcherui_RigSettings", None)
+        redcloth_indices = get_redcloth_resource_appearances_from_entity(rig_settings, resource_key)
+        if redcloth_indices:
+            appearance_indices = redcloth_indices
+    if appearance_indices is None:
+        return None
+    out = []
+    seen = set()
+    for idx in appearance_indices:
+        try:
+            idx = int(idx)
+        except Exception:
+            continue
+        if idx in seen:
+            continue
+        seen.add(idx)
+        out.append(idx)
+    return out
+
+
 def create_app_drivers(armobj: bpy.types.Armature, obj_to_hide:bpy.types.Object, appearance_indices=None):
     """Create hide drivers on object and children.
     
@@ -2126,45 +2217,32 @@ def create_app_drivers(armobj: bpy.types.Armature, obj_to_hide:bpy.types.Object,
         return
 
     rig_settings = armobj.data.witcherui_RigSettings
+    effective_indices = _get_visibility_appearance_indices_for_object(
+        armobj,
+        obj_to_hide,
+        appearance_indices,
+    )
     
-    if appearance_indices is None or len(appearance_indices) <= 1:
-        # Single appearance - use simple inequality
-        current_app_list_index = rig_settings.app_list_index
-        create_on_prop(armobj, current_app_list_index, obj_to_hide, prop_name = "hide_render")
-        create_on_prop(armobj, current_app_list_index, obj_to_hide, prop_name = "hide_viewport")
+    if effective_indices is None or len(effective_indices) <= 1:
+        current_app_list_index = (
+            effective_indices[0]
+            if effective_indices else
+            rig_settings.app_list_index
+        )
+        expression = f"idx_on_app_list != {int(current_app_list_index)}"
+        _ensure_app_visibility_driver(armobj, obj_to_hide, "hide_render", expression)
+        _ensure_app_visibility_driver(armobj, obj_to_hide, "hide_viewport", expression)
     else:
-        # Multiple appearances - create drivers with "not in" expression
-        indices_str = ", ".join(str(i) for i in sorted(appearance_indices))
-        
-        for prop_name in ["hide_render", "hide_viewport"]:
-            # Check if driver already exists for this property
-            has_driver = False
-            if obj_to_hide.animation_data and obj_to_hide.animation_data.drivers:
-                for fc in obj_to_hide.animation_data.drivers:
-                    if fc.data_path == prop_name:
-                        # Update existing driver expression
-                        fc.driver.expression = f"idx_on_app_list not in [{indices_str}]"
-                        has_driver = True
-                        break
-            
-            if not has_driver:
-                # Create new driver
-                driver_curve = obj_to_hide.driver_add(prop_name)
-                driver = driver_curve.driver
-                driver.expression = f"idx_on_app_list not in [{indices_str}]"
-                var = driver.variables.new()
-                var.type = "SINGLE_PROP"
-                var.name = "idx_on_app_list"
-                target = var.targets[0]
-                target.id_type = "ARMATURE"
-                target.data_path = "witcherui_RigSettings.app_list_index"
-                target.id = armobj.data
+        indices_str = ", ".join(str(i) for i in sorted(effective_indices))
+        expression = f"idx_on_app_list not in [{indices_str}]"
+        _ensure_app_visibility_driver(armobj, obj_to_hide, "hide_render", expression)
+        _ensure_app_visibility_driver(armobj, obj_to_hide, "hide_viewport", expression)
     
     for obj in obj_to_hide.children:
         create_app_drivers(armobj, obj, appearance_indices)
 
 
-def update_driver_for_shared_template(obj, appearance_indices):
+def update_driver_for_shared_template(obj, appearance_indices, rig_settings=None):
     """Update drivers on an object to show it for multiple appearance indices.
     
     Args:
@@ -2174,16 +2252,40 @@ def update_driver_for_shared_template(obj, appearance_indices):
     if _is_shadowmesh_name(getattr(obj, "name", "")):
         _force_shadowmesh_hidden(obj)
         for child in obj.children:
-            update_driver_for_shared_template(child, appearance_indices)
+            update_driver_for_shared_template(child, appearance_indices, rig_settings)
         return
 
-    if not appearance_indices:
+    effective_indices = appearance_indices
+    resource_key = _get_object_redcloth_resource_key(obj)
+    if resource_key and rig_settings is not None:
+        redcloth_indices = get_redcloth_resource_appearances_from_entity(rig_settings, resource_key)
+        if redcloth_indices:
+            effective_indices = redcloth_indices
+
+    if not effective_indices:
         return
     
-    # Build expression like "idx_on_app_list not in [0, 2, 3]" 
+    # Build expression like "idx_on_app_list not in [0, 2, 3]"
     # (hidden when NOT in the list of valid appearances)
-    indices_str = ", ".join(str(i) for i in sorted(appearance_indices))
-    new_expression = f"idx_on_app_list not in [{indices_str}]"
+    unique_indices = []
+    seen_indices = set()
+    for idx in effective_indices:
+        try:
+            idx = int(idx)
+        except Exception:
+            continue
+        if idx in seen_indices:
+            continue
+        seen_indices.add(idx)
+        unique_indices.append(idx)
+    if not unique_indices:
+        return
+    unique_indices.sort()
+    if len(unique_indices) == 1:
+        new_expression = f"idx_on_app_list != {unique_indices[0]}"
+    else:
+        indices_str = ", ".join(str(i) for i in unique_indices)
+        new_expression = f"idx_on_app_list not in [{indices_str}]"
     
     for prop_name in ["hide_render", "hide_viewport"]:
         if obj.animation_data and obj.animation_data.drivers:
@@ -2193,7 +2295,7 @@ def update_driver_for_shared_template(obj, appearance_indices):
     
     # Recursively update children
     for child in obj.children:
-        update_driver_for_shared_template(child, appearance_indices)
+        update_driver_for_shared_template(child, appearance_indices, rig_settings)
 
 
 def update_template_drivers_for_appearances(guid, rig_settings, prop_name="witcher_template_guid"):
@@ -2219,7 +2321,7 @@ def update_template_drivers_for_appearances(guid, rig_settings, prop_name="witch
     # Update all objects with this GUID
     objects = find_objects_by_guid(guid, prop_name)
     for obj in objects:
-        update_driver_for_shared_template(obj, appearance_indices)
+        update_driver_for_shared_template(obj, appearance_indices, rig_settings)
 
 def _iter_inventory_entries(selected_appearance, entity=None):
     """Yield inventory entries from an appearance and optional entity (object or dict)."""
@@ -3448,6 +3550,30 @@ def build_template_appearance_map(entity_source):
     return template_map
 
 
+def build_redcloth_resource_appearance_map(entity_source):
+    """Build a mapping of cloth resource key -> appearance indices."""
+    resource_map = {}
+    appearances = _get_entry_attr(entity_source, 'appearances', []) or []
+    for app_index, appearance in enumerate(appearances):
+        app_name = _get_entry_attr(appearance, 'name', str(app_index))
+        included_templates = _get_entry_attr(appearance, 'includedTemplates', []) or []
+        for template in included_templates:
+            chunks = _get_entry_attr(template, 'chunks', []) or []
+            for chunk in chunks:
+                resource = str(_get_entry_attr(chunk, 'resource', '') or '').strip()
+                if not _is_cloth_resource_path(resource):
+                    continue
+                resource_key = _make_redcloth_resource_key(resource)
+                if not resource_key:
+                    continue
+                if resource_key not in resource_map:
+                    resource_map[resource_key] = {'indices': [], 'names': []}
+                if app_index not in resource_map[resource_key]['indices']:
+                    resource_map[resource_key]['indices'].append(app_index)
+                    resource_map[resource_key]['names'].append(app_name)
+    return resource_map
+
+
 def get_template_appearances_from_entity(rig_settings, template_filename):
     """Get list of appearance indices that use this template (from entity data)."""
     entity, entity_data = get_rig_entity_state(rig_settings)
@@ -3458,6 +3584,24 @@ def get_template_appearances_from_entity(rig_settings, template_filename):
     template_map = build_template_appearance_map(entity_source)
     if template_filename in template_map:
         return template_map[template_filename]['indices']
+    return []
+
+
+def get_redcloth_resource_appearances_from_entity(rig_settings, resource_key):
+    """Get appearance indices that reference a reused redcloth/redapex resource."""
+    if rig_settings is None:
+        return []
+    resource_key = _make_redcloth_resource_key(resource_key)
+    if not resource_key:
+        return []
+    entity, entity_data = get_rig_entity_state(rig_settings)
+    entity_source = entity if entity is not None else entity_data
+    if not entity_source:
+        return []
+
+    resource_map = build_redcloth_resource_appearance_map(entity_source)
+    if resource_key in resource_map:
+        return resource_map[resource_key]['indices']
     return []
 
 

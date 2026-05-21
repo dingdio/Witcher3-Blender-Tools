@@ -1388,6 +1388,14 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
             "instead of preferring REDkit paths."
         ),
     )
+    read_dlc_mounters: bpy.props.BoolProperty(
+        name="Read DLC Mounters",
+        default=True,
+        description=(
+            "Scan .reddlc mounters and add mounted external character appearances "
+            "as extra importable appearances."
+        ),
+    )
     mesh_import_do_import_mats: bpy.props.BoolProperty(
         name="Mesh Import: Apply Materials",
         default=True,
@@ -1619,6 +1627,7 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         common_col.prop(self, "tex_ext")
         common_col.prop(self, "import_idle_animation")
         common_col.prop(self, "prefer_bundles_for_linked_assets")
+        common_col.prop(self, "read_dlc_mounters")
         common_col.prop(self, "verbose_logging")
 
         # Asset Browser settings — dedicated section
