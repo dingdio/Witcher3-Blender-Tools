@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import copy
 from ..CR2W.CR2W_types import getCR2W
 from ..CR2W.dc_skeleton import create_Skeleton, load_bin_face, load_bin_skeleton
 
@@ -21,6 +22,32 @@ from ..ui.ui_morphs import witcherui_add_redmorph
 from .. import get_uncook_path, get_do_fix_tail, set_rig_rot90_enabled
 import logging
 log = logging.getLogger(__name__)
+
+_FACE_FILE_CACHE = {}
+_FACE_FILE_CACHE_MAX = 16
+
+
+def _face_file_cache_key(filename):
+    try:
+        path = os.path.abspath(os.path.normpath(os.fspath(filename)))
+    except TypeError:
+        path = os.path.abspath(os.path.normpath(str(filename)))
+    norm_path = os.path.normcase(path)
+    try:
+        stat = os.stat(path)
+        return (norm_path, stat.st_mtime_ns, stat.st_size), norm_path
+    except OSError:
+        return (norm_path, None, None), norm_path
+
+
+def _cache_face_file(cache_key, norm_path, faceData):
+    if faceData is None:
+        return
+    for old_key in [key for key in _FACE_FILE_CACHE if key[0] == norm_path and key != cache_key]:
+        _FACE_FILE_CACHE.pop(old_key, None)
+    _FACE_FILE_CACHE[cache_key] = copy.deepcopy(faceData)
+    while len(_FACE_FILE_CACHE) > _FACE_FILE_CACHE_MAX:
+        _FACE_FILE_CACHE.pop(next(iter(_FACE_FILE_CACHE)))
 
 def load_json_skeleton(filename):
     dirpath, file = os.path.split(filename)
@@ -269,7 +296,6 @@ def get_ordered_bones(armature):
             ordered_bones.append(bone)
     return ordered_bones
 
-import copy
 def export_w3_rig(context, filename):
     xpsBones = []
     selected_objects = set(context.selected_objects)
@@ -379,6 +405,12 @@ def export_w3_rig(context, filename):
 
 
 def loadFaceFile(filename):
+    cache_key, norm_path = _face_file_cache_key(filename)
+    cached = _FACE_FILE_CACHE.get(cache_key)
+    if cached is not None:
+        log.debug("Face file cache hit: %s", filename)
+        return copy.deepcopy(cached)
+
     dirpath, file = os.path.split(filename)
     basename, ext = os.path.splitext(file)
     if ext.lower().endswith('.json'):
@@ -389,5 +421,6 @@ def loadFaceFile(filename):
     else:
         faceData = None
 
+    _cache_face_file(cache_key, norm_path, faceData)
     return faceData
 

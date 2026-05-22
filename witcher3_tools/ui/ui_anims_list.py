@@ -931,6 +931,42 @@ from .mimic_compat import (
 )
 
 _MIMIC_ANIMSET_NAME_CACHE = {}
+_MIMIC_META_INDEX_CACHE = None
+
+
+def _get_mimic_meta_index():
+    global _MIMIC_META_INDEX_CACHE
+    meta = CModStoryBoardMimicsListsManager.get_mimics_meta()
+    anim_list = list(getattr(meta, "animList", []) or [])
+    token = (id(meta), len(anim_list))
+    if _MIMIC_META_INDEX_CACHE is not None and _MIMIC_META_INDEX_CACHE[0] == token:
+        return _MIMIC_META_INDEX_CACHE[1]
+
+    paths_by_id = {}
+    ordered_paths_by_id = {}
+    first_path_by_id = {}
+    all_paths = set()
+    for anim in anim_list:
+        anim_id = str(getattr(anim, "id", "") or "").strip().lower()
+        anim_path = str(getattr(anim, "path", "") or "").strip()
+        norm_path = normalize_animset_path(anim_path)
+        if not anim_id or not norm_path:
+            continue
+        path_set = paths_by_id.setdefault(anim_id, set())
+        if norm_path not in path_set:
+            path_set.add(norm_path)
+            ordered_paths_by_id.setdefault(anim_id, []).append(norm_path)
+        first_path_by_id.setdefault(anim_id, anim_path)
+        all_paths.add(norm_path)
+
+    index = {
+        "paths_by_id": paths_by_id,
+        "ordered_paths_by_id": ordered_paths_by_id,
+        "first_path_by_id": first_path_by_id,
+        "all_paths": all_paths,
+    }
+    _MIMIC_META_INDEX_CACHE = (token, index)
+    return index
 
 
 def _get_mimic_animation_path_by_name(anim_name, main_arm_obj=None, show_all=False):
@@ -938,14 +974,15 @@ def _get_mimic_animation_path_by_name(anim_name, main_arm_obj=None, show_all=Fal
     if actor_path is not None:
         return actor_path
 
-    first_match = None
-    for anim in CModStoryBoardMimicsListsManager.get_mimics_meta().animList:
-        if anim.id != anim_name:
-            continue
-        if first_match is None:
-            first_match = anim.path
-        if is_mimic_path_compatible(anim.path, main_arm_obj, show_all=show_all):
-            return anim.path
+    target = str(anim_name or "").strip().lower()
+    if not target:
+        return None
+    mimic_index = _get_mimic_meta_index()
+    first_match = mimic_index["first_path_by_id"].get(target)
+    matching_paths = mimic_index["ordered_paths_by_id"].get(target) or ()
+    for anim_path in matching_paths:
+        if is_mimic_path_compatible(anim_path, main_arm_obj, show_all=show_all):
+            return anim_path
     if show_all or main_arm_obj is None:
         return first_match
     return None
@@ -1026,17 +1063,25 @@ def _get_actor_mimic_animation_path_by_name(anim_name, main_arm_obj=None, show_a
     target = str(anim_name or "").strip().lower()
     if not target:
         return None
-    for repo_path in collect_actor_mimic_animset_paths(main_arm_obj):
-        meta_has_name = False
-        for anim in CModStoryBoardMimicsListsManager.get_mimics_meta().animList:
-            if str(anim.id).strip().lower() == target and normalize_animset_path(anim.path) == repo_path:
-                meta_has_name = True
-                break
-        if meta_has_name:
+    repo_paths = tuple(collect_actor_mimic_animset_paths(main_arm_obj))
+    if not repo_paths:
+        return None
+
+    mimic_index = _get_mimic_meta_index()
+    meta_paths_for_name = mimic_index["paths_by_id"].get(target) or set()
+    all_meta_paths = mimic_index["all_paths"]
+
+    # Preserve actor path order, but only binary-scan uncatalogued actor paths.
+    # actor_mimics.csv is incomplete for some character-specific mimic layer
+    # sets, while scanning known stock animsets for synthetic misses can burn
+    # seconds before a later CSV hit.
+    for repo_path in repo_paths:
+        if repo_path in meta_paths_for_name:
             return repo_path
-        lookup = _load_mimic_animset_name_lookup(repo_path, main_arm_obj=main_arm_obj)
-        if target in lookup:
-            return repo_path
+        if repo_path not in all_meta_paths:
+            lookup = _load_mimic_animset_name_lookup(repo_path, main_arm_obj=main_arm_obj)
+            if target in lookup:
+                return repo_path
     return None
 
 

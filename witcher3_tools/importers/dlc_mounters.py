@@ -18,22 +18,22 @@ log = logging.getLogger(__name__)
 _DLC_ENTITY_APPEARANCE_MOUNTER_TYPE = "CR4EntityExternalAppearanceDLCMounter"
 _DLC_ENTITY_APPEARANCE_ENTRY_TYPE = "CR4EntityExternalAppearanceDLC"
 _DEPOT_ROOT_MARKERS = (
-    "\\templates\\",
+    "\\dlc\\",
+    "\\gameplay\\",
     "\\game\\",
     "\\characters\\",
     "\\items\\",
-    "\\dlc\\",
     "\\environment\\",
     "\\quests\\",
     "\\levels\\",
     "\\living_world\\",
-    "\\gameplay\\",
     "\\animations\\",
     "\\fx\\",
     "\\engine\\",
     "\\globals\\",
     "\\gui\\",
     "\\ui\\",
+    "\\templates\\",
 )
 
 _DLC_MOUNTER_CACHE = {
@@ -44,6 +44,8 @@ _DLC_MOUNTER_CACHE = {
     "scan_signature": (),
     "table": {},
 }
+_PARSED_REDDLC_MOUNTER_CACHE = {}
+_PARSED_REDDLC_MOUNTER_CACHE_MAX = 128
 
 
 def clear_dlc_mounter_cache():
@@ -55,6 +57,7 @@ def clear_dlc_mounter_cache():
         "scan_signature": (),
         "table": {},
     })
+    _PARSED_REDDLC_MOUNTER_CACHE.clear()
 
 
 def _default_context():
@@ -111,6 +114,20 @@ def _add_unique_path(target, value):
     target.append(value)
 
 
+def _dedupe_root_paths(paths):
+    roots = []
+    for value in paths or []:
+        value = str(value or "").strip()
+        if not value:
+            continue
+        value = os.path.normpath(_bpy_abspath(value))
+        if any(_is_under_root_path(value, existing) for existing in roots):
+            continue
+        roots = [existing for existing in roots if not _is_under_root_path(existing, value)]
+        _add_unique_path(roots, value)
+    return roots
+
+
 def _is_under_root_path(path: str, root: str) -> bool:
     if not path or not root:
         return False
@@ -142,11 +159,10 @@ def _repo_path_from_abs_with_roots(path: str, roots=None) -> str:
         if rel and rel != ".":
             return rel.replace("/", "\\").lstrip("\\")
 
-    lowered = normalized.lower()
-    for marker in _DEPOT_ROOT_MARKERS:
-        idx = lowered.find(marker)
-        if idx >= 0:
-            return normalized[idx + 1:].replace("/", "\\").lstrip("\\")
+    marker_match = _find_depot_root_marker(normalized)
+    if marker_match is not None:
+        idx, _marker = marker_match
+        return normalized[idx + 1:].replace("/", "\\").lstrip("\\")
     return normalized.replace("/", "\\").lstrip("\\")
 
 
@@ -158,6 +174,15 @@ def _dlc_repo_path_key(path: str, roots=None) -> str:
 def _dlc_appearance_name_from_path(path: str) -> str:
     stem = Path(str(path or "").replace("\\", "/")).stem
     return str(stem or "").strip()
+
+
+def _find_depot_root_marker(path: str):
+    lowered = str(path or "").lower()
+    for marker in _DEPOT_ROOT_MARKERS:
+        idx = lowered.find(marker)
+        if idx >= 0:
+            return idx, marker
+    return None
 
 
 def _cr2w_prop_string(prop) -> str:
@@ -219,7 +244,27 @@ def _iter_cr2w_ptr_chunks(prop, chunks):
             yield chunks[ptr - 1]
 
 
+def _reddlc_mounter_cache_key(path: str) -> tuple:
+    try:
+        stat = os.stat(path)
+        return (_norm_fs_path(path), int(stat.st_mtime_ns), int(stat.st_size))
+    except Exception:
+        return (_norm_fs_path(path), 0, -1)
+
+
+def _cache_parsed_reddlc_mounters(cache_key: tuple, parsed: dict):
+    _PARSED_REDDLC_MOUNTER_CACHE[cache_key] = copy.deepcopy(parsed or {})
+    while len(_PARSED_REDDLC_MOUNTER_CACHE) > _PARSED_REDDLC_MOUNTER_CACHE_MAX:
+        _PARSED_REDDLC_MOUNTER_CACHE.pop(next(iter(_PARSED_REDDLC_MOUNTER_CACHE)))
+
+
 def parse_entity_external_appearance_mounters(reddlc_path: str) -> dict[str, list[dict]]:
+    cache_key = _reddlc_mounter_cache_key(reddlc_path)
+    cached = _PARSED_REDDLC_MOUNTER_CACHE.get(cache_key)
+    if cached is not None:
+        log.debug("DLC mounter file cache hit: %s", reddlc_path)
+        return copy.deepcopy(cached)
+
     try:
         from ..CR2W.CR2W_file import read_CR2W
 
@@ -265,6 +310,7 @@ def parse_entity_external_appearance_mounters(reddlc_path: str) -> dict[str, lis
             if key:
                 table.setdefault(key, []).extend(copy.deepcopy(entries))
 
+    _cache_parsed_reddlc_mounters(cache_key, table)
     return table
 
 
@@ -371,7 +417,7 @@ def _dlc_source_roots_from_prefs(context=None) -> list[str]:
         _add_unique_path(roots, os.path.join(project_path, "workspace"))
         _add_unique_path(roots, os.path.join(project_path, "r4data"))
         _add_unique_path(roots, os.path.join(project_path, "content", "content0"))
-    return roots
+    return _dedupe_root_paths(roots)
 
 
 def _dlc_source_roots_from_entity_path(filename: str) -> list[str]:
@@ -379,14 +425,13 @@ def _dlc_source_roots_from_entity_path(filename: str) -> list[str]:
     if not filename or not os.path.isabs(filename):
         return []
     norm = os.path.normpath(filename)
-    lowered = norm.lower()
     roots = []
-    for marker in _DEPOT_ROOT_MARKERS:
-        idx = lowered.find(marker)
+    marker_match = _find_depot_root_marker(norm)
+    if marker_match is not None:
+        idx, _marker = marker_match
         if idx > 0:
             _add_unique_path(roots, norm[:idx])
-            break
-    return roots
+    return _dedupe_root_paths(roots)
 
 
 def _dlc_mounter_source_key(context=None, source_roots=None):
@@ -395,6 +440,7 @@ def _dlc_mounter_source_key(context=None, source_roots=None):
         _add_unique_path(roots, root)
     for root in source_roots or []:
         _add_unique_path(roots, root)
+    roots = _dedupe_root_paths(roots)
     return tuple(_norm_fs_path(root) for root in roots if root)
 
 
@@ -420,6 +466,7 @@ def _discover_dlc_mounter_files(context=None, source_roots=None):
         _add_unique_path(roots, root)
     for root in source_roots or []:
         _add_unique_path(roots, root)
+    roots = _dedupe_root_paths(roots)
 
     files = []
     scan_roots = []

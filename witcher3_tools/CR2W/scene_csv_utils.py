@@ -86,12 +86,11 @@ def _resolve_mimic_layer_anim_candidates(layer_value, layer_column):
             seen.add(n)
             candidates.append(n)
 
-    # Primary: snake_case + _face
-    _push(base if base.endswith("_face") else base + "_face")
-    # Abbreviation: 'animation' → 'anim'
     if "_animation" in base:
         abbrev = base.replace("_animation", "_anim")
         _push(abbrev if abbrev.endswith("_face") else abbrev + "_face")
+    # Primary: snake_case + _face
+    _push(base if base.endswith("_face") else base + "_face")
     # State-name fallback (catches CSV/catalog mismatches like Happy → happy_pose_face
     # when the CSV says 'happiness pose'). Layer column 'animation' → 'anim' suffix.
     if state:

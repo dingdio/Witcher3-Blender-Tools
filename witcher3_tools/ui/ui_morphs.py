@@ -1050,8 +1050,9 @@ def _bake_morph_via_modifier_apply(obj, mesh_bl_o, this_POSE_name, control_bone_
     return True
 
 
-def _capture_evaluated_mesh_vertices(context, mesh_bl_o):
-    depsgraph = context.evaluated_depsgraph_get()
+def _capture_evaluated_mesh_vertices(context, mesh_bl_o, depsgraph=None):
+    if depsgraph is None:
+        depsgraph = context.evaluated_depsgraph_get()
     eval_obj = mesh_bl_o.evaluated_get(depsgraph)
 
     eval_mesh = getattr(eval_obj, "data", None)
@@ -1087,12 +1088,12 @@ def _release_evaluated_mesh_snapshot(cleanup_owner, cleanup_mode):
             pass
 
 
-def _capture_evaluated_mesh_coords(context, mesh_bl_o):
+def _capture_evaluated_mesh_coords(context, mesh_bl_o, depsgraph=None):
     capture_mesh = None
     cleanup_owner = None
     cleanup_mode = None
     try:
-        capture_mesh, cleanup_owner, cleanup_mode = _capture_evaluated_mesh_vertices(context, mesh_bl_o)
+        capture_mesh, cleanup_owner, cleanup_mode = _capture_evaluated_mesh_vertices(context, mesh_bl_o, depsgraph=depsgraph)
         if capture_mesh is None:
             raise RuntimeError("evaluated mesh snapshot was not created")
         coords = [0.0] * (len(capture_mesh.vertices) * 3)
@@ -2172,6 +2173,13 @@ class WITCH_OT_morphs(bpy.types.Operator):
 
             import time
             start_time = time.perf_counter()
+            profile_marks = []
+
+            def _profile_mark(label):
+                try:
+                    profile_marks.append((str(label), time.perf_counter() - start_time))
+                except Exception:
+                    pass
 
             scene = context.scene
 
@@ -2220,6 +2228,7 @@ class WITCH_OT_morphs(bpy.types.Operator):
                 face_arm_objs,
                 face_mesh_objs,
             )
+            _profile_mark("resolved face objects")
 
             control_prop_snapshot = _snapshot_pose_bone_custom_props(bl_ctrl_bone_pose)
             shape_key_value_snapshot = {}
@@ -2228,13 +2237,12 @@ class WITCH_OT_morphs(bpy.types.Operator):
             workspace = getattr(context, "workspace", None)
             progress_started = False
             bakeable_face_mesh_objs = list(face_mesh_objs)
-            scene_driver_mesh_objs = _collect_scene_meshes_with_shape_key_drivers(scene)
-            shape_key_state_mesh_objs = _collect_unique_mesh_objects(bakeable_face_mesh_objs, scene_driver_mesh_objs)
             other_face_rigs = {}
             evaluation_objects = bake_context_objects or (list(evaluation_armatures) + list(bakeable_face_mesh_objs))
             bake_scene = scene
             saved_bake_every_frame = None
             using_duplicate_bake = False
+            shape_key_state_mesh_objs = list(bakeable_face_mesh_objs)
 
             try:
                 with _duplicated_morph_bake_session(
@@ -2253,6 +2261,10 @@ class WITCH_OT_morphs(bpy.types.Operator):
                         bake_mesh_pairs = list(bake_session.get("mesh_pairs", []) or [])
                         bake_evaluation_objects = list(bake_evaluation_armatures) + [source_mesh for _target_mesh, source_mesh in bake_mesh_pairs]
                         using_duplicate_bake = True
+                        # The duplicated bake view layer evaluates only the temporary face objects.
+                        # Keep snapshot/mute work scoped to the real target face meshes; walking
+                        # every driven shape-key mesh in a busy .w2scene makes each actor slower.
+                        shape_key_state_mesh_objs = list(bakeable_face_mesh_objs)
                     else:
                         bake_context = context
                         bake_scene = scene
@@ -2261,6 +2273,8 @@ class WITCH_OT_morphs(bpy.types.Operator):
                         bake_mesh_pairs = [(the_mesh, the_mesh) for the_mesh in bakeable_face_mesh_objs]
                         bake_evaluation_objects = list(evaluation_armatures) + list(bakeable_face_mesh_objs)
                         other_face_rigs = _collect_other_face_rigs(scene, face_rig)
+                        scene_driver_mesh_objs = _collect_scene_meshes_with_shape_key_drivers(scene)
+                        shape_key_state_mesh_objs = _collect_unique_mesh_objects(bakeable_face_mesh_objs, scene_driver_mesh_objs)
 
                     saved_bake_every_frame = getattr(bake_scene, 'witcher_bake_every_frame', None)
                     if saved_bake_every_frame is not None:
@@ -2271,23 +2285,52 @@ class WITCH_OT_morphs(bpy.types.Operator):
                     if not using_duplicate_bake and face_anim_data is not None:
                         face_anim_data.action = None
 
+                    _profile_mark(
+                        "bake session ready duplicate=%s bakeObjects=%d evalArmatures=%d meshes=%d stateMeshes=%d"
+                        % (
+                            using_duplicate_bake,
+                            len(bake_context_objects or []),
+                            len(bake_evaluation_armatures or []),
+                            len(bake_mesh_pairs or []),
+                            len(shape_key_state_mesh_objs or []),
+                        )
+                    )
                     _zero_pose_bone_custom_props(bl_ctrl_bone_pose)
                     muted_shape_key_driver_state = _snapshot_and_mute_shape_key_drivers(shape_key_state_mesh_objs)
                     shape_key_value_snapshot = _snapshot_shape_key_values(shape_key_state_mesh_objs)
                     if using_duplicate_bake:
                         _clear_armature_pose_state(bake_evaluation_armatures)
                     _force_depsgraph_evaluate(bake_context, bake_evaluation_objects)
+                    _profile_mark("bake prep evaluated")
 
                     # Register all pose names on the control bone before baking.
                     for pose in faceData.mimicPoses:
                         bl_ctrl_bone_pose[pose.name] = 0.0
                         bl_ctrl_bone_pose.id_properties_ui(pose.name).update(min=0., max=1.)
                         witcherui_add_redmorph(morph_list, [pose.name, pose.name, 4], existing_keys=existing_morph_keys)
+                    _profile_mark("registered morph controls")
 
                     total_poses = len(faceData.mimicPoses)
                     if wm is not None:
                         wm.progress_begin(0, max(1, total_poses))
                         progress_started = True
+
+                    bake_step_seconds = {
+                        "clear": 0.0,
+                        "import": 0.0,
+                        "update": 0.0,
+                        "capture": 0.0,
+                        "write": 0.0,
+                        "fallback_write": 0.0,
+                        "cleanup": 0.0,
+                    }
+                    bake_step_counts = 0
+
+                    def _accum_bake_step(name, started_at):
+                        try:
+                            bake_step_seconds[name] = bake_step_seconds.get(name, 0.0) + (time.perf_counter() - started_at)
+                        except Exception:
+                            pass
 
                     if not _activate_object(bake_face_rig):
                         self.report({'WARNING'}, f"Could not activate face rig '{bake_face_rig.name}'.")
@@ -2301,11 +2344,14 @@ class WITCH_OT_morphs(bpy.types.Operator):
                                 f"Baking face morph {pose_index + 1}/{total_poses}: {pose.name}"
                             )
 
+                        step_started = time.perf_counter()
                         _clear_armature_pose_state(bake_evaluation_armatures if using_duplicate_bake else [bake_face_rig])
+                        _accum_bake_step("clear", step_started)
 
                         pose.SkeletalAnimationType = "SAT_Additive"
                         set_entry = CSkeletalAnimationSetEntry()
                         set_entry.animation = pose
+                        step_started = time.perf_counter()
                         import_anims.import_anim(
                             bake_context,
                             "imported",
@@ -2315,12 +2361,23 @@ class WITCH_OT_morphs(bpy.types.Operator):
                             update_scene_settings=False,
                             at_frame=0,
                         )
+                        _accum_bake_step("import", step_started)
                         generated_action = getattr(getattr(bake_face_rig, "animation_data", None), "action", None)
+                        step_started = time.perf_counter()
                         _update_view_layer(bake_context)
+                        bake_depsgraph = None
+                        try:
+                            bake_depsgraph = bake_context.evaluated_depsgraph_get()
+                        except Exception:
+                            bake_depsgraph = None
+                        _accum_bake_step("update", step_started)
 
                         for target_mesh, source_mesh in bake_mesh_pairs:
                             if using_duplicate_bake:
-                                coords = _capture_evaluated_mesh_coords(bake_context, source_mesh)
+                                step_started = time.perf_counter()
+                                coords = _capture_evaluated_mesh_coords(bake_context, source_mesh, depsgraph=bake_depsgraph)
+                                _accum_bake_step("capture", step_started)
+                                step_started = time.perf_counter()
                                 _write_morph_shape_key_coords(
                                     main_obj,
                                     target_mesh,
@@ -2329,7 +2386,9 @@ class WITCH_OT_morphs(bpy.types.Operator):
                                     control_bone_name=control_bone_name,
                                     ensure_driver=False,
                                 )
+                                _accum_bake_step("write", step_started)
                             else:
+                                step_started = time.perf_counter()
                                 create_morph_and_driver(
                                     bake_context,
                                     main_obj,
@@ -2338,7 +2397,9 @@ class WITCH_OT_morphs(bpy.types.Operator):
                                     control_bone_name=control_bone_name,
                                     ensure_driver=False,
                                 )
+                                _accum_bake_step("fallback_write", step_started)
 
+                        step_started = time.perf_counter()
                         _activate_object(bake_face_rig)
                         _clear_armature_pose_state(bake_evaluation_armatures if using_duplicate_bake else [bake_face_rig])
                         if generated_action is not None:
@@ -2347,7 +2408,26 @@ class WITCH_OT_morphs(bpy.types.Operator):
                                     bpy.data.actions.remove(generated_action)
                             except Exception:
                                 pass
+                        _accum_bake_step("cleanup", step_started)
+                        bake_step_counts += 1
 
+                    if bake_step_counts:
+                        _profile_mark(
+                            "baked morph shapes poses=%d meshes=%d import=%.2fs update=%.2fs capture=%.2fs write=%.2fs fallback=%.2fs clear=%.2fs cleanup=%.2fs"
+                            % (
+                                bake_step_counts,
+                                len(bake_mesh_pairs or []),
+                                bake_step_seconds.get("import", 0.0),
+                                bake_step_seconds.get("update", 0.0),
+                                bake_step_seconds.get("capture", 0.0),
+                                bake_step_seconds.get("write", 0.0),
+                                bake_step_seconds.get("fallback_write", 0.0),
+                                bake_step_seconds.get("clear", 0.0),
+                                bake_step_seconds.get("cleanup", 0.0),
+                            )
+                        )
+                    else:
+                        _profile_mark("baked morph shapes")
                     for pose in faceData.mimicPoses:
                         for the_mesh in bakeable_face_mesh_objs:
                             ensure_morph_driver(
@@ -2356,6 +2436,7 @@ class WITCH_OT_morphs(bpy.types.Operator):
                                 pose.name,
                                 control_bone_name=control_bone_name,
                             )
+                    _profile_mark("ensured morph drivers")
 
             finally:
                 if progress_started and wm is not None:
@@ -2394,6 +2475,13 @@ class WITCH_OT_morphs(bpy.types.Operator):
                 len(bakeable_face_mesh_objs),
                 time_taken,
             )
+            if profile_marks:
+                previous_time = 0.0
+                parts = []
+                for label, mark_time in profile_marks:
+                    parts.append(f"{label}: +{mark_time - previous_time:.2f}s/{mark_time:.2f}s")
+                    previous_time = mark_time
+                log.info("Face morph load profile for %s: %s", main_obj.name, "; ".join(parts))
             if removed_reload_shape_keys or removed_reload_drivers:
                 log.debug(
                     "Rebuilt face morph stack for %s by clearing %d shape key(s) and %d driver(s) first.",

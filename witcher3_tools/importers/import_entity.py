@@ -36,13 +36,14 @@ from ..CR2W.dc_entity import load_bin_entity
 from ..CR2W.dc_entity import LoadCEntityTemplateFile, clear_template_cache
 from ..CR2W.dc_entity import read_entity_template_appearance_metadata as _read_entity_template_appearance_metadata
 from ..CR2W.dc_entity import is_valid_mesh_path
-from ..CR2W.CR2W_types import EngineTransform
+from ..CR2W.dc_entity import _resolve_repo_path, _resolve_repo_paths_from_array
+from ..CR2W.CR2W_types import EngineTransform, getCR2W
 from ..camera_tracks import setup_camera_preview_drivers
 from ..importers.import_helpers import set_blender_object_transform
 from ..importers import import_isolation
 from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
-from ..CR2W.common_blender import repo_file
+from ..CR2W.common_blender import repo_file, redkit_repo_context
 from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
 from .dlc_mounters import (
     append_dlc_external_appearances,
@@ -70,12 +71,15 @@ from math import radians
 #     #return settings.get().repopath+filepath
 addon_name = get_addon_name()
 _ENTITY_RUNTIME_CACHE = {}
+_VANILLA_ANIMSET_GROUP_CACHE = {}
+_VANILLA_ANIMSET_GROUP_CACHE_MAX = 64
 _BEH_IDLE_BUDGET_MS = 500.0
 _BEH_IDLE_TRANSITION_RE = re.compile(r"_to_idle", re.IGNORECASE)
 _BEH_IDLE_DOWNGRADE_RE = re.compile(r"additive|lookat|look_at|combat", re.IGNORECASE)
 _REDCLOTH_PROFILE_ENABLED = True
 _REDCLOTH_PROFILE_WARN_THRESHOLD = 0.10
 _REDCLOTH_CACHE_COLLECTION_NAME = "_WitcherRedclothCache"
+_FACE_MORPHS_APPEARANCE_PROP = "witcher_face_morphs_loaded_for_appearance"
 _REDCLOTH_CACHE_INDEX = {
     "scene_key": None,
     "collection_key": None,
@@ -93,6 +97,7 @@ def _clear_entity_cache_on_load(_filepath=""):
     lets the old Entity objects be garbage-collected.
     """
     _ENTITY_RUNTIME_CACHE.clear()
+    _VANILLA_ANIMSET_GROUP_CACHE.clear()
     _invalidate_redcloth_cache_index()
 
 
@@ -1479,7 +1484,7 @@ def _coerce_version(value, default=999):
     except Exception:
         return default
 
-def test_load_entity(filename) ->  w3_types.Entity:
+def test_load_entity(filename, append_dlc_appearances=True) ->  w3_types.Entity:
     # #TODO add this custom json after normal bin file is loaded
     # if filename.endswith("geralt_player.w2ent") or filename.endswith(r"player\player.w2ent"):
     #     RES_DIR = Path(__file__)
@@ -1494,7 +1499,7 @@ def test_load_entity(filename) ->  w3_types.Entity:
         entity = load_bin_entity(filename)
     else:
         entity = None
-    if entity is not None:
+    if entity is not None and append_dlc_appearances:
         append_dlc_external_appearances(entity, filename)
     return entity
 
@@ -1631,6 +1636,43 @@ def _focus_main_armature(context, armature_obj):
         pass
 
 
+def _ensure_imported_entity_face_morphs_loaded(context, armature_obj):
+    if armature_obj is None or getattr(armature_obj, "type", None) != 'ARMATURE':
+        return False
+    if 'mimicFaceFile' not in armature_obj or 'mimicFace' not in armature_obj:
+        return False
+    try:
+        from ..ui.ui_anims_list import ensure_owner_face_animation_setup
+
+        loaded, target_armature = ensure_owner_face_animation_setup(
+            context or bpy.context,
+            armature_obj,
+        )
+        if loaded and target_armature is not None:
+            rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+            app_idx = -1
+            try:
+                app_idx = int(getattr(rig_settings, "app_list_index", -1)) if rig_settings else -1
+            except Exception:
+                app_idx = -1
+            app_list = getattr(rig_settings, "app_list", None) if rig_settings else None
+            if app_list is not None and 0 <= app_idx < len(app_list):
+                try:
+                    current_appearance = str(getattr(app_list[app_idx], "name", "") or "").strip()
+                    if current_appearance:
+                        target_armature[_FACE_MORPHS_APPEARANCE_PROP] = current_appearance
+                except Exception:
+                    pass
+        return bool(loaded)
+    except Exception:
+        log.warning(
+            "Failed to load face morphs during entity import for '%s'.",
+            getattr(armature_obj, "name", "<unknown>"),
+            exc_info=True,
+        )
+    return False
+
+
 def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                         parent_transform = None, selected_appearance_name = "",
                         mesh_import_settings = None):
@@ -1744,6 +1786,9 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
             refresh_slot_constraints(main_arm_obj)
         except Exception:
             pass
+
+        if load_face_poses:
+            _ensure_imported_entity_face_morphs_loaded(context, main_arm_obj)
 
         try:
             stamp_import_origin(
@@ -2440,6 +2485,121 @@ def _iter_entity_mimic_animset_params(entity):
             yield mimic_param
 
 
+def _armature_animset_context_key(armature_obj):
+    def _prop(name):
+        try:
+            return str(armature_obj.get(name, "") or "").strip().lower()
+        except Exception:
+            return ""
+
+    return (
+        _prop("witcher_name"),
+        _prop("witcher_type"),
+        bool(_prop("mimicFaceFile")),
+    )
+
+
+def _vanilla_animset_cache_key(repo_path, abs_path, armature_obj):
+    try:
+        stat = os.stat(abs_path)
+        file_key = (
+            os.path.normcase(os.path.normpath(str(abs_path or ""))),
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+        )
+    except Exception:
+        file_key = (
+            os.path.normcase(os.path.normpath(str(abs_path or ""))),
+            0,
+            -1,
+        )
+    return (
+        str(repo_path or "").replace("/", "\\").strip().lower(),
+        file_key,
+        _armature_animset_context_key(armature_obj),
+    )
+
+
+def _freeze_animset_groups(groups):
+    return tuple(
+        (str(group_name or ""), tuple(str(path or "") for path in (paths or [])))
+        for group_name, paths in (groups or [])
+    )
+
+
+def _thaw_animset_groups(groups):
+    return [(group_name, list(paths or ())) for group_name, paths in (groups or ())]
+
+
+def _store_vanilla_animset_groups(cache_key, groups):
+    _VANILLA_ANIMSET_GROUP_CACHE[cache_key] = _freeze_animset_groups(groups)
+    while len(_VANILLA_ANIMSET_GROUP_CACHE) > _VANILLA_ANIMSET_GROUP_CACHE_MAX:
+        _VANILLA_ANIMSET_GROUP_CACHE.pop(next(iter(_VANILLA_ANIMSET_GROUP_CACHE)))
+
+
+def _chunk_name(chunk):
+    return str(getattr(chunk, "name", "") or getattr(chunk, "Type", "") or "").strip()
+
+
+def _chunk_prop(chunk, prop_name):
+    try:
+        return chunk.GetVariableByName(prop_name)
+    except Exception:
+        return None
+
+
+def _chunk_string(chunk, prop_name):
+    prop = _chunk_prop(chunk, prop_name)
+    if prop is None:
+        return ""
+    try:
+        return str(prop.ToString() or "").strip()
+    except Exception:
+        return str(getattr(prop, "Value", "") or getattr(prop, "value", "") or "").strip()
+
+
+def _load_animset_only_entity(file_name):
+    with open(file_name, "rb") as handle:
+        cr2w_file = getCR2W(handle)
+
+    chunks = list(getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or [])
+    entity = w3_types.Entity()
+    entity.name = Path(file_name).stem
+    entity.appearances = []
+    entity.CAnimAnimsetsParam = []
+    entity.CAnimMimicParam = []
+
+    with redkit_repo_context(file_name):
+        for chunk in chunks:
+            chunk_type = str(getattr(chunk, "Type", "") or "").strip()
+            chunk_name = _chunk_name(chunk)
+            if chunk_type == "CMovingPhysicalAgentComponent" and _chunk_prop(chunk, "skeleton"):
+                moving_component = w3_types.CMovingPhysicalAgentComponent(
+                    _resolve_repo_path(chunk, "skeleton", ".w2rig"),
+                    _chunk_string(chunk, "name"),
+                )
+                moving_component.type = "CMovingPhysicalAgentComponent"
+                moving_component.animationSets = _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims")
+                entity.MovingPhysicalAgentComponent = moving_component
+            elif chunk_name == "CAnimAnimsetsParam" and _chunk_prop(chunk, "animationSets"):
+                entity.CAnimAnimsetsParam.append({
+                    "name": _chunk_string(chunk, "name"),
+                    "componentName": _chunk_string(chunk, "componentName"),
+                    "animationSets": _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims"),
+                })
+            elif chunk_name == "CAnimMimicParam" and _chunk_prop(chunk, "animationSets"):
+                entity.CAnimMimicParam.append({
+                    "name": "MimicSets",
+                    "animationSets": _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims"),
+                })
+
+    try:
+        entity.version = cr2w_file.HEADER.version
+    except Exception:
+        pass
+    return entity
+
+
 def _get_entry_component_type(entry, fallback="") -> str:
     component_type = str(_get_entry_attr(entry, "type", "") or "").strip()
     if component_type:
@@ -2904,7 +3064,7 @@ def _collect_armature_animset_groups(entity, armature_obj):
         str(getattr(armature_obj, "get", lambda *_args, **_kwargs: "")("mimicFaceFile", "") or "").strip()
     )
     if not include_mimic_sets and component_type in {"", "CMovingPhysicalAgentComponent", "CAnimatedComponent"}:
-        include_mimic_sets = bool(list(_iter_entity_mimic_animset_params(entity)))
+        include_mimic_sets = any(_iter_entity_mimic_animset_params(entity))
     if include_mimic_sets:
         for mimic_set in _iter_entity_mimic_animset_params(entity):
             _add_group(f"{_get_entry_attr(mimic_set, 'name', 'MimicSets')} (Mimic)", _get_entry_attr(mimic_set, "animationSets", []))
@@ -2926,10 +3086,16 @@ def _collect_animset_groups_from_vanilla(repo_path, armature_obj):
             abs_path = _repo_file(repo_path)
             if not abs_path or not os.path.isfile(abs_path):
                 return []
-            vanilla_entity = test_load_entity(abs_path)
+            cache_key = _vanilla_animset_cache_key(repo_path, abs_path, armature_obj)
+            cached = _VANILLA_ANIMSET_GROUP_CACHE.get(cache_key)
+            if cached is not None:
+                return _thaw_animset_groups(cached)
+            vanilla_entity = _load_animset_only_entity(abs_path)
         if vanilla_entity is None:
+            _store_vanilla_animset_groups(cache_key, [])
             return []
         groups = list(_collect_armature_animset_groups(vanilla_entity, armature_obj))
+        _store_vanilla_animset_groups(cache_key, groups)
         if groups:
             log.info("Recovered %d animset group(s) for '%s' from vanilla copy at %s",
                      len(groups), getattr(armature_obj, "name", "?"), abs_path)
@@ -5057,19 +5223,14 @@ def import_app(context,
         pass
 
 
-    # TODO ###############################################
-    # TODO ############ FACE POSES #######################
-    # TODO ###############################################
+    # Full face-morph loading is handled by import_ent_template while the entity
+    # import session is still isolated.  This appearance-level code only keeps
+    # component morph targets wired below.
     #if grouping the entire appreance together
     # if group_parent:
     #     for obj in apperance_level_objects:
     #         obj.parent = empty_transform
     #     create_app_drivers(base_animation_skeleton, empty_transform)
-    load_face_poses = False
-    if load_face_poses:
-        mimicPoses = import_rig.import_w3_mimicPoses(faceData.mimicPoses, faceData.mimicSkeleton, actor=entity.name, mimic_namespace=mimic_namespace)
-
-
     rig_settings = base_animation_skeleton.data.witcherui_RigSettings
     main_obj = base_animation_skeleton
     rig_settings.model_armature_object = main_obj
