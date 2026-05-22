@@ -1504,6 +1504,7 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
 
     action: StringProperty(default="default")
     path: StringProperty(default="")  # Optional: when set, loads this path directly (bypasses animset_list_index)
+    component_name: StringProperty(default="")
     @classmethod
     def poll(cls, context):
         return context.scene
@@ -1528,18 +1529,24 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
 
                 if self.path:
                     anim_path = self.path
+                    target_component = str(self.component_name or "").strip()
                     # Keep the rig animset index in sync with direct row-button loads.
                     try:
                         for idx, anim_item in enumerate(rig_settings.animset_list):
                             if getattr(anim_item, "path", "") == self.path:
                                 rig_settings.animset_list_index = idx
+                                if not target_component:
+                                    target_component = str(getattr(anim_item, "component_name", "") or "").strip()
                                 break
                     except Exception:
                         pass
                 elif rig_settings.animset_list_index >= 0 and rig_settings.animset_list:
-                    anim_path = rig_settings.animset_list[rig_settings.animset_list_index].path
+                    anim_item = rig_settings.animset_list[rig_settings.animset_list_index]
+                    anim_path = anim_item.path
+                    target_component = str(getattr(anim_item, "component_name", "") or "").strip()
                 else:
                     anim_path = None
+                    target_component = ""
 
                 if anim_path and ":" not in anim_path:
                     from ..CR2W.common_blender import repo_file as _repo_file
@@ -1550,10 +1557,10 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
                         fdir = fdir + '.json'
                     if "_mimic_" in fdir:
                         skel = (rig_settings.main_face_skeleton or "").strip()
-                        import_anims.start_import(context, fdir, rigPath=_repo_file(skel) if skel else None)
+                        import_anims.start_import(context, fdir, rigPath=_repo_file(skel) if skel else None, target_component=target_component)
                     else:
                         skel = (rig_settings.main_entity_skeleton or "").strip()
-                        import_anims.start_import(context, fdir, rigPath=_repo_file(skel) if skel else None)
+                        import_anims.start_import(context, fdir, rigPath=_repo_file(skel) if skel else None, target_component=target_component)
 
             if "load" == action:
                 log.debug("load appearance")

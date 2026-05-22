@@ -629,11 +629,49 @@ def _resolve_entity_rig_path(main_arm_obj):
     rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
     skeleton_path = str(getattr(rig_settings, "main_entity_skeleton", "") or "").strip() if rig_settings else ""
     if not skeleton_path:
+        try:
+            candidate = str(main_arm_obj.get("witcher_path", "") or "").strip()
+        except Exception:
+            candidate = ""
+        if candidate.lower().endswith((".w2rig", ".w3dyng", ".dyng")):
+            skeleton_path = candidate
+    if not skeleton_path:
         return None
     try:
         return repo_file(skeleton_path)
     except Exception:
         return None
+
+
+def _iter_object_descendants(root_obj):
+    stack = list(getattr(root_obj, "children", []) or [])
+    while stack:
+        obj = stack.pop(0)
+        yield obj
+        stack.extend(list(getattr(obj, "children", []) or []))
+
+
+def _resolve_component_armature(main_arm_obj, component_name):
+    component_key = str(component_name or "").strip().lower()
+    if not component_key or component_key in {"root", "body"}:
+        return main_arm_obj
+    if component_key in {"face", "mimic"}:
+        mimic_name = str(main_arm_obj.get("mimicFace", "") or "").strip() if main_arm_obj else ""
+        mimic_obj = bpy.data.objects.get(mimic_name) if mimic_name else None
+        if getattr(mimic_obj, "type", None) == "ARMATURE":
+            return mimic_obj
+
+    candidates = [main_arm_obj] + list(_iter_object_descendants(main_arm_obj))
+    for obj in candidates:
+        if getattr(obj, "type", None) != "ARMATURE":
+            continue
+        try:
+            obj_component = str(obj.get("witcher_name", "") or "").strip().lower()
+        except Exception:
+            obj_component = ""
+        if obj_component and obj_component == component_key:
+            return obj
+    return main_arm_obj
 
 
 def _resolve_face_rig_path(main_arm_obj, target_armatures):
@@ -658,7 +696,7 @@ def _resolve_face_rig_path(main_arm_obj, target_armatures):
     return None
 
 
-def resolve_animation_load_context(context, anim_name, fdir="", main_arm_obj=None):
+def resolve_animation_load_context(context, anim_name, fdir="", main_arm_obj=None, target_component=""):
     main_arm_obj = _resolve_main_armature(context, main_arm_obj)
     if not main_arm_obj:
         raise RuntimeError("No armature found. Select or import a rig first.")
@@ -670,8 +708,9 @@ def resolve_animation_load_context(context, anim_name, fdir="", main_arm_obj=Non
             raise RuntimeError("No CMimicComponent armature found for face animation.")
         rig_path = _resolve_face_rig_path(main_arm_obj, target_armatures)
     else:
-        target_armatures = [main_arm_obj]
-        rig_path = _resolve_entity_rig_path(main_arm_obj)
+        target_armature = _resolve_component_armature(main_arm_obj, target_component)
+        target_armatures = [target_armature]
+        rig_path = _resolve_entity_rig_path(target_armature) or _resolve_entity_rig_path(main_arm_obj)
     return main_arm_obj, target_armatures, rig_path, face_animation
 
 
@@ -1265,7 +1304,7 @@ def FilterData(context):
         _apply_cached_items_to_scene(scene, cached_items)
 
 def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0,
-                         face_target_mode="auto", nla_mode='replace'):
+                         face_target_mode="auto", nla_mode='replace', target_component=""):
     face_animation = is_face_animation(anim_name, fdir)
     if face_target_mode == "owner" and face_animation:
         main_arm_obj, owner_armature, rig_path = resolve_owner_face_animation_context(
@@ -1279,6 +1318,7 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
             anim_name,
             fdir=fdir,
             main_arm_obj=main_arm_obj,
+            target_component=target_component,
         )
     effective_track = NLA_track
     if face_target_mode != "owner" and face_animation and NLA_track == 'anim_import':

@@ -209,6 +209,11 @@ class ListItemAnimset(PropertyGroup):
            description="",
            default="")
 
+    component_name: StringProperty(
+           name="Component",
+           description="Entity component targeted by this animation set",
+           default="")
+
 
 class ListItemApp(PropertyGroup):
     """Group of properties representing an item in the list."""

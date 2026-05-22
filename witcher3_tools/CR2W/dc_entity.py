@@ -2016,6 +2016,15 @@ def create_CEntity(file, _inherit_visited=None):
     if current_file_name:
         inherit_visited.add(os.path.normcase(os.path.normpath(str(current_file_name))))
 
+    def _append_unique_repo_path(target, path):
+        path = str(path or "").replace("/", "\\").strip()
+        if not path:
+            return
+        key = path.lower()
+        if key in {str(existing or "").replace("/", "\\").strip().lower() for existing in target}:
+            return
+        target.append(path)
+
     def _next_mesh_import_path():
         nonlocal mesh_import_cursor
         if mesh_import_cursor < len(mesh_import_paths):
@@ -3090,6 +3099,14 @@ def create_CEntity(file, _inherit_visited=None):
         beh_seen.add(beh_key)
         beh_paths.append(beh_path)
     this_Entity.beh_paths = beh_paths
+
+    included_template_paths = []
+    for include_path in top_level_template_includes:
+        _append_unique_repo_path(included_template_paths, include_path)
+    for _depot_path, include_entity in _iter_top_level_included_entities() or []:
+        for inherited_path in getattr(include_entity, "included_template_paths", None) or []:
+            _append_unique_repo_path(included_template_paths, inherited_path)
+    this_Entity.included_template_paths = included_template_paths
     return this_Entity
 
 def load_bin_entity(fileName) -> w3_types.Entity:

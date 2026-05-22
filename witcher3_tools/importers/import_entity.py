@@ -37,15 +37,16 @@ from ..CR2W.dc_entity import LoadCEntityTemplateFile, clear_template_cache
 from ..CR2W.dc_entity import read_entity_template_appearance_metadata as _read_entity_template_appearance_metadata
 from ..CR2W.dc_entity import is_valid_mesh_path
 from ..CR2W.dc_entity import _resolve_repo_path, _resolve_repo_paths_from_array
-from ..CR2W.CR2W_types import EngineTransform, getCR2W
+from ..CR2W.CR2W_types import EngineTransform
 from ..camera_tracks import setup_camera_preview_drivers
 from ..importers.import_helpers import set_blender_object_transform
 from ..importers import import_isolation
 from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
-from ..CR2W.common_blender import repo_file, redkit_repo_context
+from ..CR2W.common_blender import repo_file
 from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
 from .dlc_mounters import (
+    append_dlc_entity_template_params,
     append_dlc_external_appearances,
     get_dlc_external_appearance_names_for_entity,
 )
@@ -71,8 +72,6 @@ from math import radians
 #     #return settings.get().repopath+filepath
 addon_name = get_addon_name()
 _ENTITY_RUNTIME_CACHE = {}
-_VANILLA_ANIMSET_GROUP_CACHE = {}
-_VANILLA_ANIMSET_GROUP_CACHE_MAX = 64
 _BEH_IDLE_BUDGET_MS = 500.0
 _BEH_IDLE_TRANSITION_RE = re.compile(r"_to_idle", re.IGNORECASE)
 _BEH_IDLE_DOWNGRADE_RE = re.compile(r"additive|lookat|look_at|combat", re.IGNORECASE)
@@ -97,7 +96,6 @@ def _clear_entity_cache_on_load(_filepath=""):
     lets the old Entity objects be garbage-collected.
     """
     _ENTITY_RUNTIME_CACHE.clear()
-    _VANILLA_ANIMSET_GROUP_CACHE.clear()
     _invalidate_redcloth_cache_index()
 
 
@@ -1075,12 +1073,14 @@ def NewListItem( treeList, node):
     item.name = node.name
     return item
 
-def NewAnimsetListItem( treeList, path, name):
+def NewAnimsetListItem( treeList, path, name, component_name=""):
     item = treeList.add()
     if path:
         item.path = path
     if name:
         item.name = name
+    if component_name and hasattr(item, "component_name"):
+        item.component_name = component_name
     return item
 
 
@@ -1501,6 +1501,7 @@ def test_load_entity(filename, append_dlc_appearances=True) ->  w3_types.Entity:
         entity = None
     if entity is not None and append_dlc_appearances:
         append_dlc_external_appearances(entity, filename)
+        append_dlc_entity_template_params(entity, filename)
     return entity
 
 def _try_import_armature_from_item_appearances(entity, parent_transform=None, source_game="", target_collection=None,
@@ -2025,26 +2026,11 @@ def initialize_entity_armature_state(armature_obj, entity, *, filename="", impor
 
         animset_list = rig_settings.animset_list
         animset_list.clear()
-        fallback_path = (entity_state or {}).get("repo_path", "") if entity_state else ""
-        try:
-            _prefer_bundles = bool(get_all_addon_prefs(bpy.context).prefer_bundles_for_linked_assets)
-        except Exception:
-            _prefer_bundles = False
-        if _prefer_bundles and fallback_path:
-            # Preference enabled: load animsets from vanilla bundles first
-            groups = list(_collect_animset_groups_from_vanilla(fallback_path, armature_obj))
-            if not groups:
-                groups = list(_collect_armature_animset_groups(entity, armature_obj))
-        else:
-            groups = list(_collect_armature_animset_groups(entity, armature_obj))
-            if not groups and fallback_path:
-                # Silent fallback: entity had no animsets,
-                # try vanilla bundle copy without requiring the preference to be set.
-                groups = list(_collect_animset_groups_from_vanilla(fallback_path, armature_obj))
-        for group_name, paths in groups:
-            NewAnimsetListItem(animset_list, f"{group_name}:", group_name)
+        groups = list(_collect_armature_animset_groups(entity, armature_obj))
+        for group_name, paths, component_name in groups:
+            NewAnimsetListItem(animset_list, f"{group_name}:", group_name, component_name=component_name)
             for path in paths:
-                NewAnimsetListItem(animset_list, path, group_name)
+                NewAnimsetListItem(animset_list, path, group_name, component_name=component_name)
 
         # Populate idle animation
         _populate_idle_animation(rig_settings, entity)
@@ -2485,121 +2471,6 @@ def _iter_entity_mimic_animset_params(entity):
             yield mimic_param
 
 
-def _armature_animset_context_key(armature_obj):
-    def _prop(name):
-        try:
-            return str(armature_obj.get(name, "") or "").strip().lower()
-        except Exception:
-            return ""
-
-    return (
-        _prop("witcher_name"),
-        _prop("witcher_type"),
-        bool(_prop("mimicFaceFile")),
-    )
-
-
-def _vanilla_animset_cache_key(repo_path, abs_path, armature_obj):
-    try:
-        stat = os.stat(abs_path)
-        file_key = (
-            os.path.normcase(os.path.normpath(str(abs_path or ""))),
-            int(stat.st_mtime_ns),
-            int(stat.st_size),
-        )
-    except Exception:
-        file_key = (
-            os.path.normcase(os.path.normpath(str(abs_path or ""))),
-            0,
-            -1,
-        )
-    return (
-        str(repo_path or "").replace("/", "\\").strip().lower(),
-        file_key,
-        _armature_animset_context_key(armature_obj),
-    )
-
-
-def _freeze_animset_groups(groups):
-    return tuple(
-        (str(group_name or ""), tuple(str(path or "") for path in (paths or [])))
-        for group_name, paths in (groups or [])
-    )
-
-
-def _thaw_animset_groups(groups):
-    return [(group_name, list(paths or ())) for group_name, paths in (groups or ())]
-
-
-def _store_vanilla_animset_groups(cache_key, groups):
-    _VANILLA_ANIMSET_GROUP_CACHE[cache_key] = _freeze_animset_groups(groups)
-    while len(_VANILLA_ANIMSET_GROUP_CACHE) > _VANILLA_ANIMSET_GROUP_CACHE_MAX:
-        _VANILLA_ANIMSET_GROUP_CACHE.pop(next(iter(_VANILLA_ANIMSET_GROUP_CACHE)))
-
-
-def _chunk_name(chunk):
-    return str(getattr(chunk, "name", "") or getattr(chunk, "Type", "") or "").strip()
-
-
-def _chunk_prop(chunk, prop_name):
-    try:
-        return chunk.GetVariableByName(prop_name)
-    except Exception:
-        return None
-
-
-def _chunk_string(chunk, prop_name):
-    prop = _chunk_prop(chunk, prop_name)
-    if prop is None:
-        return ""
-    try:
-        return str(prop.ToString() or "").strip()
-    except Exception:
-        return str(getattr(prop, "Value", "") or getattr(prop, "value", "") or "").strip()
-
-
-def _load_animset_only_entity(file_name):
-    with open(file_name, "rb") as handle:
-        cr2w_file = getCR2W(handle)
-
-    chunks = list(getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or [])
-    entity = w3_types.Entity()
-    entity.name = Path(file_name).stem
-    entity.appearances = []
-    entity.CAnimAnimsetsParam = []
-    entity.CAnimMimicParam = []
-
-    with redkit_repo_context(file_name):
-        for chunk in chunks:
-            chunk_type = str(getattr(chunk, "Type", "") or "").strip()
-            chunk_name = _chunk_name(chunk)
-            if chunk_type == "CMovingPhysicalAgentComponent" and _chunk_prop(chunk, "skeleton"):
-                moving_component = w3_types.CMovingPhysicalAgentComponent(
-                    _resolve_repo_path(chunk, "skeleton", ".w2rig"),
-                    _chunk_string(chunk, "name"),
-                )
-                moving_component.type = "CMovingPhysicalAgentComponent"
-                moving_component.animationSets = _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims")
-                entity.MovingPhysicalAgentComponent = moving_component
-            elif chunk_name == "CAnimAnimsetsParam" and _chunk_prop(chunk, "animationSets"):
-                entity.CAnimAnimsetsParam.append({
-                    "name": _chunk_string(chunk, "name"),
-                    "componentName": _chunk_string(chunk, "componentName"),
-                    "animationSets": _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims"),
-                })
-            elif chunk_name == "CAnimMimicParam" and _chunk_prop(chunk, "animationSets"):
-                entity.CAnimMimicParam.append({
-                    "name": "MimicSets",
-                    "animationSets": _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims"),
-                })
-
-    try:
-        entity.version = cr2w_file.HEADER.version
-    except Exception:
-        pass
-    return entity
-
-
 def _get_entry_component_type(entry, fallback="") -> str:
     component_type = str(_get_entry_attr(entry, "type", "") or "").strip()
     if component_type:
@@ -3016,16 +2887,18 @@ def _collect_armature_animset_groups(entity, armature_obj):
     except Exception:
         component_type = ""
 
-    def _add_group(raw_name, paths):
+    def _add_group(raw_name, paths, component_name=""):
         animset_paths = _normalize_animset_paths(paths)
         if not animset_paths:
             return
         group_name = str(raw_name or "").strip() or "AnimSets"
-        group_paths = group_lookup.get(group_name)
+        component_name = str(component_name or "").strip()
+        group_key = (group_name, component_name)
+        group_paths = group_lookup.get(group_key)
         if group_paths is None:
             group_paths = []
-            group_lookup[group_name] = group_paths
-            groups.append((group_name, group_paths))
+            group_lookup[group_key] = group_paths
+            groups.append((group_name, group_paths, component_name))
         seen = {path.lower() for path in group_paths}
         for path in animset_paths:
             key = path.lower()
@@ -3040,25 +2913,16 @@ def _collect_armature_animset_groups(entity, armature_obj):
         if not component_group_name:
             chunk_type = str(_get_entry_attr(component_chunk, "type", "") or "").strip()
             component_group_name = "Main" if chunk_type == "CMovingPhysicalAgentComponent" else (chunk_type or "AnimSets")
-        _add_group(component_group_name, _get_entry_attr(component_chunk, "animationSets", []))
+        _add_group(component_group_name, _get_entry_attr(component_chunk, "animationSets", []), _get_entry_attr(component_chunk, "name", ""))
 
-    matched_param = False
-    saw_scoped_param = False
     animset_params = getattr(entity, "CAnimAnimsetsParam", []) or []
     for animset_param in animset_params:
         param_component_name = str(_get_entry_attr(animset_param, "componentName", "") or "").strip()
-        if param_component_name:
-            saw_scoped_param = True
-        if component_name and param_component_name != component_name:
-            continue
-        if not component_name and param_component_name:
-            continue
-        _add_group(_get_entry_attr(animset_param, "name", "AnimSets"), _get_entry_attr(animset_param, "animationSets", []))
-        matched_param = True
-
-    if not matched_param and not saw_scoped_param and component_type != "CMimicComponent":
-        for animset_param in animset_params:
-            _add_group(_get_entry_attr(animset_param, "name", "AnimSets"), _get_entry_attr(animset_param, "animationSets", []))
+        _add_group(
+            _get_entry_attr(animset_param, "name", "AnimSets"),
+            _get_entry_attr(animset_param, "animationSets", []),
+            param_component_name,
+        )
 
     include_mimic_sets = component_type == "CMimicComponent" or bool(
         str(getattr(armature_obj, "get", lambda *_args, **_kwargs: "")("mimicFaceFile", "") or "").strip()
@@ -3067,42 +2931,13 @@ def _collect_armature_animset_groups(entity, armature_obj):
         include_mimic_sets = any(_iter_entity_mimic_animset_params(entity))
     if include_mimic_sets:
         for mimic_set in _iter_entity_mimic_animset_params(entity):
-            _add_group(f"{_get_entry_attr(mimic_set, 'name', 'MimicSets')} (Mimic)", _get_entry_attr(mimic_set, "animationSets", []))
+            _add_group(
+                f"{_get_entry_attr(mimic_set, 'name', 'MimicSets')} (Mimic)",
+                _get_entry_attr(mimic_set, "animationSets", []),
+                _get_entry_attr(mimic_set, "componentName", ""),
+            )
 
-    return [(group_name, paths) for group_name, paths in groups if paths]
-
-
-def _collect_animset_groups_from_vanilla(repo_path, armature_obj):
-    """Load the cooked vanilla copy and return its animset groups. Used to recover animsets (When CAnimAnimsetsParam exists only in the cooked)."""
-    repo_path = str(repo_path or "").strip().replace("/", "\\")
-    if not repo_path:
-        return []
-    try:
-        from ..CR2W.common_blender import vanilla_only_repo_context, repo_file as _repo_file
-    except Exception:
-        return []
-    try:
-        with vanilla_only_repo_context():
-            abs_path = _repo_file(repo_path)
-            if not abs_path or not os.path.isfile(abs_path):
-                return []
-            cache_key = _vanilla_animset_cache_key(repo_path, abs_path, armature_obj)
-            cached = _VANILLA_ANIMSET_GROUP_CACHE.get(cache_key)
-            if cached is not None:
-                return _thaw_animset_groups(cached)
-            vanilla_entity = _load_animset_only_entity(abs_path)
-        if vanilla_entity is None:
-            _store_vanilla_animset_groups(cache_key, [])
-            return []
-        groups = list(_collect_armature_animset_groups(vanilla_entity, armature_obj))
-        _store_vanilla_animset_groups(cache_key, groups)
-        if groups:
-            log.info("Recovered %d animset group(s) for '%s' from vanilla copy at %s",
-                     len(groups), getattr(armature_obj, "name", "?"), abs_path)
-        return groups
-    except Exception:
-        log.debug("Vanilla animset fallback failed for %s", repo_path, exc_info=True)
-        return []
+    return [(group_name, paths, component_name) for group_name, paths, component_name in groups if paths]
 
 
 def _populate_idle_animation(rig_settings, entity):

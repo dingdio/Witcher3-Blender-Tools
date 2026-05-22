@@ -2323,6 +2323,7 @@ class Entity(base_w3):
                 version = 999,
                 inventoryDefinitions = None,
                 beh_paths = None,
+                included_template_paths = None,
                 **kwargs):
         self.name:str = name
         self.MovingPhysicalAgentComponent = MovingPhysicalAgentComponent
@@ -2335,6 +2336,7 @@ class Entity(base_w3):
         self.version:int = version
         self.inventoryDefinitions = inventoryDefinitions if inventoryDefinitions is not None else []
         self.beh_paths: list = beh_paths if beh_paths is not None else []
+        self.included_template_paths: list = included_template_paths if included_template_paths is not None else []
 
     @classmethod
     def from_json(cls, data):

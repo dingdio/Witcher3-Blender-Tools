@@ -512,6 +512,7 @@ def _get_loaded_animset_ui_state(context):
             "source_badge": "",
             "display_name": "",
             "display_path": "",
+            "target_component": "",
             "clip_count": 0,
             "has_loaded_set": False,
         }
@@ -519,6 +520,7 @@ def _get_loaded_animset_ui_state(context):
     loaded_path = str(getattr(scene, "witcher_loaded_w2anims_path", "") or "").strip()
     loaded_key = _animset_compare_key(loaded_path)
     source_tag = str(getattr(scene, "witcher_loaded_w2anims_source_tag", "") or "").strip().upper()
+    target_component = str(getattr(scene, "witcher_loaded_w2anims_target_component", "") or "").strip()
     loaded_path_no_json = loaded_path[:-5] if loaded_path.lower().endswith(".json") else loaded_path
 
     display_name = ""
@@ -553,6 +555,7 @@ def _get_loaded_animset_ui_state(context):
         "source_badge": source_badge,
         "display_name": display_name,
         "display_path": display_path,
+        "target_component": target_component,
         "clip_count": clip_count,
         "has_loaded_set": has_loaded_set,
     }
@@ -607,7 +610,15 @@ def on_anim_list_index_changed(self, context):
 
     try:
         _nla_mode = _scene_nla_mode(context.scene)
-        load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj, nla_mode=_nla_mode)
+        target_component = str(getattr(context.scene, "witcher_loaded_w2anims_target_component", "") or "").strip()
+        load_anim_into_scene(
+            context,
+            anim_name,
+            fdir_abs,
+            main_arm_obj,
+            nla_mode=_nla_mode,
+            target_component=target_component,
+        )
         # Apply root orientation if enabled
         auto_orient = getattr(context.scene, 'witcher_auto_orient_root', False)
         log.info(f"[on_select] Auto orient root setting: {auto_orient}")
@@ -4090,12 +4101,14 @@ class TOOL_OT_List_LoadAnim(Operator):
                 _dirpath, file = os.path.split(fdir_abs)
                 _basename, ext = os.path.splitext(file)
                 try:
+                    target_component = str(getattr(scene, "witcher_loaded_w2anims_target_component", "") or "").strip()
                     if ext.lower() == '.json':
                         _resolved_main_arm_obj, target_armatures, rig_path, _face_animation = resolve_animation_load_context(
                             context,
                             anim_name,
                             fdir=fdir_abs,
                             main_arm_obj=main_arm_obj,
+                            target_component=target_component,
                         )
                         animset = import_anims.import_w3_animSet(fdir_abs, rig_path)
                         #import json by name
@@ -4114,6 +4127,7 @@ class TOOL_OT_List_LoadAnim(Operator):
                             main_arm_obj,
                             face_target_mode="owner" if action == "load_cutscene" else "auto",
                             nla_mode=_scene_nla_mode(context.scene),
+                            target_component=target_component,
                         )
                 except FileNotFoundError as e:
                     self.report({'ERROR'}, str(e))
@@ -4134,6 +4148,8 @@ class TOOL_OT_List_LoadAnim(Operator):
             log.debug("Debug Clear")
             bpy.context.scene.witcher_w2anims_list.clear()
             bpy.context.scene.witcher_w2anims_list_index = -1
+            if hasattr(bpy.context.scene, "witcher_loaded_w2anims_target_component"):
+                bpy.context.scene.witcher_loaded_w2anims_target_component = ""
         return {'FINISHED'}
 
 
@@ -5247,6 +5263,8 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 title_row = status_box.row(align=True)
                 title_row.label(text=loaded_set["display_name"] or "Loaded animation set", icon='ACTION')
                 title_row.label(text=f"{loaded_set['clip_count']} clips", icon='ANIM_DATA')
+                if loaded_set["target_component"]:
+                    title_row.label(text=loaded_set["target_component"], icon='ARMATURE_DATA')
                 status_box.label(text="Load clip entries in the Clips tab (next to Sets).", icon='INFO')
                 if loaded_set["display_path"]:
                     path_row = status_box.row()
@@ -5277,31 +5295,34 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
 
                     groups = []
                     current_group_name = "Sets"
+                    current_group_component = ""
                     current_group_items = []
                     for item in rig_settings.animset_list:
                         item_path = str(getattr(item, "path", "") or "")
                         if ":" in item_path:
                             if current_group_items:
-                                groups.append((current_group_name, current_group_items))
+                                groups.append((current_group_name, current_group_component, current_group_items))
                             current_group_name = item_path.rstrip(":") or "Sets"
+                            current_group_component = str(getattr(item, "component_name", "") or "").strip()
                             current_group_items = []
                             continue
                         current_group_items.append(item)
                     if current_group_items:
-                        groups.append((current_group_name, current_group_items))
+                        groups.append((current_group_name, current_group_component, current_group_items))
 
                     total_set_count = 0
                     visible_set_count = 0
                     matched_group_count = 0
 
-                    for group_name, group_items in groups:
+                    for group_name, group_component, group_items in groups:
                         total_set_count += len(group_items)
 
                         visible_items = []
                         for item in group_items:
                             item_path = str(getattr(item, "path", "") or "")
+                            item_component = str(getattr(item, "component_name", "") or "").strip()
                             filename = item_path.replace("\\", "/").split("/")[-1]
-                            haystack = f"{filename} {item_path} {group_name}".lower()
+                            haystack = f"{filename} {item_path} {group_name} {item_component}".lower()
                             if filter_text and filter_text not in haystack:
                                 continue
                             visible_items.append(item)
@@ -5316,9 +5337,12 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                         hdr = current_box.row()
                         hdr.enabled = False
                         hdr.label(text=group_name, icon='OUTLINER_OB_ARMATURE')
+                        if group_component:
+                            hdr.label(text=group_component, icon='ARMATURE_DATA')
 
                         for item in visible_items:
                             item_path = str(getattr(item, "path", "") or "")
+                            item_component = str(getattr(item, "component_name", "") or "").strip()
                             filename = item_path.replace("\\", "/").split("/")[-1]
                             is_loaded_set = bool(loaded_set["loaded_key"]) and (
                                 _animset_repo_compare_key(context, item_path) == loaded_set["loaded_key"]
@@ -5334,6 +5358,7 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                             )
                             op.action = "w2anims"
                             op.path = item_path
+                            op.component_name = item_component
                             reveal_op = file_row.operator("witcher.reveal_anim_in_explorer", text="", icon='FILE_FOLDER')
                             reveal_op.path = item_path
                             info_op = file_row.operator("witcher.animset_path_info", text="", icon='QUESTION')
@@ -5364,11 +5389,14 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                     badge.enabled = False
                     badge.label(text=f"[{loaded_set['source_badge']}]")
                 hdr.label(text=f"{loaded_set['clip_count']} clips", icon='ANIM_DATA')
+                if loaded_set["target_component"]:
+                    hdr.label(text=loaded_set["target_component"], icon='ARMATURE_DATA')
                 set_info.label(text=loaded_set["display_name"] or "Loaded animation set", icon='ACTION')
                 if loaded_set["display_path"]:
                     path_row = set_info.row()
                     path_row.scale_y = 0.75
                     path_row.label(text=loaded_set["display_path"], icon='FILE')
+                set_info.prop(scene, "witcher_loaded_w2anims_target_component", text="Target")
             else:
                 hint = col_main.box()
                 hint.label(text="No animation set loaded yet.", icon='INFO')
@@ -6698,6 +6726,12 @@ def register():
         default='',
         options={'SKIP_SAVE'},
     )
+    bpy.types.Scene.witcher_loaded_w2anims_target_component = StringProperty(
+        name="Loaded Animation Set Target",
+        description="Entity component targeted by the currently loaded .w2anims set",
+        default='',
+        options={'SKIP_SAVE'},
+    )
     bpy.types.Scene.witcher_animset_filter_text = StringProperty(
         name="Set Filter",
         description="Filter character-linked animation sets by filename, path, or category",
@@ -6922,6 +6956,7 @@ def unregister():
         "witcher_w2anims_list_index",
         "witcher_loaded_w2anims_path",
         "witcher_loaded_w2anims_source_tag",
+        "witcher_loaded_w2anims_target_component",
         "witcher_animset_filter_text",
         "witcher_load_anim_on_select",
         "witcher_anim_nla_mode",

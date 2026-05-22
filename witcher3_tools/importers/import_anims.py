@@ -2035,7 +2035,7 @@ def import_lipsync(context, fileName = False, load_from_data = False, use_NLA=Tr
     log.info('Lipsync loaded')
     return {'FINISHED'}
     
-def start_import(context, fileName = False, load_from_data = False, rigPath = None):
+def start_import(context, fileName = False, load_from_data = False, rigPath = None, target_component = ""):
     if fileName:
         animSetTemplate = import_w3_animSet(fileName, rigPath)
     elif load_from_data:
@@ -2051,6 +2051,8 @@ def start_import(context, fileName = False, load_from_data = False, rigPath = No
     treeList = context.scene.witcher_w2anims_list
     treeList.clear()
     context.scene.witcher_loaded_w2anims_path = fileName
+    if hasattr(context.scene, "witcher_loaded_w2anims_target_component"):
+        context.scene.witcher_loaded_w2anims_target_component = str(target_component or "").strip()
     # Persist a compact source tag so the UI can show whether the loaded set is W2/W3/etc.
     source_tag = "MEMORY" if load_from_data else "FILE"
     try:
