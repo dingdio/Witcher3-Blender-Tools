@@ -49,6 +49,7 @@ from .dlc_mounters import (
     append_dlc_entity_template_params,
     append_dlc_external_appearances,
     get_dlc_external_appearance_names_for_entity,
+    realize_dlc_external_appearance,
 )
 from .. import get_do_fix_tail
 from ..ui.ui_equipment import (
@@ -1484,7 +1485,7 @@ def _coerce_version(value, default=999):
     except Exception:
         return default
 
-def test_load_entity(filename, append_dlc_appearances=True) ->  w3_types.Entity:
+def test_load_entity(filename, append_dlc_appearances=True, load_dlc_appearances=False) ->  w3_types.Entity:
     # #TODO add this custom json after normal bin file is loaded
     # if filename.endswith("geralt_player.w2ent") or filename.endswith(r"player\player.w2ent"):
     #     RES_DIR = Path(__file__)
@@ -1500,7 +1501,7 @@ def test_load_entity(filename, append_dlc_appearances=True) ->  w3_types.Entity:
     else:
         entity = None
     if entity is not None and append_dlc_appearances:
-        append_dlc_external_appearances(entity, filename)
+        append_dlc_external_appearances(entity, filename, load_appearances=load_dlc_appearances)
         append_dlc_entity_template_params(entity, filename)
     return entity
 
@@ -5128,8 +5129,15 @@ def import_from_list_item(context, item):
 
         for app in entity.appearances:
             if app.name == item.name:
+                was_lazy_dlc_app = bool(getattr(app, "_dlc_mounter_lazy", False))
+                if not realize_dlc_external_appearance(entity, app, context):
+                    log.warning("import_from_list_item: failed to load DLC appearance '%s'.", item.name)
+                    return
+                if was_lazy_dlc_app:
+                    cache_rig_entity_state(rig_settings, entity, update_json=True)
                 import_app(context, app, entity, base_animation_skeleton)
                 _focus_main_armature(context, base_animation_skeleton)
                 #bpy.ops.witcher.load_face_morphs()
+                return
     else:
         log.warning("import_from_list_item: no target armature selected.")

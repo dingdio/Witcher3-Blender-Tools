@@ -608,12 +608,247 @@ def ensure_witcher3_game_path_initialized(context) -> bool:
     _auto_initialize_game_and_audio_paths(prefs, context)
     return not bool(get_witcher3_game_path_issue(context))
 
+
+def _invalidate_dlc_mounter_settings(_self=None, _context=None):
+    try:
+        from .importers import dlc_mounters
+
+        dlc_mounters.clear_dlc_mounter_cache()
+    except Exception:
+        pass
+
+
+def _reset_dlc_mounter_sources(_self=None, context=None):
+    try:
+        prefs = get_all_addon_prefs(context or bpy.context)
+        if hasattr(prefs, "dlc_mounter_sources"):
+            prefs.dlc_mounter_sources.clear()
+            prefs.dlc_mounter_sources_index = 0
+            prefs.redkit_dlc_mounter_sources_index = 0
+    except Exception:
+        pass
+    _invalidate_dlc_mounter_settings(_self, context)
+
+
 class PathItem(bpy.types.PropertyGroup):
     path: StringProperty(
         name="Path",
         subtype='DIR_PATH',
-        description="A directory path"
+        description="A directory path",
+        update=_reset_dlc_mounter_sources,
     )
+
+
+class DlcMounterSourceItem(bpy.types.PropertyGroup):
+    enabled: BoolProperty(
+        name="Enabled",
+        default=True,
+        description="Use this DLC definition when applying DLC mounters",
+        update=_invalidate_dlc_mounter_settings,
+    )
+    key: StringProperty(default="", options={'HIDDEN'})
+    source_id: StringProperty(default="", options={'HIDDEN'})
+    source_kind: StringProperty(default="", options={'HIDDEN'})
+    is_vanilla: BoolProperty(default=False, options={'HIDDEN'})
+    source_label: StringProperty(name="Source", default="")
+    dlc_id: StringProperty(name="DLC ID", default="")
+    dlc_name: StringProperty(name="DLC", default="")
+    dlc_description: StringProperty(name="Description", default="")
+    dlc_name_key: StringProperty(name="Name Key", default="")
+    dlc_description_key: StringProperty(name="Description Key", default="")
+    dlc_folder_name: StringProperty(name="Folder Name", default="")
+    mounter_types: StringProperty(name="Mounters", default="")
+    root_path: StringProperty(name="Source Root", subtype='DIR_PATH', default="")
+    dlc_dir: StringProperty(name="DLC Folder", subtype='DIR_PATH', default="")
+    reddlc_path: StringProperty(name=".reddlc", subtype='FILE_PATH', default="")
+
+
+def _dlc_mounter_item_is_redkit(item) -> bool:
+    source_kind = str(getattr(item, "source_kind", "") or "").lower()
+    source_id = str(getattr(item, "source_id", "") or "").lower()
+    return source_kind == "redkit" or "redkit" in source_id
+
+
+def _dlc_mounter_item_icon(item):
+    if _dlc_mounter_item_is_redkit(item):
+        return 'TOOL_SETTINGS'
+    if bool(getattr(item, "is_vanilla", False)):
+        return 'FILE'
+    return 'MODIFIER'
+
+
+def _dlc_mounter_folder_key(item):
+    source_id = str(getattr(item, "source_id", "") or "").strip().lower()
+    dlc_dir = str(getattr(item, "dlc_dir", "") or "").replace("/", "\\").strip()
+    if not dlc_dir:
+        dlc_dir = str(getattr(item, "dlc_folder_name", "") or "").strip()
+    try:
+        dlc_dir = os.path.normcase(os.path.normpath(dlc_dir)).lower()
+    except Exception:
+        dlc_dir = dlc_dir.lower()
+    return source_id, dlc_dir
+
+
+def _dlc_mounter_reddlc_filename(item) -> str:
+    reddlc_path = str(getattr(item, "reddlc_path", "") or "").replace("/", "\\").strip()
+    if not reddlc_path:
+        return ""
+    return reddlc_path.rsplit("\\", 1)[-1]
+
+
+def _dlc_mounter_folder_has_multiple_reddlc(data, propname, item) -> bool:
+    collection = getattr(data, propname, None)
+    if collection is None or isinstance(collection, (str, bytes)):
+        return False
+    target_key = _dlc_mounter_folder_key(item)
+    filenames = set()
+    try:
+        iterator = iter(collection)
+    except TypeError:
+        return False
+    for other in iterator:
+        if _dlc_mounter_folder_key(other) != target_key:
+            continue
+        filename = _dlc_mounter_reddlc_filename(other)
+        if filename:
+            filenames.add(filename.lower())
+        if len(filenames) > 1:
+            return True
+    return False
+
+
+def _dlc_mounter_item_label(item, data=None, propname="") -> str:
+    folder_name = str(getattr(item, "dlc_folder_name", "") or "").strip()
+    if not folder_name:
+        folder_name = os.path.basename(os.path.normpath(str(getattr(item, "dlc_dir", "") or "")))
+    dlc_name = str(getattr(item, "dlc_name", "") or "").strip()
+    if not folder_name:
+        return dlc_name or "DLC"
+    parts = [folder_name]
+    if data is not None and propname and _dlc_mounter_folder_has_multiple_reddlc(data, propname, item):
+        reddlc_filename = _dlc_mounter_reddlc_filename(item)
+        if reddlc_filename:
+            parts.append(f"({reddlc_filename})")
+    if dlc_name and dlc_name.lower() != folder_name.lower():
+        parts.append(f"({dlc_name})")
+    return " ".join(parts)
+
+
+def _draw_dlc_mounter_source_item(layout, data, propname, item, index):
+    row = layout.row(align=True)
+    row.prop(item, "enabled", text="")
+    details = row.operator("witcher.dlc_mounter_source_details", text="", icon='INFO')
+    details.index = index
+    row.label(text="", icon=_dlc_mounter_item_icon(item))
+    row.label(text=_dlc_mounter_item_label(item, data, propname))
+
+
+def _filter_dlc_mounter_source_items(ui_list, data, propname, show_redkit: bool):
+    items = getattr(data, propname)
+    flags = []
+    for item in items:
+        is_redkit = _dlc_mounter_item_is_redkit(item)
+        flags.append(ui_list.bitflag_filter_item if is_redkit == show_redkit else 0)
+    return flags, []
+
+
+class WITCHER_UL_game_dlc_mounter_sources(bpy.types.UIList):
+    def filter_items(self, context, data, propname):
+        return _filter_dlc_mounter_source_items(self, data, propname, show_redkit=False)
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        _draw_dlc_mounter_source_item(layout, data, "dlc_mounter_sources", item, index)
+
+
+class WITCHER_UL_redkit_dlc_mounter_sources(bpy.types.UIList):
+    def filter_items(self, context, data, propname):
+        return _filter_dlc_mounter_source_items(self, data, propname, show_redkit=True)
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        _draw_dlc_mounter_source_item(layout, data, "dlc_mounter_sources", item, index)
+
+
+class WITCHER_OT_dlc_mounter_source_details(bpy.types.Operator):
+    bl_idname = "witcher.dlc_mounter_source_details"
+    bl_label = "DLC Details"
+    bl_description = "Show details for the selected DLC definition"
+    bl_options = {'INTERNAL'}
+
+    index: IntProperty(default=-1, options={'HIDDEN', 'SKIP_SAVE'})
+    dlc_id: StringProperty(name="DLC ID", options={'SKIP_SAVE'})
+    dlc_name: StringProperty(name="Name", options={'SKIP_SAVE'})
+    dlc_description: StringProperty(name="Description", options={'SKIP_SAVE'})
+    dlc_name_key: StringProperty(name="Name Key", options={'SKIP_SAVE'})
+    dlc_description_key: StringProperty(name="Description Key", options={'SKIP_SAVE'})
+    dlc_folder_name: StringProperty(name="Folder", options={'SKIP_SAVE'})
+    source_label: StringProperty(name="Source", options={'SKIP_SAVE'})
+    mounter_types: StringProperty(name="Mounters", options={'SKIP_SAVE'})
+    reddlc_path: StringProperty(name=".reddlc", subtype='FILE_PATH', options={'SKIP_SAVE'})
+    dlc_dir: StringProperty(name="DLC Folder", subtype='DIR_PATH', options={'SKIP_SAVE'})
+    root_path: StringProperty(name="Source Root", subtype='DIR_PATH', options={'SKIP_SAVE'})
+
+    def _copy_from_item(self, item):
+        self.dlc_id = str(getattr(item, "dlc_id", "") or "")
+        self.dlc_name = str(getattr(item, "dlc_name", "") or "")
+        self.dlc_description = str(getattr(item, "dlc_description", "") or "")
+        self.dlc_name_key = str(getattr(item, "dlc_name_key", "") or "")
+        self.dlc_description_key = str(getattr(item, "dlc_description_key", "") or "")
+        self.dlc_folder_name = str(getattr(item, "dlc_folder_name", "") or "")
+        if not self.dlc_folder_name:
+            self.dlc_folder_name = os.path.basename(os.path.normpath(str(getattr(item, "dlc_dir", "") or "")))
+        self.source_label = str(getattr(item, "source_label", "") or "")
+        self.mounter_types = str(getattr(item, "mounter_types", "") or "")
+        self.reddlc_path = str(getattr(item, "reddlc_path", "") or "")
+        self.dlc_dir = str(getattr(item, "dlc_dir", "") or "")
+        self.root_path = str(getattr(item, "root_path", "") or "")
+
+    def invoke(self, context, event):
+        prefs = get_all_addon_prefs(context)
+        index = int(self.index if self.index >= 0 else getattr(prefs, "dlc_mounter_sources_index", 0) or 0)
+        if index < 0 or index >= len(getattr(prefs, "dlc_mounter_sources", []) or []):
+            self.report({'WARNING'}, "No DLC selected.")
+            return {'CANCELLED'}
+        self._copy_from_item(prefs.dlc_mounter_sources[index])
+        return context.window_manager.invoke_props_dialog(self, width=620)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        col = layout.column(align=True)
+        col.prop(self, "dlc_name")
+        col.prop(self, "dlc_description")
+        col.prop(self, "dlc_name_key")
+        col.prop(self, "dlc_description_key")
+        col.prop(self, "dlc_id")
+        col.prop(self, "dlc_folder_name")
+        col.prop(self, "source_label")
+        col.prop(self, "mounter_types")
+        col.prop(self, "reddlc_path")
+        col.prop(self, "dlc_dir")
+        col.prop(self, "root_path")
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+class WITCHER_OT_refresh_dlc_mounter_sources(bpy.types.Operator):
+    bl_idname = "witcher.refresh_dlc_mounter_sources"
+    bl_label = "Refresh DLC List"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        try:
+            from .importers import dlc_mounters
+
+            count = dlc_mounters.sync_dlc_mounter_sources(context)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to refresh DLC list: {exc}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Found {count} DLC definition file(s).")
+        return {'FINISHED'}
+
+
 class AddPathOperator(bpy.types.Operator):
     bl_idname = "witcher.add_path"
     bl_label = "Add Path"
@@ -1195,7 +1430,8 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         name="Uncook Path",
         subtype='DIR_PATH',
         default=_default_uncook_path(),
-        description="Path where you uncooked the game files."
+        description="Path where you uncooked the game files.",
+        update=_reset_dlc_mounter_sources,
     )
     wolvenkit: StringProperty(
         name="Wolvenkit 7 CLI exe",
@@ -1226,7 +1462,8 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         name="REDkit Depot Path (r4data)",
         subtype='DIR_PATH',
         default="",
-        description="Main REDkit depot (read-only)."
+        description="Main REDkit depot (read-only).",
+        update=_reset_dlc_mounter_sources,
     )
     prefer_redkit_equipment_xml: BoolProperty(
         name="Prefer REDkit For Equipment XML",
@@ -1242,7 +1479,11 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     )
 
     redkit_projects: CollectionProperty(type=PathItem)
-    redkit_projects_index: IntProperty()
+    redkit_projects_index: IntProperty(update=_reset_dlc_mounter_sources)
+
+    dlc_mounter_sources: CollectionProperty(type=DlcMounterSourceItem)
+    dlc_mounter_sources_index: IntProperty()
+    redkit_dlc_mounter_sources_index: IntProperty()
 
     # New properties for the path list
     path_list: CollectionProperty(type=PathItem)
@@ -1392,9 +1633,19 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         name="Read DLC Mounters",
         default=True,
         description=(
-            "Scan .reddlc mounters and add mounted external character appearances "
-            "as extra importable appearances."
+            "Global enable/disable for DLC mounters. When disabled, all configured "
+            ".reddlc mounters are ignored during imports."
         ),
+        update=_invalidate_dlc_mounter_settings,
+    )
+    do_replace_appearances: bpy.props.BoolProperty(
+        name="Replace Appearances",
+        default=False,
+        description=(
+            "Make DLC appearance mounters behave like the game by replacing the "
+            "target appearance instead of adding the DLC appearance as a separate option."
+        ),
+        update=_invalidate_dlc_mounter_settings,
     )
     mesh_import_do_import_mats: bpy.props.BoolProperty(
         name="Mesh Import: Apply Materials",
@@ -1627,7 +1878,37 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         common_col.prop(self, "tex_ext")
         common_col.prop(self, "import_idle_animation")
         common_col.prop(self, "prefer_bundles_for_linked_assets")
-        common_col.prop(self, "read_dlc_mounters")
+        dlc_box = common_box.box()
+        dlc_header = dlc_box.row(align=True)
+        dlc_header.label(text="DLC Mounters", icon='FILE')
+        dlc_box.prop(self, "read_dlc_mounters")
+        dlc_controls = dlc_box.column(align=True)
+        dlc_controls.enabled = bool(self.read_dlc_mounters)
+        dlc_controls.prop(self, "do_replace_appearances")
+        dlc_header = dlc_controls.row(align=True)
+        dlc_header.operator("witcher.refresh_dlc_mounter_sources", text="Refresh", icon='FILE_REFRESH')
+        dlc_controls.label(text="Bundles / Assets DLC", icon='FILE')
+        dlc_row = dlc_controls.row()
+        dlc_row.template_list(
+            "WITCHER_UL_game_dlc_mounter_sources",
+            "",
+            self,
+            "dlc_mounter_sources",
+            self,
+            "dlc_mounter_sources_index",
+            rows=4,
+        )
+        dlc_controls.label(text="REDkit DLC", icon='TOOL_SETTINGS')
+        redkit_dlc_row = dlc_controls.row()
+        redkit_dlc_row.template_list(
+            "WITCHER_UL_redkit_dlc_mounter_sources",
+            "",
+            self,
+            "dlc_mounter_sources",
+            self,
+            "redkit_dlc_mounter_sources_index",
+            rows=3,
+        )
         common_col.prop(self, "verbose_logging")
 
         # Asset Browser settings — dedicated section
@@ -2166,6 +2447,13 @@ CACHE_ITEMS = (
         "description": "Mod/DLC bundle index cache.",
     },
     {
+        "name": "dlc_definition_cache.pkl",
+        "relative_path": os.path.join("DLC", "dlc_definition_cache.pkl"),
+        "label": "dlc_definition_cache.pkl",
+        "description": "DLC definition and mounter cache from configured .reddlc files.",
+        "group": "other",
+    },
+    {
         "name": "journal_browser_bestiary.pkl",
         "relative_path": os.path.join("JournalBrowser", "journal_browser_bestiary.pkl"),
         "label": "journal_browser_bestiary.pkl",
@@ -2255,6 +2543,10 @@ def _get_cache_description(cache_name: str) -> str:
 
 
 def _get_cache_group(cache_name: str) -> str:
+    item = _get_cache_item(cache_name)
+    explicit_group = item.get("group")
+    if explicit_group in CACHE_GROUP_LABELS:
+        return explicit_group
     name = str(cache_name or "").lower()
     if name.endswith(".pkl"):
         if "mods" in name:
@@ -2296,6 +2588,8 @@ def _get_cache_signature_builder(cache_name: str):
         return lambda: BundleManager.BuildSourceSignature(False)
     if cache_name == "bundle_cache_mods.pkl":
         return lambda: BundleManager.BuildSourceSignature(True)
+    if cache_name == "dlc_definition_cache.pkl":
+        return _build_dlc_definition_cache_signature
     if cache_name == "journal_browser_bestiary.pkl":
         return lambda: w3_asset_browser._journal_browser_signature("BESTIARY")
     if cache_name == "journal_browser_characters.pkl":
@@ -2379,6 +2673,27 @@ def _refresh_equipment_xml_bundle_cache() -> bool:
         return False
 
 
+def _build_dlc_definition_cache_signature():
+    from .importers import dlc_mounters
+
+    return dlc_mounters.build_dlc_mounter_cache_signature(bpy.context)
+
+
+def _refresh_dlc_definition_cache():
+    from .importers import dlc_mounters
+
+    return dlc_mounters.refresh_dlc_mounter_cache(bpy.context, sync_sources=True)
+
+
+def _clear_dlc_definition_cache_state():
+    try:
+        from .importers import dlc_mounters
+
+        dlc_mounters.clear_dlc_mounter_cache(reset_manager=True)
+    except Exception:
+        pass
+
+
 def _run_cache_refresh_action(action) -> bool:
     if action is None:
         return False
@@ -2406,6 +2721,7 @@ def _refresh_cache_by_name(cache_name: str) -> bool:
         "speech_cache.pkl": lambda: SpeechManager.Get(do_reload=True),
         "bundle_cache.pkl": lambda: BundleManager.Get(loadmods=False, reset_cache=True),
         "bundle_cache_mods.pkl": lambda: BundleManager.Get(loadmods=True, reset_cache=True),
+        "dlc_definition_cache.pkl": _refresh_dlc_definition_cache,
         "journal_browser_bestiary.pkl": lambda: _refresh_journal_cache("BESTIARY"),
         "journal_browser_characters.pkl": lambda: _refresh_journal_cache("CHARACTERS"),
         "journal_icons_bestiary": lambda: _refresh_journal_cache("BESTIARY"),
@@ -2442,6 +2758,8 @@ def _delete_cache_by_name(cache_name: str) -> bool:
                 os.remove(meta_path)
             except Exception:
                 pass
+        if cache_name == "dlc_definition_cache.pkl":
+            _clear_dlc_definition_cache_state()
         return True
     except Exception:
         log.warning("Failed to delete cache/reference item %s", cache_name, exc_info=True)
@@ -3983,11 +4301,16 @@ _classes = [
 
 def register():
     bpy.utils.register_class(PathItem)
+    bpy.utils.register_class(DlcMounterSourceItem)
     bpy.utils.register_class(WITCHER_UL_path_list)
+    bpy.utils.register_class(WITCHER_UL_game_dlc_mounter_sources)
+    bpy.utils.register_class(WITCHER_UL_redkit_dlc_mounter_sources)
+    bpy.utils.register_class(WITCHER_OT_dlc_mounter_source_details)
     bpy.utils.register_class(AddPathOperator)
     bpy.utils.register_class(RemovePathOperator)
     bpy.utils.register_class(AddRedkitProjectOperator)
     bpy.utils.register_class(RemoveRedkitProjectOperator)
+    bpy.utils.register_class(WITCHER_OT_refresh_dlc_mounter_sources)
     bpy.utils.register_class(WITCHER_OT_reset_browser_popup_width)
     bpy.utils.register_class(WITCHER_OT_autofind_w3_path)
     bpy.utils.register_class(WITCHER_OT_autofind_w2_path)
@@ -4006,6 +4329,19 @@ def register():
     except Exception:
         pass
     _auto_initialize_game_and_audio_paths(prefs, bpy.context)
+    try:
+        from .importers import dlc_mounters
+
+        dlc_sources = getattr(prefs, "dlc_mounter_sources", []) or []
+        has_legacy_dlc_strings = any(
+            not getattr(item, "dlc_name_key", "")
+            and str(getattr(item, "dlc_name", "") or "").startswith("dlc_")
+            for item in dlc_sources
+        )
+        if len(dlc_sources) == 0 or has_legacy_dlc_strings:
+            dlc_mounters.sync_dlc_mounter_sources(bpy.context)
+    except Exception:
+        pass
     bpy.types.Scene.witcher_tools_tab = EnumProperty(
         name="Witcher Tools Tab",
         items=WITCHER_TOOLS_TABS,
@@ -4067,6 +4403,7 @@ def unregister():
     unified_lists.unregister()
     
     #PATH LIST
+    bpy.utils.unregister_class(WITCHER_OT_refresh_dlc_mounter_sources)
     bpy.utils.unregister_class(RemoveRedkitProjectOperator)
     bpy.utils.unregister_class(AddRedkitProjectOperator)
     bpy.utils.unregister_class(RemovePathOperator)
@@ -4078,7 +4415,11 @@ def unregister():
     bpy.utils.unregister_class(WITCHER_OT_reset_browser_popup_width)
     bpy.utils.unregister_class(WITCHER_OT_pref_help_popup)
     bpy.utils.unregister_class(WITCHER_OT_open_pref_path)
+    bpy.utils.unregister_class(WITCHER_OT_dlc_mounter_source_details)
+    bpy.utils.unregister_class(WITCHER_UL_redkit_dlc_mounter_sources)
+    bpy.utils.unregister_class(WITCHER_UL_game_dlc_mounter_sources)
     bpy.utils.unregister_class(WITCHER_UL_path_list)
+    bpy.utils.unregister_class(DlcMounterSourceItem)
     bpy.utils.unregister_class(PathItem)
 
     w3_asset_browser.unregister()

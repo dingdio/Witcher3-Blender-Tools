@@ -27,10 +27,18 @@ _LANGUAGE_DECODER_CACHE_VERSION = {
     "kr": 1,
     "tr": 1,
 }
+_STRING_CACHE_FORMAT_VERSION = 2
 
 
 def _decoder_cache_version(language: str):
     return _LANGUAGE_DECODER_CACHE_VERSION.get(str(language or "en"))
+
+
+def _hash_string_key(key: str) -> int:
+    value = 0
+    for char in str(key or ""):
+        value = ((value * 31) + ord(char)) & 0xFFFFFFFF
+    return value
 
 
 def _refresh_strings_configuration_path() -> str:
@@ -49,7 +57,9 @@ class W3StringManager():
         self.base_path = ""
         self.Lines:dict = {}
         self.Keys:dict = {}
+        self.KeyToId:dict = {}
         self.decoder_cache_version = _decoder_cache_version(self.Language)
+        self.string_cache_format_version = _STRING_CACHE_FORMAT_VERSION
         #self.importedStrings = {} #TODO
     def _looks_corrupted(self, sample_size: int = 200) -> bool:
         checked = 0
@@ -76,7 +86,9 @@ class W3StringManager():
         self.base_path = normalize_game_path(path)
         self.Lines:dict = {}
         self.Keys:dict = {}
+        self.KeyToId:dict = {}
         self.decoder_cache_version = _decoder_cache_version(newlanguage)
+        self.string_cache_format_version = _STRING_CACHE_FORMAT_VERSION
 
         if not _has_string_source_root(self.base_path):
             log.info("String cache skipped: Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
@@ -110,10 +122,38 @@ class W3StringManager():
         for item in stringFile.block2:
             if item.str_id not in self.Keys:
                 self.Keys[item.str_id] = True
+            self.KeyToId[int(item.str_key_hex)] = int(item.str_id)
         return True
 
     def GetString(self, id: int):
         return self.Lines.get(id)
+
+    def GetStringByKey(self, key: str):
+        key = str(key or "").strip()
+        if not key:
+            return None
+
+        numeric_key = key[1:] if key.startswith("#") else key
+        try:
+            localized = self.GetString(int(numeric_key, 0))
+            if localized:
+                return localized
+        except Exception:
+            pass
+
+        key_to_id = getattr(self, "KeyToId", {}) or {}
+        candidates = [key]
+        lower_key = key.lower()
+        if lower_key != key:
+            candidates.append(lower_key)
+        for candidate in candidates:
+            string_id = key_to_id.get(_hash_string_key(candidate))
+            if string_id is None:
+                continue
+            localized = self.GetString(string_id)
+            if localized:
+                return localized
+        return None
 
     @classmethod
     def from_json(cls, data):
@@ -121,10 +161,13 @@ class W3StringManager():
         t_class.Language = data['Language']
         t_class.base_path = normalize_game_path(data.get('base_path', ""))
         t_class.decoder_cache_version = data.get('decoder_cache_version')
+        t_class.string_cache_format_version = data.get('string_cache_format_version', 1)
         for key, val in data['Lines'].items():
             t_class.Lines[int(key)] = val
         for line in data['Keys'].items():
             t_class.Keys[int(line[0])] = line[1]
+        for key, val in data.get('KeyToId', {}).items():
+            t_class.KeyToId[int(key)] = int(val)
         return t_class
     @staticmethod
     def Get(do_reload = False):
@@ -186,6 +229,9 @@ class W3StringManager():
                         and getattr(w3StringManager, "decoder_cache_version", None) != required_decoder_version
                     ):
                         load_reason = "rebuilt (decoder changed)"
+                        w3StringManager = build_from_game()
+                    elif getattr(w3StringManager, "string_cache_format_version", 1) != _STRING_CACHE_FORMAT_VERSION:
+                        load_reason = "rebuilt (format changed)"
                         w3StringManager = build_from_game()
                     elif w3StringManager._looks_corrupted():
                         load_reason = "rebuilt (corrupted cache)"

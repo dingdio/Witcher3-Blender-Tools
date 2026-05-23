@@ -1624,6 +1624,18 @@ def get_vanilla_path(item_path, loadmods):
             return parts[1]
     return item_path
 
+
+def get_asset_browser_copy_path(item_path: str, loadmods: bool = False) -> str:
+    path = _normalize_virtual_path(item_path)
+    if not loadmods or "\\" not in path:
+        return path
+
+    parts = path.split("\\")
+    if len(parts) >= 3 and parts[1].lower() == "dlc" and parts[2].lower() == parts[0].lower():
+        return "\\".join(parts[1:])
+    return path
+
+
 def strip_mod_prefix(item_path: str, mod_name: str):
     if not item_path:
         return item_path
@@ -6296,8 +6308,10 @@ class CopyPathOperator(Operator):
     path: StringProperty()
 
     def execute(self, context):
-        bpy.context.window_manager.clipboard = self.path
-        self.report({'INFO'}, f"Copied: {self.path}")
+        browser = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+        path = get_asset_browser_copy_path(self.path, loadmods=bool(getattr(browser, "loadmods", False)))
+        bpy.context.window_manager.clipboard = path
+        self.report({'INFO'}, f"Copied: {path}")
         return {'FINISHED'}
 
 
@@ -6318,9 +6332,16 @@ class CopyAllSearchPathsOperator(Operator):
             return {'CANCELLED'}
 
         if wfb.active_cache_type:
-            paths = [item for item in results if not filter_text or filter_text in item.lower()]
+            paths = [
+                get_asset_browser_copy_path(item, loadmods=bool(getattr(wfb, "loadmods", False)))
+                for item in results
+                if not filter_text or filter_text in item.lower()
+            ]
         else:
-            paths = [path for _, path in results]
+            paths = [
+                get_asset_browser_copy_path(path, loadmods=bool(getattr(wfb, "loadmods", False)))
+                for _, path in results
+            ]
 
         if not paths:
             self.report({'WARNING'}, "No results match the current filter")
