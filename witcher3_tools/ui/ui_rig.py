@@ -7,7 +7,7 @@ from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatVectorProperty, IntProperty, StringProperty
 from bpy.types import PropertyGroup, UIList
 
-from .. import pose_key_tools
+from .. import ik_rig, pose_key_tools
 from ..lipsync import redkit_project
 from .armature_context import get_main_armature
 
@@ -74,12 +74,9 @@ class WITCH_UL_RigBoneList(UIList):
 
         row = layout.row(align=True)
         row.prop(item, "enabled", text="")
-        icon_name = 'BONE_DATA'
-        if item.group == "IK":
-            icon_name = 'CONSTRAINT'
         op = row.operator(WITCH_OT_RigSelectBone.bl_idname, text="", icon='RESTRICT_SELECT_OFF')
         op.bone_name = item.name
-        row.label(text=item.label or item.name, icon=icon_name)
+        row.label(text=item.label or item.name, icon='BONE_DATA')
 
 
 class WITCH_UL_RigPresetList(UIList):
@@ -167,8 +164,6 @@ def _bone_depth(pose_bone):
 
 
 def _bone_group(name, mode):
-    if mode == 'IK':
-        return "IK" if pose_key_tools.is_game_ik_marker(name) else ""
     if mode == 'HAND':
         return "HAND" if pose_key_tools.is_hand_bone_name(name) else ""
     return "FK"
@@ -225,7 +220,7 @@ def refresh_rig_bone_list(context, mode="FK"):
         item.depth = depth
         indent = "  " * min(depth, 6)
         item.label = f"{indent}{bone_name}"
-        item.enabled = is_active or group in {"HAND", "IK"}
+        item.enabled = is_active or group == "HAND"
         if bone_name == preferred_bone_name:
             selected_index = count
         count += 1
@@ -745,7 +740,7 @@ def _sync_rotation_from_bone(context, bone_name=None):
     if armature is None or not bone_name:
         return
     mode = getattr(context.scene, "witcher_rig_tab", "FK")
-    values = pose_key_tools.pose_key_bone_rotation_euler(context, armature, bone_name, group=mode if mode in {'FK', 'HAND', 'IK'} else None)
+    values = pose_key_tools.pose_key_bone_rotation_euler(context, armature, bone_name, group=mode if mode in {'FK', 'HAND'} else None)
     if values is None:
         return
     _RIG_ROTATION_UPDATE_LOCK = True
@@ -785,7 +780,7 @@ def _on_rig_pose_key_list_index_update(self, context):
     strip = pose_key_tools.set_active_pose_key_strip(context, armature, item.name)
     _sync_pose_key_settings_from_strip(context, strip)
     mode = getattr(context.scene, "witcher_rig_tab", "FK")
-    if mode in {'FK', 'HAND', 'IK'}:
+    if mode in {'FK', 'HAND'}:
         refresh_rig_bone_list(context, mode)
     _sync_rotation_from_bone(context)
     _sync_hand_tracks_from_pose_key(context, armature)
@@ -896,7 +891,7 @@ def _on_rig_hand_tracks_update(self, context):
 
 def _on_rig_active_only_update(self, context):
     mode = getattr(context.scene, "witcher_rig_tab", "FK")
-    if mode in {'FK', 'HAND', 'IK'}:
+    if mode in {'FK', 'HAND'}:
         refresh_rig_bone_list(context, mode)
         _sync_rotation_from_bone(context)
         _set_auto_capture_baseline(context)
@@ -904,7 +899,7 @@ def _on_rig_active_only_update(self, context):
 
 def _on_rig_tab_update(self, context):
     mode = getattr(context.scene, "witcher_rig_tab", "FK")
-    if mode in {'FK', 'HAND', 'IK'}:
+    if mode in {'FK', 'HAND'}:
         refresh_rig_bone_list(context, mode)
         _sync_rotation_from_bone(context)
         if mode == 'HAND':
@@ -949,7 +944,7 @@ def _sync_pose_mode_selection(context):
     if scene is None:
         return
     mode = getattr(scene, "witcher_rig_tab", "FK")
-    if mode not in {'FK', 'HAND', 'IK'}:
+    if mode not in {'FK', 'HAND'}:
         return
 
     armature, bone_name = _active_pose_mode_armature_and_bone(context)
@@ -1043,7 +1038,6 @@ class WITCH_OT_RigRefreshBones(bpy.types.Operator):
         items=[
             ('FK', "FK", ""),
             ('HAND', "Hands", ""),
-            ('IK', "IK", ""),
         ],
         default='FK',
     )
@@ -1450,7 +1444,7 @@ class WITCH_OT_RigAddPoseKey(bpy.types.Operator):
         refresh_rig_pose_key_list(context)
         _sync_hand_tracks_from_pose_key(context, armature)
         mode = getattr(scene, "witcher_rig_tab", "FK")
-        if mode in {'FK', 'HAND', 'IK'}:
+        if mode in {'FK', 'HAND'}:
             refresh_rig_bone_list(context, mode)
         self.report({'INFO'}, "Added PoseKey")
         return {'FINISHED'}
@@ -1474,25 +1468,155 @@ class WITCH_OT_RigRemovePoseKey(bpy.types.Operator):
         refresh_rig_pose_key_list(context)
         _sync_hand_tracks_from_pose_key(context, armature)
         mode = getattr(context.scene, "witcher_rig_tab", "FK")
-        if mode in {'FK', 'HAND', 'IK'}:
+        if mode in {'FK', 'HAND'}:
             refresh_rig_bone_list(context, mode)
         self.report({'INFO'}, "Removed PoseKey")
         return {'FINISHED'}
 
 
-class WITCH_OT_RigSyncGameIkMarkers(bpy.types.Operator):
-    bl_idname = "witcher.rig_sync_game_ik_markers"
-    bl_label = "Sync Game IK Markers"
+def _selected_ik_limbs(scene):
+    limbs = []
+    if bool(getattr(scene, "witcher_rig_ik_l_arm", True)):
+        limbs.append("l_arm")
+    if bool(getattr(scene, "witcher_rig_ik_r_arm", True)):
+        limbs.append("r_arm")
+    if bool(getattr(scene, "witcher_rig_ik_l_leg", True)):
+        limbs.append("l_leg")
+    if bool(getattr(scene, "witcher_rig_ik_r_leg", True)):
+        limbs.append("r_leg")
+    return limbs
+
+
+def _ik_frame_range(context):
+    scene = context.scene
+    mode = str(getattr(scene, "witcher_rig_ik_range_mode", "ACTION") or "ACTION")
+    try:
+        frame = int(getattr(scene, "frame_current", 1))
+    except Exception:
+        frame = 1
+    if mode == "CURRENT":
+        return frame, frame
+    if mode == "CUSTOM":
+        try:
+            start = int(getattr(scene, "witcher_rig_ik_frame_start", frame))
+        except Exception:
+            start = frame
+        try:
+            end = int(getattr(scene, "witcher_rig_ik_frame_end", frame))
+        except Exception:
+            end = frame
+        return (start, end) if start <= end else (end, start)
+    if mode == "ACTION":
+        armature = _find_character_armature(context)
+        action = getattr(getattr(armature, "animation_data", None), "action", None) if armature else None
+        return ik_rig.action_frame_range(action, scene)
+    return int(scene.frame_start), int(scene.frame_end)
+
+
+def _report_ik_result(operator, context, result):
+    scene = context.scene
+    scene.witcher_rig_ik_status = str(getattr(result, "message", "") or "")
+    if result:
+        operator.report({'INFO'}, scene.witcher_rig_ik_status)
+        return {'FINISHED'}
+    operator.report({'ERROR'}, scene.witcher_rig_ik_status or "IK rig operation failed")
+    return {'CANCELLED'}
+
+
+class WITCH_OT_RigCreateIkControls(bpy.types.Operator):
+    bl_idname = "witcher.rig_create_ik_controls"
+    bl_label = "Create IK Controls"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    rebuild: BoolProperty(default=False)
+
+    def execute(self, context):
+        armature = _find_character_armature(context)
+        result = ik_rig.create_ik_rig(context, armature, options={"rebuild": self.rebuild})
+        return _report_ik_result(self, context, result)
+
+
+class WITCH_OT_RigRemoveIkControls(bpy.types.Operator):
+    bl_idname = "witcher.rig_remove_ik_controls"
+    bl_label = "Remove IK Controls"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         armature = _find_character_armature(context)
-        if armature is None:
-            self.report({'ERROR'}, "Select a character armature")
-            return {'CANCELLED'}
-        count = pose_key_tools.sync_game_ik_marker_pose(armature)
-        self.report({'INFO'}, f"Synced {count} IK marker bones")
-        return {'FINISHED'}
+        result = ik_rig.remove_ik_rig(context, armature)
+        return _report_ik_result(self, context, result)
+
+
+class WITCH_OT_RigSnapFkToIk(bpy.types.Operator):
+    bl_idname = "witcher.rig_snap_fk_to_ik"
+    bl_label = "Snap FK To IK"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        armature = _find_character_armature(context)
+        result = ik_rig.snap_fk_to_ik(
+            context,
+            armature,
+            _selected_ik_limbs(context.scene),
+            context.scene.frame_current,
+            key=bool(getattr(context.scene, "witcher_rig_ik_key_current", False)),
+        )
+        return _report_ik_result(self, context, result)
+
+
+class WITCH_OT_RigSnapIkToFk(bpy.types.Operator):
+    bl_idname = "witcher.rig_snap_ik_to_fk"
+    bl_label = "Snap IK To FK"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        armature = _find_character_armature(context)
+        result = ik_rig.snap_ik_to_fk(
+            context,
+            armature,
+            _selected_ik_limbs(context.scene),
+            context.scene.frame_current,
+            key=bool(getattr(context.scene, "witcher_rig_ik_key_current", False)),
+        )
+        return _report_ik_result(self, context, result)
+
+
+class WITCH_OT_RigBakeFkToIk(bpy.types.Operator):
+    bl_idname = "witcher.rig_bake_fk_to_ik"
+    bl_label = "Bake FK To IK"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        armature = _find_character_armature(context)
+        frame_start, frame_end = _ik_frame_range(context)
+        result = ik_rig.bake_fk_to_ik(
+            context,
+            armature,
+            frame_start,
+            frame_end,
+            _selected_ik_limbs(context.scene),
+            clear_keys=bool(getattr(context.scene, "witcher_rig_ik_clear_keys", True)),
+        )
+        return _report_ik_result(self, context, result)
+
+
+class WITCH_OT_RigBakeIkToGame(bpy.types.Operator):
+    bl_idname = "witcher.rig_bake_ik_to_game"
+    bl_label = "Bake IK To Game Action"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        armature = _find_character_armature(context)
+        frame_start, frame_end = _ik_frame_range(context)
+        result = ik_rig.bake_ik_to_fk(
+            context,
+            armature,
+            frame_start,
+            frame_end,
+            _selected_ik_limbs(context.scene),
+            new_action=bool(getattr(context.scene, "witcher_rig_ik_new_action", True)),
+        )
+        return _report_ik_result(self, context, result)
 
 
 class WITCH_OT_RigCreatePoseKey(bpy.types.Operator):
@@ -1504,7 +1628,6 @@ class WITCH_OT_RigCreatePoseKey(bpy.types.Operator):
         items=[
             ('FK', "FK", ""),
             ('HAND', "Hands", ""),
-            ('IK', "IK", ""),
         ],
         default='FK',
     )
@@ -1521,9 +1644,6 @@ class WITCH_OT_RigCreatePoseKey(bpy.types.Operator):
         if armature is None or getattr(armature, "pose", None) is None:
             self.report({'ERROR'}, "Select a character armature")
             return {'CANCELLED'}
-
-        if self.mode == 'IK' and bool(getattr(context.scene, "witcher_rig_sync_ik_on_create", True)):
-            pose_key_tools.sync_game_ik_marker_pose(armature)
 
         entries = (
             _selected_pose_bone_entries(context, self.mode)
@@ -1567,7 +1687,7 @@ class WITCH_OT_RigCreatePoseKey(bpy.types.Operator):
         refresh_rig_pose_key_list(context)
         _sync_hand_tracks_from_pose_key(context, armature)
         mode = getattr(scene, "witcher_rig_tab", "FK")
-        if mode in {'FK', 'HAND', 'IK'}:
+        if mode in {'FK', 'HAND'}:
             refresh_rig_bone_list(context, mode)
         self.report({'INFO'}, f"Created PoseKey with {len(entries)} bones")
         return {'FINISHED'}
@@ -1731,7 +1851,7 @@ class WITCH_OT_RigApplyRedkitPreset(bpy.types.Operator):
         scene.witcher_rig_pose_status = f"Applied preset {preset_name}"
         refresh_rig_pose_key_list(context)
         _sync_hand_tracks_from_pose_key(context, armature)
-        if getattr(scene, "witcher_rig_tab", "FK") in {'FK', 'HAND', 'IK'}:
+        if getattr(scene, "witcher_rig_tab", "FK") in {'FK', 'HAND'}:
             refresh_rig_bone_list(context, getattr(scene, "witcher_rig_tab", "FK"))
         _sync_rotation_from_bone(context)
         _set_auto_capture_baseline(context, armature)
@@ -1945,35 +2065,105 @@ def _draw_create_buttons(layout, mode):
     op.source = 'SELECTED'
 
 
-def draw_rig_tab(layout, context, display_armature=None):
-    scene = context.scene
-    armature = display_armature or _find_character_armature(context)
+def _draw_section_header(layout, scene, prop_name, title, icon='TRIA_RIGHT'):
+    box = layout.box()
+    expanded = bool(getattr(scene, prop_name, True))
+    row = box.row(align=True)
+    row.prop(
+        scene,
+        prop_name,
+        text="",
+        icon='TRIA_DOWN' if expanded else 'TRIA_RIGHT',
+        emboss=False,
+    )
+    row.label(text=title, icon=icon)
+    return box, expanded
 
+
+def _draw_ik_rigging_tools(layout, context, armature):
+    scene = context.scene
+
+    setup_box = layout.box()
+    setup_box.label(text="Setup", icon='ARMATURE_DATA')
+    if armature is None:
+        row = setup_box.row()
+        row.enabled = False
+        row.label(text="Select a character armature.", icon='INFO')
+        return
+    row = setup_box.row(align=True)
+    row.operator(WITCH_OT_RigCreateIkControls.bl_idname, text="Create Controls", icon='CONSTRAINT')
+    rebuild = row.operator(WITCH_OT_RigCreateIkControls.bl_idname, text="Rebuild", icon='FILE_REFRESH')
+    rebuild.rebuild = True
+    setup_box.operator(WITCH_OT_RigRemoveIkControls.bl_idname, text="Remove Controls", icon='TRASH')
+    status = str(getattr(scene, "witcher_rig_ik_status", "") or "")
+    if status:
+        info = setup_box.row()
+        info.enabled = False
+        info.label(text=status, icon='INFO')
+
+    live_box = layout.box()
+    live_box.label(text="Live IK", icon='CONSTRAINT')
+    if not all(prop in armature for prop in ik_rig.IK_PROPS.values()):
+        row = live_box.row()
+        row.enabled = False
+        row.label(text="Create controls first.", icon='INFO')
+    else:
+        grid = live_box.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=False, align=True)
+        grid.prop(armature, '["w3ik_l_arm"]', text="L Arm", slider=True)
+        grid.prop(armature, '["w3ik_r_arm"]', text="R Arm", slider=True)
+        grid.prop(armature, '["w3ik_l_leg"]', text="L Leg", slider=True)
+        grid.prop(armature, '["w3ik_r_leg"]', text="R Leg", slider=True)
+
+    snap_box = layout.box()
+    snap_box.label(text="FK / IK Snap", icon='SNAP_ON')
+    grid = snap_box.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=False, align=True)
+    grid.prop(scene, "witcher_rig_ik_l_arm", text="L Arm")
+    grid.prop(scene, "witcher_rig_ik_r_arm", text="R Arm")
+    grid.prop(scene, "witcher_rig_ik_l_leg", text="L Leg")
+    grid.prop(scene, "witcher_rig_ik_r_leg", text="R Leg")
+    snap_box.prop(scene, "witcher_rig_ik_key_current", text="Key Snap")
+    row = snap_box.row(align=True)
+    row.operator(WITCH_OT_RigSnapFkToIk.bl_idname, text="FK -> IK", icon='TRIA_RIGHT')
+    row.operator(WITCH_OT_RigSnapIkToFk.bl_idname, text="IK -> FK", icon='TRIA_LEFT')
+
+    bake_box = layout.box()
+    bake_box.label(text="FK / IK Bake", icon='ACTION')
+    bake_box.prop(scene, "witcher_rig_ik_range_mode", text="Range")
+    if getattr(scene, "witcher_rig_ik_range_mode", "ACTION") == "CUSTOM":
+        row = bake_box.row(align=True)
+        row.prop(scene, "witcher_rig_ik_frame_start", text="Start")
+        row.prop(scene, "witcher_rig_ik_frame_end", text="End")
+    bake_box.prop(scene, "witcher_rig_ik_new_action", text="New Action")
+    bake_box.prop(scene, "witcher_rig_ik_clear_keys", text="Clear IK Keys")
+    bake_box.operator(WITCH_OT_RigBakeFkToIk.bl_idname, text="Bake FK -> IK Controls", icon='KEY_HLT')
+    bake_box.operator(WITCH_OT_RigBakeIkToGame.bl_idname, text="Bake IK -> Game Action", icon='EXPORT')
+
+
+def _draw_pose_key_section(layout, context, armature):
+    scene = context.scene
     _draw_pose_key_selector(layout, context, armature)
 
     sub = layout.row(align=True)
     sub.scale_y = 1.25
     sub.prop_enum(scene, "witcher_rig_tab", 'FK')
     sub.prop_enum(scene, "witcher_rig_tab", 'HAND')
-    sub.prop_enum(scene, "witcher_rig_tab", 'IK')
     sub.prop_enum(scene, "witcher_rig_tab", 'PRESETS')
 
     mode = getattr(scene, "witcher_rig_tab", "FK")
+    if mode not in {'FK', 'HAND', 'PRESETS'}:
+        mode = 'FK'
+        try:
+            scene.witcher_rig_tab = 'FK'
+        except Exception:
+            pass
     if armature is None and mode != 'PRESETS':
         layout.label(text="Select a character armature.", icon='INFO')
         return
 
-    if mode in {'FK', 'HAND', 'IK'}:
+    if mode in {'FK', 'HAND'}:
         _draw_pose_settings(layout, context, armature)
         if mode == 'HAND':
             _draw_hands_tab(layout, context, armature)
-        elif mode == 'IK':
-            ik_box = layout.box()
-            row = ik_box.row(align=True)
-            row.operator(WITCH_OT_RigSyncGameIkMarkers.bl_idname, text="Sync Markers", icon='CONSTRAINT')
-            row.prop(scene, "witcher_rig_sync_ik_on_create", text="Auto")
-            _draw_bone_list(layout, context, mode)
-            _draw_create_buttons(layout, mode)
         else:
             _draw_bone_list(layout, context, mode)
             _draw_pose_bone_editor(layout, context, mode)
@@ -2030,6 +2220,31 @@ def draw_rig_tab(layout, context, display_armature=None):
             info.label(text=last, icon='NLA')
 
 
+def draw_rig_tab(layout, context, display_armature=None):
+    scene = context.scene
+    armature = display_armature or _find_character_armature(context)
+
+    rigging_box, show_rigging = _draw_section_header(
+        layout,
+        scene,
+        "witcher_rig_show_rigging",
+        "Rigging",
+        icon='CONSTRAINT',
+    )
+    if show_rigging:
+        _draw_ik_rigging_tools(rigging_box, context, armature)
+
+    pose_box, show_pose = _draw_section_header(
+        layout,
+        scene,
+        "witcher_rig_show_pose_key",
+        "Pose Key",
+        icon='ACTION',
+    )
+    if show_pose:
+        _draw_pose_key_section(pose_box, context, armature)
+
+
 classes = [
     WITCH_PG_RigBoneItem,
     WITCH_PG_RigPresetItem,
@@ -2047,7 +2262,12 @@ classes = [
     WITCH_OT_RigRefreshPoseKeys,
     WITCH_OT_RigAddPoseKey,
     WITCH_OT_RigRemovePoseKey,
-    WITCH_OT_RigSyncGameIkMarkers,
+    WITCH_OT_RigCreateIkControls,
+    WITCH_OT_RigRemoveIkControls,
+    WITCH_OT_RigSnapFkToIk,
+    WITCH_OT_RigSnapIkToFk,
+    WITCH_OT_RigBakeFkToIk,
+    WITCH_OT_RigBakeIkToGame,
     WITCH_OT_RigCreatePoseKey,
     WITCH_OT_RigCopyPoseKeyXml,
     WITCH_OT_RigRefreshRedkitPresets,
@@ -2062,12 +2282,13 @@ def register_props():
         items=[
             ('FK', "FK", "Pose individual animation bones"),
             ('HAND', "Hands", "Pose hand and finger bones"),
-            ('IK', "IK", "Sync and pose game IK marker bones"),
             ('PRESETS', "Presets", "PoseKey preset metadata and clipboard"),
         ],
         default='FK',
         update=_on_rig_tab_update,
     )
+    bpy.types.Scene.witcher_rig_show_rigging = BoolProperty(name="Rigging", default=True)
+    bpy.types.Scene.witcher_rig_show_pose_key = BoolProperty(name="Pose Key", default=True)
     bpy.types.Scene.witcher_rig_bone_list = bpy.props.CollectionProperty(type=WITCH_PG_RigBoneItem)
     bpy.types.Scene.witcher_rig_bone_list_index = IntProperty(default=0, update=_on_rig_bone_list_index_update)
     bpy.types.Scene.witcher_rig_bone_list_mode = StringProperty(default="")
@@ -2153,7 +2374,35 @@ def register_props():
         default='COMBINE',
         update=_on_rig_pose_settings_update,
     )
-    bpy.types.Scene.witcher_rig_sync_ik_on_create = BoolProperty(name="Sync IK On Create", default=True)
+    bpy.types.Scene.witcher_rig_ik_l_arm = BoolProperty(name="Left Arm", default=True)
+    bpy.types.Scene.witcher_rig_ik_r_arm = BoolProperty(name="Right Arm", default=True)
+    bpy.types.Scene.witcher_rig_ik_l_leg = BoolProperty(name="Left Leg", default=True)
+    bpy.types.Scene.witcher_rig_ik_r_leg = BoolProperty(name="Right Leg", default=True)
+    bpy.types.Scene.witcher_rig_ik_key_current = BoolProperty(
+        name="Key Snap",
+        description="Insert control and IK blend keys when snapping the current frame",
+        default=False,
+    )
+    bpy.types.Scene.witcher_rig_ik_range_mode = EnumProperty(
+        name="Range",
+        description="Frame range used by IK bake operators",
+        items=[
+            ('CURRENT', "Current", "Bake the current frame only"),
+            ('SCENE', "Scene", "Use the scene frame range"),
+            ('ACTION', "Action", "Use the active action frame range"),
+            ('CUSTOM', "Custom", "Use the custom start and end frames"),
+        ],
+        default='ACTION',
+    )
+    bpy.types.Scene.witcher_rig_ik_frame_start = IntProperty(name="Start", default=0)
+    bpy.types.Scene.witcher_rig_ik_frame_end = IntProperty(name="End", default=250)
+    bpy.types.Scene.witcher_rig_ik_new_action = BoolProperty(
+        name="New Action",
+        description="Bake IK to a new game action instead of replacing the active action",
+        default=True,
+    )
+    bpy.types.Scene.witcher_rig_ik_clear_keys = BoolProperty(name="Clear IK Keys", default=True)
+    bpy.types.Scene.witcher_rig_ik_status = StringProperty(name="IK Status", default="", options={'SKIP_SAVE'})
     bpy.types.Scene.witcher_rig_last_pose_key_strip = StringProperty(default="", options={'SKIP_SAVE'})
     bpy.types.Scene.witcher_rig_last_pose_key_metadata = StringProperty(default="", options={'SKIP_SAVE'})
     bpy.types.Scene.witcher_rig_pose_status = StringProperty(name="Pose Status", default="", options={'SKIP_SAVE'})
@@ -2164,6 +2413,8 @@ def unregister_props():
     stop_rig_pose_sync_timer()
     for prop_name in (
         "witcher_rig_tab",
+        "witcher_rig_show_rigging",
+        "witcher_rig_show_pose_key",
         "witcher_rig_bone_list",
         "witcher_rig_bone_list_index",
         "witcher_rig_bone_list_mode",
@@ -2195,7 +2446,17 @@ def unregister_props():
         "witcher_rig_pose_preset_name",
         "witcher_rig_pose_preset_version",
         "witcher_rig_pose_nla_blend_type",
-        "witcher_rig_sync_ik_on_create",
+        "witcher_rig_ik_l_arm",
+        "witcher_rig_ik_r_arm",
+        "witcher_rig_ik_l_leg",
+        "witcher_rig_ik_r_leg",
+        "witcher_rig_ik_key_current",
+        "witcher_rig_ik_range_mode",
+        "witcher_rig_ik_frame_start",
+        "witcher_rig_ik_frame_end",
+        "witcher_rig_ik_new_action",
+        "witcher_rig_ik_clear_keys",
+        "witcher_rig_ik_status",
         "witcher_rig_last_pose_key_strip",
         "witcher_rig_last_pose_key_metadata",
         "witcher_rig_pose_status",

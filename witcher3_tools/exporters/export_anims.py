@@ -20,6 +20,7 @@ from ..CR2W import w3_types
 from ..CR2W import anims_builder, cr2w_writer
 from ..importers.motion_tools import cline_from_per_frame
 from .. import get_rig_rot90_enabled
+from .. import ik_rig
 from ..ui.armature_context import get_main_armature
 
 
@@ -79,6 +80,16 @@ def _get_armature_bone_order(armature) -> List[str]:
     if rig_settings and len(rig_settings.bone_order_list):
         bone_order = [bone.name for bone in rig_settings.bone_order_list]
     return bone_order
+
+
+def _has_unbaked_ik_export_keys(armature, action) -> bool:
+    if ik_rig.has_unbaked_ik_controls(armature, action):
+        log.warning(
+            'Action "%s" contains live W3IK control keys. Bake IK to a game action before export.',
+            getattr(action, "name", "<action>"),
+        )
+        return True
+    return False
 
 
 def get_action_slot(armature):
@@ -384,6 +395,8 @@ class W3AnimationExporter:
             action = animation_data.action
         if action is None:
             logging.warning('[WARNING] armature "%s" has no action to export', armObj.name)
+            return None
+        if _has_unbaked_ik_export_keys(armObj, action):
             return None
 
         vmd_bone_anim = BoneAnimation()
@@ -721,6 +734,8 @@ def export_w3_anim(context, savePath, use_native_writer=False,
     if curr_action is None:
         log.warning(f'No action found to export on "{armObj.name}" (source: {source_mode})')
         return {'CANCELLED'}
+    if _has_unbaked_ik_export_keys(armObj, curr_action):
+        return {'CANCELLED'}
 
     exporter = W3AnimationExporter()
     if use_native_writer:
@@ -759,6 +774,9 @@ def export_w3_anim_set(context, savePath, entries, use_native_writer=True):
             action = bpy.data.actions.get(entry.action_name)
             if action is None:
                 log.warning(f'Export set entry "{entry.action_name}": action not found, skipping')
+                skipped.append(entry.action_name)
+                continue
+            if _has_unbaked_ik_export_keys(armObj, action):
                 skipped.append(entry.action_name)
                 continue
 
@@ -803,6 +821,9 @@ def export_w3_anim_set(context, savePath, entries, use_native_writer=True):
             action = bpy.data.actions.get(entry.action_name)
             if action is None:
                 log.warning(f'Export set entry "{entry.action_name}": action not found, skipping')
+                skipped.append(entry.action_name)
+                continue
+            if _has_unbaked_ik_export_keys(armObj, action):
                 skipped.append(entry.action_name)
                 continue
 
