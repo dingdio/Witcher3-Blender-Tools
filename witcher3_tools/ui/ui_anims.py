@@ -15,8 +15,11 @@ from .. import get_rig_rot90_enabled
 from .. import get_all_addon_prefs
 from .. import dialog_language
 from . import ui_dialog_language
+from . import ui_scene
+from . import ui_rig
 from ..importers import import_anims, import_cutscene, import_entity, import_rig, import_scene_animation
 from ..exporters import export_anims, export_cutscene
+from .. import pose_key_tools
 from ..action_compat import (
     assign_action,
     bind_strip_action_slot,
@@ -176,6 +179,8 @@ def _strip_has_witcher_scene_data(strip):
         "w3_scene_section",
         "w3_scene_event_name",
         "w3_scene_requested_animation",
+        pose_key_tools.POSEKEY_MARKER_PROP,
+        pose_key_tools.POSEKEY_METADATA_PROP,
         W3_SCENE_EVENT_WEIGHT_PROP,
         W3_SCENE_WEIGHT_PROP,
     ):
@@ -430,6 +435,86 @@ def _short_panel_header_text(text, max_len=28):
     if not value:
         return ""
     return value if len(value) <= max_len else (value[: max_len - 1] + "…")
+
+
+def _scene_event_class_name(strip, action, pose_key_metadata=None):
+    if pose_key_metadata:
+        return str(pose_key_metadata.get("class", pose_key_tools.POSEKEY_CLASS_NAME) or pose_key_tools.POSEKEY_CLASS_NAME)
+    return str(_idprop_get(strip, "w3_scene_event_class", "") or _idprop_get(action, "w3_scene_event_class", "") or "")
+
+
+def _nla_scene_event_item(context, strip, action, pose_key_metadata=None):
+    scene = getattr(context, "scene", None)
+    event_class = _scene_event_class_name(strip, action, pose_key_metadata)
+    actor = str(
+        _idprop_get(strip, "w3_scene_actor", "")
+        or _idprop_get(action, "w3_scene_actor", "")
+        or (pose_key_metadata or {}).get("actor", "")
+        or ""
+    )
+    dialogset = str(_idprop_get(strip, "w3_scene_dialogset", "") or _idprop_get(action, "w3_scene_dialogset", "") or "")
+    dialogset_slot = str(_idprop_get(strip, "w3_scene_dialogset_slot", "") or _idprop_get(action, "w3_scene_dialogset_slot", "") or "")
+    if event_class == "CStorySceneDialogsetSlot":
+        return ui_scene.find_w2scene_dialogset_slot_item(
+            scene,
+            actor_name=actor,
+            slot_name=dialogset_slot,
+            dialogset_name=dialogset,
+        )
+
+    event_name = str(
+        _idprop_get(strip, "w3_scene_event_name", "")
+        or _idprop_get(action, "w3_scene_event_name", "")
+        or (pose_key_metadata or {}).get("eventName", "")
+        or ""
+    )
+    guid = str(
+        _idprop_get(strip, "w3_scene_event_guid", "")
+        or _idprop_get(action, "w3_scene_event_guid", "")
+        or (pose_key_metadata or {}).get("guid", "")
+        or ""
+    )
+    section = str(
+        _idprop_get(strip, "w3_scene_section", "")
+        or _idprop_get(action, "w3_scene_section", "")
+        or (pose_key_metadata or {}).get("section", "")
+        or ""
+    )
+    return ui_scene.find_w2scene_event_item(
+        scene,
+        guid=guid,
+        event_type=event_class,
+        event_name=event_name,
+        section_name=section,
+    )
+
+
+def _draw_nla_scene_event_class_info(layout, context, strip, action, pose_key_metadata=None):
+    event_item = _nla_scene_event_item(context, strip, action, pose_key_metadata)
+    if event_item is not None:
+        ui_scene.draw_w2scene_cr2w_class_info(
+            layout,
+            event_item,
+            panel_id="witcher_nla_scene_event_class_info",
+            title="Class Fields",
+            empty_label="No set event fields.",
+        )
+        return True
+
+    event_class = _scene_event_class_name(strip, action, pose_key_metadata)
+    if not event_class:
+        return False
+    try:
+        header, body = layout.panel("witcher_nla_scene_event_class_info", default_closed=False)
+    except Exception:
+        box = layout.box()
+        header = box.row(align=True)
+        body = box
+    header.label(text="Class Fields", icon='PROPERTIES')
+    if body is not None:
+        body.label(text=event_class, icon='INFO')
+        body.label(text="Load the .w2scene Scene tab to inspect fields.", icon='INFO')
+    return True
 
 
 def _get_animation_panel_header_status(context):
@@ -5075,6 +5160,13 @@ class WITCHER_PT_NlaSceneStripSettings(bpy.types.Panel):
         if action is not None:
             layout.label(text="Action: " + str(getattr(action, "name", "")), icon='ACTION')
 
+        pose_key_metadata = pose_key_tools.pose_key_metadata_from_strip(strip)
+        event_class_name = _scene_event_class_name(strip, action, pose_key_metadata)
+        if event_class_name.startswith("CStoryScene") or pose_key_metadata:
+            _draw_nla_scene_event_class_info(layout, context, strip, action, pose_key_metadata)
+            if pose_key_metadata:
+                return
+
         scene_section = _idprop_get(data_source, "w3_scene_section", "")
         event_name = _idprop_get(data_source, "w3_scene_event_name", "")
         requested_anim = _idprop_get(data_source, "w3_scene_requested_animation", "")
@@ -5239,6 +5331,7 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
         nav_row.scale_y = 1.6
         nav_row.prop_enum(scene, "witcher_anim_tab", 'SETS')
         nav_row.prop_enum(scene, "witcher_anim_tab", 'CLIPS')
+        nav_row.prop_enum(scene, "witcher_anim_tab", 'RIG')
         nav_row.prop_enum(scene, "witcher_anim_tab", 'SPEECH')
         layout.separator(factor=0.3)
 
@@ -5374,6 +5467,9 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                         no_match = layout.box()
                         no_match.label(text=f"No sets match '{filter_text}'", icon='INFO')
                         no_match.label(text="Try part of file name, path, or group (e.g. sword).")
+
+        if anim_tab == "RIG":
+            ui_rig.draw_rig_tab(layout, context, display_armature)
 
         body = section("witcher_anim_imported_sets", "Imported Animation Clips", 'ACTION') if anim_tab == "CLIPS" else None
         if body:
@@ -6636,6 +6732,7 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
 #-----------------------------------------------------------------------------
 #
 classes = [
+    *ui_rig.classes,
     W3AnimExportEntry,
     ButtonOperatorImportW2Anims,
     ButtonOperatorToggloRootMotion,
@@ -6715,6 +6812,7 @@ def register():
         items=[
             ('SETS',   "Sets",   "Character-linked animation sets (idle, locomotion, facial)"),
             ('CLIPS',  "Clips",  "Import and browse individual animation clips"),
+            ('RIG',    "Rig",    "Create and import story scene PoseKey rig controls"),
             ('SPEECH', "Speech", "Voiceline import and dialogue browser"),
         ],
         default='CLIPS',
@@ -6942,6 +7040,7 @@ def register():
         default=False,
         options={'SKIP_SAVE'},
     )
+    ui_rig.register_props()
 
 
 def unregister():
@@ -6999,6 +7098,7 @@ def unregister():
     ):
         if hasattr(bpy.types.Scene, prop_name):
             delattr(bpy.types.Scene, prop_name)
+    ui_rig.unregister_props()
     #bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     #del bpy.types.Scene.anim_export_name
     for c in reversed(classes):

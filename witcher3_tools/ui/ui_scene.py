@@ -387,6 +387,7 @@ class W2SceneDialogsetItem(PropertyGroup):
 class W2SceneDialogsetSlotItem(PropertyGroup):
     dialogset_index: IntProperty(default=-1)
     source_index: IntProperty(default=-1)
+    class_hierarchy: StringProperty(default="")
     slot_number: IntProperty(default=0)
     slot_name: StringProperty(default="")
     actor_name: StringProperty(default="")
@@ -408,6 +409,7 @@ class W2SceneDialogsetSlotItem(PropertyGroup):
     actor_mimics_layer_animation: StringProperty(default="")
     actor_mimics_layer_pose_weight: FloatProperty(default=1.0)
     force_body_idle_animation_weight: FloatProperty(default=1.0)
+    class_fields: CollectionProperty(type=W2SceneFieldItem)
 
 
 class W2SceneCameraItem(PropertyGroup):
@@ -1509,6 +1511,16 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
             slot_item = scene.witcher_w2scene_dialogset_slot_items.add()
             slot_item.dialogset_index = dialogset_index
             slot_item.source_index = slot_index
+            slot_schema = _w2scene_schema_for_imported_data(slot, "CStorySceneDialogsetSlot")
+            slot_item.class_hierarchy = _w2scene_schema_hierarchy_label(slot_schema)
+            _w2scene_fill_field_items(
+                slot_item.class_fields,
+                slot,
+                slot_schema,
+                section_index=dialogset_index,
+                source_filepath=filepath,
+                context=bpy.context,
+            )
             slot_item.slot_number = _w2scene_as_int(getattr(slot, "slotNumber", 0), 0)
             slot_item.slot_name = _w2scene_prop_text(getattr(slot, "slotName", None))
             slot_item.actor_name = _w2scene_prop_text(getattr(slot, "actorName", None))
@@ -2401,6 +2413,127 @@ def _draw_w2scene_copyable_props(layout, item, fields):
             col.prop(item, prop_name, text=label)
 
 
+def _w2scene_normalized_guid(value):
+    text = str(value or "").strip().strip("{}").lower()
+    return text.replace("-", "")
+
+
+def find_w2scene_event_item(scene, guid="", event_type="", event_name="", section_name=""):
+    items = list(getattr(scene, "witcher_w2scene_section_event_items", []) or []) if scene is not None else []
+    if not items:
+        return None
+
+    section_name = str(section_name or "").strip().lower()
+    sections = list(getattr(scene, "witcher_sections", []) or []) if scene is not None else []
+
+    def section_matches(item):
+        if not section_name:
+            return True
+        try:
+            section_index = int(getattr(item, "section_index", -1))
+        except Exception:
+            section_index = -1
+        if not (0 <= section_index < len(sections)):
+            return True
+        return str(getattr(sections[section_index], "name", "") or "").strip().lower() == section_name
+
+    candidates = [item for item in items if section_matches(item)]
+    guid_norm = _w2scene_normalized_guid(guid)
+    if guid_norm:
+        for item in candidates:
+            item_guid = _w2scene_normalized_guid(getattr(item, "guid", ""))
+            if item_guid and (item_guid == guid_norm or item_guid.startswith(guid_norm) or guid_norm.startswith(item_guid)):
+                return item
+
+    event_type = str(event_type or "").strip()
+    event_name = str(event_name or "").strip()
+    if event_type and event_name:
+        for item in candidates:
+            if (
+                str(getattr(item, "event_type", "") or "").strip() == event_type
+                and str(getattr(item, "event_name", "") or "").strip() == event_name
+            ):
+                return item
+
+    if event_type:
+        for item in candidates:
+            if str(getattr(item, "event_type", "") or "").strip() == event_type:
+                return item
+    return None
+
+
+def find_w2scene_dialogset_slot_item(scene, actor_name="", slot_name="", dialogset_name=""):
+    if scene is None:
+        return None
+    slots = list(getattr(scene, "witcher_w2scene_dialogset_slot_items", []) or [])
+    if not slots:
+        return None
+    dialogsets = list(getattr(scene, "witcher_w2scene_dialogset_items", []) or [])
+    actor_name = str(actor_name or "").strip().lower()
+    slot_name = str(slot_name or "").strip().lower()
+    dialogset_name = str(dialogset_name or "").strip().lower()
+
+    def dialogset_matches(item):
+        if not dialogset_name:
+            return True
+        try:
+            dialogset_index = int(getattr(item, "dialogset_index", -1))
+        except Exception:
+            dialogset_index = -1
+        if not (0 <= dialogset_index < len(dialogsets)):
+            return True
+        return str(getattr(dialogsets[dialogset_index], "name", "") or "").strip().lower() == dialogset_name
+
+    candidates = [item for item in slots if dialogset_matches(item)]
+    if actor_name and slot_name:
+        for item in candidates:
+            if (
+                str(getattr(item, "actor_name", "") or "").strip().lower() == actor_name
+                and str(getattr(item, "slot_name", "") or "").strip().lower() == slot_name
+            ):
+                return item
+    if actor_name:
+        for item in candidates:
+            if str(getattr(item, "actor_name", "") or "").strip().lower() == actor_name:
+                return item
+    if slot_name:
+        for item in candidates:
+            if str(getattr(item, "slot_name", "") or "").strip().lower() == slot_name:
+                return item
+    return None
+
+
+def draw_w2scene_cr2w_class_info(layout, item, *, panel_id, title="Class Fields", empty_label="No set fields.", default_closed=False):
+    try:
+        header, body = layout.panel(panel_id, default_closed=default_closed)
+    except Exception:
+        box = layout.box()
+        header = box.row(align=True)
+        body = box
+    header.label(text=title, icon='PROPERTIES')
+    if body is None:
+        return
+
+    body.use_property_split = False
+    body.use_property_decorate = False
+    class_hierarchy = str(getattr(item, "class_hierarchy", "") or "").strip()
+    if class_hierarchy and hasattr(item, "class_hierarchy"):
+        meta = body.column(align=True)
+        meta.use_property_split = True
+        meta.use_property_decorate = False
+        meta.prop(item, "class_hierarchy", text="Inheritance")
+
+    field_items = list(getattr(item, "class_fields", []) or [])
+    _draw_imported_class_sections(
+        body,
+        field_items,
+        _w2scene_schema_from_field_items(field_items),
+        False,
+        empty_label,
+        per_class_show_unset=True,
+    )
+
+
 def _draw_w2scene_scene_tab(layout, scene):
     path = str(getattr(scene, "witcher_loaded_w2scene_path", "") or "").strip()
     repo_path = str(getattr(scene, "witcher_w2scene_repo_path", "") or "").strip()
@@ -2530,10 +2663,6 @@ def _draw_w2scene_sections_tab(layout, scene):
         elem_detail = elem_box.box()
         elem_header = elem_detail.row(align=True)
         elem_header.label(text=elem.element_type or "Element", icon=_w2scene_element_icon(elem.element_type))
-        elem_meta = elem_detail.column(align=True)
-        elem_meta.use_property_split = True
-        elem_meta.use_property_decorate = False
-        elem_meta.prop(elem, "class_hierarchy", text="Inheritance")
         elem_detail.separator(factor=0.3)
         elem_detail.label(text="Resolved", icon='INFO')
         _draw_w2scene_copyable_props(elem_detail, elem, [
@@ -2544,14 +2673,12 @@ def _draw_w2scene_sections_tab(layout, scene):
             ("line_id", "dialogLine"),
             ("detail_text", "details"),
         ])
-        elem_fields = list(getattr(elem, "class_fields", []) or [])
-        _draw_imported_class_sections(
+        draw_w2scene_cr2w_class_info(
             elem_detail,
-            elem_fields,
-            _w2scene_schema_from_field_items(elem_fields),
-            False,
-            "No set element fields.",
-            per_class_show_unset=True,
+            elem,
+            panel_id=f"w2scene_element_class_{section_index}_{int(getattr(elem, 'source_index', -1))}",
+            title="Class Fields",
+            empty_label="No set element fields.",
         )
 
     event_box = detail.box()
@@ -2575,10 +2702,6 @@ def _draw_w2scene_sections_tab(layout, scene):
             op = ev_header.operator(WITCH_OT_W2ScenePreviewCameraEvent.bl_idname, text="Preview", icon='VIEW_CAMERA')
             op.section_index = section_index
             op.source_index = int(getattr(event, "source_index", -1))
-        ev_meta = ev_detail.column(align=True)
-        ev_meta.use_property_split = True
-        ev_meta.use_property_decorate = False
-        ev_meta.prop(event, "class_hierarchy", text="Inheritance")
         ev_detail.separator(factor=0.3)
         ev_detail.label(text="Resolved", icon='INFO')
         _draw_w2scene_copyable_props(ev_detail, event, [
@@ -2589,14 +2712,12 @@ def _draw_w2scene_sections_tab(layout, scene):
             ("camera_name", "camera"),
             ("detail_text", "details"),
         ])
-        event_fields = list(getattr(event, "class_fields", []) or [])
-        _draw_imported_class_sections(
+        draw_w2scene_cr2w_class_info(
             ev_detail,
-            event_fields,
-            _w2scene_schema_from_field_items(event_fields),
-            False,
-            "No set event fields.",
-            per_class_show_unset=True,
+            event,
+            panel_id=f"w2scene_event_class_{section_index}_{int(getattr(event, 'source_index', -1))}",
+            title="Class Fields",
+            empty_label="No set event fields.",
         )
 
     fields = [
@@ -2770,6 +2891,14 @@ def _draw_w2scene_dialogsets_tab(layout, scene, context):
             ("slot_place_pitch", "slotPlacement.Pitch"),
             ("slot_place_roll", "slotPlacement.Roll"),
         ])
+        draw_w2scene_cr2w_class_info(
+            slot_box,
+            slot,
+            panel_id=f"w2scene_dialogset_slot_class_{idx}_{int(getattr(slot, 'source_index', -1))}",
+            title="Class Fields",
+            empty_label="No set slot fields.",
+            default_closed=True,
+        )
         slot_box.separator(factor=0.3)
         slot_box.label(text="Manual Slot Preview", icon='ARMATURE_DATA')
         slot_box.prop(wm, "witcher_dialogset_status", text="actorStatus")

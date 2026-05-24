@@ -6,6 +6,7 @@ import importlib
 from collections import deque
 from pathlib import Path
 from .. import dialog_language, get_uncook_path, get_rig_rot90_enabled
+from .. import pose_key_tools
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.CR2W_types import EngineTransform
@@ -232,6 +233,10 @@ def _w2scene_track_is_mimic_layer(track_name):
     )
 
 
+def _w2scene_track_is_pose_key(track_name):
+    return str(track_name or "").startswith("cutscene_import_posekey")
+
+
 def _w2scene_dialogset_mimic_layer_for_track(track_name):
     base_name = str(track_name or "").split(".", 1)[0]
     for layer_name, layer_track_name in W2SCENE_DIALOGSET_MIMIC_BASE_TRACK_BY_LAYER.items():
@@ -273,6 +278,8 @@ def _w2scene_dialogset_mimic_change_group_index(track_name):
 def _w2scene_track_is_body_layer(track_name):
     current_name = str(track_name or "")
     base_name = current_name.split(".", 1)[0]
+    if _w2scene_track_is_pose_key(current_name):
+        return False
     return (
         base_name == W2SCENE_DIALOGSET_IDLE_TRACK_NAME
         or base_name.startswith(W2SCENE_DIALOGSET_IDLE_CHANGE_TRACK_PREFIX)
@@ -370,6 +377,8 @@ def _w2scene_event_needs_additive_trajectory_extraction(event):
 
 
 def _w2scene_strip_blend_type(track_name, event=None):
+    if _w2scene_track_is_pose_key(track_name):
+        return 'COMBINE'
     if _w2scene_track_is_mimic_layer(track_name):
         return 'COMBINE'
     if _w2scene_track_is_body_layer(track_name):
@@ -381,6 +390,8 @@ def _w2scene_strip_blend_type(track_name, event=None):
 
 def _w2scene_track_uses_anim_clip_blends(track_name):
     current_name = str(track_name or "")
+    if _w2scene_track_is_pose_key(current_name):
+        return False
     return current_name.startswith((
         "cutscene_import_body",
         "cutscene_import_pose",
@@ -3863,7 +3874,7 @@ class SceneImporter():
         actors_dict= {}
         props_dict = {}
         dialogset_idle_animations = []
-        dialogset_mimic_animations = []  # [(actor_obj, layer_value, layer_column, track_name, pose_weight), ...]
+        dialogset_mimic_animations = []  # [(actor_obj, layer_value, layer_column, track_name, pose_weight, actor_name, slot_name, dialogset_name), ...]
         dialogset_body_state_by_actor = {}
         dialogset_mimic_state_by_actor = {}
         dialogset_idle_change_counts_by_actor = {}
@@ -4182,7 +4193,7 @@ class SceneImporter():
                     "pose_name": _cname_text(getattr(_dss, "actorPoseName", None)),
                 }
                 if body_anim:
-                    dialogset_idle_animations.append((actor_obj, body_anim, _dss.actorName, _dss.slotName))
+                    dialogset_idle_animations.append((actor_obj, body_anim, _dss.actorName, _dss.slotName, _di_name))
                 else:
                     log.debug(
                         "No body idle resolved for slot %s (actor=%s, status=%s, emotional=%s, pose=%s)",
@@ -4216,7 +4227,7 @@ class SceneImporter():
                     # Store the (state, column) so loader can try candidates.
                     _pose_weight = _as_float(getattr(_dss, "actorMimicsLayer_Pose_Weight", None), 1.0) if _col == "pose" else 1.0
                     mimic_state[_col] = _val
-                    dialogset_mimic_animations.append((actor_obj, _val, _col, _track, _pose_weight))
+                    dialogset_mimic_animations.append((actor_obj, _val, _col, _track, _pose_weight, _dss.actorName, _dss.slotName, _di_name))
                 dialogset_mimic_state_by_actor[getattr(actor_obj, "name", str(_dss.actorName))] = mimic_state
 
         if _target_dialogset and selected_dialogset_count == 0:
@@ -4612,6 +4623,58 @@ class SceneImporter():
             except Exception:
                 return ""
 
+        def scene_event_nla_metadata(event, track_name="", at_frame=None, actor_name=""):
+            metadata = {
+                "w3_scene_file": self._scene_filepath,
+                "w3_scene_section": self._section_name,
+                "w3_scene_track_name": track_name,
+                "w3_scene_event_class": event.__class__.__name__ if event is not None else "",
+                "w3_scene_event_guid": get_w2scene_event_guid_string(event) if event is not None else "",
+                "w3_scene_event_name": getattr(event, "eventName", "") if event is not None else "",
+                "w3_scene_actor": actor_name or getattr(event, "actor", None) or getattr(event, "actorName", None) or "",
+            }
+            if at_frame is not None:
+                metadata["w3_scene_event_start_frame"] = float(at_frame)
+            return metadata
+
+        def dialogset_slot_nla_metadata(actor_name="", slot_name="", dialogset_name="", track_name="", at_frame=None):
+            metadata = {
+                "w3_scene_file": self._scene_filepath,
+                "w3_scene_section": self._section_name,
+                "w3_scene_track_name": track_name,
+                "w3_scene_event_class": "CStorySceneDialogsetSlot",
+                "w3_scene_event_name": str(slot_name or ""),
+                "w3_scene_actor": str(actor_name or ""),
+                "w3_scene_dialogset": str(dialogset_name or ""),
+                "w3_scene_dialogset_slot": str(slot_name or ""),
+            }
+            if at_frame is not None:
+                metadata["w3_scene_event_start_frame"] = float(at_frame)
+            return metadata
+
+        def first_event_from_key_data(key_data):
+            for item in key_data or []:
+                event = None
+                if isinstance(item, dict):
+                    event = item.get("event")
+                elif isinstance(item, (list, tuple)) and len(item) >= 3:
+                    event = item[2]
+                if event is not None:
+                    return event
+            return None
+
+        def key_data_scene_event_metadata(key_data, track_name="", at_frame=None):
+            event = first_event_from_key_data(key_data)
+            metadata = scene_event_nla_metadata(event, track_name=track_name, at_frame=at_frame)
+            event_count = 0
+            for item in key_data or []:
+                if isinstance(item, dict):
+                    event_count += 1 if item.get("event") is not None else 0
+                elif isinstance(item, (list, tuple)) and len(item) >= 3 and item[2] is not None:
+                    event_count += 1
+            metadata["w3_scene_event_count"] = int(event_count)
+            return metadata
+
         def annotate_loaded_scene_animation(target_armatures, track_name, at_frame, metadata, event=None):
             annotated_count = 0
             for arm_obj in list(target_armatures or []):
@@ -4898,6 +4961,7 @@ class SceneImporter():
             additive_reference_frame=0.0,
             source="",
             cycle=False,
+            metadata=None,
         ):
             layer_value = _cname_text(layer_value)
             if actor_obj is None or not layer_value:
@@ -4964,12 +5028,13 @@ class SceneImporter():
                 event=event,
             )
             if target_armatures:
-                metadata = {
+                strip_metadata = dict(metadata or {})
+                strip_metadata.update({
                     "w3_scene_mimic_layer": layer_column,
                     "w3_scene_mimic_layer_value": layer_value,
                     "w3_scene_mimic_layer_source": source,
                     "w3_scene_mimic_layer_resolved": resolved_cand,
-                }
+                })
                 apply_mimic_layer_strip_weights(
                     target_armatures,
                     track_name,
@@ -4981,7 +5046,7 @@ class SceneImporter():
                     blend_out_frames=blend_out_frames,
                     convert_transform_to_additive=convert_transform_to_additive,
                     additive_reference_frame=additive_reference_frame,
-                    metadata=metadata,
+                    metadata=strip_metadata,
                 )
             return target_armatures
 
@@ -5656,8 +5721,8 @@ class SceneImporter():
             section_start_frame=float(frame_offset),
             section_end_frame=section_end_frame,
         )
-        for actor_obj, idle_name, actor_name, slot_name in dialogset_idle_animations:
-            load_scene_animation_by_name(
+        for actor_obj, idle_name, actor_name, slot_name, dialogset_name in dialogset_idle_animations:
+            loaded = load_scene_animation_by_name(
                 idle_name,
                 actor_obj,
                 W2SCENE_DIALOGSET_IDLE_TRACK_NAME,
@@ -5666,7 +5731,30 @@ class SceneImporter():
                 compatible_only=True,
                 cycle=True,
             )
-        for actor_obj, layer_value, layer_column, mimic_track_name, pose_weight in dialogset_mimic_animations:
+            metadata = dialogset_slot_nla_metadata(
+                actor_name=actor_name,
+                slot_name=slot_name,
+                dialogset_name=dialogset_name,
+                track_name=W2SCENE_DIALOGSET_IDLE_TRACK_NAME,
+                at_frame=float(frame_offset),
+            )
+            metadata["w3_scene_requested_animation"] = idle_name
+            metadata["w3_scene_event_duration_frames"] = max(0.0, section_end_frame - float(frame_offset))
+            annotate_loaded_scene_animation(loaded or [actor_obj], W2SCENE_DIALOGSET_IDLE_TRACK_NAME, float(frame_offset), metadata, event=None)
+        for actor_obj, layer_value, layer_column, mimic_track_name, pose_weight, actor_name, slot_name, dialogset_name in dialogset_mimic_animations:
+            metadata = dialogset_slot_nla_metadata(
+                actor_name=actor_name,
+                slot_name=slot_name,
+                dialogset_name=dialogset_name,
+                track_name=mimic_track_name,
+                at_frame=float(frame_offset),
+            )
+            metadata.update({
+                "w3_scene_requested_animation": layer_value,
+                "w3_scene_mimic_layer": layer_column,
+                "w3_scene_mimic_layer_source": "dialogset",
+                "w3_scene_event_duration_frames": max(0.0, section_end_frame - float(frame_offset)),
+            })
             load_scene_mimic_layer(
                 actor_obj,
                 layer_value,
@@ -5678,6 +5766,7 @@ class SceneImporter():
                 extend_to_frame=section_end_frame,
                 source="dialogset",
                 cycle=True,
+                metadata=metadata,
             )
 
         ###################
@@ -6086,6 +6175,7 @@ class SceneImporter():
         lookat_state_by_actor = {}
         lookat_event_entries = []
         camera_marker_keys = set()
+        imported_pose_key_entries = []
 
         def apply_lookat_event(event, trigger_frame):
             actor_name = getattr(event, "actor", None)
@@ -6330,6 +6420,7 @@ class SceneImporter():
                         "CStorySceneEventAdditiveAnimation",
                         "CStorySceneEventOverrideAnimation",
                         "CStorySceneEventChangePose",
+                        "CStorySceneEventPoseKey",
                         "CStorySceneEventMimics",
                         "CStorySceneEventMimicsAnim",
                     }:
@@ -6403,6 +6494,45 @@ class SceneImporter():
                         _idle_frame,
                         transition_end_frame=_idle_transition_end,
                     )
+                elif event.__class__.__name__ == "CStorySceneEventPoseKey":
+                    actor_name = getattr(event, "actor", None)
+                    actor_obj = set_cur_actor_by_str(actor_name, actors_dict) if actor_name else curr_actor
+                    if actor_obj is None:
+                        import_scene_animation.warn_scene_animation_skip(
+                            "missing actor for pose-key event",
+                            event=event,
+                            section=self._section_name,
+                            details={"actor": actor_name or ""},
+                        )
+                        continue
+                    _pose_key_frame = get_event_start_frame(shot, event)
+                    _pose_key_track = _safe_nla_track_name(
+                        "cutscene_import_posekey",
+                        actor_name,
+                        getattr(event, "eventName", None) or "PoseKey",
+                        (get_w2scene_event_guid_string(event) or "")[:8],
+                    )
+                    _pose_key_strip = pose_key_tools.import_pose_key_event_to_nla(
+                        context,
+                        event,
+                        actor_obj,
+                        _pose_key_frame,
+                        track_name=_pose_key_track,
+                        section_name=self._section_name,
+                    )
+                    if _pose_key_strip is None:
+                        import_scene_animation.warn_scene_animation_skip(
+                            "pose-key event has no supported bone transforms",
+                            event=event,
+                            section=self._section_name,
+                            track_name=_pose_key_track,
+                        )
+                    else:
+                        imported_pose_key_entries.append({
+                            "actor": str(actor_name or ""),
+                            "strip": _pose_key_strip,
+                        })
+                        remember_section_nla_targets([actor_obj])
                 elif event.__class__.__name__ == "CStorySceneEventMimics":
                     event: w3_types.CStorySceneEventMimics
                     actor_name = getattr(event, "actor", None)
@@ -7245,6 +7375,15 @@ class SceneImporter():
                     strip.name = action_name
                 except Exception:
                     pass
+                metadata = scene_event_nla_metadata(
+                    shot_key[3],
+                    track_name=action_name,
+                    at_frame=shot_frame,
+                )
+                metadata["w3_scene_camera_source"] = "shot"
+                metadata["w3_scene_event_duration_frames"] = max(0.0, float(strip_end) - float(shot_frame))
+                _set_w2scene_import_metadata((action, strip), metadata)
+                _remember_w2scene_event_guid_metadata(getattr(bpy.context, "scene", None), metadata)
                 created_actions += 1
                 created_strips += 1
                 raw_shot_strips += 1
@@ -7286,6 +7425,16 @@ class SceneImporter():
                     strip.name = action_name
                 except Exception:
                     pass
+                metadata = scene_event_nla_metadata(
+                    interval.get("event"),
+                    track_name=track_name,
+                    at_frame=start_frame,
+                )
+                metadata["w3_scene_camera_source"] = "interpolation"
+                metadata["w3_scene_event_duration_frames"] = max(0.0, float(nominal_end) - float(start_frame))
+                metadata["w3_scene_camera_key_count"] = len(keys)
+                _set_w2scene_import_metadata((action, strip), metadata)
+                _remember_w2scene_event_guid_metadata(getattr(bpy.context, "scene", None), metadata)
                 created_actions += 1
                 created_strips += 1
                 interpolation_strips += 1
@@ -7525,8 +7674,12 @@ class SceneImporter():
                 extra_details=placement_extra_details,
             )
             if placement_action is not None:
-                self.__assign_action(actor_obj, placement_action, track_name="ScenePlacement", at_frame=float(frame_offset))
+                placement_strip = self.__assign_action(actor_obj, placement_action, track_name="ScenePlacement", at_frame=float(frame_offset))
                 extend_nla_track_to_frame(actor_obj, "ScenePlacement", section_end_frame)
+                metadata = key_data_scene_event_metadata(placement_action_keys, track_name="ScenePlacement", at_frame=float(frame_offset))
+                metadata["w3_scene_event_duration_frames"] = max(0.0, section_end_frame - float(frame_offset))
+                _set_w2scene_import_metadata((placement_action, placement_strip), metadata)
+                _remember_w2scene_event_guid_metadata(getattr(bpy.context, "scene", None), metadata)
 
         for motion_entry in scene_motion_accumulator.build_actor_motion_actions(
             action_name_factory=lambda actor_obj: _safe_nla_track_name("SceneMotionExtraction", getattr(actor_obj, "name", "Actor")),
@@ -7620,8 +7773,12 @@ class SceneImporter():
             action_name = _safe_nla_track_name("ScenePlacement", getattr(prop_obj, "name", "Prop"))
             placement_action = create_object_transform_action(action_name, prop_obj, action_keys, interpolation='CONSTANT')
             if placement_action is not None:
-                self.__assign_action(prop_obj, placement_action, track_name="ScenePlacement", at_frame=float(frame_offset))
+                placement_strip = self.__assign_action(prop_obj, placement_action, track_name="ScenePlacement", at_frame=float(frame_offset))
                 extend_nla_track_to_frame(prop_obj, "ScenePlacement", section_end_frame)
+                metadata = key_data_scene_event_metadata(action_keys, track_name="ScenePlacement", at_frame=float(frame_offset))
+                metadata["w3_scene_event_duration_frames"] = max(0.0, section_end_frame - float(frame_offset))
+                _set_w2scene_import_metadata((placement_action, placement_strip), metadata)
+                _remember_w2scene_event_guid_metadata(getattr(bpy.context, "scene", None), metadata)
 
         for attach_entry in attach_key_data_by_prop.values():
             prop_obj = attach_entry["object"]
@@ -7631,8 +7788,12 @@ class SceneImporter():
             action_name = _safe_nla_track_name(W2SCENE_ATTACH_TRACK_NAME, getattr(prop_obj, "name", "Prop"))
             attach_action = create_prop_attach_action(action_name, prop_obj, attach_keys, section_end_frame)
             if attach_action is not None:
-                self.__assign_action(prop_obj, attach_action, track_name=W2SCENE_ATTACH_TRACK_NAME, at_frame=float(frame_offset))
+                attach_strip = self.__assign_action(prop_obj, attach_action, track_name=W2SCENE_ATTACH_TRACK_NAME, at_frame=float(frame_offset))
                 extend_nla_track_to_frame(prop_obj, W2SCENE_ATTACH_TRACK_NAME, section_end_frame)
+                metadata = key_data_scene_event_metadata(attach_keys, track_name=W2SCENE_ATTACH_TRACK_NAME, at_frame=float(frame_offset))
+                metadata["w3_scene_event_duration_frames"] = max(0.0, section_end_frame - float(frame_offset))
+                _set_w2scene_import_metadata((attach_action, attach_strip), metadata)
+                _remember_w2scene_event_guid_metadata(getattr(bpy.context, "scene", None), metadata)
 
         for visibility_entry in visibility_key_data_by_prop.values():
             prop_obj = visibility_entry["object"]
@@ -7650,10 +7811,42 @@ class SceneImporter():
             action_name = _safe_nla_track_name("SceneVisibility", getattr(prop_obj, "name", "Prop"))
             visibility_action = create_object_visibility_action(action_name, prop_obj, action_keys, interpolation='CONSTANT')
             if visibility_action is not None:
-                self.__assign_action(prop_obj, visibility_action, track_name="SceneVisibility", at_frame=float(frame_offset))
+                visibility_strip = self.__assign_action(prop_obj, visibility_action, track_name="SceneVisibility", at_frame=float(frame_offset))
                 extend_nla_track_to_frame(prop_obj, "SceneVisibility", section_end_frame)
+                metadata = key_data_scene_event_metadata(action_keys, track_name="SceneVisibility", at_frame=float(frame_offset))
+                metadata["w3_scene_event_duration_frames"] = max(0.0, section_end_frame - float(frame_offset))
+                _set_w2scene_import_metadata((visibility_action, visibility_strip), metadata)
+                _remember_w2scene_event_guid_metadata(getattr(bpy.context, "scene", None), metadata)
 
         _log_body_strip_overlap_debug()
+
+        if imported_pose_key_entries:
+            pose_keys_by_actor = {}
+            for entry in imported_pose_key_entries:
+                strip = entry.get("strip")
+                if strip is None:
+                    continue
+                metadata = pose_key_tools.pose_key_metadata_from_strip(strip)
+                actor_key = str(metadata.get("actor") or entry.get("actor") or "").strip().lower()
+                actor_key = actor_key or str(id(strip))
+                pose_keys_by_actor.setdefault(actor_key, []).append((
+                    float(getattr(strip, "frame_start", 0.0) or 0.0),
+                    strip,
+                ))
+            for actor_pose_keys in pose_keys_by_actor.values():
+                actor_pose_keys.sort(key=lambda item: (item[0], str(getattr(item[1], "name", "") or "")))
+                for index, (start_frame, strip) in enumerate(actor_pose_keys):
+                    metadata = pose_key_tools.pose_key_metadata_from_strip(strip)
+                    if not bool(metadata.get("linkToDialogset", False)):
+                        pose_key_tools.set_pose_key_preview_hold(context, strip, None)
+                        continue
+                    next_start = None
+                    for candidate_start, _candidate_strip in actor_pose_keys[index + 1:]:
+                        if candidate_start > start_frame + 1e-4:
+                            next_start = candidate_start
+                            break
+                    hold_until = next_start if next_start is not None else section_end_frame
+                    pose_key_tools.set_pose_key_preview_hold(context, strip, hold_until)
 
         default_range = set_scene_frame_range_from_w2scene_default_timeline(context, default_timeline_obj)
         mimic_state_end_frame = float(default_range[1]) if default_range is not None else float(section_end_frame)

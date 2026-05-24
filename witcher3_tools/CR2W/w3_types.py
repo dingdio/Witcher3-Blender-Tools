@@ -1491,10 +1491,22 @@ class CStorySceneEventPoseKey(CStorySceneEventDuration):
         self.weightCurve = None #<property Name="weightCurve" Type="SCurveData" />
         self.linkToDialogset = None #<property Name="linkToDialogset" Type="Bool" />
         self.version = None #<property Name="version" Type="Int32" />
+        self.bones = None #<property Name="bones" Type="array:2,0,SSSBoneTransform" />
+        self.bonesHands = None #<property Name="bonesHands" Type="array:2,0,SSSBoneTransform" />
+        self.cachedBonesIK = None #<property Name="cachedBonesIK" Type="array:2,0,Int32" />
+        self.cachedTransformsIK = None #<property Name="cachedTransformsIK" Type="array:133,0,EngineQsTransform" />
+        self.presetName = None #<property Name="presetName" Type="CName" />
+        self.presetVersion = None #<property Name="presetVersion" Type="Int32" />
         self.cachedBones = None #<property Name="cachedBones" Type="array:2,0,Int32" />
         self.cachedTransforms = None #<property Name="cachedTransforms" Type="array:133,0,EngineQsTransform" />
+        self.editorCachedHandTracks = None #<property Name="editorCachedHandTracks" Type="array:2,0,Float" />
+        self.editorCachedIkEffectorsID = None #<property Name="editorCachedIkEffectorsID" Type="array:2,0,Int32" />
+        self.editorCachedIkEffectorsPos = None #<property Name="editorCachedIkEffectorsPos" Type="array:2,0,Vector" />
+        self.editorCachedIkEffectorsWeight = None #<property Name="editorCachedIkEffectorsWeight" Type="array:2,0,Float" />
+        self.tracks = None #<property Name="tracks" Type="array:2,0,SSSTrackTransform" />
         self.cachedTracks = None #<property Name="cachedTracks" Type="array:2,0,Int32" />
         self.cachedTracksValues = None #<property Name="cachedTracksValues" Type="array:2,0,Float" />
+        self.editorCachedMimicSliders = None #<property Name="editorCachedMimicSliders" Type="array:2,0,Float" />
         loadProps(self, args)
 
 class CStorySceneEventPropPlacementInterpolation(CStorySceneEventInterpolation):
