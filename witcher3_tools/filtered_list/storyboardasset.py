@@ -28,8 +28,12 @@ class CModStoryBoardActor(object):
 
         # coarse classification for prefiltering animations
         #self._cachedActorType: EStoryBoardActorType = ESB_AT_Untested
-        
+
         self._animPaths: List[str] = []
+        # Source game this actor's animsets come from -- "w3" or "w2". Used by
+        # CModStoryBoardAnimationListsManager.getAnimationListFor() to pick the
+        # right CSV (witcher_2_actor_animations.csv vs actor_animations.csv).
+        self.source_game: str = "w3"
         
     def isCompatibleAnimation(self, animPath:str): #animId:CName):
         #GetComponentByClassName('CAnimatedComponent')

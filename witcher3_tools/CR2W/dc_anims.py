@@ -1456,7 +1456,12 @@ def create_anim_set_info_only(file, havok_infos=None, quiet=False):
 
             for prop in anim_chunk.PROPS:
                 if prop.theName == "name":
-                    name = prop.Index.String
+                    # W2 stores the name as either an indexed CName (.Index.String)
+                    # or as a plain CName whose textual form comes from ToString().
+                    if getattr(prop, 'Index', None) is not None:
+                        name = prop.Index.String
+                    else:
+                        name = prop.ToString()
                 elif prop.theName == "duration":
                     duration = prop.Value
                 elif prop.theName == "framesPerSecond":

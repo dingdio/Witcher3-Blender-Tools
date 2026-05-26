@@ -186,17 +186,32 @@ class CStoryBoardMimicsMetaInfo(CStoryBoardAnimationMetaInfo):
 #  - selecting animation from available (actor compatible) list of animations
 #
 
+# CSV filename per source game (relative to witcher3_tools/CR2W/data/).
+_ACTOR_ANIM_CSV_BY_SOURCE = {
+    "w3": "actor_animations.csv",
+    "w2": "witcher_2_actor_animations.csv",
+}
+
+
+def _normalize_source_game(value) -> str:
+    text = str(value or "").strip().lower().replace(" ", "")
+    return "w2" if text in {"w2", "witcher2", "tw2"} else "w3"
+
+
 class CModStoryBoardAnimationListsManager(object):
     active = None # type: CModStoryBoardAnimationListsManager
     active_list = None # type: CModStoryBoardAnimationListsManager
-    _shared_anim_meta = None       # CSV loaded once, shared across all instances
-    _shared_extra_anim_count = 0   # cached alongside _shared_anim_meta
+    # Per-source-game caches. Each CSV is loaded once and shared across
+    # subsequent manager instances; the dropdown / armature can switch between
+    # them without re-parsing.
+    _shared_anim_meta_by_source: dict = {}
+    _shared_extra_anim_count_by_source: dict = {}
 
     @classmethod
     def clear_shared_cache(cls):
-        """Force the CSV to be re-read on the next lazyLoad() call."""
-        cls._shared_anim_meta = None
-        cls._shared_extra_anim_count = 0
+        """Force every CSV to be re-read on the next lazyLoad() call."""
+        cls._shared_anim_meta_by_source = {}
+        cls._shared_extra_anim_count_by_source = {}
     # ------------------------------------------------------------------------
     def __init__(self):
         super(CModStoryBoardAnimationListsManager, self).__init__()
@@ -204,6 +219,7 @@ class CModStoryBoardAnimationListsManager(object):
         self._compatibleAnimationCount: int
         self._dataLoaded: bool
         self._extraAnimCount: int
+        self._loadedSourceGame: str = ""
         # ------------------------------------------------------------------------
         # contains info about all animations. the slot number for an animation will
         # be used as id in the filtered UI listview. this is required as the UI
@@ -216,19 +232,34 @@ class CModStoryBoardAnimationListsManager(object):
     def init(self):
         pass
     # ------------------------------------------------------------------------
-    def lazyLoad(self):
-        if CModStoryBoardAnimationListsManager._shared_anim_meta is not None:
-            self._animMeta = CModStoryBoardAnimationListsManager._shared_anim_meta
-            self._extraAnimCount = CModStoryBoardAnimationListsManager._shared_extra_anim_count
+    def lazyLoad(self, source_game: str = "w3"):
+        source_game = _normalize_source_game(source_game)
+        cls = CModStoryBoardAnimationListsManager
+        cached_meta = cls._shared_anim_meta_by_source.get(source_game)
+        if cached_meta is not None:
+            self._animMeta = cached_meta
+            self._extraAnimCount = cls._shared_extra_anim_count_by_source.get(source_game, 0)
+            self._loadedSourceGame = source_game
             self._dataLoaded = True
             return
-        self._animMeta = CStoryBoardAnimationMetaInfo()
-        self._extraAnimCount = self._animMeta.addExtraAnimations(SBUI_getExtraAnimations())
-        RES_DIR = Path(__file__)
-        RES_DIR = str(Path(RES_DIR).parents[1])
-        self._animMeta.loadCsv(os.path.join(RES_DIR, "CR2W\\data\\actor_animations.csv"))
-        CModStoryBoardAnimationListsManager._shared_anim_meta = self._animMeta
-        CModStoryBoardAnimationListsManager._shared_extra_anim_count = self._extraAnimCount
+        meta = CStoryBoardAnimationMetaInfo()
+        # Extra/custom animations are W3-only (the SBUI extras catalog is W3
+        # depot-pathed). For W2 we still need the sentinel "-no animation-" entry
+        # at animList[0] that createCompatibleList() uses as the placeholder.
+        if source_game == "w3":
+            extra_count = meta.addExtraAnimations(SBUI_getExtraAnimations())
+        else:
+            meta.animList.clear()
+            meta.animList.append(SStoryBoardAnimationInfo("", "", "", "", "no animation", "-no animation-", 0, 0))
+            extra_count = 0
+        csv_name = _ACTOR_ANIM_CSV_BY_SOURCE.get(source_game, _ACTOR_ANIM_CSV_BY_SOURCE["w3"])
+        RES_DIR = str(Path(__file__).parents[1])
+        meta.loadCsv(os.path.join(RES_DIR, "CR2W", "data", csv_name))
+        self._animMeta = meta
+        self._extraAnimCount = extra_count
+        self._loadedSourceGame = source_game
+        cls._shared_anim_meta_by_source[source_game] = meta
+        cls._shared_extra_anim_count_by_source[source_game] = extra_count
         self._dataLoaded = True
     # ------------------------------------------------------------------------
     def activate():
@@ -241,12 +272,13 @@ class CModStoryBoardAnimationListsManager(object):
         actorAnims: CModSbUiAnimationList
         i: int
 
-        if (not self._dataLoaded):
-            self.lazyLoad()
+        source_game = _normalize_source_game(getattr(actor, "source_game", "") or "w3")
+        if not self._dataLoaded or self._loadedSourceGame != source_game:
+            self.lazyLoad(source_game)
 
         actorAnims = CModSbUiAnimationList()
         self._compatibleAnimationCount = actorAnims.createCompatibleList(actor, self._animMeta)
-        
+
         CModStoryBoardAnimationListsManager.active_list = actorAnims
         return actorAnims
     # ------------------------------------------------------------------------
@@ -303,9 +335,12 @@ class CModStoryBoardMimicsListsManager(CModStoryBoardAnimationListsManager):
     def __init__(self):
         super(CModStoryBoardMimicsListsManager, self).__init__()
     # ------------------------------------------------------------------------
-    def lazyLoad(self):
+    def lazyLoad(self, source_game: str = "w3"):
+        # Mimics CSV is currently W3-only; W2 face animation cataloguing is a
+        # separate task. Accept the kwarg to keep the parent signature.
         self._animMeta = CModStoryBoardMimicsListsManager.get_mimics_meta()
         self._extraAnimCount = 0
+        self._loadedSourceGame = _normalize_source_game(source_game)
         self._dataLoaded = True
     # ------------------------------------------------------------------------
 # ----------------------------------------------------------------------------

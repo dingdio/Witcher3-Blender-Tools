@@ -5593,6 +5593,8 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 col.prop(scene, "witcher_anim_nla_mode", text="NLA Load Mode")
             if hasattr(scene, "witcher_quick_anim_auto_collapse_categories"):
                 col.prop(scene, "witcher_quick_anim_auto_collapse_categories", text="Auto Collapse Categories")
+            if hasattr(scene, "witcher_quick_anim_source"):
+                col.prop(scene, "witcher_quick_anim_source", text="Source")
             if hasattr(scene, "witcher_quick_anim_show_all"):
                 col.prop(scene, "witcher_quick_anim_show_all", text="Show All Animations")
 

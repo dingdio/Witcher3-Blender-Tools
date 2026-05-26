@@ -256,7 +256,8 @@ def resolve_quick_dialogset_body(context, force=False):
         return actor_obj, info
 
     show_all = False
-    source_key = _get_quick_anim_source_key(actor_obj, show_all)
+    source_override = _resolve_quick_anim_source(scene, actor_obj)
+    source_key = _get_quick_anim_source_key(actor_obj, show_all, source_override=source_override)
     cache_key = (source_key, status.lower(), emotional.lower(), pose.lower(), anim_id)
     cached = _DIALOGSET_BODY_RESOLVE_CACHE.get(cache_key)
     if cached is not None and not force:
@@ -778,7 +779,8 @@ def ensure_quick_anim_list_current(context):
         return
     show_all = bool(getattr(scene, "witcher_quick_anim_show_all", False))
     main_arm_obj = _resolve_main_armature(context)
-    current_key = _get_quick_anim_source_key(main_arm_obj, show_all)
+    source_override = _resolve_quick_anim_source(scene, main_arm_obj)
+    current_key = _get_quick_anim_source_key(main_arm_obj, show_all, source_override=source_override)
     stored_key = _ACTIVE_SOURCE_KEY_BY_SCENE.get(_scene_key(scene), _ACTIVE_SOURCE_KEY_SENTINEL)
     if stored_key != current_key:
         _schedule_deferred_quick_anim_setup()
@@ -793,20 +795,42 @@ def _scene_key(scene):
         return 0
 
 
-def _get_quick_anim_source_key(main_arm_obj, show_all=False):
+def _quick_anim_source_pref(scene) -> str:
+    """Return the user's source-game override: AUTO / W3 / W2."""
+    return str(getattr(scene, "witcher_quick_anim_source", "AUTO") or "AUTO").upper()
+
+
+def _resolve_quick_anim_source(scene, main_arm_obj) -> str:
+    """Resolve which actor_animations CSV to use ('w3' or 'w2').
+
+    AUTO follows the selected armature's source_game; W3/W2 force the override.
+    """
+    pref = _quick_anim_source_pref(scene)
+    if pref == "W3":
+        return "w3"
+    if pref == "W2":
+        return "w2"
+    return _source_game_for_armature_obj(main_arm_obj)
+
+
+def _get_quick_anim_source_key(main_arm_obj, show_all=False, source_override: str = ""):
     if show_all or not main_arm_obj or main_arm_obj.type != "ARMATURE":
-        return ("__show_all__",)
+        # Show-all still needs to distinguish which CSV we are browsing so the
+        # dropdown can swap between the W3 and W2 globals without colliding.
+        effective_source = normalize_source_game(source_override or "w3")
+        return ("__show_all__", effective_source)
     rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
     if rig_settings is None:
-        return ("__show_all__",)
+        return ("__show_all__", normalize_source_game(source_override or "w3"))
     anim_paths = tuple(
         (set.path, normalize_source_game(getattr(set, "source_game", "") or getattr(rig_settings, "source_game", "w3")))
         for set in rig_settings.animset_list
         if ":" not in set.path
     )
+    effective_source = normalize_source_game(source_override) if source_override else _source_game_for_armature_obj(main_arm_obj)
     return (
         main_arm_obj.name,
-        _source_game_for_armature_obj(main_arm_obj),
+        effective_source,
         getattr(rig_settings, "main_entity_skeleton", ""),
         getattr(rig_settings, "main_face_skeleton", ""),
         anim_paths,
@@ -1173,11 +1197,13 @@ def _actor_compatible_animation_paths(main_arm_obj):
     return exact_paths, normalized_paths
 
 
-def _normal_animation_manager(manager=None):
+def _normal_animation_manager(manager=None, source_game: str = "w3"):
+    source_game = normalize_source_game(source_game or "w3")
     if manager is None or isinstance(manager, CModStoryBoardMimicsListsManager):
         manager = CModStoryBoardAnimationListsManager()
-    if not getattr(manager, "_dataLoaded", False):
-        manager.lazyLoad()
+    loaded_source = normalize_source_game(getattr(manager, "_loadedSourceGame", "") or "")
+    if not getattr(manager, "_dataLoaded", False) or loaded_source != source_game:
+        manager.lazyLoad(source_game)
     return manager
 
 
@@ -1187,7 +1213,7 @@ def _get_actor_compatible_animation_path_by_name(anim_name, main_arm_obj, manage
         return None
 
     try:
-        manager = _normal_animation_manager(manager)
+        manager = _normal_animation_manager(manager, source_game=_source_game_for_armature_obj(main_arm_obj))
     except Exception:
         return None
 
@@ -1210,7 +1236,7 @@ def GetAnimationInfoByName(anim_name, main_arm_obj=None, show_all=False, prefer_
             fdir = _get_actor_mimic_animation_path_by_name(anim_name, main_arm_obj=main_arm_obj, show_all=show_all)
     if fdir is None and not prefer_mimic:
         try:
-            manager = _normal_animation_manager(CModStoryBoardAnimationListsManager.active)
+            manager = _normal_animation_manager(CModStoryBoardAnimationListsManager.active, source_game=source_game)
         except Exception:
             manager = None
         actor_aware = main_arm_obj is not None and not show_all
@@ -1239,10 +1265,12 @@ def SetupActor(main_arm_obj, context=None, show_all=False):
     scene = (context.scene if context else bpy.context.scene)
     scene_id = _scene_key(scene)
     show_all = show_all or not main_arm_obj
-    source_key = _get_quick_anim_source_key(main_arm_obj, show_all)
+    source_game = _resolve_quick_anim_source(scene, main_arm_obj)
+    source_key = _get_quick_anim_source_key(main_arm_obj, show_all, source_override=source_game)
 
     animListsManager: CModStoryBoardAnimationListsManager = CModStoryBoardAnimationListsManager()
     actor = CModStoryBoardActor()
+    actor.source_game = source_game
 
     if show_all:
         actor._animPaths = None  # isCompatibleAnimation returns True for all
@@ -1251,15 +1279,15 @@ def SetupActor(main_arm_obj, context=None, show_all=False):
         if rig_settings is None:
             log.warning("Armature '%s' has no rig settings; falling back to show-all.", main_arm_obj.name)
             actor._animPaths = None
-            source_key = ("__show_all__",)
+            source_key = ("__show_all__", source_game)
         else:
             animset_list = rig_settings.animset_list
             actor._animPaths = []
             for set in animset_list:
                 if ":" not in set.path:
                     actor._animPaths.append(set.path)
-    
-    animListsManager.lazyLoad()
+
+    animListsManager.lazyLoad(source_game)
 
     #TODO list should be filtered by the list of w2anims passed into it from the entity object
     list = animListsManager.getAnimationListFor(actor)
@@ -1290,7 +1318,8 @@ def FilterData(context):
     if not main_arm_obj and not show_all:
         return
 
-    source_key = _get_quick_anim_source_key(main_arm_obj, show_all)
+    source_override = _resolve_quick_anim_source(scene, main_arm_obj)
+    source_key = _get_quick_anim_source_key(main_arm_obj, show_all, source_override=source_override)
     scene_id = _scene_key(scene)
     active_source = _ACTIVE_SOURCE_KEY_BY_SCENE.get(scene_id, _ACTIVE_SOURCE_KEY_SENTINEL)
     source_changed = active_source != source_key
@@ -1570,7 +1599,8 @@ def _refresh_quick_anim_view_from_list(context, list_obj, preferred_id=None):
     cached_items = _filtered_list_to_cache_items(filteredList)
 
     main_arm_obj = _resolve_main_armature(context)
-    source_key = _get_quick_anim_source_key(main_arm_obj)
+    source_override = _resolve_quick_anim_source(context.scene, main_arm_obj)
+    source_key = _get_quick_anim_source_key(main_arm_obj, source_override=source_override)
     cache_key = (source_key, search, auto_collapse)
     _set_quick_anim_cache(cache_key, cached_items)
     _apply_cached_items_to_scene(context.scene, cached_items, preferred_id=preferred_id)
@@ -1837,6 +1867,18 @@ def register():
             default=False,
             update=lambda self, ctx: _schedule_deferred_quick_anim_setup(),
         )
+    if not hasattr(bpy.types.Scene, "witcher_quick_anim_source"):
+        bpy.types.Scene.witcher_quick_anim_source = EnumProperty(
+            name="Source",
+            description="Which game's animation catalog the Quick Animation Browser draws from. AUTO follows the selected character's source game.",
+            items=[
+                ("AUTO", "Auto", "Pick W3 or W2 based on the selected character's source game"),
+                ("W3", "W3", "Force the Witcher 3 actor_animations catalog"),
+                ("W2", "W2", "Force the Witcher 2 actor_animations catalog"),
+            ],
+            default="AUTO",
+            update=lambda self, ctx: _schedule_deferred_quick_anim_setup(),
+        )
     if not hasattr(bpy.types.Scene, DIALOGSET_BODY_STATUS_PROP):
         setattr(bpy.types.Scene, DIALOGSET_BODY_STATUS_PROP, EnumProperty(
             name="actorStatus",
@@ -1893,6 +1935,8 @@ def unregister():
         del bpy.types.Scene.witcher_quick_anim_search
     if hasattr(bpy.types.Scene, "witcher_quick_anim_show_all"):
         del bpy.types.Scene.witcher_quick_anim_show_all
+    if hasattr(bpy.types.Scene, "witcher_quick_anim_source"):
+        del bpy.types.Scene.witcher_quick_anim_source
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
