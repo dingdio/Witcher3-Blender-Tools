@@ -542,6 +542,8 @@ def get_repo_from_abs_path(file_path):
     MOD_DIR = get_mod_directory(bpy.context)
     MOD_TEX_PATH = get_modded_texture_path(bpy.context)
     addon_prefs = get_all_addon_prefs(bpy.context)
+    W2_UNCOOK_DIR = get_w2_unbundle_path(bpy.context)
+    W2_GAME_DIR = get_witcher2_game_path(bpy.context)
 
     def _try_strip(path, root):
         root = os.path.realpath(bpy.path.abspath(root)) if root else ""
@@ -568,6 +570,19 @@ def get_repo_from_abs_path(file_path):
     result = _try_strip(file_path, addon_prefs.redkit_depot_path)
     if result:
         return result
+
+    # Witcher 2 roots must be checked before the Witcher 3 uncook root so W2
+    # imported meshes/items keep their source-game relative paths.
+    result = _try_strip(file_path, W2_UNCOOK_DIR)
+    if result:
+        return result
+    if W2_GAME_DIR:
+        w2_data_root = W2_GAME_DIR
+        if os.path.basename(os.path.normpath(w2_data_root)).lower() != "data":
+            w2_data_root = os.path.join(w2_data_root, "data")
+        result = _try_strip(file_path, w2_data_root)
+        if result:
+            return result
 
     # Mod directory
     if MOD_DIR and MOD_DIR in file_path:
@@ -967,7 +982,10 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
         
         
         if meshFile.HEADER.version <= 115:
-            uncook_path = get_witcher2_game_path(bpy.context)+"\\data\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
+            uncook_path = (get_w2_unbundle_path(bpy.context) or "").strip()
+            if not uncook_path:
+                uncook_path = get_witcher2_game_path(bpy.context)+"\\data"
+            uncook_path = uncook_path.rstrip("\\/") + "\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
             #uncook_path_modkit = get_witcher2_game_path(bpy.context)
         else:
             uncook_path = get_texture_path(bpy.context)+"\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES

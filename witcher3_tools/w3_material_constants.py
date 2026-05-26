@@ -56,8 +56,12 @@ for ng_name, shaders in NG_TO_SHADER.items():
 		SHADER_MAPPING[shader] = ng_name
 
 # Witcher 2 has a separate material library and nodegroup mapping.
+DEFAULT_W3_MATERIAL_BASE = r"engine\materials\graphs\pbr_std.w2mg"
+DEFAULT_W2_MATERIAL_BASE = r"characters\shaders\cloth.w2mg"
+
 NG_TO_SHADER_W2 = {
-	'Witcher2_Eye': ['eye_witcher', 'pbr_eye'],
+	# W2 'eye_witcher' reuses the existing Witcher3_Eye nodegroup; no Witcher2_Eye group ships in the bundled .blend.
+	'Witcher3_Eye': ['eye_witcher', 'pbr_eye'],
  	'Witcher2_Hair': ['pbr_hair'],
 	'Witcher2_Main': [
 		'pbr_std',
@@ -75,7 +79,38 @@ for ng_name, shaders in NG_TO_SHADER_W2.items():
 
 WITCHER2_SHADER_BY_BASE_PATH = {
 	r"characters\shaders\eye_witcher.w2mg": 'eye_witcher',
+	r"characters\shaders\eye.w2mg": 'pbr_eye',
+	r"characters\shaders\hair.w2mg": 'pbr_hair',
+	r"characters\shaders\skin.w2mg": 'pbr_skin',
+	r"characters\shaders\skin_lod.w2mg": 'pbr_skin',
+	r"characters\shaders\cloth.w2mg": 'pbr_std',
+	r"characters\shaders\cloth_2sided.w2mg": 'pbr_std',
+	r"characters\shaders\leather.w2mg": 'pbr_std',
+	r"characters\shaders\metal.w2mg": 'pbr_std',
+	r"characters\shaders\metal_silver.w2mg": 'pbr_std',
+	r"characters\shaders\glass.w2mg": 'transparent_lit',
+	r"characters\shaders\transparent_std.w2mg": 'transparent_lit',
 }
+
+WITCHER2_MATERIALS = [
+	("custom", "Custom", "Custom Path"),
+	(DEFAULT_W2_MATERIAL_BASE, DEFAULT_W2_MATERIAL_BASE, "Witcher 2 character cloth graph"),
+	(r"characters\shaders\hair.w2mg", r"characters\shaders\hair.w2mg", "Witcher 2 hair graph"),
+	(r"characters\shaders\skin.w2mg", r"characters\shaders\skin.w2mg", "Witcher 2 skin graph"),
+	(r"characters\shaders\eye_witcher.w2mg", r"characters\shaders\eye_witcher.w2mg", "Witcher 2 witcher eye graph"),
+	(r"characters\shaders\eye.w2mg", r"characters\shaders\eye.w2mg", "Witcher 2 eye graph"),
+	(r"characters\shaders\leather.w2mg", r"characters\shaders\leather.w2mg", "Witcher 2 leather graph"),
+	(r"characters\shaders\metal.w2mg", r"characters\shaders\metal.w2mg", "Witcher 2 metal graph"),
+	(r"characters\shaders\metal_silver.w2mg", r"characters\shaders\metal_silver.w2mg", "Witcher 2 silver metal graph"),
+	(r"characters\shaders\glass.w2mg", r"characters\shaders\glass.w2mg", "Witcher 2 glass graph"),
+	(r"characters\shaders\transparent_std.w2mg", r"characters\shaders\transparent_std.w2mg", "Witcher 2 transparent graph"),
+	(r"characters\shaders\cloth_2sided.w2mg", r"characters\shaders\cloth_2sided.w2mg", "Witcher 2 two-sided cloth graph"),
+	(r"characters\shaders\satin.w2mg", r"characters\shaders\satin.w2mg", "Witcher 2 satin graph"),
+	(r"characters\shaders\default.w2mg", r"characters\shaders\default.w2mg", "Witcher 2 default graph"),
+	(r"engine\materials\graphs\stdmat.w2mg", r"engine\materials\graphs\stdmat.w2mg", "Witcher 2 standard graph"),
+	(r"engine\materials\graphs\stdmatbump.w2mg", r"engine\materials\graphs\stdmatbump.w2mg", "Witcher 2 bumped standard graph"),
+	(r"engine\materials\graphs\stddetailbump.w2mg", r"engine\materials\graphs\stddetailbump.w2mg", "Witcher 2 detail bump graph"),
+]
 
 PARAM_ORDER = ['Diffuse', 'Diffusemap', 'DiffuseArray',
 	'Normal', 'Normalmap', 'NormalArray',

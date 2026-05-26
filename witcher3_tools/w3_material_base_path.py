@@ -38,6 +38,11 @@ _PARAM_SOCKET_TYPES: Dict[str, str] = {
 }
 
 
+def _material_repo_version(material: Optional[Material]) -> int:
+    props = getattr(material, "witcher_props", None)
+    return 115 if str(getattr(props, "material_version", "") or "").strip().lower() == "witcher2" else 999
+
+
 def _ordered_param_names(names: Set[str]) -> List[str]:
     return sorted(
         names,
@@ -121,7 +126,8 @@ def _build_inventory_entry(
 
 
 def build_material_inventory(material_path: str, material: Optional[Material] = None) -> Dict[str, Any]:
-    chain_info = collect_material_chain(material_path)
+    material_version = _material_repo_version(material)
+    chain_info = collect_material_chain(material_path, version=material_version)
     node_ng = get_active_witcher_group_node(material) if material else None
     material_ready = bool(node_ng)
 
@@ -154,7 +160,7 @@ def build_material_inventory(material_path: str, material: Optional[Material] = 
                 "source_path": entry.get("path", ""),
             }
 
-    declared_graph_params = read_declared_graph_params(resolved_graph or material_path) or set()
+    declared_graph_params = read_declared_graph_params(resolved_graph or material_path, version=material_version) or set()
     inventory: List[Dict[str, Any]] = []
     for par_name in _ordered_param_names(set(effective_params.keys())):
         entry = effective_params[par_name]

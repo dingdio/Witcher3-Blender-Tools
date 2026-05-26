@@ -142,6 +142,115 @@ def is_witcher2_material(material: Material) -> bool:
     return bool(props and props.material_version == 'witcher2')
 
 
+def _material_repo_version(material: Material) -> int:
+    return 115 if is_witcher2_material(material) else 999
+
+
+def _material_bin_cr2w_version(mat_bin) -> int:
+    try:
+        return int(mat_bin.get_CR2W_version())
+    except Exception:
+        pass
+
+    source_file = (
+        getattr(mat_bin, "_W_CLASS__CR2WFILE", None)
+        or getattr(mat_bin, "_CLASS__CR2WFILE", None)
+    )
+    header = getattr(source_file, "HEADER", None)
+    try:
+        return int(getattr(header, "version", 999))
+    except Exception:
+        return 999
+
+
+def _material_bin_is_witcher2(mat_bin) -> bool:
+    return _material_bin_cr2w_version(mat_bin) <= 115
+
+
+def _texture_xbm_repo_path(texture_path: str) -> str:
+    texture_path = str(texture_path or "").strip()
+    if not texture_path:
+        return ""
+    root, ext = os.path.splitext(texture_path)
+    if ext.lower() in {".dds", ".tga", ".png", ".xbm"}:
+        return root + ".xbm"
+    return texture_path
+
+
+def _local_handle_ref_chunk(source_chunk, handle):
+    if not source_chunk or not handle or not getattr(handle, "ChunkHandle", False):
+        return None
+    cr2w_file = getattr(source_chunk, "_W_CLASS__CR2WFILE", None)
+    ref_idx = getattr(handle, "Reference", None)
+    if not cr2w_file or not isinstance(ref_idx, int):
+        return None
+    chunks = getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or []
+    if 0 <= ref_idx < len(chunks):
+        return chunks[ref_idx]
+    return None
+
+
+def _attach_local_material_graph_params(graph_chunk):
+    if not graph_chunk or getattr(graph_chunk, "Type", None) != "CMaterialGraph":
+        return None
+    if getattr(graph_chunk, "_graph_params", None) is not None:
+        return graph_chunk
+    parameter_blocks = graph_chunk.GetVariableByName('parameterBlocks')
+    graph_params = []
+    for handle in getattr(parameter_blocks, "Handles", None) or []:
+        param_chunk = _local_handle_ref_chunk(graph_chunk, handle)
+        if getattr(param_chunk, "Type", "").startswith("CMaterialParameter"):
+            graph_params.append(param_chunk)
+    graph_chunk._graph_params = graph_params
+    return graph_chunk
+
+
+def _guess_w2_local_material_base(mat_bin, material_name: str = "") -> str:
+    # Stopgap keyword heuristic for W2 materials that ship with an inline CMaterialGraph
+    # instead of a baseMaterial handle. Picks a plausible .w2mg from the material/file
+    # name and parameter names. Replace once we parse the embedded graph for real.
+    mat_instance = getattr(mat_bin, 'CMaterialInstance', None)
+    elements = getattr(getattr(mat_instance, 'InstanceParameters', None), 'elements', []) or []
+    param_names = set()
+    texture_paths = []
+    for mat_param in elements:
+        prop = getattr(mat_param, "PROP", None)
+        if not prop:
+            continue
+        prop_name = str(getattr(prop, "theName", "") or "")
+        if prop_name:
+            param_names.add(prop_name.lower())
+        for handle in getattr(prop, "Handles", []) or []:
+            depot_path = getattr(handle, "DepotPath", None)
+            if depot_path:
+                texture_paths.append(str(depot_path).lower())
+
+    name_hint = str(material_name or "").lower()
+    source_file = getattr(mat_bin, "_W_CLASS__CR2WFILE", None) or getattr(mat_bin, "_CLASS__CR2WFILE", None)
+    file_hint = str(getattr(source_file, "fileName", "") or "").lower()
+    depot_hint = str(getattr(mat_bin, "DepotPath", "") or "").lower()
+    combined_hint = f"{name_hint} {file_hint} {depot_hint}"
+    if "hair" in combined_hint or "coif" in combined_hint:
+        return r"characters\shaders\hair.w2mg"
+    if "eye" in combined_hint and "eyelash" not in combined_hint:
+        return r"characters\shaders\eye_witcher.w2mg"
+    if any(word in combined_hint for word in ("skin", "body", "head", "hand", "face")):
+        return r"characters\shaders\skin.w2mg"
+    if any(word in combined_hint for word in ("metal", "steel", "silver", "sword", "scabbard", "medalion", "medallion")):
+        return r"characters\shaders\metal.w2mg"
+    if "glass" in combined_hint:
+        return r"characters\shaders\glass.w2mg"
+    if (
+        "tex_specshift" in param_names
+        or any("scattering" in name for name in param_names)
+        or any("translucency" in name for name in param_names)
+    ):
+        return r"characters\shaders\hair.w2mg"
+    if any("sheet" in path for path in texture_paths):
+        return DEFAULT_W2_MATERIAL_BASE
+    return DEFAULT_W2_MATERIAL_BASE
+
+
 def resolve_witcher2_shader_type(mat_base: str, shader_type: str) -> str:
     normalized_base = normalize_depot_path(mat_base)
     direct_match = WITCHER2_SHADER_BY_BASE_PATH.get(normalized_base)
@@ -201,7 +310,7 @@ def get_recommended_node_group_for_base_path(material: Material, material_path: 
 
     if normalized_path.endswith(".w2mi"):
         fallback_shader_type = guess_shader_type(shader_type)
-        resolved_w2mg = resolve_w2mg(normalized_path)
+        resolved_w2mg = resolve_w2mg(normalized_path, version=_material_repo_version(material))
         if resolved_w2mg:
             resolved_path = normalize_depot_path(resolved_w2mg)
             shader_type = _shader_name_from_material_path(resolved_path)
@@ -473,14 +582,25 @@ def create_instance_group(  material,
     return (ordered_params, nodegroup_node)
 
 def xml_data_from_CR2W(mat_bin, name = None):
+    is_w2_material = _material_bin_is_witcher2(mat_bin)
+    default_base = DEFAULT_W2_MATERIAL_BASE if is_w2_material else DEFAULT_W3_MATERIAL_BASE
     base_var = mat_bin.GetVariableByName('baseMaterial')
     if base_var:
-        mat_base = base_var.Handles[0].DepotPath
+        handle = base_var.Handles[0] if getattr(base_var, "Handles", None) else None
+        mat_base = getattr(handle, "DepotPath", None) if handle else None
+        if not mat_base:
+            local_graph = _local_handle_ref_chunk(mat_bin, handle)
+            if getattr(local_graph, "Type", None) == "CMaterialGraph":
+                _attach_local_material_graph_params(local_graph)
+            mat_base = _guess_w2_local_material_base(mat_bin, name) if is_w2_material else default_base
     elif hasattr(mat_bin, 'DepotPath') and mat_bin.DepotPath:
         # CMaterialGraph referenced directly (no instance wrapper) — the chunk IS the shader
         mat_base = mat_bin.DepotPath
+    elif getattr(mat_bin, "Type", None) == "CMaterialGraph":
+        _attach_local_material_graph_params(mat_bin)
+        mat_base = _guess_w2_local_material_base(mat_bin, name) if is_w2_material else default_base
     else:
-        mat_base = r'engine\materials\graphs\pbr_std.w2mg'
+        mat_base = default_base
     shader_type = mat_base.split("\\")[-1][:-5]	# The .w2mg or .w2mi file, minus the extension.
     
     if name == None:
@@ -489,7 +609,7 @@ def xml_data_from_CR2W(mat_bin, name = None):
     new_xml = ElementTree.Element('material')
     new_xml.set('name', _sanitize_xml_attr(name if name else Path(filePath).stem, "material"))
     new_xml.set('local', "true")
-    new_xml.set('base', _sanitize_xml_attr(mat_base, r"engine\materials\graphs\pbr_std.w2mg"))
+    new_xml.set('base', _sanitize_xml_attr(mat_base, default_base))
 
     w2mi_params = {}
     read_instance_params(mat_bin, w2mi_params)
@@ -500,7 +620,7 @@ def xml_data_from_CR2W(mat_bin, name = None):
             ,type = attrs[0]
             ,value = attrs[1]
         )
-    prune_unsupported_instance_params(new_xml, mat_base)
+    prune_unsupported_instance_params(new_xml, mat_base, version=_material_bin_cr2w_version(mat_bin))
     return new_xml
 
 def get_all_w2mi(w2mi_path, all_instances):
@@ -630,16 +750,17 @@ def setup_w3_material(
     links = material.node_tree.links
 
     resolve_started = time.perf_counter()
+    material_version = _material_repo_version(material)
     if mat_base.endswith(".w2mi"):
         # The XML contains little to no info about material instances, but the FBX importer
         # imported some image nodes we can use.
         fallback_shader_type = guess_shader_type(shader_type)
         w2mi_path = xml_data.get('base')
         #w2mi_tex_params = read_2wmi_params(material, uncook_path, w2mi_path, shader_type)
-        inherited_params = read_2wmi_params(w2mi_path)
+        inherited_params = read_2wmi_params(w2mi_path, version=material_version)
 
         # Try to resolve the actual .w2mg base shader from the w2mi chain
-        resolved_w2mg = resolve_w2mg(w2mi_path)
+        resolved_w2mg = resolve_w2mg(w2mi_path, version=material_version)
         if resolved_w2mg:
             resolved_mat_base = resolved_w2mg
             shader_type = resolved_w2mg.split("\\")[-1][:-5]
@@ -648,12 +769,12 @@ def setup_w3_material(
             shader_type = fallback_shader_type
 
     elif mat_base.endswith(".w2mg"):
-        inherited_params = read_material_params_from_path(mat_base)
+        inherited_params = read_material_params_from_path(mat_base, version=material_version)
 
     if is_witcher2_material(material):
         shader_type = resolve_witcher2_shader_type(resolved_mat_base, shader_type)
 
-    prune_unsupported_instance_params(xml_data, resolved_mat_base, params=params)
+    prune_unsupported_instance_params(xml_data, resolved_mat_base, params=params, version=material_version)
     resolve_seconds = time.perf_counter() - resolve_started
 
     # Checking if this material was already imported by comparing some custom properties
@@ -838,13 +959,14 @@ def read_2wmi_params2(
     return _read_material_params_from_bin(material_bin)
 
 def read_2wmi_params(
-        w2mi_path: str
+        w2mi_path: str,
+        version: int = 999,
         ) -> Dict[str, tuple[str, str]]:
     # Check if the .w2mi file references any textures or texarrays, and do the same there.
     # Load the .w2mi file.
     log.info("READING W2MI: " + w2mi_path) # FIX PATHS WITH SPACES bob_broken_woods_longpile
 
-    return read_material_params_from_path(w2mi_path)
+    return read_material_params_from_path(w2mi_path, version=version)
 
 def guess_texture_type_by_link(mat: Material, img_node):
         socket_name = img_node.outputs[0].links[0].to_socket.name
@@ -1048,21 +1170,52 @@ def _values_differ(expected, actual, tolerance: float = 1e-5) -> bool:
         return expected != actual
 
 
+def _coerce_scalar_socket_default(value):
+    try:
+        return float(value)
+    except Exception:
+        pass
+
+    if isinstance(value, (str, bytes)):
+        return None
+    try:
+        values = tuple(value)
+    except Exception:
+        return None
+    if len(values) != 1:
+        return None
+    try:
+        return float(values[0])
+    except Exception:
+        return None
+
+
 def _shader_default_differs(node_ng: Node, input_pin, par_type: str, par_value: str) -> bool:
     if input_pin is None:
         return False
 
     if par_type == 'Float':
-        return _values_differ(float(par_value), float(input_pin.default_value))
+        current_default = _coerce_scalar_socket_default(input_pin.default_value)
+        if current_default is None:
+            log.debug(
+                "Ignoring shader default Float override for %s: socket default is not scalar",
+                getattr(input_pin, "name", ""),
+            )
+            return False
+        return _values_differ(float(par_value), current_default)
 
     if par_type == 'Color':
         values = [float(f.strip()) for f in par_value.split(";")]
+        if not hasattr(input_pin.default_value, "__iter__"):
+            return False
         normalized = tuple(value / 255.0 for value in values[:4])
         current = tuple(input_pin.default_value[:4])
         return _values_differ(normalized, current)
 
     if par_type == 'Vector':
         values = [float(f.strip()) for f in par_value.split(";")]
+        if not hasattr(input_pin.default_value, "__iter__"):
+            return False
         current_xyz = tuple(input_pin.default_value[:3])
         if _values_differ(tuple(values[:3]), current_xyz):
             return True
@@ -1499,6 +1652,7 @@ def create_node_texture(
 
     par_name = param.get('name')
     par_value = param.get('value')
+    repo_version = _material_repo_version(mat)
 
     node = nodes.new(type="ShaderNodeTexImage")
     node.width = 300
@@ -1553,15 +1707,17 @@ def create_node_texture(
 
     if par_value.endswith('.texarray'):
         par_value = f"{par_value}.texture_{texarray_index}{get_tex_ext(bpy.context)}"
-    else:
-        FULL_REPO_NAME = repo_file(par_value)
     # We use os.path.abspath() to make sure the filepath has consistent slashes and backslashes,
     # so that we can compare image file paths to each other for duplicate checking.
     final_tex_path = par_value.replace(".xbm", get_tex_ext(bpy.context))
     try:
         final_texture = repo_file_mat(final_tex_path) # TODO fix loading texarray
         if not os.path.exists(win_safe_path(final_texture)):
-            final_texture = uncook_path + os.sep + final_tex_path
+            repo_texture = repo_file(final_tex_path, version=repo_version)
+            if repo_texture and os.path.exists(win_safe_path(repo_texture)):
+                final_texture = repo_texture
+            else:
+                final_texture = uncook_path + os.sep + final_tex_path
     except Exception as e:
         #raise e
         log.critical(f"TEXTURE ERROR {e}")
@@ -1571,12 +1727,28 @@ def create_node_texture(
     
             
     ## didn't find the texture, try find and convert xbm
+    if tex_path.lower().endswith(".xbm") and os.path.exists(win_safe_path(tex_path)):
+        dds_path = os.path.splitext(tex_path)[0] + ".dds"
+        if not os.path.exists(win_safe_path(dds_path)):
+            try:
+                convert_started = time.perf_counter()
+                convert_xbm_to_dds(tex_path, out_path=dds_path)
+                conversion_seconds = time.perf_counter() - convert_started
+                converted_from_xbm = True
+            except Exception as e:
+                conversion_seconds = time.perf_counter() - convert_started
+                log.warning("Failed to convert xbm_to_dds: %s (%s)", tex_path, e)
+        if os.path.exists(win_safe_path(dds_path)):
+            tex_path = dds_path
+
     if not os.path.exists(win_safe_path(tex_path)):
-        
+
         #check if texture and uncook path are different
         #if different change text_path to
         #dds textures should go to texture folders
-        
+
+        xbm_path = os.path.splitext(tex_path)[0] + ".xbm"
+        dds_path = os.path.splitext(tex_path)[0] + ".dds"
         for ext in ['.tga','.dds', '.png']:
             if tex_path.endswith(ext):
                 xbm_path = tex_path.replace(ext, ".xbm")
@@ -1594,15 +1766,14 @@ def create_node_texture(
                     if os.path.exists(win_safe_path(uncook_dds_path)) or os.path.exists(win_safe_path(uncook_xbm_path)):
                         xbm_path = uncook_xbm_path
                         dds_path = uncook_dds_path
-                    else:
-                        # Last fallback: repo_file() will use bundle fallback extraction in uncook for textures.
-                        bundle_xbm_path = repo_file(par_value)
-                        if bundle_xbm_path and os.path.exists(win_safe_path(bundle_xbm_path)):
-                            xbm_path = bundle_xbm_path
-                            dds_path = os.path.splitext(bundle_xbm_path)[0] + ".dds"
                 else:
                     xbm_path = xbm_path.replace(TEXTURE_PATH, GAME_UNCOOK_PATH)
                     dds_path = dds_path.replace(TEXTURE_PATH, GAME_UNCOOK_PATH)
+                # Last fallback: repo_file() will use bundle fallback extraction in uncook for textures.
+                bundle_xbm_path = repo_file(_texture_xbm_repo_path(par_value), version=repo_version)
+                if bundle_xbm_path and os.path.exists(win_safe_path(bundle_xbm_path)):
+                    xbm_path = bundle_xbm_path
+                    dds_path = os.path.splitext(bundle_xbm_path)[0] + ".dds"
             if os.path.exists(win_safe_path(dds_path)):
                 tex_path = dds_path
             elif os.path.exists(win_safe_path(xbm_path)):

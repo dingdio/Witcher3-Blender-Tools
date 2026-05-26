@@ -48,10 +48,10 @@ def _find_chunk_handle_path(chunk, *preferred_names: str) -> str:
     return ""
 
 
-_material_param_cache: Dict[str, Dict[str, tuple[str, str]]] = {}
-_resolved_w2mg_cache: Dict[str, Optional[str]] = {}
+_material_param_cache: Dict[tuple[int, str], Dict[str, tuple[str, str]]] = {}
+_resolved_w2mg_cache: Dict[tuple[int, str], Optional[str]] = {}
 _graph_buffer_meta_cache: Dict[str, Dict[str, object]] = {}
-_graph_declared_param_cache: Dict[str, Optional[Set[str]]] = {}
+_graph_declared_param_cache: Dict[tuple[int, str], Optional[Set[str]]] = {}
 
 GRAPH_DECLARED_INSTANCE_PARAMS: Set[str] = {"SpecularColor"}
 
@@ -84,8 +84,8 @@ def _apply_implicit_graph_param_default(
     )
 
 
-def _load_material_root_chunk(material_path: str):
-    full_path = repo_file(material_path)
+def _load_material_root_chunk(material_path: str, version: int = 999):
+    full_path = repo_file(material_path, version=version)
     if not os.path.exists(full_path):
         return None
 
@@ -162,25 +162,26 @@ def _read_material_graph_buffer_meta(material_bin, full_path: str) -> Dict[str, 
     return meta
 
 
-def read_declared_graph_params(material_path: str) -> Optional[Set[str]]:
+def read_declared_graph_params(material_path: str, version: int = 999) -> Optional[Set[str]]:
     if not material_path:
         return None
 
     graph_path = material_path
     if material_path.lower().endswith(".w2mi"):
-        resolved_graph = resolve_w2mg(material_path)
+        resolved_graph = resolve_w2mg(material_path, version=version)
         if not resolved_graph:
             return None
         graph_path = resolved_graph
 
     normalized_path = normalize_depot_path(graph_path)
-    if normalized_path in _graph_declared_param_cache:
-        cached = _graph_declared_param_cache[normalized_path]
+    cache_key = (int(version), normalized_path)
+    if cache_key in _graph_declared_param_cache:
+        cached = _graph_declared_param_cache[cache_key]
         return set(cached) if cached is not None else None
 
-    material_bin = _load_material_root_chunk(graph_path)
+    material_bin = _load_material_root_chunk(graph_path, version=version)
     if material_bin is None or material_bin.Type != "CMaterialGraph":
-        _graph_declared_param_cache[normalized_path] = None
+        _graph_declared_param_cache[cache_key] = None
         return None
 
     declared_params: Set[str] = set()
@@ -200,16 +201,17 @@ def read_declared_graph_params(material_path: str) -> Optional[Set[str]]:
                 declared_params.add(par_name)
 
     cached_value = set(declared_params)
-    _graph_declared_param_cache[normalized_path] = cached_value
+    _graph_declared_param_cache[cache_key] = cached_value
     return set(cached_value)
 
 
 def prune_unsupported_instance_params(
         xml_data: Element,
         shader_graph_path: str,
-        params: Optional[Dict[str, str]] = None
+        params: Optional[Dict[str, str]] = None,
+        version: int = 999,
         ) -> None:
-    declared_params = read_declared_graph_params(shader_graph_path)
+    declared_params = read_declared_graph_params(shader_graph_path, version=version)
     if declared_params is None:
         return
 
@@ -230,27 +232,34 @@ def prune_unsupported_instance_params(
         )
 
 
-def _read_material_params_from_bin(material_bin, seen_paths: Optional[Set[str]] = None):
+def _read_material_params_from_bin(material_bin, seen_paths: Optional[Set[str]] = None, version: Optional[int] = None):
+    if version is None:
+        try:
+            version = int(material_bin.get_CR2W_version())
+        except Exception:
+            version = 999
     final_params: Dict[str, tuple[str, str]] = {}
     base_material = material_bin.GetVariableByName('baseMaterial')
     if base_material and getattr(base_material, "Handles", None):
         handle = base_material.Handles[0]
         base_path = getattr(handle, "DepotPath", None)
         if base_material.theType == "handle:IMaterial" and base_path:
-            final_params.update(read_material_params_from_path(base_path, seen_paths=seen_paths))
+            final_params.update(read_material_params_from_path(base_path, seen_paths=seen_paths, version=version))
     read_instance_params(material_bin, final_params)
     return final_params
 
 
 def read_material_params_from_path(
         material_path: str,
-        seen_paths: Optional[Set[str]] = None
+        seen_paths: Optional[Set[str]] = None,
+        version: int = 999,
         ) -> Dict[str, tuple[str, str]]:
     if not material_path:
         return {}
 
     normalized_path = normalize_depot_path(material_path)
-    cached = _material_param_cache.get(normalized_path)
+    cache_key = (int(version), normalized_path)
+    cached = _material_param_cache.get(cache_key)
     if cached is not None:
         return dict(cached)
 
@@ -262,46 +271,47 @@ def read_material_params_from_path(
 
     seen_paths.add(normalized_path)
     try:
-        material_bin = _load_material_root_chunk(material_path)
+        material_bin = _load_material_root_chunk(material_path, version=version)
         if material_bin is None:
             return {}
 
-        params = _read_material_params_from_bin(material_bin, seen_paths=seen_paths)
-        _material_param_cache[normalized_path] = dict(params)
+        params = _read_material_params_from_bin(material_bin, seen_paths=seen_paths, version=version)
+        _material_param_cache[cache_key] = dict(params)
         return dict(params)
     finally:
         seen_paths.discard(normalized_path)
 
 
-def resolve_w2mg(w2mi_path):
+def resolve_w2mg(w2mi_path, version: int = 999):
     """Follow w2mi baseMaterial chain to find the final .w2mg shader path."""
     if not w2mi_path:
         return None
 
     normalized_path = normalize_depot_path(w2mi_path)
-    if normalized_path in _resolved_w2mg_cache:
-        return _resolved_w2mg_cache[normalized_path]
+    cache_key = (int(version), normalized_path)
+    if cache_key in _resolved_w2mg_cache:
+        return _resolved_w2mg_cache[cache_key]
 
     try:
-        material_bin = _load_material_root_chunk(w2mi_path)
+        material_bin = _load_material_root_chunk(w2mi_path, version=version)
         if material_bin is None:
-            _resolved_w2mg_cache[normalized_path] = None
+            _resolved_w2mg_cache[cache_key] = None
             return None
         base_var = material_bin.GetVariableByName('baseMaterial')
         if not base_var:
-            _resolved_w2mg_cache[normalized_path] = None
+            _resolved_w2mg_cache[cache_key] = None
             return None
         base_path = base_var.Handles[0].DepotPath
         if base_path.endswith(".w2mg"):
-            _resolved_w2mg_cache[normalized_path] = base_path
+            _resolved_w2mg_cache[cache_key] = base_path
             return base_path
         if base_path.endswith(".w2mi"):
-            resolved = resolve_w2mg(base_path)
-            _resolved_w2mg_cache[normalized_path] = resolved
+            resolved = resolve_w2mg(base_path, version=version)
+            _resolved_w2mg_cache[cache_key] = resolved
             return resolved
     except Exception:
         pass
-    _resolved_w2mg_cache[normalized_path] = None
+    _resolved_w2mg_cache[cache_key] = None
     return None
 
 
@@ -313,7 +323,7 @@ def read_local_material_params_from_bin(material_bin) -> Dict[str, tuple[str, st
     return local_params
 
 
-def collect_material_chain(material_path: str) -> Dict[str, Any]:
+def collect_material_chain(material_path: str, version: int = 999) -> Dict[str, Any]:
     normalized_path = normalize_depot_path(material_path)
     result: Dict[str, Any] = {
         "requested_path": material_path or "",
@@ -336,7 +346,7 @@ def collect_material_chain(material_path: str) -> Dict[str, Any]:
             break
         seen_paths.add(normalized_current)
 
-        material_bin = _load_material_root_chunk(current_path)
+        material_bin = _load_material_root_chunk(current_path, version=version)
         if material_bin is None:
             result["errors"].append(f"Could not read material '{current_path}'.")
             break

@@ -16,6 +16,11 @@ from .w3_material_base_path import (
     refresh_base_material_entry_state,
 )
 from .w3_material_reader import normalize_depot_path
+from .w3_material_constants import (
+    DEFAULT_W2_MATERIAL_BASE,
+    DEFAULT_W3_MATERIAL_BASE,
+    WITCHER2_MATERIALS,
+)
 from .w3_vector_param import (
     get_legacy_w_value,
     get_mapping_vector_input,
@@ -25,6 +30,10 @@ from .w3_vector_param import (
 )
 from . import get_all_addon_prefs, get_texture_path, get_uncook_path
 from .extension_paths import get_cache_root
+from .source_game_paths import (
+    normalize_source_game as _normalize_material_source_game,
+    w2_source_roots,
+)
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +43,19 @@ log = logging.getLogger(__name__)
 _BASE_PATH_CACHE_FILE = Path(get_cache_root(create=True)) / "material_base_paths.json"
 _BASE_PATH_ENUM_CACHE = {}
 _NUMERIC_SUFFIX_RE = re.compile(r"\.\d{3}$")
+
+
+def _material_source_game(material) -> str:
+    props = getattr(material, "witcher_props", None)
+    version = str(getattr(props, "material_version", "") or "").strip().lower()
+    return "w2" if version == "witcher2" else "w3"
+
+
+def _base_path_cache_file(source_game="w3") -> Path:
+    source_game = _normalize_material_source_game(source_game)
+    if source_game == "w3":
+        return _BASE_PATH_CACHE_FILE
+    return Path(get_cache_root(create=True)) / f"material_base_paths_{source_game}.json"
 
 
 def _cache_base_path_enum_items(cache_key, items):
@@ -47,28 +69,30 @@ def _cache_base_path_enum_items(cache_key, items):
     return stable_items
 
 
-def _load_material_base_path_cache():
+def _load_material_base_path_cache(source_game="w3"):
+    cache_file = _base_path_cache_file(source_game)
     try:
-        if not _BASE_PATH_CACHE_FILE.exists():
+        if not cache_file.exists():
             return []
-        with open(_BASE_PATH_CACHE_FILE, 'r', encoding='utf-8') as handle:
+        with open(cache_file, 'r', encoding='utf-8') as handle:
             payload = json.load(handle)
         paths = payload.get("paths", [])
         if not isinstance(paths, list):
             return []
         return [str(path) for path in paths if str(path or "").strip()]
     except Exception:
-        log.warning("Failed to load material base path cache from %s", _BASE_PATH_CACHE_FILE, exc_info=True)
+        log.warning("Failed to load material base path cache from %s", cache_file, exc_info=True)
         return []
 
 
-def _save_material_base_path_cache(paths):
+def _save_material_base_path_cache(paths, source_game="w3"):
+    cache_file = _base_path_cache_file(source_game)
     try:
-        _BASE_PATH_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(_BASE_PATH_CACHE_FILE, 'w', encoding='utf-8') as handle:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_file, 'w', encoding='utf-8') as handle:
             json.dump({"paths": list(paths)}, handle, indent=2)
     except Exception:
-        log.warning("Failed to save material base path cache to %s", _BASE_PATH_CACHE_FILE, exc_info=True)
+        log.warning("Failed to save material base path cache to %s", cache_file, exc_info=True)
 
 
 def _gather_material_base_paths_from_bundles():
@@ -91,20 +115,44 @@ def _gather_material_base_paths_from_bundles():
     return sorted(paths, key=str.lower)
 
 
-def _material_base_path_enum_items(force_refresh: bool = False):
-    cache_key = "bundle_material_base_paths"
+def _gather_w2_material_base_paths_from_roots(context):
+    paths = {
+        normalize_depot_path(identifier)
+        for identifier, _label, _description in WITCHER2_MATERIALS
+        if identifier and identifier != "custom"
+    }
+    for root in w2_source_roots(context, existing_only=True):
+        try:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for filename in filenames:
+                    if not filename.lower().endswith((".w2mi", ".w2mg")):
+                        continue
+                    full_path = os.path.join(dirpath, filename)
+                    rel_path = os.path.relpath(full_path, root)
+                    paths.add(normalize_depot_path(rel_path))
+        except Exception:
+            log.debug("Failed to scan Witcher 2 material base paths under %s", root, exc_info=True)
+    return sorted(paths, key=str.lower)
+
+
+def _material_base_path_enum_items(force_refresh: bool = False, *, source_game="w3", context=None):
+    source_game = _normalize_material_source_game(source_game)
+    cache_key = f"{source_game}_material_base_paths"
     if not force_refresh and cache_key in _BASE_PATH_ENUM_CACHE:
         return _BASE_PATH_ENUM_CACHE[cache_key]
 
-    paths = [] if force_refresh else _load_material_base_path_cache()
+    paths = [] if force_refresh else _load_material_base_path_cache(source_game)
     if not paths:
         try:
-            paths = _gather_material_base_paths_from_bundles()
+            if source_game == "w2":
+                paths = _gather_w2_material_base_paths_from_roots(context)
+            else:
+                paths = _gather_material_base_paths_from_bundles()
         except Exception:
-            log.warning("Failed to gather base material paths from bundles", exc_info=True)
+            log.warning("Failed to gather %s base material paths", source_game.upper(), exc_info=True)
             paths = []
         if paths:
-            _save_material_base_path_cache(paths)
+            _save_material_base_path_cache(paths, source_game)
 
     items = [
         (
@@ -117,16 +165,20 @@ def _material_base_path_enum_items(force_refresh: bool = False):
     return _cache_base_path_enum_items(cache_key, items)
 
 
-def _material_base_path_values(force_refresh: bool = False):
+def _material_base_path_values(force_refresh: bool = False, *, source_game="w3", context=None):
     return [
         identifier
-        for identifier, _label, _description in _material_base_path_enum_items(force_refresh)
+        for identifier, _label, _description in _material_base_path_enum_items(
+            force_refresh,
+            source_game=source_game,
+            context=context,
+        )
         if identifier
     ]
 
 
-def _filtered_material_base_paths(query: str = "", *, file_type: str = "ALL", limit: int = 0):
-    paths = _material_base_path_values()
+def _filtered_material_base_paths(query: str = "", *, file_type: str = "ALL", limit: int = 0, source_game="w3", context=None):
+    paths = _material_base_path_values(source_game=source_game, context=context)
     if file_type == "W2MI":
         paths = [path for path in paths if path.lower().endswith(".w2mi")]
     elif file_type == "W2MG":
@@ -507,7 +559,8 @@ class WITCH_PT_materials(bpy.types.Panel):
         props = mat.witcher_props
         row = layout.row(align=True)
         row.prop(props, "base_custom", text="Base Path")
-        row.operator("witcher.search_base_material_path", text="", icon='VIEWZOOM')
+        search_op = row.operator("witcher.search_base_material_path", text="", icon='VIEWZOOM')
+        search_op.source_game = _material_source_game(mat)
         row.operator("witcher.read_base_material", text="Load", icon='FILE_REFRESH')
 
         recommendation = _base_path_group_recommendation(mat)
@@ -842,6 +895,15 @@ class BaseMaterialParamItem(bpy.types.PropertyGroup):
     message: bpy.props.StringProperty(name="Message")
     show_details: bpy.props.BoolProperty(name="Show Details", default=False)
 
+
+def _update_material_version(self, context):
+    current_base = normalize_depot_path(getattr(self, "base_custom", ""))
+    if self.material_version == "witcher2" and current_base == normalize_depot_path(DEFAULT_W3_MATERIAL_BASE):
+        self.base_custom = DEFAULT_W2_MATERIAL_BASE
+    elif self.material_version == "witcher3" and current_base == normalize_depot_path(DEFAULT_W2_MATERIAL_BASE):
+        self.base_custom = DEFAULT_W3_MATERIAL_BASE
+
+
 class WitcherMaterialProperties(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="name", default="Material")
     enableMask: bpy.props.BoolProperty(name="enableMask", default=False, description="Enable Mask of hair etc")
@@ -937,7 +999,7 @@ class WitcherMaterialProperties(bpy.types.PropertyGroup):
     base_custom: bpy.props.StringProperty(
         name="Base Path",
         description="Enter a .w2mi or .w2mg path",
-        default=r"engine\materials\graphs\pbr_std.w2mg",
+        default=DEFAULT_W3_MATERIAL_BASE,
     )
     
     
@@ -951,6 +1013,7 @@ class WitcherMaterialProperties(bpy.types.PropertyGroup):
         description="What game this material was orignally for",
         items=material_version_options,
         default="witcher3",
+        update=_update_material_version,
     )
     
 def get_group_inputs(mat):
@@ -1148,9 +1211,17 @@ def _refresh_base_read_snapshot(material, material_path: str, *, count_created: 
 class WITCH_OT_search_base_material_path(bpy.types.Operator):
     bl_idname = "witcher.search_base_material_path"
     bl_label = "Search Base Path"
-    bl_description = "Search bundle .w2mi and .w2mg paths to populate the Base Path"
+    bl_description = "Search source-specific .w2mi and .w2mg paths to populate the Base Path"
     bl_options = {'REGISTER', 'INTERNAL'}
 
+    source_game: bpy.props.EnumProperty(
+        name="Game",
+        items=[
+            ('w3', "Witcher 3", "Search Witcher 3 bundle material paths"),
+            ('w2', "Witcher 2", "Search Witcher 2 REDkit/Uncook material paths"),
+        ],
+        default='w3',
+    )
     filter_text: bpy.props.StringProperty(name="Search", default="")
     file_type: bpy.props.EnumProperty(
         name="Type",
@@ -1164,8 +1235,13 @@ class WITCH_OT_search_base_material_path(bpy.types.Operator):
     base_path_items: bpy.props.CollectionProperty(type=BaseMaterialPathItem)
     base_path_items_index: bpy.props.IntProperty(default=0)
 
-    def _rebuild_items(self):
-        matches, _total = _filtered_material_base_paths(self.filter_text, file_type=self.file_type)
+    def _rebuild_items(self, context):
+        matches, _total = _filtered_material_base_paths(
+            self.filter_text,
+            file_type=self.file_type,
+            source_game=self.source_game,
+            context=context,
+        )
         self.base_path_items.clear()
         for path in matches:
             item = self.base_path_items.add()
@@ -1181,15 +1257,19 @@ class WITCH_OT_search_base_material_path(bpy.types.Operator):
             self.report({'ERROR'}, "No material selected")
             return {'CANCELLED'}
 
+        material_game = _material_source_game(material)
+        self.source_game = _normalize_material_source_game(self.source_game)
+        if self.source_game == "w3" and material_game == "w2":
+            self.source_game = "w2"
         current = normalize_depot_path(getattr(material.witcher_props, "base_custom", ""))
         self.filter_text = ""
         self.file_type = 'ALL'
 
-        if not _material_base_path_values():
-            self.report({'WARNING'}, "No .w2mi or .w2mg bundle paths were found")
+        if not _material_base_path_values(source_game=self.source_game, context=context):
+            self.report({'WARNING'}, f"No {self.source_game.upper()} .w2mi or .w2mg paths were found")
             return {'CANCELLED'}
 
-        self._rebuild_items()
+        self._rebuild_items(context)
         if current and self.base_path_items:
             for idx, item in enumerate(self.base_path_items):
                 if normalize_depot_path(getattr(item, "path", "")) == current:
@@ -1199,11 +1279,14 @@ class WITCH_OT_search_base_material_path(bpy.types.Operator):
         return context.window_manager.invoke_props_dialog(self, width=980)
 
     def check(self, context):
-        self._rebuild_items()
+        self.source_game = _normalize_material_source_game(self.source_game)
+        self._rebuild_items(context)
         return True
 
     def draw(self, context):
         layout = self.layout
+        source_row = layout.row(align=True)
+        source_row.prop(self, "source_game", expand=True)
         row = layout.row(align=True)
         row.prop(self, "filter_text", text="", icon='VIEWZOOM')
         type_row = layout.row(align=True)
@@ -1233,6 +1316,7 @@ class WITCH_OT_search_base_material_path(bpy.types.Operator):
         if not (0 <= self.base_path_items_index < len(self.base_path_items)):
             return {'CANCELLED'}
         material.witcher_props.base_custom = self.base_path_items[self.base_path_items_index].path
+        material.witcher_props.material_version = "witcher2" if self.source_game == "w2" else "witcher3"
         return {'FINISHED'}
 
 

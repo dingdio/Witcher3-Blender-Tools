@@ -1,14 +1,23 @@
 import logging
 from pathlib import Path
 import os
+import re
 import struct
 from typing import List
 from types import SimpleNamespace
 
 import numpy as np
 
-from .bin_helpers import ReadBit6, ReadVLQInt32
-from .common_blender import extract_missing_buffers, win_safe_path
+from .bin_helpers import (
+    ReadBit6,
+    ReadVLQInt32,
+    read_i32_at as _read_i32_at,
+    read_u8_at as _read_u8_at,
+    read_u16_at as _read_u16_at,
+    read_u32_at as _read_u32_at,
+    read_witcher2_encoded_string_at as _read_w2_encoded_string_at,
+)
+from .common_blender import extract_missing_buffers, repo_file, win_safe_path
 from .helper_function import flip_v
 
 from .Types import CMesh
@@ -20,6 +29,8 @@ from .CR2W_types import PROPERTY, SMeshChunkPacked, getCR2W, W_CLASS
 from .Types.BlenderMesh import CommonData
 from .Types.SBufferInfos import MMatrix, SBufferInfos, SVertexBufferInfos, SMeshInfos, EMeshVertexType, VertexSkinningEntry
 log = logging.getLogger(__name__)
+
+_W2_IMPORT_FILE_MATERIAL_NAMES_CACHE = {}
 
 
 def _derive_mesh_is_static(mesh_infos):
@@ -120,7 +131,8 @@ def _read_indices_numpy(fhandle, num_indices):
 
 
 def _read_vertices_uncooked_numpy(fhandle, num_vertices, num_bones_per_vertex,
-                                  num_extra_floats, cToLin, CData, final_meshdata):
+                                  num_extra_floats, cToLin, CData, final_meshdata,
+                                  emit_skinning=True):
     """Read uncooked vertex data in bulk using numpy structured arrays.
 
     Used for both W2 uncooked and W3 rawVertices paths where the layout is:
@@ -176,23 +188,24 @@ def _read_vertices_uncooked_numpy(fhandle, num_vertices, num_bones_per_vertex,
     extra = verts['extra']
     final_meshdata.extra_vectors = extra.tolist()
 
-    # Skinning data - extract non-zero weights
-    bone_ids = verts['bone_ids']   # (N, nbpv)
-    weights = verts['weights']     # (N, nbpv)
-    nz_mask = weights != 0.0
-    nz_vert, nz_slot = np.nonzero(nz_mask)
+    if emit_skinning:
+        # Skinning data - extract non-zero weights
+        bone_ids = verts['bone_ids']   # (N, nbpv)
+        weights = verts['weights']     # (N, nbpv)
+        nz_mask = weights != 0.0
+        nz_vert, nz_slot = np.nonzero(nz_mask)
 
-    for idx in range(len(nz_vert)):
-        vi = int(nz_vert[idx])
-        si = int(nz_slot[idx])
-        entry = VertexSkinningEntry()
-        entry.boneId = int(bone_ids[vi, si])
-        entry.boneId_idx = si
-        entry.meshBufferId = 0
-        entry.vertexId = vi
-        entry.strength = float(weights[vi, si])
-        CData.w3_DataCache.vertices.append(entry)
-        final_meshdata.skinningVerts.append(entry)
+        for idx in range(len(nz_vert)):
+            vi = int(nz_vert[idx])
+            si = int(nz_slot[idx])
+            entry = VertexSkinningEntry()
+            entry.boneId = int(bone_ids[vi, si])
+            entry.boneId_idx = si
+            entry.meshBufferId = 0
+            entry.vertexId = vi
+            entry.strength = float(weights[vi, si])
+            CData.w3_DataCache.vertices.append(entry)
+            final_meshdata.skinningVerts.append(entry)
 
 
 def _read_vertices_cooked_w2_numpy(fhandle, num_vertices, vertex_size, is_skinned,
@@ -372,6 +385,381 @@ class SubmeshData:
         self.distance = 0
 
 
+def _w2_cnames(meshFile):
+    names = []
+    for cname in getattr(meshFile, "CNAMES", []) or []:
+        try:
+            names.append(cname.name.value)
+        except Exception:
+            names.append("")
+    return names
+
+
+def _w2_chunk_data_range(meshFile, chunk):
+    chunk_index = getattr(chunk, "ChunkIndex", None)
+    exports = getattr(meshFile, "CR2WExport", []) or []
+    if chunk_index is None or chunk_index < 0 or chunk_index >= len(exports):
+        return None, None
+    export = exports[chunk_index]
+    start = int(getattr(meshFile, "start", 0) or 0) + int(getattr(export, "dataOffset", 0) or 0)
+    size = int(getattr(export, "dataSize", 0) or 0)
+    return start, start + max(0, size)
+
+
+def _read_w2_cmesh_header(meshFile, chunk, data: bytes):
+    """Read W2 CMesh props directly from the chunk data offset.
+
+    W2 CMesh stores reflected properties followed by a mesh-specific payload in
+    the same export range. This focused pass recovers the small reflected header
+    without depending on the generic class reader to understand the payload.
+    """
+    names = _w2_cnames(meshFile)
+    start, end = _w2_chunk_data_range(meshFile, chunk)
+    if start is None:
+        return {}, getattr(chunk, "classEnd", 0) or 0
+
+    props = {}
+    offset = start
+    while offset + 4 <= min(end, len(data)):
+        prop_start = offset
+        try:
+            name_id, offset = _read_u16_at(data, offset)
+            type_id, offset = _read_u16_at(data, offset)
+        except ValueError:
+            return props, prop_start
+        if not (0 < name_id < len(names)) or not (0 < type_id < len(names)):
+            return props, prop_start
+
+        prop_name = names[name_id]
+        prop_type = names[type_id]
+        offset += 2  # W2 property marker, normally 0xFFFF.
+        size_offset = offset
+        try:
+            prop_size, offset = _read_i32_at(data, offset)
+        except ValueError:
+            return props, prop_start
+
+        value_offset = offset
+        prop_end = size_offset + prop_size
+        if prop_size < 4 or prop_end <= prop_start or prop_end > end or prop_end > len(data):
+            return props, prop_start
+
+        try:
+            if prop_name == "materials" and prop_type in ("@*IMaterial", "array:2,0,handle:IMaterial"):
+                count, value_pos = _read_u32_at(data, value_offset)
+                value_pos += 4
+                handles = []
+                for _ in range(count):
+                    material_id, value_pos = _read_i32_at(data, value_pos)
+                    handles.append(SimpleNamespace(
+                        Reference=material_id - 1 if material_id > 0 else None,
+                        DepotPath=None,
+                        ChunkHandle=material_id > 0,
+                        val=material_id,
+                    ))
+                props["materials"] = SimpleNamespace(Count=int(count), Handles=handles)
+            elif prop_name == "materialNames" and prop_type in ("@String", "array:2,0,String"):
+                count, value_pos = _read_u32_at(data, value_offset)
+                value_pos += 4
+                material_names = []
+                for _ in range(count):
+                    value, value_pos = _read_w2_encoded_string_at(data, value_pos)
+                    material_names.append(value)
+                props["materialNames"] = material_names
+            elif prop_name == "importFile" and prop_type == "String":
+                value, _value_pos = _read_w2_encoded_string_at(data, value_offset)
+                props["importFile"] = value
+        except Exception:
+            log.debug("Failed to parse W2 CMesh property %s/%s", prop_name, prop_type, exc_info=True)
+
+        offset = prop_end
+
+    return props, offset
+
+
+def _w2_prop_string_value(prop):
+    if not prop:
+        return ""
+    if isinstance(prop, str):
+        return prop
+    string_value = getattr(prop, "String", None)
+    if isinstance(string_value, str):
+        return string_value
+    nested = getattr(string_value, "String", None)
+    if isinstance(nested, str):
+        return nested
+    value = getattr(prop, "Value", None)
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _w2_import_file_stem(import_file):
+    import_file = str(import_file or "").replace("\\", "/").strip()
+    if not import_file:
+        return ""
+    base = import_file.rsplit("/", 1)[-1]
+    stem, _ext = os.path.splitext(base)
+    return stem
+
+
+def _w2_string_array_values(prop):
+    values = []
+    for element in getattr(prop, "elements", []) or []:
+        value = getattr(element, "String", "")
+        if hasattr(value, "String"):
+            value = value.String
+        value = str(value or "").strip()
+        if value:
+            values.append(value)
+    return values
+
+
+def _iter_w2_mesh_paths_from_import_file(import_file):
+    normalized = str(import_file or "").replace("/", "\\").strip()
+    if not normalized:
+        return
+
+    lower = normalized.lower()
+    marker = "\\w2_assets\\"
+    marker_idx = lower.find(marker)
+    if marker_idx >= 0:
+        normalized = normalized[marker_idx + len(marker):]
+    else:
+        drive, tail = os.path.splitdrive(normalized)
+        if drive:
+            normalized = tail.lstrip("\\")
+
+    root, _ext = os.path.splitext(normalized)
+    if not root:
+        return
+
+    candidates = []
+    if "\\export\\" in root.lower():
+        parts = re.split(r"\\export\\", root, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            candidates.append(parts[0] + "\\model\\" + parts[1] + ".w2mesh")
+    candidates.append(root + ".w2mesh")
+
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.replace("/", "\\").lstrip("\\")
+        key = candidate.lower()
+        if candidate and key not in seen:
+            seen.add(key)
+            yield candidate
+
+
+def _w2_material_names_from_matching_mesh(import_file, import_file_stem, material_count, version):
+    if not import_file or not import_file_stem or material_count <= 0:
+        return []
+
+    cache_key = (str(import_file).lower(), int(material_count), int(version))
+    if cache_key in _W2_IMPORT_FILE_MATERIAL_NAMES_CACHE:
+        return list(_W2_IMPORT_FILE_MATERIAL_NAMES_CACHE[cache_key])
+
+    for repo_path in _iter_w2_mesh_paths_from_import_file(import_file) or []:
+        try:
+            full_path = repo_file(repo_path, version=version)
+        except Exception:
+            continue
+        if not full_path or not os.path.exists(win_safe_path(full_path)):
+            continue
+        try:
+            with open(win_safe_path(full_path), "rb") as ref_handle:
+                ref_mesh = getCR2W(ref_handle)
+                for ref_chunk in getattr(getattr(ref_mesh, "CHUNKS", None), "CHUNKS", []) or []:
+                    if getattr(ref_chunk, "Type", None) != "CMesh":
+                        continue
+                    names = _w2_string_array_values(ref_chunk.GetVariableByName("materialNames"))
+                    if len(names) == material_count:
+                        result = [f"{import_file_stem}_{name}" for name in names]
+                        _W2_IMPORT_FILE_MATERIAL_NAMES_CACHE[cache_key] = list(result)
+                        return result
+        except Exception:
+            log.debug("Failed to read W2 material names from matching mesh %s", full_path, exc_info=True)
+
+    _W2_IMPORT_FILE_MATERIAL_NAMES_CACHE[cache_key] = []
+    return []
+
+
+def _w2_fallback_material_name(mesh_name, import_file_stem, fallback_prefix, idx, material_count):
+    if import_file_stem:
+        hint = f"{mesh_name} {import_file_stem}".lower()
+        if "hair" in hint or "coif" in hint:
+            if material_count == 1 or idx == 0:
+                return f"{import_file_stem}_hair"
+        if material_count == 1:
+            return import_file_stem
+        return f"{import_file_stem}_Material{idx}"
+    return f"{fallback_prefix}_Material{idx}"
+
+
+def _w2_uncooked_vertex_stride(num_bones_per_vertex: int, num_extra_floats: int):
+    return (
+        12  # position
+        + num_bones_per_vertex  # bone ids
+        + (num_bones_per_vertex * 4)  # weights
+        + 12  # normals
+        + 4  # color
+        + 8  # uv1
+        + 8  # uv2
+        + 12  # tangent
+        + (num_extra_floats * 4)
+    )
+
+
+def _w2_uncooked_counts_fit(data_len: int, data_offset: int, vertices_count: int,
+                            indices_count: int, vertex_stride: int):
+    min_size = data_offset + 1 + (vertices_count * vertex_stride) + 1 + (indices_count * 2)
+    return min_size <= data_len
+
+
+# Hard upper bounds for W2 submesh counts. Anything larger is a parser error
+# (misaligned read producing garbage), not a real mesh — letting it through
+# causes Blender to attempt multi-terabyte allocations and crash. Limits chosen
+# generously vs. real shipped W2 meshes (Triss et al. are well under 1M verts).
+_W2_MAX_SUBMESH_VERTICES = 10_000_000
+_W2_MAX_SUBMESH_INDICES = 30_000_000
+
+
+def _validate_w2_submesh_counts(num_vertices, num_indices, source_label,
+                                data_len=None, data_offset=None):
+    if num_vertices is None or num_indices is None:
+        raise ValueError(
+            f"{source_label}: missing vertex/index count (verts={num_vertices}, indices={num_indices})"
+        )
+    if num_vertices < 0 or num_indices < 0:
+        raise ValueError(
+            f"{source_label}: negative count (verts={num_vertices}, indices={num_indices})"
+        )
+    if num_vertices > _W2_MAX_SUBMESH_VERTICES or num_indices > _W2_MAX_SUBMESH_INDICES:
+        raise ValueError(
+            f"{source_label}: implausible counts (verts={num_vertices}, indices={num_indices}) "
+            f"- parser likely misaligned"
+        )
+    if num_indices % 3 != 0:
+        raise ValueError(
+            f"{source_label}: index count {num_indices} is not a multiple of 3"
+        )
+    if data_len is not None and data_offset is not None:
+        # Lower bound: indices alone (2 bytes each) must fit somewhere in the file.
+        if data_offset + num_indices * 2 > data_len:
+            raise ValueError(
+                f"{source_label}: counts (verts={num_vertices}, indices={num_indices}) "
+                f"would read past end of file (offset={data_offset}, data_len={data_len})"
+            )
+
+
+def _read_w2_vlq_at(data: bytes, offset: int):
+    if offset >= len(data):
+        raise ValueError("Unexpected end of W2 VLQ data")
+    b1 = data[offset]
+    offset += 1
+    sign = (b1 & 128) == 128
+    has_next = (b1 & 64) == 64
+    size = b1 % 128 % 64
+    shift = 6
+    while has_next:
+        if offset >= len(data):
+            raise ValueError("Unexpected end of W2 VLQ data")
+        b = data[offset]
+        offset += 1
+        size = (b % 128) << shift | size
+        has_next = (b & 128) == 128
+        shift += 7
+    return (-size if sign else size), offset
+
+
+def _has_w2_expected_vlq_at(data: bytes, offset: int, expected: int, max_padding=4):
+    for padding in range(max_padding + 1):
+        try:
+            value, _end = _read_w2_vlq_at(data, offset + padding)
+        except ValueError:
+            continue
+        if value == expected:
+            return True
+    return False
+
+
+def _looks_like_w2_uncooked_mesh_payload(data: bytes, payload_start: int, version: int):
+    """Return True when the W2 mesh payload has a plausible uncooked header.
+
+    The older reader used byte 3 == 5 as a cooked marker. Some shipped W2
+    uncooked meshes also have that value in their small payload prefix, so check
+    the first submesh header before committing to the cooked path.
+    """
+    if payload_start < 0 or payload_start >= len(data):
+        return False
+
+    header_size = 3 if version <= 86 else 7
+    offset = payload_start + header_size
+    if offset >= len(data):
+        return False
+
+    nb_submeshes = data[offset]
+    if nb_submeshes <= 0 or nb_submeshes > 128:
+        return False
+
+    try:
+        offset += 1
+        vertex_type, offset = _read_u16_at(data, offset)
+        _material_id, offset = _read_u32_at(data, offset)
+    except ValueError:
+        return False
+
+    if vertex_type > 64:
+        return False
+
+    num_extra_floats = 9 if version > 100 else 3
+    vertex_stride = _w2_uncooked_vertex_stride(4, num_extra_floats)
+    for unknown_size in (1, 2):
+        try:
+            value_offset = offset + unknown_size
+            vertices_count, value_offset = _read_u32_at(data, value_offset)
+            indices_count, value_offset = _read_u32_at(data, value_offset)
+        except ValueError:
+            continue
+        if (
+            _is_plausible_w2_uncooked_counts(vertices_count, indices_count)
+            and _w2_uncooked_counts_fit(len(data), value_offset, vertices_count, indices_count, vertex_stride)
+            and _has_w2_expected_vlq_at(data, value_offset, vertices_count)
+        ):
+            return True
+
+    return False
+
+
+def _is_plausible_w2_uncooked_counts(vertices_count, indices_count):
+    if vertices_count is None or indices_count is None:
+        return False
+    if vertices_count <= 0 or vertices_count > 5_000_000:
+        return False
+    if indices_count <= 0 or indices_count > 15_000_000:
+        return False
+    if indices_count % 3:
+        return False
+    return True
+
+
+def _read_w2_expected_vlq(br: bStream, expected: int, max_padding=4):
+    if expected <= 0:
+        return ReadVLQInt32(br.fhandle)
+
+    start = br.tell()
+    for padding in range(max_padding + 1):
+        br.seek(start + padding)
+        try:
+            value = ReadVLQInt32(br.fhandle)
+        except Exception:
+            continue
+        if value == expected:
+            return value
+
+    br.seek(start)
+    return ReadVLQInt32(br.fhandle)
+
+
 def _normalize_embedded_cmesh_chunk_index(value):
     if value is None:
         return None
@@ -394,7 +782,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
     #raise NotImplementedError
     embedded_cmesh_chunk_index = _normalize_embedded_cmesh_chunk_index(embedded_cmesh_chunk_index)
     _diag_label = f'{filename}{f" [embedded CMesh chunk {embedded_cmesh_chunk_index}]" if embedded_cmesh_chunk_index is not None else ""}'
-    log.info('FileLoading: '+ _diag_label)
+    log.debug('FileLoading: %s', _diag_label)
 
     # with open(filename,"rb") as meshFileReader:
     #     meshFile = getCR2W(meshFileReader)
@@ -410,7 +798,6 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
     CData.modelName = meshName
     CData.meshDataAllMeshes = []
     bonePositions: List[Vector3D] = []
-
     bufferInfos:SBufferInfos = SBufferInfos()
 
 
@@ -419,39 +806,73 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
     #?###################?#
     if meshFile.HEADER.version <= 115: #? WITCHER 2
         f.seek(0)
-        br:bStream = bStream(data = f.read())
+        raw_data = f.read()
+        br:bStream = bStream(data = raw_data)
         f.close()
-
-        chunk: W_CLASS
+        the_material_names = []
+        the_materials = SimpleNamespace(Count=0, Handles=[])
+        cmesh_count = sum(1 for item in meshFile.CHUNKS.CHUNKS if getattr(item, "Type", None) == "CMesh")
         selected_cmesh_found = False
 
+        chunk: W_CLASS
         for chunk in meshFile.CHUNKS.CHUNKS:
             if chunk.Type == "CMesh":
                 if embedded_cmesh_chunk_index is not None and getattr(chunk, "ChunkIndex", None) != embedded_cmesh_chunk_index:
                     continue
                 selected_cmesh_found = True
-                the_materials = chunk.GetVariableByName("materials")
+                raw_props, payload_start = _read_w2_cmesh_header(meshFile, chunk, raw_data)
+                the_materials = chunk.GetVariableByName("materials") or raw_props.get("materials")
                 the_material_names_chunk = chunk.GetVariableByName("materialNames")
                 the_material_names = []
+                import_file_path = (
+                    _w2_prop_string_value(chunk.GetVariableByName("importFile"))
+                    or raw_props.get("importFile")
+                )
+                import_file_stem = _w2_import_file_stem(import_file_path)
+                fallback_prefix = meshName
+                if cmesh_count > 1 or embedded_cmesh_chunk_index is not None:
+                    fallback_prefix = f"{meshName}_cmesh{getattr(chunk, 'ChunkIndex', 0)}"
                 if the_material_names_chunk:
-                    for mat in the_material_names_chunk.elements:
-                        the_material_names.append(meshName+"_"+mat.String)
+                    for mat_name in _w2_string_array_values(the_material_names_chunk):
+                        the_material_names.append(meshName+"_"+mat_name)
+                elif raw_props.get("materialNames"):
+                    for mat_name in raw_props.get("materialNames") or []:
+                        the_material_names.append(meshName+"_"+mat_name)
                 else:
                     if the_materials:
-                        for idx in range(the_materials.Count):
-                            the_material_names.append("Material"+str(idx))
+                        matched_names = _w2_material_names_from_matching_mesh(
+                            import_file_path,
+                            import_file_stem,
+                            the_materials.Count,
+                            meshFile.HEADER.version,
+                        )
+                        if matched_names:
+                            the_material_names.extend(matched_names)
+                        else:
+                            for idx in range(the_materials.Count):
+                                the_material_names.append(
+                                    _w2_fallback_material_name(
+                                        meshName,
+                                        import_file_stem,
+                                        fallback_prefix,
+                                        idx,
+                                        the_materials.Count,
+                                    )
+                            )
                     else:
                         # Allow meshes with no materials
                         the_materials = SimpleNamespace(Count=0, Handles=[])
 
                 #go to buffer start
-                br.seek(chunk.PROPS[-1].dataEnd)
+                br.seek(payload_start)
 
                 is_uncooked = False
+                looks_uncooked = _looks_like_w2_uncooked_mesh_payload(
+                    raw_data, payload_start, meshFile.HEADER.version)
                 yes = br.read(8)
-                if (yes[3] != 5 or meshFile.HEADER.version <= 83): #
+                if (looks_uncooked or len(yes) < 4 or yes[3] != 5 or meshFile.HEADER.version <= 83): #
                     is_uncooked = True
-                    br.seek(-8,1)
+                    br.seek(payload_start)
                     #log.critical('Error reading LODs')
                     #return
                 
@@ -470,16 +891,43 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                         extra_vectors = True
                         if meshFile.HEADER.version <= 100: # 95, 92 lowest
                             extra_vectors = False
+                        num_extra_floats = 9 if extra_vectors else 3
                         submesh = SubmeshData()
                         submesh.vertexType_w2 = br.readUInt16() # TODO check this
                         if submesh.vertexType_w2 in [1,5] :
                             submesh.vertexType = EMeshVertexType.EMVT_SKINNED
                         
                         submesh.materialID = br.readUInt32()
-                        stuffmore = br.read(1)
-                        efaewf = br.tell()
-                        submesh.verticesCount = br.readUInt32() # 4240
-                        submesh.indicesCount = br.readUInt32() #21651
+                        header_unknown_pos = br.tell()
+                        count_layout_found = False
+                        for unknown_size in (1, 2):
+                            br.seek(header_unknown_pos)
+                            br.read(unknown_size)
+                            submesh.verticesCount = br.readUInt32()
+                            submesh.indicesCount = br.readUInt32()
+                            vertex_stride = _w2_uncooked_vertex_stride(4, num_extra_floats)
+                            if (
+                                _is_plausible_w2_uncooked_counts(submesh.verticesCount, submesh.indicesCount)
+                                and _w2_uncooked_counts_fit(
+                                    len(raw_data), br.tell(), submesh.verticesCount,
+                                    submesh.indicesCount, vertex_stride)
+                                and _has_w2_expected_vlq_at(raw_data, br.tell(), submesh.verticesCount)
+                            ):
+                                count_layout_found = True
+                                break
+                        if not count_layout_found:
+                            br.seek(header_unknown_pos)
+                            br.read(1)
+                            submesh.verticesCount = br.readUInt32()
+                            submesh.indicesCount = br.readUInt32()
+
+                        _validate_w2_submesh_counts(
+                            submesh.verticesCount,
+                            submesh.indicesCount,
+                            f"W2 uncooked submesh in {meshName} (chunk {getattr(chunk, 'ChunkIndex', '?')}, vertexType={submesh.vertexType_w2})",
+                            data_len=len(raw_data),
+                            data_offset=br.tell(),
+                        )
 
                         meshInfo = SMeshInfos()
                         meshInfo.numVertices = submesh.verticesCount
@@ -496,12 +944,13 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                         #?#################?#
                         #?### Vertices ####?#
                         #?#################?#
-                        numVertices_count = ReadVLQInt32(br.fhandle)
+                        _read_w2_expected_vlq(br, meshInfo.numVertices)
                         num_extra_floats = 9 if extra_vectors else 3
                         _read_vertices_uncooked_numpy(
                             br.fhandle, meshInfo.numVertices,
                             meshInfo.numBonesPerVertex, num_extra_floats,
-                            cToLin, CData, final_meshdata)
+                            cToLin, CData, final_meshdata,
+                            submesh.vertexType == EMeshVertexType.EMVT_SKINNED)
                         # Pad extra_vectors to 9 elements if only 3 were in file
                         if not extra_vectors:
                             final_meshdata.extra_vectors = [
@@ -517,17 +966,39 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                         #?#################?#
                         #?#### Indices ####?#
                         #?#################?#
-                        numIndices_count = ReadVLQInt32(br.fhandle)
+                        _read_w2_expected_vlq(br, meshInfo.numIndices)
                         final_meshdata.faces = _read_indices_numpy(br.fhandle, meshInfo.numIndices)
                         lastIOffset = br.tell()
 
-                        bonesId_count = br.readByte()
+                        bonesId_count = ReadBit6(br.fhandle)
                         for _ in range(bonesId_count):
                             submesh.bonesId.append(br.readUInt16())
 
-                        #Replace skinning ids with mapped id
-                        for skinningVert in final_meshdata.skinningVerts:
-                            skinningVert.boneId = submesh.bonesId[skinningVert.boneId]
+                        # Replace skinning ids with mapped ids. Static W2 meshes
+                        # still use the same fixed vertex stride, but do not have
+                        # a bone map.
+                        if final_meshdata.skinningVerts and submesh.bonesId:
+                            valid_skinning_verts = []
+                            invalid_skinning_verts = set()
+                            for skinningVert in final_meshdata.skinningVerts:
+                                if 0 <= skinningVert.boneId < len(submesh.bonesId):
+                                    skinningVert.boneId = submesh.bonesId[skinningVert.boneId]
+                                    valid_skinning_verts.append(skinningVert)
+                                else:
+                                    invalid_skinning_verts.add(id(skinningVert))
+                            if invalid_skinning_verts:
+                                CData.w3_DataCache.vertices = [
+                                    entry for entry in CData.w3_DataCache.vertices
+                                    if id(entry) not in invalid_skinning_verts
+                                ]
+                                final_meshdata.skinningVerts = valid_skinning_verts
+                        elif final_meshdata.skinningVerts:
+                            invalid_skinning_verts = {id(entry) for entry in final_meshdata.skinningVerts}
+                            CData.w3_DataCache.vertices = [
+                                entry for entry in CData.w3_DataCache.vertices
+                                if id(entry) not in invalid_skinning_verts
+                            ]
+                            final_meshdata.skinningVerts = []
 
                         final_meshdata.meshInfo = submesh
                         return submesh
@@ -542,7 +1013,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                 lodCount = br.readUByte()
                 for _ in range(lodCount):
                     lod = TW2_LOD()
-                    nbSubmeshes = br.readUByte()
+                    nbSubmeshes = ReadBit6(br.fhandle)
 
                     buffer = CPaddedBuffer(meshFile,CUInt16)
                     chunk.CMesh.ChunkgroupIndeces.elements.append(buffer)
@@ -661,23 +1132,45 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                         isSkinned = True
                         submesh.vertexType = EMeshVertexType.EMVT_SKINNED
 
-                    log.critical(f"submesh (vertype: {submesh.vertexType_w2}, vertsize: {vertexSize}, vertStart = {br.tell()})")
+                    log.debug(
+                        "W2 cooked submesh vertex layout: vertype=%s vertsize=%s vertStart=%s",
+                        submesh.vertexType_w2,
+                        vertexSize,
+                        br.tell(),
+                    )
+                    vertex_offset = submeshStartPos + submesh.verticesStart * vertexSize
+                    vertex_end = vertex_offset + submesh.verticesCount * vertexSize
+                    index_offset = submeshStartPos + meshIndicesOffset + submesh.indicesStart * 2
+                    index_end = index_offset + submesh.indicesCount * 2
+                    if (
+                        vertex_offset < 0
+                        or index_offset < 0
+                        or vertex_end > len(raw_data)
+                        or index_end > len(raw_data)
+                    ):
+                        raise ValueError(
+                            f"W2 cooked submesh in {meshName} (chunk {getattr(chunk, 'ChunkIndex', '?')}, "
+                            f"vertexType={submesh.vertexType_w2}) ranges past end of file "
+                            f"(vertex={vertex_offset}:{vertex_end}, index={index_offset}:{index_end}, "
+                            f"data_len={len(raw_data)})"
+                        )
+
                     #?#################?#
                     #?### Vertices ####?#
                     #?#################?#
-                    br.seek(submeshStartPos + submesh.verticesStart * vertexSize)
+                    br.seek(vertex_offset)
                     _read_vertices_cooked_w2_numpy(
                         br.fhandle, submesh.verticesCount, vertexSize,
                         isSkinned, 4, hasSecondUVLayer, cToLin,
                         submesh.bonesId, CData.boneData.jointNames,
                         CData, final_meshdata)
-                    br.seek(submeshStartPos + submesh.verticesStart * vertexSize + vertexSize * submesh.verticesCount)
+                    br.seek(vertex_end)
 
 
                     #?#################?#
                     #?#### Indices ####?#
                     #?#################?#
-                    br.seek(submeshStartPos + meshIndicesOffset + submesh.indicesStart * 2) #br.seek(bufferInfo.offset + lastIOffset, 0)
+                    br.seek(index_offset) #br.seek(bufferInfo.offset + lastIOffset, 0)
                     final_meshdata.faces = _read_indices_numpy(br.fhandle, submesh.indicesCount)
                     lastIOffset = br.tell() - meshIndicesOffset #! bufferInfo.offset
 
@@ -689,6 +1182,23 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                     submesh.indicesStart = br.readUInt32()
                     submesh.verticesCount = br.readUInt32()
                     submesh.indicesCount = br.readUInt32()
+
+                    _validate_w2_submesh_counts(
+                        submesh.verticesCount,
+                        submesh.indicesCount,
+                        f"W2 cooked submesh in {meshName} (chunk {getattr(chunk, 'ChunkIndex', '?')}, vertexType={submesh.vertexType_w2})",
+                    )
+                    # verticesStart/indicesStart are used as seek offsets into the
+                    # submesh data block; if they're absurd we'll seek past EOF and
+                    # hand garbage to the numpy reader -> bogus Blender allocation.
+                    if submesh.verticesStart < 0 or submesh.verticesStart > _W2_MAX_SUBMESH_VERTICES:
+                        raise ValueError(
+                            f"W2 cooked submesh in {meshName}: implausible verticesStart={submesh.verticesStart}"
+                        )
+                    if submesh.indicesStart < 0 or submesh.indicesStart > _W2_MAX_SUBMESH_INDICES:
+                        raise ValueError(
+                            f"W2 cooked submesh in {meshName}: implausible indicesStart={submesh.indicesStart}"
+                        )
 
                     bonesCount = br.readByte()
                     if (bonesCount > 0):
@@ -723,7 +1233,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                                 raise e
 
                     for i in range(nbSubMesh):
-                        if not keep_lod_meshes and i not in LODs[0].submeshesIds:
+                        if LODs and not keep_lod_meshes and i not in LODs[0].submeshesIds:
                             continue
                         br.seek(subMeshesStartAdress + 4)
                         loadSubmesh(br, subMeshesData[i], meshIndicesOffset, materialIds, boneNames)
@@ -737,7 +1247,8 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
             raise ValueError(
                 f"Embedded Witcher 2 CMesh chunk {embedded_cmesh_chunk_index} not found in {filename}"
             )
-
+        log.debug('FileLoading: %s - parse complete (%d submeshes)',
+                    _diag_label, len(getattr(CData, 'meshDataAllMeshes', []) or []))
         return (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile)
 
     #?###################?#
@@ -1075,4 +1586,6 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
  #                                                                     #
  #=====================================================================#
 
+    log.debug('FileLoading: %s - parse complete (W3, %d submeshes)',
+                _diag_label, len(getattr(CData, 'meshDataAllMeshes', []) or []))
     return (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile)
