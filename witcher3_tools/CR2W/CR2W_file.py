@@ -1,10 +1,14 @@
 import logging
 import os
+import math
 from pathlib import Path
+import struct
+from types import SimpleNamespace
 from .third_party_libs import yaml
 from .common_blender import repo_file
 from .prop_utils import prop_to_string
 from ..extension_paths import get_dev_override
+from ..source_game_paths import resolve_w2_repo_file_from_source
 log = logging.getLogger(__name__)
 import io
 
@@ -13,6 +17,7 @@ from .bin_helpers import (ReadUlong48, readUShort,
                         ReadFloat24,
                         ReadFloat16)
 
+from .CR2W_helpers import Enums
 from .CR2W_types import ( Entity_Type_List, getCR2W, W_CLASS )
 
 from .bStream import *
@@ -227,6 +232,7 @@ class LEVEL():
         self.includes = []
         self.Foliage = False
         self.type = "Clayer"
+        self.version = 999
 
 class CLayerInfo(object):
     def __init__(self, name = "", depotFilePath = "", layerBuildTag = ""):
@@ -441,7 +447,8 @@ def _load_level_dependency(resolved_path, dependency_loader=None, dependency_res
         dependency_resolver=dependency_resolver,
     )
 
-def _resolve_level_dependency_path(depot_path, version, dependency_resolver=None):
+
+def _resolve_level_dependency_path(depot_path, version, dependency_resolver=None, source_filename=None):
     if not depot_path:
         return ""
     if dependency_resolver is not None:
@@ -451,12 +458,302 @@ def _resolve_level_dependency_path(depot_path, version, dependency_resolver=None
             resolved = dependency_resolver(depot_path)
         if resolved:
             return resolved
+    source_resolved = resolve_w2_repo_file_from_source(depot_path, source_filename, version=version)
+    if source_resolved:
+        return source_resolved
     return repo_file(depot_path, version)
+
+
+_W2_SECTOR_FLAG_MESH_VISIBLE = 1 << 2
+_W2_COOKED_LAYER_PACKED_MESH_RECORD_SIZE = 4 + (16 * 4)
+
+# Cooked W2 CLayer embeds native sector data after reflected properties.
+# Sector blocks are aligned inside their own byte stream, but that stream can
+# start at any CR2W file offset, so records are not necessarily file-offset
+# aligned. Only negative .w2mesh import handles followed by plausible 4x4
+# matrices are accepted.
+
+def _w2_layer_export_range(cr2w_file, layer_chunk):
+    try:
+        export = cr2w_file.CR2WExport[layer_chunk.ChunkIndex]
+        start = int(getattr(cr2w_file, "start", 0) or 0) + int(export.dataOffset)
+        end = start + int(export.dataSize)
+        return start, end
+    except Exception:
+        return None, None
+
+
+def _w2_layer_unmodeled_tail_start(layer_chunk, class_start):
+    prop_ends = []
+    for prop in getattr(layer_chunk, "PROPS", None) or []:
+        try:
+            prop_ends.append(int(getattr(prop, "dataEnd", 0) or 0))
+        except Exception:
+            pass
+    if prop_ends:
+        return max(max(prop_ends), int(class_start or 0))
+    return int(class_start or 0)
+
+
+def _is_w2_mesh_import_path(path):
+    return str(path or "").lower().endswith(".w2mesh")
+
+
+def _w2_mesh_import_paths(cr2w_file):
+    mesh_imports = {}
+    for import_index, entry in enumerate(getattr(cr2w_file, "CR2WImport", None) or []):
+        path = str(getattr(entry, "path", "") or "").strip()
+        if _is_w2_mesh_import_path(path):
+            mesh_imports[import_index] = path
+    return mesh_imports
+
+
+def _w2_packed_matrix_at(raw_data, handle_offset, class_end):
+    if handle_offset + _W2_COOKED_LAYER_PACKED_MESH_RECORD_SIZE > class_end:
+        return None
+    try:
+        values = struct.unpack_from("<16f", raw_data, handle_offset + 4)
+    except Exception:
+        return None
+    if not all(math.isfinite(value) for value in values):
+        return None
+
+    # W2 cooked layer records store a full 4x4 local-to-world matrix directly
+    # after the mesh import handle. The three row W components are zero and
+    # the final homogeneous component is one.
+    if abs(values[3]) > 1e-4 or abs(values[7]) > 1e-4 or abs(values[11]) > 1e-4:
+        return None
+    if abs(values[15] - 1.0) > 1e-4:
+        return None
+
+    row_lengths = []
+    for row_start in (0, 4, 8):
+        row = values[row_start:row_start + 3]
+        row_lengths.append(math.sqrt(sum(component * component for component in row)))
+    if not all(1e-6 < length < 1000.0 for length in row_lengths):
+        return None
+    if not all(abs(component) < 1000000.0 for component in values[12:15]):
+        return None
+    return values
+
+
+def _w2_sector_record_flags(raw_data, handle_offset, payload_start):
+    flags = _W2_SECTOR_FLAG_MESH_VISIBLE
+    try:
+        if handle_offset - 4 >= payload_start:
+            flags = struct.unpack_from("<H", raw_data, handle_offset - 4)[0]
+    except Exception:
+        flags = _W2_SECTOR_FLAG_MESH_VISIBLE
+    return int(flags) | _W2_SECTOR_FLAG_MESH_VISIBLE
+
+
+def _make_w2_sector_resource(path, hashint=0):
+    return SimpleNamespace(
+        box0=0.0,
+        box1=0.0,
+        box2=0.0,
+        box3=0.0,
+        box4=0.0,
+        box5=0.0,
+        hashint=hashint,
+        pathHash=path,
+    )
+
+
+def _make_w2_sector_block(path, resource_index, matrix_values, flags, handle_offset, import_index):
+    rotation_matrix = SimpleNamespace(
+        ax=matrix_values[0],
+        ay=matrix_values[1],
+        az=matrix_values[2],
+        bx=matrix_values[4],
+        by=matrix_values[5],
+        bz=matrix_values[6],
+        cx=matrix_values[8],
+        cy=matrix_values[9],
+        cz=matrix_values[10],
+    )
+    position = SimpleNamespace(
+        x=matrix_values[12],
+        y=matrix_values[13],
+        z=matrix_values[14],
+    )
+    packed_object = SimpleNamespace(
+        meshIndex=resource_index,
+        forceAutoHide=0,
+        lightChanels=0,
+        forcedLodLevel=0,
+        shadowBias=0,
+        renderingPlane=0,
+    )
+    return SimpleNamespace(
+        rotationMatrix=rotation_matrix,
+        position=position,
+        streamingRadius=1,
+        flags=int(flags),
+        occlusionSystemID=0,
+        packedObjectType=Enums.BlockDataObjectType.Mesh,
+        packedObject=packed_object,
+        resourceIndex=resource_index,
+        sourceOffset=int(handle_offset),
+        sourceImportIndex=int(import_index),
+        sourceDepotPath=path,
+        sourceKind="W2CookedLayerPackedMesh",
+    )
+
+
+def _decode_w2_cooked_layer_sector_data(cr2w_file, layer_chunk, filename):
+    if getattr(getattr(cr2w_file, "HEADER", None), "version", 0) > 115:
+        return None
+    if getattr(layer_chunk, "name", None) != "CLayer":
+        return None
+    if not filename or not os.path.isfile(filename):
+        return None
+
+    class_start, class_end = _w2_layer_export_range(cr2w_file, layer_chunk)
+    if class_start is None or class_end is None or class_end <= class_start:
+        return None
+
+    mesh_imports = _w2_mesh_import_paths(cr2w_file)
+    if not mesh_imports:
+        return None
+
+    payload_start = _w2_layer_unmodeled_tail_start(layer_chunk, class_start)
+    scan_start = payload_start
+    if class_end - scan_start < _W2_COOKED_LAYER_PACKED_MESH_RECORD_SIZE:
+        return None
+
+    try:
+        with open(filename, "rb") as source_file:
+            raw_data = source_file.read()
+    except Exception as exc:
+        log.debug("Unable to read W2 cooked layer payload from %s: %s", filename, exc)
+        return None
+
+    resources = [_make_w2_sector_resource(0)]
+    resource_indices = {"": 0}
+    block_data = []
+    objects = []
+    seen_offsets = set()
+    next_candidate_offset = scan_start
+
+    scan_end = min(class_end, len(raw_data)) - _W2_COOKED_LAYER_PACKED_MESH_RECORD_SIZE
+    if scan_end < scan_start:
+        return None
+
+    # Byte-granular scan is deliberate; see the CLayer sector-data note above.
+    for handle_offset in range(scan_start, scan_end + 1):
+        if handle_offset < next_candidate_offset:
+            continue
+        try:
+            handle_value = struct.unpack_from("<i", raw_data, handle_offset)[0]
+        except Exception:
+            continue
+        if handle_value >= 0:
+            continue
+
+        import_index = (-handle_value) - 1
+        mesh_path = mesh_imports.get(import_index)
+        if not mesh_path:
+            continue
+
+        matrix_values = _w2_packed_matrix_at(raw_data, handle_offset, class_end)
+        if matrix_values is None:
+            continue
+        if handle_offset in seen_offsets:
+            continue
+        seen_offsets.add(handle_offset)
+        next_candidate_offset = handle_offset + _W2_COOKED_LAYER_PACKED_MESH_RECORD_SIZE
+
+        resource_index = resource_indices.get(mesh_path)
+        if resource_index is None:
+            resource_index = len(resources)
+            resource_indices[mesh_path] = resource_index
+            resources.append(_make_w2_sector_resource(mesh_path))
+
+        flags = _w2_sector_record_flags(raw_data, handle_offset, payload_start)
+        block = _make_w2_sector_block(
+            mesh_path,
+            resource_index,
+            matrix_values,
+            flags,
+            handle_offset,
+            import_index,
+        )
+        block_data.append(block)
+        objects.append(
+            SimpleNamespace(
+                type=Enums.BlockDataObjectType.Mesh,
+                flags=0,
+                radius=1,
+                offset=handle_offset,
+                position=block.position,
+            )
+        )
+
+    if not block_data:
+        return None
+
+    log.debug("Decoded %d W2 cooked layer packed mesh record(s) from %s", len(block_data), filename)
+    return SimpleNamespace(
+        name="W2CookedLayerSectorData",
+        Type="CSectorData",
+        Resources=resources,
+        Objects=objects,
+        BlockData=block_data,
+        is_w2_cooked_layer_sector_data=True,
+    )
+
+
+def _merge_sector_data(primary, extra):
+    if not extra:
+        return primary
+    if not primary:
+        return extra
+
+    try:
+        resources = list(getattr(primary, "Resources", []) or [])
+        resource_indices = {
+            str(getattr(resource, "pathHash", "") or ""): index
+            for index, resource in enumerate(resources)
+        }
+
+        for block in getattr(extra, "BlockData", []) or []:
+            path = str(getattr(block, "sourceDepotPath", "") or "")
+            if not path:
+                extra_resources = getattr(extra, "Resources", []) or []
+                idx = int(getattr(block, "resourceIndex", -1) or -1)
+                if 0 <= idx < len(extra_resources):
+                    path = str(getattr(extra_resources[idx], "pathHash", "") or "")
+            if not path:
+                continue
+
+            resource_index = resource_indices.get(path)
+            if resource_index is None:
+                resource_index = len(resources)
+                resource_indices[path] = resource_index
+                resources.append(_make_w2_sector_resource(path))
+
+            block.resourceIndex = resource_index
+            try:
+                block.packedObject.meshIndex = resource_index
+            except Exception:
+                pass
+            primary.BlockData.append(block)
+
+        primary.Resources = resources
+        if hasattr(primary, "Objects") and hasattr(extra, "Objects"):
+            primary.Objects.extend(getattr(extra, "Objects", []) or [])
+        primary.has_w2_cooked_layer_sector_data = True
+        return primary
+    except Exception as exc:
+        log.debug("Unable to merge W2 cooked layer sector data: %s", exc)
+        return primary
 
 
 def create_level(file, filename, dependency_loader=None, dependency_resolver=None):
     level = LEVEL()
     level.layerNode = filename
+    level.version = int(getattr(getattr(file, "HEADER", None), "version", 999) or 999)
     CHUNKS = file.CHUNKS.CHUNKS
     CSectorData =  False
     Entities = []
@@ -484,6 +781,7 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                             include_path,
                             file.HEADER.version,
                             dependency_resolver=dependency_resolver,
+                            source_filename=filename,
                         )
                         entity = _load_level_dependency(
                             fileName,
@@ -523,6 +821,7 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                         template_path,
                         file.HEADER.version,
                         dependency_resolver=dependency_resolver,
+                        source_filename=filename,
                     )
                     entity = _load_level_dependency(
                         fileName,
@@ -621,6 +920,16 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                 except Exception as e:
                     pass#raise e
                 Entities.append(Entity)
+    if level.type == "CLayer":
+        try:
+            w2_cooked_sector_data = _decode_w2_cooked_layer_sector_data(file, CHUNKS[0], filename)
+        except Exception as exc:
+            log.debug("W2 cooked layer packed mesh decode failed for %s: %s", filename, exc)
+            w2_cooked_sector_data = None
+        if w2_cooked_sector_data:
+            CSectorData = _merge_sector_data(CSectorData, w2_cooked_sector_data)
+            level.W2CookedLayerSectorData = w2_cooked_sector_data
+
     level.CSectorData = CSectorData
     level.Entities = Entities
 
