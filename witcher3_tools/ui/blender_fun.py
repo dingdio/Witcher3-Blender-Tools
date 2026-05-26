@@ -48,7 +48,7 @@ def reset_transforms(new_obj):
 
 class ImageUtility():
     @staticmethod
-    def GetEFormatFromCompression(compression:str):
+    def GetEFormatFromCompression(compression: str, source_game: str = "w3"):
         if compression == Enums.ETextureCompression.TCM_None.name:
             return EFormat.R8G8B8A8_UNORM
         elif compression in (Enums.ETextureCompression.TCM_DXTNoAlpha.name, Enums.ETextureCompression.TCM_Normals.name):
@@ -56,6 +56,8 @@ class ImageUtility():
         elif compression in (Enums.ETextureCompression.TCM_DXTAlpha.name, Enums.ETextureCompression.TCM_NormalsHigh.name, Enums.ETextureCompression.TCM_NormalsGloss.name):
             return EFormat.BC3_UNORM
         elif compression == Enums.ETextureCompression.TCM_QualityColor.name:
+            if str(source_game or "").lower() in {"witcher2", "tw2"}:
+                return EFormat.BC3_UNORM
             return EFormat.BC7_UNORM
         elif compression == Enums.ETextureCompression.TCM_QualityR.name:
             return EFormat.BC4_UNORM
@@ -90,6 +92,93 @@ def _swizzle_rgba8_bytes_to_bgra(raw_bytes: bytes) -> bytes:
         out[i + 3] = src[i + 3]
     return bytes(out)
 
+
+def _write_dds_payload(dds_path: str, metadata: DDSMetadata, payload: bytes) -> str:
+    import os
+
+    dir_name = os.path.dirname(dds_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    output_stream: bStream = bStream(path=dds_path)
+    DDSUtils.GenerateAndWriteHeader(output_stream, metadata)
+    output_stream.write(payload)
+    output_stream.close()
+    return dds_path
+
+
+def _find_witcher2_xbm_mip_table_start(data: bytes, start_offset: int, width: int | None, height: int | None) -> int:
+    search_end = min(len(data) - 20, start_offset + 48)
+    for offset in range(max(0, start_offset), max(0, search_end)):
+        unk, mip_count, mip_width, mip_height, _blocksize = struct.unpack_from("<IIIII", data, offset)
+        if unk != 0 or not (1 <= mip_count <= 32):
+            continue
+        if width is not None and mip_width != width:
+            continue
+        if height is not None and mip_height != height:
+            continue
+        return offset
+    return -1
+
+
+def _convert_witcher2_xbm_to_dds_raw(fdir, dds_path, xbm_file, texture_chunk, force=False):
+    """Convert old Witcher 2 XBM by extracting inline mip payloads from the parsed texture chunk."""
+    import os
+
+    if os.path.exists(dds_path) and not force:
+        return dds_path
+
+    with open(fdir, "rb") as handle:
+        data = handle.read()
+
+    if len(data) < 44 or data[:4] != b"CR2W":
+        raise ValueError("Not a Witcher 2 CR2W texture")
+
+    export = xbm_file.CR2WExport[texture_chunk.ChunkIndex]
+    chunk_end = min(len(data), int(getattr(xbm_file, "start", 0) or 0) + export.dataOffset + export.dataSize)
+    prop_ends = [int(getattr(prop, "dataEnd", 0) or 0) for prop in getattr(texture_chunk, "PROPS", []) or []]
+    prop_end = max(prop_ends) if prop_ends else int(getattr(xbm_file, "start", 0) or 0) + export.dataOffset
+
+    width_var = texture_chunk.GetVariableByName("width")
+    height_var = texture_chunk.GetVariableByName("height")
+    compression_var = texture_chunk.GetVariableByName("compression")
+    width = getattr(width_var, "Value", None)
+    height = getattr(height_var, "Value", None)
+    compression = getattr(getattr(compression_var, "Index", None), "String", "") if compression_var else ""
+    if not width or not height or not compression:
+        raise ValueError("Incomplete Witcher 2 XBM texture metadata")
+
+    mip_table_start = _find_witcher2_xbm_mip_table_start(data, prop_end, width, height)
+    if mip_table_start < 0:
+        raise ValueError("Witcher 2 XBM mip table not found")
+
+    _unknown, mip_count = struct.unpack_from("<II", data, mip_table_start)
+    offset = mip_table_start + 8
+    payload_parts = []
+    first_width = width
+    first_height = height
+    for mip_index in range(mip_count):
+        mip_width, mip_height, _blocksize, mip_size = struct.unpack_from("<IIII", data, offset)
+        offset += 16
+        if mip_index == 0:
+            first_width = mip_width
+            first_height = mip_height
+        if mip_size < 0 or offset + mip_size > chunk_end:
+            raise ValueError("Invalid W2 XBM mip payload size")
+        payload_parts.append(data[offset:offset + mip_size])
+        offset += mip_size
+
+    metadata = DDSMetadata(
+        int(first_width),
+        int(first_height),
+        int(mip_count),
+        ImageUtility.GetEFormatFromCompression(compression, source_game="witcher2"),
+    )
+    payload = b"".join(payload_parts)
+    if metadata.format == EFormat.R8G8B8A8_UNORM:
+        payload = _swizzle_rgba8_bytes_to_bgra(payload)
+    return _write_dds_payload(dds_path, metadata, payload)
+
+
 def convert_xbm_to_dds(fdir, force=False, out_path=None):
     import os
     f = open(fdir,"rb")
@@ -103,8 +192,19 @@ def convert_xbm_to_dds(fdir, force=False, out_path=None):
 
     for chunk in xbmFile.CHUNKS.CHUNKS:
         if chunk.Type == "CBitmapTexture":
-            width = chunk.GetVariableByName('width').Value
-            height = chunk.GetVariableByName('height').Value
+            dds_path = os.path.splitext(out_path or fdir)[0] + '.dds'
+            if xbmFile.HEADER.version <= 115:
+                try:
+                    return _convert_witcher2_xbm_to_dds_raw(fdir, dds_path, xbmFile, chunk, force=force)
+                except Exception:
+                    log.debug("Raw Witcher 2 XBM conversion failed, falling back to CR2W props: %s", fdir, exc_info=True)
+
+            width_var = chunk.GetVariableByName('width')
+            height_var = chunk.GetVariableByName('height')
+            if width_var is None or height_var is None:
+                raise ValueError("XBM texture is missing width/height metadata")
+            width = width_var.Value
+            height = height_var.Value
             
             if xbmFile.HEADER.version > 115:
                 mipcount = 1

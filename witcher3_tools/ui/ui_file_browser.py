@@ -2414,8 +2414,10 @@ def get_browser_item_output_path(context, cache_type, item_path, loadmods=False)
 
 
 _browser_asset_preview_collection = None
+_browser_asset_preview_collection_primed = False
 _browser_asset_preview_path_cache = {}
 _browser_w2ent_icon_path_cache = {}
+_BROWSER_ASSET_PREVIEW_CACHE_VERSION = "v2"
 _BROWSER_W2ENT_ICON_CACHE_VERSION = "v5"
 _browser_scaleform_root_cache = {
     "game_path": "",
@@ -2434,11 +2436,28 @@ def _get_browser_asset_preview_collection():
     global _browser_asset_preview_collection
     if _browser_asset_preview_collection is None:
         _browser_asset_preview_collection = bpy.utils.previews.new()
+    _prime_browser_asset_preview_collection(_browser_asset_preview_collection)
     return _browser_asset_preview_collection
 
 
+def _prime_browser_asset_preview_collection(pcoll):
+    global _browser_asset_preview_collection_primed
+    if _browser_asset_preview_collection_primed:
+        return
+    _browser_asset_preview_collection_primed = True
+
+    dummy_path = ensure_browser_dummy_icon_path("Preview", "__browser_preview_prime__.png")
+    if not dummy_path or not win_path_exists(dummy_path):
+        return
+    try:
+        if pcoll.get("__browser_preview_prime__") is None:
+            pcoll.load("__browser_preview_prime__", win_safe_path(dummy_path), 'IMAGE')
+    except Exception:
+        log.debug("Failed to prime browser preview collection", exc_info=True)
+
+
 def _clear_browser_asset_previews():
-    global _browser_asset_preview_collection
+    global _browser_asset_preview_collection, _browser_asset_preview_collection_primed
     _browser_asset_preview_path_cache.clear()
     _browser_w2ent_icon_path_cache.clear()
     clear_browser_dummy_icon_cache()
@@ -2451,6 +2470,7 @@ def _clear_browser_asset_previews():
         except Exception:
             pass
     _browser_asset_preview_collection = None
+    _browser_asset_preview_collection_primed = False
 
 
 def _make_browser_preview_temp_path(cache_type: str, file_path: str, suffix: str = ".dds") -> str:
@@ -2459,7 +2479,11 @@ def _make_browser_preview_temp_path(cache_type: str, file_path: str, suffix: str
 
     safe_name = os.path.splitext(os.path.basename(file_path or "preview"))[0] or "preview"
     digest = hashlib.sha1(
-        f"{cache_type}|{_normalize_virtual_path(file_path)}".encode("utf-8", errors="ignore")
+        (
+            f"{_BROWSER_ASSET_PREVIEW_CACHE_VERSION}|"
+            f"{cache_type}|"
+            f"{_normalize_virtual_path(file_path)}"
+        ).encode("utf-8", errors="ignore")
     ).hexdigest()[:12]
     preview_dir = os.path.join(tempfile.gettempdir(), "witcher_preview", "browser")
     os.makedirs(preview_dir, exist_ok=True)
@@ -2663,6 +2687,34 @@ def _iter_preview_lookup_paths(file_path: str):
     return candidates
 
 
+def _extract_witcher2_bundle_item_to_preview_temp(item_path: str) -> str:
+    item_key = _normalize_virtual_path(item_path)
+    if not item_key:
+        return ""
+
+    ext = os.path.splitext(item_key)[1].lower()
+    if ext not in TEXTURE_EXTENSIONS or ext == ".w2cube":
+        return ""
+
+    temp_path = _make_browser_preview_temp_path(WITCHER2_BUNDLE_CACHE_TYPE, item_key, ext)
+    if win_path_exists(temp_path):
+        return temp_path
+
+    try:
+        items = LoadWitcher2BundleManager().find_item_by_hash(item_key)
+        if not items:
+            return ""
+        final_item = items[-1] if isinstance(items, list) else items
+        written_path = final_item.extract_to_file(temp_path)
+        if written_path:
+            temp_path = written_path
+    except Exception:
+        log.debug("Failed to extract Witcher 2 bundle preview item: %s", item_key, exc_info=True)
+        return ""
+
+    return temp_path if win_path_exists(temp_path) else ""
+
+
 def _resolve_preview_image_path(context, cache_type: str, file_path: str, loadmods: bool = False) -> str:
     """Resolve an image file suitable for previewing a browser asset icon."""
     search_path = _normalize_virtual_path(file_path)
@@ -2709,11 +2761,9 @@ def _resolve_preview_image_path(context, cache_type: str, file_path: str, loadmo
 
             if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
                 for candidate_path in _iter_preview_lookup_paths(search_path):
-                    abs_path = ensure_witcher2_bundle_item_extracted(
-                        context,
-                        candidate_path,
-                        overwrite=False,
-                    )
+                    abs_path = get_witcher2_bundle_abs_path(context, candidate_path)
+                    if not abs_path or not win_path_exists(abs_path):
+                        abs_path = _extract_witcher2_bundle_item_to_preview_temp(candidate_path)
                     resolved = _resolve_browser_image_abs_path(
                         abs_path,
                         _make_browser_preview_temp_path(cache_type, candidate_path, ".dds"),
@@ -2877,7 +2927,13 @@ def _get_browser_item_icon_info(context, cache_type: str, item_path: str, loadmo
 
     if preview_target:
         target_path = preview_target["target_path"]
-        cache_key = f"{cache_type}|{int(bool(loadmods))}|{preview_target['kind']}|{target_path.lower()}"
+        cache_key = (
+            f"{_BROWSER_ASSET_PREVIEW_CACHE_VERSION}|"
+            f"{cache_type}|"
+            f"{int(bool(loadmods))}|"
+            f"{preview_target['kind']}|"
+            f"{target_path.lower()}"
+        )
         preview_path = _browser_asset_preview_path_cache.get(cache_key, "")
         if not preview_path or not win_path_exists(preview_path):
             preview_path = _resolve_preview_image_path(context, cache_type, target_path, loadmods=loadmods)
@@ -2885,6 +2941,14 @@ def _get_browser_item_icon_info(context, cache_type: str, item_path: str, loadmo
                 _cache_bounded_store(_browser_asset_preview_path_cache, cache_key, preview_path, max_entries=4096)
             else:
                 preview_path = ""
+
+        if preview_path and cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+            icon_path = _ensure_browser_png_icon_preview(
+                preview_path,
+                _make_browser_preview_temp_path(cache_type, target_path, ".png"),
+            )
+            if icon_path:
+                preview_path = icon_path
 
     if not preview_path:
         preview_path = ensure_browser_dummy_icon_path(cache_type, item_path)
@@ -2909,6 +2973,7 @@ def _get_browser_item_icon_info(context, cache_type: str, item_path: str, loadmo
         try:
             icon = pcoll.load(preview_key, win_safe_path(preview_path), 'IMAGE')
         except Exception:
+            log.debug("Failed to load browser preview icon: %s", preview_path, exc_info=True)
             icon = None
 
     icon_id = 0
@@ -2928,6 +2993,15 @@ def _get_browser_item_icon_info(context, cache_type: str, item_path: str, loadmo
 
 def _ensure_browser_item_icon_id(context, cache_type: str, item_path: str, loadmods: bool = False) -> int:
     return int(_get_browser_item_icon_info(context, cache_type, item_path, loadmods=loadmods).get("icon_id", 0) or 0)
+
+
+def _draw_browser_list_preview_label(layout, text: str, icon_id: int, fallback_icon: str = 'FILE'):
+    if icon_id:
+        thumb = layout.row(align=True)
+        thumb.template_icon(icon_value=icon_id, scale=0.7)
+        layout.label(text=text)
+    else:
+        layout.label(text=text, icon=fallback_icon)
 
 
 _sound_preview_state = {
@@ -3306,6 +3380,57 @@ def _save_preview_png(path: str, rgba_u8: np.ndarray) -> bool:
     except Exception:
         log.debug("Failed to write preview PNG: %s", path, exc_info=True)
         return False
+
+
+def _ensure_browser_png_icon_preview(source_path: str, png_path: str, max_size: int = 192) -> str:
+    source_path = win_safe_path(source_path or "")
+    png_path = win_safe_path(png_path or "")
+    if not source_path or not png_path or not win_path_exists(source_path):
+        return ""
+
+    if os.path.splitext(source_path)[1].lower() == ".png":
+        return source_path
+
+    try:
+        if (
+            win_path_exists(png_path)
+            and win_path_getmtime(png_path) >= win_path_getmtime(source_path)
+        ):
+            return png_path
+    except Exception:
+        pass
+
+    image = None
+    try:
+        parent_dir = os.path.dirname(png_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+
+        image = bpy.data.images.load(source_path, check_existing=False)
+        width, height = [int(v) for v in image.size[:]]
+        if width <= 0 or height <= 0:
+            return ""
+
+        longest = max(width, height)
+        if longest > max_size:
+            scale = max_size / float(longest)
+            image.scale(max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+
+        image.filepath_raw = png_path
+        image.file_format = 'PNG'
+        image.save()
+    except Exception:
+        log.debug("Failed to build browser PNG icon preview: %s", source_path, exc_info=True)
+        return ""
+    finally:
+        if image is not None:
+            try:
+                bpy.data.images.remove(image)
+            except Exception:
+                pass
+
+    return png_path if win_path_exists(png_path) else ""
+
 
 def build_w2ter_buffer_preview(context, cache_type, file_path) -> str:
     loadmods = context.scene.witcher_file_browser.loadmods if context and hasattr(context.scene, "witcher_file_browser") else False
@@ -5389,10 +5514,7 @@ class SimpleFileBrowser(Operator):
                         loadmods=witcher_file_browser.loadmods,
                     )
                     icon_id = int(icon_info.get("icon_id", 0) or 0)
-                    if icon_id:
-                        path_row.label(text=display_label, icon_value=icon_id)
-                    else:
-                        path_row.label(text=display_label, icon='FILE')
+                    _draw_browser_list_preview_label(path_row, display_label, icon_id, fallback_icon='FILE')
                     btns = row_split.row(align=True)
                     # Copy path
                     copy_op = btns.operator("witcher.copy_path", text="", icon="COPYDOWN")
@@ -5733,10 +5855,12 @@ class SimpleFileBrowser(Operator):
                     icon_id = int(icon_info.get("icon_id", 0) or 0)
                     name_row = row.row(align=True)
                     name_row.alert = is_revealed
-                    if icon_id:
-                        name_row.label(text=display_name, icon_value=icon_id)
-                    else:
-                        name_row.label(text=display_name, icon='VIEWZOOM' if is_revealed else 'FILE')
+                    _draw_browser_list_preview_label(
+                        name_row,
+                        display_name,
+                        icon_id,
+                        fallback_icon='VIEWZOOM' if is_revealed else 'FILE',
+                    )
 
                     stats_op = row.operator("witcher.file_item_stats", text="", icon='INFO')
                     stats_op.file_path = full_item_path
@@ -5800,10 +5924,7 @@ class SimpleFileBrowser(Operator):
                 loadmods=loadmods,
             )
             icon_id = int(icon_info.get("icon_id", 0) or 0)
-            if icon_id:
-                path_row.label(text=display_label, icon_value=icon_id)
-            else:
-                path_row.label(text=display_label, icon='FILE')
+            _draw_browser_list_preview_label(path_row, display_label, icon_id, fallback_icon='FILE')
             btns = path_btn_split.row(align=True)
             # Copy path
             copy_op = btns.operator("witcher.copy_path", text="", icon="COPYDOWN")
