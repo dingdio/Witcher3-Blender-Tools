@@ -43,7 +43,7 @@ from ..importers.import_helpers import set_blender_object_transform
 from ..importers import import_isolation
 from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
-from ..CR2W.common_blender import repo_file
+from ..CR2W.common_blender import repo_file, win_safe_path
 from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
 from .dlc_mounters import (
     append_dlc_entity_template_params,
@@ -2544,7 +2544,7 @@ def _chunk_has_visual_payload(chunk) -> bool:
     return _get_entry_component_type(chunk) in _EQUIPMENT_VISUAL_COMPONENT_TYPES
 
 
-def _mesh_skinning_cache_key(mesh_path):
+def _mesh_skinning_cache_key(mesh_path, embedded_cmesh_chunk_index=None):
     if not mesh_path:
         return None
     try:
@@ -2552,26 +2552,36 @@ def _mesh_skinning_cache_key(mesh_path):
     except Exception:
         normalized = str(mesh_path)
     try:
+        selected_index = int(embedded_cmesh_chunk_index) if embedded_cmesh_chunk_index is not None else None
+    except Exception:
+        selected_index = str(embedded_cmesh_chunk_index)
+    try:
         return (
             normalized,
+            selected_index,
             os.path.getmtime(mesh_path),
             os.path.getsize(mesh_path),
         )
     except Exception:
-        return (normalized,)
+        return (normalized, selected_index)
 
 
-def _mesh_path_is_skinned(mesh_path, version=999) -> bool:
+def _mesh_path_is_skinned(mesh_path, version=999, embedded_cmesh_chunk_index=None) -> bool:
     mesh_path = str(mesh_path or "").strip()
     if not mesh_path:
         return False
 
     resolved_path = mesh_path if os.path.isabs(mesh_path) else repo_file(mesh_path, version)
     resolved_path = str(resolved_path or "").strip()
-    if not resolved_path or not os.path.exists(resolved_path):
+    safe_resolved_path = win_safe_path(resolved_path) if resolved_path else ""
+    if not safe_resolved_path or not os.path.exists(safe_resolved_path):
         return False
 
-    cache_key = _mesh_skinning_cache_key(resolved_path)
+    selected_cmesh_chunk_index = None
+    if embedded_cmesh_chunk_index is not None:
+        selected_cmesh_chunk_index = int(embedded_cmesh_chunk_index)
+
+    cache_key = _mesh_skinning_cache_key(safe_resolved_path, selected_cmesh_chunk_index)
     if cache_key in _SKINNED_MESH_PROFILE_CACHE:
         return _SKINNED_MESH_PROFILE_CACHE[cache_key]
 
@@ -2584,6 +2594,7 @@ def _mesh_path_is_skinned(mesh_path, version=999) -> bool:
             resolved_path,
             False,
             False,
+            embedded_cmesh_chunk_index=selected_cmesh_chunk_index,
         )
         mesh_infos = getattr(CData, "meshInfos", None) or []
         is_skinned = any(
@@ -2612,6 +2623,19 @@ def _entity_has_skinned_mesh_payload(profile_chunks, version=999) -> bool:
             continue
         if _mesh_path_is_skinned(mesh_path, version):
             return True
+        embedded_source_path = str(_get_entry_attr(chunk, "_embedded_source_path", "") or "").strip()
+        embedded_cmesh_chunk_index = _get_entry_attr(
+            chunk,
+            "_embedded_cmesh_chunk_index",
+            _get_entry_attr(chunk, "_embedded_mesh_chunk_index", None),
+        )
+        if embedded_source_path and embedded_cmesh_chunk_index is not None:
+            if _mesh_path_is_skinned(
+                embedded_source_path,
+                version,
+                embedded_cmesh_chunk_index=embedded_cmesh_chunk_index,
+            ):
+                return True
     return False
 
 
@@ -3942,17 +3966,61 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         # Import meshes
         if "mesh" in chunk:
             mesh_path = chunk['mesh']
-            if not is_valid_mesh_path(mesh_path):
-                log.warning(f"Skipping chunk with invalid mesh path ({chunk['type']} #{chunk['chunkIndex']}): {mesh_path}")
+            embedded_source_path = str(_get_entry_attr(chunk, "_embedded_source_path", "") or "")
+            embedded_cmesh_chunk_index = _get_entry_attr(
+                chunk,
+                "_embedded_cmesh_chunk_index",
+                _get_entry_attr(chunk, "_embedded_mesh_chunk_index", None),
+            )
+            has_embedded_mesh = bool(embedded_source_path and embedded_cmesh_chunk_index is not None)
+            if not is_valid_mesh_path(mesh_path) and not has_embedded_mesh:
+                raise ValueError(
+                    f"Invalid mesh path for chunk {chunk['type']} #{chunk['chunkIndex']}: {mesh_path}"
+                )
             else:
+                selected_cmesh_chunk_index = None
+                if has_embedded_mesh:
+                    if os.path.exists(win_safe_path(embedded_source_path)):
+                        resolved_mesh_path = embedded_source_path
+                        selected_cmesh_chunk_index = int(embedded_cmesh_chunk_index)
+                    else:
+                        raise FileNotFoundError(
+                            f"Missing embedded mesh source for chunk {chunk.get('type')} "
+                            f"#{chunk.get('chunkIndex')}: {mesh_path} -> {embedded_source_path}"
+                        )
+                else:
+                    resolved_mesh_path = repo_file(mesh_path, entity.version)
+                    if not resolved_mesh_path or not os.path.exists(win_safe_path(resolved_mesh_path)):
+                        raise FileNotFoundError(
+                            f"Missing mesh for chunk {chunk.get('type')} "
+                            f"#{chunk.get('chunkIndex')}: {mesh_path} -> {resolved_mesh_path}"
+                        )
+                if selected_cmesh_chunk_index is not None:
+                    log.debug(
+                        "Importing embedded Witcher 2 CMesh chunk %s for %s from %s",
+                        selected_cmesh_chunk_index,
+                        mesh_path,
+                        resolved_mesh_path,
+                    )
                 component_name = _get_chunk_component_name(chunk)
-                meshes, armatures = fbx_util.import_model(repo_file(mesh_path, entity.version), 
-                                                     f"{chunk['type']}{i}{chunk['chunkIndex']}", 
-                                                     entity.name,
-                                                     keep_lod_meshes=mesh_import_settings["keep_lod_meshes"],
-                                                     keep_empty_lods=mesh_import_settings["keep_empty_lods"],
-                                                     keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
-                                                     hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"])
+                try:
+                    meshes, armatures = fbx_util.import_model(
+                        resolved_mesh_path,
+                        f"{chunk['type']}{i}{chunk['chunkIndex']}",
+                        entity.name,
+                        keep_lod_meshes=mesh_import_settings["keep_lod_meshes"],
+                        keep_empty_lods=mesh_import_settings["keep_empty_lods"],
+                        keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
+                        hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
+                        embedded_cmesh_chunk_index=selected_cmesh_chunk_index,
+                    )
+                except Exception as mesh_err:
+                    raise RuntimeError(
+                        f"Failed to import mesh for chunk {chunk.get('type')} "
+                        f"#{chunk.get('chunkIndex')} ({resolved_mesh_path}"
+                        f"{f' [embedded CMesh chunk {selected_cmesh_chunk_index}]' if selected_cmesh_chunk_index is not None else ''}): "
+                        f"{mesh_err}"
+                    ) from mesh_err
              
                 if component_name:
                     for mesh in meshes:

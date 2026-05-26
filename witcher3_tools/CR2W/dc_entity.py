@@ -644,6 +644,9 @@ def _resolve_mesh_path(chunk, mesh_value):
         candidate = _mesh_path_from_import_index(chunk, getattr(prop, "Index", None))
         if is_valid_mesh_path(candidate):
             return _repair_w2_component_mesh_path(chunk, candidate)
+    embedded_source_path, embedded_cmesh_chunk_index = _w2_embedded_mesh_ref_info(chunk)
+    if embedded_source_path and embedded_cmesh_chunk_index is not None:
+        return embedded_source_path
     return None
 
 def _chunk_props_summary(chunk, limit=10):
@@ -1213,10 +1216,11 @@ def _mesh_chunk_signature(chunk):
     return (
         getattr(chunk, "type", None),
         getattr(chunk, "name", None),
-        getattr(chunk, "mesh", None),
-        getattr(chunk, "resource", None),
-        getattr(chunk, "mimicFace", None),
-        getattr(chunk, "guid", None),
+        _repo_path_key(getattr(chunk, "mesh", None)),
+        _repo_path_key(getattr(chunk, "resource", None)),
+        _repo_path_key(getattr(chunk, "mimicFace", None)),
+        _repo_path_key(getattr(chunk, "_embedded_source_path", None)),
+        getattr(chunk, "_embedded_cmesh_chunk_index", getattr(chunk, "_embedded_mesh_chunk_index", None)),
         getattr(chunk, "transformParent", None),
         _transform_signature(getattr(chunk, "transform", None)),
     )
@@ -1482,12 +1486,48 @@ def _handle_ref_chunk(chunk, handle):
     return None
 
 
+def _w2_embedded_mesh_ref_info(source_chunk):
+    if not source_chunk:
+        return None, None
+    cr2w_file = getattr(source_chunk, "_W_CLASS__CR2WFILE", None)
+    version = getattr(getattr(cr2w_file, "HEADER", None), "version", 999)
+    file_name = getattr(cr2w_file, "fileName", None)
+    if version > 115 or not file_name:
+        return None, None
+
+    if getattr(source_chunk, "Type", None) == "CMesh":
+        chunk_index = getattr(source_chunk, "ChunkIndex", None)
+        return file_name, chunk_index if isinstance(chunk_index, int) else None
+
+    try:
+        mesh_prop = source_chunk.GetVariableByName("mesh")
+    except Exception:
+        mesh_prop = None
+    for handle in getattr(mesh_prop, "Handles", None) or []:
+        ref_chunk = _handle_ref_chunk(source_chunk, handle)
+        if getattr(ref_chunk, "Type", None) == "CMesh":
+            chunk_index = getattr(ref_chunk, "ChunkIndex", None)
+            return file_name, chunk_index if isinstance(chunk_index, int) else None
+    return None, None
+
+
+def _attach_w2_embedded_mesh_info(source_chunk, converted_chunk):
+    source_path, embedded_cmesh_chunk_index = _w2_embedded_mesh_ref_info(source_chunk)
+    if source_path and embedded_cmesh_chunk_index is not None:
+        setattr(converted_chunk, "_embedded_source_path", source_path)
+        setattr(converted_chunk, "_embedded_cmesh_chunk_index", embedded_cmesh_chunk_index)
+        if not is_valid_mesh_path(getattr(converted_chunk, "mesh", None)):
+            setattr(converted_chunk, "mesh", source_path)
+    return converted_chunk
+
+
 def _convert_chunk_for_model(chunk):
     if not chunk:
         return None
     if chunk.Type in ("CMeshComponent", "CStaticMeshComponent", "CFurComponent", "CRigidMeshComponent", "CRagdollMeshComponent"):
         component = CMeshComponent(chunk).convert_for_io()
         component.mesh = _resolve_mesh_path(chunk, getattr(component, "mesh", None))
+        _attach_w2_embedded_mesh_info(chunk, component)
         return component if component.mesh else None
     if chunk.Type == "CClothComponent":
         resource = _resolve_repo_path(chunk, "resource", (".redcloth", ".redapex"))
@@ -1509,6 +1549,7 @@ def _make_mesh_proxy_chunk(source_chunk, name: str, mesh_path: str, skeleton: st
     proxy.name = name
     proxy.mesh = mesh_path
     proxy.skeleton = skeleton
+    _attach_w2_embedded_mesh_info(source_chunk, proxy)
     return proxy
 
 
@@ -1659,6 +1700,7 @@ def _build_w2_cooked_appearance_template(file, template_chunk, appearance, curre
     return model_ent if model_ent.chunks else None
 
 def chunk_append(new_mesh, chunk, item, added_chunks=None):
+    _attach_w2_embedded_mesh_info(chunk, item)
     new_mesh.chunks.append(item)
     new_mesh.chunks[-1].type = chunk.Type
     new_mesh.chunks[-1].chunkIndex = chunk.ChunkIndex
@@ -1718,6 +1760,7 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
         return None
 
     def _append_unique_chunk(source_chunk, converted_chunk, added_chunks=None):
+        _attach_w2_embedded_mesh_info(source_chunk, converted_chunk)
         converted_chunk.type = getattr(source_chunk, "Type", getattr(converted_chunk, "type", None))
         converted_chunk.chunkIndex = getattr(source_chunk, "ChunkIndex", getattr(converted_chunk, "chunkIndex", 0))
         signature = _mesh_chunk_signature(converted_chunk)
@@ -2034,6 +2077,7 @@ def create_CEntity(file, _inherit_visited=None):
         return None
 
     def _append_unique_chunk(source_chunk, converted_chunk, added_chunks=None):
+        _attach_w2_embedded_mesh_info(source_chunk, converted_chunk)
         converted_chunk.type = getattr(source_chunk, "Type", getattr(converted_chunk, "type", None))
         converted_chunk.chunkIndex = getattr(source_chunk, "ChunkIndex", getattr(converted_chunk, "chunkIndex", 0))
         signature = _mesh_chunk_signature(converted_chunk)

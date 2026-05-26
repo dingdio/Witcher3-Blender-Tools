@@ -330,18 +330,24 @@ def import_mesh(filename:str,
                 keep_empty_lods:bool = False,
                 keep_proxy_meshes:bool = False,
                 do_import_collision:bool = False,
-                hide_zero_weight_faces:bool = True) -> w3_types.CSkeletalAnimationSet:
+                hide_zero_weight_faces:bool = True,
+                embedded_cmesh_chunk_index=None) -> w3_types.CSkeletalAnimationSet:
     mesh_started = time.perf_counter()
     parse_seconds = 0.0
     prepare_seconds = 0.0
     collision_seconds = 0.0
     dirpath, file = os.path.split(filename)
     basename, ext = os.path.splitext(file)
-    if ext.lower() in ('.w2mesh', '.w2ent'):
+    if ext.lower() in ('.w2mesh', '.w2ent') or embedded_cmesh_chunk_index is not None:
         with open(win_safe_path(filename), "rb") as _mesh_file:
             try:
                 parse_started = time.perf_counter()
-                (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile) = dc_mesh.load_bin_mesh(filename, keep_lod_meshes, keep_proxy_meshes)
+                (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile) = dc_mesh.load_bin_mesh(
+                    filename,
+                    keep_lod_meshes,
+                    keep_proxy_meshes,
+                    embedded_cmesh_chunk_index=embedded_cmesh_chunk_index,
+                )
                 parse_seconds = time.perf_counter() - parse_started
                 mesh_chunks = getattr(CData, "meshDataAllMeshes", None) or []
                 material_names = the_material_names or []

@@ -372,12 +372,29 @@ class SubmeshData:
         self.distance = 0
 
 
-def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
+def _normalize_embedded_cmesh_chunk_index(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        values = sorted({int(index) for index in value if index is not None})
+        if not values:
+            return None
+        if len(values) > 1:
+            raise ValueError(
+                f"embedded_cmesh_chunk_index selects one Witcher 2 CMesh chunk; got {values}"
+            )
+        return values[0]
+    return int(value)
+
+
+def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, embedded_cmesh_chunk_index=None):
     #OPTIONS
     cToLin = True
 
     #raise NotImplementedError
-    log.info('FileLoading: '+ filename)
+    embedded_cmesh_chunk_index = _normalize_embedded_cmesh_chunk_index(embedded_cmesh_chunk_index)
+    _diag_label = f'{filename}{f" [embedded CMesh chunk {embedded_cmesh_chunk_index}]" if embedded_cmesh_chunk_index is not None else ""}'
+    log.info('FileLoading: '+ _diag_label)
 
     # with open(filename,"rb") as meshFileReader:
     #     meshFile = getCR2W(meshFileReader)
@@ -406,8 +423,13 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
         f.close()
 
         chunk: W_CLASS
+        selected_cmesh_found = False
+
         for chunk in meshFile.CHUNKS.CHUNKS:
             if chunk.Type == "CMesh":
+                if embedded_cmesh_chunk_index is not None and getattr(chunk, "ChunkIndex", None) != embedded_cmesh_chunk_index:
+                    continue
+                selected_cmesh_found = True
                 the_materials = chunk.GetVariableByName("materials")
                 the_material_names_chunk = chunk.GetVariableByName("materialNames")
                 the_material_names = []
@@ -709,7 +731,12 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False):
                     pass
                 else:
                     loadSubmeshes(br, LODs, materialIds, boneNames) # FOR COOKED
-                break #!TODO load multiple embedded cmesh not just first
+                break
+
+        if embedded_cmesh_chunk_index is not None and not selected_cmesh_found:
+            raise ValueError(
+                f"Embedded Witcher 2 CMesh chunk {embedded_cmesh_chunk_index} not found in {filename}"
+            )
 
         return (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile)
 
