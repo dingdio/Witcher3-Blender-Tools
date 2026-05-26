@@ -39,6 +39,14 @@ from ..CR2W.common_blender import (
     repo_file,
     mod_loading_context,
 )
+from ..source_game_paths import (
+    existing_repo_file_for_source,
+    normalize_source_game,
+    repo_file_for_source,
+    source_game_for_animset_item,
+    source_game_for_rig_settings,
+    source_roots,
+)
 from ..duplication import duplicate_character_hierarchy as _duplicate_character_hierarchy
 
 from . import ui_file_browser
@@ -339,10 +347,6 @@ def _collect_inventory_preview(filepath):
     if not entity:
         return preview, "No entity data"
 
-    # Debug: log entity attributes
-    entity_attrs = dir(entity) if not isinstance(entity, dict) else list(entity.keys())
-    log.debug(f"Entity type: {type(entity)}, attributes: {[a for a in entity_attrs if not a.startswith('_')]}")
-
     def _get_attr(obj, key, default=None):
         """Get attribute from object or dict."""
         if isinstance(obj, dict):
@@ -350,10 +354,8 @@ def _collect_inventory_preview(filepath):
         return getattr(obj, key, default)
 
     def _collect_from_inv_defs(inv_defs, app_name=""):
-        log.debug(f"Collecting from {len(inv_defs)} inv_defs for app={app_name}")
         for inv_def in inv_defs:
             entries = _get_attr(inv_def, "entries", None) or []
-            log.debug(f"  inv_def has {len(entries)} entries")
             for entry in entries:
                 category = _get_attr(entry, "category", "") or ""
                 item_name = _get_attr(entry, "item", "") or ""
@@ -362,7 +364,6 @@ def _collect_inventory_preview(filepath):
                     init_item = _get_attr(initializer, "itemName", None) or _get_attr(initializer, "item", None)
                     if init_item:
                         item_name = init_item
-                log.debug(f"    Entry: category={category}, item_name={item_name}, initializer={type(initializer)}")
                 if not item_name and initializer is not None:
                     # Treat missing itemName as random initializer
                     item_name = "random"
@@ -383,7 +384,6 @@ def _collect_inventory_preview(filepath):
 
     # Appearance-level inventory
     appearances = _get_attr(entity, "appearances", []) or []
-    log.debug(f"Entity has {len(appearances)} appearances")
     for app in appearances:
         app_name = _get_attr(app, "name", "")
         inv_defs = _get_attr(app, "inventoryDefinitions", None) or []
@@ -391,13 +391,9 @@ def _collect_inventory_preview(filepath):
 
     # Entity-level inventory (templateParams)
     inv_defs = _get_attr(entity, "inventoryDefinitions", None) or []
-    log.debug(f"Entity-level inventoryDefinitions: {len(inv_defs)}")
     _collect_from_inv_defs(inv_defs, "entity")
 
     if not preview:
-        # Additional debug: check if entity has templateParams or other inventory sources
-        template_params = _get_attr(entity, "templateParams", None)
-        log.debug(f"Entity templateParams: {template_params}")
         return preview, "No inventory entries found"
     return preview, f"{len(preview)} inventory entries"
 
@@ -1403,18 +1399,31 @@ class WITCH_OT_RevealAnimInExplorer(Operator):
     bl_description = "Open the folder containing this animation file in Windows Explorer"
 
     path: StringProperty(default="")
+    source_game: StringProperty(default="")
 
     def execute(self, context):
         if not self.path:
             return {'CANCELLED'}
-        full_path = os.path.join(get_uncook_path(context), self.path)
+        source_game = normalize_source_game(self.source_game)
+        if not self.source_game:
+            _main_arm_obj, rig_settings = get_main_armature_and_rig_settings(
+                context,
+                prefer_active=True,
+                remember=False,
+                fallback=True,
+            )
+            source_game = source_game_for_rig_settings(rig_settings)
+
+        repo_rel = self.path.replace("/", os.sep).replace("\\", os.sep)
+        roots = source_roots(context, source_game)
+        full_path = os.path.normpath(os.path.join(roots[0], repo_rel)) if roots else repo_rel
         try:
             with mod_loading_context(context):
-                resolved = repo_file(self.path)
+                resolved = existing_repo_file_for_source(self.path, source_game)
             if resolved:
                 full_path = resolved
         except Exception:
-            # Fallback to uncook path when bundle extraction is unavailable.
+            # Fallback to the source-game root when bundle extraction is unavailable.
             pass
         if not os.path.isfile(full_path) and os.path.isfile(full_path + ".json"):
             full_path = full_path + ".json"
@@ -1434,21 +1443,33 @@ class WITCH_OT_AnimSetPathInfo(Operator):
     bl_description = "Show the repo path and local uncook path for this animation set"
 
     path: StringProperty(default="")
+    source_game: StringProperty(default="")
     uncook_path: StringProperty(default="", options={'SKIP_SAVE'})
     resolved_path: StringProperty(default="", options={'SKIP_SAVE'})
     status_text: StringProperty(default="", options={'SKIP_SAVE'})
 
     def invoke(self, context, event):
+        if not self.source_game:
+            _main_arm_obj, rig_settings = get_main_armature_and_rig_settings(
+                context,
+                prefer_active=True,
+                remember=False,
+                fallback=True,
+            )
+            self.source_game = source_game_for_rig_settings(rig_settings)
+        self.source_game = normalize_source_game(self.source_game)
+
         repo_rel = (self.path or "").replace("/", os.sep).replace("\\", os.sep)
-        self.uncook_path = os.path.normpath(os.path.join(get_uncook_path(context), repo_rel)) if repo_rel else ""
+        roots = source_roots(context, self.source_game)
+        self.uncook_path = os.path.normpath(os.path.join(roots[0], repo_rel)) if repo_rel and roots else ""
         self.resolved_path = ""
         exists = False
 
-        if self.uncook_path and os.path.isfile(self.uncook_path + ".json"):
-            self.resolved_path = self.uncook_path + ".json"
-            exists = True
-        elif self.uncook_path and os.path.exists(self.uncook_path):
-            self.resolved_path = self.uncook_path
+        try:
+            self.resolved_path = existing_repo_file_for_source(self.path, self.source_game)
+        except Exception:
+            self.resolved_path = ""
+        if self.resolved_path:
             exists = True
 
         self.status_text = "Exists on disk" if exists else "Not extracted yet (Reveal/Load may extract it)"
@@ -1459,6 +1480,7 @@ class WITCH_OT_AnimSetPathInfo(Operator):
         col = layout.column(align=True)
         col.label(text="Animation Set Path", icon='QUESTION')
         col.prop(self, "path", text="Repo")
+        col.prop(self, "source_game", text="Source")
         col.prop(self, "uncook_path", text="Uncook")
         if self.resolved_path:
             col.prop(self, "resolved_path", text="Resolved")
@@ -1505,6 +1527,7 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
     action: StringProperty(default="default")
     path: StringProperty(default="")  # Optional: when set, loads this path directly (bypasses animset_list_index)
     component_name: StringProperty(default="")
+    source_game: StringProperty(default="")
     @classmethod
     def poll(cls, context):
         return context.scene
@@ -1526,6 +1549,7 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
         with mod_loading_context(context):
             if "w2anims" == action:
                 log.debug("load w2anims, skeleton: %s", rig_settings.main_entity_skeleton)
+                source_game = normalize_source_game(self.source_game) if self.source_game else source_game_for_rig_settings(rig_settings)
 
                 if self.path:
                     anim_path = self.path
@@ -1537,6 +1561,8 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
                                 rig_settings.animset_list_index = idx
                                 if not target_component:
                                     target_component = str(getattr(anim_item, "component_name", "") or "").strip()
+                                if not self.source_game:
+                                    source_game = source_game_for_animset_item(anim_item, rig_settings)
                                 break
                     except Exception:
                         pass
@@ -1544,23 +1570,37 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
                     anim_item = rig_settings.animset_list[rig_settings.animset_list_index]
                     anim_path = anim_item.path
                     target_component = str(getattr(anim_item, "component_name", "") or "").strip()
+                    source_game = source_game_for_animset_item(anim_item, rig_settings)
                 else:
                     anim_path = None
                     target_component = ""
 
                 if anim_path and ":" not in anim_path:
-                    from ..CR2W.common_blender import repo_file as _repo_file
-                    _repo_file(anim_path)  # Extract from bundle to uncook dir if not already present
-                    fdir = os.path.join(get_uncook_path(context), anim_path)
+                    fdir = repo_file_for_source(anim_path, source_game)  # Extract if available.
                     log.debug("Loading anims from: %s", fdir)
-                    if os.path.exists(fdir + '.json'):
+                    if fdir and os.path.exists(fdir + '.json'):
                         fdir = fdir + '.json'
+                    if not fdir or not os.path.exists(fdir):
+                        roots = "; ".join(source_roots(context, source_game)) or "<no configured roots>"
+                        self.report({'ERROR'}, f"Animation set not found for {source_game.upper()}: {anim_path}")
+                        self.report({'WARNING'}, f"Checked roots: {roots}")
+                        return {'CANCELLED'}
                     if "_mimic_" in fdir:
                         skel = (rig_settings.main_face_skeleton or "").strip()
-                        import_anims.start_import(context, fdir, rigPath=_repo_file(skel) if skel else None, target_component=target_component)
+                        import_anims.start_import(
+                            context,
+                            fdir,
+                            rigPath=repo_file_for_source(skel, source_game) if skel else None,
+                            target_component=target_component,
+                        )
                     else:
                         skel = (rig_settings.main_entity_skeleton or "").strip()
-                        import_anims.start_import(context, fdir, rigPath=_repo_file(skel) if skel else None, target_component=target_component)
+                        import_anims.start_import(
+                            context,
+                            fdir,
+                            rigPath=repo_file_for_source(skel, source_game) if skel else None,
+                            target_component=target_component,
+                        )
 
             if "load" == action:
                 log.debug("load appearance")

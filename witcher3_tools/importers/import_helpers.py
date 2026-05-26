@@ -11,12 +11,22 @@ from pathlib import Path
 
 from ..CR2W.CR2W_helpers import Enums
 from ..CR2W.common_blender import repo_file
+from ..CR2W.dc_entity import (
+    _repair_w2_component_mesh_path,
+    _resolve_repo_path,
+    _w2_embedded_mesh_ref_info,
+)
 
 
 
 
 import logging
 log = logging.getLogger(__name__)
+
+
+class MeshReferenceMissing(ValueError):
+    pass
+
 
 def get_w3_level_data(level, fbx_uncook_path = False):
     if fbx_uncook_path == False:
@@ -30,7 +40,7 @@ def get_w3_level_data(level, fbx_uncook_path = False):
         CSectorData_ENTITY = Import_Entity()
         CSectorData_ENTITY.type = "CSectorData"
         CSectorData_ENTITY.name = "CSectorData_Transform"
-        #meshPath entities hold a transform and componants such as import data
+        # meshPath entities hold a transform and components such as import data.
         # THIS_ENTITY = meshPath("CSectorData_Transform", False, False, fbx_uncook_path, BasicEngineQsTransform())
         # THIS_ENTITY.type = "Entity"
         for idx, block in enumerate(level.CSectorData.BlockData):
@@ -93,23 +103,9 @@ def get_Entities(level, fbx_uncook_path = False):
             #TODO HANDLE MORE THAN A SINGLE MESH IN THE meshPath Class
             for meshChunk in ent.bufferedCR2W.CHUNKS.CHUNKS:
                 if meshChunk.name == "CStaticMeshComponent":
-                    name = meshChunk.GetVariableByName('name')
-                    transform = meshChunk.GetVariableByName('transform')
-                    if transform:
-                        EngineTransform = transform.EngineTransform
-                    else:
-                        EngineTransform = None
-                    DepotPath = meshChunk.GetVariableByName('mesh').Handles[0].DepotPath
-                    THIS_ENTITY.static_mesh_list.append(meshPath(DepotPath, False, False, fbx_uncook_path, EngineTransform ))
+                    THIS_ENTITY.static_mesh_list.append(meshPath(fbx_uncook_path=fbx_uncook_path).static_from_chunk(meshChunk))
                 if meshChunk.name == "CMeshComponent":
-                    name = meshChunk.GetVariableByName('name')
-                    transform = meshChunk.GetVariableByName('transform')
-                    if transform:
-                        EngineTransform = transform.EngineTransform
-                    else:
-                        EngineTransform = None
-                    DepotPath = meshChunk.GetVariableByName('mesh').Handles[0].DepotPath
-                    THIS_ENTITY.mesh_list.append(meshPath(DepotPath, False, False, fbx_uncook_path, EngineTransform ))
+                    THIS_ENTITY.mesh_list.append(meshPath(fbx_uncook_path=fbx_uncook_path).static_from_chunk(meshChunk))
         
         if THIS_ENTITY and hasattr(ent, 'sub_chunks'):
             for sub_chunk in ent.sub_chunks:
@@ -204,6 +200,34 @@ class Transform_Entity:
     def from_json(cls, data):
         return cls(**data)
 
+
+def _chunk_debug_label(chunk):
+    chunk_type = getattr(chunk, "name", None) or getattr(chunk, "Type", None) or type(chunk).__name__
+    chunk_index = getattr(chunk, "ChunkIndex", None)
+    if chunk_index is None:
+        return str(chunk_type)
+    return f"{chunk_type} #{chunk_index}"
+
+
+def _resolve_static_mesh_chunk_path(meshChunk):
+    embedded_source_path, embedded_cmesh_chunk_index = _w2_embedded_mesh_ref_info(meshChunk)
+    if embedded_source_path and embedded_cmesh_chunk_index is not None:
+        return str(embedded_source_path), int(embedded_cmesh_chunk_index)
+
+    mesh_path = _resolve_repo_path(meshChunk, "mesh", ".w2mesh")
+    if mesh_path:
+        return _repair_w2_component_mesh_path(meshChunk, mesh_path), None
+
+    try:
+        mesh_prop = meshChunk.GetVariableByName("mesh")
+    except Exception:
+        mesh_prop = None
+    if mesh_prop is None:
+        raise MeshReferenceMissing(f"{_chunk_debug_label(meshChunk)} has no mesh property")
+
+    raise ValueError(f"Unable to resolve mesh reference for {_chunk_debug_label(meshChunk)}")
+
+
 class meshPath:
     def __init__(self, meshName = False, translation = False, matrix = False, fbx_uncook_path = False, transform = False, BlockDataObjectType = Enums.BlockDataObjectType.Mesh, uncook_path = None):
         if fbx_uncook_path == False:
@@ -223,6 +247,7 @@ class meshPath:
         self.components = [] #lights, submesh etc.
         self.type = "Mesh"
         self.BlockDataObjectType = BlockDataObjectType
+        self.embedded_cmesh_chunk_index = None
     def fbxPath(self):
         try:
             name = Path(os.path.join(self.fbx_uncook_path, self.meshName))
@@ -239,8 +264,7 @@ class meshPath:
         name = repo_file(self.meshName) #str(Path(os.path.join(self.uncook_path, self.meshName)))
         return name
     def static_from_chunk(self, meshChunk):
-        #DepotPath = meshChunk.GetVariableByName('mesh').Handles[0].DepotPath
-        self.meshName = meshChunk.GetVariableByName('mesh').Handles[0].DepotPath
+        self.meshName, self.embedded_cmesh_chunk_index = _resolve_static_mesh_chunk_path(meshChunk)
 
         if meshChunk.GetVariableByName('name'):
             self.name = meshChunk.GetVariableByName('name').String.String

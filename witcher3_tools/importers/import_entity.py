@@ -9,6 +9,7 @@ import copy
 import os
 import re
 import time
+import types
 import bpy
 import numpy as np
 from pathlib import Path
@@ -43,7 +44,7 @@ from ..importers.import_helpers import set_blender_object_transform
 from ..importers import import_isolation
 from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
-from ..CR2W.common_blender import repo_file, win_safe_path
+from ..CR2W.common_blender import repo_file, redkit_repo_context, win_safe_path
 from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
 from .dlc_mounters import (
     append_dlc_entity_template_params,
@@ -1074,7 +1075,7 @@ def NewListItem( treeList, node):
     item.name = node.name
     return item
 
-def NewAnimsetListItem( treeList, path, name, component_name=""):
+def NewAnimsetListItem( treeList, path, name, component_name="", source_game="w3"):
     item = treeList.add()
     if path:
         item.path = path
@@ -1082,6 +1083,8 @@ def NewAnimsetListItem( treeList, path, name, component_name=""):
         item.name = name
     if component_name and hasattr(item, "component_name"):
         item.component_name = component_name
+    if hasattr(item, "source_game"):
+        item.source_game = "w2" if str(source_game or "").strip().lower() == "w2" else "w3"
     return item
 
 
@@ -1117,6 +1120,10 @@ _TO_PLAIN_DATA_MAX_DEPTH = 64
 def _to_plain_data(value, _visited=None, _depth=0):
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, np.generic):
+        return _to_plain_data(value.item(), _visited, _depth + 1)
+    if isinstance(value, np.ndarray):
+        return _to_plain_data(value.tolist(), _visited, _depth + 1)
     if isinstance(value, (bytes, bytearray)):
         return list(value)
     if isinstance(value, memoryview):
@@ -1125,10 +1132,29 @@ def _to_plain_data(value, _visited=None, _depth=0):
         return str(value)
     if _depth > _TO_PLAIN_DATA_MAX_DEPTH:
         return None
+    if isinstance(value, type):
+        return getattr(value, "__name__", str(value))
+    if isinstance(
+        value,
+        (
+            types.BuiltinFunctionType,
+            types.BuiltinMethodType,
+            types.FunctionType,
+            types.MethodType,
+            types.ModuleType,
+            types.GetSetDescriptorType,
+            types.MemberDescriptorType,
+            types.MappingProxyType,
+        ),
+    ):
+        return None
     if isinstance(value, dict):
         if _visited is None:
             _visited = set()
-        return {key: _to_plain_data(item, _visited, _depth + 1) for key, item in value.items()}
+        return {
+            str(_to_plain_data(key, _visited, _depth + 1)): _to_plain_data(item, _visited, _depth + 1)
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple, set)):
         if _visited is None:
             _visited = set()
@@ -1159,7 +1185,7 @@ def _to_plain_data(value, _visited=None, _depth=0):
                 key: _to_plain_data(item, _visited, _depth + 1)
                 for key, item in vars(value).items()
             }
-        return value
+        return str(value)
     finally:
         _visited.discard(obj_id)
 
@@ -1680,6 +1706,20 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                         mesh_import_settings = None):
     base_context = bpy.context
     mesh_import_settings = get_entity_mesh_import_settings(mesh_import_settings)
+    if not getattr(import_ent_template, "_repo_context_active", False):
+        import_ent_template._repo_context_active = True
+        try:
+            with redkit_repo_context(filename):
+                return import_ent_template(
+                    filename,
+                    load_face_poses,
+                    import_apperance,
+                    parent_transform,
+                    selected_appearance_name,
+                    mesh_import_settings=mesh_import_settings,
+                )
+        finally:
+            import_ent_template._repo_context_active = False
     # Keep isolation at the public entry point.  The existing entity import
     # implementation below should stay unaware of the temporary session.
     if import_isolation.needs_isolation_session(base_context):
@@ -2029,9 +2069,21 @@ def initialize_entity_armature_state(armature_obj, entity, *, filename="", impor
         animset_list.clear()
         groups = list(_collect_armature_animset_groups(entity, armature_obj))
         for group_name, paths, component_name in groups:
-            NewAnimsetListItem(animset_list, f"{group_name}:", group_name, component_name=component_name)
+            NewAnimsetListItem(
+                animset_list,
+                f"{group_name}:",
+                group_name,
+                component_name=component_name,
+                source_game=rig_settings.source_game,
+            )
             for path in paths:
-                NewAnimsetListItem(animset_list, path, group_name, component_name=component_name)
+                NewAnimsetListItem(
+                    animset_list,
+                    path,
+                    group_name,
+                    component_name=component_name,
+                    source_game=rig_settings.source_game,
+                )
 
         # Populate idle animation
         _populate_idle_animation(rig_settings, entity)
@@ -2108,6 +2160,15 @@ def _get_armature_source_roots(armature):
         seen.add(norm)
         out.append(str(root))
     return out
+
+
+def _repo_context_source_for_armature(armature) -> str:
+    for root in _get_armature_source_roots(armature):
+        if root and os.path.isabs(str(root)):
+            return str(root)
+    rig_settings = getattr(getattr(armature, "data", None), "witcherui_RigSettings", None) if armature else None
+    repo_path_hint = str(getattr(rig_settings, "repo_path", "") or "").strip() if rig_settings else ""
+    return repo_path_hint if repo_path_hint and os.path.isabs(repo_path_hint) else ""
 
 
 def _is_shadowmesh_name(name: str) -> bool:
@@ -3257,6 +3318,7 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
             _resolve_slot_visual_policy,
             get_effective_equip_template,
             get_equipment_catalog_for_search_roots,
+            get_equipment_source_game_for_search_roots,
             load_equipment_items_batch,
             refresh_variant_states,
         )
@@ -3268,8 +3330,16 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
     source_roots = prepared.get("source_roots", source_roots)
 
     item_lookup, template_lookup = _build_equipment_lookup(source_roots)
+    _rig_source_game_raw = str(getattr(rig_settings, "source_game", "") or "").strip().lower()
+    source_game = _rig_source_game_raw
+    if source_game not in {"w2", "w3"}:
+        source_game = get_equipment_source_game_for_search_roots(source_roots)
     slots = rig_settings.equipment_slots
-    slot_by_category = {slot.category: (idx, slot) for idx, slot in enumerate(slots) if slot.category}
+    # IMPORTANT: store ONLY indices, not slot PropertyGroup references.
+    # bpy_prop_collection.add() can reallocate the underlying RNA array,
+    # invalidating any cached PropertyGroup refs. Re-fetch via slots[idx]
+    # on each use to stay safe across additions.
+    slot_by_category = {slot.category: idx for idx, slot in enumerate(slots) if slot.category}
     slot_search_list = slots
 
     try:
@@ -3309,7 +3379,11 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
             if desired_mounts and desired_mounts.issubset(existing_mounts) and existing_loaded:
                 return
     seen_entries = set()
-    equip_category_keywords = ("sword", "weapon", "armor", "boots", "gloves", "pants", "trousers", "crossbow", "head", "hair", "axe", "mace")
+    equip_category_keywords = (
+        "sword", "weapon", "armor", "boots", "gloves", "pants", "trousers",
+        "crossbow", "head", "hair", "body", "torso", "dress", "robe",
+        "jacket", "shirt", "axe", "mace",
+    )
 
     category_items, item_attributes = get_equipment_catalog_for_search_roots(source_roots)
     slots_to_load = []
@@ -3364,13 +3438,19 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
         if resolved:
             resolved_category, resolved_item_name, resolved_template = resolved
 
-        # Prefer slot by inventory category, then resolved category, then item/template match
+        # Prefer slot by inventory category, then resolved category, then item/template match.
+        # NOTE: slot_by_category stores INDICES only (not refs) — see init comment.
+        # Always re-fetch slot via slots[idx] because slots.add() may have invalidated
+        # any older PropertyGroup ref via RNA array realloc.
         if category_raw and category_raw in slot_by_category:
-            slot_index, slot = slot_by_category[category_raw]
+            slot_index = slot_by_category[category_raw]
+            slot = slots[slot_index] if 0 <= slot_index < len(slots) else None
         elif resolved_category and resolved_category in slot_by_category:
-            slot_index, slot = slot_by_category[resolved_category]
+            slot_index = slot_by_category[resolved_category]
+            slot = slots[slot_index] if 0 <= slot_index < len(slots) else None
         else:
-            slot_index, slot = _find_slot_by_item_or_template(slot_search_list, item_raw)
+            slot_index, _stale_slot = _find_slot_by_item_or_template(slot_search_list, item_raw)
+            slot = slots[slot_index] if (slot_index is not None and 0 <= slot_index < len(slots)) else None
 
         slot_was_created = False
         # If no slot exists, create one for this mounted inventory item
@@ -3379,19 +3459,23 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
             if not new_category:
                 new_category = f"inventory_{len(slots)}"
             if new_category in slot_by_category:
-                slot_index, slot = slot_by_category[new_category]
+                slot_index = slot_by_category[new_category]
+                slot = slots[slot_index] if 0 <= slot_index < len(slots) else None
             else:
                 slot = slots.add()
-                slot.source_game = getattr(rig_settings, "source_game", "w3")
+                slot.source_game = source_game
                 slot.category = new_category
                 slot.resolved_repo_path = ""
                 slot_index = len(slots) - 1
-                slot_by_category[new_category] = (slot_index, slot)
+                slot_by_category[new_category] = slot_index
                 slot_was_created = True
+                # Re-fetch by index after add() in case the local ref got
+                # invalidated by the same realloc that may invalidate older refs.
+                slot = slots[slot_index]
 
         if slot is None:
             continue
-            
+
         if not slot.category:
             fallback = category_raw or resolved_category or _derive_template_from_item(item_raw) or str(item_raw)
             if not fallback:
@@ -3402,9 +3486,9 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
                 fallback = f"{base_fallback}_{counter}"
                 counter += 1
             slot.category = fallback
-            slot_by_category[fallback] = (slot_index, slot)
+            slot_by_category[fallback] = slot_index
 
-        slot.source_game = getattr(rig_settings, "source_game", "w3")
+        slot.source_game = source_game
         if shared_inventory:
             slot.is_inventory = True
 
@@ -3495,7 +3579,7 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
                 except Exception:
                     pass
                 slot_by_category = {
-                    existing_slot.category: (idx, existing_slot)
+                    existing_slot.category: idx
                     for idx, existing_slot in enumerate(slots)
                     if existing_slot.category
                 }
@@ -3516,7 +3600,7 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
                     slots.remove(slot_index)
                 except Exception:
                     pass
-                slot_by_category = {existing_slot.category: (idx, existing_slot) for idx, existing_slot in enumerate(slots) if existing_slot.category}
+                slot_by_category = {existing_slot.category: idx for idx, existing_slot in enumerate(slots) if existing_slot.category}
                 slot_search_list = slots
             continue
 
@@ -3533,15 +3617,22 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
         slots_to_load.append(slot_index)
 
     if slots_to_load:
-        load_equipment_items_batch(
-            context,
-            armature,
-            slots_to_load,
-            rig_settings,
-            prepared_context=prepared,
-            post_refresh_variants=post_refresh,
-            mount_mode="equip",
-        )
+        try:
+            load_equipment_items_batch(
+                context,
+                armature,
+                slots_to_load,
+                rig_settings,
+                prepared_context=prepared,
+                post_refresh_variants=post_refresh,
+                mount_mode="equip",
+            )
+        except Exception as exc:
+            log.warning(
+                "Auto inventory equipment import failed; continuing character import: %s",
+                exc,
+                exc_info=True,
+            )
 
     # Update variant state after all mounts applied
     try:
@@ -3673,6 +3764,8 @@ def do_constraints(constrains, objdict, meshdict, HardAttachments, group_parent=
 def _set_parent_keep_world(obj, parent_obj, *, parent_type='OBJECT', parent_bone=""):
     if obj is None:
         return
+    if obj == parent_obj:
+        return
     try:
         saved_world = obj.matrix_world.copy()
     except Exception:
@@ -3706,6 +3799,8 @@ def process_constraints(constrains, objdict, group_parent=None):
         if parent_obj_name in objdict and child_obj_name in objdict:
             parent_obj = objdict[parent_obj_name]
             child_obj = objdict[child_obj_name]
+            if parent_obj == child_obj:
+                continue
             constrain_util.CreateConstraints2(parent_obj, child_obj)
 
             # If the object is a Cloth group, attach the group to the appearance instead.
@@ -3912,6 +4007,74 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
     
     def get_chunk_namespace(chunk):
         return f"{ent_namespace}{chunk['type']}{i}{chunk['chunkIndex']}"
+
+    def _resolved_path_key(path):
+        path = str(path or "").strip()
+        if not path:
+            return ""
+        try:
+            resolved = path if os.path.isabs(path) else repo_file(path, entity.version)
+        except Exception:
+            resolved = path
+        try:
+            return os.path.normcase(os.path.normpath(str(resolved or path)))
+        except Exception:
+            return str(resolved or path).replace("/", "\\").lower()
+
+    def _resolve_required_chunk_resource(chunk, field_name, label):
+        repo_path = str(chunk.get(field_name) or "").strip()
+        if not repo_path:
+            raise ValueError(
+                f"Empty {field_name} path for {label} on "
+                f"{chunk.get('type')} #{chunk.get('chunkIndex')}"
+            )
+        try:
+            resolved_path = repo_file(repo_path, entity.version)
+        except Exception as exc:
+            raise FileNotFoundError(
+                f"Failed to resolve {label} for {chunk.get('type')} "
+                f"#{chunk.get('chunkIndex')}: {repo_path}"
+            ) from exc
+        if not resolved_path or not os.path.exists(win_safe_path(resolved_path)):
+            raise FileNotFoundError(
+                f"Missing {label} for {chunk.get('type')} "
+                f"#{chunk.get('chunkIndex')}: {repo_path} -> {resolved_path}"
+            )
+        return resolved_path
+
+    def _try_reuse_owner_moving_agent(chunk, chunk_ns):
+        if chunk.get('type') != "CMovingPhysicalAgentComponent" or not chunk.get('skeleton'):
+            return None
+        chunk_skeleton = str(chunk.get('skeleton') or "").strip()
+        chunk_skeleton_key = _resolved_path_key(chunk_skeleton)
+        candidate_armatures = []
+        for owner_armature in (objdict.get(entity.name), root_skeleton):
+            if owner_armature is not None and owner_armature not in candidate_armatures:
+                candidate_armatures.append(owner_armature)
+        try:
+            for obj in bpy.data.objects:
+                if obj in candidate_armatures or getattr(obj, "type", "") != 'ARMATURE':
+                    continue
+                if not obj.get("_w3_entity_import_in_progress", False):
+                    continue
+                rig_settings = getattr(getattr(obj, "data", None), "witcherui_RigSettings", None)
+                if str(getattr(rig_settings, "entity_name", "") or "").strip() != str(entity.name or "").strip():
+                    continue
+                candidate_armatures.append(obj)
+        except Exception:
+            pass
+        for owner_armature in candidate_armatures:
+            if owner_armature is None or getattr(owner_armature, "type", "") != 'ARMATURE':
+                continue
+            rig_settings = getattr(getattr(owner_armature, "data", None), "witcherui_RigSettings", None)
+            owner_skeleton = str(getattr(rig_settings, "main_entity_skeleton", "") or "").strip() if rig_settings else ""
+            if not owner_skeleton or _resolved_path_key(owner_skeleton) != chunk_skeleton_key:
+                continue
+            add_chunk_metadata(owner_armature, chunk, chunk_skeleton)
+            objdict[chunk_ns] = owner_armature
+            objdict.setdefault(entity.name, owner_armature)
+            return owner_armature
+        return None
     
     def get_ns_for_chunk(chunk_index, chunks):
         for chunk in chunks:
@@ -3955,7 +4118,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         chunk_ns = get_chunk_namespace(chunk)
         if target_collection is not None:
             _activate_target_collection(bpy.context, target_collection)
-        
+
         # Handle attachments
         if chunk['type'] in ["CMeshSkinningAttachment", "CAnimatedAttachment"]:
             parent_ns = get_ns_for_chunk(chunk['parent'], cur_chunks)
@@ -4021,7 +4184,6 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                         f"{f' [embedded CMesh chunk {selected_cmesh_chunk_index}]' if selected_cmesh_chunk_index is not None else ''}): "
                         f"{mesh_err}"
                     ) from mesh_err
-             
                 if component_name:
                     for mesh in meshes:
                         mesh['witcher_name'] = component_name
@@ -4032,14 +4194,14 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 for arm in armatures:
                     add_chunk_metadata(arm, chunk, mesh_path, component_name=component_name)
                     objdict[chunk_ns] = arm
-                    
+
                 for mesh in meshes:
                     add_chunk_metadata(mesh, chunk, mesh_path, component_name=component_name)
                     if mesh.name[-5:-1] == "_lod":
                         meshdict[chunk_ns + mesh.name[-5:]] = mesh
                     else:
                         meshdict[chunk_ns] = mesh
-                        
+
                     if hide_shadowmesh:
                         chunk_name = chunk.get('name', '')
                         if any(_is_shadowmesh_name(candidate) for candidate in (mesh.name, chunk_name, mesh_path)):
@@ -4107,24 +4269,52 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
 
         # Handle morphs
         if "morphComponentId" in chunk:
-            morph_source_meshes, morph_source_arms = fbx_util.import_model(
-                repo_file(chunk['morphSource'], entity.version), 
-                f"{chunk['type']}{i}{chunk['chunkIndex']}", 
-                entity.name,
-                keep_lod_meshes=mesh_import_settings["keep_lod_meshes"],
-                keep_empty_lods=mesh_import_settings["keep_empty_lods"],
-                keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
-                hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
-            )
-            morph_target_meshes, morph_target_arms = fbx_util.import_model(
-                repo_file(chunk['morphTarget'], entity.version),
-                f"{chunk['type']}{i}{chunk['chunkIndex']}_morphTarget",
-                entity.name,
-                keep_lod_meshes=mesh_import_settings["keep_lod_meshes"],
-                keep_empty_lods=mesh_import_settings["keep_empty_lods"],
-                keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
-                hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
-            )
+            morph_source_path = repo_file(chunk['morphSource'], entity.version)
+            morph_target_path = repo_file(chunk['morphTarget'], entity.version)
+            if (
+                not morph_source_path
+                or not morph_target_path
+                or not os.path.exists(win_safe_path(morph_source_path))
+                or not os.path.exists(win_safe_path(morph_target_path))
+            ):
+                log.warning(
+                    "Skipping morph '%s' because source/target mesh is missing: %s -> %s, %s -> %s",
+                    chunk.get('morphComponentId'),
+                    chunk.get('morphSource'),
+                    morph_source_path,
+                    chunk.get('morphTarget'),
+                    morph_target_path,
+                )
+                continue
+            try:
+                morph_source_meshes, morph_source_arms = fbx_util.import_model(
+                    morph_source_path,
+                    f"{chunk['type']}{i}{chunk['chunkIndex']}",
+                    entity.name,
+                    keep_lod_meshes=mesh_import_settings["keep_lod_meshes"],
+                    keep_empty_lods=mesh_import_settings["keep_empty_lods"],
+                    keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
+                    hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
+                )
+                morph_target_meshes, morph_target_arms = fbx_util.import_model(
+                    morph_target_path,
+                    f"{chunk['type']}{i}{chunk['chunkIndex']}_morphTarget",
+                    entity.name,
+                    keep_lod_meshes=mesh_import_settings["keep_lod_meshes"],
+                    keep_empty_lods=mesh_import_settings["keep_empty_lods"],
+                    keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
+                    hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
+                )
+            except Exception as morph_err:
+                log.warning(
+                    "Failed to import morph meshes for chunk %s #%s (source=%s, target=%s): %s. Skipping morph.",
+                    chunk.get('type'),
+                    chunk.get('chunkIndex'),
+                    morph_source_path,
+                    morph_target_path,
+                    morph_err,
+                )
+                continue
             
             morphs_todo.append([chunk['morphComponentId'], (morph_source_meshes, morph_source_arms)])
             join_as_shape_keys(morph_source_meshes, morph_target_meshes, chunk['morphComponentId'])
@@ -4145,18 +4335,26 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         # Handle skeletons
         if chunk['type'] == "CMovingPhysicalAgentComponent":
             if 'skeleton' in chunk:
+                reused_agent = _try_reuse_owner_moving_agent(chunk, chunk_ns)
+                if reused_agent is not None:
+                    root_skeleton = reused_agent
+                    has_moving_agent = True
+                    continue
+                skeleton_path = _resolve_required_chunk_resource(chunk, 'skeleton', 'skeleton')
                 moving_agent = import_rig.import_w3_rig(
-                    repo_file(chunk['skeleton'], entity.version),
+                    skeleton_path,
                     chunk_ns
                 )
                 add_chunk_metadata(moving_agent, chunk, chunk['skeleton'])
                 objdict[chunk_ns] = moving_agent
+                objdict.setdefault(entity.name, moving_agent)
                 root_skeleton = moving_agent
                 has_moving_agent = True
                 _apply_chunk_transform_to_import_roots(chunk, armatures=[moving_agent])
         elif "skeleton" in chunk and chunk['skeleton'] is not None:
+            skeleton_path = _resolve_required_chunk_resource(chunk, 'skeleton', 'skeleton')
             root_bone = import_rig.import_w3_rig(
-                repo_file(chunk['skeleton'], entity.version),
+                skeleton_path,
                 chunk_ns
             )
             add_chunk_metadata(root_bone, chunk, chunk['skeleton'])
@@ -4167,8 +4365,9 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
 
         # Handle dynamic rigs
         if "dyng" in chunk and chunk['dyng'] is not None:
+            dyng_path = _resolve_required_chunk_resource(chunk, 'dyng', 'dynamic rig')
             root_bone = import_rig.import_w3_rig(
-                repo_file(chunk['dyng'], entity.version),
+                dyng_path,
                 chunk_ns
             )
             add_chunk_metadata(root_bone, chunk, chunk['dyng'])
@@ -4177,7 +4376,8 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
 
         # Handle mimic face
         if "mimicFace" in chunk:
-            faceData = import_rig.loadFaceFile(repo_file(chunk['mimicFace'], entity.version))
+            mimic_face_path = _resolve_required_chunk_resource(chunk, 'mimicFace', 'mimic face')
+            faceData = import_rig.loadFaceFile(mimic_face_path)
             if faceData is None:
                 log.warning("Failed to load mimic face: %s", chunk['mimicFace'])
             else:
@@ -4595,6 +4795,32 @@ def add_app_template(   entity,
                                 morphs_todo_accum=None,
                                 bind_root_chunks_to_entity=True,
                                 target_collection=None):
+    source_context_path = templateFilename if templateFilename and os.path.isabs(str(templateFilename)) else _repo_context_source_for_armature(base_animation_skeleton)
+    if source_context_path and not getattr(add_app_template, "_repo_context_active", False):
+        add_app_template._repo_context_active = True
+        try:
+            with redkit_repo_context(source_context_path):
+                return add_app_template(
+                    entity,
+                    base_animation_skeleton,
+                    group_parent,
+                    ent_namespace,
+                    import_redcloth_enabled,
+                    i,
+                    selectedAppearance,
+                    hide_shadowmesh,
+                    empty_transform,
+                    root_skeleton,
+                    templateFilename,
+                    template_data=template_data,
+                    appearance_indices=appearance_indices,
+                    use_app_drivers=use_app_drivers,
+                    morphs_todo_accum=morphs_todo_accum,
+                    bind_root_chunks_to_entity=bind_root_chunks_to_entity,
+                    target_collection=target_collection,
+                )
+        finally:
+            add_app_template._repo_context_active = False
     constrains = []
     HardAttachments = []
 
@@ -4701,6 +4927,14 @@ def import_app(context,
                entity,
                base_animation_skeleton):
     base_context = context or bpy.context
+    source_context_path = _repo_context_source_for_armature(base_animation_skeleton)
+    if source_context_path and not getattr(import_app, "_repo_context_active", False):
+        import_app._repo_context_active = True
+        try:
+            with redkit_repo_context(source_context_path):
+                return import_app(context, selectedAppearance, entity, base_animation_skeleton)
+        finally:
+            import_app._repo_context_active = False
     # Appearance import is another public boundary.  Wrap once here instead of
     # threading isolation-specific parameters down through template/chunk code.
     if import_isolation.needs_isolation_session(base_context):
@@ -4739,7 +4973,7 @@ def import_app(context,
     #OPTIONS
     hide_shadowmesh = True
     mimic_namespace = False
-    root_skeleton = False
+    root_skeleton = base_animation_skeleton
     faceData = False
     group_parent = True #None
 
@@ -4783,7 +5017,6 @@ def import_app(context,
 
     morphs_todo = []
 
-    log.debug(selectedAppearance.name)
     rig_settings = base_animation_skeleton.data.witcherui_RigSettings
 
     # =====================================================
@@ -5067,15 +5300,12 @@ def import_app(context,
             pass
 
         if equip_template and equip_template != "None":
-            # All equipment (W2 and W3) goes through the shared loader so
-            # slot mounting, bound items (belt, scabbards) and attachment
-            # type handling work consistently.
+            # Defaults go through the shared loader so slot mounting,
+            # bound items and attachment type handling work consistently.
             deferred_default_slot_indices.append(slot_index)
             continue
 
     # Apply inventory-mounted items (overrides defaults when present).
-    # Witcher 2 entities can also express equipped gear through inventory
-    # definitions, so keep this shared path active for both games.
     _apply_inventory_mounts(
         context,
         base_animation_skeleton,
@@ -5087,7 +5317,7 @@ def import_app(context,
         post_refresh=not deferred_default_slot_indices,
     )
 
-    # Witcher 3 defaults must be loaded through the shared equipment loader so
+    # Defaults must be loaded through the shared equipment loader so
     # they get mounted to their equip_slot immediately on import.
     slots_to_reload = list(dict.fromkeys(deferred_default_slot_indices + persistent_slot_indices))
     if slots_to_reload:
@@ -5109,7 +5339,7 @@ def import_app(context,
                 mount_mode=None,
             )
         except Exception as e:
-            log.warning("Failed to load deferred Witcher 3 equipment: %s", e)
+            log.warning("Failed to load deferred equipment: %s", e)
 
     # Refresh variant state after equipment slots populated
     try:

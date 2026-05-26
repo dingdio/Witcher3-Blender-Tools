@@ -11,6 +11,7 @@ from ..camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties
 from ..importers.import_rig import get_ordered_bones
 from ..importers.motion_tools import MotionExtraction, apply_motion, apply_motion_to_bone, extract_motion_from_bone
 from .. import get_do_fix_tail, get_rig_rot90_enabled
+from ..source_game_paths import repo_file_for_source, source_game_for_animset_item, source_game_for_rig_settings, source_roots
 
 
 import json
@@ -2092,27 +2093,26 @@ def load_idle_animation_for_armature(context, armature_obj):
         for item in getattr(rig_settings, "animset_list", []) or []:
             p = (getattr(item, "path", "") or "").strip()
             if p and not p.endswith(":"):
-                anim_paths.append(p)
+                anim_paths.append((p, source_game_for_animset_item(item, rig_settings)))
         if not anim_paths:
             return False
 
-        from ..CR2W.common_blender import repo_file as _repo_file
         from ..CR2W.dc_anims import load_bin_anims_single
-        import os
-        from .. import get_uncook_path
 
         skel = (getattr(rig_settings, "main_entity_skeleton", "") or "").strip()
-        rig_path = _repo_file(skel) if skel else None
+        source_game = source_game_for_rig_settings(rig_settings)
+        rig_path = repo_file_for_source(skel, source_game) if skel else None
 
-        for anim_path in anim_paths:
+        for anim_path, anim_source_game in anim_paths:
             # Phase 1: locate animation entry — catch parse/IO errors, skip to next animset
             animation = None
             try:
-                _repo_file(anim_path)
-                fdir = os.path.join(get_uncook_path(context), anim_path)
-                if os.path.exists(fdir + ".json"):
+                fdir = repo_file_for_source(anim_path, anim_source_game)
+                if fdir and os.path.exists(fdir + ".json"):
                     fdir += ".json"
-                if not os.path.exists(fdir):
+                if not fdir or not os.path.exists(fdir):
+                    roots = "; ".join(source_roots(context, anim_source_game)) or "<no configured roots>"
+                    log.debug("Idle animset not found for %s in %s: %s", anim_source_game, roots, anim_path)
                     continue
 
                 _, ext = os.path.splitext(fdir)

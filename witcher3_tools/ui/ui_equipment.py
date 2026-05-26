@@ -32,6 +32,7 @@ from .. import get_rig_rot90_enabled
 from .armature_context import (
     get_main_armature_and_rig_settings,
 )
+from ..source_game_paths import normalize_source_game as _normalize_source_game
 
 # Category cache file path (extension-safe user cache)
 _CATEGORY_CACHE_FILE = Path(get_cache_root(create=True)) / "equipment_categories.json"
@@ -47,6 +48,7 @@ _EQUIPMENT_ENTITY_CACHE = {}
 _TEMPLATE_PATH_RESOLVE_CACHE = {}  # (template_key, roots_tuple) -> (repo_path, export_path)
 _XML_DECL_RE = re.compile(r'^\s*<\?xml[^>]*\?>', re.IGNORECASE)
 _XML_DECL_ENCODING_BYTES_RE = re.compile(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', re.IGNORECASE)
+_XML_HASH_COMMENT_LINE_RE = re.compile(r'(?m)^[ \t]*#.*(?:\r?\n|$)')
 _CATEGORY_CACHE_SCHEMA_VERSION = 2
 _CATALOG_CACHE_FLAGS = {
     "w3": {"schema_version": 0, "icon_path": False, "hold_template": False},
@@ -60,10 +62,6 @@ _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP = {
 def _clear_cache_if_oversized(cache, max_entries=64):
     if len(cache) > max_entries:
         cache.clear()
-
-
-def _normalize_source_game(source_game):
-    return "w2" if str(source_game or "").strip().lower() == "w2" else "w3"
 
 
 def _set_catalog_cache_flags(source_game="w3", *, schema_version=0, icon_path=False, hold_template=False):
@@ -279,10 +277,13 @@ def _load_category_cache(source_game="w3"):
         return False
 
 
-def _candidate_w2_items_dirs(search_roots=None):
+def _candidate_w2_items_dirs(search_roots=None, *, include_configured_roots=True):
     candidates = []
     seen = set()
-    roots = _normalize_unique_roots(list(search_roots or []) + _get_w2_repo_roots())
+    roots = list(search_roots or [])
+    if include_configured_roots:
+        roots.extend(_get_w2_repo_roots())
+    roots = _normalize_unique_roots(roots)
     for root in roots:
         try:
             current = Path(root)
@@ -460,6 +461,11 @@ def _is_w2_search(search_roots):
         for candidate in norm_search_roots:
             if candidate == norm_root or candidate.startswith(prefix):
                 return True
+    # Do not let globally configured W2 roots classify an unrelated W3 entity
+    # import as W2. Catalog loading may include configured W2 roots later, but
+    # source-game detection must only consider the active search roots.
+    if _candidate_w2_items_dirs(search_roots, include_configured_roots=False):
+        return True
     return False
 
 
@@ -1773,7 +1779,8 @@ def _slot_matches_unmounted_visual_hint(slot):
         "tail", "hair", "armor", "gloves", "pants", "boots",
         "torso", "legs", "arms", "trousers", "head", "mask",
         "cape", "cloak", "beard", "mustache", "helmet", "hood",
-        "shirt", "shoes", "amulet", "accessory", "belt", "medal"
+        "shirt", "shoes", "amulet", "accessory", "belt", "medal",
+        "sword", "weapon", "scabbard", "crossbow",
     }
     for value in (
         getattr(slot, "category", ""),
@@ -1786,8 +1793,27 @@ def _slot_matches_unmounted_visual_hint(slot):
     return False
 
 
+def _allow_w2_visual_without_resolved_mount(slot, attachment_profile=None):
+    if slot is None:
+        return False
+    if _normalize_source_game(getattr(slot, "source_game", "")) != "w2":
+        return False
+
+    profile_kind = str(getattr(attachment_profile, "kind", "") or "").strip()
+    if profile_kind == "inventory_wrapper":
+        return False
+    if profile_kind in {"owner_graph", "slot_visual", "slot_animated"}:
+        return True
+
+    return bool(
+        getattr(slot, "weapon", False)
+        or _safe_json_list(getattr(slot, "bound_items_json", ""))
+        or _slot_matches_unmounted_visual_hint(slot)
+    )
+
+
 def _allow_unmounted_slotless_visual(slot, *, attachment_profile=None, item_entity=None):
-    if slot is None or _slot_has_explicit_mount_target(slot):
+    if slot is None:
         return False
 
     if attachment_profile is None and item_entity is not None:
@@ -1795,6 +1821,12 @@ def _allow_unmounted_slotless_visual(slot, *, attachment_profile=None, item_enti
             attachment_profile = import_entity.classify_equipment_attachment_profile(item_entity)
         except Exception:
             attachment_profile = None
+
+    if _allow_w2_visual_without_resolved_mount(slot, attachment_profile=attachment_profile):
+        return True
+
+    if _slot_has_explicit_mount_target(slot):
+        return False
 
     if attachment_profile is not None:
         profile_kind = str(getattr(attachment_profile, "kind", "") or "").strip()
@@ -3219,16 +3251,6 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
             bound_equip_slot = ""
 
         bound_slot_empty = None
-        if bound_equip_slot:
-            bound_slot_empty = find_slot_empty(rig_settings.entity_name, bound_equip_slot, armature)
-            if not bound_slot_empty:
-                bound_slot_empty = _ensure_slot_empty_from_rig(bound_equip_slot, armature, rig_settings)
-            if not bound_slot_empty and slot_empty and slot_empty.get("witcher_slot_name") == bound_equip_slot:
-                bound_slot_empty = slot_empty
-            if not bound_slot_empty:
-                log.warning(
-                    f"Bound item '{bound_name}' requested slot '{bound_equip_slot}' but no slot empty was found"
-                )
 
         bound_item_entity = _get_cached_equipment_item_entity(
             export_path,
@@ -3246,14 +3268,26 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
 
         bound_target_info = {
             "name": bound_equip_slot,
-            "is_valid": bool(bound_slot_empty),
-            "target_type": "slot" if bound_slot_empty else "",
-            "slot_empty": bound_slot_empty,
+            "is_valid": False,
+            "target_type": "",
+            "slot_empty": None,
             "armature": target_armature,
             "bone_name": "",
         }
+        if bound_equip_slot:
+            bound_target_info = _resolve_equipment_mount_target(bound_equip_slot, armature, rig_settings)
+            bound_slot_empty = bound_target_info.get("slot_empty")
+            if bound_target_info.get("armature") is not None:
+                target_armature = bound_target_info.get("armature")
+            if not bound_target_info.get("is_valid"):
+                log_fn = log.debug if source_game == "w2" else log.warning
+                log_fn(
+                    "Bound item '%s' requested target '%s' but no slot or bone was found",
+                    bound_name,
+                    bound_equip_slot,
+                )
         allow_bound_unmounted_visual = (
-            not bound_slot_empty
+            not bound_target_info.get("is_valid")
             and getattr(bound_attachment_profile, "kind", "") != "owner_graph"
         )
         bound_mount_strategy = _infer_equipment_mount_strategy(
@@ -3261,6 +3295,13 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
             bound_target_info,
             allow_unmounted_visual=allow_bound_unmounted_visual,
         )
+        prefixed_animated_binding = (
+            str(attrs.get("attachment_type", "") or "").strip().lower() == "animated"
+            and bool(str(attrs.get("attachment_prefix", "") or "").strip())
+            and getattr(bound_attachment_profile, "kind", "") == "slot_animated"
+        )
+        if prefixed_animated_binding:
+            bound_mount_strategy = "owner_graph_bound"
         bound_bind_armature = _resolve_bound_owner_bind_armature(
             slot,
             armature,
@@ -4337,9 +4378,12 @@ def extract_categories_from_xml(folder_path):
             if not file_name.lower().endswith(".xml"):
                 continue
             file_path = os.path.join(dirpath, file_name)
+            if not _is_plaintext_xml_candidate(file_path):
+                log.debug("Skipping non-text XML file %s", file_path)
+                continue
+            source_game = _source_game_from_xml_path(file_path)
             try:
                 root = _parse_xml_root_with_fallbacks(file_path)
-                source_game = _source_game_from_xml_path(file_path)
 
                 for item in root.findall(".//item"):
                     category = item.get("category")
@@ -4357,6 +4401,7 @@ def extract_categories_from_xml(folder_path):
                     hold_slot = item.get("hold_slot", "")
                     weapon = item.get("weapon", "false").lower() == "true"
                     attachment_type = item.get("attachment_type", "")
+                    attachment_prefix = item.get("attachment_prefix", "")
                     tags_text = ""
                     tags_node = item.find("tags")
                     if tags_node is not None and tags_node.text:
@@ -4424,6 +4469,7 @@ def extract_categories_from_xml(folder_path):
                             'hold_slot': hold_slot,
                             'weapon': weapon,
                             'attachment_type': attachment_type,
+                            'attachment_prefix': attachment_prefix,
                             'variants': variants,
                             'bound_items': bound_items,
                             'tags': tags,
@@ -4432,10 +4478,16 @@ def extract_categories_from_xml(folder_path):
                         }
 
             except (ET.ParseError, ValueError, UnicodeError) as e:
-                log.warning("Error parsing XML %s (%s). Skipping file.", file_path, e)
+                if source_game == "w2":
+                    log.debug("Skipping malformed Witcher 2 XML %s (%s).", file_path, e)
+                else:
+                    log.warning("Error parsing XML %s (%s). Skipping file.", file_path, e)
                 continue
             except Exception as e:
-                log.warning("Unexpected error parsing XML %s (%s). Skipping file.", file_path, e)
+                if source_game == "w2":
+                    log.debug("Skipping Witcher 2 XML %s after unexpected parse error: %s", file_path, e)
+                else:
+                    log.warning("Unexpected error parsing XML %s (%s). Skipping file.", file_path, e)
                 continue
 
     return sorted(category_items.keys()), category_items, item_attributes
@@ -4660,6 +4712,51 @@ def _strip_duplicate_xml_attributes(xml_text):
     return _re.sub(r'<[\w][^>]*>', _fix_tag, xml_text, flags=_re.DOTALL)
 
 
+def _is_plaintext_xml_candidate(file_path):
+    """Return False for packed/binary files that use an .xml extension."""
+    try:
+        with open(file_path, "rb") as f:
+            raw = f.read(512)
+    except Exception:
+        return True
+    if not raw:
+        return False
+    for bom in (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff"):
+        if raw.startswith(bom):
+            raw = raw[len(bom):]
+            break
+    stripped = raw.lstrip(b" \t\r\n\x00")
+    return stripped.startswith((b"<", b"#"))
+
+
+def _parse_xml_text_with_game_fallbacks(text):
+    # ElementTree rejects unicode strings with an XML encoding declaration.
+    text = _XML_DECL_RE.sub("", text, count=1).lstrip("\ufeff")
+    last_exc = None
+    candidates = [text]
+    cleaned = _XML_HASH_COMMENT_LINE_RE.sub("", text)
+    if cleaned != text:
+        candidates.append(cleaned)
+
+    for candidate in candidates:
+        try:
+            return ET.fromstring(candidate)
+        except ET.ParseError as exc:
+            last_exc = exc
+
+        deduped = _strip_duplicate_xml_attributes(candidate)
+        if deduped == candidate:
+            continue
+        try:
+            return ET.fromstring(deduped)
+        except ET.ParseError as exc:
+            last_exc = exc
+
+    if last_exc is not None:
+        raise last_exc
+    raise ET.ParseError("empty XML text")
+
+
 def _parse_xml_root_with_fallbacks(file_path):
     try:
         return ET.parse(file_path).getroot()
@@ -4705,9 +4802,7 @@ def _parse_xml_root_with_fallbacks(file_path):
         tried.add(key)
         try:
             text = raw.decode(encoding)
-            # ElementTree rejects unicode strings with an XML encoding declaration.
-            text = _XML_DECL_RE.sub("", text, count=1).lstrip("\ufeff")
-            return ET.fromstring(text)
+            return _parse_xml_text_with_game_fallbacks(text)
         except Exception as exc:
             last_exc = exc
             continue
@@ -4715,9 +4810,8 @@ def _parse_xml_root_with_fallbacks(file_path):
     # Final fallback: strip duplicate attributes (invalid but present in some game XMLs)
     try:
         text = raw.decode("utf-8", errors="replace")
-        text = _XML_DECL_RE.sub("", text, count=1).lstrip("\ufeff")
         text = _strip_duplicate_xml_attributes(text)
-        return ET.fromstring(text)
+        return _parse_xml_text_with_game_fallbacks(text)
     except Exception as exc:
         last_exc = exc
 

@@ -5,7 +5,7 @@ from ..CR2W.CR2W_helpers import Enums
 from ..CR2W.CR2W_types import Entity_Type_List
 import bpy
 import os
-from ..importers.import_helpers import MatrixToArray, checkLevel, meshPath, set_blender_object_transform, _transform_real
+from ..importers.import_helpers import MatrixToArray, MeshReferenceMissing, checkLevel, meshPath, set_blender_object_transform, _transform_real
 from mathutils import Matrix, Euler
 from math import radians
 import time
@@ -48,7 +48,8 @@ class lightObject:
         self.block = block
         self.BlockDataObjectType = BlockDataObjectType
 
-from ..CR2W.common_blender import repo_file
+from ..CR2W.common_blender import repo_file, win_safe_path
+from ..source_game_paths import resolve_w2_repo_file_from_root
 # def repo_file(filepath: str):
 #     if filepath.endswith('.fbx'):
 #         return os.path.join(bpy.context.preferences.addons['io_import_w2l'].preferences.fbx_uncook_path, filepath)
@@ -69,6 +70,77 @@ def _log_layer_import_complete(level_file, progress_count, errors):
         log.info("Finished layer: %s", level_file)
     else:
         log.info("Layer contained no importable items: %s", level_file)
+
+
+def _mesh_repo_path(mesh) -> str:
+    return str(getattr(mesh, "meshName", "") or "").strip()
+
+
+def _append_import_error(errors, message: str) -> None:
+    if errors is None:
+        return
+    try:
+        errors.append(message)
+    except Exception:
+        pass
+
+
+def _normalize_embedded_cmesh_chunk_index(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        values = sorted({int(index) for index in value if index is not None})
+        if not values:
+            return None
+        if len(values) > 1:
+            raise ValueError(
+                f"embedded_cmesh_chunk_index selects one Witcher 2 CMesh chunk; got {values}"
+            )
+        return values[0]
+    return int(value)
+
+
+def _embedded_cmesh_chunk_index(mesh):
+    value = getattr(mesh, "embedded_cmesh_chunk_index", None)
+    if value is None:
+        value = getattr(mesh, "mesh_chunk_indices", None)
+    return _normalize_embedded_cmesh_chunk_index(value)
+
+
+def _mesh_cr2w_version(mesh, fallback=999):
+    try:
+        return int(getattr(mesh, "cr2w_version", fallback) or fallback)
+    except Exception:
+        try:
+            return int(fallback)
+        except Exception:
+            return 999
+
+
+def _existing_mesh_path_from_explicit_root(mesh_name, mesh, version=999):
+    mesh_name = str(mesh_name or "").replace("/", "\\").lstrip("\\")
+    if not mesh_name or os.path.isabs(mesh_name):
+        return ""
+    root = str(getattr(mesh, "uncook_path", "") or "").strip()
+    if not root:
+        return ""
+    candidate = os.path.join(root, mesh_name)
+    if os.path.exists(win_safe_path(candidate)):
+        return candidate
+    try:
+        if int(version) <= 115:
+            return resolve_w2_repo_file_from_root(mesh_name, root)
+    except Exception:
+        pass
+    return ""
+
+
+def _mesh_scene_repo_key(mesh_name, embedded_cmesh_chunk_index=None):
+    mesh_name = str(mesh_name or "").strip()
+    embedded_cmesh_chunk_index = _normalize_embedded_cmesh_chunk_index(embedded_cmesh_chunk_index)
+    if not mesh_name or embedded_cmesh_chunk_index is None:
+        return mesh_name
+    return f"{mesh_name}#cmesh={embedded_cmesh_chunk_index}"
 
 
 def _layer_load_mode_signature(dev_empty_only=False):
@@ -269,11 +341,13 @@ _CACHED_FULL_LIGHT_ITEM_KINDS = frozenset({
     "component_point_light",
     "component_spot_light",
 })
+_CACHED_FULL_EMPTY_ITEM_KINDS = frozenset({"component_empty"})
 _CACHED_SECTOR_INSTANCER_KINDS = frozenset({"sector_instancer"})
 _CACHED_FULL_ITEM_KINDS = (
     _CACHED_FULL_MESH_ITEM_KINDS
     | _CACHED_REDCLOTH_ITEM_KINDS
     | _CACHED_FULL_LIGHT_ITEM_KINDS
+    | _CACHED_FULL_EMPTY_ITEM_KINDS
     | _CACHED_SECTOR_INSTANCER_KINDS
 )
 _CACHED_FULL_PARENT_ITEM_KINDS = frozenset({"group", "entity"})
@@ -337,6 +411,62 @@ def _component_drawable_flags(component):
     if hasattr(prop, "Value"):
         return getattr(prop, "Value", None)
     return prop
+
+
+def _component_prop_string(component, prop_name):
+    try:
+        prop = component.GetVariableByName(prop_name)
+    except Exception:
+        prop = None
+    if prop is None:
+        return ""
+    try:
+        value = prop.ToString()
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    try:
+        return str(prop.String.String or "").strip()
+    except Exception:
+        return ""
+
+
+def _component_display_label(component):
+    component_name = getattr(component, "name", getattr(component, "Type", "")) or "Component"
+    label = _component_prop_string(component, "name")
+    return f"{component_name} {label}".strip() if label else str(component_name)
+
+
+def _import_meshless_component_empty(component, parent_obj, **kwargs):
+    obj = _create_linked_empty(_component_display_label(component), display_size=0.2)
+    if obj is None:
+        return None
+    if parent_obj is not None:
+        obj.parent = parent_obj
+    try:
+        transform_prop = component.GetVariableByName('transform')
+    except Exception:
+        transform_prop = None
+    if transform_prop is not None:
+        set_blender_object_transform(obj, transform_prop.EngineTransform)
+    component_name = getattr(component, "name", getattr(component, "Type", "")) or "CMeshComponent"
+    try:
+        obj["witcher_type"] = component_name
+        label = _component_prop_string(component, "name")
+        if label:
+            obj["witcher_name"] = label
+        obj["witcher_meshless_component"] = True
+    except Exception:
+        pass
+    _tag_object_tree_for_layer_and_plan(
+        obj,
+        kwargs.get("_layer_import_owner"),
+        kwargs.get("_layer_import_generation"),
+        kwargs.get("_layer_import_plan_item_id"),
+        kwargs.get("_layer_import_plan_mode"),
+    )
+    return obj
 
 
 def _drawable_flags_display_value(flags):
@@ -514,8 +644,9 @@ def _new_mesh_path(
     uncook_path=None,
     transform=False,
     block_data_object_type=Enums.BlockDataObjectType.Mesh,
+    cr2w_version=None,
 ):
-    return meshPath(
+    mesh = meshPath(
         meshName=mesh_name,
         translation=translation,
         matrix=matrix,
@@ -524,13 +655,17 @@ def _new_mesh_path(
         BlockDataObjectType=block_data_object_type,
         uncook_path=uncook_path,
     )
+    if cr2w_version is not None:
+        mesh.cr2w_version = _mesh_cr2w_version(mesh, cr2w_version)
+    return mesh
 
 
 def get_CSectorData(level, *, mesh_fbx_uncook_path=None, mesh_uncook_path=None):
     if level.CSectorData:
+        level_version = getattr(level, "version", None)
         #import entities hold import data
         static_mesh_list = []
-        #meshPath entities hold a transform and componants such as import data
+        # meshPath entities hold a transform and components such as import data.
         # THIS_ENTITY = meshPath("CSectorData_Transform", False, False, fbx_uncook_path, BasicEngineQsTransform())
         # THIS_ENTITY.type = "Entity"
         for idx, block in enumerate(level.CSectorData.BlockData):
@@ -549,6 +684,7 @@ def get_CSectorData(level, *, mesh_fbx_uncook_path=None, mesh_uncook_path=None):
                     MatrixToArray(block.rotationMatrix),
                     fbx_uncook_path=mesh_fbx_uncook_path,
                     uncook_path=mesh_uncook_path,
+                    cr2w_version=level_version,
                 )
                 mesh_item.sector_flags = int(getattr(block, "flags", 0) or 0)
                 mesh_item.proxy_role = _sector_proxy_role_from_flags(mesh_item.sector_flags)
@@ -563,6 +699,7 @@ def get_CSectorData(level, *, mesh_fbx_uncook_path=None, mesh_uncook_path=None):
                     fbx_uncook_path=mesh_fbx_uncook_path,
                     uncook_path=mesh_uncook_path,
                     block_data_object_type=Enums.BlockDataObjectType.RigidBody,
+                    cr2w_version=level_version,
                 )
                 mesh_item.sector_flags = int(getattr(block, "flags", 0) or 0)
                 static_mesh_list.append(mesh_item)
@@ -576,6 +713,7 @@ def get_CSectorData(level, *, mesh_fbx_uncook_path=None, mesh_uncook_path=None):
                     fbx_uncook_path=mesh_fbx_uncook_path,
                     uncook_path=mesh_uncook_path,
                     block_data_object_type=Enums.BlockDataObjectType.Collision,
+                    cr2w_version=level_version,
                 )
                 mesh_item.sector_flags = int(getattr(block, "flags", 0) or 0)
                 static_mesh_list.append(mesh_item)
@@ -825,6 +963,10 @@ def _add_level_import_plan_item(
     source_kind="",
     drawable_flags=None,
     engine_visible=None,
+    embedded_cmesh_chunk_index=None,
+    component_type="",
+    cr2w_version=None,
+    mesh_uncook_path=None,
 ):
     item_kind = str(kind or "unknown").strip() or "unknown"
     item = {
@@ -859,6 +1001,15 @@ def _add_level_import_plan_item(
         item["drawable_flags"] = drawable_flags
     if engine_visible is not None:
         item["engine_visible"] = bool(engine_visible)
+    if component_type:
+        item["component_type"] = str(component_type)
+    if cr2w_version is not None:
+        item["cr2w_version"] = _mesh_cr2w_version(None, cr2w_version)
+    if mesh_uncook_path:
+        item["mesh_uncook_path"] = str(mesh_uncook_path)
+    embedded_cmesh_chunk_index = _normalize_embedded_cmesh_chunk_index(embedded_cmesh_chunk_index)
+    if embedded_cmesh_chunk_index is not None:
+        item["embedded_cmesh_chunk_index"] = embedded_cmesh_chunk_index
     plan["items"].append(item)
     plan["stats"]["total"] = len(plan["items"])
     by_kind = plan["stats"]["by_kind"]
@@ -1159,6 +1310,8 @@ def _cached_plan_item_enabled_by_import_options(item, by_id, kwargs, *, context=
         return bool(kwargs.get("do_import_PointLight", True))
     if kind in {"spot_light", "component_spot_light"}:
         return bool(kwargs.get("do_import_SpotLight", True))
+    if kind in _CACHED_FULL_EMPTY_ITEM_KINDS:
+        return bool(kwargs.get("do_import_Entity", True))
     if kind == "entity_template":
         return bool(kwargs.get("do_import_Entity", True))
     return True
@@ -1407,6 +1560,7 @@ def _cached_plan_mesh_from_item(item, kind, context=None):
         item.get("translation") or False,
         item.get("matrix") or False,
         fbx_uncook_path=fbx_uncook_path,
+        uncook_path=item.get("mesh_uncook_path") or None,
         transform=item.get("transform") or False,
         block_data_object_type=block_type,
     )
@@ -1434,6 +1588,13 @@ def _cached_plan_mesh_from_item(item, kind, context=None):
         mesh.import_name = str(item.get("name", "") or "").strip()
     except Exception:
         pass
+    embedded_cmesh_chunk_index = _normalize_embedded_cmesh_chunk_index(
+        item.get("embedded_cmesh_chunk_index", item.get("mesh_chunk_indices"))
+    )
+    if embedded_cmesh_chunk_index is not None:
+        mesh.embedded_cmesh_chunk_index = embedded_cmesh_chunk_index
+    if item.get("cr2w_version") is not None:
+        mesh.cr2w_version = _mesh_cr2w_version(mesh, item.get("cr2w_version"))
     if kind in {"foliage", "grass"}:
         mesh.type = "mesh_foliage"
     return mesh
@@ -1515,6 +1676,34 @@ def _import_cached_plan_light_item(
     _tag_single_object_for_layer(light_obj, owner_tag, generation_tag)
     _tag_object_tree_for_plan_item(light_obj, item_id, mode_signature)
     return light_obj
+
+
+def _import_cached_plan_empty_item(
+    item,
+    target_collection,
+    parent_obj,
+    owner_tag,
+    generation_tag,
+    item_id,
+    mode_signature,
+):
+    obj = _create_linked_empty(item.get("name", "Component"), target_collection, display_size=0.2)
+    if obj is None:
+        return None
+    if parent_obj is not None:
+        obj.parent = parent_obj
+    _apply_plan_item_transform(obj, item)
+    _tag_single_object_for_layer(obj, owner_tag, generation_tag)
+    _tag_object_tree_for_plan_item(obj, item_id, mode_signature)
+    try:
+        obj["witcher_cached_plan_kind"] = str(item.get("kind", "") or "")
+        obj["witcher_meshless_component"] = True
+        component_type = str(item.get("component_type", "") or "")
+        if component_type:
+            obj["witcher_type"] = component_type
+    except Exception:
+        pass
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -2174,7 +2363,7 @@ def _pick_best_sector_source_mesh(new_objects, parent_root):
     return best
 
 
-def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, errors, mode_signature, item_id):
+def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, errors, mode_signature, item_id, cr2w_version=999, mesh_uncook_path=None):
     """Return the single LOD0 mesh that the GN instancer references for repo_path.
 
     Reuses an already-imported source within the current scene so multiple instancers
@@ -2193,8 +2382,9 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
     src_mesh_data = _new_mesh_path(
         repo_path,
         False, False,
-        uncook_path=kwargs.get("mesh_uncook_path"),
+        uncook_path=mesh_uncook_path or kwargs.get("mesh_uncook_path"),
         fbx_uncook_path=kwargs.get("mesh_fbx_uncook_path"),
+        cr2w_version=cr2w_version,
     )
     mesh_kwargs = dict(kwargs)
     mesh_kwargs.pop("_cached_plan_fast_static_clone", None)
@@ -2301,6 +2491,8 @@ def _import_cached_plan_sector_instancer_item(
             errors,
             mode_signature,
             item_id,
+            cr2w_version=item.get("cr2w_version", 999),
+            mesh_uncook_path=item.get("mesh_uncook_path") or None,
         )
     if src_root is None:
         return None
@@ -2411,6 +2603,9 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 continue
         elif kind in _CACHED_FULL_LIGHT_ITEM_KINDS:
             if not _cached_plan_light_enabled(kind, kwargs):
+                continue
+        elif kind in _CACHED_FULL_EMPTY_ITEM_KINDS:
+            if not bool(kwargs.get("do_import_Entity", True)):
                 continue
         else:
             continue
@@ -2564,6 +2759,26 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
             created[item_id] = root_obj
             imported_count += 1
             light_count += 1
+            continue
+
+        if kind in _CACHED_FULL_EMPTY_ITEM_KINDS:
+            parent_started = time.perf_counter()
+            root_obj = _import_cached_plan_empty_item(
+                item,
+                target_collection,
+                parent_obj,
+                owner_tag,
+                generation_tag,
+                item_id,
+                mode_signature,
+            )
+            parent_seconds += time.perf_counter() - parent_started
+            if root_obj is None:
+                continue
+            loaded_by_id[item_id] = root_obj
+            created[item_id] = root_obj
+            imported_count += 1
+            parent_count += 1
             continue
 
         if kind in _CACHED_REDCLOTH_ITEM_KINDS:
@@ -2750,6 +2965,9 @@ def _maybe_group_cached_items_into_sector_instancers(items, kwargs):
         if parent_id or not repo_path:
             survivors.append(item)
             continue
+        if item.get("embedded_cmesh_chunk_index") is not None or item.get("mesh_chunk_indices"):
+            survivors.append(item)
+            continue
         is_proxy = _cached_plan_item_is_proxy_mesh(item) if kind in {"mesh", "component_mesh"} else False
         if (kind == "mesh" and not is_proxy) or kind in {"rigid", "rigid_body", "collision"}:
             visibility_key = _sector_visibility_key_for_item(kind, item)
@@ -2901,12 +3119,28 @@ def _resolve_component_import_plan(
                 fbx_uncook_path=mesh_fbx_uncook_path,
                 uncook_path=mesh_uncook_path,
             ).static_from_chunk(component)
-        except Exception:
-            log.exception("Problem resolving mesh component %s", component_name)
-            return None
+        except MeshReferenceMissing:
+            drawable_flags = _component_drawable_flags(component)
+            engine_visible = _drawable_flags_visible_from_value(drawable_flags, default=True)
+            return _add_level_import_plan_item(
+                plan,
+                "component_empty",
+                _component_display_label(component),
+                parent_id=parent_id,
+                transform=transform,
+                world_position=world_position,
+                drawable_flags=drawable_flags,
+                engine_visible=engine_visible,
+                component_type=component_name,
+            )
+        except Exception as exc:
+            raise ValueError(f"Problem resolving mesh component {component_name}: {exc}") from exc
+        mesh_path = _mesh_repo_path(mesh)
+        if not mesh_path:
+            raise ValueError(f"{component_name} resolved to an empty mesh path")
         mesh_label = str(getattr(mesh, "name", "") or "").strip()
         if not mesh_label or mesh_label == "Mesh Item":
-            mesh_label = Path(mesh.meshName).stem or component_name
+            mesh_label = Path(mesh_path).stem or component_name
         drawable_flags = _component_drawable_flags(component)
         engine_visible = _drawable_flags_visible_from_value(drawable_flags, default=True)
         return _add_level_import_plan_item(
@@ -2914,14 +3148,17 @@ def _resolve_component_import_plan(
             "component_mesh",
             f"{component_name} {mesh_label}",
             parent_id=parent_id,
-            repo_path=mesh.meshName,
+            repo_path=mesh_path,
             transform=getattr(mesh, "transform", None),
             matrix=getattr(mesh, "matrix", None),
             translation=getattr(mesh, "translation", None),
             world_position=_mesh_world_position(mesh, parent_position),
-            is_proxy_mesh=_path_indicates_proxy_mesh(mesh.meshName, component_name),
+            is_proxy_mesh=_path_indicates_proxy_mesh(mesh_path, component_name),
             drawable_flags=drawable_flags,
             engine_visible=engine_visible,
+            embedded_cmesh_chunk_index=_embedded_cmesh_chunk_index(mesh),
+            cr2w_version=getattr(component, "get_CR2W_version", lambda: 999)(),
+            mesh_uncook_path=mesh_uncook_path,
         )
 
     if component_name == "CPointLightComponent":
@@ -2981,6 +3218,12 @@ def _resolve_gameplay_entity_import_plan(
 
     filtered_mesh_list = []
     for mesh in mesh_list:
+        mesh_path = _mesh_repo_path(mesh)
+        if not mesh_path:
+            raise ValueError(
+                "Gameplay entity mesh resolved to an empty path: "
+                f"{getattr(ENTITY_OBJECT, 'name', '') or getattr(ENTITY_OBJECT, 'type', '')}"
+            )
         if not _position_within_nearby_filter(_mesh_world_position(mesh, anchor_position), nearby_filter):
             _note_nearby_filter_skip(nearby_stats)
             continue
@@ -3025,18 +3268,25 @@ def _resolve_gameplay_entity_import_plan(
     items_before_children = len(plan["items"])
 
     for mesh in mesh_list:
-        is_proxy_mesh = _path_indicates_proxy_mesh(mesh.meshName, "")
+        mesh_path = _mesh_repo_path(mesh)
+        if not mesh_path:
+            raise ValueError(
+                "Gameplay entity mesh resolved to an empty path: "
+                f"{getattr(ENTITY_OBJECT, 'name', '') or getattr(ENTITY_OBJECT, 'type', '')}"
+            )
+        is_proxy_mesh = _path_indicates_proxy_mesh(mesh_path, "")
         _add_level_import_plan_item(
             plan,
             "mesh",
-            Path(mesh.meshName).stem or "Mesh",
+            Path(mesh_path).stem or "Mesh",
             parent_id=entity_id,
-            repo_path=mesh.meshName,
+            repo_path=mesh_path,
             transform=getattr(mesh, "transform", None),
             matrix=getattr(mesh, "matrix", None),
             translation=getattr(mesh, "translation", None),
             world_position=_mesh_world_position(mesh, anchor_position),
             is_proxy_mesh=is_proxy_mesh,
+            embedded_cmesh_chunk_index=_embedded_cmesh_chunk_index(mesh),
         )
 
     for chunk in cloth_list:
@@ -3153,8 +3403,11 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
     nearby_stats = _get_nearby_import_stats(kwargs)
     nearby_stats["filtered"] = 0
     plan = _new_level_import_plan()
-    mesh_fbx_uncook_path = kwargs.get("_mesh_fbx_uncook_path")
-    mesh_uncook_path = kwargs.get("_mesh_uncook_path")
+    level_version = getattr(levelData, "version", 999)
+    mesh_fbx_uncook_path = kwargs.get("_mesh_fbx_uncook_path") or kwargs.get("mesh_fbx_uncook_path")
+    mesh_uncook_path = kwargs.get("_mesh_uncook_path") or kwargs.get("mesh_uncook_path")
+    if not mesh_uncook_path:
+        mesh_uncook_path = _derive_w2_uncook_root_from_level_path(getattr(levelData, "layerNode", ""), level_version)
 
     if levelData.Foliage and do_import_Mesh:
         for treeCollection in (levelData.Foliage.Trees.elements if hasattr(levelData.Foliage, 'Trees') else []):
@@ -3200,6 +3453,9 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
     if mesh_list:
         mesh_candidates = []
         for mesh in mesh_list:
+            mesh_path = _mesh_repo_path(mesh)
+            if not mesh_path:
+                raise ValueError("CSectorData item resolved to an empty mesh path")
             if not _position_within_nearby_filter(_mesh_world_position(mesh), nearby_filter):
                 _note_nearby_filter_skip(nearby_stats)
                 continue
@@ -3220,14 +3476,17 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
             _sector_instancer_groups: dict = {}  # (kind, repo_path, visibility_key) -> [{"t": [...], "m": [...]}, ...]
 
             for mesh in mesh_candidates:
-                is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
+                mesh_path = _mesh_repo_path(mesh)
+                if not mesh_path:
+                    raise ValueError("CSectorData item resolved to an empty mesh path")
+                is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(mesh_path, "")
                 if mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh and (
                     (is_proxy_mesh and proxy_filter_active and do_import_ProxyMesh)
                     or ((not is_proxy_mesh or not proxy_filter_active) and do_import_Mesh)
                 ):
-                    if instanced_sector and not is_proxy_mesh:
+                    if instanced_sector and not is_proxy_mesh and _embedded_cmesh_chunk_index(mesh) is None:
                         # Accumulate for GN instancer instead of individual object
-                        rp = str(mesh.meshName or "").strip()
+                        rp = mesh_path
                         if rp:
                             tv = _extract_vector_position(getattr(mesh, "translation", None))
                             t = list(tv) if tv else [0.0, 0.0, 0.0]
@@ -3239,9 +3498,9 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
                         _add_level_import_plan_item(
                             plan,
                             "mesh",
-                            Path(mesh.meshName).stem or "Mesh",
+                            Path(mesh_path).stem or "Mesh",
                             parent_id=mesh_root_id,
-                            repo_path=mesh.meshName,
+                            repo_path=mesh_path,
                             transform=getattr(mesh, "transform", None),
                             matrix=getattr(mesh, "matrix", None),
                             translation=getattr(mesh, "translation", None),
@@ -3249,10 +3508,13 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
                             is_proxy_mesh=is_proxy_mesh,
                             proxy_role=getattr(mesh, "proxy_role", ""),
                             sector_flags=getattr(mesh, "sector_flags", None),
+                            embedded_cmesh_chunk_index=_embedded_cmesh_chunk_index(mesh),
+                            cr2w_version=level_version,
+                            mesh_uncook_path=mesh_uncook_path,
                         )
                 elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
-                    if instanced_sector:
-                        rp = str(mesh.meshName or "").strip()
+                    if instanced_sector and _embedded_cmesh_chunk_index(mesh) is None:
+                        rp = mesh_path
                         if rp:
                             tv = _extract_vector_position(getattr(mesh, "translation", None))
                             t = list(tv) if tv else [0.0, 0.0, 0.0]
@@ -3263,17 +3525,20 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
                         _add_level_import_plan_item(
                             plan,
                             "collision",
-                            Path(mesh.meshName).stem or "Collision",
+                            Path(mesh_path).stem or "Collision",
                             parent_id=collision_root_id,
-                            repo_path=mesh.meshName,
+                            repo_path=mesh_path,
                             transform=getattr(mesh, "transform", None),
                             matrix=getattr(mesh, "matrix", None),
                             translation=getattr(mesh, "translation", None),
                             world_position=_mesh_world_position(mesh),
+                            embedded_cmesh_chunk_index=_embedded_cmesh_chunk_index(mesh),
+                            cr2w_version=level_version,
+                            mesh_uncook_path=mesh_uncook_path,
                         )
                 elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
-                    if instanced_sector:
-                        rp = str(mesh.meshName or "").strip()
+                    if instanced_sector and _embedded_cmesh_chunk_index(mesh) is None:
+                        rp = mesh_path
                         if rp:
                             tv = _extract_vector_position(getattr(mesh, "translation", None))
                             t = list(tv) if tv else [0.0, 0.0, 0.0]
@@ -3285,14 +3550,17 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
                         _add_level_import_plan_item(
                             plan,
                             "rigid_body",
-                            Path(mesh.meshName).stem or "RigidBody",
+                            Path(mesh_path).stem or "RigidBody",
                             parent_id=rigid_root_id,
-                            repo_path=mesh.meshName,
+                            repo_path=mesh_path,
                             transform=getattr(mesh, "transform", None),
                             matrix=getattr(mesh, "matrix", None),
                             translation=getattr(mesh, "translation", None),
                             world_position=_mesh_world_position(mesh),
                             sector_flags=getattr(mesh, "sector_flags", None),
+                            embedded_cmesh_chunk_index=_embedded_cmesh_chunk_index(mesh),
+                            cr2w_version=level_version,
+                            mesh_uncook_path=mesh_uncook_path,
                         )
                 elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
                     _add_level_import_plan_item(
@@ -3335,6 +3603,8 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
                     sector_visibility_key=vis_key,
                     sector_visible=(vis_key != "hidden"),
                     source_kind=si_kind,
+                    cr2w_version=level_version,
+                    mesh_uncook_path=mesh_uncook_path,
                 )
 
     if do_import_Entity:
@@ -3439,6 +3709,23 @@ def _normalize_level_repo_path(level_path, context=None):
         if norm_path.lower().startswith(prefix.lower()):
             return norm_path[len(prefix):]
     return norm_path
+
+
+def _derive_w2_uncook_root_from_level_path(level_path, version=999):
+    try:
+        if int(version) > 115:
+            return ""
+    except Exception:
+        return ""
+    norm_path = _normalize_repo_path(level_path)
+    if not norm_path or not os.path.isabs(norm_path):
+        return ""
+    marker = "\\levels\\"
+    marker_index = norm_path.lower().find(marker)
+    if marker_index <= 0:
+        return ""
+    root = norm_path[:marker_index].rstrip("\\")
+    return root if os.path.isdir(win_safe_path(root)) else ""
 
 
 def _get_layer_import_owner_tag(level_path, context=None):
@@ -3795,6 +4082,14 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
     #     if len(o.name) > 4 and o.name[-4] != "." and 'repo_path' in o:
     #         repo_lookup_list[o['repo_path']].append(o)
     levelFile = levelData.layerNode
+    level_version = getattr(levelData, "version", 999)
+    mesh_uncook_path = kwargs.get("_mesh_uncook_path") or kwargs.get("mesh_uncook_path") or ""
+    if not mesh_uncook_path:
+        mesh_uncook_path = _derive_w2_uncook_root_from_level_path(levelFile, level_version)
+    if mesh_uncook_path:
+        kwargs["_mesh_uncook_path"] = mesh_uncook_path
+        kwargs["mesh_uncook_path"] = mesh_uncook_path
+    mesh_fbx_uncook_path = kwargs.get("_mesh_fbx_uncook_path") or kwargs.get("mesh_fbx_uncook_path")
     if target_collection is None:
         target_collection = _ensure_level_collection(levelFile, context)
     kwargs["_level_target_collection"] = target_collection
@@ -3885,11 +4180,18 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                             import_single_mesh(tree_mesh, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
                             progress_count += 1
 
-                mesh_list = get_CSectorData(levelData)
+                mesh_list = get_CSectorData(
+                    levelData,
+                    mesh_fbx_uncook_path=mesh_fbx_uncook_path,
+                    mesh_uncook_path=mesh_uncook_path or None,
+                )
                 if mesh_list:
                     mesh_candidates = []
                     for mesh in mesh_list:
                         _raise_if_layer_import_cancelled(kwargs)
+                        mesh_path = _mesh_repo_path(mesh)
+                        if not mesh_path:
+                            raise ValueError("CSectorData item resolved to an empty mesh path")
                         if not _position_within_nearby_filter(_mesh_world_position(mesh), nearby_filter):
                             _note_nearby_filter_skip(nearby_stats)
                             continue
@@ -3934,12 +4236,17 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                             mesh: meshPath
                             for idx, mesh in enumerate(mesh_candidates):
                                 _raise_if_layer_import_cancelled(kwargs)
-                                is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
+                                mesh_path = _mesh_repo_path(mesh)
+                                if not mesh_path:
+                                    raise ValueError("CSectorData item resolved to an empty mesh path")
+                                is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(mesh_path, "")
+                                selected_cmesh_chunk_index = _embedded_cmesh_chunk_index(mesh)
                                 if (
                                     mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
                                     and not is_proxy_mesh and do_import_Mesh
+                                    and selected_cmesh_chunk_index is None
                                 ):
-                                    rp = str(mesh.meshName or "").strip()
+                                    rp = mesh_path
                                     if rp:
                                         tv = _extract_vector_position(getattr(mesh, "translation", None))
                                         t = list(tv) if tv else [0.0, 0.0, 0.0]
@@ -3949,6 +4256,17 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                                         instancer_groups.setdefault(("mesh", rp, vis_key), []).append({"t": t, "m": m})
                                 elif (
                                     mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
+                                    and not is_proxy_mesh and do_import_Mesh
+                                ):
+                                    import_single_mesh(
+                                        mesh,
+                                        errors,
+                                        Mesh_transform,
+                                        keep_lod_meshes=keep_lod_meshes,
+                                        **kwargs,
+                                    )
+                                elif (
+                                    mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
                                     and is_proxy_mesh and proxy_filter_active and do_import_ProxyMesh
                                 ):
                                     import_single_mesh(
@@ -3956,8 +4274,8 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                                         keep_lod_meshes=keep_lod_meshes or bool(kwargs.get("keep_proxy_meshes", True)),
                                         **kwargs,
                                     )
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
-                                    rp = str(mesh.meshName or "").strip()
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody and selected_cmesh_chunk_index is None:
+                                    rp = mesh_path
                                     if rp:
                                         tv = _extract_vector_position(getattr(mesh, "translation", None))
                                         t = list(tv) if tv else [0.0, 0.0, 0.0]
@@ -3965,14 +4283,18 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                                         m = [list(r) for r in m] if m else None
                                         vis_key = _sector_visibility_key_from_flags(getattr(mesh, "sector_flags", None), default=True)
                                         instancer_groups.setdefault(("rigid", rp, vis_key), []).append({"t": t, "m": m})
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
-                                    rp = str(mesh.meshName or "").strip()
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
+                                    import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision and selected_cmesh_chunk_index is None:
+                                    rp = mesh_path
                                     if rp:
                                         tv = _extract_vector_position(getattr(mesh, "translation", None))
                                         t = list(tv) if tv else [0.0, 0.0, 0.0]
                                         m = _copy_matrix_array(getattr(mesh, "matrix", None))
                                         m = [list(r) for r in m] if m else None
                                         instancer_groups.setdefault(("collision", rp, ""), []).append({"t": t, "m": m})
+                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
+                                    _import_sector_collision_from_cache(mesh, errors, Collision_transform, **kwargs)
                                 elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
                                     import_light(mesh, PointLight_transform)
                                 elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.SpotLight and do_import_SpotLight:
@@ -4011,8 +4333,11 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                             mesh: meshPath
                             for idx, mesh in enumerate(mesh_candidates):
                                 _raise_if_layer_import_cancelled(kwargs)
-                                progress_msg = f"{idx+1}/{total_loops} - {os.path.basename(mesh.meshName)}"
-                                is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
+                                mesh_path = _mesh_repo_path(mesh)
+                                if not mesh_path:
+                                    raise ValueError("CSectorData item resolved to an empty mesh path")
+                                progress_msg = f"{idx+1}/{total_loops} - {os.path.basename(mesh_path)}"
+                                is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(mesh_path, "")
                                 if (
                                     mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
                                     and ((is_proxy_mesh and proxy_filter_active and do_import_ProxyMesh) or ((not is_proxy_mesh or not proxy_filter_active) and do_import_Mesh))
@@ -4572,7 +4897,28 @@ def _import_foliage_mesh(mesh: meshPath):
 def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod_meshes = False, version = 999, **kwargs):
     _raise_if_layer_import_cancelled(kwargs)
     mesh_started = time.perf_counter()
-    use_fbx = get_use_fbx_repo(bpy.context)
+    try:
+        requested_version = int(version)
+    except Exception:
+        requested_version = 999
+    if requested_version == 999:
+        version = _mesh_cr2w_version(mesh, kwargs.get("cr2w_version", requested_version))
+    else:
+        version = requested_version
+    mesh_name = _mesh_repo_path(mesh)
+    if not mesh_name:
+        label = str(getattr(mesh, "name", "") or getattr(mesh, "type", "") or "mesh")
+        message = f"Mesh import has an empty mesh path ({label})"
+        log.error(message)
+        _append_import_error(errors, message)
+        raise ValueError(message)
+    try:
+        mesh.meshName = mesh_name
+    except Exception:
+        pass
+    embedded_cmesh_chunk_index = _embedded_cmesh_chunk_index(mesh)
+    scene_repo_key = _mesh_scene_repo_key(mesh_name, embedded_cmesh_chunk_index)
+    use_fbx = get_use_fbx_repo(bpy.context) and embedded_cmesh_chunk_index is None
     import_seconds = 0.0
     finalize_seconds = 0.0
     transform_seconds = 0.0
@@ -4580,7 +4926,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
     reused_existing = False
 
     obj = check_if_empty_already_in_scene(
-        mesh.meshName,
+        scene_repo_key,
         fast_static_clone=bool(kwargs.get("_cached_plan_fast_static_clone", False)),
     )
     # if keep_lod_meshes:
@@ -4589,6 +4935,22 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
     #     obj = check_if_mesh_already_in_scene(mesh.meshName)
     #obj = False
     if not obj:
+        resolved_cr2w_path = None
+        if getattr(mesh, "type", "") != "mesh_foliage" and not use_fbx:
+            resolved_cr2w_path = _existing_mesh_path_from_explicit_root(mesh_name, mesh, version)
+            if not resolved_cr2w_path:
+                try:
+                    resolved_cr2w_path = repo_file(mesh_name, version)
+                except Exception as exc:
+                    message = f"Mesh import path could not be resolved {mesh_name}: {exc}"
+                    log.error(message)
+                    _append_import_error(errors, message)
+                    raise
+            if not resolved_cr2w_path or not os.path.exists(win_safe_path(resolved_cr2w_path)):
+                message = f"Mesh file does not exist: {mesh_name} -> {resolved_cr2w_path}"
+                log.error(message)
+                _append_import_error(errors, message)
+                raise FileNotFoundError(message)
         # if keep_lod_meshes:
         #     bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
         #     obj = bpy.context.object
@@ -4597,7 +4959,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
         obj = bpy.context.object
         try:
             import_started = time.perf_counter()
-            if mesh.type == "mesh_foliage":
+            if getattr(mesh, "type", "") == "mesh_foliage":
                 backend = "foliage"
                 _import_foliage_mesh(mesh)
             else:
@@ -4606,7 +4968,13 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
                     fbx_util.importFbx(mesh.fbxPath(),mesh.fileName(),mesh.fileName(), keep_lod_meshes=keep_lod_meshes)
                 elif not use_fbx:
                     backend = "cr2w"
-                    import_mesh.import_mesh(repo_file(mesh.meshName, version), keep_lod_meshes = keep_lod_meshes, keep_empty_lods = kwargs.get('keep_empty_lods', False), keep_proxy_meshes = kwargs.get('keep_proxy_meshes', False))
+                    import_mesh.import_mesh(
+                        resolved_cr2w_path,
+                        keep_lod_meshes=keep_lod_meshes,
+                        keep_empty_lods=kwargs.get('keep_empty_lods', False),
+                        keep_proxy_meshes=kwargs.get('keep_proxy_meshes', False),
+                        embedded_cmesh_chunk_index=embedded_cmesh_chunk_index,
+                    )
                 else:
                     backend = "fallback_cube"
                     log.warning("Can't find FBX file %s", mesh.fbxPath())
@@ -4637,7 +5005,10 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
             #if keep_lod_meshes:
             import_name = str(getattr(mesh, "import_name", "") or "").strip()
             obj.name = import_name or Path(mesh.meshName).stem
-            obj['repo_path'] = mesh.meshName
+            obj['repo_path'] = scene_repo_key
+            if embedded_cmesh_chunk_index is not None:
+                obj['witcher_source_mesh_path'] = mesh.meshName
+                obj['witcher_embedded_cmesh_chunk_index'] = embedded_cmesh_chunk_index
             for subobj in objs:
                 if subobj == obj:
                     continue
@@ -4780,7 +5151,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
             finalize_seconds,
             transform_seconds,
             "yes" if reused_existing else "no",
-            mesh.type,
+            getattr(mesh, "type", ""),
         )
     return obj
 
@@ -4809,10 +5180,16 @@ def getDataBufferMesh(entity, *, mesh_fbx_uncook_path=None, mesh_uncook_path=Non
             if chunk.name in Entity_Type_List:
                 log.info("Found an entity in data buffer??")
             if chunk.name in MeshComponent_Type_List:
-                mesh = _new_mesh_path(
-                    fbx_uncook_path=mesh_fbx_uncook_path,
-                    uncook_path=mesh_uncook_path,
-                ).static_from_chunk(chunk)
+                try:
+                    mesh = _new_mesh_path(
+                        fbx_uncook_path=mesh_fbx_uncook_path,
+                        uncook_path=mesh_uncook_path,
+                        cr2w_version=getattr(chunk, "get_CR2W_version", lambda: 999)(),
+                    ).static_from_chunk(chunk)
+                except Exception as exc:
+                    raise ValueError(f"Unable to resolve streamingDataBuffer mesh {chunk.name}: {exc}") from exc
+                if not _mesh_repo_path(mesh):
+                    raise ValueError(f"streamingDataBuffer mesh {chunk.name} resolved to an empty mesh path")
                 drawable_flags = _component_drawable_flags(chunk)
                 mesh.drawable_flags = drawable_flags
                 mesh.engine_visible = _drawable_flags_visible_from_value(drawable_flags, default=True)
@@ -4828,23 +5205,30 @@ from .. import get_witcher2_game_path
 def import_single_component(component, parent_obj, keep_lod_meshes = False, **kwargs):
     if component.name == "CMeshComponent" or component.name == "CStaticMeshComponent":
         try:
-            mesh = meshPath(fbx_uncook_path = get_fbx_uncook_path(bpy.context)).static_from_chunk(component)
-            is_proxy_mesh = _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
+            mesh = _new_mesh_path(
+                fbx_uncook_path=get_fbx_uncook_path(bpy.context),
+                uncook_path=kwargs.get("_mesh_uncook_path") or kwargs.get("mesh_uncook_path"),
+                cr2w_version=getattr(component, "get_CR2W_version", lambda: 999)(),
+            ).static_from_chunk(component)
+            mesh_path = _mesh_repo_path(mesh)
+            if not mesh_path:
+                raise ValueError(f"{component.name} resolved to an empty mesh path")
+            is_proxy_mesh = _path_indicates_proxy_mesh(mesh_path, "")
             if is_proxy_mesh and _proxy_mesh_filter_active(kwargs):
                 if not bool(kwargs.get("do_import_ProxyMesh", False)):
-                    return
+                    return None
             elif not bool(kwargs.get("do_import_Mesh", True)):
-                return
+                return None
             # if component.get_CR2W_version() <= 115:
             #     mesh.uncook_path = get_witcher2_game_path(bpy.context) + '\\data'
             mesh_label = str(getattr(mesh, "name", "") or "").strip()
             if not mesh_label or mesh_label == "Mesh Item":
-                mesh_label = Path(mesh.meshName).stem or component.name
+                mesh_label = Path(mesh_path).stem or component.name
             drawable_flags = _component_drawable_flags(component)
             mesh.drawable_flags = drawable_flags
             mesh.engine_visible = _drawable_flags_visible_from_value(drawable_flags, default=True)
             mesh.import_name = f"{component.name} {mesh_label}"
-            import_single_mesh(
+            return import_single_mesh(
                 mesh,
                 [],
                 parent_obj,
@@ -4852,8 +5236,12 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False, **kw
                 version=component.get_CR2W_version(),
                 **kwargs,
             )
+        except MeshReferenceMissing as exc:
+            log.debug("Importing meshless %s as empty: %s", component.name, exc)
+            return _import_meshless_component_empty(component, parent_obj, **kwargs)
         except Exception as e:
-            log.critical('import_single_component mesh fail') #w2 has embedded here??
+            log.exception("import_single_component mesh fail: %s", e) #w2 has embedded here??
+            raise
     elif component.name == "CPointLightComponent":
         if not bool(kwargs.get("do_import_PointLight", True)):
             return
@@ -4881,6 +5269,7 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False, **kw
             light_obj.data.shadow_soft_size = RADIUS.Value
         if component.GetVariableByName('transform'):
             set_blender_object_transform(light_obj, component.GetVariableByName('transform').EngineTransform)
+        return light_obj
     
     elif component.name == "CSpotLightComponent":
         if not bool(kwargs.get("do_import_SpotLight", True)):
@@ -4916,12 +5305,17 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False, **kw
         light_obj.data.spot_blend = 0
         light_obj.data.spot_size = component.GetVariableByName('outerAngle').Value
         #light_obj.data.spot_size = component.GetVariableByName('softness').Value
+        return light_obj
 
 def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_meshes = False, **kwargs):
     _raise_if_layer_import_cancelled(kwargs)
     entity_started = time.perf_counter()
     try:
-        (mesh_list, cloth_list) = getDataBufferMesh(ENTITY_OBJECT)
+        (mesh_list, cloth_list) = getDataBufferMesh(
+            ENTITY_OBJECT,
+            mesh_fbx_uncook_path=kwargs.get("_mesh_fbx_uncook_path") or kwargs.get("mesh_fbx_uncook_path"),
+            mesh_uncook_path=kwargs.get("_mesh_uncook_path") or kwargs.get("mesh_uncook_path"),
+        )
     except Exception as e:
         raise e
     nearby_filter = _get_nearby_import_filter(kwargs)
@@ -4944,11 +5338,17 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
     filtered_mesh_list = []
     for mesh in mesh_list:
         _raise_if_layer_import_cancelled(kwargs)
+        mesh_path = _mesh_repo_path(mesh)
+        if not mesh_path:
+            raise ValueError(
+                "Gameplay entity mesh resolved to an empty path: "
+                f"{getattr(ENTITY_OBJECT, 'name', '') or getattr(ENTITY_OBJECT, 'type', '')}"
+            )
         try:
             mesh_file_name = mesh.fileName() if callable(getattr(mesh, "fileName", None)) else ""
         except Exception:
             mesh_file_name = ""
-        is_proxy_mesh = _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), mesh_file_name)
+        is_proxy_mesh = _path_indicates_proxy_mesh(mesh_path, mesh_file_name)
         if is_proxy_mesh and proxy_filter_active:
             if not do_import_proxy_mesh:
                 continue
@@ -5020,8 +5420,9 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
     if mesh_list:
         for mesh in mesh_list:
             _raise_if_layer_import_cancelled(kwargs)
-            import_single_mesh(mesh, errors, empty_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-            imported_any = True
+            imported_mesh = import_single_mesh(mesh, errors, empty_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
+            if imported_mesh is not None:
+                imported_any = True
     if cloth_list:
         from ..importers import import_entity
         target_collection = entity_target_collection or _get_active_collection()
@@ -5077,8 +5478,9 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
     
     for component in eligible_components:
         _raise_if_layer_import_cancelled(kwargs)
-        import_single_component(component, empty_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-        imported_any = True
+        imported_component = import_single_component(component, empty_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
+        if imported_component is not None:
+            imported_any = True
     _tag_entity_empty_engine_visibility_from_children(empty_transform, kwargs)
     #MESH THIS ENTITY HAS
     # for mesh in ENTITY_OBJECT.static_mesh_list:
@@ -5093,8 +5495,9 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
             if _position_within_nearby_filter(entity_world_position, nearby_filter):
                 from ..importers import import_entity
                 ent_template = import_entity.import_ent_template(ENTITY_OBJECT.template.layerNode, False, 0, empty_transform)
-                ent_template.parent = empty_transform
-                imported_any = True
+                if ent_template is not None:
+                    ent_template.parent = empty_transform
+                    imported_any = True
             else:
                 _note_nearby_filter_skip(nearby_stats)
             pass

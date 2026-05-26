@@ -178,6 +178,47 @@ def _mesh_data_debug_summary(mesh_data):
     )
 
 
+def _sanitize_mesh_faces_for_import(mesh_data):
+    verts = getattr(mesh_data, "vertex3DCoords", None) or []
+    faces = getattr(mesh_data, "faces", None) or []
+    vert_count = len(verts)
+    if not faces:
+        return 0
+
+    valid_faces = []
+    dropped = 0
+    for face in faces:
+        try:
+            clean_face = [int(idx) for idx in face]
+        except Exception:
+            dropped += 1
+            continue
+        if len(clean_face) != 3 or len(set(clean_face)) < 3:
+            dropped += 1
+            continue
+        if any(idx < 0 or idx >= vert_count for idx in clean_face):
+            dropped += 1
+            continue
+        valid_faces.append(clean_face)
+
+    if dropped:
+        mesh_data.faces = valid_faces
+    return dropped
+
+
+def _mesh_vertices_are_importable(mesh_data):
+    verts = getattr(mesh_data, "vertex3DCoords", None) or []
+    for vert in verts:
+        try:
+            if len(vert) < 3:
+                return False
+            if not all(math.isfinite(float(vert[idx])) for idx in range(3)):
+                return False
+        except Exception:
+            return False
+    return True
+
+
 def _normalize_vector3(value, fallback):
     x = float(value[0])
     y = float(value[1])
@@ -541,9 +582,9 @@ def get_repo_from_abs_path(file_path):
     UNCOOK_DIR = get_uncook_path(bpy.context)
     MOD_DIR = get_mod_directory(bpy.context)
     MOD_TEX_PATH = get_modded_texture_path(bpy.context)
-    addon_prefs = get_all_addon_prefs(bpy.context)
     W2_UNCOOK_DIR = get_w2_unbundle_path(bpy.context)
     W2_GAME_DIR = get_witcher2_game_path(bpy.context)
+    addon_prefs = get_all_addon_prefs(bpy.context)
 
     def _try_strip(path, root):
         root = os.path.realpath(bpy.path.abspath(root)) if root else ""
@@ -671,6 +712,21 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
             mat_id,
             _mesh_data_debug_summary(meshDataBl),
         )
+        if not _mesh_vertices_are_importable(meshDataBl):
+            log.warning(
+                "Skipping submesh[%d] '%s' because parsed vertex coordinates are invalid.",
+                idx,
+                meshName,
+            )
+            continue
+        dropped_faces = _sanitize_mesh_faces_for_import(meshDataBl)
+        if dropped_faces:
+            log.warning(
+                "Dropped %d invalid faces from submesh[%d] '%s' before Blender mesh creation.",
+                dropped_faces,
+                idx,
+                meshName,
+            )
         
         if not keep_lod_meshes and lod_level > 0 and "proxy" not in meshName:
             log.debug(
@@ -1082,14 +1138,19 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
 def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_normals:bool):
     if True: #try:
         import bpy
+        def _diag(msg):
+            log.debug("do_blender_mesh_import[%s]: %s", CData.modelName, msg)
+        _diag(f"START verts={len(meshDataBl.vertex3DCoords)} faces={len(meshDataBl.faces)} "
+              f"normalsAll={len(meshDataBl.normalsAll)} skinningVerts={len(meshDataBl.skinningVerts)} "
+              f"jointNames={len(CData.boneData.jointNames)} BIMBI={len(CData.boneData.BoneIndecesMappingBoneIndex)}")
         name = CData.modelName+"_Mesh"
         mesh = bpy.data.meshes.new(name)
         mesh_ob = bpy.data.objects.new(name, mesh)
-        #col = bpy.data.collections.get("Collection")
-        #col.objects.link(obj)
         bpy.context.collection.objects.link(mesh_ob)
         bpy.context.view_layer.objects.active = mesh_ob
+        _diag("BEFORE from_pydata")
         mesh.from_pydata(meshDataBl.vertex3DCoords, [], meshDataBl.faces)
+        _diag(f"AFTER from_pydata (loops={len(mesh.loops)} polys={len(mesh.polygons)})")
         
         #=========#
         #    UV   #
@@ -1112,7 +1173,9 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
         )
         if CData.useExtraStreams or has_meaningful_uv2:
             allUVMaps.append(("SecondUV", uv2_data))
+        _diag(f"BEFORE UV loop (count={len(allUVMaps)})")
         for uv_name, uv_data in allUVMaps:
+            _diag(f"  UV: {uv_name} data_len={len(uv_data)}")
             uv_layer = mesh.uv_layers.new(name=uv_name)
             # Build flat UV array mapped from loop -> vertex using foreach_set
             loop_count = len(mesh.loops)
@@ -1121,6 +1184,7 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
             uv_arr = np.array(uv_data, dtype=np.float64)
             flat_uvs = uv_arr[loop_vert_indices].ravel()
             uv_layer.data.foreach_set("uv", flat_uvs)
+        _diag("AFTER UV loop")
         if mesh.uv_layers.get("DiffuseUV"):
             # Keep export behavior deterministic: UV0 comes from DiffuseUV.
             diffuse_uv = mesh.uv_layers["DiffuseUV"]
@@ -1189,6 +1253,7 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
                 #mesh.show_edge_sharp = True  # optionnal
                 mesh.free_normals_split()
             else:
+                _diag(f"BEFORE normals path (4.1+) normalsAll={len(meshDataBl.normalsAll)}")
                 mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
 
                 # Build per-vertex normals array and normalize
@@ -1235,7 +1300,9 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
                     the_custom_normals = []
 
                 if the_custom_normals:
+                    _diag(f"BEFORE normals_split_custom_set count={len(the_custom_normals)}")
                     mesh.normals_split_custom_set(the_custom_normals)
+                    _diag("AFTER normals_split_custom_set")
         else:
             mesh_da = mesh
             if bpy.app.version < (4, 1, 0):
@@ -1274,11 +1341,13 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
                     break
 
         #todo check skinning verts for any groups that are not created for some reason
+        _diag(f"BEFORE vertex_groups create (sorted_array={len(sorted_array)})")
         for group_name in sorted_array:
             try:
                 mesh_ob.vertex_groups.new(name=group_name)
             except Exception as e:
                 log.error("Error creating vertex group: %s", e)
+        _diag(f"BEFORE assignVertexGroup loop (skinningVerts={len(meshDataBl.skinningVerts)})")
         for vert in meshDataBl.skinningVerts:
             try:
                 assignVertexGroup(vert, CData, mesh_ob)
@@ -1286,7 +1355,7 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
                 if _derive_mesh_is_static(CData):
                     log.critical('found skinning verts on static mesh')
                     break
-
+        _diag("END do_blender_mesh_import")
         return mesh_ob
     # except Exception as e:
     #     log.warning("Not in Blender")

@@ -214,6 +214,11 @@ class ListItemAnimset(PropertyGroup):
            description="Entity component targeted by this animation set",
            default="")
 
+    source_game: StringProperty(
+           name="Source Game",
+           description="Source game for this animation set path",
+           default="w3")
+
 
 class ListItemApp(PropertyGroup):
     """Group of properties representing an item in the list."""

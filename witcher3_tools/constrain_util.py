@@ -17,7 +17,10 @@ _MESH_COMPONENT_ARMATURE_TYPES = {
 
 
 def _normalized_bone_name(name):
-    return file_helpers.rm_ns(name or "")
+    name = file_helpers.rm_ns(name or "")
+    if name.startswith("item_"):
+        return name[5:]
+    return name
 
 
 def _normalized_object_path(obj):
@@ -306,11 +309,11 @@ def CreateConstraints2(arm_parent: bpy.types.Object, arm_child:bpy.types.Object,
     
     for tgt_parent_bone in arm_parent.pose.bones:
         tgt_child_bone = False
-        p_bone_name = file_helpers.rm_ns(tgt_parent_bone.name)
+        p_bone_name = _normalized_bone_name(tgt_parent_bone.name)
         #print(p_bone_name)
 
         for cBone in arm_child.pose.bones:
-            c_bone_name = file_helpers.rm_ns(cBone.name)
+            c_bone_name = _normalized_bone_name(cBone.name)
             if c_bone_name == p_bone_name:
                 tgt_child_bone = cBone
         #some positions of the face rig of a character don't match

@@ -3,8 +3,13 @@ from pathlib import Path
 from .. import import_anims
 #from io_import_w2l.filter_list import memory
 log = logging.getLogger(__name__)
-from ..CR2W.common_blender import repo_file
 from ..CR2W.dc_anims import load_bin_anims_single
+from ..source_game_paths import (
+    normalize_source_game,
+    repo_file_for_source,
+    source_game_for_rig_settings,
+    source_roots,
+)
 
 import csv
 import os
@@ -18,7 +23,6 @@ from bpy.props import (
     StringProperty,
     PointerProperty,
 )
-from .. import get_uncook_path
 from ..ui.armature_context import get_main_armature, set_main_armature
 from ..CR2W.scene_csv_utils import (
     _lookup_dialogset_body_anim,
@@ -35,6 +39,18 @@ DIALOGSET_BODY_TRACK = "SceneDialogsetIdle"
 _DIALOGSET_BODY_ITEMS_CACHE = None
 _DIALOGSET_BODY_RESOLVE_CACHE = {}
 _UPDATING_DIALOGSET_BODY = False
+
+
+def _source_game_for_armature_obj(armature_obj, fallback="w3"):
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    rig_value = str(getattr(rig_settings, "source_game", "") or "").strip() if rig_settings else ""
+    if rig_value:
+        return source_game_for_rig_settings(rig_settings, fallback=fallback)
+    try:
+        obj_value = str(armature_obj.get("witcher_source_game", "") or "").strip()
+    except Exception:
+        obj_value = ""
+    return normalize_source_game(obj_value or fallback)
 
 
 def _resolve_main_armature(context, main_arm_obj=None):
@@ -638,7 +654,7 @@ def _resolve_entity_rig_path(main_arm_obj):
     if not skeleton_path:
         return None
     try:
-        return repo_file(skeleton_path)
+        return repo_file_for_source(skeleton_path, _source_game_for_armature_obj(main_arm_obj))
     except Exception:
         return None
 
@@ -679,18 +695,20 @@ def _resolve_face_rig_path(main_arm_obj, target_armatures):
     if main_arm_obj:
         candidates.append(main_arm_obj)
     candidates.extend(target_armatures or [])
+    main_source_game = _source_game_for_armature_obj(main_arm_obj)
     for armature_obj in _unique_armatures(candidates):
         mimic_face_file = str(armature_obj.get("mimicFaceFile", "") or "").strip()
+        source_game = _source_game_for_armature_obj(armature_obj, fallback=main_source_game)
         if mimic_face_file:
             try:
-                return repo_file(mimic_face_file)
+                return repo_file_for_source(mimic_face_file, source_game)
             except Exception:
                 pass
         rig_settings = getattr(armature_obj.data, "witcherui_RigSettings", None)
         skeleton_path = str(getattr(rig_settings, "main_face_skeleton", "") or "").strip() if rig_settings else ""
         if skeleton_path:
             try:
-                return repo_file(skeleton_path)
+                return repo_file_for_source(skeleton_path, source_game)
             except Exception:
                 pass
     return None
@@ -781,9 +799,14 @@ def _get_quick_anim_source_key(main_arm_obj, show_all=False):
     rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
     if rig_settings is None:
         return ("__show_all__",)
-    anim_paths = tuple(set.path for set in rig_settings.animset_list if ":" not in set.path)
+    anim_paths = tuple(
+        (set.path, normalize_source_game(getattr(set, "source_game", "") or getattr(rig_settings, "source_game", "w3")))
+        for set in rig_settings.animset_list
+        if ":" not in set.path
+    )
     return (
         main_arm_obj.name,
+        _source_game_for_armature_obj(main_arm_obj),
         getattr(rig_settings, "main_entity_skeleton", ""),
         getattr(rig_settings, "main_face_skeleton", ""),
         anim_paths,
@@ -874,7 +897,7 @@ def _load_selected_quick_anim(context):
     anim_name, fdir = manager.getAnimationName(anim_id)
     if not anim_name or not fdir:
         return False
-    fdir_abs = repo_file(fdir)
+    fdir_abs = repo_file_for_source(fdir, _source_game_for_armature_obj(main_arm_obj))
     _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
     _nla_mode = _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
     load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj, nla_mode=_nla_mode)
@@ -1041,21 +1064,25 @@ def _face_rig_path_for_armature(main_arm_obj):
     if not face_skeleton:
         return None
     try:
-        return repo_file(face_skeleton)
+        return repo_file_for_source(face_skeleton, _source_game_for_armature_obj(main_arm_obj))
     except Exception:
         return None
 
 
-def _resolve_animset_abs_path(repo_path):
+def _resolve_animset_abs_path(repo_path, source_game=""):
     repo_path = str(repo_path or "").strip()
     if not repo_path:
         return None
     try:
-        abs_path = repo_file(repo_path)
+        abs_path = repo_file_for_source(repo_path, source_game)
     except Exception:
         abs_path = ""
     if not abs_path:
-        abs_path = os.path.join(get_uncook_path(bpy.context), repo_path)
+        roots = source_roots(bpy.context, source_game)
+        if roots:
+            abs_path = os.path.join(roots[0], repo_path)
+    if not abs_path:
+        return None
     if os.path.exists(abs_path + ".json"):
         return abs_path + ".json"
     return abs_path if os.path.exists(abs_path) else None
@@ -1063,7 +1090,7 @@ def _resolve_animset_abs_path(repo_path):
 
 def _load_mimic_animset_name_lookup(repo_path, main_arm_obj=None):
     norm_path = normalize_animset_path(repo_path)
-    abs_path = _resolve_animset_abs_path(repo_path)
+    abs_path = _resolve_animset_abs_path(repo_path, _source_game_for_armature_obj(main_arm_obj))
     if not abs_path:
         return {}
     try:
@@ -1175,7 +1202,7 @@ def _get_actor_compatible_animation_path_by_name(anim_name, main_arm_obj, manage
 
 
 def GetAnimationInfoByName(anim_name, main_arm_obj=None, show_all=False, prefer_mimic=False, quiet=False, compatible_only=False):
-    uncook_path = get_uncook_path(bpy.context)
+    source_game = _source_game_for_armature_obj(main_arm_obj)
     fdir = None
     if prefer_mimic:
         fdir = _get_mimic_animation_path_by_name(anim_name, main_arm_obj=main_arm_obj, show_all=show_all)
@@ -1205,7 +1232,7 @@ def GetAnimationInfoByName(anim_name, main_arm_obj=None, show_all=False, prefer_
             log.critical('Did not find animation!')
         return (None, None)
     #(, ) = item.animLineId.split(';')
-    fdir = os.path.join(uncook_path, fdir)
+    fdir = repo_file_for_source(fdir, source_game)
     return (anim_name, fdir)
 
 def SetupActor(main_arm_obj, context=None, show_all=False):
@@ -1408,7 +1435,6 @@ class MyAnimListItem_Debug(bpy.types.Operator):
 
     def execute(self, context):
         global _QUICK_ANIM_INIT_ATTEMPTED
-        uncook_path = get_uncook_path(context)
         scene = context.scene
         action = self.action
         if "load" == action:

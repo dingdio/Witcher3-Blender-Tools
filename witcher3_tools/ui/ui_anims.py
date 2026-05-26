@@ -17,6 +17,11 @@ from .. import dialog_language
 from . import ui_dialog_language
 from . import ui_scene
 from . import ui_rig
+from ..source_game_paths import (
+    display_path_relative_to_source_roots,
+    normalize_source_game,
+    source_roots,
+)
 from ..importers import import_anims, import_cutscene, import_entity, import_rig, import_scene_animation
 from ..exporters import export_anims, export_cutscene
 from .. import pose_key_tools
@@ -551,12 +556,18 @@ def _animset_compare_key(path_value):
     return os.path.normcase(normalized)
 
 
-def _animset_repo_compare_key(context, repo_rel_path):
+def _animset_repo_compare_keys(context, repo_rel_path, source_game=""):
     repo_rel = str(repo_rel_path or "").strip()
     if not repo_rel or ":" in repo_rel:
-        return ""
-    abs_path = os.path.join(get_uncook_path(context), repo_rel.replace("/", os.sep).replace("\\", os.sep))
-    return _animset_compare_key(abs_path)
+        return set()
+    keys = {_animset_compare_key(repo_rel)}
+    if os.path.isabs(repo_rel):
+        keys.add(_animset_compare_key(repo_rel))
+        return {key for key in keys if key}
+    repo_fs = repo_rel.replace("/", os.sep).replace("\\", os.sep)
+    for root in source_roots(context, source_game):
+        keys.add(_animset_compare_key(os.path.join(root, repo_fs)))
+    return {key for key in keys if key}
 
 
 def _resolve_root_orientation_action(armature_obj):
@@ -598,6 +609,8 @@ def _get_loaded_animset_ui_state(context):
             "display_name": "",
             "display_path": "",
             "target_component": "",
+            "source_game": "w3",
+            "loaded_keys": set(),
             "clip_count": 0,
             "has_loaded_set": False,
         }
@@ -605,6 +618,7 @@ def _get_loaded_animset_ui_state(context):
     loaded_path = str(getattr(scene, "witcher_loaded_w2anims_path", "") or "").strip()
     loaded_key = _animset_compare_key(loaded_path)
     source_tag = str(getattr(scene, "witcher_loaded_w2anims_source_tag", "") or "").strip().upper()
+    source_game = "w2" if source_tag == "W2" else "w3"
     target_component = str(getattr(scene, "witcher_loaded_w2anims_target_component", "") or "").strip()
     loaded_path_no_json = loaded_path[:-5] if loaded_path.lower().endswith(".json") else loaded_path
 
@@ -612,13 +626,7 @@ def _get_loaded_animset_ui_state(context):
     display_path = ""
     if loaded_path_no_json:
         display_name = os.path.basename(loaded_path_no_json.replace("\\", "/"))
-        try:
-            uncook_root = os.path.normpath(get_uncook_path(context))
-            rel_path = os.path.relpath(os.path.normpath(loaded_path_no_json), uncook_root)
-            if not rel_path.startswith(".."):
-                display_path = rel_path.replace("\\", "/")
-        except Exception:
-            pass
+        display_path = display_path_relative_to_source_roots(loaded_path_no_json, context, source_game)
 
     clip_count = len(getattr(scene, "witcher_w2anims_list", []))
     has_loaded_set = bool(loaded_key or clip_count)
@@ -641,6 +649,8 @@ def _get_loaded_animset_ui_state(context):
         "display_name": display_name,
         "display_path": display_path,
         "target_component": target_component,
+        "source_game": source_game,
+        "loaded_keys": {loaded_key} if loaded_key else set(),
         "clip_count": clip_count,
         "has_loaded_set": has_loaded_set,
     }
@@ -5436,9 +5446,12 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                         for item in visible_items:
                             item_path = str(getattr(item, "path", "") or "")
                             item_component = str(getattr(item, "component_name", "") or "").strip()
+                            item_source_game = normalize_source_game(
+                                getattr(item, "source_game", "") or getattr(rig_settings, "source_game", "w3")
+                            )
                             filename = item_path.replace("\\", "/").split("/")[-1]
                             is_loaded_set = bool(loaded_set["loaded_key"]) and (
-                                _animset_repo_compare_key(context, item_path) == loaded_set["loaded_key"]
+                                bool(_animset_repo_compare_keys(context, item_path, item_source_game) & loaded_set["loaded_keys"])
                             )
                             button_icon = 'CHECKMARK' if is_loaded_set else 'ACTION'
                             button_text = filename if not is_loaded_set else f"{filename}  [Loaded]"
@@ -5452,10 +5465,13 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                             op.action = "w2anims"
                             op.path = item_path
                             op.component_name = item_component
+                            op.source_game = item_source_game
                             reveal_op = file_row.operator("witcher.reveal_anim_in_explorer", text="", icon='FILE_FOLDER')
                             reveal_op.path = item_path
+                            reveal_op.source_game = item_source_game
                             info_op = file_row.operator("witcher.animset_path_info", text="", icon='QUESTION')
                             info_op.path = item_path
+                            info_op.source_game = item_source_game
 
                     stats_row = search_box.row(align=True)
                     if filter_text:
