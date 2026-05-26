@@ -45,6 +45,11 @@ def get_uncook_root(create: bool = True) -> str:
     return _ensure_dir(os.path.join(get_extension_user_dir(create), "witcher_uncook"), create)
 
 
+def get_w2_uncook_root(create: bool = True) -> str:
+    """Return the root directory for extracted Witcher 2 DZIP resources."""
+    return _ensure_dir(os.path.join(get_extension_user_dir(create), "witcher2_uncook"), create)
+
+
 def get_audio_root(create: bool = True) -> str:
     """Return the root directory for speech/lipsync and converted audio outputs."""
     return _ensure_dir(os.path.join(get_extension_user_dir(create), "witcher_audio"), create)

@@ -3,6 +3,7 @@ import csv
 import functools
 import os
 import base64
+import struct
 import time
 import numpy as np
 from pathlib import Path
@@ -176,21 +177,28 @@ def detectedProp(f, CR2WFILE, offset ):
 # }
 
 
-def getClass(f, CR2WFILE, self, idx):
-    self.currentClass = ""#TODO FIX THIS #CR2WFILE.CNAMES[i].name.value;
+def _seek_class_payload(f, CR2WFILE, idx):
     f.seek(CR2WFILE.CR2WExport[idx].dataOffset + CR2WFILE.start)
+    version = getattr(getattr(CR2WFILE, "HEADER", None), "version", 999)
+    if version <= 115 or is_old_version(version):
+        return
+
     zero = readSByte(f)
-    if is_old_version(CR2WFILE.HEADER.version):
-        f.seek(-1, os.SEEK_CUR)
-    elif zero != 0:
-        if (zero == 1):
-            _ = readInt32(f)
-        elif (zero == -128):
-            dzero2 = ReadBit6(f)
-            log.debug("Witcher 2 class preamble used -128 sentinel.")
-        else:
-            f.seek(-1, os.SEEK_CUR)
-            log.debug("Class data starts without zero preamble; rewound leading byte: %s", zero)
+    if zero == 0:
+        return
+    if zero == 1:
+        _ = readInt32(f)
+        return
+    if zero == -128:
+        _ = ReadBit6(f)
+        return
+
+    f.seek(-1, os.SEEK_CUR)
+
+
+def getClass(f, CR2WFILE, self, idx):
+    self.currentClass = ""
+    _seek_class_payload(f, CR2WFILE, idx)
     return W_CLASS(f, CR2WFILE, self, idx)
 
 class DATA:
@@ -222,25 +230,9 @@ class DATA:
             self.sizes.append(CR2WFILE.CR2WExport[i].dataSize)
 
         for i in range(0, CR2WFILE.CR2WTable[4].itemCount):
-            self.currentClass = ""#TODO FIX THIS #CR2WFILE.CNAMES[i].name.value;
-            f.seek(CR2WFILE.CR2WExport[i].dataOffset + CR2WFILE.start);
-            zero = readSByte(f)
-            if is_old_version(CR2WFILE.HEADER.version):
-                f.seek(-1, os.SEEK_CUR)
-            elif zero != 0:
-                if (zero == 1):
-                    _ = readInt32(f)
-                elif (zero == -128):
-                    dzero2 = ReadBit6(f)
-                    log.debug("Witcher 2 class preamble used -128 sentinel.")
-                else:
-                    f.seek(-1, os.SEEK_CUR)
-                    log.debug("Class data starts without zero preamble; rewound leading byte: %s", zero)
-            #self.Class = W_CLASS(f, CR2WFILE, self)
-            start_time = time.time()
+            self.currentClass = ""
+            _seek_class_payload(f, CR2WFILE, i)
             self.CHUNKS.append(W_CLASS(f, CR2WFILE, self, i))
-            time_taken = time.time() - start_time
-            log.debug('%i Read Chunk %s in %f seconds.',i, self.CHUNKS[-1].name, time.time() - start_time)
 
             #if the anim_name is set it will extract just that animation from a w2anims or w2cutscene file
             if anim_name: #"w2anims" in CR2WFILE.fileName:
@@ -303,11 +295,6 @@ class DATA:
                 # else:
                 #     f.seek(self.classEnd)
                 #     return
-            if time_taken > 0.3:
-                log.debug("Time taken more than 0.3")
-            #log.debug(' Read Chunk in %f seconds.', time.time() - start_time)
-
-
 class STRINGINDEX:
     def __init__(self, f, CR2WFILE, parent):
         """The string index.
@@ -2060,9 +2047,9 @@ class W_CLASS:
 
 
         if CR2WFILE.HEADER.version <= 115: #? WITCHER 2
-            startofthis -=1
-            self.classEnd -=1
-            f.seek(-1, os.SEEK_CUR)
+            startofthis = CR2WFILE.CR2WExport[idx].dataOffset + CR2WFILE.start
+            self.classEnd = startofthis + CR2WFILE.CR2WExport[idx].dataSize
+            f.seek(startofthis)
             file_end = FileSize(f)
             while True:
                 prop_start = f.tell()
@@ -2142,16 +2129,18 @@ class W_CLASS:
             elif currentClass == "CMesh": #! for now CMesh is read in dc_mesh
                 self.CMesh = CMesh(CR2WFILE)
             elif self.name == "CMaterialInstance":
-                f.seek(1, os.SEEK_CUR)
-                
-                # 'diffusecolor'
-                # 'fadeSharpness'
-                # 'fogColor'
-                #nMatElement = readInt32(f)
-                
-                MyMaterialInstance = CMaterialInstance(CR2WFILE)
-                MyMaterialInstance.Read(f)
-                self.CMaterialInstance = MyMaterialInstance
+                # W2 CMaterialInstance payload is best-effort; on malformed buffers we
+                # rewind so the outer classEnd seek (below) can resync.
+                if self.classEnd is not None and f.tell() + 5 <= self.classEnd:
+                    start_pos = f.tell()
+                    try:
+                        f.seek(1, os.SEEK_CUR)
+                        MyMaterialInstance = CMaterialInstance(CR2WFILE)
+                        MyMaterialInstance.Read(f)
+                        self.CMaterialInstance = MyMaterialInstance
+                    except (struct.error, ValueError, EOFError, IndexError) as e:
+                        log.debug("Witcher 2 CMaterialInstance extra payload skipped: %s", e)
+                        f.seek(start_pos)
             if self.classEnd is not None and self.classEnd > f.tell():
                 f.seek(self.classEnd)
 

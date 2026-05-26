@@ -11,6 +11,7 @@ from .extension_paths import (
     get_temp_root,
     get_texture_root,
     get_uncook_root,
+    get_w2_uncook_root,
 )
 from .lod_utils import lod_level_from_name
 
@@ -510,6 +511,10 @@ def _default_w3_audio_path():
     return get_audio_root(create=True)
 
 
+def _default_w2_uncook_path():
+    return get_w2_uncook_root(create=True)
+
+
 def _normalize_pref_path(path_value: str) -> str:
     raw = str(path_value or "").strip()
     if not raw:
@@ -546,6 +551,8 @@ def _auto_initialize_game_and_audio_paths(prefs, context):
 
     if not getattr(prefs, "uncook_path", ""):
         prefs.uncook_path = _default_uncook_path()
+    if not getattr(prefs, "w2_unbundle_path", ""):
+        prefs.w2_unbundle_path = _default_w2_uncook_path()
     if not getattr(prefs, "W3_VOICE_PATH", ""):
         prefs.W3_VOICE_PATH = _default_w3_audio_path()
     if bool(getattr(prefs, "use_separate_texture_uncook_path", False)):
@@ -1510,10 +1517,10 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
     )
     
     w2_unbundle_path: StringProperty(
-        name="Witcher 2 Unbundle",
+        name="Witcher 2 Uncook Path",
         subtype='DIR_PATH',
-        default="",
-        description="Extracted Witcher 2 dzip files"
+        default=_default_w2_uncook_path(),
+        description="Extension storage folder for extracted Witcher 2 DZIP resources."
     )
 
     tex_mod_uncook_path: StringProperty(
@@ -2447,6 +2454,12 @@ CACHE_ITEMS = (
         "description": "Mod/DLC bundle index cache.",
     },
     {
+        "name": "w2_dzip_cache.pkl",
+        "relative_path": os.path.join("Witcher2Bundles", "w2_dzip_cache.pkl"),
+        "label": "w2_dzip_cache.pkl",
+        "description": "Witcher 2 DZIP archive index cache.",
+    },
+    {
         "name": "dlc_definition_cache.pkl",
         "relative_path": os.path.join("DLC", "dlc_definition_cache.pkl"),
         "label": "dlc_definition_cache.pkl",
@@ -2588,6 +2601,8 @@ def _get_cache_signature_builder(cache_name: str):
         return lambda: BundleManager.BuildSourceSignature(False)
     if cache_name == "bundle_cache_mods.pkl":
         return lambda: BundleManager.BuildSourceSignature(True)
+    if cache_name == "w2_dzip_cache.pkl":
+        return lambda: DzipManager.BuildSourceSignature(get_witcher2_game_path(bpy.context))
     if cache_name == "dlc_definition_cache.pkl":
         return _build_dlc_definition_cache_signature
     if cache_name == "journal_browser_bestiary.pkl":
@@ -2721,6 +2736,7 @@ def _refresh_cache_by_name(cache_name: str) -> bool:
         "speech_cache.pkl": lambda: SpeechManager.Get(do_reload=True),
         "bundle_cache.pkl": lambda: BundleManager.Get(loadmods=False, reset_cache=True),
         "bundle_cache_mods.pkl": lambda: BundleManager.Get(loadmods=True, reset_cache=True),
+        "w2_dzip_cache.pkl": lambda: DzipManager.Get(reset_cache=True),
         "dlc_definition_cache.pkl": _refresh_dlc_definition_cache,
         "journal_browser_bestiary.pkl": lambda: _refresh_journal_cache("BESTIARY"),
         "journal_browser_characters.pkl": lambda: _refresh_journal_cache("CHARACTERS"),
@@ -3105,7 +3121,7 @@ def _draw_external_path_sections(layout, addon_prefs, section_prefix="witcher_ex
     if body:
         col = body.column(align=True)
         add_row(col, "Game", addon_prefs.witcher2_game_path)
-        add_row(col, "Unbundle", addon_prefs.w2_unbundle_path)
+        add_row(col, "Uncook", addon_prefs.w2_unbundle_path)
 
     # --- Extra / user-defined paths ---
     if len(addon_prefs.path_list) > 0:
@@ -4220,6 +4236,7 @@ class WITCHER_OT_delete_cache(bpy.types.Operator):
 
 from .CR2W.witcher_cache.CollisionCache import CollisionManager
 from .CR2W.witcher_cache.Bundles import BundleManager
+from .CR2W.witcher_cache.Witcher2Bundles import DzipManager
 from .CR2W.witcher_cache.SoundCache import SoundManager
 from .CR2W.witcher_cache.Speech import SpeechManager
 from .CR2W.witcher_cache.TextureCache import TextureManager

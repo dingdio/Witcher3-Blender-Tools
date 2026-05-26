@@ -34,6 +34,7 @@ from .. import (
     get_vgmstream_path,
     set_external_import_dependency_alert,
     get_uncook_path,
+    get_w2_unbundle_path,
     get_witcher2_game_path,
 )
 from ..importers import import_entity
@@ -88,6 +89,7 @@ import re
 from ..CR2W.witcher_cache.Bundles import LoadBundleManager
 from ..CR2W.witcher_cache.Bundles.BundleItem import BundleItem
 from ..CR2W.witcher_cache.Bundles.Bundle import Bundle
+from ..CR2W.witcher_cache.Witcher2Bundles import LoadWitcher2BundleManager
 from ..CR2W.witcher_cache.TextureCache import LoadTextureManager
 from ..CR2W.witcher_cache.TextureCache.TextureCache import TextureCache
 from ..CR2W.witcher_cache.CollisionCache import LoadCollisionManager
@@ -585,6 +587,8 @@ class MySettings(PropertyGroup):
 from ..CR2W.witcher_cache.CacheController import CacheController
 folder_structure:FolderStructure = FolderStructure()
 
+WITCHER2_BUNDLE_CACHE_TYPE = "Bundle Witcher 2"
+
 # Disk-based cache types (read-only depots/workspaces)
 DISK_CACHE_TYPES = {
     "REDkit Depot",
@@ -706,6 +710,8 @@ def is_external_cache(cache_type: str) -> bool:
     return cache_type in EXTERNAL_CACHE_TYPES
 
 def get_effective_cache_type(cache_type: str) -> str:
+    if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+        return "Bundle"
     return EXTERNAL_CACHE_EFFECTIVE_TYPES.get(cache_type, cache_type)
 
 
@@ -722,6 +728,7 @@ def get_cache_type_icon(cache_type: str) -> str:
         "Workspace": "FILE_FOLDER",
         "Cooked": "PACKAGE",
         "Witcher 2 Data": "FILE_FOLDER",
+        WITCHER2_BUNDLE_CACHE_TYPE: "PACKAGE",
     }.get(effective_cache_type, "FILE_FOLDER")
 
 
@@ -1413,6 +1420,13 @@ def _get_witcher2_data_root(context) -> str:
     if os.path.basename(os.path.normpath(game_root)).lower() == "data":
         return game_root
     return os.path.join(game_root, "data")
+
+
+def _get_witcher2_uncook_root(context, create: bool = False) -> str:
+    root = _normalize_dir(get_w2_unbundle_path(context))
+    if create and root:
+        os.makedirs(root, exist_ok=True)
+    return root
 
 def is_disk_cache(cache_type: str) -> bool:
     return cache_type in DISK_CACHE_TYPES
@@ -2291,6 +2305,14 @@ def get_file_info(context, cache_type, item_path, loadmods=False):
         return (False, 0)
     if is_external_cache(cache_type):
         return get_external_file_info(context, cache_type, item_path, loadmods=loadmods)
+    if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+        abs_path = get_witcher2_bundle_abs_path(context, item_path)
+        if abs_path and win_path_exists(abs_path):
+            try:
+                return (True, win_path_getsize(abs_path))
+            except Exception:
+                return (True, 0)
+        return (False, 0)
     if cache_type == "Texture":
         return get_texture_file_info(context, item_path, loadmods=loadmods)
     if get_effective_cache_type(cache_type) == "Collision":
@@ -2303,7 +2325,10 @@ def get_source_label(context, item_path, loadmods=False, cache_type=""):
         if is_external_cache(cache_type):
             return ""
         effective_cache_type = get_effective_cache_type(cache_type) if cache_type else cache_type
-        source_root = get_texture_path(context) if effective_cache_type == "Texture" else get_uncook_path(context)
+        if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+            source_root = _get_witcher2_uncook_root(context, create=False)
+        else:
+            source_root = get_texture_path(context) if effective_cache_type == "Texture" else get_uncook_path(context)
         source_root = source_root or ""
         rel_path = get_vanilla_path(item_path, loadmods)
         return get_source_for_path(source_root, rel_path)
@@ -2324,12 +2349,49 @@ def get_uncook_abs_path(context, item_path, loadmods=False) -> str:
         return ""
 
 
+def get_witcher2_bundle_abs_path(context, item_path) -> str:
+    root = _get_witcher2_uncook_root(context, create=False)
+    if not root:
+        return ""
+    rel_path = (item_path or "").replace("/", "\\").lstrip("\\")
+    return os.path.join(root, rel_path)
+
+
+def ensure_witcher2_bundle_item_extracted(context, item_path, overwrite=False) -> str:
+    root = _get_witcher2_uncook_root(context, create=True)
+    if not root:
+        return ""
+
+    item_key = (item_path or "").replace("/", "\\")
+    manager = LoadWitcher2BundleManager()
+    items = manager.find_item_by_hash(item_key)
+    if not items:
+        return ""
+
+    final_item = items[-1] if isinstance(items, list) else items
+    item_name = (getattr(final_item, "name", None) or item_key).replace("/", "\\").lstrip("\\")
+    export_path = os.path.join(root, item_name)
+    if win_path_exists(export_path) and not overwrite:
+        set_source_for_path(root, item_name, "witcher2")
+        return export_path
+    if prepare_extraction_target(export_path, root):
+        written_path = final_item.extract_to_file(export_path)
+        if written_path:
+            export_path = written_path
+    if win_path_exists(export_path):
+        set_source_for_path(root, item_name, "witcher2")
+    return export_path if win_path_exists(export_path) else ""
+
+
 def get_browser_item_output_path(context, cache_type, item_path, loadmods=False) -> str:
     if is_disk_cache(cache_type):
         return get_disk_abs_path(cache_type, item_path) or ""
 
     if is_external_cache(cache_type):
         return _get_external_item_output_path(context, cache_type, item_path, loadmods=loadmods)
+
+    if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+        return get_witcher2_bundle_abs_path(context, item_path)
 
     effective_cache_type = get_effective_cache_type(cache_type)
     if effective_cache_type == "Collision":
@@ -2568,7 +2630,7 @@ def _expand_scaleform_icon_candidates(context, icon_path: str):
     return candidates
 
 
-def _resolve_browser_image_abs_path(abs_path: str) -> str:
+def _resolve_browser_image_abs_path(abs_path: str, dds_out_path: str = "") -> str:
     abs_path = win_safe_path(abs_path or "")
     if not abs_path or not win_path_exists(abs_path):
         return ""
@@ -2577,10 +2639,10 @@ def _resolve_browser_image_abs_path(abs_path: str) -> str:
     if ext in {'.dds', '.png', '.jpg', '.jpeg', '.tga', '.bmp'}:
         return abs_path
     if ext == '.xbm':
-        dds_path = os.path.splitext(abs_path)[0] + '.dds'
+        dds_path = win_safe_path(dds_out_path or (os.path.splitext(abs_path)[0] + '.dds'))
         if not win_path_exists(dds_path):
             try:
-                convert_xbm_to_dds(abs_path)
+                convert_xbm_to_dds(abs_path, out_path=dds_path)
             except Exception:
                 return ""
         if win_path_exists(dds_path):
@@ -2637,7 +2699,25 @@ def _resolve_preview_image_path(context, cache_type: str, file_path: str, loadmo
 
             if is_disk_cache(cache_type):
                 for candidate_path in _iter_preview_lookup_paths(search_path):
-                    resolved = _resolve_browser_image_abs_path(get_disk_abs_path(cache_type, candidate_path))
+                    resolved = _resolve_browser_image_abs_path(
+                        get_disk_abs_path(cache_type, candidate_path),
+                        _make_browser_preview_temp_path(cache_type, candidate_path, ".dds"),
+                    )
+                    if resolved:
+                        return resolved
+                return ""
+
+            if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+                for candidate_path in _iter_preview_lookup_paths(search_path):
+                    abs_path = ensure_witcher2_bundle_item_extracted(
+                        context,
+                        candidate_path,
+                        overwrite=False,
+                    )
+                    resolved = _resolve_browser_image_abs_path(
+                        abs_path,
+                        _make_browser_preview_temp_path(cache_type, candidate_path, ".dds"),
+                    )
                     if resolved:
                         return resolved
                 return ""
@@ -2700,7 +2780,7 @@ def _resolve_w2ent_icon_virtual_path(context, cache_type: str, item_path: str, l
     if not normalized_item.lower().endswith(".w2ent"):
         return ""
 
-    source_game = "w2" if cache_type == "Witcher 2 Data" else "w3"
+    source_game = "w2" if cache_type in {"Witcher 2 Data", WITCHER2_BUNDLE_CACHE_TYPE} else "w3"
     cache_key = (_BROWSER_W2ENT_ICON_CACHE_VERSION, source_game, normalized_item.lower())
     if cache_key in _browser_w2ent_icon_path_cache:
         return _browser_w2ent_icon_path_cache[cache_key]
@@ -2711,7 +2791,16 @@ def _resolve_w2ent_icon_virtual_path(context, cache_type: str, item_path: str, l
 
         search_roots = []
         if source_game == "w2":
-            search_roots = get_repo_override_roots_for_item(context, cache_type, normalized_item)
+            if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+                search_roots = [
+                    root for root in (
+                        _get_witcher2_uncook_root(context, create=False),
+                        _get_witcher2_data_root(context),
+                    )
+                    if root
+                ]
+            else:
+                search_roots = get_repo_override_roots_for_item(context, cache_type, normalized_item)
         ui_equipment.ensure_equipment_catalog_ready(
             source_game=source_game,
             search_roots=search_roots,
@@ -3307,6 +3396,12 @@ def get_bundle_item_size(cache_type, item_path, loadmods=False):
             if items:
                 final_item = items[-1] if isinstance(items, list) else items
                 return getattr(final_item, 'size', 0) or 0
+        elif cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+            manager = LoadWitcher2BundleManager()
+            items = manager.find_item_by_hash(item_path)
+            if items:
+                final_item = items[-1] if isinstance(items, list) else items
+                return getattr(final_item, 'size', 0) or getattr(final_item, 'Size', 0) or 0
         elif cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
             session = get_external_archive_session(cache_type)
             if session:
@@ -3397,6 +3492,11 @@ def _resolve_item_for_stats(cache_type: str, item_path: str, loadmods: bool = Fa
                     if isinstance(key, str) and key.replace("/", "\\").lower().endswith(suffix):
                         items = value
                         break
+        return items[-1] if isinstance(items, list) and items else items
+
+    if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+        manager = LoadWitcher2BundleManager()
+        items = manager.find_item_by_hash(item_key)
         return items[-1] if isinstance(items, list) and items else items
 
     if cache_type == "Collision":
@@ -3580,6 +3680,7 @@ def get_cached_search_results(query, cache_type, folder_struct, loadmods=False):
         # Global search across all caches - do this ONCE
         for ct, loader in [
             ("Bundle", lambda: LoadBundleManager(loadmods=loadmods)),
+            (WITCHER2_BUNDLE_CACHE_TYPE, lambda: LoadWitcher2BundleManager()),
             ("Collision", lambda: LoadCollisionManager(loadmods=loadmods)),
             ("Texture", lambda: LoadTextureManager(loadmods=loadmods)),
             ("Sound", lambda: LoadSoundManager(loadmods=loadmods)),
@@ -5102,6 +5203,7 @@ class SimpleFileBrowser(Operator):
                     ("Workspace", "FILE_FOLDER", "Project workspace(s)"),
                     ("Cooked", "PACKAGE", "Project cooked output (packed)"),
                     ("Witcher 2 Data", "FILE_FOLDER", "Witcher 2 game data (read-only)"),
+                    (WITCHER2_BUNDLE_CACHE_TYPE, "PACKAGE", "Witcher 2 DZIP archives"),
                 ]
                 for cache_name, icon, desc in cache_types:
                     row = col.row(align=True)
@@ -6688,6 +6790,8 @@ class SelectCacheTypeOperator(Operator):
         try:
             if cache_type == "Bundle":
                 manager = LoadBundleManager(loadmods=loadmods, reset_cache=loadmods)
+            elif cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+                manager = LoadWitcher2BundleManager()
             elif cache_type == "Collision":
                 manager = LoadCollisionManager(loadmods=loadmods, do_reload=loadmods)
             elif cache_type == "Texture":
@@ -6883,6 +6987,20 @@ class FileActionOperatorImportToScene(Operator):
                     out_path = os.path.join(export_root, inner_name)
                     if prepare_extraction_target(out_path, export_root):
                         final_item.extract_to_file(out_path)
+
+            elif cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+                item = LoadWitcher2BundleManager().find_item_by_hash(full_path_norm)
+                if not item:
+                    self.report({'ERROR'}, f"Witcher 2 bundle item not found: {full_path}")
+                    return None
+                w2_uncook_root = _get_witcher2_uncook_root(context, create=False)
+                w2_data_root = _get_witcher2_data_root(context)
+                abs_file_path = ensure_witcher2_bundle_item_extracted(
+                    context,
+                    full_path_norm,
+                    overwrite=overwrite_existing,
+                )
+                override_roots = [root for root in (w2_uncook_root, w2_data_root) if root]
 
             elif cache_type == "Bundle":
                 if loadmods:
@@ -7314,31 +7432,41 @@ class FileActionOperatorImportToScene(Operator):
                         self.report({'ERROR'}, f"Texture import failed: {os.path.basename(abs_file_path)}")
                     return {'CANCELLED'}
             elif ext == ".w2mesh":
-                mesh_import_settings = MeshImportSettings.from_addon_prefs(get_all_addon_prefs(context))
-                import_mesh.import_mesh(
-                    abs_file_path,
-                    do_merge_normals=False,
-                    **mesh_import_settings.to_import_mesh_kwargs(),
-                )
+                try:
+                    mesh_import_settings = MeshImportSettings.from_addon_prefs(get_all_addon_prefs(context))
+                    import_mesh.import_mesh(
+                        abs_file_path,
+                        do_merge_normals=False,
+                        **mesh_import_settings.to_import_mesh_kwargs(),
+                    )
+                except Exception as exc:
+                    log.error("Mesh import failed for %s", abs_file_path, exc_info=True)
+                    self.report({'ERROR'}, f"Mesh import failed: {exc}")
+                    return {'CANCELLED'}
             elif ext == ".w2cube":
                 result = bpy.ops.witcher.import_w2cube('EXEC_DEFAULT', filepath=abs_file_path)
                 if 'FINISHED' not in result:
                     self.report({'ERROR'}, f"Cubemap import failed: {os.path.basename(abs_file_path)}")
                     return {'CANCELLED'}
             elif ext == ".w2ent":
-                metadata = import_entity.get_entity_appearance_metadata(abs_file_path)
-                w2ent_mode = import_entity.classify_entity_import_metadata(metadata, context=context)
-                if w2ent_mode == "character":
-                    default_appearance_name = str(metadata.get("default_name", "") or "").strip()
-                    import_entity.import_direct_entity_file(
-                        abs_file_path,
-                        False,
-                        0 if default_appearance_name else 1,
-                        None,
-                        selected_appearance_name=default_appearance_name,
-                    )
-                elif not import_entity.try_apply_inventory_file_to_selected_character(context, abs_file_path):
-                    import_entity.import_direct_entity_file(abs_file_path, False, 0, None)
+                try:
+                    metadata = import_entity.get_entity_appearance_metadata(abs_file_path)
+                    w2ent_mode = import_entity.classify_entity_import_metadata(metadata, context=context)
+                    if w2ent_mode == "character":
+                        default_appearance_name = str(metadata.get("default_name", "") or "").strip()
+                        import_entity.import_direct_entity_file(
+                            abs_file_path,
+                            False,
+                            0 if default_appearance_name else 1,
+                            None,
+                            selected_appearance_name=default_appearance_name,
+                        )
+                    elif not import_entity.try_apply_inventory_file_to_selected_character(context, abs_file_path):
+                        import_entity.import_direct_entity_file(abs_file_path, False, 0, None)
+                except Exception as exc:
+                    log.error("Entity import failed for %s", abs_file_path, exc_info=True)
+                    self.report({'ERROR'}, f"Entity import failed: {exc}")
+                    return {'CANCELLED'}
             elif ext == ".flyr":
                 from ..CR2W import CR2W_reader
                 from ..importers import import_w2l
@@ -8150,6 +8278,11 @@ class FileActionOperator(Operator):
                     items = manager.find_item_by_hash(full_path_norm)
                     if items:
                         item_lists = [items]
+            elif cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+                manager = LoadWitcher2BundleManager()
+                items = manager.find_item_by_hash(full_path_norm)
+                if items:
+                    item_lists = [items]
             elif cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
                 session = get_external_archive_session(cache_type)
                 items = session["items"].get(full_path_norm) if session else None
@@ -8186,12 +8319,19 @@ class FileActionOperator(Operator):
                 vanilla_name = strip_mod_prefix(item_name, mod_name)
                 if vanilla_name == item_name and mod_name:
                     vanilla_name = strip_mod_prefix(full_path_norm, mod_name)
-                export_path = repo_file(vanilla_name)
-                if not win_path_exists(export_path):
-                    written_path = final_item.extract_to_file(export_path)
-                    if written_path:
-                        export_path = written_path
-                    log.debug("Extracted to: %s", export_path)
+                if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
+                    export_path = ensure_witcher2_bundle_item_extracted(
+                        context,
+                        vanilla_name,
+                        overwrite=bool(getattr(witcher_file_browser, "mods_overwrite", False)),
+                    )
+                else:
+                    export_path = repo_file(vanilla_name)
+                    if not win_path_exists(export_path):
+                        written_path = final_item.extract_to_file(export_path)
+                        if written_path:
+                            export_path = written_path
+                        log.debug("Extracted to: %s", export_path)
                 if win_path_exists(export_path):
                     exported_bundle_paths.append(export_path)
                 if not primary_export_path and not vanilla_name.lower().endswith(".buffer"):

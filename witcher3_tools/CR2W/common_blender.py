@@ -2,6 +2,7 @@ try:
     import bpy
     from .witcher_cache.Bundles import LoadBundleManager
     from .witcher_cache.Bundles import BundleItem
+    from .witcher_cache.Witcher2Bundles import LoadWitcher2BundleManager
     try:
         from .. import get_addon_name
         addon_name = get_addon_name()
@@ -17,6 +18,11 @@ import shutil
 import sys
 from contextlib import contextmanager
 from ..extension_paths import get_dev_override
+from ..source_game_paths import (
+    coerce_w2_data_root,
+    iter_w2_repo_path_variants,
+    normalize_roots,
+)
 import logging
 log = logging.getLogger(__name__)
 
@@ -36,7 +42,7 @@ def _get_addon_prefs():
 
 def win_safe_path(path: str) -> str:
     """On Windows, apply \\?\\ prefix for paths > 250 chars to bypass MAX_PATH.
-    Safe on all Windows 10/11 machines — no registry changes needed.
+    Safe on all Windows 10/11 machines - no registry changes needed.
     NOTE: never call os.path.normpath() on the result (it strips the prefix).
     Returns the original path unchanged on non-Windows or short paths."""
     if sys.platform != 'win32' or not path:
@@ -194,6 +200,7 @@ def bpy_image_load_safe(path, **kwargs):
 _repo_override_roots = []
 _repo_override_read_only = False
 _redkit_repo_context_stack = []
+_w2_repo_context_stack = []
 _mod_priority_enabled = False
 _mod_priority_high = True
 _overwrite_existing = False
@@ -229,15 +236,41 @@ def _redkit_roots_for_path(path):
     roots = _get_redkit_depot_roots()
     return roots if any(_is_under_root(str(path), root) for root in roots) else []
 
+
+def _w2_repo_context_for_source(source_path=None, roots=None):
+    unbundle_root, game_data_root = _get_w2_repo_roots_from_prefs()
+    values = []
+    if source_path:
+        values.append(source_path)
+    values.extend(roots or [])
+    for value in values:
+        if not value:
+            continue
+        try:
+            candidate = os.path.normpath(str(value))
+        except Exception:
+            continue
+        if not os.path.isabs(candidate):
+            continue
+        if game_data_root and _is_under_root(candidate, game_data_root):
+            return {"kind": "redkit_data", "root": game_data_root}
+        if unbundle_root and _is_under_root(candidate, unbundle_root):
+            return {"kind": "extracted", "root": unbundle_root}
+    return None
+
+
 @contextmanager
 def redkit_repo_context(source_path=None, roots=None):
     """Temporarily enable REDkit dual-depot lookup for children of a REDkit source."""
     context_roots = list(roots or _redkit_roots_for_path(source_path))
+    w2_context = _w2_repo_context_for_source(source_path, roots=roots)
     _redkit_repo_context_stack.append(context_roots)
+    _w2_repo_context_stack.append(w2_context)
     try:
         yield
     finally:
         _redkit_repo_context_stack.pop()
+        _w2_repo_context_stack.pop()
 
 @contextmanager
 def vanilla_only_repo_context():
@@ -246,18 +279,29 @@ def vanilla_only_repo_context():
     REDkit-uncooked sibling is missing data that only exists post-cook (e.g.
     CAnimAnimsetsParam baked into entity templates)."""
     saved = list(_redkit_repo_context_stack)
+    saved_w2 = list(_w2_repo_context_stack)
     _redkit_repo_context_stack.clear()
+    _w2_repo_context_stack.clear()
     try:
         yield
     finally:
         _redkit_repo_context_stack.clear()
         _redkit_repo_context_stack.extend(saved)
+        _w2_repo_context_stack.clear()
+        _w2_repo_context_stack.extend(saved_w2)
 
 def _active_redkit_repo_roots():
     for roots in reversed(_redkit_repo_context_stack):
         if roots:
             return roots
     return []
+
+
+def _active_w2_repo_context():
+    for context in reversed(_w2_repo_context_stack):
+        if context:
+            return context
+    return None
 
 def set_mod_priority_settings(enabled=False, prefer_mods=True):
     """Enable mod priority resolution in repo_file."""
@@ -595,10 +639,161 @@ def _get_repo_roots_from_prefs(version=999):
 
     if version <= 115:
         fbx_uncook_path = prefs.fbx_uncook_path
-        uncook_path = prefs.witcher2_game_path + '\\data'
+        uncook_path = str(getattr(prefs, "w2_unbundle_path", "") or "").strip()
+        if not uncook_path:
+            uncook_path = coerce_w2_data_root(getattr(prefs, "witcher2_game_path", ""))
         texture_path = uncook_path
 
     return fbx_uncook_path, uncook_path, texture_path, use_separate_texture_path
+
+
+def _get_w2_repo_roots_from_prefs():
+    prefs = _get_addon_prefs()
+    if not prefs:
+        return "", ""
+    w2_uncook = str(getattr(prefs, "w2_unbundle_path", "") or "").strip()
+    w2_game = str(getattr(prefs, "witcher2_game_path", "") or "").strip()
+    w2_game_data = coerce_w2_data_root(w2_game)
+    return (
+        os.path.normpath(w2_uncook) if w2_uncook else "",
+        os.path.normpath(w2_game_data) if w2_game_data else "",
+    )
+
+
+def _find_w2_existing_repo_file(root: str, filepath: str, skip_path: str = "") -> str:
+    if not root:
+        return ""
+    skip_key = os.path.normcase(os.path.normpath(skip_path)) if skip_path else ""
+    for rel_path in iter_w2_repo_path_variants(filepath):
+        candidate = os.path.join(root, rel_path)
+        candidate_key = os.path.normcase(os.path.normpath(candidate))
+        if skip_key and candidate_key == skip_key:
+            continue
+        if os.path.exists(win_safe_path(candidate)):
+            return candidate
+    return ""
+
+
+def _find_w2_bundle_items(filepath: str):
+    try:
+        manager = LoadWitcher2BundleManager()
+        items = None
+        for rel_path in iter_w2_repo_path_variants(filepath):
+            items = manager.find_item_by_hash(rel_path)
+            if items:
+                return items
+        return None
+    except Exception:
+        log.debug("Witcher 2 DZIP lookup failed for %s", filepath, exc_info=True)
+        return None
+
+
+def _extract_w2_bundle_repo_file(filepath: str, extract_root: str) -> str:
+    if not extract_root:
+        return ""
+    abs_filename = os.path.join(extract_root, filepath)
+    if _is_readonly_target(abs_filename):
+        return ""
+    items = _find_w2_bundle_items(filepath)
+    if not items:
+        return ""
+    final_item = items[-1] if isinstance(items, list) else items
+    item_name = getattr(final_item, "name", "") or filepath
+    out_rel_path = item_name.replace("/", "\\")
+    out_path = os.path.join(extract_root, out_rel_path)
+    if prepare_extraction_target(out_path, extract_root):
+        final_item.extract_to_file(out_path)
+        set_source_for_path(extract_root, out_rel_path, "witcher2")
+        if os.path.exists(win_safe_path(out_path)):
+            return out_path
+    return ""
+
+
+def _warn_w2_redkit_fallback(filepath: str, resolved_path: str) -> None:
+    log.debug(
+        "WITCHER 2 REDKIT RESOLVE: loading '%s' from REDkit: %s",
+        filepath,
+        resolved_path,
+    )
+
+
+def _warn_w2_uncook_fallback(filepath: str, resolved_path: str) -> None:
+    log.warning(
+        "WITCHER 2 UNCOOK FALLBACK: loading '%s' from Uncook after REDkit lookup failed: %s",
+        filepath,
+        resolved_path,
+    )
+
+
+def _warn_w2_bundle_fallback(filepath: str, resolved_path: str) -> None:
+    log.warning(
+        "WITCHER 2 BUNDLE FALLBACK: extracted '%s' from Bundles after REDkit lookup failed: %s",
+        filepath,
+        resolved_path,
+    )
+
+
+def _resolve_w2_repo_file(filepath: str, extract_root: str, abs_filename: str) -> str:
+    unbundle_root, game_data_root = _get_w2_repo_roots_from_prefs()
+    context = _active_w2_repo_context() or {}
+    context_kind = context.get("kind", "")
+    context_root = context.get("root", "")
+
+    if context_kind == "redkit_data":
+        redkit_roots = normalize_roots([context_root, game_data_root])
+        if not _overwrite_existing:
+            for root in redkit_roots:
+                redkit_candidate = _find_w2_existing_repo_file(root, filepath, skip_path=abs_filename)
+                if redkit_candidate:
+                    return redkit_candidate
+
+        fallback_roots = normalize_roots([extract_root, unbundle_root])
+        if not _overwrite_existing:
+            for root in fallback_roots:
+                extracted_candidate = _find_w2_existing_repo_file(root, filepath)
+                if extracted_candidate:
+                    _warn_w2_uncook_fallback(filepath, extracted_candidate)
+                    return extracted_candidate
+
+        extracted_candidate = _extract_w2_bundle_repo_file(filepath, extract_root)
+        if extracted_candidate:
+            _warn_w2_bundle_fallback(filepath, extracted_candidate)
+            return extracted_candidate
+
+        return abs_filename
+
+    extracted_roots = [extract_root, unbundle_root]
+    if context_kind == "extracted":
+        extracted_roots.insert(0, context_root)
+    extracted_roots = normalize_roots(extracted_roots)
+
+    if not _overwrite_existing:
+        for root in extracted_roots:
+            extracted_candidate = _find_w2_existing_repo_file(root, filepath)
+            if extracted_candidate:
+                return extracted_candidate
+
+    extracted_candidate = _extract_w2_bundle_repo_file(filepath, extract_root)
+    if extracted_candidate:
+        return extracted_candidate
+
+    game_roots = []
+    if context_kind == "redkit_data":
+        game_roots.append(context_root)
+    game_roots.append(game_data_root)
+    game_roots = normalize_roots(game_roots)
+    for root in game_roots:
+        game_data_candidate = _find_w2_existing_repo_file(root, filepath, skip_path=abs_filename)
+        if game_data_candidate and not _overwrite_existing:
+            _warn_w2_redkit_fallback(filepath, game_data_candidate)
+            return game_data_candidate
+
+    if _overwrite_existing:
+        extracted_candidate = _extract_w2_bundle_repo_file(filepath, extract_root)
+        if extracted_candidate:
+            return extracted_candidate
+
+    return abs_filename
 
 
 def _get_redkit_depot_roots():
@@ -695,19 +890,8 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                 return os.path.join(texture_path, filepath)
             return filepath
         abs_filename = os.path.join(extract_root, filepath)
-        if version <= 115 and not os.path.exists(win_safe_path(abs_filename)):
-            templates_fallback = None
-            lower_filepath = filepath.lower()
-            if not lower_filepath.startswith("templates\\"):
-                templates_fallback = os.path.join(extract_root, "templates", filepath)
-            elif lower_filepath.startswith("templates\\"):
-                stripped = filepath[len("templates\\"):]
-                if stripped:
-                    fallback_candidate = os.path.join(extract_root, stripped)
-                    if os.path.exists(win_safe_path(fallback_candidate)):
-                        return fallback_candidate
-            if templates_fallback and os.path.exists(win_safe_path(templates_fallback)):
-                return templates_fallback
+        if version <= 115:
+            return _resolve_w2_repo_file(filepath, extract_root, abs_filename)
         mod_entry = None
         if _mod_priority_enabled:
             mod_entry = _get_mod_entry(filepath)

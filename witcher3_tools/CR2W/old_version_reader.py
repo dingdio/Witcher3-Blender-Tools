@@ -176,7 +176,8 @@ def load_old_version_resource_tables(cr2w, f, start):
                 object_flags = readUShort(f)
             template = readInt32(f)
             _read_red_serialized_string(f)
-            readU64(f)
+            if version >= 118:
+                readU64(f)
             cr2w.CR2WExport.append(
                 CR2WExport(
                     className=class_name,
