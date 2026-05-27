@@ -1667,7 +1667,20 @@ def _focus_main_armature(context, armature_obj):
 def _ensure_imported_entity_face_morphs_loaded(context, armature_obj):
     if armature_obj is None or getattr(armature_obj, "type", None) != 'ARMATURE':
         return False
-    if 'mimicFaceFile' not in armature_obj or 'mimicFace' not in armature_obj:
+    try:
+        w2_faces_high_chunk = int(armature_obj.get("witcher_w2_mimic_faces_high_embedded_chunk_index", -1))
+    except Exception:
+        w2_faces_high_chunk = -1
+    has_w3_mimic = 'mimicFaceFile' in armature_obj and 'mimicFace' in armature_obj
+    has_w2_mimic = bool(armature_obj.get("witcher_w2_mimic_support", False)) and (
+        bool(str(armature_obj.get("witcher_w2_mimic_faces_high", "") or "").strip())
+        or bool(str(armature_obj.get("witcher_w2_mimic_faces", "") or "").strip())
+        or (
+            bool(str(armature_obj.get("witcher_w2_mimic_faces_high_embedded_source", "") or "").strip())
+            and w2_faces_high_chunk >= 0
+        )
+    )
+    if not has_w3_mimic and not has_w2_mimic:
         return False
     try:
         from ..ui.ui_anims_list import ensure_owner_face_animation_setup
@@ -2532,6 +2545,63 @@ def _is_w2_mimic_support_chunk(chunk) -> bool:
     return bool(_get_entry_attr(chunk, "w2_mimic_support", False))
 
 
+def _is_w2_head_base_chunk(chunk) -> bool:
+    return bool(_get_entry_attr(chunk, "w2_head_support", False)) and (
+        str(_get_entry_attr(chunk, "w2_head_mesh_role", "") or "").strip().lower() == "base"
+    )
+
+
+def _store_w2_head_metadata(obj, chunk):
+    if obj is None or not _get_entry_attr(chunk, "w2_head_support", False):
+        return
+    obj["witcher_w2_head_support"] = True
+    for src_key, prop_key in (
+        ("w2_head_name", "witcher_w2_head_name"),
+        ("w2_head_mesh_role", "witcher_w2_head_mesh_role"),
+    ):
+        value = str(_get_entry_attr(chunk, src_key, "") or "").strip()
+        if value:
+            obj[prop_key] = value
+    try:
+        obj["witcher_w2_head_hide_when_mimic_available"] = bool(_get_entry_attr(chunk, "w2_head_hide_when_mimic_available", False))
+    except Exception:
+        pass
+    try:
+        obj["witcher_w2_head_dist_for_default_head"] = float(_get_entry_attr(chunk, "w2_head_dist_for_default_head", 0.0) or 0.0)
+    except Exception:
+        pass
+
+
+def _hide_w2_base_head_objects_for_mimic(head_name, objdict, meshdict):
+    head_key = str(head_name or "").strip().lower()
+    if not head_key:
+        return 0
+    hidden = 0
+    seen = set()
+    for obj in list(objdict.values()) + list(meshdict.values()):
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if str(obj.get("witcher_w2_head_mesh_role", "") or "").strip().lower() != "base":
+            continue
+        if str(obj.get("witcher_w2_head_name", "") or "").strip().lower() != head_key:
+            continue
+        if not bool(obj.get("witcher_w2_head_hide_when_mimic_available", False)):
+            continue
+        try:
+            obj.hide_set(True)
+        except Exception:
+            pass
+        try:
+            obj.hide_viewport = True
+            obj.hide_render = True
+        except Exception:
+            pass
+        obj["witcher_w2_hidden_by_mimic_head"] = True
+        hidden += 1
+    return hidden
+
+
 def _w2_mimic_metadata_from_chunk(chunk):
     if not _is_w2_mimic_support_chunk(chunk):
         return {}
@@ -2554,6 +2624,13 @@ def _w2_mimic_metadata_from_chunk(chunk):
         "faces_high_embedded_chunk_index": _get_entry_attr(chunk, "w2_mimic_faces_high_embedded_chunk_index", -1),
         "faces_low_embedded_source": str(_get_entry_attr(chunk, "w2_mimic_faces_low_embedded_source", "") or ""),
         "faces_low_embedded_chunk_index": _get_entry_attr(chunk, "w2_mimic_faces_low_embedded_chunk_index", -1),
+        "bone_mapping": _get_entry_attr(chunk, "w2_mimic_bone_mapping", []) or [],
+        "bone_mapping_low": _get_entry_attr(chunk, "w2_mimic_bone_mapping_low", []) or [],
+        "dist_for_default_head": (
+            _get_entry_attr(chunk, "w2_mimic_dist_for_default_head", None)
+            if _get_entry_attr(chunk, "w2_mimic_dist_for_default_head", None) is not None
+            else _get_entry_attr(chunk, "w2_head_dist_for_default_head", None)
+        ),
     }
     return {key: value for key, value in metadata.items() if value not in ("", None)}
 
@@ -2624,6 +2701,16 @@ def _store_w2_mimic_metadata(obj, metadata, *, armature_name="", mesh_object_nam
         obj["witcher_w2_mimic_metadata_json"] = json.dumps(metadata, sort_keys=True)
     except Exception:
         pass
+    for src_key, prop_key in (
+        ("bone_mapping", "witcher_w2_mimic_bone_mapping_json"),
+        ("bone_mapping_low", "witcher_w2_mimic_bone_mapping_low_json"),
+    ):
+        value = metadata.get(src_key)
+        if value:
+            try:
+                obj[prop_key] = json.dumps(value, sort_keys=True)
+            except Exception:
+                pass
 
 
 def _store_entity_w2_mimic_metadata(armature_obj, entity):
@@ -2698,6 +2785,150 @@ def _load_w2_embedded_skeleton_data(source_path, chunk_index):
             exc_info=True,
         )
     return None
+
+
+def _coerce_w2_bone_mapping(value):
+    if not value:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return []
+    out = []
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            child_index = int(item[0])
+            parent_index = int(item[1])
+        except Exception:
+            continue
+        if child_index < 0 or parent_index < 0:
+            continue
+        out.append((child_index, parent_index))
+    return out
+
+
+def _bone_name_by_order_index(armature_obj, bone_index):
+    if armature_obj is None or getattr(armature_obj, "type", "") != 'ARMATURE':
+        return ""
+    try:
+        bone_index = int(bone_index)
+    except Exception:
+        return ""
+    if bone_index < 0:
+        return ""
+
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    ordered = getattr(rig_settings, "bone_order_list", None) if rig_settings is not None else None
+    try:
+        if ordered is not None and 0 <= bone_index < len(ordered):
+            name = str(getattr(ordered[bone_index], "name", "") or "").strip()
+            if name:
+                return name
+    except Exception:
+        pass
+
+    try:
+        bones = list(getattr(getattr(armature_obj, "pose", None), "bones", []) or [])
+        if 0 <= bone_index < len(bones):
+            return str(getattr(bones[bone_index], "name", "") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _remove_w2_mimic_mapping_constraints(pose_bone):
+    if pose_bone is None:
+        return
+    for constraint in list(getattr(pose_bone, "constraints", []) or []):
+        if str(getattr(constraint, "name", "") or "").startswith("W2_MIMIC_MAP_"):
+            pose_bone.constraints.remove(constraint)
+
+
+def _apply_w2_mimic_bone_mapping_constraints(parent_armature, child_armature, metadata):
+    if (
+        parent_armature is None
+        or child_armature is None
+        or getattr(parent_armature, "type", "") != 'ARMATURE'
+        or getattr(child_armature, "type", "") != 'ARMATURE'
+    ):
+        return 0
+
+    mapping = _coerce_w2_bone_mapping(metadata.get("bone_mapping"))
+    if not mapping:
+        mapping = _coerce_w2_bone_mapping(metadata.get("bone_mapping_low"))
+    if not mapping:
+        return 0
+
+    changed = 0
+    for child_index, parent_index in mapping:
+        child_bone_name = _bone_name_by_order_index(child_armature, child_index)
+        parent_bone_name = _bone_name_by_order_index(parent_armature, parent_index)
+        if not child_bone_name or not parent_bone_name:
+            continue
+        child_pose_bone = child_armature.pose.bones.get(child_bone_name)
+        if child_pose_bone is None or parent_armature.pose.bones.get(parent_bone_name) is None:
+            continue
+        _remove_w2_mimic_mapping_constraints(child_pose_bone)
+        copy_transform = child_pose_bone.constraints.new('COPY_TRANSFORMS')
+        copy_transform.name = f"W2_MIMIC_MAP_{parent_bone_name}_to_{child_bone_name}"
+        copy_transform.target = parent_armature
+        copy_transform.subtarget = parent_bone_name
+        try:
+            copy_transform.owner_space = 'WORLD'
+            copy_transform.target_space = 'WORLD'
+        except Exception:
+            pass
+        try:
+            copy_transform.mix_mode = 'REPLACE'
+        except Exception:
+            pass
+        changed += 1
+
+    if changed:
+        child_armature["witcher_w2_mimic_parent_armature"] = parent_armature.name
+        child_armature["witcher_w2_mimic_mapping_constraint_count"] = changed
+    return changed
+
+
+def _attach_w2_mimic_meshes_to_mimic_rig(mimic_armature, mesh_armatures, meshes):
+    if mimic_armature is None or getattr(mimic_armature, "type", "") != 'ARMATURE':
+        return 0
+
+    attached = 0
+    mesh_armatures = list(mesh_armatures or [])
+    meshes = list(meshes or [])
+
+    for mesh_armature in mesh_armatures:
+        if mesh_armature is None or mesh_armature is mimic_armature or getattr(mesh_armature, "type", "") != 'ARMATURE':
+            continue
+        try:
+            constrain_util.CreateConstraints2(mimic_armature, mesh_armature)
+            mesh_armature["witcher_w2_mimic_mesh_constrained_to_rig"] = True
+        except Exception:
+            log.debug(
+                "Failed to constrain W2 mimic mesh armature '%s' to mimic rig '%s'.",
+                getattr(mesh_armature, "name", ""),
+                getattr(mimic_armature, "name", ""),
+                exc_info=True,
+            )
+        _set_parent_keep_world(mesh_armature, mimic_armature)
+        mesh_armature["witcher_w2_mimic_mesh_parent_rig"] = mimic_armature.name
+        attached += 1
+
+    mesh_armature_ids = {id(obj) for obj in mesh_armatures if obj is not None}
+    for mesh in meshes:
+        if mesh is None:
+            continue
+        if getattr(mesh, "parent", None) is not None and id(mesh.parent) in mesh_armature_ids:
+            continue
+        _set_parent_keep_world(mesh, mimic_armature)
+        mesh["witcher_w2_mimic_mesh_parent_rig"] = mimic_armature.name
+        attached += 1
+
+    return attached
 
 
 def _iter_entity_mimic_animset_params(entity):
@@ -4418,6 +4649,44 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 mesh_object_name=mesh_object_name,
             )
 
+        parent_armature = root_skeleton if getattr(root_skeleton, "type", "") == 'ARMATURE' else objdict.get(entity.name)
+        if getattr(parent_armature, "type", "") == 'ARMATURE':
+            constrained = 0
+            if imported_armature is not None and getattr(imported_armature, "type", "") == 'ARMATURE':
+                constrained += _apply_w2_mimic_bone_mapping_constraints(parent_armature, imported_armature, metadata)
+            if constrained:
+                for target_obj in metadata_targets:
+                    if target_obj is not None:
+                        target_obj["witcher_w2_mimic_parent_armature"] = parent_armature.name
+                        target_obj["witcher_w2_mimic_mapping_constraint_count"] = constrained
+
+            if imported_armature is not None and imported_armature is not parent_armature:
+                _set_parent_keep_world(imported_armature, parent_armature)
+            attached_meshes = _attach_w2_mimic_meshes_to_mimic_rig(
+                imported_armature,
+                imported_mesh_armatures,
+                imported_meshes,
+            )
+            if attached_meshes:
+                for target_obj in metadata_targets:
+                    if target_obj is not None:
+                        target_obj["witcher_w2_mimic_mesh_attachment_count"] = attached_meshes
+
+            if imported_armature is None:
+                for target_obj in _get_import_root_objects(list(imported_mesh_armatures or []) + list(imported_meshes or [])):
+                    if target_obj is not None and target_obj is not parent_armature:
+                        _set_parent_keep_world(target_obj, parent_armature)
+
+        hidden_base_heads = _hide_w2_base_head_objects_for_mimic(
+            metadata.get("head_name", ""),
+            objdict,
+            meshdict,
+        )
+        if hidden_base_heads:
+            for target_obj in metadata_targets:
+                if target_obj is not None:
+                    target_obj["witcher_w2_base_heads_hidden_for_mimic"] = hidden_base_heads
+
         if imported_armature is not None:
             objdict[chunk_ns] = imported_armature
             return root_skeleton or imported_armature
@@ -4522,10 +4791,12 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 # Store objects directly while adding metadata
                 for arm in armatures:
                     add_chunk_metadata(arm, chunk, mesh_path, component_name=component_name)
+                    _store_w2_head_metadata(arm, chunk)
                     objdict[chunk_ns] = arm
 
                 for mesh in meshes:
                     add_chunk_metadata(mesh, chunk, mesh_path, component_name=component_name)
+                    _store_w2_head_metadata(mesh, chunk)
                     if mesh.name[-5:-1] == "_lod":
                         meshdict[chunk_ns + mesh.name[-5:]] = mesh
                     else:
@@ -5084,6 +5355,19 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
     
     do_constraints(constrains, objdict, meshdict, HardAttachments)
 
+    if source_game == "w2" and root_skeleton is not None and getattr(root_skeleton, "type", "") == 'ARMATURE':
+        imported_roots = _get_import_root_objects(
+            [
+                obj
+                for obj in list(objdict.values()) + list(meshdict.values())
+                if obj is not None and obj is not root_skeleton
+            ]
+        )
+        for obj in imported_roots:
+            if obj is not None and obj.parent is None:
+                _set_parent_keep_world(obj, root_skeleton)
+                obj["witcher_w2_parented_to_main_entity"] = True
+
     if parent_transform:
         if root_skeleton:
             root_skeleton.parent = parent_transform
@@ -5220,6 +5504,12 @@ def add_app_template(   entity,
     if group_parent:
         if bind_root_chunks_to_entity:
             group_objects = apperance_level_objects
+            if template_source_game == "w2":
+                seen = {id(o) for o in group_objects}
+                for obj in grouped_root_objects:
+                    if obj is not None and id(obj) not in seen:
+                        group_objects.append(obj)
+                        seen.add(id(obj))
         else:
             group_objects = list(grouped_root_objects)
             seen = {id(o) for o in group_objects}

@@ -3,7 +3,7 @@ import json
 import math
 import copy
 from ..CR2W.CR2W_types import getCR2W
-from ..CR2W.dc_skeleton import create_Skeleton, load_bin_face, load_bin_skeleton
+from ..CR2W.dc_skeleton import create_Skeleton, load_bin_face, load_bin_skeleton, load_bin_w2_faces
 
 from math import degrees
 from math import radians
@@ -404,8 +404,18 @@ def export_w3_rig(context, filename):
 
 
 
-def loadFaceFile(filename):
+def loadFaceFile(filename, w2_chunk_index=None, w2_track_skeleton_file=None):
     cache_key, norm_path = _face_file_cache_key(filename)
+    if w2_chunk_index is not None:
+        try:
+            w2_chunk_index = int(w2_chunk_index)
+        except Exception:
+            w2_chunk_index = None
+    if w2_chunk_index is not None:
+        cache_key = cache_key + ("w2_chunk", w2_chunk_index)
+    if w2_track_skeleton_file:
+        track_cache_key, _track_norm_path = _face_file_cache_key(w2_track_skeleton_file)
+        cache_key = cache_key + ("w2_track_skeleton", track_cache_key)
     cached = _FACE_FILE_CACHE.get(cache_key)
     if cached is not None:
         log.debug("Face file cache hit: %s", filename)
@@ -418,6 +428,28 @@ def loadFaceFile(filename):
     elif ext.lower().endswith('.w3fac'):
         bin_data = load_bin_face(filename)
         faceData = read_json_w3.readFaceFileData(bin_data)
+    elif ext.lower().endswith('.w2faces'):
+        # Witcher 2 mimic faces support. Keep this separate from the W3 .w3fac path.
+        bin_data = load_bin_w2_faces(
+            filename,
+            chunk_index=w2_chunk_index,
+            track_skeleton_file=w2_track_skeleton_file,
+        )
+        faceData = read_json_w3.readFaceFileData(bin_data)
+        faceData.source_game = "w2"
+        faceData.mimic_faces_chunk_index = getattr(bin_data, "mimic_faces_chunk_index", None)
+        faceData.mimic_skeleton_chunk_index = getattr(bin_data, "mimic_skeleton_chunk_index", None)
+    elif w2_chunk_index is not None and ext.lower().endswith(('.w2ent', '.w2beard', '.w2mesh', '.cr2w')):
+        # Witcher 2 cooked entities can embed CMimicFaces chunks directly.
+        bin_data = load_bin_w2_faces(
+            filename,
+            chunk_index=w2_chunk_index,
+            track_skeleton_file=w2_track_skeleton_file,
+        )
+        faceData = read_json_w3.readFaceFileData(bin_data)
+        faceData.source_game = "w2"
+        faceData.mimic_faces_chunk_index = getattr(bin_data, "mimic_faces_chunk_index", None)
+        faceData.mimic_skeleton_chunk_index = getattr(bin_data, "mimic_skeleton_chunk_index", None)
     else:
         faceData = None
 

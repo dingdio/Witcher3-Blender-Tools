@@ -168,6 +168,241 @@ def create_CMimicFace(file):
                                      mimicPoses=final_poses)
     return CMimicFace
 
+
+# Witcher 2 mimic faces support.
+#
+# CMimicFaces (.w2faces) predates the Witcher 3 .w3fac layout.  It stores a
+# handle to a CSkeleton plus a nested array of EngineQsTransform poses.  Keep
+# this parser separate so the W3 mimicFaceFile/.w3fac path stays untouched.
+def _w2_cname(cr2w_file, index):
+    if index is None or index < 0:
+        return ""
+    cnames = getattr(cr2w_file, "CNAMES", []) or []
+    if index >= len(cnames):
+        return ""
+    name = getattr(cnames[index], "name", "")
+    return str(getattr(name, "value", name) or "")
+
+
+def _w2_chunk_range(cr2w_file, chunk_index):
+    exports = getattr(cr2w_file, "CR2WExport", None) or []
+    if chunk_index is None or chunk_index < 0 or chunk_index >= len(exports):
+        return (0, 0)
+    export = exports[chunk_index]
+    start = int(getattr(cr2w_file, "start", 0) or 0) + int(getattr(export, "dataOffset", 0) or 0)
+    end = start + int(getattr(export, "dataSize", 0) or 0)
+    return (start, end)
+
+
+def _iter_w2_chunk_props(cr2w_file, file_data, chunk_index):
+    start, end = _w2_chunk_range(cr2w_file, chunk_index)
+    pos = start
+    file_size = len(file_data)
+    end = min(end, file_size)
+
+    while pos + 10 <= end:
+        name_idx, type_idx, unk = struct.unpack_from("<HHh", file_data, pos)
+        size = struct.unpack_from("<I", file_data, pos + 6)[0]
+        if name_idx == 0 or type_idx == 0 or unk != -1 or size < 4:
+            break
+
+        data_start = pos + 10
+        data_end = data_start + size - 4
+        if data_end < data_start or data_end > end:
+            break
+
+        yield _w2_cname(cr2w_file, name_idx), _w2_cname(cr2w_file, type_idx), data_start, data_end
+        pos = data_end
+
+
+def _skip_w2_array_element_type_marker(cr2w_file, file_data, pos, end):
+    if pos + 4 > end:
+        return pos
+    type_idx, marker = struct.unpack_from("<Hh", file_data, pos)
+    if marker != -1:
+        return pos
+    if _w2_cname(cr2w_file, type_idx):
+        return pos + 4
+    return pos
+
+
+def _read_w2_engine_qs_transform(file_data, pos, end):
+    if pos >= end:
+        raise ValueError("Unexpected end of W2 EngineQsTransform data")
+
+    flags = file_data[pos]
+    pos += 1
+    x = y = z = 0.0
+    pitch = yaw = roll = 0.0
+    w = 1.0
+    scale_x = scale_y = scale_z = 1.0
+
+    if flags & 1:
+        if pos + 12 > end:
+            raise ValueError("Unexpected end of W2 EngineQsTransform position data")
+        x, y, z = struct.unpack_from("<fff", file_data, pos)
+        pos += 12
+    if flags & 2:
+        if pos + 16 > end:
+            raise ValueError("Unexpected end of W2 EngineQsTransform rotation data")
+        pitch, yaw, roll, w = struct.unpack_from("<ffff", file_data, pos)
+        pos += 16
+    if flags & 4:
+        if pos + 12 > end:
+            raise ValueError("Unexpected end of W2 EngineQsTransform scale data")
+        scale_x, scale_y, scale_z = struct.unpack_from("<fff", file_data, pos)
+        pos += 12
+
+    return (x, y, z, pitch, yaw, roll, w, scale_x, scale_y, scale_z), pos
+
+
+def _read_w2_mimic_pose_arrays(cr2w_file, file_data, data_start, data_end):
+    pos = data_start
+    if pos + 4 > data_end:
+        return []
+
+    pose_count = struct.unpack_from("<I", file_data, pos)[0]
+    pos += 4
+    pos = _skip_w2_array_element_type_marker(cr2w_file, file_data, pos, data_end)
+
+    poses = []
+    for _pose_index in range(pose_count):
+        if pos + 4 > data_end:
+            raise ValueError("Unexpected end of W2 mimic pose array")
+
+        bone_count = struct.unpack_from("<I", file_data, pos)[0]
+        pos += 4
+        pos = _skip_w2_array_element_type_marker(cr2w_file, file_data, pos, data_end)
+
+        transforms = []
+        for _bone_index in range(bone_count):
+            transform, pos = _read_w2_engine_qs_transform(file_data, pos, data_end)
+            transforms.append(transform)
+        poses.append(transforms)
+
+    if pos != data_end:
+        log.debug("W2 mimic pose parser ended at %s, expected %s", pos, data_end)
+    return poses
+
+
+def _find_w2_mimic_faces_chunk(cr2w_file, chunk_index=None):
+    chunks = getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or []
+    if chunk_index is not None:
+        chunk_index = int(chunk_index)
+        if 0 <= chunk_index < len(chunks) and getattr(chunks[chunk_index], "name", "") == "CMimicFaces":
+            return chunk_index
+        raise ValueError(f"W2 CMimicFaces chunk not found at index {chunk_index}")
+
+    for idx, chunk in enumerate(chunks):
+        if getattr(chunk, "name", "") == "CMimicFaces":
+            return idx
+    raise ValueError("No W2 CMimicFaces chunk found")
+
+
+def _find_w2_mimic_skeleton_chunk(cr2w_file, face_chunk_index):
+    chunks = getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or []
+    face_chunk = chunks[face_chunk_index] if 0 <= face_chunk_index < len(chunks) else None
+    skeleton_prop = face_chunk.GetVariableByName("mimicSkeleton") if face_chunk else None
+    handles = getattr(skeleton_prop, "Handles", None) or []
+    if handles:
+        ref = getattr(handles[0], "Reference", None)
+        if isinstance(ref, int) and 0 <= ref < len(chunks):
+            return ref
+
+    for idx in range(face_chunk_index + 1, len(chunks)):
+        if getattr(chunks[idx], "name", "") == "CSkeleton":
+            return idx
+    return None
+
+
+def _read_w2_mimic_skeleton(cr2w_file, file_data, skeleton_chunk_index):
+    chunks = getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or []
+    if skeleton_chunk_index is None or skeleton_chunk_index < 0 or skeleton_chunk_index >= len(chunks):
+        return w3_types.w2rig(nbBones=0, names=[], tracks=[], parentIdx=[], positions=[], rotations=[], scales=[])
+
+    skel_chunk = chunks[skeleton_chunk_index]
+    skeleton = read_skelly(skel_chunk)
+    if getattr(skeleton, "names", None):
+        return skeleton
+
+    start, end = _w2_chunk_range(cr2w_file, skeleton_chunk_index)
+    chunk_data = file_data[start:end]
+    if HavokPackfile.find_magic(chunk_data) >= 0:
+        return create_Skeleton_w2_uncooked(chunk_data, cr2w_file)
+
+    return skeleton
+
+
+def _w2_mimic_pose_name(index, pose_count, track_names=None):
+    if pose_count == 3:
+        low_pose_names = ("w2_low_ref", "w2_low_jaw", "w2_low_eyes")
+        if index < len(low_pose_names):
+            return low_pose_names[index]
+
+    track_names = [str(name or "").strip() for name in (track_names or [])]
+    track_names = [name for name in track_names if name]
+    if track_names:
+        if index == 0:
+            return "w2_base"
+        # This matches CEdMimicFacesEditor::UpdatePose:
+        # pose 0 is displayed as <base>, pose N uses GetTrackName(N - 1).
+        track_index = index - 1
+        if 0 <= track_index < len(track_names):
+            return track_names[track_index]
+
+    return f"w2_pose_{index:03d}"
+
+
+def create_CMimicFaces_w2(file, file_data, chunk_index=None, track_names=None):
+    face_chunk_index = _find_w2_mimic_faces_chunk(file, chunk_index=chunk_index)
+    skeleton_chunk_index = _find_w2_mimic_skeleton_chunk(file, face_chunk_index)
+    mimicSkeleton = _read_w2_mimic_skeleton(file, file_data, skeleton_chunk_index)
+
+    raw_poses = []
+    for prop_name, prop_type, data_start, data_end in _iter_w2_chunk_props(file, file_data, face_chunk_index):
+        if prop_name == "mimicPoses" and "EngineQsTransform" in prop_type:
+            raw_poses = _read_w2_mimic_pose_arrays(file, file_data, data_start, data_end)
+            break
+
+    bone_names = list(getattr(mimicSkeleton, "names", []) or [])
+    track_names = list(track_names or getattr(mimicSkeleton, "tracks", []) or [])
+    if track_names and not getattr(mimicSkeleton, "tracks", None):
+        mimicSkeleton.tracks = track_names[:]
+    final_poses = []
+    for pose_index, transforms in enumerate(raw_poses):
+        pose = MimicPose()
+        pose.name = _w2_mimic_pose_name(pose_index, len(raw_poses), track_names=track_names)
+        pose.numFrames = 1
+        pose.duration = 0.0
+        pose.dt = 0.0
+
+        for bone_index, transform in enumerate(transforms):
+            x, y, z, pitch, yaw, roll, w, scale_x, scale_y, scale_z = transform
+            myBone = Bone()
+            myBone.index = bone_index
+            myBone.BoneName = bone_names[bone_index] if bone_index < len(bone_names) else str(bone_index)
+            myBone.position_numFrames = 1
+            myBone.rotation_numFrames = 1
+            myBone.scale_numFrames = 1
+            myBone.positionFrames.append(Vector3D(x, y, z))
+            myBone.rotationFrames.append(Quaternion(pitch, yaw, roll, w))
+            myBone.scaleFrames.append(Vector3D(scale_x, scale_y, scale_z))
+            pose.bones.append(myBone)
+
+        final_poses.append(pose)
+
+    CMimicFaces = w3_types.CMimicFace(
+        name="w2faces",
+        mimicSkeleton=mimicSkeleton,
+        floatTrackSkeleton=w3_types.w2rig(nbBones=0, names=[], tracks=[], parentIdx=[], positions=[], rotations=[], scales=[]),
+        mimicPoses=final_poses,
+    )
+    CMimicFaces.source_game = "w2"
+    CMimicFaces.mimic_faces_chunk_index = face_chunk_index
+    CMimicFaces.mimic_skeleton_chunk_index = skeleton_chunk_index
+    return CMimicFaces
+
+
 import os
 
 from .CR2W_types import PROPERTY, getCR2W, W_CLASS
@@ -286,6 +521,7 @@ def create_Skeleton_w2_uncooked(file_data, rigFile):
 
     this_skeleton.nbBones = havok_skel.num_bones
     this_skeleton.names = havok_skel.names
+    this_skeleton.tracks = havok_skel.tracks
     this_skeleton.parentIdx = havok_skel.parent_indices
 
     # Convert Havok QsTransform tuples (x, y, z, w) to w3_types.Quaternion
@@ -312,6 +548,25 @@ def load_bin_face(fileName) -> w3_types.CMimicFace:
         f.close()
         CMimicFace = create_CMimicFace(theFile)
     return CMimicFace
+
+def _load_w2_track_names(track_skeleton_file):
+    if not track_skeleton_file or not os.path.exists(track_skeleton_file):
+        return []
+    try:
+        skeleton = load_bin_skeleton(track_skeleton_file)
+    except Exception:
+        log.warning("Failed to load W2 mimic track skeleton: %s", track_skeleton_file, exc_info=True)
+        return []
+    return [str(track or "").strip() for track in (getattr(skeleton, "tracks", []) or []) if str(track or "").strip()]
+
+
+def load_bin_w2_faces(fileName, chunk_index=None, track_skeleton_file=None) -> w3_types.CMimicFace:
+    with open(fileName, "rb") as f:
+        file_data = f.read()
+        f.seek(0)
+        theFile = getCR2W(f)
+    track_names = _load_w2_track_names(track_skeleton_file)
+    return create_CMimicFaces_w2(theFile, file_data, chunk_index=chunk_index, track_names=track_names)
 
 def load_bin_skeleton(fileName):
     with open(fileName,"rb") as f:

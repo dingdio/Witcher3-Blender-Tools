@@ -91,7 +91,7 @@ class HavokSkeleton:
     """Skeleton data extracted from an hkaSkeleton Havok object."""
 
     __slots__ = ('names', 'parent_indices', 'positions', 'rotations', 'scales',
-                 'num_bones', 'skeleton_name')
+                 'tracks', 'num_bones', 'skeleton_name')
 
     def __init__(self):
         self.skeleton_name = ""
@@ -101,6 +101,7 @@ class HavokSkeleton:
         self.positions = []       # list[tuple(x, y, z, w)]
         self.rotations = []       # list[tuple(x, y, z, w)]
         self.scales = []          # list[tuple(x, y, z, w)]
+        self.tracks = []          # list[str]
 
     def __repr__(self):
         return (f"HavokSkeleton(name={self.skeleton_name!r}, "
@@ -494,7 +495,74 @@ class HavokPackfile:
                 skel.rotations.append((0.0, 0.0, 0.0, 1.0))
                 skel.scales.append((1.0, 1.0, 1.0, 0.0))
 
+        # ------ Witcher 2 float-track names ------
+        #
+        # Most W2 skeletons have no float tracks.  The shared
+        # characters\templates\mimics\floattracks.w2rig stores them as a Havok
+        # string pointer array at the hkaSkeleton field previously labelled
+        # referenceFloats (+0x1C/+0x20) in this parser.  Only accept the data
+        # when every entry resolves through a local fixup to a printable string,
+        # so numeric reference-float arrays are left untouched.
+        tracks = self._read_hka_string_pointer_array(
+            ds,
+            fixup_map,
+            data_abs,
+            skeleton_offset,
+            ptr_field=0x24,
+            count_field=0x28,
+        )
+        if not tracks:
+            tracks = self._read_hka_string_pointer_array(
+                ds,
+                fixup_map,
+                data_abs,
+                skeleton_offset,
+                ptr_field=0x1C,
+                count_field=0x20,
+            )
+        skel.tracks = tracks
+
         return skel
+
+    def _read_hka_string_pointer_array(
+        self,
+        data_section,
+        fixup_map,
+        data_abs,
+        object_offset,
+        *,
+        ptr_field,
+        count_field,
+        max_count=512,
+    ):
+        obj_abs = data_abs + object_offset
+        if obj_abs + count_field + 4 > len(self.data):
+            return []
+
+        count = self._u32(obj_abs + count_field)
+        if count <= 0 or count > max_count:
+            return []
+
+        array_offset = fixup_map.get(object_offset + ptr_field)
+        if array_offset is None:
+            return []
+        array_abs = data_abs + array_offset
+        if array_abs < 0 or array_abs + count * 4 > len(self.data):
+            return []
+
+        names = []
+        for index in range(count):
+            string_offset = fixup_map.get(array_offset + index * 4)
+            if string_offset is None:
+                return []
+            string_abs = data_abs + string_offset
+            if string_abs < 0 or string_abs >= len(self.data):
+                return []
+            name = self._cstring(string_abs, 128).strip()
+            if not name or any(ord(ch) < 32 or ord(ch) > 126 for ch in name):
+                return []
+            names.append(name)
+        return names
 
     def _find_skeleton_object(self, fixup_map, data_section):
         """Find the data-section-relative offset of the hkaSkeleton object.

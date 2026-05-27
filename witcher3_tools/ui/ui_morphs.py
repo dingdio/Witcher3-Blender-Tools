@@ -1,4 +1,5 @@
 import logging
+import os
 import bpy
 from typing import Tuple
 from contextlib import contextmanager
@@ -777,9 +778,9 @@ class WITCH_PT_WitcherMorphs(WITCH_PT_Base, bpy.types.Panel):
                 box.prop(rig_settings, "phoneme_enabled", text="Phoneme Control")
                 box.prop(rig_settings, "facs_enabled", text="FACS Control")
                 if not rig_settings.witcher_morphs_collapse:
-                    the_data = control_arm_obj.pose.bones.get("w3_face_poses")
+                    the_data, _control_bone_name = _get_face_control_pose_bone(control_arm_obj)
                     if the_data is None:
-                        box.label(text="Missing w3_face_poses control bone. Reload face morphs.", icon='ERROR')
+                        box.label(text="Missing face poses control bone. Reload face morphs.", icon='ERROR')
                         return
 
                     face_mesh_objs, _face_rig = _resolve_face_mesh_objects_for_face_setup(context, main_arm_obj, None)
@@ -891,9 +892,9 @@ class WITCH_PT_WitcherMorphs(WITCH_PT_Base, bpy.types.Panel):
                 body_comp_morphs = [x for x in rig_settings.witcher_morphs_list if x.type == 3 and rig_settings.morph_search_filter.lower() in x.name.lower()]
                 row.label(text="Morph Components (" + str(len(body_comp_morphs)) + ")")
                 if not rig_settings.witcher_morphs_collapse2:
-                    the_data = control_arm_obj.pose.bones.get("w3_face_poses")
+                    the_data, _control_bone_name = _get_face_control_pose_bone(control_arm_obj)
                     if the_data is None:
-                        box.label(text="Missing w3_face_poses control bone. Reload face morphs.", icon='ERROR')
+                        box.label(text="Missing face poses control bone. Reload face morphs.", icon='ERROR')
                         return
 
                     for morph in body_comp_morphs:
@@ -1252,7 +1253,22 @@ FACE_MORPH_TYPE_NATIVE = 4
 FACE_MORPH_TYPE_PHONEME = 5
 FACE_MORPH_TYPE_FACS = 6
 FACE_ACTIVE_EPSILON = 0.0001
+W3_FACE_POSES_BONE = "w3_face_poses"
+W2_FACE_POSES_BONE = "w2_face_poses"
 _PHONEME_DRIVEN_UI_CACHE = {}
+
+
+def _get_face_control_pose_bone(arm_obj):
+    if not arm_obj or getattr(arm_obj, "type", None) != 'ARMATURE' or not getattr(arm_obj, "pose", None):
+        return None, ""
+
+    pose_bones = arm_obj.pose.bones
+    # Prefer W3 when it exists; W2 mimic imports use a separate fallback bone.
+    for bone_name in (W3_FACE_POSES_BONE, W2_FACE_POSES_BONE):
+        pose_bone = pose_bones.get(bone_name)
+        if pose_bone is not None:
+            return pose_bone, bone_name
+    return None, ""
 
 
 def _get_armature_object_from_armature_data(arm_data):
@@ -1363,7 +1379,7 @@ class WITCH_UL_ActiveFaceMorphs(bpy.types.UIList):
         pose_bone = None
         face_mesh_objs = []
         if arm_obj and getattr(arm_obj, "pose", None):
-            pose_bone = arm_obj.pose.bones.get("w3_face_poses")
+            pose_bone, _control_bone_name = _get_face_control_pose_bone(arm_obj)
             face_mesh_objs, _face_rig = _resolve_face_mesh_objects_for_face_setup(context, arm_obj, None)
 
         search = (getattr(data, "morph_search_filter", "") or "").lower()
@@ -1383,7 +1399,7 @@ class WITCH_UL_ActiveFaceMorphs(bpy.types.UIList):
             return
 
         arm_obj = _get_armature_object_from_armature_data(getattr(data, "id_data", None))
-        pose_bone = arm_obj.pose.bones.get("w3_face_poses") if arm_obj and getattr(arm_obj, "pose", None) else None
+        pose_bone, _control_bone_name = _get_face_control_pose_bone(arm_obj)
         face_mesh_objs, _face_rig = _resolve_face_mesh_objects_for_face_setup(context, arm_obj, None) if arm_obj else ([], None)
 
         split = layout.split(factor=0.42)
@@ -1427,6 +1443,101 @@ def get_face_meshs(mimicFace: str) -> Tuple:
             if mod_target and mod_target.name in face_arms and mesh_obj.name not in face_meshes:
                 face_meshes.append(mesh_obj.name)
     return (face_meshes, face_arms)
+
+
+def _get_w2_face_meshs(mimicFace: str) -> Tuple:
+    """Witcher 2 mimic faces support: find meshes attached to a CW2MimicHeadComponent rig."""
+    face_meshes, face_arms = get_face_meshs(mimicFace)
+    all_objs = bpy.data.objects
+
+    for arm_obj in all_objs:
+        if arm_obj.type != 'ARMATURE':
+            continue
+        if str(arm_obj.get("witcher_w2_mimic_mesh_parent_rig", "") or "") == mimicFace and arm_obj.name not in face_arms:
+            face_arms.append(arm_obj.name)
+
+    for mesh_obj in all_objs:
+        if mesh_obj.type != 'MESH':
+            continue
+        if str(mesh_obj.get("witcher_w2_mimic_mesh_parent_rig", "") or "") == mimicFace and mesh_obj.name not in face_meshes:
+            face_meshes.append(mesh_obj.name)
+            continue
+        for modifier in mesh_obj.modifiers:
+            if modifier.type != 'ARMATURE':
+                continue
+            mod_target = getattr(modifier, "object", None)
+            if mod_target and mod_target.name == mimicFace and mesh_obj.name not in face_meshes:
+                face_meshes.append(mesh_obj.name)
+            elif mod_target and mod_target.name in face_arms and mesh_obj.name not in face_meshes:
+                face_meshes.append(mesh_obj.name)
+    return (face_meshes, face_arms)
+
+
+def _as_w2_chunk_index(value):
+    try:
+        value = int(value)
+    except Exception:
+        return None
+    return value if value >= 0 else None
+
+
+def _resolve_w2_mimic_face_source(main_obj):
+    """Witcher 2 mimic faces support: resolve external or embedded CMimicFaces data."""
+    if main_obj is None or not bool(main_obj.get("witcher_w2_mimic_support", False)):
+        return None
+
+    embedded_source = str(main_obj.get("witcher_w2_mimic_faces_high_embedded_source", "") or "").strip()
+    embedded_chunk = _as_w2_chunk_index(main_obj.get("witcher_w2_mimic_faces_high_embedded_chunk_index", -1))
+    if embedded_source and embedded_chunk is not None and os.path.exists(embedded_source):
+        return (embedded_source, embedded_chunk)
+
+    face_file = (
+        str(main_obj.get("witcher_w2_mimic_faces_high", "") or "").strip()
+        or str(main_obj.get("witcher_w2_mimic_faces", "") or "").strip()
+    )
+    if face_file:
+        resolved = face_file if os.path.isabs(face_file) else repo_file(face_file, 115)
+        return (resolved, None)
+    return None
+
+
+def _resolve_w2_mimic_track_skeleton_source(main_obj):
+    """Witcher 2 mimic faces support: resolve the optional float-track skeleton."""
+    if main_obj is None or not bool(main_obj.get("witcher_w2_mimic_support", False)):
+        return None
+
+    skeleton_file = str(main_obj.get("witcher_w2_mimic_float_track_skeleton", "") or "").strip()
+    if not skeleton_file:
+        return None
+    resolved = skeleton_file if os.path.isabs(skeleton_file) else repo_file(skeleton_file, 115)
+    return resolved if resolved and os.path.exists(resolved) else None
+
+
+def _resolve_w2_mimic_face_rig_name(main_obj, scene):
+    """Witcher 2 mimic faces support: resolve the imported mimic head armature."""
+    if main_obj is None or scene is None:
+        return ""
+
+    prop_name = str(main_obj.get("witcher_w2_mimic_armature", "") or "").strip()
+    if prop_name and scene.objects.get(prop_name):
+        return prop_name
+
+    if bool(main_obj.get("witcher_w2_mimic_support", False)) and getattr(main_obj, "type", "") == 'ARMATURE':
+        mesh_role = str(main_obj.get("witcher_w2_mimic_mesh_role", "") or "").strip().lower()
+        if mesh_role == "mimic":
+            return main_obj.name
+
+    for obj in scene.objects:
+        if getattr(obj, "type", "") != 'ARMATURE':
+            continue
+        if not bool(obj.get("witcher_w2_mimic_support", False)):
+            continue
+        parent_name = str(obj.get("witcher_w2_mimic_parent_armature", "") or "").strip()
+        if parent_name == main_obj.name:
+            return obj.name
+        if getattr(obj, "parent", None) == main_obj:
+            return obj.name
+    return prop_name
 
 
 def _get_mimic_skeleton_bone_names(faceData) -> set[str]:
@@ -2154,13 +2265,15 @@ class WITCH_OT_morphs(bpy.types.Operator):
         if not main_obj:
             self.report({'WARNING'}, "No character target armature found. Set the Character target armature first.")
             return {'CANCELLED'}
-        if 'mimicFaceFile' not in main_obj:
+        scene = getattr(context, "scene", None)
+        w2_face_source = _resolve_w2_mimic_face_source(main_obj)
+        use_w2_mimic = 'mimicFaceFile' not in main_obj and w2_face_source is not None
+        if 'mimicFaceFile' not in main_obj and not use_w2_mimic:
             self.report({'WARNING'}, "Please ensure a Mimic Face Rig is available to use this function.")
             return {'CANCELLED'}
         if getattr(context, "scene", None):
             set_main_armature(context.scene, main_obj)
-        control_bone_name = 'w3_face_poses'
-        scene = getattr(context, "scene", None)
+        control_bone_name = 'w2_face_poses' if use_w2_mimic else 'w3_face_poses'
         saved_frame_current = getattr(scene, "frame_current", None) if scene is not None else None
         saved_frame_subframe = getattr(scene, "frame_subframe", 0.0) if scene is not None else 0.0
         save_world = main_obj.matrix_world.copy()
@@ -2175,8 +2288,19 @@ class WITCH_OT_morphs(bpy.types.Operator):
 
             create_control_bone(main_obj, control_bone_name)
             _safe_mode_set('OBJECT', main_obj)
-            fileName = main_obj['mimicFaceFile']
-            faceData = import_rig.loadFaceFile(repo_file(fileName))
+            if use_w2_mimic:
+                face_path, w2_chunk_index = w2_face_source
+                faceData = import_rig.loadFaceFile(
+                    face_path,
+                    w2_chunk_index=w2_chunk_index,
+                    w2_track_skeleton_file=_resolve_w2_mimic_track_skeleton_source(main_obj),
+                )
+            else:
+                fileName = main_obj['mimicFaceFile']
+                faceData = import_rig.loadFaceFile(repo_file(fileName))
+            if faceData is None:
+                self.report({'WARNING'}, "Could not load mimic face data.")
+                return {'CANCELLED'}
 
             rig_settings = main_obj.data.witcherui_RigSettings
             rig_settings.model_armature_object = main_obj
@@ -2193,21 +2317,24 @@ class WITCH_OT_morphs(bpy.types.Operator):
 
             scene = context.scene
 
-            face_rig = scene.objects.get(main_obj['mimicFace'])
+            face_rig_name = _resolve_w2_mimic_face_rig_name(main_obj, scene) if use_w2_mimic else main_obj['mimicFace']
+            face_rig = scene.objects.get(face_rig_name)
             if not face_rig:
                 # Check if face bones were merged into the main armature
                 face_bone_names = _get_mimic_skeleton_bone_names(faceData)
                 if face_bone_names and any(main_obj.pose.bones.get(bn) for bn in face_bone_names):
                     face_rig = main_obj
                 else:
-                    self.report({'WARNING'}, f"Could not find face rig '{main_obj['mimicFace']}' in the scene.")
+                    self.report({'WARNING'}, f"Could not find face rig '{face_rig_name}' in the scene.")
                     return {'CANCELLED'}
 
             merged_state = (face_rig == main_obj)
             if merged_state:
                 (face_meshes, face_arms) = _get_face_meshs_merged(main_obj, faceData)
+            elif use_w2_mimic:
+                (face_meshes, face_arms) = _get_w2_face_meshs(face_rig.name)
             else:
-                (face_meshes, face_arms) = get_face_meshs(main_obj['mimicFace'])
+                (face_meshes, face_arms) = get_face_meshs(face_rig.name)
             face_mesh_objs = []
             for mesh_name in face_meshes:
                 mesh_obj = scene.objects.get(mesh_name)
@@ -2519,15 +2646,16 @@ class WITCH_OT_morphs(bpy.types.Operator):
 
             _safe_mode_set('OBJECT', main_obj)
 
-            # Refresh phoneme setup after every morph rebuild so phoneme drivers
-            # always relink to the newly rebuilt morph shape keys.
-            try:
-                _activate_object(main_obj)
-                op_result = bpy.ops.witcher.load_face_phonemes()
-                if 'FINISHED' not in op_result:
-                    log.warning("Auto phoneme refresh returned %s", op_result)
-            except Exception as exc:
-                log.warning("Auto phoneme refresh failed: %s", exc)
+            # Refresh W3 phoneme setup after every W3 morph rebuild so phoneme
+            # drivers always relink to the newly rebuilt morph shape keys.
+            if not use_w2_mimic:
+                try:
+                    _activate_object(main_obj)
+                    op_result = bpy.ops.witcher.load_face_phonemes()
+                    if 'FINISHED' not in op_result:
+                        log.warning("Auto phoneme refresh returned %s", op_result)
+                except Exception as exc:
+                    log.warning("Auto phoneme refresh failed: %s", exc)
 
             #bpy.context.view_layer.objects.active = main_obj
             return {'FINISHED'}
@@ -2918,7 +3046,7 @@ class WITCH_OT_clear_face_controls(bpy.types.Operator):
             self.report({'WARNING'}, "No character armature found.")
             return {'CANCELLED'}
 
-        pose_bone = main_obj.pose.bones.get("w3_face_poses")
+        pose_bone, _control_bone_name = _get_face_control_pose_bone(main_obj)
         rig_settings = getattr(main_obj.data, "witcherui_RigSettings", None)
         if pose_bone is None or rig_settings is None:
             self.report({'WARNING'}, "No face controls found. Load Face Morphs first.")
@@ -2988,7 +3116,7 @@ class WITCH_OT_clear_lipsync(bpy.types.Operator):
             self.report({'WARNING'}, "No character armature found.")
             return {'CANCELLED'}
 
-        pose_bone = main_obj.pose.bones.get("w3_face_poses")
+        pose_bone, _control_bone_name = _get_face_control_pose_bone(main_obj)
         rig_settings = getattr(main_obj.data, "witcherui_RigSettings", None)
 
         # Collect track names to remove

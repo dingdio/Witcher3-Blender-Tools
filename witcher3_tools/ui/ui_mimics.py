@@ -167,7 +167,7 @@ def _has_face_morphs_loaded(armature_obj):
         return False
     if not armature_obj.pose:
         return False
-    control_bone = armature_obj.pose.bones.get("w3_face_poses")
+    control_bone = armature_obj.pose.bones.get("w3_face_poses") or armature_obj.pose.bones.get("w2_face_poses")
     if control_bone is None:
         return False
 
@@ -227,7 +227,13 @@ def _ensure_face_morphs_loaded(context, armature_obj, force=False):
         return False
     if not force and _has_face_morphs_loaded(armature_obj):
         return True
-    if 'mimicFaceFile' not in armature_obj or 'mimicFace' not in armature_obj:
+    has_w3_mimic = 'mimicFaceFile' in armature_obj and 'mimicFace' in armature_obj
+    has_w2_mimic = bool(armature_obj.get("witcher_w2_mimic_support", False)) and (
+        bool(str(armature_obj.get("witcher_w2_mimic_faces_high", "") or "").strip())
+        or bool(str(armature_obj.get("witcher_w2_mimic_faces", "") or "").strip())
+        or bool(str(armature_obj.get("witcher_w2_mimic_faces_high_embedded_source", "") or "").strip())
+    )
+    if not has_w3_mimic and not has_w2_mimic:
         return False
 
     view_layer = context.view_layer
