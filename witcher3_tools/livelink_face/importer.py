@@ -19,6 +19,7 @@ TRACK_NAME = "livelink_face"
 HEAD_BONE_CANDIDATES = ("head", "Head", "head_g", "Head_g")
 NECK_BONE_CANDIDATES = ("neck", "Neck", "neck1", "Neck1", "neck_g", "Neck_g")
 HEAD_CHANNELS = ("HeadYaw", "HeadPitch", "HeadRoll")
+FACE_POSE_BONE_CANDIDATES = ("w3_face_poses", "w2_face_poses")
 
 # Live Link Face UDP packets use the ARKit blendshape order before the head/eye rotation floats.
 STREAM_FACS_ORDER = (
@@ -135,6 +136,19 @@ def _find_pose_bone(armature, candidates):
     for bone in armature.pose.bones:
         if _normalized_name(bone.name) in lowered:
             return bone
+    return None
+
+
+def _resolve_face_pose_bone(armature):
+    if armature is None or getattr(armature, "pose", None) is None:
+        return None
+    candidates = FACE_POSE_BONE_CANDIDATES
+    if bool(armature.get("witcher_w2_mimic_support", False)) and "mimicFaceFile" not in armature:
+        candidates = ("w2_face_poses", "w3_face_poses")
+    for bone_name in candidates:
+        pose_bone = armature.pose.bones.get(bone_name)
+        if pose_bone is not None:
+            return pose_bone
     return None
 
 
@@ -321,9 +335,9 @@ def ensure_livelink_face_setup(context, armature):
     if not ui_voice._armature_has_face_morphs(armature):
         raise RuntimeError("Load Face Morphs on the character before importing Live Link Face.")
 
-    pose_bone = armature.pose.bones.get("w3_face_poses") if armature.pose else None
+    pose_bone = _resolve_face_pose_bone(armature)
     if pose_bone is None:
-        raise RuntimeError("The target armature is missing the w3_face_poses pose bone.")
+        raise RuntimeError("The target armature is missing a face pose control bone.")
 
     missing_facs = [name for name in facs_helper.get_facs_channels() if name not in pose_bone]
     if missing_facs:
@@ -347,7 +361,9 @@ def ensure_livelink_face_setup(context, armature):
             if previous_active and previous_active.name in bpy.data.objects:
                 context.view_layer.objects.active = previous_active
 
-    pose_bone = armature.pose.bones.get("w3_face_poses")
+    pose_bone = _resolve_face_pose_bone(armature)
+    if pose_bone is None:
+        raise RuntimeError("Create FACS did not add a face pose control bone.")
     missing_facs = [name for name in facs_helper.get_facs_channels() if name not in pose_bone]
     if missing_facs:
         raise RuntimeError(f"Create FACS did not add {len(missing_facs)} required ARKit controls.")
@@ -375,9 +391,9 @@ def apply_sample_to_pose(
     neck_rotation_share=0.35,
     mirror_view=False,
 ):
-    pose_bone = armature.pose.bones.get("w3_face_poses") if armature and armature.pose else None
+    pose_bone = _resolve_face_pose_bone(armature)
     if pose_bone is None:
-        raise RuntimeError("The target armature is missing the w3_face_poses pose bone.")
+        raise RuntimeError("The target armature is missing a face pose control bone.")
 
     if mirror_view:
         sample = mirror_sample(sample)

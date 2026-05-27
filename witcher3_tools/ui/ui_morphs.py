@@ -491,6 +491,12 @@ class witcherui_MeshSettings(bpy.types.PropertyGroup):
     
     witcher_meshexport_collapse: bpy.props.BoolProperty(default = False)
 
+def _iter_face_control_bone_names_for_armature(arm_obj):
+    if bool(arm_obj.get("witcher_w2_mimic_support", False)) and 'mimicFaceFile' not in arm_obj:
+        return ("w2_face_poses", "w3_face_poses")
+    return ("w3_face_poses", "w2_face_poses")
+
+
 def _phoneme_enabled_update_callback(self, context):
     """Sync the phoneme_enabled toggle to the pose bone float property used by drivers.
 
@@ -504,7 +510,11 @@ def _phoneme_enabled_update_callback(self, context):
         return
     for arm_obj in bpy.data.objects:
         if arm_obj.type == 'ARMATURE' and arm_obj.data is arm_data:
-            pb = arm_obj.pose.bones.get("w3_face_poses")
+            pb = None
+            for bone_name in _iter_face_control_bone_names_for_armature(arm_obj):
+                pb = arm_obj.pose.bones.get(bone_name)
+                if pb is not None:
+                    break
             if pb is not None:
                 if "phoneme_enabled" not in pb:
                     pb["phoneme_enabled"] = 1.0
@@ -520,7 +530,11 @@ def _facs_enabled_update_callback(self, context):
         return
     for arm_obj in bpy.data.objects:
         if arm_obj.type == 'ARMATURE' and arm_obj.data is arm_data:
-            pb = arm_obj.pose.bones.get("w3_face_poses")
+            pb = None
+            for bone_name in _iter_face_control_bone_names_for_armature(arm_obj):
+                pb = arm_obj.pose.bones.get(bone_name)
+                if pb is not None:
+                    break
             if pb is not None:
                 if "facs_enabled" not in pb:
                     pb["facs_enabled"] = 1.0
@@ -1263,8 +1277,7 @@ def _get_face_control_pose_bone(arm_obj):
         return None, ""
 
     pose_bones = arm_obj.pose.bones
-    # Prefer W3 when it exists; W2 mimic imports use a separate fallback bone.
-    for bone_name in (W3_FACE_POSES_BONE, W2_FACE_POSES_BONE):
+    for bone_name in _iter_face_control_bone_names_for_armature(arm_obj):
         pose_bone = pose_bones.get(bone_name)
         if pose_bone is not None:
             return pose_bone, bone_name
@@ -1366,6 +1379,10 @@ def _get_driven_terms_for_entry(entry, available_native_morphs):
     if entry is None:
         return []
     if entry.type == FACE_MORPH_TYPE_FACS:
+        # Witcher 2 support: W2 mimic imports use a separate native morph name set.
+        w2_terms = facs_helper_w2.get_witcher_morphs_for_facs(entry.path, available_native_morphs)
+        if w2_terms:
+            return w2_terms
         return facs_helper.get_witcher_morphs_for_facs(entry.path, available_native_morphs)
     if entry.type == FACE_MORPH_TYPE_PHONEME:
         return _get_phoneme_driven_map_cached(available_native_morphs).get(entry.path, [])
@@ -2680,12 +2697,25 @@ class WITCH_OT_morphs(bpy.types.Operator):
         #bpy.ops.object.modifier_apply_as_shapekey(keep_modifier=True, modifier="Armature")
 
 
-from . import phoneme_helper, facs_helper
+from . import phoneme_helper, facs_helper, facs_helper_w2
 
 
-def _resolve_face_mesh_objects_for_face_setup(context, main_obj, faceData=None):
+def _resolve_face_mesh_objects_for_face_setup(context, main_obj, faceData=None, use_w2_mimic=None):
     scene = context.scene
-    face_rig_name = main_obj.get('mimicFace')
+    if use_w2_mimic is None:
+        use_w2_mimic = (
+            main_obj is not None
+            and bool(main_obj.get("witcher_w2_mimic_support", False))
+            and 'mimicFaceFile' not in main_obj
+        )
+
+    # Witcher 2 support: W2 mimic rigs are linked through imported entity metadata,
+    # not the W3 mimicFace/mimicFaceFile properties.
+    face_rig_name = (
+        _resolve_w2_mimic_face_rig_name(main_obj, scene)
+        if use_w2_mimic
+        else main_obj.get('mimicFace')
+    )
     if not face_rig_name:
         return [], None
 
@@ -2701,6 +2731,8 @@ def _resolve_face_mesh_objects_for_face_setup(context, main_obj, faceData=None):
 
     if face_rig == main_obj and faceData:
         face_meshes, _face_arms = _get_face_meshs_merged(main_obj, faceData)
+    elif use_w2_mimic:
+        face_meshes, _face_arms = _get_w2_face_meshs(face_rig.name)
     else:
         face_meshes, _face_arms = get_face_meshs(face_rig.name)
     if not face_meshes:
@@ -2884,15 +2916,25 @@ class WITCH_OT_facs(bpy.types.Operator):
         if not main_obj:
             self.report({'WARNING'}, "No character target armature found. Set the Character target armature first.")
             return {'CANCELLED'}
-        if 'mimicFaceFile' not in main_obj or 'mimicFace' not in main_obj:
+        w2_face_source = _resolve_w2_mimic_face_source(main_obj)
+        use_w2_mimic = (
+            'mimicFaceFile' not in main_obj
+            and (
+                w2_face_source is not None
+                or bool(main_obj.get("witcher_w2_mimic_support", False))
+                or bool(getattr(main_obj, "pose", None) and main_obj.pose.bones.get(W2_FACE_POSES_BONE) is not None)
+            )
+        )
+        if not use_w2_mimic and ('mimicFaceFile' not in main_obj or 'mimicFace' not in main_obj):
             self.report({'WARNING'}, "Please load Face Morphs before creating FACS controls.")
             return {'CANCELLED'}
         if getattr(context, "scene", None):
             set_main_armature(context.scene, main_obj)
 
-        pose_bone = main_obj.pose.bones.get('w3_face_poses')
+        control_bone_name = W2_FACE_POSES_BONE if use_w2_mimic else W3_FACE_POSES_BONE
+        pose_bone = main_obj.pose.bones.get(control_bone_name)
         if pose_bone is None:
-            self.report({'WARNING'}, "Please load Face Morphs before creating FACS controls (missing w3_face_poses).")
+            self.report({'WARNING'}, f"Please load Face Morphs before creating FACS controls (missing {control_bone_name}).")
             return {'CANCELLED'}
 
         rig_settings = main_obj.data.witcherui_RigSettings
@@ -2900,15 +2942,29 @@ class WITCH_OT_facs(bpy.types.Operator):
 
         faceData = None
         try:
-            face_file = main_obj.get('mimicFaceFile')
-            if face_file:
-                faceData = import_rig.loadFaceFile(repo_file(face_file))
+            if use_w2_mimic and w2_face_source:
+                face_path, w2_chunk_index = w2_face_source
+                faceData = import_rig.loadFaceFile(
+                    face_path,
+                    w2_chunk_index=w2_chunk_index,
+                    w2_track_skeleton_file=_resolve_w2_mimic_track_skeleton_source(main_obj),
+                )
+            else:
+                face_file = main_obj.get('mimicFaceFile')
+                if face_file:
+                    faceData = import_rig.loadFaceFile(repo_file(face_file))
         except Exception as exc:
             log.warning("Failed to read mimic face data for FACS setup: %s", exc)
 
-        face_mesh_objs, face_rig = _resolve_face_mesh_objects_for_face_setup(context, main_obj, faceData)
+        face_mesh_objs, face_rig = _resolve_face_mesh_objects_for_face_setup(
+            context,
+            main_obj,
+            faceData,
+            use_w2_mimic=use_w2_mimic,
+        )
         if not face_rig:
-            self.report({'WARNING'}, f"Could not find face rig '{main_obj.get('mimicFace')}' in the scene.")
+            face_rig_label = _resolve_w2_mimic_face_rig_name(main_obj, context.scene) if use_w2_mimic else main_obj.get('mimicFace')
+            self.report({'WARNING'}, f"Could not find face rig '{face_rig_label}' in the scene.")
             return {'CANCELLED'}
         if not face_mesh_objs:
             self.report({'WARNING'}, "No face meshes found for the mimic face rig.")
@@ -2921,8 +2977,10 @@ class WITCH_OT_facs(bpy.types.Operator):
             if entry.type in (3, 4) and entry.path:
                 available_morphs.add(entry.path)
 
-        facs_channels = facs_helper.get_facs_channels()
-        facs_terms = facs_helper.build_witcher_morph_terms(available_morphs=available_morphs)
+        # Witcher 2 support: use the W2 float-track mapping only for W2 mimic rigs.
+        facs_mapping = facs_helper_w2 if use_w2_mimic else facs_helper
+        facs_channels = facs_mapping.get_facs_channels()
+        facs_terms = facs_mapping.build_witcher_morph_terms(available_morphs=available_morphs)
         if not facs_terms:
             self.report({'WARNING'}, "No matching Witcher face morphs found for the FACS mapping.")
             return {'CANCELLED'}
@@ -2953,12 +3011,15 @@ class WITCH_OT_facs(bpy.types.Operator):
         for morph_name in facs_terms.keys():
             ensure_pose_property(morph_name)
 
-        try:
-            _phonemes_data, morphs_data, phoneme_list, _morph_list = phoneme_helper.read_phoneme_weights()
-        except Exception as exc:
-            log.warning("Failed to read phonemes.txt while creating FACS controls: %s", exc)
-            morphs_data = {}
-            phoneme_list = []
+        morphs_data = {}
+        phoneme_list = []
+        if not use_w2_mimic:
+            try:
+                _phonemes_data, morphs_data, phoneme_list, _morph_list = phoneme_helper.read_phoneme_weights()
+            except Exception as exc:
+                log.warning("Failed to read phonemes.txt while creating FACS controls: %s", exc)
+                morphs_data = {}
+                phoneme_list = []
 
         prev_active = context.view_layer.objects.active
         prev_mode = main_obj.mode

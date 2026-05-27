@@ -52,7 +52,7 @@ class WITCH_OT_import_livelinkface_csv(bpy.types.Operator, ImportHelper):
     apply_facs: BoolProperty(
         name="FACS",
         default=True,
-        description="Key ARKit/FACS values on w3_face_poses",
+        description="Key ARKit/FACS values on the face pose controls",
     )
     apply_head: BoolProperty(
         name="Head / Neck",

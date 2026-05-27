@@ -155,7 +155,14 @@ def _get_active_armature(context):
     return _resolve_voice_target_armature(context)
 
 def _armature_has_face_morphs(armature):
-    return bool(armature and armature.pose and "w3_face_poses" in armature.pose.bones)
+    return bool(
+        armature
+        and armature.pose
+        and (
+            "w3_face_poses" in armature.pose.bones
+            or "w2_face_poses" in armature.pose.bones
+        )
+    )
 
 
 def _object_to_armature(obj):
