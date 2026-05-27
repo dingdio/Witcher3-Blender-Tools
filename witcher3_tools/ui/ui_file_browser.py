@@ -99,6 +99,8 @@ from ..CR2W.witcher_cache.SoundCache.SoundCache import SoundCache
 from ..CR2W.witcher_cache.SoundCache.SoundBanksInfo import SoundBanksInfoXML
 from ..CR2W.witcher_cache.SoundCache.SoundManager import _soundbanks_metadata_path
 from ..CR2W.witcher_cache.Speech import LoadSpeechManager
+from ..CR2W.witcher_cache.W2Speech import LoadWitcher2SpeechManager, w2_voice_base_name
+from .. import dialog_language
 from ..external_addon_tools import ensure_apx_from_apb, get_apx_addon_status, get_srt_addon_status
 
 
@@ -267,6 +269,11 @@ class MySettings(PropertyGroup):
     external_export_ui_ping: IntProperty(
         default=0,
         options={'HIDDEN', 'SKIP_SAVE'},
+    )
+    show_standalone_archives: BoolProperty(
+        name="Standalone Mod Caches",
+        description="Show tools for opening individual .cache/.bundle files",
+        default=False,
     )
     preview_texture_path: StringProperty(default="")  # For texture preview popup
     revealed_file_path: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
@@ -588,6 +595,7 @@ from ..CR2W.witcher_cache.CacheController import CacheController
 folder_structure:FolderStructure = FolderStructure()
 
 WITCHER2_BUNDLE_CACHE_TYPE = "Bundle Witcher 2"
+WITCHER2_SPEECH_CACHE_TYPE = "W2Speech"
 
 # Disk-based cache types (read-only depots/workspaces)
 DISK_CACHE_TYPES = {
@@ -712,7 +720,19 @@ def is_external_cache(cache_type: str) -> bool:
 def get_effective_cache_type(cache_type: str) -> str:
     if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
         return "Bundle"
+    if cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+        return "Speech"
     return EXTERNAL_CACHE_EFFECTIVE_TYPES.get(cache_type, cache_type)
+
+
+def get_cache_type_display_label(cache_type: str) -> str:
+    return {
+        "REDkit Depot": "REDkit Depot",
+        "REDkit Uncooked": "REDkit Uncooked",
+        "Witcher 2 Data": "REDkit 2 Data",
+        WITCHER2_BUNDLE_CACHE_TYPE: "W2 DZIP",
+        WITCHER2_SPEECH_CACHE_TYPE: "W2Speech",
+    }.get(cache_type, cache_type or "")
 
 
 def get_cache_type_icon(cache_type: str) -> str:
@@ -729,15 +749,18 @@ def get_cache_type_icon(cache_type: str) -> str:
         "Cooked": "PACKAGE",
         "Witcher 2 Data": "FILE_FOLDER",
         WITCHER2_BUNDLE_CACHE_TYPE: "PACKAGE",
+        WITCHER2_SPEECH_CACHE_TYPE: "SPEAKER",
     }.get(effective_cache_type, "FILE_FOLDER")
 
 
 def cache_supports_scene_import(cache_type: str) -> bool:
+    if cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+        return False
     return True
 
 
 def cache_supports_sound_preview(cache_type: str) -> bool:
-    return get_effective_cache_type(cache_type) == "Sound"
+    return get_effective_cache_type(cache_type) == "Sound" or cache_type == WITCHER2_SPEECH_CACHE_TYPE
 
 def get_external_archive_session(cache_type: str):
     if not is_external_cache(cache_type):
@@ -2313,6 +2336,14 @@ def get_file_info(context, cache_type, item_path, loadmods=False):
             except Exception:
                 return (True, 0)
         return (False, 0)
+    if cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+        abs_path = get_witcher2_speech_abs_path(context, item_path)
+        if abs_path and win_path_exists(abs_path):
+            try:
+                return (True, win_path_getsize(abs_path))
+            except Exception:
+                return (True, 0)
+        return (False, 0)
     if cache_type == "Texture":
         return get_texture_file_info(context, item_path, loadmods=loadmods)
     if get_effective_cache_type(cache_type) == "Collision":
@@ -2327,10 +2358,17 @@ def get_source_label(context, item_path, loadmods=False, cache_type=""):
         effective_cache_type = get_effective_cache_type(cache_type) if cache_type else cache_type
         if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
             source_root = _get_witcher2_uncook_root(context, create=False)
+        elif cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+            source_root = _get_witcher2_uncook_root(context, create=False)
         else:
             source_root = get_texture_path(context) if effective_cache_type == "Texture" else get_uncook_path(context)
         source_root = source_root or ""
-        rel_path = get_vanilla_path(item_path, loadmods)
+        if cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+            manager = LoadWitcher2SpeechManager()
+            language = _get_witcher2_speech_language(context, manager)
+            rel_path = os.path.join("local_speech", language, "audio", _w2_speech_virtual_path(item_path))
+        else:
+            rel_path = get_vanilla_path(item_path, loadmods)
         return get_source_for_path(source_root, rel_path)
     except Exception:
         return ""
@@ -2355,6 +2393,104 @@ def get_witcher2_bundle_abs_path(context, item_path) -> str:
         return ""
     rel_path = (item_path or "").replace("/", "\\").lstrip("\\")
     return os.path.join(root, rel_path)
+
+
+def _w2_speech_id_from_path(item_path) -> int | None:
+    text = str(item_path or "").replace("/", "\\").strip()
+    if not text:
+        return None
+    stem = os.path.splitext(os.path.basename(text))[0]
+    if stem.lower().startswith("vo_id"):
+        stem = stem[5:]
+    try:
+        return int(stem, 10)
+    except Exception:
+        return None
+
+
+def _w2_speech_virtual_path(item_path) -> str:
+    speech_id = _w2_speech_id_from_path(item_path)
+    if speech_id is None:
+        speech_id = item_path
+    return w2_voice_base_name(speech_id) + ".mp2"
+
+
+def _get_witcher2_speech_language(context, manager=None) -> str:
+    for value in (
+        getattr(manager, "Language", "") if manager is not None else "",
+        getattr(manager, "RequestedLanguage", "") if manager is not None else "",
+    ):
+        value = str(value or "").strip().lower()
+        if value:
+            return value
+    try:
+        return dialog_language.normalize_dialog_language(
+            dialog_language.get_active_voice_language(context)
+        ).lower()
+    except Exception:
+        return "en"
+
+
+def _get_witcher2_speech_dirs(context, manager=None, create: bool = False):
+    root = _get_witcher2_uncook_root(context, create=create)
+    if not root:
+        return "", "", ""
+    language = _get_witcher2_speech_language(context, manager)
+    base_dir = os.path.join(root, "local_speech", language)
+    audio_dir = os.path.join(base_dir, "audio")
+    lipsync_dir = os.path.join(base_dir, "lipsync")
+    if create:
+        os.makedirs(audio_dir, exist_ok=True)
+        os.makedirs(lipsync_dir, exist_ok=True)
+    return root, audio_dir, lipsync_dir
+
+
+def get_witcher2_speech_abs_path(context, item_path, manager=None, ext: str = ".mp2") -> str:
+    _root, audio_dir, lipsync_dir = _get_witcher2_speech_dirs(context, manager=manager, create=False)
+    if not audio_dir:
+        return ""
+    base_name = w2_voice_base_name(_w2_speech_id_from_path(item_path) or item_path)
+    ext = (ext or ".mp2").lower()
+    output_dir = lipsync_dir if ext == ".dat" else audio_dir
+    return os.path.join(output_dir, base_name + ext)
+
+
+def ensure_witcher2_speech_item_extracted(context, item_path, overwrite=False) -> str:
+    speech_id = _w2_speech_id_from_path(item_path)
+    if speech_id is None:
+        return ""
+
+    manager = LoadWitcher2SpeechManager()
+    items = manager.find_item_by_hash(speech_id) if manager else None
+    if not items:
+        return ""
+
+    final_item = items[-1] if isinstance(items, list) else items
+    root, audio_dir, lipsync_dir = _get_witcher2_speech_dirs(context, manager=manager, create=True)
+    base_name = w2_voice_base_name(speech_id)
+
+    if audio_dir:
+        mp2_path = os.path.join(audio_dir, base_name + ".mp2")
+        dat_path = os.path.join(lipsync_dir, base_name + ".dat")
+        needs_audio = bool(getattr(final_item, "mp2_size", 0)) and (overwrite or not win_path_exists(mp2_path))
+        needs_lipsync = bool(getattr(final_item, "lipsync_size", 0)) and (overwrite or not win_path_exists(dat_path))
+        if needs_audio or needs_lipsync:
+            final_item.extract_pair(
+                output_dir=audio_dir,
+                lipsync_output_dir=lipsync_dir,
+                file_name=base_name,
+            )
+        if root:
+            language = _get_witcher2_speech_language(context, manager)
+            rel_audio = os.path.join("local_speech", language, "audio", base_name + ".mp2")
+            rel_lipsync = os.path.join("local_speech", language, "lipsync", base_name + ".dat")
+            if win_path_exists(mp2_path):
+                set_source_for_path(root, rel_audio, "witcher2 speech")
+            if win_path_exists(dat_path):
+                set_source_for_path(root, rel_lipsync, "witcher2 speech")
+        return mp2_path if win_path_exists(mp2_path) else dat_path if win_path_exists(dat_path) else ""
+
+    return final_item.extract_to_file(file_name=base_name)
 
 
 def ensure_witcher2_bundle_item_extracted(context, item_path, overwrite=False) -> str:
@@ -2392,6 +2528,9 @@ def get_browser_item_output_path(context, cache_type, item_path, loadmods=False)
 
     if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
         return get_witcher2_bundle_abs_path(context, item_path)
+
+    if cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+        return get_witcher2_speech_abs_path(context, item_path)
 
     effective_cache_type = get_effective_cache_type(cache_type)
     if effective_cache_type == "Collision":
@@ -3147,6 +3286,14 @@ def _get_sound_item_and_export_path(context, item_path: str, loadmods: bool = Fa
 
 
 def ensure_sound_item_extracted(context, item_path: str, loadmods: bool = False, cache_type: str = "Sound") -> str:
+    if cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+        browser = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+        return ensure_witcher2_speech_item_extracted(
+            context,
+            item_path,
+            overwrite=bool(getattr(browser, "mods_overwrite", False)),
+        )
+
     final_item, export_path = _get_sound_item_and_export_path(
         context,
         item_path,
@@ -3539,6 +3686,15 @@ def get_bundle_item_size(cache_type, item_path, loadmods=False):
             if items:
                 final_item = items[-1] if isinstance(items, list) else items
                 return getattr(final_item, 'size', 0) or getattr(final_item, 'Size', 0) or 0
+        elif cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+            speech_id = _w2_speech_id_from_path(item_path)
+            if speech_id is None:
+                return 0
+            manager = LoadWitcher2SpeechManager()
+            items = manager.find_item_by_hash(speech_id)
+            if items:
+                final_item = items[-1] if isinstance(items, list) else items
+                return getattr(final_item, 'mp2_size', 0) or getattr(final_item, 'size', 0) or 0
         elif cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
             session = get_external_archive_session(cache_type)
             if session:
@@ -3634,6 +3790,14 @@ def _resolve_item_for_stats(cache_type: str, item_path: str, loadmods: bool = Fa
     if cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
         manager = LoadWitcher2BundleManager()
         items = manager.find_item_by_hash(item_key)
+        return items[-1] if isinstance(items, list) and items else items
+
+    if cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+        speech_id = _w2_speech_id_from_path(item_key)
+        if speech_id is None:
+            return None
+        manager = LoadWitcher2SpeechManager()
+        items = manager.find_item_by_hash(speech_id)
         return items[-1] if isinstance(items, list) and items else items
 
     if cache_type == "Collision":
@@ -3818,6 +3982,7 @@ def get_cached_search_results(query, cache_type, folder_struct, loadmods=False):
         for ct, loader in [
             ("Bundle", lambda: LoadBundleManager(loadmods=loadmods)),
             (WITCHER2_BUNDLE_CACHE_TYPE, lambda: LoadWitcher2BundleManager()),
+            (WITCHER2_SPEECH_CACHE_TYPE, lambda: LoadWitcher2SpeechManager()),
             ("Collision", lambda: LoadCollisionManager(loadmods=loadmods)),
             ("Texture", lambda: LoadTextureManager(loadmods=loadmods)),
             ("Sound", lambda: LoadSoundManager(loadmods=loadmods)),
@@ -3826,7 +3991,10 @@ def get_cached_search_results(query, cache_type, folder_struct, loadmods=False):
                 manager = loader()
                 tokens = query.lower().replace('_', ' ').split()
                 for key in manager.Items.keys():
-                    key_str = str(key) if not isinstance(key, str) else key
+                    if ct == WITCHER2_SPEECH_CACHE_TYPE:
+                        key_str = _w2_speech_virtual_path(key)
+                    else:
+                        key_str = str(key) if not isinstance(key, str) else key
                     if _should_skip_buffer_name(key_str):
                         continue
                     normalized = key_str.lower().replace('_', ' ')
@@ -5327,76 +5495,125 @@ class SimpleFileBrowser(Operator):
                 # Search across all caches (uses cached results)
                 self.draw_global_search_results(layout, witcher_file_browser.search_query)
             else:
-                # Show cache type buttons
-                col = layout.column(align=True)
-                cache_types = [
-                    ("Bundle", "PACKAGE", "Game asset bundles (.w2mesh, .w2ent, etc.)"),
-                    ("Collision", "MESH_CUBE", "Collision meshes (.nxs)"),
-                    ("Texture", "IMAGE_DATA", "Texture cache (.xbm, .dds)"),
-                    ("Sound", "SPEAKER", "Sound cache (.wem, .bnk)"),
-                    ("Speech", "SPEAKER", "Speech/audio files"),
-                    ("REDkit Depot", "FILE_FOLDER", "REDkit r4data depot (read-only)"),
-                    ("REDkit Uncooked", "FILE_FOLDER", "REDkit uncooked depot (read-only)"),
-                    ("Workspace", "FILE_FOLDER", "Project workspace(s)"),
-                    ("Cooked", "PACKAGE", "Project cooked output (packed)"),
-                    ("Witcher 2 Data", "FILE_FOLDER", "Witcher 2 game data (read-only)"),
-                    (WITCHER2_BUNDLE_CACHE_TYPE, "PACKAGE", "Witcher 2 DZIP archives"),
+                # Show cache type buttons grouped by game/source family.
+                cache_groups = [
+                    (
+                        "Witcher 3",
+                        "PACKAGE",
+                        [
+                            ("Bundle", "Bundles", "PACKAGE", "Game asset bundles"),
+                            ("Collision", "Collision", "MESH_CUBE", "Collision meshes"),
+                            ("Texture", "Textures", "IMAGE_DATA", "Texture cache"),
+                            ("Sound", "Sound", "SPEAKER", "Sound cache"),
+                            ("Speech", "Speech", "SPEAKER", "Speech archives"),
+                        ],
+                        (
+                            "Witcher 3 REDkit",
+                            "FILE_FOLDER",
+                            [
+                                ("REDkit Depot", "Depot", "FILE_FOLDER", "r4data source depot"),
+                                ("REDkit Uncooked", "Uncooked", "FILE_FOLDER", "Generated asset depot"),
+                                ("Workspace", "Workspace", "FILE_FOLDER", "Project workspace"),
+                                ("Cooked", "Cooked", "PACKAGE", "Project cooked output"),
+                            ],
+                        ),
+                    ),
+                    (
+                        "Witcher 2",
+                        "PACKAGE",
+                        [
+                            (WITCHER2_BUNDLE_CACHE_TYPE, "DZIP Archives", "PACKAGE", "Witcher 2 DZIP archives"),
+                            (WITCHER2_SPEECH_CACHE_TYPE, "W2Speech", "SPEAKER", "Witcher 2 speech archives"),
+                        ],
+                        (
+                            "Witcher 2 REDkit",
+                            "FILE_FOLDER",
+                            (
+                                ("Witcher 2 Data", "REDkit 2 Data", "FILE_FOLDER", "REDkit 2 data folder"),
+                            ),
+                        ),
+                    ),
                 ]
-                for cache_name, icon, desc in cache_types:
-                    row = col.row(align=True)
-                    op = row.operator("witcher.select_cache_type", text=cache_name, icon=icon)
-                    op.cache_type = cache_name
-                    row.label(text=desc)
+                for group_name, group_icon, cache_types, redkit_section in cache_groups:
+                    group_box = layout.box()
+                    group_box.label(text=group_name, icon=group_icon)
+                    cache_col = group_box.column(align=True)
+                    for cache_name, button_text, icon, desc in cache_types:
+                        row = cache_col.row(align=True)
+                        op = row.operator("witcher.select_cache_type", text=button_text, icon=icon)
+                        op.cache_type = cache_name
+                        row.label(text=desc)
 
-                last_external = get_last_recent_external_archive(context)
-                last_external_path = last_external.get("path", "") if last_external else ""
-                last_external_available = bool(last_external) and _can_restore_external_archive(
-                    last_external.get("cache_type", ""),
-                    last_external_path,
-                )
-                if last_external and last_external_available:
-                    layout.separator(factor=0.4)
-                    resume_box = layout.box()
-                    resume_head = resume_box.row(align=True)
-                    resume_head.label(text="Last External", icon='FILEBROWSER')
-                    resume_head.label(
-                        text=get_effective_cache_type(last_external.get("cache_type", "")),
-                        icon=get_cache_type_icon(last_external.get("cache_type", "")),
-                    )
-                    resume_row = resume_box.row(align=True)
-                    op = resume_row.operator(
-                        "witcher.reopen_external_archive",
-                        text=last_external.get("display_name", "") or os.path.basename(last_external_path) or last_external_path,
-                        icon=get_cache_type_icon(last_external.get("cache_type", "")),
-                    )
-                    op.cache_type = last_external.get("cache_type", "")
-                    op.archive_path = last_external_path
-                    copy_op = resume_row.operator("witcher.copy_path", text="", icon="COPYDOWN")
-                    copy_op.path = last_external_path
+                    section_name, section_icon, redkit_types = redkit_section
+                    group_box.separator(factor=0.35)
+                    redkit_col = group_box.column(align=True)
+                    redkit_col.label(text=section_name, icon=section_icon)
+                    for cache_name, button_text, icon, desc in redkit_types:
+                        row = redkit_col.row(align=True)
+                        op = row.operator("witcher.select_cache_type", text=button_text, icon=icon)
+                        op.cache_type = cache_name
+                        row.label(text=desc)
 
                 layout.separator(factor=0.5)
                 ext_box = layout.box()
-                ext_box.label(text="Standalone Archives", icon='FILEBROWSER')
-                ext_box.operator(
-                    "witcher.open_external_collision_cache",
-                    text="Open collision.cache",
-                    icon='MESH_CUBE',
+                ext_header = ext_box.row(align=True)
+                ext_header.prop(
+                    witcher_file_browser,
+                    "show_standalone_archives",
+                    text="",
+                    icon='TRIA_DOWN' if witcher_file_browser.show_standalone_archives else 'TRIA_RIGHT',
+                    emboss=False,
                 )
-                ext_box.operator(
-                    "witcher.open_external_texture_cache",
-                    text="Open texture.cache",
-                    icon='IMAGE_DATA',
-                )
-                ext_box.operator(
-                    "witcher.open_external_sound_cache",
-                    text="Open sound.cache",
-                    icon='SPEAKER',
-                )
-                ext_box.operator(
-                    "witcher.open_external_bundle",
-                    text="Open .bundle",
-                    icon='FILEBROWSER',
-                )
+                ext_header.label(text="Standalone Mod Caches", icon='FILEBROWSER')
+
+                if witcher_file_browser.show_standalone_archives:
+                    open_col = ext_box.column(align=True)
+                    open_row = open_col.row(align=True)
+                    open_row.operator(
+                        "witcher.open_external_collision_cache",
+                        text="collision.cache",
+                        icon='MESH_CUBE',
+                    )
+                    open_row.operator(
+                        "witcher.open_external_texture_cache",
+                        text="texture.cache",
+                        icon='IMAGE_DATA',
+                    )
+                    open_row = open_col.row(align=True)
+                    open_row.operator(
+                        "witcher.open_external_sound_cache",
+                        text="sound.cache",
+                        icon='SPEAKER',
+                    )
+                    open_row.operator(
+                        "witcher.open_external_bundle",
+                        text=".bundle",
+                        icon='FILEBROWSER',
+                    )
+
+                    last_external = get_last_recent_external_archive(context)
+                    last_external_path = last_external.get("path", "") if last_external else ""
+                    last_external_available = bool(last_external) and _can_restore_external_archive(
+                        last_external.get("cache_type", ""),
+                        last_external_path,
+                    )
+                    if last_external and last_external_available:
+                        resume_row = ext_box.row(align=True)
+                        resume_row.label(text="Last", icon='FILEBROWSER')
+                        resume_row.label(
+                            text=get_effective_cache_type(last_external.get("cache_type", "")),
+                            icon=get_cache_type_icon(last_external.get("cache_type", "")),
+                        )
+                        resume_row = ext_box.row(align=True)
+                        op = resume_row.operator(
+                            "witcher.reopen_external_archive",
+                            text=last_external.get("display_name", "") or os.path.basename(last_external_path) or "Reopen",
+                            icon=get_cache_type_icon(last_external.get("cache_type", "")),
+                        )
+                        op.cache_type = last_external.get("cache_type", "")
+                        op.archive_path = last_external_path
+                        copy_op = resume_row.operator("witcher.copy_path", text="", icon="COPYDOWN")
+                        copy_op.path = last_external_path
             return
 
         # Header: navigation buttons + cache type indicator
@@ -5408,7 +5625,8 @@ class SimpleFileBrowser(Operator):
         fwd_row = row.row(align=True)
         fwd_row.enabled = can_go_forward()
         fwd_row.operator("witcher.navigate_forward", text="", icon="FORWARD")
-        row.label(text=f"[{witcher_file_browser.active_cache_type}]", icon='FILE_FOLDER')
+        active_cache_label = get_cache_type_display_label(witcher_file_browser.active_cache_type)
+        row.label(text=f"[{active_cache_label}]", icon='FILE_FOLDER')
         if is_external_cache(witcher_file_browser.active_cache_type):
             session = get_external_archive_session(witcher_file_browser.active_cache_type)
             archive_label = os.path.basename(session["archive_path"]) if session else "(not loaded)"
@@ -6925,6 +7143,8 @@ class SelectCacheTypeOperator(Operator):
                 manager = LoadBundleManager(loadmods=loadmods, reset_cache=loadmods)
             elif cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
                 manager = LoadWitcher2BundleManager()
+            elif cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+                manager = LoadWitcher2SpeechManager()
             elif cache_type == "Collision":
                 manager = LoadCollisionManager(loadmods=loadmods, do_reload=loadmods)
             elif cache_type == "Texture":
@@ -6959,7 +7179,10 @@ class SelectCacheTypeOperator(Operator):
             # Populate from manager.Items
             for key in manager.Items.keys():
                 # Handle non-string keys (e.g., Speech cache uses integer hash keys)
-                key_str = str(key) if not isinstance(key, str) else key
+                if cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+                    key_str = _w2_speech_virtual_path(key)
+                else:
+                    key_str = str(key) if not isinstance(key, str) else key
                 # Skip non-terrain buffer files (e.g., .w2mesh.1.buffer)
                 if _should_skip_buffer_name(key_str):
                     continue
@@ -7134,6 +7357,13 @@ class FileActionOperatorImportToScene(Operator):
                     overwrite=overwrite_existing,
                 )
                 override_roots = [root for root in (w2_uncook_root, w2_data_root) if root]
+
+            elif cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+                abs_file_path = ensure_witcher2_speech_item_extracted(
+                    context,
+                    full_path_norm,
+                    overwrite=overwrite_existing,
+                )
 
             elif cache_type == "Bundle":
                 if loadmods:
@@ -7669,8 +7899,7 @@ class SoundPreviewToggleOperator(Operator):
     def execute(self, context):
         witcher_file_browser = context.scene.witcher_file_browser
         cache_type = self.cache_type or witcher_file_browser.active_cache_type
-        effective_cache_type = get_effective_cache_type(cache_type)
-        if effective_cache_type != "Sound":
+        if not cache_supports_sound_preview(cache_type):
             self.report({'WARNING'}, "Sound preview is only available for Sound cache items.")
             return {'CANCELLED'}
 
@@ -8416,6 +8645,11 @@ class FileActionOperator(Operator):
                 items = manager.find_item_by_hash(full_path_norm)
                 if items:
                     item_lists = [items]
+            elif cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+                speech_id = _w2_speech_id_from_path(full_path_norm)
+                if speech_id is not None:
+                    manager = LoadWitcher2SpeechManager()
+                    items = manager.find_item_by_hash(speech_id)
             elif cache_type == EXTERNAL_COLLISION_CACHE_TYPE:
                 session = get_external_archive_session(cache_type)
                 items = session["items"].get(full_path_norm) if session else None
@@ -8476,7 +8710,13 @@ class FileActionOperator(Operator):
             final_item = items[-1] if isinstance(items, list) else items
 
             # Get export path and extract - use unprefixed item name for disk path
-            if effective_cache_type == "Collision":
+            if cache_type == WITCHER2_SPEECH_CACHE_TYPE:
+                export_path = ensure_witcher2_speech_item_extracted(
+                    context,
+                    full_path_norm,
+                    overwrite=bool(getattr(witcher_file_browser, "mods_overwrite", False)),
+                )
+            elif effective_cache_type == "Collision":
                 vanilla_name = get_collision_output_rel_path(full_path_norm, loadmods=loadmods)
             else:
                 item_name = getattr(final_item, 'name', None) or getattr(final_item, 'Name', full_path)
@@ -8485,9 +8725,10 @@ class FileActionOperator(Operator):
                 if vanilla_name == item_name and mod_name:
                     # Fallback: strip from full_path when the item name is missing or prefixed differently
                     vanilla_name = strip_mod_prefix(full_path_norm, mod_name)
-            export_path = repo_file(vanilla_name)
+            if cache_type != WITCHER2_SPEECH_CACHE_TYPE:
+                export_path = repo_file(vanilla_name)
 
-            if not win_path_exists(export_path):
+            if cache_type != WITCHER2_SPEECH_CACHE_TYPE and not win_path_exists(export_path):
                 written_path = final_item.extract_to_file(export_path)
                 if written_path:
                     export_path = written_path

@@ -2459,6 +2459,7 @@ CACHE_ITEMS = (
         "relative_path": os.path.join("Witcher2Bundles", "w2_dzip_cache.pkl"),
         "label": "w2_dzip_cache.pkl",
         "description": "Witcher 2 DZIP archive index cache.",
+        "group": "witcher2",
     },
     {
         "name": "w2_string_cache",
@@ -2466,6 +2467,15 @@ CACHE_ITEMS = (
         "label": "W2Strings",
         "description": "Witcher 2 localized string table cache.",
         "is_dir": True,
+        "group": "witcher2",
+    },
+    {
+        "name": "w2_speech_cache",
+        "relative_path": os.path.join("W2Speech"),
+        "label": "W2Speech",
+        "description": "Witcher 2 speech archive lookup cache.",
+        "is_dir": True,
+        "group": "witcher2",
     },
     {
         "name": "dlc_definition_cache.pkl",
@@ -2531,6 +2541,7 @@ ASSET_BROWSER_MAIN_CACHE_NAMES = {
 CACHE_GROUP_LABELS = {
     "main": "Main (Asset Browser)",
     "main_mods": "Main Mods (Asset Browser)",
+    "witcher2": "Witcher 2",
     "other": "Other (Supporting / Reference)",
 }
 
@@ -2746,6 +2757,7 @@ def _refresh_cache_by_name(cache_name: str) -> bool:
         "bundle_cache_mods.pkl": lambda: BundleManager.Get(loadmods=True, reset_cache=True),
         "w2_dzip_cache.pkl": lambda: DzipManager.Get(reset_cache=True),
         "w2_string_cache": lambda: W2StringManager.Get(do_reload=True),
+        "w2_speech_cache": lambda: W2SpeechManager.Get(do_reload=True),
         "dlc_definition_cache.pkl": _refresh_dlc_definition_cache,
         "journal_browser_bestiary.pkl": lambda: _refresh_journal_cache("BESTIARY"),
         "journal_browser_characters.pkl": lambda: _refresh_journal_cache("CHARACTERS"),
@@ -2800,7 +2812,7 @@ def _draw_cache_management_table(body):
     header.label(text="Status")
     header.label(text="Modified")
 
-    for group_key in ("main", "main_mods", "other"):
+    for group_key in ("main", "main_mods", "witcher2", "other"):
         group_items = [name for name in CACHE_ITEM_ORDER if _get_cache_group(name) == group_key]
         if not group_items:
             continue
@@ -4249,6 +4261,7 @@ from .CR2W.witcher_cache.Witcher2Bundles import DzipManager
 from .CR2W.witcher_cache.SoundCache import SoundManager
 from .CR2W.witcher_cache.Speech import SpeechManager
 from .CR2W.witcher_cache.TextureCache import TextureManager
+from .CR2W.witcher_cache.W2Speech import W2SpeechManager
 from .CR2W.witcher_cache.W2Strings import W2StringManager
 from .CR2W.witcher_cache.W3Strings import W3StringManager
 
