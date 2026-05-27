@@ -2042,6 +2042,8 @@ def initialize_entity_armature_state(armature_obj, entity, *, filename="", impor
         rig_settings.repo_path = entity_state.get("repo_path", "")
         version = _coerce_version(getattr(entity, "version", None), 999)
         rig_settings.source_game = "w2" if version <= 115 else "w3"
+        if version <= 115:
+            _store_entity_w2_mimic_metadata(armature_obj, entity)
         if mesh_import_settings is not None:
             apply_entity_mesh_import_settings(rig_settings, mesh_import_settings)
         rig_settings.main_entity_skeleton = entity_state.get("main_entity_skeleton", "") or existing_main_entity_skeleton
@@ -2518,6 +2520,184 @@ def _get_entry_attr(entry, key, default=None):
     if isinstance(entry, dict):
         return entry.get(key, default)
     return getattr(entry, key, default)
+
+
+# ============================================================
+# Witcher 2 mimic support
+# ============================================================
+# W2 heads use CHeadDefinifion + CMimicFaces (.w2faces). Keep these
+# properties separate from the W3 mimicFace/mimicFaceFile/.w3fac path.
+
+def _is_w2_mimic_support_chunk(chunk) -> bool:
+    return bool(_get_entry_attr(chunk, "w2_mimic_support", False))
+
+
+def _w2_mimic_metadata_from_chunk(chunk):
+    if not _is_w2_mimic_support_chunk(chunk):
+        return {}
+    metadata = {
+        "head_name": str(_get_entry_attr(chunk, "w2_mimic_head_name", "") or ""),
+        "mesh_role": str(_get_entry_attr(chunk, "w2_mimic_mesh_role", "") or ""),
+        "mesh": str(_get_entry_attr(chunk, "w2_mimic_mesh", "") or _get_entry_attr(chunk, "mesh", "") or ""),
+        "mesh_high": str(_get_entry_attr(chunk, "w2_mimic_mesh_high", "") or ""),
+        "mesh_low": str(_get_entry_attr(chunk, "w2_mimic_mesh_low", "") or ""),
+        "skeleton": str(_get_entry_attr(chunk, "w2_mimic_skeleton", "") or _get_entry_attr(chunk, "skeleton", "") or ""),
+        "pose_skeleton": str(_get_entry_attr(chunk, "w2_mimic_pose_skeleton", "") or ""),
+        "parent_skeleton": str(_get_entry_attr(chunk, "w2_mimic_parent_skeleton", "") or ""),
+        "float_track_skeleton": str(_get_entry_attr(chunk, "w2_mimic_float_track_skeleton", "") or ""),
+        "skeleton_embedded_source": str(_get_entry_attr(chunk, "w2_mimic_skeleton_embedded_source", "") or ""),
+        "skeleton_embedded_chunk_index": _get_entry_attr(chunk, "w2_mimic_skeleton_embedded_chunk_index", -1),
+        "faces": str(_get_entry_attr(chunk, "w2_mimic_faces", "") or ""),
+        "faces_high": str(_get_entry_attr(chunk, "w2_mimic_faces_high", "") or ""),
+        "faces_low": str(_get_entry_attr(chunk, "w2_mimic_faces_low", "") or ""),
+        "faces_high_embedded_source": str(_get_entry_attr(chunk, "w2_mimic_faces_high_embedded_source", "") or ""),
+        "faces_high_embedded_chunk_index": _get_entry_attr(chunk, "w2_mimic_faces_high_embedded_chunk_index", -1),
+        "faces_low_embedded_source": str(_get_entry_attr(chunk, "w2_mimic_faces_low_embedded_source", "") or ""),
+        "faces_low_embedded_chunk_index": _get_entry_attr(chunk, "w2_mimic_faces_low_embedded_chunk_index", -1),
+    }
+    return {key: value for key, value in metadata.items() if value not in ("", None)}
+
+
+def _collect_w2_mimic_metadata_from_entity(entity):
+    out = []
+    seen = set()
+    for appearance in _get_entry_attr(entity, "appearances", []) or []:
+        for template in _get_entry_attr(appearance, "includedTemplates", []) or []:
+            for chunk in _get_entry_attr(template, "chunks", []) or []:
+                metadata = _w2_mimic_metadata_from_chunk(chunk)
+                if not metadata:
+                    continue
+                key = (
+                    metadata.get("head_name", "").lower(),
+                    metadata.get("mesh", "").lower().replace("/", "\\"),
+                    metadata.get("skeleton", "").lower().replace("/", "\\"),
+                    metadata.get("faces_high", "").lower().replace("/", "\\"),
+                    metadata.get("faces_low", "").lower().replace("/", "\\"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(metadata)
+    return out
+
+
+def _store_w2_mimic_metadata(obj, metadata, *, armature_name="", mesh_object_name=""):
+    if obj is None or not metadata:
+        return
+    obj["witcher_w2_mimic_support"] = True
+    for src_key, prop_key in (
+        ("head_name", "witcher_w2_mimic_head_name"),
+        ("mesh_role", "witcher_w2_mimic_mesh_role"),
+        ("mesh", "witcher_w2_mimic_mesh"),
+        ("mesh_high", "witcher_w2_mimic_mesh_high"),
+        ("mesh_low", "witcher_w2_mimic_mesh_low"),
+        ("skeleton", "witcher_w2_mimic_skeleton"),
+        ("pose_skeleton", "witcher_w2_mimic_pose_skeleton"),
+        ("parent_skeleton", "witcher_w2_mimic_parent_skeleton"),
+        ("float_track_skeleton", "witcher_w2_mimic_float_track_skeleton"),
+        ("skeleton_embedded_source", "witcher_w2_mimic_skeleton_embedded_source"),
+        ("faces", "witcher_w2_mimic_faces"),
+        ("faces_high", "witcher_w2_mimic_faces_high"),
+        ("faces_low", "witcher_w2_mimic_faces_low"),
+        ("faces_high_embedded_source", "witcher_w2_mimic_faces_high_embedded_source"),
+        ("faces_low_embedded_source", "witcher_w2_mimic_faces_low_embedded_source"),
+    ):
+        value = str(metadata.get(src_key, "") or "").strip()
+        if value:
+            obj[prop_key] = value
+    for src_key, prop_key in (
+        ("skeleton_embedded_chunk_index", "witcher_w2_mimic_skeleton_embedded_chunk_index"),
+        ("faces_high_embedded_chunk_index", "witcher_w2_mimic_faces_high_embedded_chunk_index"),
+        ("faces_low_embedded_chunk_index", "witcher_w2_mimic_faces_low_embedded_chunk_index"),
+    ):
+        try:
+            value = int(metadata.get(src_key, -1))
+        except Exception:
+            value = -1
+        if value >= 0:
+            obj[prop_key] = value
+    if armature_name:
+        obj["witcher_w2_mimic_armature"] = armature_name
+    if mesh_object_name:
+        obj["witcher_w2_mimic_mesh_object"] = mesh_object_name
+    try:
+        obj["witcher_w2_mimic_metadata_json"] = json.dumps(metadata, sort_keys=True)
+    except Exception:
+        pass
+
+
+def _store_entity_w2_mimic_metadata(armature_obj, entity):
+    metadata_items = _collect_w2_mimic_metadata_from_entity(entity)
+    if not metadata_items or armature_obj is None:
+        return
+    first = metadata_items[0]
+    _store_w2_mimic_metadata(armature_obj, first)
+    try:
+        armature_obj["witcher_w2_mimic_heads_json"] = json.dumps(metadata_items, sort_keys=True)
+    except Exception:
+        pass
+
+
+def _load_w2_embedded_skeleton_data(source_path, chunk_index):
+    source_path = str(source_path or "").strip()
+    if not source_path or not os.path.exists(win_safe_path(source_path)):
+        return None
+    try:
+        chunk_index = int(chunk_index)
+    except Exception:
+        return None
+    if chunk_index < 0:
+        return None
+    try:
+        from ..CR2W.CR2W_file import read_CR2W
+        from ..CR2W.dc_skeleton import create_Skeleton_w2, read_skelly
+
+        cr2w_file = read_CR2W(source_path)
+        chunks = list(getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or [])
+        candidate_indices = [chunk_index]
+        if chunk_index > 0:
+            candidate_indices.append(chunk_index - 1)
+        for candidate_index in candidate_indices:
+            if not (0 <= candidate_index < len(chunks)):
+                continue
+            chunk = chunks[candidate_index]
+            if getattr(chunk, "Type", None) != "CSkeleton":
+                continue
+            rig = None
+            if getattr(getattr(cr2w_file, "HEADER", None), "version", 999) <= 115:
+                class _ChunkList:
+                    CHUNKS = [chunk]
+
+                class _SingleChunkFile:
+                    CHUNKS = _ChunkList()
+
+                with open(source_path, "rb") as f:
+                    rig = create_Skeleton_w2(f, _SingleChunkFile())
+            if rig is None or not getattr(rig, "names", None):
+                rig = read_skelly(chunk)
+            if not getattr(rig, "names", None):
+                continue
+            skeleton_data = read_json_w3.readCSkeletonData(rig)
+            bone_names = {
+                str(getattr(bone, "name", "") or "")
+                for bone in getattr(skeleton_data, "bones", []) or []
+            }
+            if not {"Rootface", "head_face"}.intersection(bone_names):
+                log.debug(
+                    "Rejected embedded Witcher 2 mimic skeleton with incomplete face bone names: %s #%s",
+                    source_path,
+                    chunk_index,
+                )
+                continue
+            return skeleton_data
+    except Exception:
+        log.debug(
+            "Failed to read embedded Witcher 2 mimic skeleton %s #%s",
+            source_path,
+            chunk_index,
+            exc_info=True,
+        )
+    return None
 
 
 def _iter_entity_mimic_animset_params(entity):
@@ -4100,6 +4280,149 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             if source_game:
                 obj['witcher_source_game'] = source_game
 
+    def import_w2_mimic_support_chunk(chunk, chunk_ns):
+        """Import W2 CHeadDefinifion mimic resources without touching W3 .w3fac state."""
+        metadata = _w2_mimic_metadata_from_chunk(chunk)
+        if not metadata:
+            return root_skeleton
+
+        component_name = (
+            _get_chunk_component_name(chunk)
+            or metadata.get("head_name")
+            or "w2_mimic_head"
+        )
+        imported_armature = None
+        imported_meshes = []
+        imported_mesh_armatures = []
+
+        skeleton_repo = str(metadata.get("skeleton", "") or "").strip()
+        skeleton_embedded_source = str(metadata.get("skeleton_embedded_source", "") or "").strip()
+        skeleton_embedded_chunk_index = metadata.get("skeleton_embedded_chunk_index", -1)
+        if skeleton_repo or skeleton_embedded_source:
+            try:
+                skeleton_path = _resolve_required_chunk_resource(chunk, 'w2_mimic_skeleton', 'Witcher 2 mimic skeleton')
+                imported_armature = import_rig.import_w3_rig(
+                    skeleton_path,
+                    f"{chunk_ns}_rig",
+                )
+                add_chunk_metadata(imported_armature, chunk, skeleton_repo, component_name=component_name)
+                _store_w2_mimic_metadata(imported_armature, metadata, armature_name=imported_armature.name)
+                objdict[f"{chunk_ns}:rig"] = imported_armature
+            except Exception:
+                embedded_skeleton = _load_w2_embedded_skeleton_data(
+                    skeleton_embedded_source,
+                    skeleton_embedded_chunk_index,
+                )
+                if embedded_skeleton is not None:
+                    try:
+                        imported_armature = import_rig.create_armature(
+                            embedded_skeleton,
+                            f"{chunk_ns}_rig",
+                            fileName=skeleton_embedded_source,
+                        )
+                        add_chunk_metadata(
+                            imported_armature,
+                            chunk,
+                            skeleton_repo or skeleton_embedded_source,
+                            component_name=component_name,
+                        )
+                        _store_w2_mimic_metadata(imported_armature, metadata, armature_name=imported_armature.name)
+                        objdict[f"{chunk_ns}:rig"] = imported_armature
+                    except Exception:
+                        log.warning(
+                            "Failed to import embedded Witcher 2 mimic skeleton: %s #%s",
+                            skeleton_embedded_source,
+                            skeleton_embedded_chunk_index,
+                            exc_info=True,
+                        )
+                else:
+                    log.warning(
+                        "Failed to import Witcher 2 mimic skeleton: %s",
+                        skeleton_repo or f"{skeleton_embedded_source} #{skeleton_embedded_chunk_index}",
+                        exc_info=True,
+                    )
+
+        mesh_repo = str(metadata.get("mesh", "") or chunk.get("mesh", "") or "").strip()
+        if mesh_repo:
+            embedded_source_path = str(_get_entry_attr(chunk, "_embedded_source_path", "") or "")
+            embedded_cmesh_chunk_index = _get_entry_attr(
+                chunk,
+                "_embedded_cmesh_chunk_index",
+                _get_entry_attr(chunk, "_embedded_mesh_chunk_index", None),
+            )
+            selected_cmesh_chunk_index = None
+            try:
+                if embedded_source_path and embedded_cmesh_chunk_index is not None:
+                    if not os.path.exists(win_safe_path(embedded_source_path)):
+                        raise FileNotFoundError(f"{mesh_repo} -> {embedded_source_path}")
+                    resolved_mesh_path = embedded_source_path
+                    selected_cmesh_chunk_index = int(embedded_cmesh_chunk_index)
+                else:
+                    resolved_mesh_path = repo_file(mesh_repo, entity.version)
+                    if not resolved_mesh_path or not os.path.exists(win_safe_path(resolved_mesh_path)):
+                        raise FileNotFoundError(f"{mesh_repo} -> {resolved_mesh_path}")
+
+                imported_meshes, imported_mesh_armatures = fbx_util.import_model(
+                    resolved_mesh_path,
+                    f"{chunk['type']}{i}{chunk['chunkIndex']}",
+                    entity.name,
+                    keep_lod_meshes=mesh_import_settings["keep_lod_meshes"],
+                    keep_empty_lods=mesh_import_settings["keep_empty_lods"],
+                    keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
+                    hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
+                    embedded_cmesh_chunk_index=selected_cmesh_chunk_index,
+                )
+            except Exception:
+                log.warning("Failed to import Witcher 2 mimic mesh: %s", mesh_repo, exc_info=True)
+
+        armature_name = getattr(imported_armature, "name", "") if imported_armature is not None else ""
+        mesh_object_name = imported_meshes[0].name if imported_meshes else ""
+
+        for arm in imported_mesh_armatures:
+            add_chunk_metadata(arm, chunk, mesh_repo, component_name=component_name)
+            _store_w2_mimic_metadata(arm, metadata, armature_name=armature_name or arm.name, mesh_object_name=mesh_object_name)
+            objdict[f"{chunk_ns}:mesh_armature:{arm.name}"] = arm
+
+        for mesh in imported_meshes:
+            add_chunk_metadata(mesh, chunk, mesh_repo, component_name=component_name)
+            _store_w2_mimic_metadata(mesh, metadata, armature_name=armature_name, mesh_object_name=mesh.name)
+            if mesh.name[-5:-1] == "_lod":
+                meshdict[chunk_ns + mesh.name[-5:]] = mesh
+            else:
+                meshdict[chunk_ns] = mesh
+
+        if imported_armature is not None:
+            _apply_chunk_transform_to_import_roots(chunk, armatures=[imported_armature])
+        if imported_meshes or imported_mesh_armatures:
+            _apply_chunk_transform_to_import_roots(
+                chunk,
+                armatures=imported_mesh_armatures,
+                meshes=imported_meshes,
+            )
+
+        metadata_targets = []
+        for target_obj in (
+            imported_armature,
+            objdict.get(entity.name),
+            root_skeleton,
+            *(imported_mesh_armatures or []),
+        ):
+            if target_obj is None or target_obj in metadata_targets:
+                continue
+            metadata_targets.append(target_obj)
+        for target_obj in metadata_targets:
+            _store_w2_mimic_metadata(
+                target_obj,
+                metadata,
+                armature_name=armature_name or getattr(imported_armature, "name", ""),
+                mesh_object_name=mesh_object_name,
+            )
+
+        if imported_armature is not None:
+            objdict[chunk_ns] = imported_armature
+            return root_skeleton or imported_armature
+        return root_skeleton
+
     has_moving_agent = False
     
     # Handle base constraints first
@@ -4107,6 +4430,8 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         for chunk in cur_chunks:
             chunk_ns = get_chunk_namespace(chunk)
             if not isChildNode(chunk['chunkIndex'], cur_chunks):
+                if _is_w2_mimic_support_chunk(chunk):
+                    continue
                 if chunk['type'] in _ROOT_CONSTRAINT_SKIP_CHUNK_TYPES:
                     continue
                 # CAnimatedComponent sub-skeletons must NOT be bone-name-matched to the parent entity via CreateConstraints2. Cause problems with crossbows etc.
@@ -4125,6 +4450,10 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             child_ns = get_ns_for_chunk(chunk['child'], cur_chunks)
             if parent_ns and child_ns:
                 constrains.append([f"{ent_namespace}{parent_ns}", f"{ent_namespace}{child_ns}"])
+
+        if _is_w2_mimic_support_chunk(chunk):
+            root_skeleton = import_w2_mimic_support_chunk(chunk, chunk_ns)
+            continue
 
         # Import meshes
         if "mesh" in chunk:

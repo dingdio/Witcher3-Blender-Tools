@@ -51,6 +51,7 @@ _KNOWN_REPO_EXTS = (
     ".redapex",
     ".w3fac",
     ".w2fac",
+    ".w2faces",
     ".w3dyng",
     ".dyng",
 )
@@ -1242,6 +1243,9 @@ def _mesh_chunk_signature(chunk):
         _repo_path_key(getattr(chunk, "mesh", None)),
         _repo_path_key(getattr(chunk, "resource", None)),
         _repo_path_key(getattr(chunk, "mimicFace", None)),
+        bool(getattr(chunk, "w2_mimic_support", False)),
+        getattr(chunk, "w2_mimic_mesh_role", None),
+        _repo_path_key(getattr(chunk, "w2_mimic_faces", None)),
         _repo_path_key(getattr(chunk, "_embedded_source_path", None)),
         getattr(chunk, "_embedded_cmesh_chunk_index", getattr(chunk, "_embedded_mesh_chunk_index", None)),
         getattr(chunk, "transformParent", None),
@@ -1591,6 +1595,83 @@ def _make_mesh_proxy_chunk(source_chunk, name: str, mesh_path: str, skeleton: st
     return proxy
 
 
+# ============================================================
+# Witcher 2 mimic support
+# ============================================================
+# W2 character heads define face resources through CHeadDefinifion
+# (mimic mesh + mimic skeleton + .w2faces pose banks). Keep this as
+# explicit W2 metadata so the W3 .w3fac/CMimicFace import path stays isolated.
+
+def _resolve_w2_head_mesh_refs(head_chunk, prop_name):
+    prop = _find_prop_by_name(head_chunk, prop_name)
+    if not prop:
+        return []
+
+    out = []
+    seen = set()
+    for handle in getattr(prop, "Handles", None) or []:
+        mesh_path = _resolve_handle_repo_path(head_chunk, handle, ".w2mesh")
+        if not mesh_path:
+            continue
+        mesh_key = _repo_path_key(mesh_path)
+        if mesh_key in seen:
+            continue
+        seen.add(mesh_key)
+        out.append((mesh_path, _handle_ref_chunk(head_chunk, handle) or head_chunk))
+    return out
+
+
+def _resolve_w2_head_resource(chunk, prop_name, expected_ext):
+    return _resolve_repo_path(chunk, prop_name, expected_ext)
+
+
+def _w2_embedded_head_resource_ref_info(head_chunk, prop_name, expected_type):
+    prop = _find_prop_by_name(head_chunk, prop_name)
+    if not prop:
+        return "", None
+    cr2w_file = getattr(head_chunk, "_W_CLASS__CR2WFILE", None)
+    file_name = getattr(cr2w_file, "fileName", None)
+    if not file_name:
+        return "", None
+    for handle in getattr(prop, "Handles", None) or []:
+        ref_chunk = _handle_ref_chunk(head_chunk, handle)
+        if getattr(ref_chunk, "Type", None) != expected_type:
+            continue
+        chunk_index = getattr(ref_chunk, "ChunkIndex", None)
+        return file_name, chunk_index if isinstance(chunk_index, int) else None
+    return "", None
+
+
+def _make_w2_mimic_proxy_chunk(source_chunk, head_name, mesh_path, mesh_role, metadata):
+    proxy = _make_mesh_proxy_chunk(
+        source_chunk,
+        f"{head_name}_w2_mimic_{mesh_role}",
+        mesh_path,
+        metadata.get("mimic_skeleton") or None,
+    )
+    proxy.type = "CW2MimicHeadComponent"
+    proxy.w2_mimic_support = True
+    proxy.w2_mimic_head_name = head_name
+    proxy.w2_mimic_mesh_role = mesh_role
+    proxy.w2_mimic_mesh = mesh_path
+    proxy.w2_mimic_mesh_high = metadata.get("mimic_mesh_high", "")
+    proxy.w2_mimic_mesh_low = metadata.get("mimic_mesh_low", "")
+    proxy.w2_mimic_skeleton = metadata.get("mimic_skeleton", "")
+    proxy.w2_mimic_pose_skeleton = metadata.get("pose_skeleton", "")
+    proxy.w2_mimic_parent_skeleton = metadata.get("parent_skeleton", "")
+    proxy.w2_mimic_float_track_skeleton = metadata.get("float_track_skeleton", "")
+    proxy.w2_mimic_skeleton_embedded_source = metadata.get("skeleton_embedded_source", "")
+    proxy.w2_mimic_skeleton_embedded_chunk_index = metadata.get("skeleton_embedded_chunk_index", -1)
+    proxy.w2_mimic_faces = metadata.get(f"mimic_faces_{mesh_role}", "")
+    proxy.w2_mimic_faces_high = metadata.get("mimic_faces_high", "")
+    proxy.w2_mimic_faces_low = metadata.get("mimic_faces_low", "")
+    proxy.w2_mimic_faces_high_embedded_source = metadata.get("faces_high_embedded_source", "")
+    proxy.w2_mimic_faces_high_embedded_chunk_index = metadata.get("faces_high_embedded_chunk_index", -1)
+    proxy.w2_mimic_faces_low_embedded_source = metadata.get("faces_low_embedded_source", "")
+    proxy.w2_mimic_faces_low_embedded_chunk_index = metadata.get("faces_low_embedded_chunk_index", -1)
+    return proxy
+
+
 def _resolve_w2_body_part_chunks(template_chunk, part_names, chunks):
     wanted_parts = {str(part or "").strip().lower() for part in part_names if part}
     if not wanted_parts:
@@ -1673,25 +1754,63 @@ def _build_w2_head_chunks(chunks, head_name):
     if not head_chunk:
         return []
 
-    head_mesh_prop = _find_prop_by_name(head_chunk, "meshesForBaseHead")
-    if not head_mesh_prop:
-        return []
-
     head_chunks = []
     seen = set()
-    for handle in getattr(head_mesh_prop, "Handles", None) or []:
-        mesh_path = _resolve_handle_repo_path(head_chunk, handle, ".w2mesh")
-        if not mesh_path:
-            continue
+    for mesh_path, source_chunk in _resolve_w2_head_mesh_refs(head_chunk, "meshesForBaseHead"):
         mesh_key = _repo_path_key(mesh_path)
         if mesh_key in seen:
             continue
         seen.add(mesh_key)
-        source_chunk = _handle_ref_chunk(head_chunk, handle) or head_chunk
         # poseSkeleton in cooked W2 head definitions often points to an embedded
         # mimic/face skeleton, not a mesh skinning rig. Do not coerce it into an
         # external .w2rig path for normal mesh import.
         head_chunks.append(_make_mesh_proxy_chunk(source_chunk, head_name, mesh_path, None))
+
+    # Witcher 2 mimic support: carry the high/low mimic resources alongside the
+    # base head as a W2-only proxy chunk. The Blender importer consumes this
+    # without setting W3 mimicFace/mimicFaceFile properties.
+    mimic_high_refs = _resolve_w2_head_mesh_refs(head_chunk, "meshesForMimicHighHead")
+    mimic_low_refs = _resolve_w2_head_mesh_refs(head_chunk, "meshesForMimicLowHead")
+    # In W2 heads, poseSkeleton is the actual face rig used by the mimic mesh.
+    # mimicSkeleton commonly points at the float-track skeleton.
+    pose_skeleton = _resolve_w2_head_resource(head_chunk, "poseSkeleton", ".w2rig")
+    float_track_skeleton = _resolve_w2_head_resource(head_chunk, "mimicSkeleton", ".w2rig")
+    skeleton_embedded_source, skeleton_embedded_chunk_index = _w2_embedded_head_resource_ref_info(
+        head_chunk,
+        "poseSkeleton",
+        "CSkeleton",
+    )
+    faces_high_embedded_source, faces_high_embedded_chunk_index = _w2_embedded_head_resource_ref_info(
+        head_chunk,
+        "mimicFacesHigh",
+        "CMimicFaces",
+    )
+    faces_low_embedded_source, faces_low_embedded_chunk_index = _w2_embedded_head_resource_ref_info(
+        head_chunk,
+        "mimicFacesLow",
+        "CMimicFaces",
+    )
+    metadata = {
+        "mimic_mesh_high": mimic_high_refs[0][0] if mimic_high_refs else "",
+        "mimic_mesh_low": mimic_low_refs[0][0] if mimic_low_refs else "",
+        "mimic_skeleton": pose_skeleton or float_track_skeleton or "",
+        "pose_skeleton": pose_skeleton or "",
+        "parent_skeleton": _resolve_w2_head_resource(head_chunk, "parentSkeleton", ".w2rig") or "",
+        "float_track_skeleton": float_track_skeleton or "",
+        "skeleton_embedded_source": skeleton_embedded_source or "",
+        "skeleton_embedded_chunk_index": skeleton_embedded_chunk_index if skeleton_embedded_chunk_index is not None else -1,
+        "mimic_faces_high": _resolve_w2_head_resource(head_chunk, "mimicFacesHigh", ".w2faces") or "",
+        "mimic_faces_low": _resolve_w2_head_resource(head_chunk, "mimicFacesLow", ".w2faces") or "",
+        "faces_high_embedded_source": faces_high_embedded_source or "",
+        "faces_high_embedded_chunk_index": faces_high_embedded_chunk_index if faces_high_embedded_chunk_index is not None else -1,
+        "faces_low_embedded_source": faces_low_embedded_source or "",
+        "faces_low_embedded_chunk_index": faces_low_embedded_chunk_index if faces_low_embedded_chunk_index is not None else -1,
+    }
+    preferred_ref = mimic_high_refs[:1] or mimic_low_refs[:1]
+    if preferred_ref and (metadata["mimic_skeleton"] or metadata["mimic_faces_high"] or metadata["mimic_faces_low"]):
+        mesh_role = "high" if mimic_high_refs else "low"
+        mesh_path, source_chunk = preferred_ref[0]
+        head_chunks.append(_make_w2_mimic_proxy_chunk(source_chunk, head_name, mesh_path, mesh_role, metadata))
     return head_chunks
 
 
