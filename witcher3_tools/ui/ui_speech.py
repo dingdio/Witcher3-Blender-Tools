@@ -1,6 +1,7 @@
 
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -14,12 +15,15 @@ from .. import (
     get_vgmstream_path,
     get_all_addon_prefs,
     get_game_path,
+    get_w2_unbundle_path,
+    get_witcher2_game_path,
 )
 from ..CR2W.witcher_cache.Speech import LoadSpeechManager
 from ..CR2W.witcher_cache.Speech.W3Speech import pad_filename
 from ..importers import import_anims, import_rig
 from ..exporters import export_anims
 from ..ui.ui_utils import WITCH_PT_Base
+from .. import dialog_language
 
 import bpy
 from bpy.types import Panel, Operator, UIList, PropertyGroup
@@ -46,7 +50,217 @@ def _get_active_armature(context):
     return None
 
 def _armature_has_face_morphs(armature):
-    return bool(armature and armature.pose and "w3_face_poses" in armature.pose.bones)
+    return bool(
+        armature
+        and armature.pose
+        and (
+            "w3_face_poses" in armature.pose.bones
+            or "w2_face_poses" in armature.pose.bones
+        )
+    )
+
+
+_W2_VO_ID_RE = re.compile(r"^VO_ID\d+$", re.IGNORECASE)
+_W2_LOCAL_SPEECH_LANG_RE = re.compile(r"(?:^|[\\/])local_speech[\\/]([^\\/]+)[\\/]", re.IGNORECASE)
+
+
+def _w2_voice_stem_from_path(path_value):
+    stem = Path(str(path_value or "")).stem
+    return stem if _W2_VO_ID_RE.match(stem or "") else ""
+
+
+def _w2_voice_language_from_path(path_value):
+    match = _W2_LOCAL_SPEECH_LANG_RE.search(str(path_value or ""))
+    return match.group(1).lower() if match else ""
+
+
+def _w2_local_speech_bases(context):
+    # Witcher 2 support: localized speech can be loose under the game install
+    # (CookedPC/local_speech or data/local_speech) or under a configured W2 export.
+    candidates = []
+    game_root = str(get_witcher2_game_path(context) or "").strip()
+    if game_root:
+        candidates.append(Path(game_root) / "CookedPC")
+        candidates.append(Path(game_root) / "data")
+    unbundle_root = str(get_w2_unbundle_path(context) or "").strip()
+    if unbundle_root:
+        candidates.append(Path(unbundle_root))
+        candidates.append(Path(unbundle_root) / "data")
+
+    out = []
+    seen = set()
+    for base in candidates:
+        try:
+            key = os.path.normcase(os.path.normpath(str(base)))
+        except Exception:
+            key = str(base).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(base)
+    return out
+
+
+def _w2_language_candidates(context, path_value="", language=None):
+    candidates = []
+    for value in (
+        language,
+        _w2_voice_language_from_path(path_value),
+        dialog_language.get_active_voice_language(context),
+        "en",
+    ):
+        value = dialog_language.normalize_dialog_language(value or "").lower()
+        if value and value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def _w2_pair_path_from_sibling(path_value, target_ext):
+    path = Path(path_value)
+    target_ext = target_ext.lower()
+    parts = list(path.parts)
+    lower_parts = [part.lower() for part in parts]
+    try:
+        if target_ext == ".mp2":
+            idx = lower_parts.index("lipsync")
+            parts[idx] = "audio"
+        elif target_ext == ".dat":
+            idx = lower_parts.index("audio")
+            parts[idx] = "lipsync"
+        else:
+            return ""
+    except ValueError:
+        return ""
+    candidate = Path(*parts).with_suffix(target_ext)
+    return str(candidate) if candidate.is_file() else ""
+
+
+def _resolve_w2_voice_repo_path(path_value, context, language=None):
+    raw_path = str(path_value or "").replace("/", "\\").strip()
+    if not raw_path:
+        return ""
+    if os.path.isabs(raw_path):
+        return raw_path if os.path.exists(raw_path) else ""
+
+    rel_path = raw_path.lstrip("\\")
+    langs = _w2_language_candidates(context, rel_path, language=language)
+    for base in _w2_local_speech_bases(context):
+        direct = base / rel_path
+        if direct.is_file():
+            return str(direct)
+        if rel_path.lower().startswith("local_speech\\"):
+            continue
+        stem = _w2_voice_stem_from_path(rel_path)
+        ext = Path(rel_path).suffix.lower()
+        folder = "lipsync" if ext == ".dat" else "audio" if ext == ".mp2" else ""
+        if stem and folder:
+            for lang in langs:
+                candidate = base / "local_speech" / lang / folder / f"{stem}{ext}"
+                if candidate.is_file():
+                    return str(candidate)
+    return ""
+
+
+def _resolve_w2_voice_pair(path_value, context, language=None):
+    path = str(path_value or "").strip()
+    if not path:
+        return "", ""
+    if not os.path.isabs(path) or not os.path.exists(path):
+        resolved = _resolve_w2_voice_repo_path(path, context, language=language)
+        if resolved:
+            path = resolved
+
+    ext = Path(path).suffix.lower()
+    dat_path = path if ext == ".dat" else ""
+    mp2_path = path if ext == ".mp2" else ""
+    stem = _w2_voice_stem_from_path(path)
+    langs = _w2_language_candidates(context, path, language=language)
+
+    if dat_path and not mp2_path:
+        mp2_path = _w2_pair_path_from_sibling(dat_path, ".mp2")
+    elif mp2_path and not dat_path:
+        dat_path = _w2_pair_path_from_sibling(mp2_path, ".dat")
+
+    if stem:
+        for base in _w2_local_speech_bases(context):
+            for lang in langs:
+                if not dat_path:
+                    candidate = base / "local_speech" / lang / "lipsync" / f"{stem}.dat"
+                    if candidate.is_file():
+                        dat_path = str(candidate)
+                if not mp2_path:
+                    candidate = base / "local_speech" / lang / "audio" / f"{stem}.mp2"
+                    if candidate.is_file():
+                        mp2_path = str(candidate)
+                if dat_path and mp2_path:
+                    break
+            if dat_path and mp2_path:
+                break
+
+    return dat_path, mp2_path
+
+
+def _import_w2_sound_strip(context, sound_path, at_frame=0):
+    scene = context.scene
+    if not scene.sequence_editor:
+        scene.sequence_editor_create()
+    from .ui_voice import _get_next_sound_channel, _get_sequence_editor_strips
+
+    strips = _get_sequence_editor_strips(scene.sequence_editor)
+    if strips is None:
+        raise RuntimeError("Blender sequencer strips API is unavailable")
+
+    if getattr(scene, "witcher_voice_replace_audio", False):
+        for strip in [strip for strip in strips if strip.type == 'SOUND']:
+            strips.remove(strip)
+    channel = 1 if getattr(scene, "witcher_voice_replace_audio", False) else _get_next_sound_channel(scene)
+    sound_path = str(sound_path)
+    soundstrip = strips.new_sound(
+        Path(sound_path).stem,
+        sound_path,
+        channel=channel,
+        frame_start=int(at_frame) + 1,
+    )
+    soundstrip.frame_start = at_frame
+    try:
+        soundstrip["witcher_source_game"] = "w2"
+        soundstrip["witcher_w2_voice_file"] = Path(sound_path).stem
+        soundstrip[dialog_language.DIALOG_AUDIO_LANGUAGE_PROP] = _w2_voice_language_from_path(sound_path) or "en"
+    except Exception:
+        pass
+    strip_end = int(getattr(soundstrip, "frame_final_end", 0) or 0)
+    if strip_end > scene.frame_end:
+        scene.frame_end = strip_end
+    return soundstrip
+
+
+def _import_w2_voice_pair(context, filepath, active_armature=None, use_nla=True):
+    dat_path, mp2_path = _resolve_w2_voice_pair(filepath, context)
+    if not dat_path and not mp2_path:
+        raise FileNotFoundError(f"W2 voice pair not found: {filepath}")
+
+    _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
+    nla_mode = _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+    at_frame = float(context.scene.frame_current) if nla_mode == 'append_at_cursor' else 0
+
+    if dat_path:
+        import_anims.import_lipsync(
+            context,
+            dat_path,
+            use_NLA=use_nla,
+            NLA_track="voice_import",
+            override_select=active_armature,
+            at_frame=at_frame,
+            nla_mode=nla_mode,
+        )
+        if active_armature and active_armature.animation_data:
+            active_armature.animation_data.use_nla = True
+
+    soundstrip = None
+    if mp2_path:
+        soundstrip = _import_w2_sound_strip(context, mp2_path, at_frame=at_frame)
+
+    return dat_path, mp2_path, soundstrip
+
 
 class ImportWEM(bpy.types.Operator, ImportHelper):
     bl_idname = "witcher.import_wem"
@@ -96,10 +310,15 @@ class ConvertAllWEM(bpy.types.Operator):
         return {'FINISHED'}
 
 class ButtonOperatorImportVoice(bpy.types.Operator, ImportHelper):
-    """Import W2 lipsync Animation"""
+    """Import W2/W3 lipsync and voice audio pairs"""
     bl_idname = "witcher.import_w2_voice"
-    bl_label = "w2 lipsync"
-    filename_ext = ".cr2w"
+    bl_label = "Import Voiceline Pair"
+    filename_ext = ".dat"
+
+    filter_glob: StringProperty(
+        default="*.dat;*.mp2;*.cr2w;*.re",
+        options={'HIDDEN'}
+    )
 
     use_NLA: bpy.props.BoolProperty(name="Use NLA",
                                         default=True,
@@ -108,6 +327,33 @@ class ButtonOperatorImportVoice(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         active_armature = _get_active_armature(context)
         fdir = self.filepath
+        ext = Path(fdir).suffix.lower()
+        if ext in {".dat", ".mp2"} or "local_speech" in str(fdir).replace("/", "\\").lower():
+            try:
+                dat_path, mp2_path, soundstrip = _import_w2_voice_pair(
+                    context,
+                    fdir,
+                    active_armature=active_armature,
+                    use_nla=self.use_NLA,
+                )
+            except Exception as exc:
+                self.report({'ERROR'}, f"W2 voice import failed: {exc}")
+                return {'CANCELLED'}
+
+            if dat_path and not active_armature:
+                self.report({'WARNING'}, "No armature selected. Loaded audio, but lipsync has no character target.")
+            elif dat_path and not _armature_has_face_morphs(active_armature):
+                self.report({'WARNING'}, "Face morphs not loaded on the active armature.")
+            if mp2_path and soundstrip is None:
+                self.report({'WARNING'}, f"MP2 pair found but no sound strip was created: {mp2_path}")
+            if dat_path and not mp2_path:
+                self.report({'WARNING'}, f"Loaded W2 DAT only; MP2 pair not found for {Path(dat_path).stem}.")
+            elif mp2_path and not dat_path:
+                self.report({'WARNING'}, f"Loaded W2 MP2 only; DAT pair not found for {Path(mp2_path).stem}.")
+            else:
+                self.report({'INFO'}, f"W2 voice pair imported: {Path(dat_path or mp2_path).stem}")
+            return {'FINISHED'}
+
         if (os.path.exists(fdir+'.json')):
             fdir = fdir + '.json'
         if fdir.endswith('.cr2w'):
@@ -205,9 +451,20 @@ class ButtonOperatorImportVoice(bpy.types.Operator, ImportHelper):
             self.report({'INFO'}, "Lipsync import finished.")
         return {'FINISHED'}
     def invoke(self, context, event):
-        UNCOOK_PATH = os.path.join(get_W3_VOICE_PATH(bpy.context))
-        if os.path.exists(UNCOOK_PATH):
-            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        if self.filepath == '':
+            w2_lang = dialog_language.get_active_voice_language(context) or "en"
+            w2_default = ""
+            game_root = str(get_witcher2_game_path(context) or "").strip()
+            if game_root:
+                candidate = os.path.join(game_root, "CookedPC", "local_speech", w2_lang, "lipsync")
+                if os.path.isdir(candidate):
+                    w2_default = candidate
+            if w2_default:
+                self.filepath = w2_default
+            else:
+                UNCOOK_PATH = os.path.join(get_W3_VOICE_PATH(bpy.context))
+                if os.path.exists(UNCOOK_PATH):
+                    self.filepath = UNCOOK_PATH
         return ImportHelper.invoke(self, context, event)
 
 class WITCHER_PT_speech_panel(WITCH_PT_Base, Panel):

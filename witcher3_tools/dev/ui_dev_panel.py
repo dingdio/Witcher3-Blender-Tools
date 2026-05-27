@@ -357,6 +357,21 @@ def _resolve_entry_import_paths(path_obj):
     """Resolve an entry to a list of filesystem paths suitable for import operators."""
     repo_paths = _get_entry_repo_paths(path_obj)
     if repo_paths:
+        source_game = _safe_text(path_obj.get("source_game", "")) if isinstance(path_obj, dict) else ""
+        if source_game:
+            from ..source_game_paths import normalize_source_game
+            if normalize_source_game(source_game) == "w2":
+                try:
+                    from ..ui.ui_speech import _resolve_w2_voice_repo_path
+                    resolved_voice_paths = [
+                        _resolve_w2_voice_repo_path(rp, bpy.context) for rp in repo_paths
+                    ]
+                    if all(resolved_voice_paths):
+                        return resolved_voice_paths
+                except Exception:
+                    pass
+            from ..source_game_paths import repo_file_for_source
+            return [repo_file_for_source(rp, source_game) for rp in repo_paths]
         from ..CR2W.common_blender import repo_file
         return [repo_file(rp) for rp in repo_paths]
     fs_path = _get_entry_fs_path(path_obj)

@@ -1,6 +1,7 @@
 import logging
 log = logging.getLogger(__name__)
 import os
+import re
 import struct
 import math
 from .dc_skeleton import create_CMimicFace, create_Skeleton, load_bin_skeleton
@@ -33,6 +34,7 @@ from .bStream import *
 
 
 W2_MIMIC_FLOATTRACKS_RIG = r"characters\templates\mimics\floattracks.w2rig"
+_W2_LIPSYNC_DAT_NAME_RE = re.compile(rb"VO_[A-Z0-9]+_[0-9]+_[0-9]+(?:_face)?")
 
 class CVector3D:
     def __init__(self, f, compression = 0):
@@ -1315,6 +1317,57 @@ def load_lipsync_file(fileName_in = False) -> w3_types.CSkeletalAnimation:
         anim = read_lipsync_buffer_file(fileName, CMimicFace.floatTrackSkeleton)
 
     return anim
+
+
+def _w2_lipsync_dat_animation_name(raw_data, file_name=""):
+    # Witcher 2 support: loose VO_ID*.dat files are not CR2W files. They start
+    # with a small property blob, then embed one Havok hkaSplineCompressedAnimation.
+    match = _W2_LIPSYNC_DAT_NAME_RE.search(raw_data or b"")
+    if match:
+        try:
+            return match.group(0).decode("ascii", errors="ignore")
+        except Exception:
+            pass
+    return os.path.splitext(os.path.basename(str(file_name or "")))[0] or "w2_lipsync"
+
+
+def load_w2_lipsync_dat_file(fileName, rigPath=None) -> w3_types.CSkeletalAnimation:
+    """Load a Witcher 2 localized VO_ID*.dat lipsync file.
+
+    W2 DAT lipsync files are separate from W3 .cr2w/.re lipsync resources. They
+    contain one embedded Havok spline animation with float tracks for the W2
+    mimic rig. Keep this path isolated from the W3 .w3fac lipsync loader.
+    """
+    with open(fileName, "rb") as f:
+        raw_data = f.read()
+
+    fallback_bone_names, fallback_track_names = _get_fallback_w2_skeleton_names(
+        rigPath,
+        source_file=fileName,
+    )
+    decoded = HavokPackfile.decode_animation_blob_at_index(
+        raw_data,
+        0,
+        fallback_bone_names=fallback_bone_names,
+        fallback_track_names=fallback_track_names,
+    )
+    if not decoded or not getattr(decoded, "buffer", None):
+        raise RuntimeError(f"Could not decode W2 lipsync DAT: {fileName}")
+
+    name = _w2_lipsync_dat_animation_name(raw_data, fileName)
+    anim = w3_types.CSkeletalAnimation(
+        name=name,
+        duration=float(getattr(decoded, "duration", 0.0) or getattr(decoded.buffer, "duration", 0.0) or 0.0),
+        framesPerSecond=(
+            1.0 / decoded.buffer.dt
+            if getattr(decoded.buffer, "dt", 0.0)
+            else 30.0
+        ),
+        animBuffer=decoded.buffer,
+        SkeletalAnimationType="SAT_Normal",
+    )
+    return anim
+
 
 def load_base_skeleton(rigPath):
     with open(rigPath, "rb") as f:

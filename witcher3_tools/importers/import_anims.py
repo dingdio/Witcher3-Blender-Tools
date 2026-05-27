@@ -8,6 +8,7 @@ from ..CR2W.dc_anims import (
     load_base_skeleton,
     load_bin_anims,
     load_lipsync_file,
+    load_w2_lipsync_dat_file,
     load_bin_anims_info,
     load_w2_anims_info,
 )
@@ -2211,7 +2212,15 @@ def import_lipsync(context, fileName = False, load_from_data = False, use_NLA=Tr
     if fileName:
         dirpath, file = os.path.split(fileName)
         basename, ext = os.path.splitext(file)
-        if ext.lower() in {'.cr2w', '.re'}:
+        if ext.lower() == '.dat':
+            # Witcher 2 support: localized VO_ID*.dat files contain one embedded
+            # Havok float-track lipsync animation, separate from the W3 .w3fac path.
+            lipsync_CSkeletalAnimation = load_w2_lipsync_dat_file(fileName)
+            anim_set_entry = w3_types.CSkeletalAnimationSetEntry()
+            anim_set_entry.name = lipsync_CSkeletalAnimation.name
+            anim_set_entry.animation = lipsync_CSkeletalAnimation
+            import_anim(context, "lipsync", anim_set_entry, use_NLA=use_NLA, NLA_track=NLA_track, override_select = override_select, at_frame = at_frame, nla_mode=nla_mode)
+        elif ext.lower() in {'.cr2w', '.re'}:
             lipsync_CSkeletalAnimation =  load_lipsync_file(fileName)
             anim_set_entry = w3_types.CSkeletalAnimationSetEntry()
             lipsync_CSkeletalAnimation.name = getFilenameFile(lipsync_CSkeletalAnimation.name)
