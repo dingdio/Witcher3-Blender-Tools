@@ -411,6 +411,7 @@ from .ui import armature_context
 from .ui import ui_cache_export
 from . import lipsync
 from . import livelink_face
+from . import strings_browser
 from .ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_apx, WITCH_OT_redcloth, WITCH_OT_redapex, WITCH_OT_w2mesh_export, WITCH_OT_nxs,
                          WITCH_OT_export_goto_project_path,
                          WITCH_OT_create_sound_info, WITCH_OT_remove_sound_info,
@@ -2460,6 +2461,13 @@ CACHE_ITEMS = (
         "description": "Witcher 2 DZIP archive index cache.",
     },
     {
+        "name": "w2_string_cache",
+        "relative_path": os.path.join("W2Strings"),
+        "label": "W2Strings",
+        "description": "Witcher 2 localized string table cache.",
+        "is_dir": True,
+    },
+    {
         "name": "dlc_definition_cache.pkl",
         "relative_path": os.path.join("DLC", "dlc_definition_cache.pkl"),
         "label": "dlc_definition_cache.pkl",
@@ -2737,6 +2745,7 @@ def _refresh_cache_by_name(cache_name: str) -> bool:
         "bundle_cache.pkl": lambda: BundleManager.Get(loadmods=False, reset_cache=True),
         "bundle_cache_mods.pkl": lambda: BundleManager.Get(loadmods=True, reset_cache=True),
         "w2_dzip_cache.pkl": lambda: DzipManager.Get(reset_cache=True),
+        "w2_string_cache": lambda: W2StringManager.Get(do_reload=True),
         "dlc_definition_cache.pkl": _refresh_dlc_definition_cache,
         "journal_browser_bestiary.pkl": lambda: _refresh_journal_cache("BESTIARY"),
         "journal_browser_characters.pkl": lambda: _refresh_journal_cache("CHARACTERS"),
@@ -4240,6 +4249,7 @@ from .CR2W.witcher_cache.Witcher2Bundles import DzipManager
 from .CR2W.witcher_cache.SoundCache import SoundManager
 from .CR2W.witcher_cache.Speech import SpeechManager
 from .CR2W.witcher_cache.TextureCache import TextureManager
+from .CR2W.witcher_cache.W2Strings import W2StringManager
 from .CR2W.witcher_cache.W3Strings import W3StringManager
 
 # Operator to refresh a cache file
@@ -4387,6 +4397,7 @@ def register():
     ui_cache_export.register()
     register_class(WITCH_PT_Quick)
     ui_voice.register()
+    strings_browser.register()
     lipsync.register()
     ui_mimics.register()
     ui_re_anims.register()
@@ -4465,6 +4476,7 @@ def unregister():
     livelink_face.unregister()
     ui_morphs.unregister()
     lipsync.unregister()
+    strings_browser.unregister()
     ui_voice.unregister()
     ui_mimics.unregister()
     ui_re_anims.unregister()

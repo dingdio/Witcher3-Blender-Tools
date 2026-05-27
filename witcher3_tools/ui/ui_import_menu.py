@@ -187,6 +187,9 @@ class WITCH_MT_Menu(bpy.types.Menu):
         layout.operator("witcher.open_external_texture_cache", text="Open texture.cache", icon="IMAGE_DATA")
         layout.operator("witcher.open_external_sound_cache", text="Open sound.cache", icon="SPEAKER")
         layout.operator("witcher.open_external_bundle", text="Open .bundle", icon="PACKAGE")
+        layout.separator()
+        op = layout.operator("witcher.open_strings_browser", text="Browse Strings (.w3strings / REDkit .db)", icon='OUTLINER_DATA_FONT')
+        op.initial_game = 'W3'
 
 class WITCH_MT_Menu_witcher_2(bpy.types.Menu):
     bl_label = "Witcher 2 Assets"
@@ -205,6 +208,9 @@ class WITCH_MT_Menu_witcher_2(bpy.types.Menu):
         layout.separator()
         layout.operator(WITCH_OT_w2L.bl_idname, text="Layer (.w2l)", icon='SPHERE')
         layout.operator(WITCH_OT_w2w.bl_idname, text="World (.w2w)", icon='WORLD_DATA')
+        layout.separator()
+        op = layout.operator("witcher.open_strings_browser", text="Browse Strings (REDkit .db)", icon='OUTLINER_DATA_FONT')
+        op.initial_game = 'W2'
 
 def menu_import_witcher_2(self, context):
     self.layout.menu(WITCH_MT_Menu.bl_idname, **_witcher_menu_icon_kwargs())

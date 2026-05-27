@@ -3254,8 +3254,6 @@ def import_sound_to_timeline(context, item_path: str, loadmods: bool = False, ca
 
 
 def play_sound_preview(context, cache_type: str, item_path: str, loadmods: bool = False) -> str:
-    global _sound_preview_device, _sound_preview_handle, _sound_preview_state
-
     sound_abs_path = ensure_sound_item_extracted(
         context,
         item_path,
@@ -3264,6 +3262,20 @@ def play_sound_preview(context, cache_type: str, item_path: str, loadmods: bool 
     )
     if not sound_abs_path:
         raise RuntimeError(f"Sound item not found: {item_path}")
+
+    return play_sound_file_preview(context, sound_abs_path, item_path, cache_type=cache_type)
+
+
+def sound_preview_matches(cache_type: str, item_path: str) -> bool:
+    return _sound_preview_matches(cache_type, item_path)
+
+
+def clear_sound_preview(context=None) -> None:
+    _clear_sound_preview(context)
+
+
+def play_sound_file_preview(context, sound_abs_path: str, item_path: str, cache_type: str = "Sound") -> str:
+    global _sound_preview_device, _sound_preview_handle, _sound_preview_state
 
     wav_path = ensure_sound_wav(context, sound_abs_path, item_path)
 
@@ -8546,6 +8558,14 @@ class WITCHER_PT_AssetBrowser(Panel):
             mod_row.label(text="Mod options", icon='MODIFIER')
             mod_row.prop(browser_settings, "use_mods_priority", text="Load Mods")
             mod_row.prop(browser_settings, "mods_overwrite", text="Overwrite")
+
+        # ~TEMP move strings_browser later
+        try:
+            from .. import strings_browser as _strings_browser
+
+            _strings_browser.draw_launcher(layout)
+        except Exception:
+            pass
 
         # Box 2: Characters (merged Quick Imports + Browsers)
         char_box = layout.box()
