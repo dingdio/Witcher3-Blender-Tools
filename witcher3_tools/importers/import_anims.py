@@ -3,7 +3,14 @@ from .. import auto_scene_setup
 from ..file_helpers import getFilenameFile, rm_ns
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
-from ..CR2W.dc_anims import load_bin_anims, load_lipsync_file, load_bin_anims_info, load_w2_anims_info
+from ..CR2W.dc_anims import (
+    W2_MIMIC_FLOATTRACKS_RIG,
+    load_base_skeleton,
+    load_bin_anims,
+    load_lipsync_file,
+    load_bin_anims_info,
+    load_w2_anims_info,
+)
 from ..CR2W.CR2W_helpers import Enums
 log = logging.getLogger(__name__)
 
@@ -179,9 +186,12 @@ _MIMIC_POSE_WEIGHT_VALUE_PROP = "_w3_mimic_pose_weight"
 _MIMIC_SCENE_WEIGHT_SOURCE_PROP = "_w3_mimic_scene_weight_source_action"
 _MIMIC_SCENE_WEIGHT_VALUE_PROP = "_w3_mimic_scene_weight"
 _GENERIC_SCENE_WEIGHT_SOURCE_PROP = "_w3_scene_additive_weight_source_action"
-_MIMIC_POSE_WEIGHT_TRACK_PREFIX = 'pose.bones["w3_face_poses"]["'
-_MIMIC_POSE_WEIGHT_TRACK_MARKER = 'w3_face_poses"]["'
+W3_FACE_POSES_BONE = "w3_face_poses"
+W2_FACE_POSES_BONE = "w2_face_poses"
+_MIMIC_POSE_WEIGHT_TRACK_PREFIX = f'pose.bones["{W3_FACE_POSES_BONE}"]["'
+_MIMIC_POSE_WEIGHT_TRACK_MARKER = f'{W3_FACE_POSES_BONE}"]["'
 _MIMIC_HEAD_FLOAT_TRACKS = {"head1", "head2", "head3"}
+_W2_FLOAT_TRACK_NAME_CACHE = {}
 
 
 def _is_mimic_pose_weight_fcurve(fcurve):
@@ -542,6 +552,153 @@ def _ensure_control_float_property(control_bone, name, default=0.0):
     except Exception:
         pass
     return current
+
+
+def _is_w2_face_animation_target(arm_obj):
+    if not arm_obj or getattr(arm_obj, "type", None) != "ARMATURE":
+        return False
+    try:
+        if bool(arm_obj.get("witcher_w2_mimic_support", False)):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(getattr(arm_obj, "pose", None) and arm_obj.pose.bones.get(W2_FACE_POSES_BONE))
+    except Exception:
+        return False
+
+
+def _resolve_face_control_bone_name(arm_obj, camera_animation=False):
+    if camera_animation:
+        return "Camera_Node"
+    pose_bones = getattr(getattr(arm_obj, "pose", None), "bones", None)
+    has_w2 = bool(pose_bones and pose_bones.get(W2_FACE_POSES_BONE))
+    has_w3 = bool(pose_bones and pose_bones.get(W3_FACE_POSES_BONE))
+    if _is_w2_face_animation_target(arm_obj):
+        return W2_FACE_POSES_BONE if has_w2 or not has_w3 else W3_FACE_POSES_BONE
+    if has_w3:
+        return W3_FACE_POSES_BONE
+    if has_w2:
+        return W2_FACE_POSES_BONE
+    return W3_FACE_POSES_BONE
+
+
+def _track_name_as_index(value):
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    text = str(value or "").strip()
+    if text.isdigit():
+        return int(text)
+    return None
+
+
+def _w2_float_track_skeleton_candidates(arm_obj):
+    seen = set()
+
+    def emit(path):
+        path = str(path or "").strip()
+        key = path.lower()
+        if path and key not in seen:
+            seen.add(key)
+            return path
+        return None
+
+    if arm_obj is not None:
+        path = emit(arm_obj.get("witcher_w2_mimic_float_track_skeleton", "") if hasattr(arm_obj, "get") else "")
+        if path:
+            yield path
+        try:
+            scene = bpy.context.scene
+            mimic_name = str(arm_obj.get("witcher_w2_mimic_armature", "") or "").strip()
+            mimic_arm = scene.objects.get(mimic_name) if scene is not None and mimic_name else None
+            path = emit(mimic_arm.get("witcher_w2_mimic_float_track_skeleton", "") if mimic_arm else "")
+            if path:
+                yield path
+        except Exception:
+            pass
+
+    path = emit(W2_MIMIC_FLOATTRACKS_RIG)
+    if path:
+        yield path
+
+
+def _resolve_w2_track_skeleton_path(path, source_file=None):
+    if not path:
+        return ""
+    if os.path.isabs(path):
+        return path
+    if source_file:
+        try:
+            from ..source_game_paths import resolve_w2_repo_file_from_source
+
+            resolved = resolve_w2_repo_file_from_source(path, source_file, version=115)
+            if resolved:
+                return resolved
+        except Exception:
+            pass
+    try:
+        return repo_file_for_source(path, "w2")
+    except Exception:
+        return path
+
+
+def _load_w2_float_track_names_for_armature(arm_obj, source_file=None):
+    for candidate in _w2_float_track_skeleton_candidates(arm_obj):
+        resolved = _resolve_w2_track_skeleton_path(candidate, source_file=source_file)
+        if not resolved:
+            continue
+        cache_key = os.path.normcase(os.path.normpath(str(resolved)))
+        cached = _W2_FLOAT_TRACK_NAME_CACHE.get(cache_key)
+        if cached is not None:
+            return cached[:]
+        try:
+            rig = load_base_skeleton(resolved)
+            names = [str(name or "").strip() for name in (getattr(rig, "tracks", None) or []) if str(name or "").strip()]
+        except Exception:
+            names = []
+        if names:
+            _W2_FLOAT_TRACK_NAME_CACHE[cache_key] = names
+            return names[:]
+    return []
+
+
+def _repair_w2_numeric_float_track_names(arm_obj, tracks, control_bone=None, source_file=None):
+    if not tracks or not _is_w2_face_animation_target(arm_obj):
+        return 0
+    indexed_tracks = []
+    for track in tracks:
+        idx = _track_name_as_index(getattr(track, "trackName", None))
+        if idx is not None:
+            indexed_tracks.append((track, idx))
+    if not indexed_tracks:
+        return 0
+
+    track_names = _load_w2_float_track_names_for_armature(arm_obj, source_file=source_file)
+    if not track_names and control_bone is not None:
+        track_names = [
+            str(key)
+            for key in control_bone.keys()
+            if key != "_RNA_UI" and _track_name_as_index(key) is None
+        ]
+
+    renamed = 0
+    for track, idx in indexed_tracks:
+        if 0 <= idx < len(track_names):
+            track.trackName = track_names[idx]
+            renamed += 1
+    if renamed:
+        log.info("W2 mimic import: repaired %d numeric float-track names from floattracks.w2rig", renamed)
+    return renamed
+
+
+def _looks_like_w2_mimic_animset_path(path):
+    text = str(path or "").replace("/", "\\").lower()
+    return (
+        "\\characters\\templates\\mimics\\" in text
+        or "\\characters\\templates\\face\\" in text
+        or ("\\characters\\main_npc\\" in text and "\\mimics\\" in text)
+        or ("\\characters\\common\\heads\\" in text and "mimic" in os.path.basename(text))
+    )
 
 
 def _find_anim_bone(bones, *names):
@@ -1054,6 +1211,28 @@ class AnimImporter:
                     break
 
         anim_desc = copy.deepcopy(SkeletalAnimationData)
+        w2_face_float_animation = bool(
+            face_animation
+            and not camera_animation
+            and (
+                _is_w2_face_animation_target(armObj)
+                or _looks_like_w2_mimic_animset_path(self.__animFile.filepath)
+            )
+            and getattr(anim_desc, "tracks", None)
+        )
+        if w2_face_float_animation:
+            _repair_w2_numeric_float_track_names(
+                armObj,
+                anim_desc.tracks,
+                source_file=self.__animFile.filepath,
+            )
+            if getattr(anim_desc, "bones", None):
+                log.info(
+                    "W2 mimic import: ignoring %d transform bone track(s) on face float animation '%s'",
+                    len(anim_desc.bones),
+                    SkeletalAnimation.name,
+                )
+                anim_desc.bones = []
 
         rig_settings = getattr(armObj.data, "witcherui_RigSettings", None)
         use_rot90 = get_rig_rot90_enabled(
@@ -1402,10 +1581,8 @@ class AnimImporter:
         _safe_mode_set('OBJECT', armObj)
         log.debug(' Finished adding keyframes in %f seconds.', time.time() - start_time)
 
-        control_bone_name = "w3_face_poses"
-        if camera_animation:
-            control_bone_name = "Camera_Node"
-        AnimTracks = SkeletalAnimationData.tracks
+        control_bone_name = _resolve_face_control_bone_name(armObj, camera_animation=camera_animation)
+        AnimTracks = anim_desc.tracks
         morph_action_target = None
         if AnimTracks:
             log.debug('---- morph animations:%5d  target: %s', len(AnimTracks), armObj.name)
@@ -1422,12 +1599,20 @@ class AnimImporter:
                     _loaded, ensured_arm_obj = ensure_owner_face_animation_setup(bpy.context, armObj)
                     if ensured_arm_obj and getattr(ensured_arm_obj, "type", None) == 'ARMATURE':
                         control_arm_obj = ensured_arm_obj
+                        control_bone_name = _resolve_face_control_bone_name(control_arm_obj, camera_animation=camera_animation)
                     control_bone = control_arm_obj.pose.bones.get(control_bone_name)
                 except Exception as exc:
                     log.warning('Failed to auto-load face morphs on "%s": %s', armObj.name, exc)
             if control_bone is None:
                 log.warning('Shape key control bone "%s" still missing on "%s" after face morph attempt. Skipping morph tracks.', control_bone_name, armObj.name)
             else:
+                if w2_face_float_animation or (not camera_animation and control_bone_name == W2_FACE_POSES_BONE):
+                    _repair_w2_numeric_float_track_names(
+                        control_arm_obj,
+                        AnimTracks,
+                        control_bone=control_bone,
+                        source_file=self.__animFile.filepath,
+                    )
                 if control_arm_obj != armObj:
                     morph_action_target = control_arm_obj
                 mirror_map = {}#_MirrorMapper(meshObj.data.shape_keys.key_blocks) if self.__mirror else {}
@@ -1438,9 +1623,9 @@ class AnimImporter:
                     keyFrames = track.trackFrames
                     if len(keyFrames) == 0:
                         continue
-                    name = track.trackName
+                    name = str(track.trackName)
                     if name not in shapeKeyDict:
-                        if not camera_animation and control_bone_name == "w3_face_poses" and name in _MIMIC_HEAD_FLOAT_TRACKS:
+                        if not camera_animation and control_bone_name == W3_FACE_POSES_BONE and name in _MIMIC_HEAD_FLOAT_TRACKS:
                             shapeKeyDict[name] = _ensure_control_float_property(control_bone, name)
                             log.debug('Created mimic float control property %s (%d frames)', name, len(keyFrames))
                         else:

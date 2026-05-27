@@ -194,11 +194,29 @@ def _get_mimic_rig_path(armature_obj):
     if not armature_obj or armature_obj.type != 'ARMATURE':
         return None
 
+    def _resolve_for_armature(path):
+        try:
+            from .ui_anims_list import _source_game_for_armature_obj
+            from ..source_game_paths import repo_file_for_source
+
+            return repo_file_for_source(path, _source_game_for_armature_obj(armature_obj))
+        except Exception:
+            return repo_file(path)
+
+    # Witcher 2 support: W2 face animation float tracks are named by the
+    # inherited/template float-track skeleton, not by a W3 .w3fac file.
+    w2_track_skeleton = (armature_obj.get("witcher_w2_mimic_float_track_skeleton", "") or "").strip()
+    if w2_track_skeleton:
+        try:
+            return _resolve_for_armature(w2_track_skeleton)
+        except Exception:
+            pass
+
     # Mimic animation tracks are defined against the face rig, not the body rig.
     mimic_face_file = (armature_obj.get("mimicFaceFile", "") or "").strip()
     if mimic_face_file:
         try:
-            return repo_file(mimic_face_file)
+            return _resolve_for_armature(mimic_face_file)
         except Exception:
             pass
 
@@ -209,7 +227,7 @@ def _get_mimic_rig_path(armature_obj):
     skeleton_path = (getattr(rig_settings, "main_face_skeleton", "") or "").strip()
     if skeleton_path:
         try:
-            return repo_file(skeleton_path)
+            return _resolve_for_armature(skeleton_path)
         except Exception:
             pass
 
@@ -444,8 +462,12 @@ def _build_mimic_hint_label(meta, item_name):
     cat3 = (meta.get("cat3", "") or "").strip()
     name = (item_name or "").strip()
     caption = (meta.get("caption", "") or "").strip()
+    source_game = (meta.get("source_game", "") or "").strip().lower()
 
     badges = []
+    if source_game == "w2":
+        badges.append("W2")
+
     # Primary audience/character hint
     if cat2 and cat2.lower() != "layers":
         badges.append(_abbrev_mimic_badge(cat2))
@@ -519,8 +541,17 @@ def _load_selected_mimic(context):
 
     rig_path = _get_mimic_rig_path(target_armature)
 
-    fileName, anim_name = item.mimicLineId.split(';', 1)
-    fileName = os.path.join(get_uncook_path(context), fileName)
+    file_rel, anim_name = item.mimicLineId.split(';', 1)
+    try:
+        from .ui_anims_list import _source_game_for_armature_obj
+        from ..source_game_paths import repo_file_for_source
+
+        target_source_game = _source_game_for_armature_obj(target_armature)
+        meta = MimicsResourceManager.Get().MetaByKey.get(item.mimicLineId, {})
+        source_game = str(meta.get("source_game", "") or target_source_game or "w3").strip()
+        fileName = repo_file_for_source(file_rel, source_game)
+    except Exception:
+        fileName = os.path.join(get_uncook_path(context), file_rel)
     show_all = bool(getattr(context.scene, MIMIC_SHOW_ALL_PROP, False))
     if not show_all:
         try:
@@ -930,7 +961,6 @@ def draw_quick_dialogset_mimic_controls(layout, context):
 class MimicsResourceManager:
     resourceManager = None
     def __init__(self):
-        
         RES_DIR = Path(__file__)
         RES_DIR = str(Path(RES_DIR).parents[1])
         filename = os.path.join(RES_DIR, "CR2W", "data", "actor_mimics.csv")
@@ -938,22 +968,71 @@ class MimicsResourceManager:
 
         self.HashdumpDict = {}
         self.MetaByKey = {}
-        with open(self.pathashespath, encoding="utf-8", newline="") as csv_file:
+        self._load_catalog_csv(self.pathashespath, source_game="w3")
+
+        # Witcher 2 support: reuse the W2 actor animation catalog, but only
+        # expose rows that are face/mimic/lipsync sets. The full W2 catalog also
+        # contains body animations and would make the Quick Mimic list noisy.
+        w2_filename = os.path.join(RES_DIR, "CR2W", "data", "witcher_2_actor_animations.csv")
+        self._load_catalog_csv(
+            w2_filename,
+            source_game="w2",
+            row_filter=self._is_w2_mimic_catalog_row,
+        )
+
+    @staticmethod
+    def _is_w2_mimic_catalog_row(row):
+        file_path = normalize_animset_path(row.get("file", ""))
+        anim_id = str(row.get("id", "") or "").strip().lower()
+        cat_text = " ".join(
+            str(row.get(key, "") or "").strip().lower()
+            for key in ("cat1", "cat2", "cat3", "caption")
+        )
+        base_name = file_path.rsplit("\\", 1)[-1]
+        return (
+            "\\mimics\\" in file_path
+            or "\\templates\\face\\" in file_path
+            or "mimic" in base_name
+            or "lipsync" in file_path
+            or "mimic" in anim_id
+            or "lipsync" in anim_id
+            or anim_id.endswith("_face")
+            or "mimics" in cat_text
+            or "lipsync" in cat_text
+        )
+
+    @staticmethod
+    def _frame_count(row):
+        try:
+            return int((row.get("frames", "") or "0").strip() or 0)
+        except Exception:
+            return 0
+
+    def _load_catalog_csv(self, filename, source_game="w3", row_filter=None):
+        if not os.path.exists(filename):
+            return
+        with open(filename, encoding="utf-8", newline="") as csv_file:
             reader = csv.DictReader(csv_file, delimiter=";")
             for row in reader:
-                key = row["file"]+";"+row["id"]
-                self.HashdumpDict[key] = row["id"]
-                try:
-                    frames = int((row.get("frames", "") or "0").strip() or 0)
-                except Exception:
-                    frames = 0
+                if row_filter is not None and not row_filter(row):
+                    continue
+                file_path = row.get("file", "") or ""
+                anim_id = row.get("id", "") or ""
+                if not file_path or not anim_id:
+                    continue
+                key = file_path + ";" + anim_id
+                if key in self.MetaByKey:
+                    continue
+                self.HashdumpDict[key] = anim_id
+                frames = self._frame_count(row)
                 self.MetaByKey[key] = {
-                    "file": row.get("file", "") or "",
+                    "file": file_path,
                     "cat1": row.get("cat1", "") or "",
                     "cat2": row.get("cat2", "") or "",
                     "cat3": row.get("cat3", "") or "",
                     "caption": row.get("caption", "") or "",
                     "frames": frames,
+                    "source_game": source_game,
                 }
                 #self.HashdumpDict[row["file"]] = row["cat1"]+" "+row["cat2"]+" "+row["cat3"]+": "+row["id"]+" "+row["caption"]+row["frames"]
     @staticmethod

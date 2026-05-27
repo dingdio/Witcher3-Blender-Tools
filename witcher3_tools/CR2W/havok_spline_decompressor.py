@@ -4,11 +4,11 @@ import struct
 from dataclasses import dataclass
 
 try:
-    from .w3_types import Quaternion, w2AnimsFrames
+    from .w3_types import Quaternion, Track, w2AnimsFrames
 except Exception:
     try:
         # Supports direct module execution from CR2W folder in local debug scripts.
-        from w3_types import Quaternion, w2AnimsFrames
+        from w3_types import Quaternion, Track, w2AnimsFrames
     except Exception:
         # Minimal fallback for standalone parser validation without package context.
         class Quaternion:
@@ -46,6 +46,14 @@ except Exception:
                 self.scale_numFrames = scale_numFrames
                 self.scaleFrames = scaleFrames
                 self.rotationFramesQuat = rotationFramesQuat
+
+        class Track:
+            def __init__(self, id, trackName, numFrames, dt, trackFrames):
+                self.id = id
+                self.trackName = trackName
+                self.numFrames = numFrames
+                self.dt = dt
+                self.trackFrames = trackFrames
 
 log = logging.getLogger(__name__)
 
@@ -195,6 +203,33 @@ class SplineDynamicTrackQuat:
         return False
 
 
+class SplineDynamicTrackFloat:
+    def __init__(self, track, knots, degree):
+        self.track = track
+        self.knots = knots
+        self.degree = degree
+
+    def get_value(self, local_frame):
+        if len(self.track) <= 1 or not self.knots:
+            return self.track[0] if self.track else 0.0
+        knot_span = _find_knot_span(
+            self.degree,
+            local_frame,
+            len(self.track),
+            self.knots,
+        )
+        return _get_single_point(
+            knot_span,
+            self.degree,
+            local_frame,
+            self.knots,
+            self.track,
+        )
+
+    def is_static(self):
+        return not self.knots
+
+
 def _align_relative(offset, alignment=4):
     result = offset & (alignment - 1)
     if result == 0:
@@ -339,6 +374,8 @@ def _find_knot_span(degree, value, c_points_size, knots):
     if c_points_size <= 1:
         return 0
 
+    if value <= knots[degree]:
+        return degree
     if value >= knots[c_points_size]:
         return c_points_size - 1
 
@@ -351,6 +388,8 @@ def _find_knot_span(degree, value, c_points_size, knots):
             high = mid
         else:
             low = mid
+        if high <= low + 1:
+            return max(degree, min(low, c_points_size - 1))
         mid = (low + high) // 2
 
     return mid
@@ -520,6 +559,102 @@ class TransformSplineBlock:
         )
 
 
+def _float_track_mask_type(mask):
+    # W2 mimic/lipsync hkaSplineCompressedAnimation float tracks use the same
+    # per-track mask bytes across stock animsets: 0x00 identity, 0x03 static,
+    # and 0x12 dynamic 16-bit spline data.  0x02 is accepted as the 8-bit
+    # dynamic variant for compatibility with Havok's mask layout.
+    if mask == 0x00:
+        return "identity"
+    if mask == 0x03:
+        return "static"
+    if mask in (0x02, 0x12):
+        return "dynamic"
+    return "unknown"
+
+
+class FloatSplineBlock:
+    def __init__(self, data, block_offset, float_block_offset, num_tracks, num_float_tracks):
+        self._tracks = []
+        self._assign(data, block_offset, float_block_offset, num_tracks, num_float_tracks)
+
+    def _make_float_track(self, data, rel, mask):
+        track_type = _float_track_mask_type(mask)
+        if track_type == "identity":
+            return SplineStaticTrack(0.0), rel
+
+        if track_type == "static":
+            if rel + 4 > len(data):
+                return SplineStaticTrack(0.0), rel
+            value, rel = _read_f32(data, rel)
+            return SplineStaticTrack(float(value)), rel
+
+        if track_type != "dynamic":
+            log.warning("Unsupported W2 Havok float-track mask 0x%02x at offset %d", mask, rel)
+            return SplineStaticTrack(0.0), rel
+
+        if rel + 3 > len(data):
+            return SplineStaticTrack(0.0), rel
+
+        num_items, rel = _read_u16(data, rel)
+        degree, rel = _read_u8(data, rel)
+        knot_size = num_items + degree + 2
+        if rel + knot_size > len(data):
+            return SplineStaticTrack(0.0), rel
+
+        knots = list(data[rel : rel + knot_size])
+        rel += knot_size
+        rel = _align_relative(rel, 4)
+
+        if rel + 8 > len(data):
+            return SplineStaticTrack(0.0), rel
+        min_v = struct.unpack_from("<f", data, rel)[0]
+        max_v = struct.unpack_from("<f", data, rel + 4)[0]
+        rel += 8
+
+        use_16bit = bool(mask & 0x10)
+        values = []
+        for _ in range(num_items + 1):
+            if use_16bit:
+                if rel + 2 > len(data):
+                    break
+                q_val, rel = _read_u16(data, rel)
+                frac = float(q_val) * (1.0 / 65535.0)
+            else:
+                if rel + 1 > len(data):
+                    break
+                q_val, rel = _read_u8(data, rel)
+                frac = float(q_val) * (1.0 / 255.0)
+            values.append(float(min_v + (max_v - min_v) * frac))
+
+        rel = _align_relative(rel, 4)
+        if not values:
+            return SplineStaticTrack(0.0), rel
+        return SplineDynamicTrackFloat(values, knots, degree), rel
+
+    def _assign(self, data, block_offset, float_block_offset, num_tracks, num_float_tracks):
+        if num_float_tracks <= 0:
+            return
+
+        mask_rel = int(block_offset) + (int(num_tracks) * 4)
+        masks_end = mask_rel + int(num_float_tracks)
+        if mask_rel < 0 or masks_end > len(data):
+            log.warning("W2 Havok float-track masks outside data buffer")
+            return
+
+        masks = list(data[mask_rel:masks_end])
+        rel = int(float_block_offset) if float_block_offset is not None else _align_relative(masks_end, 4)
+
+        for mask in masks:
+            track, rel = self._make_float_track(data, rel, mask)
+            self._tracks.append(track)
+
+    def get_value(self, track_id, local_frame):
+        if track_id < 0 or track_id >= len(self._tracks):
+            return 0.0
+        return self._tracks[track_id].get_value(local_frame)
+
+
 def _fallback_dt(duration, num_frames):
     if num_frames > 1 and duration > 0.0:
         return duration / float(num_frames - 1)
@@ -537,12 +672,17 @@ def decompress_spline_animation(
     block_inverse_duration,
     block_offsets,
     bone_names=None,
+    float_block_offsets=None,
+    track_names=None,
+    return_tracks=False,
 ):
-    if not data or num_tracks <= 0:
-        return []
+    if not data or (num_tracks <= 0 and num_float_tracks <= 0):
+        return ([], []) if return_tracks else []
 
     if not block_offsets:
         block_offsets = [0]
+    if not float_block_offsets:
+        float_block_offsets = []
 
     blocks = []
     for boff in block_offsets:
@@ -553,7 +693,23 @@ def decompress_spline_animation(
             continue
 
     if not blocks:
-        return []
+        blocks = []
+
+    float_blocks = []
+    if num_float_tracks > 0:
+        for block_id, boff in enumerate(block_offsets):
+            foff = None
+            if block_id < len(float_block_offsets):
+                foff = float_block_offsets[block_id]
+            try:
+                float_blocks.append(
+                    FloatSplineBlock(data, int(boff), foff, num_tracks, num_float_tracks)
+                )
+            except Exception as exc:
+                log.warning("Failed to parse W2 Havok float spline block at offset %s: %s", boff, exc)
+
+    if not blocks and not float_blocks:
+        return ([], []) if return_tracks else []
 
     num_frames = max(1, int(num_frames))
     if frame_duration <= 0.0:
@@ -566,7 +722,7 @@ def decompress_spline_animation(
         block_inverse_duration = 1.0 / block_duration
 
     bones = []
-    for track_id in range(num_tracks):
+    for track_id in range(max(0, num_tracks)):
         pos_frames = []
         rot_frames = []
         scale_frames = []
@@ -617,4 +773,45 @@ def decompress_spline_animation(
             )
         )
 
-    return bones
+    tracks = []
+    for track_id in range(max(0, num_float_tracks)):
+        track_frames = []
+
+        for frame_idx in range(num_frames):
+            sample_time = frame_idx * frame_duration
+
+            if block_inverse_duration > 0.0:
+                block_id = int(sample_time * block_inverse_duration)
+            else:
+                block_id = 0
+
+            if block_id < 0:
+                block_id = 0
+            elif float_blocks and block_id >= len(float_blocks):
+                block_id = len(float_blocks) - 1
+
+            local_time = sample_time - (float(block_id) * block_duration)
+            if local_time < 0.0:
+                local_time = 0.0
+
+            local_frame = local_time * frame_rate
+            value = 0.0
+            if float_blocks:
+                value = float_blocks[block_id].get_value(track_id, local_frame)
+            track_frames.append(float(value))
+
+        track_name = track_id
+        if track_names and track_id < len(track_names):
+            track_name = track_names[track_id]
+
+        tracks.append(
+            Track(
+                track_id,
+                trackName=track_name,
+                numFrames=num_frames,
+                dt=frame_duration,
+                trackFrames=track_frames,
+            )
+        )
+
+    return (bones, tracks) if return_tracks else bones

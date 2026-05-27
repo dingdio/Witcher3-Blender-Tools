@@ -378,7 +378,14 @@ def is_face_animation(anim_name, fdir=""):
     anim_text = str(anim_name or "").strip().lower()
     if ":face" in anim_text:
         return True
-    return "_mimic_" in str(fdir or "").strip().lower()
+    if anim_text.endswith("_face") or "_face:" in anim_text:
+        return True
+    path_text = str(fdir or "").strip().replace("/", "\\").lower()
+    if "_mimic_" in path_text or "\\mimics\\" in path_text:
+        return True
+    if "lipsync" in anim_text or "lipsync" in path_text:
+        return True
+    return False
 
 
 def _is_mimic_component_armature(obj):
@@ -394,6 +401,12 @@ def _is_mimic_component_armature(obj):
     mimic_face_file = str(obj.get("mimicFaceFile", "") or "").strip()
     if mimic_face_file and mimic_name and mimic_name == object_name:
         return True
+    # Witcher 2 support: imported CW2MimicHeadComponent armatures carry W2
+    # mimic metadata instead of W3 mimicFace/mimicFaceFile fields.
+    if bool(obj.get("witcher_w2_mimic_support", False)):
+        w2_mimic_armature = str(obj.get("witcher_w2_mimic_armature", "") or "").strip()
+        if w2_mimic_armature and w2_mimic_armature == object_name:
+            return True
     return False
 
 
@@ -412,6 +425,8 @@ def _find_named_mimic_armature(root_obj):
     if not root_obj:
         return None
     mimic_name = str(root_obj.get("mimicFace", "") or "").strip()
+    if not mimic_name:
+        mimic_name = str(root_obj.get("witcher_w2_mimic_armature", "") or "").strip()
     if not mimic_name:
         return None
     candidate = bpy.data.objects.get(mimic_name)
@@ -502,6 +517,8 @@ def _resolve_face_animation_targets(main_arm_obj):
         if _is_mimic_component_armature(armature_obj)
     )
     mimic_targets.extend(_iter_related_scene_mimic_armatures(main_arm_obj))
+    if not mimic_targets and bool(main_arm_obj.get("witcher_w2_mimic_support", False)):
+        mimic_targets.append(main_arm_obj)
     return _unique_armatures(mimic_targets)
 
 
@@ -698,8 +715,14 @@ def _resolve_face_rig_path(main_arm_obj, target_armatures):
     candidates.extend(target_armatures or [])
     main_source_game = _source_game_for_armature_obj(main_arm_obj)
     for armature_obj in _unique_armatures(candidates):
+        w2_track_skeleton = str(armature_obj.get("witcher_w2_mimic_float_track_skeleton", "") or "").strip()
         mimic_face_file = str(armature_obj.get("mimicFaceFile", "") or "").strip()
         source_game = _source_game_for_armature_obj(armature_obj, fallback=main_source_game)
+        if w2_track_skeleton:
+            try:
+                return repo_file_for_source(w2_track_skeleton, source_game)
+            except Exception:
+                pass
         if mimic_face_file:
             try:
                 return repo_file_for_source(mimic_face_file, source_game)
@@ -1083,6 +1106,8 @@ def _face_rig_path_for_armature(main_arm_obj):
         return None
     rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
     face_skeleton = str(getattr(rig_settings, "main_face_skeleton", "") or "").strip() if rig_settings else ""
+    if not face_skeleton:
+        face_skeleton = str(main_arm_obj.get("witcher_w2_mimic_float_track_skeleton", "") or "").strip()
     if not face_skeleton:
         face_skeleton = str(main_arm_obj.get("mimicFaceFile", "") or "").strip()
     if not face_skeleton:

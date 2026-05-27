@@ -406,7 +406,7 @@ class HavokPackfile:
         # Find the hkaSkeleton object
         skeleton_offset = self._find_skeleton_object(fixup_map, ds)
         if skeleton_offset is None:
-            log.error("Could not locate hkaSkeleton in data section")
+            log.debug("Could not locate hkaSkeleton in data section")
             return None
 
         skel_abs = data_abs + skeleton_offset
@@ -603,7 +603,7 @@ class HavokPackfile:
                                   base)
                         return base
 
-        log.error("Could not find hkaSkeleton object in data section")
+        log.debug("Could not find hkaSkeleton object in data section")
         return None
 
     # -- Animation extraction ------------------------------------------------
@@ -700,7 +700,7 @@ class HavokPackfile:
         endian = '<' if self.little_endian else '>'
         return list(struct.unpack_from(f'{endian}{count}I', self.data, arr_abs))
 
-    def read_full_animation(self, bone_names=None):
+    def read_full_animation(self, bone_names=None, track_names=None):
         """Decode hkaSplineCompressedAnimation into a Blender-friendly buffer.
 
         Returns:
@@ -744,7 +744,11 @@ class HavokPackfile:
         # Sanity guards
         if anim_type != 5:
             return None
-        if num_tracks <= 0 or num_tracks > 2000:
+        if num_tracks < 0 or num_tracks > 2000:
+            return None
+        if num_float_tracks < 0 or num_float_tracks > 2000:
+            return None
+        if num_tracks == 0 and num_float_tracks == 0:
             return None
         if num_frames <= 0 or num_frames > 200000:
             return None
@@ -789,7 +793,7 @@ class HavokPackfile:
             frame_duration = 1.0 / 30.0
 
         try:
-            bones = decompress_spline_animation(
+            bones, tracks = decompress_spline_animation(
                 data_blob,
                 num_tracks,
                 num_float_tracks,
@@ -800,6 +804,9 @@ class HavokPackfile:
                 block_inverse_duration,
                 block_offsets,
                 bone_names=bone_names,
+                float_block_offsets=_float_block_offsets,
+                track_names=track_names,
+                return_tracks=True,
             )
         except Exception as exc:
             log.warning("Spline decompression failed: %s", exc)
@@ -810,7 +817,7 @@ class HavokPackfile:
             from . import w3_types
             return w3_types.CAnimationBufferBitwiseCompressed(
                 bones,
-                [],
+                tracks,
                 duration=duration,
                 numFrames=num_frames,
                 dt=frame_duration,
@@ -820,7 +827,7 @@ class HavokPackfile:
                 import w3_types  # type: ignore
                 return w3_types.CAnimationBufferBitwiseCompressed(  # type: ignore[attr-defined]
                     bones,
-                    [],
+                    tracks,
                     duration=duration,
                     numFrames=num_frames,
                     dt=frame_duration,
@@ -828,22 +835,23 @@ class HavokPackfile:
             except Exception:
                 # Standalone fallback for parser-only validation.
                 class _AnimationBuffer:
-                    def __init__(self, bones_, duration_, num_frames_, dt_):
+                    def __init__(self, bones_, tracks_, duration_, num_frames_, dt_):
                         self.bones = bones_
-                        self.tracks = []
+                        self.tracks = tracks_
                         self.duration = duration_
                         self.numFrames = num_frames_
                         self.dt = dt_
 
                 return _AnimationBuffer(
                     bones,
+                    tracks,
                     duration,
                     num_frames,
                     frame_duration,
                 )
 
     @classmethod
-    def _decode_packfile_animation(cls, packfile, fallback_bone_names=None):
+    def _decode_packfile_animation(cls, packfile, fallback_bone_names=None, fallback_track_names=None):
         """Decode a single packfile animation into HavokDecodedAnimation."""
         decoded = HavokDecodedAnimation()
         if not packfile:
@@ -860,16 +868,22 @@ class HavokPackfile:
 
         skel = packfile.read_skeleton()
         bone_names = None
+        track_names = None
         if skel and skel.names:
             bone_names = skel.names
         elif fallback_bone_names:
             bone_names = fallback_bone_names
+        if skel and skel.tracks:
+            track_names = skel.tracks
+        elif fallback_track_names:
+            track_names = fallback_track_names
 
-        decoded.buffer = packfile.read_full_animation(bone_names=bone_names)
+        decoded.buffer = packfile.read_full_animation(bone_names=bone_names, track_names=track_names)
         if decoded.buffer is not None:
             decoded.duration = decoded.buffer.duration
             decoded.num_frames = decoded.buffer.numFrames
             decoded.num_transform_tracks = len(decoded.buffer.bones)
+            decoded.num_float_tracks = len(getattr(decoded.buffer, "tracks", []) or [])
 
         return decoded
 
@@ -901,7 +915,7 @@ class HavokPackfile:
         return results
 
     @classmethod
-    def scan_and_decode_animations(cls, data, fallback_bone_names=None):
+    def scan_and_decode_animations(cls, data, fallback_bone_names=None, fallback_track_names=None):
         """Find all Havok packfile blobs and decode spline animations.
 
         Returns:
@@ -919,6 +933,7 @@ class HavokPackfile:
             decoded = cls._decode_packfile_animation(
                 packfile,
                 fallback_bone_names=fallback_bone_names,
+                fallback_track_names=fallback_track_names,
             )
             results.append(decoded)
             search_start = offset + 4
@@ -926,7 +941,7 @@ class HavokPackfile:
         return results
 
     @classmethod
-    def decode_animation_blob_at_index(cls, data, blob_index, fallback_bone_names=None):
+    def decode_animation_blob_at_index(cls, data, blob_index, fallback_bone_names=None, fallback_track_names=None):
         """Decode only one Havok animation blob by its zero-based blob index."""
         if blob_index is None or blob_index < 0:
             return None
@@ -943,6 +958,7 @@ class HavokPackfile:
                 return cls._decode_packfile_animation(
                     packfile,
                     fallback_bone_names=fallback_bone_names,
+                    fallback_track_names=fallback_track_names,
                 )
 
             current_index += 1

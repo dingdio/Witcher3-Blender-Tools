@@ -22,7 +22,17 @@ def _looks_like_mimic_animset(path):
     norm = normalize_animset_path(path)
     if not norm.endswith(".w2anims"):
         return False
-    return "\\mimics\\" in norm or "mimic" in os.path.basename(norm)
+    # Witcher 2 support: face/lipsync sets are not always under a "mimics"
+    # folder. Some inherited/common clips live in templates\face or use
+    # lipsync-style names while still driving the W2 float-track face rig.
+    base = norm.rsplit("\\", 1)[-1]
+    return (
+        "\\mimics\\" in norm
+        or "\\templates\\face\\" in norm
+        or "mimic" in base
+        or "lipsync" in norm
+        or base == "mimika.w2anims"
+    )
 
 
 def _extract_animset_path(candidate):
@@ -158,7 +168,13 @@ def _is_mimic_component_armature(obj):
         return True
     mimic_name = str(obj.get("mimicFace", "") or "").strip()
     mimic_face_file = str(obj.get("mimicFaceFile", "") or "").strip()
-    return bool(mimic_face_file and mimic_name and mimic_name == object_name)
+    if mimic_face_file and mimic_name and mimic_name == object_name:
+        return True
+    if bool(obj.get("witcher_w2_mimic_support", False)):
+        w2_mimic_armature = str(obj.get("witcher_w2_mimic_armature", "") or "").strip()
+        if w2_mimic_armature and w2_mimic_armature == object_name:
+            return True
+    return False
 
 
 def _iter_descendant_armatures(root_obj):
@@ -172,6 +188,8 @@ def _iter_descendant_armatures(root_obj):
 
 def _find_named_mimic_armature(root_obj):
     mimic_name = str(root_obj.get("mimicFace", "") or "").strip() if root_obj else ""
+    if not mimic_name and root_obj:
+        mimic_name = str(root_obj.get("witcher_w2_mimic_armature", "") or "").strip()
     if not mimic_name:
         return None
     candidate = bpy.data.objects.get(mimic_name)
