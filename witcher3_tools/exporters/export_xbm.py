@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import logging
 import os
-import struct
 import tempfile
 from datetime import datetime
 
 import numpy as np
 
+from ..CR2W.texture_dds import (
+    DDSMetadata,
+    EFormat,
+    dds_format_name_from_header,
+    eformat_from_format_name,
+    mip_payload_size_for_eformat,
+    row_pitch_for_format_name,
+    swizzle_rgba8_bytes_to_bgra,
+    write_dds_payload,
+)
 from .texture_groups import get_texture_group_info
 
 log = logging.getLogger(__name__)
@@ -79,45 +88,35 @@ def _blender_image_to_compressed_mips(image, group_info):
 
 
 def _write_temp_rgba_dds(image, dds_path):
-    from ..CR2W.bStream import bStream
-    from ..CR2W.witcher_cache.TextureCache.DDSUtils import DDSUtils
-    from ..CR2W.witcher_cache.TextureCache.DDS_Metadata import DDSMetadata
-    from ..CR2W.witcher_cache.TextureCache.DDS_Enums import EFormat
-
     width, height = image.size
     rgba_bytes = _blender_image_to_top_rgba8_bytes(image)
-    bgra_bytes = _swizzle_rgba_to_bgra(rgba_bytes)
+    bgra_bytes = swizzle_rgba8_bytes_to_bgra(rgba_bytes)
 
     metadata = DDSMetadata(width=width, height=height, mipscount=0, format=EFormat.R8G8B8A8_UNORM)
-    stream = bStream(path=dds_path)
-    stream.decoder = 'ISO-8859-1'
-    try:
-        DDSUtils.GenerateAndWriteHeader(stream, metadata)
-        stream.write(bgra_bytes)
-    finally:
-        stream.close()
+    write_dds_payload(dds_path, metadata, bgra_bytes)
 
 
 def _extract_dds_mips(dds_path):
     with open(dds_path, "rb") as handle:
         data = handle.read()
 
-    format_name, width, height, mip_count, data_offset = _parse_dds_header(data)
+    format_name, width, height, mip_count, data_offset = dds_format_name_from_header(data)
     mip_count = max(1, int(mip_count or 0))
+    eformat = eformat_from_format_name(format_name)
 
     offset = data_offset
     mip_entries = []
     mip_width = int(width)
     mip_height = int(height)
     for _level in range(mip_count):
-        mip_size = _dds_mip_size(format_name, mip_width, mip_height)
+        mip_size = mip_payload_size_for_eformat(eformat, mip_width, mip_height)
         if offset + mip_size > len(data):
             raise ValueError(f"DDS mip payload overruns file: {dds_path}")
 
         mip_entries.append({
             "width": mip_width,
             "height": mip_height,
-            "blocksize": _dds_row_pitch(format_name, mip_width),
+            "blocksize": row_pitch_for_format_name(format_name, mip_width),
             "bytes": data[offset:offset + mip_size],
         })
         offset += mip_size
@@ -128,102 +127,6 @@ def _extract_dds_mips(dds_path):
         mip_height = max(1, mip_height // 2)
 
     return mip_entries
-
-
-def _parse_dds_header(data: bytes):
-    if len(data) < 128 or data[:4] != b"DDS ":
-        raise ValueError("Invalid DDS file")
-
-    height = struct.unpack_from("<I", data, 12)[0]
-    width = struct.unpack_from("<I", data, 16)[0]
-    mip_count = struct.unpack_from("<I", data, 28)[0]
-    fourcc = data[84:88]
-    rgb_bit_count = struct.unpack_from("<I", data, 88)[0]
-    rmask = struct.unpack_from("<I", data, 92)[0]
-    gmask = struct.unpack_from("<I", data, 96)[0]
-    bmask = struct.unpack_from("<I", data, 100)[0]
-    amask = struct.unpack_from("<I", data, 104)[0]
-
-    if fourcc == b"DX10":
-        if len(data) < 148:
-            raise ValueError("Invalid DX10 DDS header")
-        dxgi_format = struct.unpack_from("<I", data, 128)[0]
-        format_name = _dxgi_to_format_name(dxgi_format)
-        data_offset = 148
-    elif fourcc == b"DXT1":
-        format_name = "BC1_UNORM"
-        data_offset = 128
-    elif fourcc == b"DXT3":
-        format_name = "BC2_UNORM"
-        data_offset = 128
-    elif fourcc == b"DXT5":
-        format_name = "BC3_UNORM"
-        data_offset = 128
-    elif fourcc == b"BC4U":
-        format_name = "BC4_UNORM"
-        data_offset = 128
-    elif fourcc == b"BC5U":
-        format_name = "BC5_UNORM"
-        data_offset = 128
-    elif fourcc == b"\x00\x00\x00\x00" and rgb_bit_count == 32:
-        if (rmask, gmask, bmask, amask) in (
-            (0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000),
-            (0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000),
-        ):
-            format_name = "R8G8B8A8_UNORM"
-            data_offset = 128
-        else:
-            raise ValueError("Unsupported uncompressed DDS pixel masks")
-    else:
-        raise ValueError(f"Unsupported DDS format: fourcc={fourcc!r}")
-
-    return format_name, width, height, mip_count, data_offset
-
-
-def _dxgi_to_format_name(dxgi_format: int) -> str:
-    if dxgi_format in (71, 72):
-        return "BC1_UNORM"
-    if dxgi_format in (74, 75):
-        return "BC2_UNORM"
-    if dxgi_format in (77, 78):
-        return "BC3_UNORM"
-    if dxgi_format == 80:
-        return "BC4_UNORM"
-    if dxgi_format == 83:
-        return "BC5_UNORM"
-    if dxgi_format in (28, 29, 87, 91):
-        return "R8G8B8A8_UNORM"
-    if dxgi_format in (98, 99):
-        return "BC7_UNORM"
-    raise ValueError(f"Unsupported DXGI format in DDS: {dxgi_format}")
-
-
-def _dds_mip_size(format_name: str, width: int, height: int) -> int:
-    width = int(width)
-    height = int(height)
-    if format_name == "R8G8B8A8_UNORM":
-        return width * height * 4
-
-    block_width = max(1, (width + 3) // 4)
-    block_height = max(1, (height + 3) // 4)
-    if format_name in ("BC1_UNORM", "BC4_UNORM"):
-        return block_width * block_height * 8
-    if format_name in ("BC2_UNORM", "BC3_UNORM", "BC5_UNORM", "BC7_UNORM"):
-        return block_width * block_height * 16
-    raise ValueError(f"Unsupported DDS format: {format_name}")
-
-
-def _dds_row_pitch(format_name: str, width: int) -> int:
-    width = int(width)
-    if format_name == "R8G8B8A8_UNORM":
-        return width * 4
-
-    block_width = max(1, (width + 3) // 4)
-    if format_name in ("BC1_UNORM", "BC4_UNORM"):
-        return block_width * 8
-    if format_name in ("BC2_UNORM", "BC3_UNORM", "BC5_UNORM", "BC7_UNORM"):
-        return block_width * 16
-    raise ValueError(f"Unsupported DDS format: {format_name}")
 
 
 def _get_import_metadata(image, export_filepath):
@@ -302,17 +205,3 @@ def _downsample_rgba_image(pixels: np.ndarray) -> np.ndarray:
     new_width = max(1, (width + 1) // 2)
     reshaped = src.reshape((new_height, 2, new_width, 2, 4))
     return reshaped.mean(axis=(1, 3), dtype=np.float32)
-
-
-def _swizzle_rgba_to_bgra(raw_bytes: bytes) -> bytes:
-    if not raw_bytes:
-        return raw_bytes
-
-    src = memoryview(raw_bytes)
-    out = bytearray(len(raw_bytes))
-    for i in range(0, len(raw_bytes), 4):
-        out[i + 0] = src[i + 2]
-        out[i + 1] = src[i + 1]
-        out[i + 2] = src[i + 0]
-        out[i + 3] = src[i + 3]
-    return bytes(out)

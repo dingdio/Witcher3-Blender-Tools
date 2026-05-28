@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ..CR2W.texture_dds import DDSMetadata, EFormat, write_dds_payload
+
 W2TER_BUFFER_RE = re.compile(r"\.w2ter\.(\d+)\.buffer$", re.IGNORECASE)
 W2TER_TILE_RE = re.compile(
     r"tile_(?P<y>\d+)_x_(?P<x>\d+)_res(?P<res>\d+)\.w2ter(?:\.(?P<buffer>\d+)\.buffer)?$",
@@ -310,53 +312,9 @@ def assemble_tintmap(tile_paths: Dict[Tuple[int, int], str], tile_blocks: int, x
     return bytes(result)
 
 
-def build_dds_header_dxt1(width: int, height: int) -> bytes:
-    dds_magic = b"DDS "
-    dds_header_size = 124
-    # CAPS | HEIGHT | WIDTH | PIXELFORMAT | LINEARSIZE
-    dds_flags = 0x00081007
-    dds_depth = 0
-    dds_pixelformat_size = 32
-    dds_pixelflags = 0x00000004
-    dds_fourcc = b"DXT1"
-    dds_caps = 0x1000
-
-    linear_size = ((width + 3) // 4) * ((height + 3) // 4) * 8
-    fourcc_value = struct.unpack("<I", dds_fourcc)[0]
-
-    header = struct.pack("<4sI", dds_magic, dds_header_size)
-    header += struct.pack(
-        "<IIIIII",
-        dds_flags,
-        height,
-        width,
-        linear_size,
-        dds_depth,
-        0,
-    )
-    # 11 reserved DWORDs
-    header += b"\x00" * 44
-    header += struct.pack(
-        "<IIIIIIII",
-        dds_pixelformat_size,
-        dds_pixelflags,
-        fourcc_value,
-        0,
-        0,
-        0,
-        0,
-        0,
-    )
-    header += struct.pack("<IIII", dds_caps, 0, 0, 0)
-    header += struct.pack("<I", 0)
-    return header
-
-
 def write_dds_dxt1(output_path: str, width: int, height: int, data: bytes) -> None:
-    header = build_dds_header_dxt1(width, height)
-    with open(output_path, "wb") as dds_file:
-        dds_file.write(header)
-        dds_file.write(data)
+    metadata = DDSMetadata(width=width, height=height, mipscount=0, format=EFormat.BC1_UNORM)
+    write_dds_payload(output_path, metadata, data)
 
 
 def _decode_rgb565(value: int) -> Tuple[int, int, int]:

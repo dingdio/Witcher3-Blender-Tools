@@ -39,7 +39,8 @@ from .. import (
 )
 from ..importers import import_entity
 from ..mesh_import_settings import MeshImportSettings
-from ..ui.blender_fun import convert_xbm_to_dds, convert_w2cube_to_dds, load_image_with_dds_repair
+from ..CR2W.texture_converters import convert_xbm_to_dds, convert_w2cube_to_dds
+from ..ui.blender_fun import load_image_with_dds_repair
 from .browser_dummy_icons import (
     clear_browser_dummy_icon_cache,
     ensure_browser_dummy_icon_path,

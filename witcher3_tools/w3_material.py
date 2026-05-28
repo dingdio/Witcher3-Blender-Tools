@@ -34,9 +34,11 @@ from .w3_material_reader import (
     resolve_w2mg,
 )
 from . import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext, get_texture_path
-from .ui.blender_fun import (
+from .CR2W.texture_converters import (
     convert_texarray_to_dds,
     convert_xbm_to_dds,
+)
+from .ui.blender_fun import (
     load_image_with_dds_repair,
     load_w2cube_image,
     load_w2cube_blick_equirect_image,

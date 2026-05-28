@@ -18,13 +18,20 @@ import addon_utils
 from .. import file_helpers, w3_material_blender, CR2W, get_texture_path, get_uncook_path
 from ..cloth_util import setup_w3_material_CR2W
 from ..CR2W.common_blender import bpy_image_load_safe, win_safe_path
-from ..CR2W.witcher_cache.TextureCache.DDSUtils import DDSUtils
-from ..CR2W.witcher_cache.TextureCache.DDS_Metadata import DDSMetadata
-from ..CR2W.witcher_cache.TextureCache.DDS_Enums import EFormat
+from ..CR2W.texture_dds import (
+    DDSMetadata,
+    EFormat,
+    block_bytes_for_eformat,
+    dds_format_name_from_dxgi,
+    eformat_from_format_name,
+    mip_payload_size_for_eformat,
+    swizzle_rgba8_bytes_to_bgra,
+    write_dds_payload,
+)
 
 from ..CR2W.CR2W_types import getCR2W
-from ..CR2W import bStream
-from ..ui.blender_fun import convert_xbm_to_dds, load_w2cube_image
+from ..CR2W.texture_converters import convert_xbm_to_dds
+from ..ui.blender_fun import load_w2cube_image
 
 
 _CUBEMAP_FACE_KEYS = ("PX", "NX", "PY", "NY", "PZ", "NZ")
@@ -840,51 +847,43 @@ def _parse_block_compressed_cubemap_dds_top_faces(dds_path: str):
     if (caps2 & 0x0000FE00) == 0:
         return None
 
-    # Legacy DXT1/DXT5 DDS or DX10 DDS.
-    eformat = None
-    block_bytes = None
+    # Legacy block-compressed DDS or DX10 DDS.
+    format_name = ""
     data_off = 128
     if fourcc == 0x31545844:  # DXT1
-        eformat = EFormat.BC1_UNORM
-        block_bytes = 8
+        format_name = "BC1_UNORM"
+    elif fourcc == 0x33545844:  # DXT3
+        format_name = "BC2_UNORM"
     elif fourcc == 0x35545844:  # DXT5
-        eformat = EFormat.BC3_UNORM
-        block_bytes = 16
+        format_name = "BC3_UNORM"
+    elif fourcc == 0x55344342:  # BC4U
+        format_name = "BC4_UNORM"
+    elif fourcc == 0x55354342:  # BC5U
+        format_name = "BC5_UNORM"
     elif fourcc == 0x30315844:  # DX10
         if len(raw) < 148:
             return None
         data_off = 148
         try:
             dxgi_format = struct.unpack_from("<I", raw, 128)[0]
+            format_name = dds_format_name_from_dxgi(dxgi_format)
         except Exception:
-            return None
-        if dxgi_format == 71:
-            eformat = EFormat.BC1_UNORM
-            block_bytes = 8
-        elif dxgi_format == 74:
-            eformat = EFormat.BC2_UNORM
-            block_bytes = 16
-        elif dxgi_format == 77:
-            eformat = EFormat.BC3_UNORM
-            block_bytes = 16
-        elif dxgi_format == 98:
-            eformat = EFormat.BC7_UNORM
-            block_bytes = 16
-        else:
             return None
     else:
         return None
 
-    def mip_size_bytes(w, h):
-        bw = max(1, (max(1, w) + 3) // 4)
-        bh = max(1, (max(1, h) + 3) // 4)
-        return bw * bh * block_bytes
+    try:
+        eformat = eformat_from_format_name(format_name)
+    except Exception:
+        return None
+    if not block_bytes_for_eformat(eformat):
+        return None
 
     sizes = []
     w = width
     h = height
     for _ in range(mip_count):
-        sizes.append(mip_size_bytes(w, h))
+        sizes.append(mip_payload_size_for_eformat(eformat, w, h))
         w = max(1, w // 2)
         h = max(1, h // 2)
     face_total = sum(sizes)
@@ -902,24 +901,8 @@ def _parse_block_compressed_cubemap_dds_top_faces(dds_path: str):
     return width, height, eformat, faces
 
 
-def _swizzle_rgba_to_bgra(raw_bytes: bytes) -> bytes:
-    if not raw_bytes:
-        return raw_bytes
-    src = memoryview(raw_bytes)
-    out = bytearray(len(raw_bytes))
-    for i in range(0, len(raw_bytes), 4):
-        out[i + 0] = src[i + 2]
-        out[i + 1] = src[i + 1]
-        out[i + 2] = src[i + 0]
-        out[i + 3] = src[i + 3]
-    return bytes(out)
-
-
 def _write_rgba8_face_dds(face_path: str, width: int, height: int, bgra_bytes: bytes) -> str:
-    os.makedirs(os.path.dirname(face_path), exist_ok=True)
     safe_path = win_safe_path(face_path)
-    stream = bStream(path=safe_path)
-    stream.decoder = 'ISO-8859-1'
     metadata = DDSMetadata(
         width=width,
         height=height,
@@ -929,17 +912,12 @@ def _write_rgba8_face_dds(face_path: str, width: int, height: int, bgra_bytes: b
         slicecount=0,
         normal=False,
     )
-    DDSUtils.GenerateAndWriteHeader(stream, metadata)
-    stream.write(bgra_bytes)
-    stream.close()
+    write_dds_payload(safe_path, metadata, bgra_bytes)
     return face_path
 
 
 def _write_face_dds(face_path: str, width: int, height: int, eformat, face_bytes: bytes) -> str:
-    os.makedirs(os.path.dirname(face_path), exist_ok=True)
     safe_path = win_safe_path(face_path)
-    stream = bStream(path=safe_path)
-    stream.decoder = 'ISO-8859-1'
     metadata = DDSMetadata(
         width=width,
         height=height,
@@ -949,9 +927,7 @@ def _write_face_dds(face_path: str, width: int, height: int, eformat, face_bytes
         slicecount=0,
         normal=False,
     )
-    DDSUtils.GenerateAndWriteHeader(stream, metadata)
-    stream.write(face_bytes)
-    stream.close()
+    write_dds_payload(safe_path, metadata, face_bytes)
     return face_path
 
 
@@ -970,7 +946,7 @@ def _export_cubemap_face_dds_files(dds_path: str):
             face_bytes = faces[face_key]
             # DDSUtils writes A8R8G8B8 masks for R8G8B8A8_UNORM, so write BGRA bytes.
             if mask_kind == "rgba":
-                face_bytes = _swizzle_rgba_to_bgra(face_bytes)
+                face_bytes = swizzle_rgba8_bytes_to_bgra(face_bytes)
             w2_suffix = _CUBEMAP_FACE_W2_SUFFIX.get(face_key, face_key.lower())
             face_path = str(Path(dds_path).with_name(f"{stem}__{w2_suffix}.dds"))
             face_files[face_key] = _write_rgba8_face_dds(face_path, width, height, face_bytes)
