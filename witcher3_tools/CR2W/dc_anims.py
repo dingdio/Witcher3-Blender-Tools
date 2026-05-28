@@ -207,6 +207,47 @@ def _safe_track_name(skeleton_file, idx):
         )
     return idx
 
+
+def _skeleton_bone_names(skeleton_file):
+    if not skeleton_file:
+        return []
+    names = getattr(skeleton_file, "names", None)
+    if names is not None:
+        return list(names)
+    bones = getattr(skeleton_file, "bones", None)
+    if bones is None:
+        return []
+    result = []
+    for idx, bone in enumerate(bones):
+        name = getattr(bone, "name", None)
+        if name is None and isinstance(bone, dict):
+            name = bone.get("name")
+        result.append(str(name or idx))
+    return result
+
+
+def _skeleton_bone_count(skeleton_file, bone_names=None):
+    if not skeleton_file:
+        return 0
+    nb_bones = getattr(skeleton_file, "nbBones", None)
+    if nb_bones is not None:
+        try:
+            return int(nb_bones)
+        except Exception:
+            pass
+    if bone_names is None:
+        bone_names = _skeleton_bone_names(skeleton_file)
+    if bone_names:
+        return len(bone_names)
+    bones = getattr(skeleton_file, "bones", None)
+    return len(bones) if bones is not None else 0
+
+
+def _safe_bone_name(bone_names, idx, fallback=None):
+    if 0 <= idx < len(bone_names) and bone_names[idx]:
+        return bone_names[idx]
+    return idx if fallback is None else fallback
+
 def create_lipsync_anim(file, Skeleton_file):
     CHUNKS = file.CHUNKS.CHUNKS
     bones = []
@@ -556,13 +597,14 @@ def read_uncooked_anim_buffer(embedded_data, CAnimationBufferBitwiseCompressed, 
     else:
         consume_bone_count = len(bone_meta_items)
     append_bone_count = consume_bone_count
+    skeleton_bone_names = _skeleton_bone_names(Skeleton_file)
     if Skeleton_file:
-        append_bone_count = min(append_bone_count, int(getattr(Skeleton_file, "nbBones", 0) or 0))
+        append_bone_count = min(append_bone_count, _skeleton_bone_count(Skeleton_file, skeleton_bone_names))
 
     for idx in range(consume_bone_count):
         bone_meta = bone_meta_items[idx] if idx < len(bone_meta_items) else None
 
-        bone_name = Skeleton_file.names[idx] if Skeleton_file and idx < append_bone_count else f"Bone_{idx}"
+        bone_name = _safe_bone_name(skeleton_bone_names, idx, f"Bone_{idx}") if idx < append_bone_count else f"Bone_{idx}"
 
         # Get track metadata from chunk (WARNING: these are for COMPRESSED data!)
         pos_meta = getattr(bone_meta, 'position', None) if bone_meta is not None else None
@@ -1046,12 +1088,14 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
         log.warning('No bone data found in animation buffer')
         return w3_types.CAnimationBufferBitwiseCompressed([], [], duration=buffer_duration, numFrames=buffer_numFrames, dt=buffer_dt)
 
+    skeleton_bone_names = _skeleton_bone_names(Skeleton_file)
+    skeleton_bone_count = _skeleton_bone_count(Skeleton_file, skeleton_bone_names)
     for (idx, bone) in enumerate(bones_prop.More):
-        if Skeleton_file and idx == Skeleton_file.nbBones:
-            log.warning(f'Animation has more bone entiries than skeleton. Rig:{str(Skeleton_file.nbBones)}  Anim:{str(len(bones_prop.More))}')
+        if Skeleton_file and idx == skeleton_bone_count:
+            log.warning(f'Animation has more bone entiries than skeleton. Rig:{str(skeleton_bone_count)}  Anim:{str(len(bones_prop.More))}')
             break
         this_bone = w2AnimsFrames(idx,
-            BoneName = Skeleton_file.names[idx] if Skeleton_file else idx,
+            BoneName = _safe_bone_name(skeleton_bone_names, idx),
             position_dt = "",
             position_numFrames = "",
             positionFrames = [],
@@ -1086,7 +1130,7 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
         for _ in range(0, this_bone.position_numFrames):
             this_bone.positionFrames.append(CVector3D(f, compression).getList())
         # Diagnostic: log bones with multi-frame position data to spot decoding errors
-        bone_label = Skeleton_file.names[idx] if Skeleton_file else idx
+        bone_label = _safe_bone_name(skeleton_bone_names, idx)
         if this_bone.position_numFrames > 1 and this_bone.positionFrames:
             first_pos = this_bone.positionFrames[0]
             max_abs = max(abs(v) for v in first_pos) if first_pos else 0

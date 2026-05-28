@@ -95,9 +95,36 @@ class w2AnimsFrames(base_w3):
         self.rotationFramesQuat : Quaternion = rotationFramesQuat
 
 class CSkeleton(base_w3):
-    def __init__(self, bones=[], tracks=[]):
+    def __init__(self, bones=None, tracks=None):
+        bones = [] if bones is None else bones
+        tracks = [] if tracks is None else tracks
         self.bones = bones
         self.tracks = tracks
+        # Compatibility with older animation code paths that consumed w2rig.
+        self.nbBones = len(bones)
+        self.names = []
+        self.parentIdx = []
+        self.positions = []
+        self.rotations = []
+        self.scales = []
+        for idx, bone in enumerate(bones):
+            if isinstance(bone, dict):
+                name = bone.get("name")
+                parent_id = bone.get("parentId")
+                position = bone.get("co")
+                rotation = bone.get("ro_quat")
+                scale = bone.get("sc")
+            else:
+                name = getattr(bone, "name", None)
+                parent_id = getattr(bone, "parentId", None)
+                position = getattr(bone, "co", None)
+                rotation = getattr(bone, "ro_quat", None)
+                scale = getattr(bone, "sc", None)
+            self.names.append(str(name or idx))
+            self.parentIdx.append(parent_id if parent_id is not None else -1)
+            self.positions.append(position if position is not None and position is not False else [0.0, 0.0, 0.0])
+            self.rotations.append(rotation if rotation is not None and rotation is not False else Quaternion(0.0, 0.0, 0.0, 1.0))
+            self.scales.append(scale if scale is not None and scale is not False else [1.0, 1.0, 1.0])
 
 from .CR2W_types import PROPERTY, v_types
 
