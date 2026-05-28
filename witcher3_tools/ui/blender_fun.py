@@ -456,6 +456,269 @@ def _dds_top_mip_size(format_name: str, width: int, height: int) -> int:
     raise ValueError(f"Unsupported DDS format: {format_name}")
 
 
+def _eformat_from_format_name(format_name: str) -> EFormat:
+    format_map = {
+        "R8G8B8A8_UNORM": EFormat.R8G8B8A8_UNORM,
+        "BC1_UNORM": EFormat.BC1_UNORM,
+        "BC2_UNORM": EFormat.BC2_UNORM,
+        "BC3_UNORM": EFormat.BC3_UNORM,
+        "BC4_UNORM": EFormat.BC4_UNORM,
+        "BC5_UNORM": EFormat.BC5_UNORM,
+        "BC7_UNORM": EFormat.BC7_UNORM,
+    }
+    return format_map[format_name]
+
+
+def _mip_payload_size_for_eformat(eformat: EFormat, width: int, height: int) -> int:
+    width = max(1, int(width))
+    height = max(1, int(height))
+    if eformat == EFormat.R8G8B8A8_UNORM:
+        return width * height * 4
+
+    block_width = max(1, (width + 3) // 4)
+    block_height = max(1, (height + 3) // 4)
+    if eformat in (EFormat.BC1_UNORM, EFormat.BC4_UNORM):
+        return block_width * block_height * 8
+    if eformat in (EFormat.BC2_UNORM, EFormat.BC3_UNORM, EFormat.BC5_UNORM, EFormat.BC7_UNORM):
+        return block_width * block_height * 16
+    raise ValueError(f"Unsupported texture array format: {eformat}")
+
+
+def _split_texture_array_mip_major_payload(
+        payload: bytes,
+        width: int,
+        height: int,
+        mip_count: int,
+        slice_count: int,
+        eformat: EFormat,
+        ) -> list[bytes]:
+    """Split REDengine texture-array bytes into per-slice DDS payloads.
+
+    TextureCache stores arrays mip-major: mip 0 for every slice, then mip 1 for
+    every slice, and so on. Blender image nodes need ordinary 2D textures, so
+    rebuild each slice as its own full mip chain.
+    """
+    width = max(1, int(width))
+    height = max(1, int(height))
+    mip_count = max(1, int(mip_count))
+    slice_count = max(1, int(slice_count))
+
+    src = memoryview(payload)
+    cursor = 0
+    slices = [bytearray() for _ in range(slice_count)]
+    mip_width = width
+    mip_height = height
+
+    for _mip_index in range(mip_count):
+        mip_slice_size = _mip_payload_size_for_eformat(eformat, mip_width, mip_height)
+        mip_total_size = mip_slice_size * slice_count
+        if cursor + mip_total_size > len(src):
+            return []
+
+        for slice_index in range(slice_count):
+            start = cursor + (slice_index * mip_slice_size)
+            slices[slice_index].extend(src[start:start + mip_slice_size])
+
+        cursor += mip_total_size
+        mip_width = max(1, mip_width // 2)
+        mip_height = max(1, mip_height // 2)
+
+    if cursor != len(src):
+        return []
+    return [bytes(slice_payload) for slice_payload in slices]
+
+
+def _write_texture_array_slices(
+        texarray_path: str,
+        width: int,
+        height: int,
+        mip_count: int,
+        eformat: EFormat,
+        slice_payloads: list[bytes],
+        *,
+        force: bool = False,
+        ) -> list[str]:
+    import os
+
+    output_paths = []
+    metadata = DDSMetadata(
+        width=int(width),
+        height=int(height),
+        mipscount=int(mip_count),
+        format=eformat,
+    )
+
+    for slice_index, payload in enumerate(slice_payloads):
+        output_path = f"{texarray_path}.texture_{slice_index}.dds"
+        output_paths.append(output_path)
+        if os.path.exists(output_path) and not force and is_valid_dds_file(output_path):
+            continue
+        if eformat == EFormat.R8G8B8A8_UNORM:
+            payload = _swizzle_rgba8_bytes_to_bgra(payload)
+        _write_dds_payload(output_path, metadata, payload)
+
+    return output_paths
+
+
+def _extract_texture_cache_array_slices(
+        texarray_path: str,
+        texturecachekey: int,
+        fallback_slice_count: int,
+        *,
+        force: bool = False,
+        ) -> list[str]:
+    if not texturecachekey:
+        return []
+
+    for use_mods in (False, True):
+        try:
+            texture_manager = LoadTextureManager(loadmods=use_mods)
+            items = texture_manager.find_item_by_hash(texturecachekey)
+        except Exception:
+            log.debug("TextureCache lookup failed for texarray key %s", texturecachekey, exc_info=True)
+            continue
+
+        if not items:
+            continue
+
+        texture_item = items[-1]
+        slice_count = int(getattr(texture_item, "SliceCount", 0) or fallback_slice_count or 0)
+        if slice_count <= 0:
+            continue
+
+        try:
+            stream = bStream(data=b"")
+            stream.decoder = 'ISO-8859-1'
+            texture_item.Extract(stream)
+            dds_bytes = stream.fhandle.getvalue()
+            format_name, width, height, mip_count, data_offset = _dds_format_name_from_header(dds_bytes[:148])
+            eformat = _eformat_from_format_name(format_name)
+            slice_payloads = _split_texture_array_mip_major_payload(
+                dds_bytes[data_offset:],
+                width,
+                height,
+                mip_count,
+                slice_count,
+                eformat,
+            )
+            if slice_payloads:
+                return _write_texture_array_slices(
+                    texarray_path,
+                    width,
+                    height,
+                    mip_count,
+                    eformat,
+                    slice_payloads,
+                    force=force,
+                )
+        except Exception:
+            log.debug("Failed to extract texarray %s from TextureCache", texarray_path, exc_info=True)
+
+    return []
+
+
+def convert_texarray_to_dds(fdir: str, force: bool = False) -> list[str]:
+    """Convert a cooked CTextureArray into per-slice DDS files.
+
+    Returns paths named like `foo.texarray.texture_0.dds`. TextureCache is used
+    first for full resolution; the embedded resident mips are used as fallback.
+    """
+    import os
+
+    if not fdir or not os.path.isfile(fdir):
+        return []
+
+    with open(fdir, "rb") as handle:
+        file_bytes = handle.read()
+
+    with open(fdir, "rb") as handle:
+        texarray_file = getCR2W(handle)
+
+    br: bStream = bStream(data=file_bytes)
+    file_size = len(file_bytes)
+
+    for chunk in texarray_file.CHUNKS.CHUNKS:
+        if getattr(chunk, "Type", "") != "CTextureArray":
+            continue
+        if not getattr(chunk, "PROPS", None):
+            continue
+
+        buffer_start = getattr(chunk, 'texarray_buffer_start', None)
+        if buffer_start is None:
+            buffer_start = chunk.PROPS[-1].dataEnd
+        if buffer_start is None or buffer_start < 0 or buffer_start >= file_size:
+            continue
+
+        candidate_starts = [int(buffer_start)]
+        if getattr(chunk, 'texarray_buffer_start', None) is None:
+            candidate_starts.extend(int(buffer_start) + offset for offset in (2, 4, 8, 12, 16))
+
+        seen_starts = set()
+        for candidate_start in candidate_starts:
+            if candidate_start in seen_starts or candidate_start < 0 or candidate_start + 20 > file_size:
+                continue
+            seen_starts.add(candidate_start)
+
+            br.seek(candidate_start)
+            texturecachekey = br.readUInt32()
+            encodedformat = br.readUInt16()
+            width = br.readUInt16()
+            height = br.readUInt16()
+            slice_count = br.readUInt16()
+            mipmapscount = br.readUInt16()
+            residentmip = br.readUInt16()
+            filesize = br.readUInt32()
+            sentinel = br.readInt32()
+
+            data_pos = br.tell()
+            remaining = max(0, file_size - data_pos)
+            header_plausible = (
+                bool(width) and bool(height) and
+                1 <= int(slice_count or 0) <= 256 and
+                1 <= int(mipmapscount or 0) <= 32 and
+                0 <= int(residentmip or 0) <= int(mipmapscount or 0) and
+                0 <= int(filesize or 0) <= remaining and
+                sentinel == -1
+            )
+            if not header_plausible:
+                continue
+
+            converted_paths = _extract_texture_cache_array_slices(
+                fdir,
+                int(texturecachekey or 0),
+                int(slice_count or 0),
+                force=force,
+            )
+            if converted_paths:
+                return converted_paths
+
+            raw_bytes = br.read(filesize)
+            eformat = CommonImageTools.get_eformat_from_redengine_byte(encodedformat & 0xFF)
+            actual_width = max(1, int(width) >> int(residentmip or 0))
+            actual_height = max(1, int(height) >> int(residentmip or 0))
+            actual_mips = max(1, int(mipmapscount) - int(residentmip or 0))
+            slice_payloads = _split_texture_array_mip_major_payload(
+                raw_bytes,
+                actual_width,
+                actual_height,
+                actual_mips,
+                int(slice_count),
+                eformat,
+            )
+            if slice_payloads:
+                return _write_texture_array_slices(
+                    fdir,
+                    actual_width,
+                    actual_height,
+                    actual_mips,
+                    eformat,
+                    slice_payloads,
+                    force=force,
+                )
+
+    return []
+
+
 def is_valid_dds_file(dds_path: str) -> bool:
     import os
 

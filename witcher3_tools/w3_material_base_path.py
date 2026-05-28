@@ -101,7 +101,7 @@ def _build_inventory_entry(
         status = "unsupported_export_only"
         can_create = True
         if not message:
-            message = "Create as an export-only socket on a material-local group copy."
+            message = "No preview socket exists; create a local export socket so this param can be included as an instance override."
     else:
         status = "declared_only_info"
         can_create = False

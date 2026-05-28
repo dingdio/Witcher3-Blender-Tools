@@ -35,6 +35,7 @@ from .w3_material_reader import (
 )
 from . import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext, get_texture_path
 from .ui.blender_fun import (
+    convert_texarray_to_dds,
     convert_xbm_to_dds,
     load_image_with_dds_repair,
     load_w2cube_image,
@@ -1492,6 +1493,48 @@ def node_tree_inputs_new(node_ng, par_type, par_name ):
     else:
         node_ng.node_tree.inputs.new(par_type, par_name)
 
+
+def _resolve_texarray_source_path(texarray_value: str, uncook_path: str, repo_version: int) -> str:
+    texarray_value = str(texarray_value or "")
+    if not texarray_value:
+        return ""
+
+    if os.path.isabs(texarray_value):
+        return texarray_value
+
+    try:
+        resolved_path = repo_file(texarray_value, version=repo_version)
+        if resolved_path and os.path.exists(win_safe_path(resolved_path)):
+            return resolved_path
+    except Exception:
+        log.debug("Failed to resolve texarray through repo_file: %s", texarray_value, exc_info=True)
+
+    return os.path.join(uncook_path, texarray_value)
+
+
+def _legacy_texarray_slice_paths(texarray_value: str, uncook_path: str) -> list[str]:
+    tex_index = 0
+    paths = []
+    tex_ext = get_tex_ext(bpy.context)
+    texarray_path = os.path.abspath(uncook_path + os.sep + f"{texarray_value}.texture_{tex_index}{tex_ext}")
+    create_one = True
+
+    while create_one or Path(texarray_path).exists():
+        create_one = False
+        paths.append(texarray_path)
+        tex_index += 1
+        texarray_path = os.path.abspath(uncook_path + os.sep + f"{texarray_value}.texture_{tex_index}{tex_ext}")
+
+    return paths
+
+
+def _coerce_texarray_index(texarray_index) -> int:
+    try:
+        return max(0, int(float(texarray_index)))
+    except Exception:
+        return 0
+
+
 def create_node_for_param(
         mat: Material
         ,param: Element
@@ -1538,23 +1581,27 @@ def create_node_for_param(
         #create the tex array and link it
 
         texture_array = []
-        tex_index = 0
-        
-        texarray_path = os.path.abspath( uncook_path + os.sep + f"{par_value}.texture_{str(tex_index)}{get_tex_ext(bpy.context)}" )
-        create_one = True
-        
-        while create_one or Path(texarray_path).exists():
-            create_one = False
+        texture_paths = []
+
+        texarray_source_path = _resolve_texarray_source_path(par_value, uncook_path, _material_repo_version(mat))
+        if texarray_source_path and os.path.exists(win_safe_path(texarray_source_path)):
+            try:
+                texture_paths = convert_texarray_to_dds(texarray_source_path)
+            except Exception:
+                log.warning("Failed to convert texarray '%s'", texarray_source_path, exc_info=True)
+
+        if not texture_paths:
+            texture_paths = _legacy_texarray_slice_paths(par_value, uncook_path)
+
+        for tex_index, texarray_path in enumerate(texture_paths):
             sub_param = {
-                'name' : f"{par_value}.texture_{str(tex_index)}{get_tex_ext(bpy.context)}",
+                'name' : os.path.basename(texarray_path),
                 'value' :texarray_path
             }
             sub_node = create_node_texture(mat, sub_param, node_ng, y_loc, uncook_path, texarray_index)
             sub_node = fix_texture_node(par_name, sub_node)
             sub_node.location = (-800, y_loc)
             texture_array.append(sub_node)
-            tex_index+=1
-            texarray_path = os.path.abspath( uncook_path + os.sep + f"{par_value}.texture_{str(tex_index)}{get_tex_ext(bpy.context)}" )
 
         #full_path = os.path.join(get_uncook_path(bpy.context), par_value)
         #texarray_ = CR2W_reader.load_material(full_path)
@@ -1705,8 +1752,20 @@ def create_node_texture(
         node_uv.hide = True
         links.new(node_uv.outputs[0], node_mapping.inputs[0])
 
-    if par_value.endswith('.texarray'):
-        par_value = f"{par_value}.texture_{texarray_index}{get_tex_ext(bpy.context)}"
+    if par_value.lower().endswith('.texarray'):
+        texarray_source_value = par_value
+        selected_index = _coerce_texarray_index(texarray_index)
+        texarray_paths = []
+        texarray_source_path = _resolve_texarray_source_path(texarray_source_value, uncook_path, repo_version)
+        if texarray_source_path and os.path.exists(win_safe_path(texarray_source_path)):
+            try:
+                texarray_paths = convert_texarray_to_dds(texarray_source_path)
+            except Exception:
+                log.warning("Failed to convert texarray '%s'", texarray_source_path, exc_info=True)
+        if texarray_paths and selected_index < len(texarray_paths):
+            par_value = texarray_paths[selected_index]
+        else:
+            par_value = f"{texarray_source_value}.texture_{selected_index}{get_tex_ext(bpy.context)}"
     # We use os.path.abspath() to make sure the filepath has consistent slashes and backslashes,
     # so that we can compare image file paths to each other for duplicate checking.
     final_tex_path = par_value.replace(".xbm", get_tex_ext(bpy.context))

@@ -610,6 +610,7 @@ _TEXTURE_REPO_EXTENSIONS = {
     ".jpeg",
     ".bmp",
     ".w2cube",
+    ".texarray",
 }
 
 

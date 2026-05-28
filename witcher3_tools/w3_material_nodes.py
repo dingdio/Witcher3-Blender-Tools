@@ -1497,6 +1497,16 @@ class WITCH_OT_create_base_material_param(bpy.types.Operator):
     param_name: bpy.props.StringProperty()
     create_export_socket: bpy.props.BoolProperty(default=False)
 
+    @classmethod
+    def description(cls, context, properties):
+        if getattr(properties, "create_export_socket", False):
+            return (
+                "Create a helper node plus a local export socket. "
+                "Use this when the current shader group has no preview input for the param, "
+                "but the param should still be available as a material instance override."
+            )
+        return "Create a helper node and connect it to the matching shader group input."
+
     def execute(self, context):
         material = context.material
         if material is None or getattr(material, "witcher_props", None) is None:
