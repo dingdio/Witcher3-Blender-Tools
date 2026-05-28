@@ -10,6 +10,14 @@ from .w3_material import (
     get_active_witcher_group_node,
     node_tree_inputs_new,
 )
+from .w3_material_chain import (
+    CHAIN_NODE_ROW_Y,
+    chain_color_for_index,
+    chain_node_x,
+    chain_node_y,
+    chain_row_step_for_type,
+    coerce_source_index,
+)
 from .w3_material_constants import IGNORED_PARAMS, PARAM_ORDER
 from .w3_material_reader import (
     collect_material_chain,
@@ -60,6 +68,9 @@ def _build_inventory_entry(
         value: str,
         source_kind: str,
         source_path: str,
+        source_index: int = -1,
+        row_index: int = -1,
+        row_y: int = 0,
         node_ng: Optional[Node],
         material_ready: bool,
         is_declared_only: bool = False,
@@ -114,6 +125,9 @@ def _build_inventory_entry(
         "value": value if value is not None else "",
         "source_kind": source_kind or "",
         "source_path": source_path or "",
+        "source_index": int(source_index),
+        "row_index": int(row_index),
+        "row_y": int(row_y),
         "has_value": bool(has_value),
         "has_matching_socket": has_matching_socket,
         "is_linked": is_linked,
@@ -136,6 +150,15 @@ def build_material_inventory(material_path: str, material: Optional[Material] = 
     chain = chain_info.get("chain", [])
 
     graph_entry = next((entry for entry in chain if entry.get("chunk_type") == "CMaterialGraph"), None)
+    source_index_by_path = {
+        str(entry.get("normalized_path") or entry.get("path") or ""): idx
+        for idx, entry in enumerate(chain)
+    }
+
+    def source_index_for(entry) -> int:
+        key = str(entry.get("normalized_path") or entry.get("path") or "")
+        return source_index_by_path.get(key, -1)
+
     if graph_entry is not None:
         graph_params = read_local_material_params_from_bin(graph_entry.get("_material_bin"))
         for par_name, attrs in graph_params.items():
@@ -144,6 +167,7 @@ def build_material_inventory(material_path: str, material: Optional[Material] = 
                 "value": attrs[1],
                 "source_kind": "graph_default",
                 "source_path": graph_entry.get("path", ""),
+                "source_index": source_index_for(graph_entry),
             }
 
     instance_entries = [
@@ -158,6 +182,7 @@ def build_material_inventory(material_path: str, material: Optional[Material] = 
                 "value": attrs[1],
                 "source_kind": "instance",
                 "source_path": entry.get("path", ""),
+                "source_index": source_index_for(entry),
             }
 
     declared_graph_params = read_declared_graph_params(resolved_graph or material_path, version=material_version) or set()
@@ -171,12 +196,14 @@ def build_material_inventory(material_path: str, material: Optional[Material] = 
                 value=entry.get("value", ""),
                 source_kind=entry.get("source_kind", ""),
                 source_path=entry.get("source_path", ""),
+                source_index=coerce_source_index(entry.get("source_index")),
                 node_ng=node_ng,
                 material_ready=material_ready,
             )
         )
 
     declared_only_names = _ordered_param_names(set(declared_graph_params) - set(effective_params.keys()))
+    declared_source_index = source_index_for(graph_entry) if graph_entry is not None else -1
     for par_name in declared_only_names:
         inventory.append(
             _build_inventory_entry(
@@ -185,12 +212,19 @@ def build_material_inventory(material_path: str, material: Optional[Material] = 
                 value="",
                 source_kind="declared_only",
                 source_path=resolved_graph or material_path,
+                source_index=declared_source_index,
                 node_ng=node_ng,
                 material_ready=material_ready,
                 is_declared_only=True,
                 has_value=False,
             )
         )
+
+    row_y = CHAIN_NODE_ROW_Y
+    for row_index, item in enumerate(inventory):
+        item["row_index"] = row_index
+        item["row_y"] = row_y
+        row_y -= chain_row_step_for_type(item.get("param_type", ""))
 
     counts = {
         "concrete": sum(1 for item in inventory if not item["is_declared_only"]),
@@ -216,6 +250,7 @@ def build_material_inventory(material_path: str, material: Optional[Material] = 
                 "path": entry.get("path", ""),
                 "chunk_type": entry.get("chunk_type", ""),
                 "source_kind": entry.get("source_kind", ""),
+                "source_index": source_index_for(entry),
             }
             for entry in chain
         ],
@@ -245,6 +280,9 @@ def refresh_base_material_entry_state(material: Optional[Material], entry: Dict[
         value=str(entry.get("value", "") or ""),
         source_kind=str(entry.get("source_kind", "") or ""),
         source_path=str(entry.get("source_path", "") or ""),
+        source_index=coerce_source_index(entry.get("source_index")),
+        row_index=coerce_source_index(entry.get("row_index")),
+        row_y=coerce_source_index(entry.get("row_y")),
         node_ng=node_ng,
         material_ready=bool(node_ng),
         is_declared_only=bool(entry.get("is_declared_only", False)),
@@ -252,7 +290,29 @@ def refresh_base_material_entry_state(material: Optional[Material], entry: Dict[
     )
 
 
-def tag_base_material_helper_node(node, param_name: str, source_path: str = "", source_kind: str = ""):
+def _apply_chain_color(node, source_index: int) -> None:
+    color = chain_color_for_index(source_index)
+    if not node or color is None:
+        return
+    try:
+        if getattr(node, "use_custom_color", False) and node.get("witcher_material_chain_source_index") is not None:
+            return
+        node.use_custom_color = True
+        node.color = color
+        node["witcher_material_chain_source_index"] = int(source_index)
+    except Exception:
+        pass
+
+
+def tag_base_material_helper_node(
+        node,
+        param_name: str,
+        source_path: str = "",
+        source_kind: str = "",
+        source_index: int = -1,
+        row_index: int = -1,
+        row_y: int = -1,
+        ):
     if not node:
         return
     try:
@@ -260,6 +320,13 @@ def tag_base_material_helper_node(node, param_name: str, source_path: str = "", 
         node["witcher_base_material_param"] = param_name
         node["witcher_base_material_source"] = source_path or ""
         node["witcher_base_material_source_kind"] = source_kind or ""
+        node["witcher_material_source_path"] = source_path or ""
+        node["witcher_material_source_kind"] = source_kind or ""
+        node["witcher_material_source_param"] = param_name or ""
+        node["witcher_material_source_index"] = int(source_index)
+        node["witcher_material_source_row_index"] = int(row_index)
+        node["witcher_material_source_row_y"] = int(row_y)
+        _apply_chain_color(node, source_index)
     except Exception:
         pass
 
@@ -354,6 +421,30 @@ def _next_helper_y(mat: Material) -> int:
     return min_y - 170
 
 
+def _next_chain_helper_y(mat: Material, source_index: int, param_type: str) -> int:
+    try:
+        source_index = int(source_index)
+    except Exception:
+        return _next_helper_y(mat)
+    if source_index < 0:
+        return _next_helper_y(mat)
+
+    chain_nodes = []
+    for node in getattr(mat.node_tree, "nodes", []) or []:
+        try:
+            if int(node.get("witcher_material_source_index", -1)) != source_index:
+                continue
+            chain_nodes.append(node)
+        except Exception:
+            continue
+
+    if not chain_nodes:
+        return 1000 - (source_index * 40)
+
+    min_y = min(int(getattr(node.location, "y", node.location[1])) for node in chain_nodes)
+    return min_y - _param_step_for_type(param_type)
+
+
 def _ordered_group_inputs(node_ng: Optional[Node]) -> List:
     if node_ng is None:
         return []
@@ -421,7 +512,18 @@ def _desired_helper_y(
         node_ng: Optional[Node],
         param_name: str,
         param_type: str,
+        row_index: int = -1,
+        row_y: Optional[int] = None,
         ) -> int:
+    if row_y is not None:
+        try:
+            return int(row_y)
+        except Exception:
+            pass
+    row_index = coerce_source_index(row_index)
+    if row_index >= 0:
+        return chain_node_y(row_index)
+
     layout_inputs = _layout_group_inputs(node_ng, param_name)
     if not layout_inputs:
         return _next_helper_y(material)
@@ -479,7 +581,34 @@ def _desired_helper_y(
     return y_loc
 
 
-def _desired_helper_x(node_ng: Optional[Node], param_name: str) -> int:
+def _source_depth_for_entry(entry: Dict[str, Any]) -> int:
+    source_index = coerce_source_index(entry.get("source_index"))
+    return source_index if source_index >= 0 else -1
+
+
+def _row_index_for_entry(entry: Dict[str, Any]) -> int:
+    row_index = coerce_source_index(entry.get("row_index"))
+    return row_index if row_index >= 0 else -1
+
+
+def _row_y_for_entry(entry: Dict[str, Any]) -> Optional[int]:
+    if "row_y" not in entry:
+        return None
+    try:
+        return int(entry.get("row_y"))
+    except Exception:
+        return None
+
+
+def _desired_helper_x(node_ng: Optional[Node], param_name: str, source_index: int = -1) -> int:
+    try:
+        depth = int(source_index)
+    except Exception:
+        depth = -1
+    if depth >= 0:
+        node_group_x = 500 if node_ng is None else int(getattr(node_ng.location, "x", node_ng.location[0]))
+        return chain_node_x(node_group_x, depth)
+
     layout_inputs = _layout_group_inputs(node_ng, param_name)
     if layout_inputs:
         target_index = next((
@@ -556,17 +685,26 @@ def create_base_material_helper(
     if input_pin is not None:
         for helper_node in _base_material_helper_nodes(material, param_name=par_name):
             if _relink_base_material_helper_node(material, node_ng, helper_node, input_pin, par_type):
+                source_index = _source_depth_for_entry(entry)
+                row_index = _row_index_for_entry(entry)
+                row_y = _row_y_for_entry(entry)
                 tag_base_material_helper_node(
                     helper_node,
                     par_name,
                     source_path=str(entry.get("source_path", "") or ""),
                     source_kind=str(entry.get("source_kind", "") or ""),
+                    source_index=source_index,
+                    row_index=row_index,
+                    row_y=row_y if row_y is not None else -1,
                 )
                 return node_ng, helper_node, "reused"
 
+    source_index = _source_depth_for_entry(entry)
+    row_index = _row_index_for_entry(entry)
+    row_y = _row_y_for_entry(entry)
     if y_loc is None:
-        y_loc = _desired_helper_y(material, node_ng, par_name, par_type)
-    desired_x = _desired_helper_x(node_ng, par_name)
+        y_loc = _desired_helper_y(material, node_ng, par_name, par_type, row_index, row_y)
+    desired_x = _desired_helper_x(node_ng, par_name, source_index)
     existing_node_ptrs = {node.as_pointer() for node in material.node_tree.nodes}
 
     param = build_param_element(
@@ -574,6 +712,11 @@ def create_base_material_helper(
         par_type,
         par_value,
         witcher_require_socket="true",
+        witcher_source_path=str(entry.get("source_path", "") or ""),
+        witcher_source_kind=str(entry.get("source_kind", "") or ""),
+        witcher_source_index=source_index,
+        witcher_source_row_index=row_index,
+        witcher_source_row_y=row_y if row_y is not None else "",
     )
     node = create_node_for_param(material, param, node_ng, uncook_path, y_loc)
     if node is None:
@@ -591,5 +734,8 @@ def create_base_material_helper(
         par_name,
         source_path=str(entry.get("source_path", "") or ""),
         source_kind=str(entry.get("source_kind", "") or ""),
+        source_index=source_index,
+        row_index=row_index,
+        row_y=row_y if row_y is not None else -1,
     )
     return node_ng, node, "created"

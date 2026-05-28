@@ -481,7 +481,7 @@ def Build_CMaterialInstance_Chunk(cr2w, inst):
         cMaterialInstance.InstanceParameters = CArray(cr2w, CVariantSizeNameType) # CREATE ARRAY
         
         for param in input_props:
-            if param['type'] == 'TEX_IMAGE' or  param['type'] == "handle:CTextureArray":
+            if param['type'] == 'TEX_IMAGE' or  param['type'] == "handle:CTextureArray" or param['type'] == "handle:CCubeTexture":
                 _className = 'CBitmapTexture'
                 _theType = 'handle:ITexture'
                 _texPath = param['value'].rsplit('.', 1)[0] + '.xbm'
@@ -489,6 +489,10 @@ def Build_CMaterialInstance_Chunk(cr2w, inst):
                     _className = 'CTextureArray'
                     _theType = 'handle:CTextureArray'
                     _texPath = re.sub(r'(.texarray).*', r'\1', param['value'])
+                elif param['type'] == "handle:CCubeTexture":
+                    _className = 'CCubeTexture'
+                    _theType = 'handle:CCubeTexture'
+                    _texPath = param['value'].rsplit('.', 1)[0] + '.w2cube'
                 
                 new_param = CVariantSizeNameType(cr2w)
                 handle = HANDLE(CR2WFILE=cr2w,

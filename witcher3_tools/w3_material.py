@@ -16,6 +16,7 @@ from xml.etree import ElementTree
 Element = ElementTree.Element
 
 from .w3_material_constants import *
+from .w3_material_chain import chain_color_for_index, coerce_source_index
 from .w3_vector_param import (
     VECTOR_PARAM_KIND,
     VECTOR_SOURCE_XYZ,
@@ -27,9 +28,11 @@ from .w3_vector_param import (
 )
 from .w3_material_reader import (
     _read_material_params_from_bin,
+    collect_material_chain,
     normalize_depot_path,
     prune_unsupported_instance_params,
     read_instance_params,
+    read_local_material_params_from_bin,
     read_material_params_from_path,
     resolve_w2mg,
 )
@@ -82,6 +85,51 @@ def _sanitize_xml_attr(value, fallback: str = "") -> str:
     return clean if clean else fallback
 
 
+def _repo_path_from_material_file(file_path: str) -> str:
+    file_path = win_unprefix_path(str(file_path or ""))
+    if not file_path:
+        return ""
+    if not os.path.isabs(file_path):
+        return normalize_depot_path(file_path)
+
+    try:
+        abs_path = os.path.normcase(os.path.normpath(os.path.realpath(file_path)))
+        candidate_roots = [
+            get_texture_path(bpy.context),
+            get_uncook_path(bpy.context),
+            get_modded_texture_path(bpy.context),
+            get_mod_directory(bpy.context),
+        ]
+        for root in candidate_roots:
+            if not root:
+                continue
+            root_path = os.path.normcase(os.path.normpath(os.path.realpath(win_unprefix_path(root))))
+            if abs_path == root_path:
+                return ""
+            root_prefix = root_path + os.sep
+            if abs_path.startswith(root_prefix):
+                rel_path = os.path.relpath(file_path, root)
+                return normalize_depot_path(rel_path)
+    except Exception:
+        pass
+    return ""
+
+
+def _material_bin_source_repo_path(mat_bin) -> str:
+    depot_path = str(getattr(mat_bin, "DepotPath", "") or "")
+    if depot_path.lower().endswith((".w2mi", ".w2mg")):
+        return normalize_depot_path(depot_path)
+
+    source_file = (
+        getattr(mat_bin, "_W_CLASS__CR2WFILE", None)
+        or getattr(mat_bin, "_CLASS__CR2WFILE", None)
+    )
+    file_name = str(getattr(source_file, "fileName", "") or "")
+    if file_name.lower().endswith((".w2mi", ".w2mg")):
+        return _repo_path_from_material_file(file_name)
+    return ""
+
+
 def _apply_image_texture_metadata(image: Optional[Image], source_path: str) -> None:
     if image is None or not source_path:
         return
@@ -124,20 +172,109 @@ def hide_unused_sockets(node, inp=True, out=True):
 def ensure_node_group(ng_name, resource_path=RES_PATH):
     """Check if a nodegroup exists, and if not, append it from the addon's resource file."""
 
+    resource_path = resource_path or RES_PATH
+    ng_name = _find_available_node_group_name(ng_name, resource_path) or ng_name
     if ng_name not in bpy.data.node_groups:
         with bpy.data.libraries.load(resource_path) as (data_from, data_to):
             for ng in data_from.node_groups:
                 if ng == ng_name:
                     data_to.node_groups.append(ng)
 
-    ng = bpy.data.node_groups[ng_name]
+    ng = bpy.data.node_groups.get(ng_name)
+    if ng is None:
+        raise KeyError(f"Node group {ng_name} not found in {resource_path}")
     ng.use_fake_user = False
 
     return ng
 
 
 MATERIAL_SETUP_VERSION = 4
-_BASE_PATH_NODE_GROUP_CACHE: Dict[Tuple[str, str], Dict[str, str]] = {}
+_BASE_PATH_NODE_GROUP_CACHE: Dict[Tuple[object, ...], Dict[str, str]] = {}
+_RESOURCE_NODE_GROUP_CACHE: Dict[str, Tuple[Optional[float], Set[str]]] = {}
+
+
+def _resource_cache_key(resource_path: str) -> str:
+    try:
+        return os.path.normcase(os.path.normpath(os.path.realpath(resource_path or RES_PATH)))
+    except Exception:
+        return str(resource_path or RES_PATH)
+
+
+def _resource_mtime(resource_path: str) -> Optional[float]:
+    try:
+        return os.path.getmtime(resource_path or RES_PATH)
+    except OSError:
+        return None
+
+
+def _resource_node_group_names(resource_path: str = RES_PATH) -> Set[str]:
+    resource_path = resource_path or RES_PATH
+    cache_key = _resource_cache_key(resource_path)
+    mtime = _resource_mtime(resource_path)
+    cached = _RESOURCE_NODE_GROUP_CACHE.get(cache_key)
+    if cached and cached[0] == mtime:
+        return set(cached[1])
+
+    node_group_names: Set[str] = set()
+    try:
+        with bpy.data.libraries.load(resource_path) as (data_from, _data_to):
+            node_group_names = set(data_from.node_groups or [])
+    except Exception:
+        log.exception("Failed to inspect material node groups from %s", resource_path)
+
+    _RESOURCE_NODE_GROUP_CACHE[cache_key] = (mtime, node_group_names)
+    return set(node_group_names)
+
+
+def _find_available_node_group_name(ng_name: str, resource_path: str = RES_PATH) -> str:
+    ng_name = str(ng_name or "")
+    if not ng_name:
+        return ""
+
+    if bpy.data.node_groups.get(ng_name) is not None:
+        return ng_name
+
+    target_lower = ng_name.lower()
+    try:
+        loaded_names = list(bpy.data.node_groups.keys())
+    except Exception:
+        loaded_names = [node_group.name for node_group in bpy.data.node_groups]
+    for loaded_name in loaded_names:
+        if str(loaded_name).lower() == target_lower:
+            return str(loaded_name)
+
+    resource_names = _resource_node_group_names(resource_path)
+    if ng_name in resource_names:
+        return ng_name
+    for resource_name in sorted(resource_names):
+        if resource_name.lower() == target_lower:
+            return resource_name
+    return ""
+
+
+def resolve_material_node_group_name(
+        shader_type: str,
+        shader_mapping: Dict[str, str],
+        fallback_ng_name: str,
+        resource_path: str = RES_PATH,
+        ) -> str:
+    exact_ng_name = _find_available_node_group_name(shader_type, resource_path)
+    if exact_ng_name:
+        return exact_ng_name
+    return shader_mapping.get(shader_type, fallback_ng_name)
+
+
+def _node_group_family_name(ng_name: str) -> str:
+    ng_name = str(ng_name or "")
+    if len(ng_name) > 4 and ng_name[-4] == "." and ng_name[-3:].isdigit():
+        return ng_name[:-4]
+    return ng_name
+
+
+def _node_group_names_match(actual_name: str, expected_name: str) -> bool:
+    if not expected_name:
+        return True
+    return _node_group_family_name(actual_name).lower() == _node_group_family_name(expected_name).lower()
 
 
 def is_witcher2_material(material: Material) -> bool:
@@ -290,11 +427,18 @@ def get_recommended_node_group_for_base_path(material: Material, material_path: 
     normalized_path = normalize_depot_path(material_path)
     shader_mapping, fallback_ng_name, resource_path = get_shader_resources_for_material(material)
     material_version = 'witcher2' if is_witcher2_material(material) else 'witcher3'
-    cache_key = (material_version, normalized_path)
+    resource_stamp = _resource_mtime(resource_path)
+    cache_key = (material_version, normalized_path, resource_stamp)
 
     if cache_key in _BASE_PATH_NODE_GROUP_CACHE:
         cached = dict(_BASE_PATH_NODE_GROUP_CACHE[cache_key])
         cached["requested_path"] = material_path or ""
+        cached["node_group_name"] = resolve_material_node_group_name(
+            cached.get("shader_type", ""),
+            shader_mapping,
+            fallback_ng_name,
+            cached.get("resource_path") or resource_path,
+        )
         return cached
 
     result = {
@@ -325,7 +469,12 @@ def get_recommended_node_group_for_base_path(material: Material, material_path: 
 
     result["resolved_path"] = resolved_path
     result["shader_type"] = shader_type
-    result["node_group_name"] = shader_mapping.get(shader_type, fallback_ng_name)
+    result["node_group_name"] = resolve_material_node_group_name(
+        shader_type,
+        shader_mapping,
+        fallback_ng_name,
+        resource_path,
+    )
 
     _BASE_PATH_NODE_GROUP_CACHE[cache_key] = dict(result)
     return result
@@ -587,6 +736,7 @@ def create_instance_group(  material,
 def xml_data_from_CR2W(mat_bin, name = None):
     is_w2_material = _material_bin_is_witcher2(mat_bin)
     default_base = DEFAULT_W2_MATERIAL_BASE if is_w2_material else DEFAULT_W3_MATERIAL_BASE
+    source_repo_path = _material_bin_source_repo_path(mat_bin)
     base_var = mat_bin.GetVariableByName('baseMaterial')
     if base_var:
         handle = base_var.Handles[0] if getattr(base_var, "Handles", None) else None
@@ -613,6 +763,8 @@ def xml_data_from_CR2W(mat_bin, name = None):
     new_xml.set('name', _sanitize_xml_attr(name if name else Path(filePath).stem, "material"))
     new_xml.set('local', "true")
     new_xml.set('base', _sanitize_xml_attr(mat_base, default_base))
+    if source_repo_path:
+        new_xml.set('source_path', _sanitize_xml_attr(source_repo_path))
 
     w2mi_params = {}
     read_instance_params(mat_bin, w2mi_params)
@@ -622,6 +774,9 @@ def xml_data_from_CR2W(mat_bin, name = None):
             ,name = name 
             ,type = attrs[0]
             ,value = attrs[1]
+            ,witcher_source_path = source_repo_path
+            ,witcher_source_kind = "instance" if source_repo_path.lower().endswith(".w2mi") else "graph_default"
+            ,witcher_source_index = 0 if source_repo_path else -1
         )
     prune_unsupported_instance_params(new_xml, mat_base, version=_material_bin_cr2w_version(mat_bin))
     return new_xml
@@ -748,6 +903,7 @@ def setup_w3_material(
     shader_type = mat_base.split("\\")[-1][:-5]	# The .w2mg or .w2mi file, minus the extension.
     resolved_mat_base = mat_base
     inherited_params: Dict[str, tuple[str, str]] = {}
+    inherited_param_sources: Dict[str, Dict[str, object]] = {}
 
     nodes = material.node_tree.nodes
     links = material.node_tree.links
@@ -760,7 +916,7 @@ def setup_w3_material(
         fallback_shader_type = guess_shader_type(shader_type)
         w2mi_path = xml_data.get('base')
         #w2mi_tex_params = read_2wmi_params(material, uncook_path, w2mi_path, shader_type)
-        inherited_params = read_2wmi_params(w2mi_path, version=material_version)
+        inherited_params, inherited_param_sources = read_material_params_with_sources(w2mi_path, version=material_version)
 
         # Try to resolve the actual .w2mg base shader from the w2mi chain
         resolved_w2mg = resolve_w2mg(w2mi_path, version=material_version)
@@ -772,18 +928,25 @@ def setup_w3_material(
             shader_type = fallback_shader_type
 
     elif mat_base.endswith(".w2mg"):
-        inherited_params = read_material_params_from_path(mat_base, version=material_version)
+        inherited_params, inherited_param_sources = read_material_params_with_sources(mat_base, version=material_version)
 
     if is_witcher2_material(material):
         shader_type = resolve_witcher2_shader_type(resolved_mat_base, shader_type)
 
     prune_unsupported_instance_params(xml_data, resolved_mat_base, params=params, version=material_version)
     resolve_seconds = time.perf_counter() - resolve_started
+    shader_mapping, fallback_ng_name, resource_path = get_shader_resources_for_material(material)
+    expected_ng_name = resolve_material_node_group_name(
+        shader_type,
+        shader_mapping,
+        fallback_ng_name,
+        resource_path,
+    )
 
     # Checking if this material was already imported by comparing some custom properties
     # that we create on imported materials.
     duplicate_started = time.perf_counter()
-    existing_mat = find_material(mat_base, params)
+    existing_mat = find_material(mat_base, params, expected_ng_name=expected_ng_name)
     if existing_mat:
         if overwrite_existing_enabled():
             repair_broken_dds_images_in_material(existing_mat, allow_dds_repair=True)
@@ -912,7 +1075,7 @@ def setup_w3_material(
         #links nodes to created output
         #! Missing params will be created by this function
         mat_load_params_into_nodes(material, ordered_params, nodegroup_node, uncook_path)
-        apply_shader_default_overrides(material, nodegroup_node, inherited_params, uncook_path)
+        apply_shader_default_overrides(material, nodegroup_node, inherited_params, uncook_path, inherited_param_sources)
         if shader_type == 'pbr_eye':
             setup_eye_reflection_nodes(material, nodegroup_node, nodes, links)
         hide_unused_sockets(nodegroup_node)
@@ -941,7 +1104,7 @@ def setup_w3_material(
         )
     return material
 
-def find_material(mat_base, params):
+def find_material(mat_base, params, expected_ng_name: str = ""):
     """Find a material based on the Witcher 3 shader type and shader parameters,
     which we store in custom properties on import.
     This is useful for checking whether a material was already imported.
@@ -953,6 +1116,12 @@ def find_material(mat_base, params):
             mat_base == m['witcher3_mat_base'] and \
             params == m['witcher3_mat_params'].to_dict()
         ):
+            if expected_ng_name:
+                active_group = get_active_witcher_group_node(m)
+                active_tree = getattr(active_group, "node_tree", None) if active_group else None
+                active_ng_name = str(getattr(active_tree, "name", "") or "")
+                if not _node_group_names_match(active_ng_name, expected_ng_name):
+                    continue
             # A material with the same parameters is already imported,
             return m
 
@@ -971,6 +1140,40 @@ def read_2wmi_params(
 
     return read_material_params_from_path(w2mi_path, version=version)
 
+
+def read_material_params_with_sources(
+        material_path: str,
+        version: int = 999,
+        ) -> Tuple[Dict[str, tuple[str, str]], Dict[str, Dict[str, object]]]:
+    chain_info = collect_material_chain(material_path, version=version)
+    chain = chain_info.get("chain", []) or []
+    params: Dict[str, tuple[str, str]] = {}
+    sources: Dict[str, Dict[str, object]] = {}
+    source_index_by_entry = {id(entry): idx for idx, entry in enumerate(chain)}
+
+    def remember(entry, par_name: str, attrs, source_kind: str) -> None:
+        params[par_name] = attrs
+        sources[par_name] = {
+            "source_kind": source_kind,
+            "source_path": entry.get("path", ""),
+            "source_index": source_index_by_entry.get(id(entry), -1),
+            "chunk_type": entry.get("chunk_type", ""),
+        }
+
+    graph_entry = next((entry for entry in chain if entry.get("chunk_type") == "CMaterialGraph"), None)
+    if graph_entry is not None:
+        for par_name, attrs in read_local_material_params_from_bin(graph_entry.get("_material_bin")).items():
+            remember(graph_entry, par_name, attrs, "graph_default")
+
+    for entry in reversed([entry for entry in chain if entry.get("chunk_type") == "CMaterialInstance"]):
+        for par_name, attrs in read_local_material_params_from_bin(entry.get("_material_bin")).items():
+            remember(entry, par_name, attrs, "instance")
+
+    if not params:
+        params = read_material_params_from_path(material_path, version=version)
+    return params, sources
+
+
 def guess_texture_type_by_link(mat: Material, img_node):
         socket_name = img_node.outputs[0].links[0].to_socket.name
         if socket_name == 'Base Color':
@@ -986,12 +1189,16 @@ def create_param(
             ,name: str
             ,type: str
             ,value: str
+            ,**extra_attrs
         ) -> Element:
     """Create a parameter sub-Element in the xml_data Element."""
     new_param = ElementTree.SubElement(xml_data, 'param')
     new_param.set('name', _sanitize_xml_attr(name, "param"))
     new_param.set('type', _sanitize_xml_attr(type, "Float"))
     new_param.set('value', _sanitize_xml_attr(value))
+    for attr_name, attr_value in extra_attrs.items():
+        if attr_value is not None:
+            new_param.set(attr_name, str(attr_value))
 
     return new_param
 
@@ -1051,10 +1258,9 @@ def guess_shader_type(shader_type: str) -> str:
 def init_material_nodes(material: Material, shader_type: str, clear:bool = True):
     """Wipe all nodes, then create a node group node and return it."""
     shader_mapping, fallback_ng_name, resource_path = get_shader_resources_for_material(material)
-    ng_name = shader_mapping.get(shader_type)
-    if not ng_name:
+    ng_name = resolve_material_node_group_name(shader_type, shader_mapping, fallback_ng_name, resource_path)
+    if ng_name == fallback_ng_name and shader_type not in shader_mapping and shader_type != fallback_ng_name:
         log.debug(f"Unknown shader type: {shader_type} (Fell back to default)")
-        ng_name = fallback_ng_name
     ng = ensure_node_group(ng_name, resource_path=resource_path)			# Nodegroup node tree  (bpy.types.ShaderNodeTree)
     node_ng = None							# Nodegroup group node (bpy.types.ShaderNodeGroup)
     assert ng, f"Node group {ng_name} not found. Resources didn't append correctly?"
@@ -1254,9 +1460,49 @@ def build_param_element(name: str, param_type: str, value: str, **extra_attrs) -
     return param
 
 
+def _tag_created_material_source_nodes(
+        mat: Material,
+        existing_node_ptrs: Set[int],
+        param: Element,
+        param_name: str,
+        param_type: str,
+        ) -> None:
+    source_path = str(param.get("witcher_source_path") or "")
+    source_kind = str(param.get("witcher_source_kind") or "")
+    source_index = coerce_source_index(param.get("witcher_source_index"))
+    source_row_index = coerce_source_index(param.get("witcher_source_row_index"))
+    source_row_y = coerce_source_index(param.get("witcher_source_row_y"))
+    source_color = chain_color_for_index(source_index)
+    if not source_path and source_index < 0:
+        return
+
+    for created_node in getattr(getattr(mat, "node_tree", None), "nodes", []) or []:
+        try:
+            if created_node.as_pointer() in existing_node_ptrs:
+                continue
+            created_node["witcher_material_source_path"] = source_path
+            created_node["witcher_material_source_kind"] = source_kind
+            created_node["witcher_material_source_param"] = param_name or ""
+            created_node["witcher_material_source_type"] = param_type or ""
+            created_node["witcher_material_source_index"] = int(source_index)
+            created_node["witcher_material_source_row_index"] = int(source_row_index)
+            created_node["witcher_material_source_row_y"] = int(source_row_y)
+            if source_path:
+                created_node["witcher_base_material_source"] = source_path
+            if source_kind:
+                created_node["witcher_base_material_source_kind"] = source_kind
+            if source_color is not None:
+                created_node.use_custom_color = True
+                created_node.color = source_color
+                created_node["witcher_material_chain_source_index"] = int(source_index)
+        except Exception:
+            continue
+
+
 def build_shader_default_override_params(
         node_ng: Node,
-        inherited_params: Dict[str, tuple[str, str]]
+        inherited_params: Dict[str, tuple[str, str]],
+        inherited_param_sources: Optional[Dict[str, Dict[str, object]]] = None,
         ) -> List[Element]:
     if not inherited_params:
         return []
@@ -1272,6 +1518,7 @@ def build_shader_default_override_params(
         if not _shader_default_differs(node_ng, input_pin, par_type, par_value):
             continue
 
+        source_info = (inherited_param_sources or {}).get(par_name, {})
         shader_default_params.append(
             build_param_element(
                 input_pin.name,
@@ -1280,6 +1527,11 @@ def build_shader_default_override_params(
                 witcher_shader_default="true",
                 witcher_require_socket="true",
                 witcher_source_name=par_name,
+                witcher_source_path=source_info.get("source_path", ""),
+                witcher_source_kind=source_info.get("source_kind", ""),
+                witcher_source_index=source_info.get("source_index", -1),
+                witcher_source_row_index=source_info.get("row_index", -1),
+                witcher_source_row_y=source_info.get("row_y", ""),
             )
         )
 
@@ -1309,9 +1561,10 @@ def apply_shader_default_overrides(
         mat: Material,
         node_ng: Node,
         inherited_params: Dict[str, tuple[str, str]],
-        uncook_path: str
+        uncook_path: str,
+        inherited_param_sources: Optional[Dict[str, Dict[str, object]]] = None,
         ):
-    shader_default_params = build_shader_default_override_params(node_ng, inherited_params)
+    shader_default_params = build_shader_default_override_params(node_ng, inherited_params, inherited_param_sources)
     if not shader_default_params:
         return
 
@@ -1375,6 +1628,10 @@ def mat_load_params_into_nodes(
             y_loc -= 170
         if param.get("witcher_include"):
             node.witcher_include = True
+            try:
+                node.witcher_export = True
+            except Exception:
+                pass
 
 
 def _is_uv_mapping_vector_param(param_name: str) -> bool:
@@ -1547,6 +1804,10 @@ def create_node_for_param(
     ) -> bpy.types.Node:
     """Create and hook up the nodes for a Witcher 3 shader parameter to the primary nodegroup."""
     links = mat.node_tree.links
+    existing_node_ptrs = {
+        node.as_pointer()
+        for node in getattr(mat.node_tree, "nodes", []) or []
+    }
 
     par_name = param.get('name')
     par_type = param.get('type')
@@ -1612,6 +1873,13 @@ def create_node_for_param(
         TexArray_ng = mat.node_tree.nodes.new(type='ShaderNodeGroup')
         TexArray_ng.node_tree = tex_array_group
         TexArray_ng.location = (200, 0)
+        texarray_repo_path = normalize_depot_path(par_value)
+        TexArray_ng["witcher_texarray_source_path"] = texarray_repo_path
+        TexArray_ng["witcher_material_param_type"] = "handle:CTextureArray"
+        try:
+            TexArray_ng.witcher_texarray_source_path = texarray_repo_path
+        except Exception:
+            pass
         
         for idx, sub_n in enumerate(texture_array):
             links.new(sub_n.outputs[0], TexArray_ng.inputs[idx])
@@ -1676,6 +1944,7 @@ def create_node_for_param(
             reconcile_uv_mapping_vector_links(mat)
     except Exception:
         pass
+    _tag_created_material_source_nodes(mat, existing_node_ptrs, param, par_name, par_type)
     return node
 
 
@@ -1702,6 +1971,7 @@ def create_node_texture(
     par_name = param.get('name')
     par_value = param.get('value')
     repo_version = _material_repo_version(mat)
+    texarray_source_repo_path = ""
 
     node = nodes.new(type="ShaderNodeTexImage")
     node.width = 300
@@ -1756,6 +2026,7 @@ def create_node_texture(
 
     if par_value.lower().endswith('.texarray'):
         texarray_source_value = par_value
+        texarray_source_repo_path = normalize_depot_path(texarray_source_value)
         selected_index = _coerce_texarray_index(texarray_index)
         texarray_paths = []
         texarray_source_path = _resolve_texarray_source_path(texarray_source_value, uncook_path, repo_version)
@@ -1857,6 +2128,13 @@ def create_node_texture(
     image_started = time.perf_counter()
     node.image = load_texture(mat, tex_path, uncook_path)
     image_load_seconds = time.perf_counter() - image_started
+    if texarray_source_repo_path:
+        node["witcher_texture_source_path"] = texarray_source_repo_path
+        node["witcher_material_param_type"] = "handle:ITexture"
+        try:
+            node.witcher_texture_source_path = texarray_source_repo_path
+        except Exception:
+            pass
     if not node.image:
         node.label = "MISSING:" + par_value
 
@@ -1914,6 +2192,13 @@ def create_node_cubemap(
     node = nodes.new(type="ShaderNodeTexEnvironment")
     node.width = 300
     node.label = par_name
+    cube_repo_path = normalize_depot_path(par_value)
+    node["witcher_texture_source_path"] = cube_repo_path
+    node["witcher_material_param_type"] = "handle:CCubeTexture"
+    try:
+        node.witcher_texture_source_path = cube_repo_path
+    except Exception:
+        pass
     if loaded_img:
         node.image = loaded_img
 

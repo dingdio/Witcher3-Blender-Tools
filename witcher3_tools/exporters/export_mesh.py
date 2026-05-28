@@ -120,7 +120,15 @@ def extract_bone_data(armature, matrix_ref=None, rotate_bones_90=False):
     return bone_data
 
 
-from ..w3_material_nodes import get_group_inputs, get_socket_value, get_repo_from_abs_path, is_path_resolved
+from ..w3_material_nodes import (
+    get_group_inputs,
+    get_socket_value,
+    get_repo_from_abs_path,
+    get_texarray_group_value,
+    is_node_export_enabled,
+    is_path_resolved,
+    validate_material_export_params,
+)
 
 def _collect_tex_nodes(from_node, depth=4, _visited=None):
     """Walk the node graph upstream from from_node, collecting all TEX_IMAGE nodes."""
@@ -261,26 +269,32 @@ def get_mesh_material_info(mesh_bl, mesh_obj=None):
             }
         }
         if mat_props.local:
+            validation_issues = validate_material_export_params(mat)
+            if validation_issues:
+                issue_text = "\n".join(validation_issues)
+                raise ValueError(f"Material '{mat.name}' export validation failed:\n{issue_text}")
             group_inputs = get_group_inputs(mat)
             if group_inputs:
                 for input_socket in group_inputs:
                     if input_socket.is_linked:
                         linked_socket = input_socket.links[0].from_socket
-                        if linked_socket.node.witcher_include:
+                        if linked_socket.node.witcher_include and is_node_export_enabled(linked_socket.node):
 
                             if linked_socket.node.type == 'GROUP':
+                                texarray_value = get_texarray_group_value(linked_socket.node)
                                 for input_socket_group in linked_socket.node.inputs:
                                     if input_socket_group.is_linked:
-                                        linked_socket_inner = input_socket_group.links[0].from_socket
                                         mat_dict['witcher_props']['input_props'].append(
-                                            {'name':linked_socket.node.name,
-                                            'type': 'handle:CTextureArray',#linked_socket_inner.node.type,
-                                            'value':get_socket_value(input_socket_group)})
+                                            {'name':input_socket.name,
+                                            'type': 'handle:CTextureArray',
+                                            'value': texarray_value or get_socket_value(input_socket_group)})
                                         break
                             else:
                                 export_type = linked_socket.node.type
                                 if input_socket.type == 'VECTOR':
                                     export_type = 'COMBXYZ'
+                                elif linked_socket.node.type == 'TEX_ENVIRONMENT':
+                                    export_type = 'handle:CCubeTexture'
                                 mat_dict['witcher_props']['input_props'].append(
                                     {'name':input_socket.name,
                                     'type': export_type,

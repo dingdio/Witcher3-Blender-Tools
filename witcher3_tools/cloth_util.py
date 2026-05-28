@@ -182,7 +182,14 @@ def setup_w3_material_CR2W(
         enableMask = mat_bin.GetVariableByName('enableMask')
         if enableMask and enableMask.Value == 1:
             bl_material.witcher_props.enableMask = True
-        return setup_w3_material(uncook_path, bl_material, xml_data=new_xml, xml_path=mat_filename, force_update=force_update, is_instance_file = is_instance_file)
+        finished_mat = setup_w3_material(uncook_path, bl_material, xml_data=new_xml, xml_path=mat_filename, force_update=force_update, is_instance_file = is_instance_file)
+        try:
+            from .w3_material_nodes import auto_load_base_material_snapshot
+
+            auto_load_base_material_snapshot(bpy.context, finished_mat, create_missing=True)
+        except Exception:
+            log.warning("Failed to auto-load Base Path snapshot for material '%s'", getattr(finished_mat, "name", "<unknown>"), exc_info=True)
+        return finished_mat
 
 def load_w3_materials_CR2W(
         obj: Object
