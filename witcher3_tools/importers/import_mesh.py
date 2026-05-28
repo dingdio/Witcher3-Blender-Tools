@@ -1666,14 +1666,6 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
     exportMeshdata.meshInfo.numVertices = len(exportMeshdata.vertex3DCoords)
     exportMeshdata.tangent_vector, exportMeshdata.extra_vectors = _solve_meshdata_tangent_basis(exportMeshdata)
 
-    # W2 mesh indices are UInt16; fail fast instead of writing wrapped/corrupt
-    # indices that lead to broken UVs/geometry on reimport.
-    if exportMeshdata.meshInfo.numVertices > 65535:
-        raise ValueError(
-            f"Export mesh '{mesh_ob.name}' expands to {exportMeshdata.meshInfo.numVertices} vertices "
-            f"after normal/UV splits (UInt16 limit is 65535). Split the mesh into smaller parts."
-        )
-
     if bpy.app.version < (4, 1, 0):
         me.free_normals_split()
 

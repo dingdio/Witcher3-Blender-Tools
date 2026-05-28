@@ -53,52 +53,103 @@ class MeshData(object):
         self.vertexColor = []
         self.meshInfo = [SMeshInfos]
 
-    #!Not currently in use
-    def split_data(self):
-        num_verts = 65534
-        num_splits = (len(self.vertex3DCoords) + num_verts - 1) // num_verts
-        split_data = []
-        vertex_faces = {}
-        used_faces = set()
-        for i, face in enumerate(self.faces):
-            for vertex_index in face:
-                if vertex_index not in vertex_faces:
-                    vertex_faces[vertex_index] = set()
-                vertex_faces[vertex_index].add(i)
+    def split_data(self, max_vertices=65535):
+        """Split mesh data into UInt16-indexable chunks without recalculating vertex data."""
+        total_vertices = len(self.vertex3DCoords)
+        if total_vertices <= max_vertices:
+            return [self]
+        if max_vertices < 3:
+            raise ValueError("Mesh chunks need room for at least one triangle.")
 
-        for i in range(num_splits):
-            split_mesh = MeshData()
-            start_index = i * num_verts
-            end_index = min((i + 1) * num_verts, len(self.vertex3DCoords))
-            split_mesh.vertex3DCoords = self.vertex3DCoords[start_index:end_index]
-            split_mesh.UV_vertex3DCoords = self.UV_vertex3DCoords[start_index:end_index]
-            split_mesh.UV2_vertex3DCoords = self.UV2_vertex3DCoords[start_index:end_index]
-            split_mesh.tangent_vector = self.tangent_vector[start_index:end_index]
-            split_mesh.extra_vectors = self.extra_vectors[start_index:end_index]
-            split_mesh.faces = self.faces[start_index:end_index]
-            split_mesh.normals = self.normals[start_index:end_index]
-            split_mesh.normalsAll = self.normalsAll[start_index:end_index*3]
-            split_mesh.skinningVerts = self.skinningVerts[start_index:end_index]
-            split_mesh.vertexColor = self.vertexColor[start_index:end_index]
-            faces = []
-            for idx in reversed(range(start_index, end_index)):
-                for face_index in vertex_faces.get(idx, []):
-                    if face_index not in used_faces:
-                        faces.append(self.faces[face_index])
-                        used_faces.add(face_index)
-            split_mesh.faces = self.faces[start_index:len(faces)]
-            split_mesh.meshInfo = SMeshInfos()
-            split_mesh.meshInfo.numVertices = self.meshInfo
-            split_mesh.meshInfo.numIndices = self.meshInfo
-            split_mesh.meshInfo.numBonesPerVertex = self.meshInfo
-            split_mesh.meshInfo.firstVertex = self.meshInfo
-            split_mesh.meshInfo.firstIndex = self.meshInfo
-            split_mesh.meshInfo.vertexType = self.meshInfo
-            split_mesh.meshInfo.materialID = self.meshInfo
-            split_mesh.meshInfo.lod = self.meshInfo
-            split_mesh.meshInfo.distance = self.meshInfo
-            split_data.append(split_mesh)
-        return split_data
+        source_info = self.meshInfo if isinstance(self.meshInfo, SMeshInfos) else SMeshInfos()
+        skinning_by_vertex = {}
+        for entry in self.skinningVerts:
+            skinning_by_vertex.setdefault(int(entry.vertexId), []).append(entry)
+
+        def copy_mesh_info(chunk):
+            chunk.meshInfo = SMeshInfos()
+            chunk.meshInfo.numVertices = len(chunk.vertex3DCoords)
+            chunk.meshInfo.numIndices = len(chunk.faces) * 3
+            chunk.meshInfo.numBonesPerVertex = getattr(source_info, "numBonesPerVertex", 4)
+            chunk.meshInfo.vertexType = getattr(source_info, "vertexType", EMeshVertexType.EMVT_STATIC)
+            chunk.meshInfo.materialID = getattr(source_info, "materialID", 0)
+            chunk.meshInfo.lod = getattr(source_info, "lod", -1)
+            chunk.meshInfo.distance = getattr(source_info, "distance", 0)
+
+        def append_value(dst, src, index, fallback):
+            if index < len(src):
+                dst.append(src[index])
+            else:
+                dst.append(fallback)
+
+        def append_vertex(chunk, old_index):
+            new_index = len(chunk.vertex3DCoords)
+            append_value(chunk.vertex3DCoords, self.vertex3DCoords, old_index, [0.0, 0.0, 0.0])
+            append_value(chunk.UV_vertex3DCoords, self.UV_vertex3DCoords, old_index, [0.0, 1.0])
+            append_value(chunk.UV2_vertex3DCoords, self.UV2_vertex3DCoords, old_index, [0.0, 1.0])
+            append_value(chunk.tangent_vector, self.tangent_vector, old_index, [1.0, 0.0, 0.0])
+            append_value(chunk.extra_vectors, self.extra_vectors, old_index, [0.0, 1.0, 0.0])
+            append_value(chunk.normals, self.normals, old_index, [0.0, 0.0, 1.0])
+            append_value(chunk.vertexColor, self.vertexColor, old_index, [0.0, 0.0, 0.0, 0.0])
+
+            normal_offset = old_index * 3
+            if normal_offset + 2 < len(self.normalsAll):
+                chunk.normalsAll.extend(self.normalsAll[normal_offset:normal_offset + 3])
+            elif old_index < len(self.normals):
+                chunk.normalsAll.extend(self.normals[old_index])
+            else:
+                chunk.normalsAll.extend([0.0, 0.0, 1.0])
+
+            for entry in skinning_by_vertex.get(old_index, []):
+                copied = VertexSkinningEntry()
+                copied.boneId = entry.boneId
+                copied.boneId_idx = entry.boneId_idx
+                copied.meshBufferId = entry.meshBufferId
+                copied.vertexId = new_index
+                copied.strength = entry.strength
+                chunk.skinningVerts.append(copied)
+            return new_index
+
+        if not self.faces:
+            chunks = []
+            for start_index in range(0, total_vertices, max_vertices):
+                chunk = MeshData()
+                for old_index in range(start_index, min(start_index + max_vertices, total_vertices)):
+                    append_vertex(chunk, old_index)
+                copy_mesh_info(chunk)
+                chunks.append(chunk)
+            return chunks
+
+        chunks = []
+        chunk = MeshData()
+        vertex_map = {}
+
+        def flush_chunk():
+            nonlocal chunk, vertex_map
+            if not chunk.faces and not chunk.vertex3DCoords:
+                return
+            copy_mesh_info(chunk)
+            chunks.append(chunk)
+            chunk = MeshData()
+            vertex_map = {}
+
+        for face in self.faces:
+            face_indices = [int(index) for index in face]
+            missing = [index for index in face_indices if index not in vertex_map]
+            if vertex_map and len(vertex_map) + len(missing) > max_vertices:
+                flush_chunk()
+
+            new_face = []
+            for old_index in face_indices:
+                new_index = vertex_map.get(old_index)
+                if new_index is None:
+                    new_index = append_vertex(chunk, old_index)
+                    vertex_map[old_index] = new_index
+                new_face.append(new_index)
+            chunk.faces.append(new_face)
+
+        flush_chunk()
+        return chunks
 
 
 def lin2srgb(lin):

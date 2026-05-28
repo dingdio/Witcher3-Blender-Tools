@@ -26,6 +26,7 @@ from .. import get_rig_rot90_enabled
 COLLISION_SUFFIXES = ("_col", "_tri", "_box", "_sphere", "_capsule")
 DEFAULT_PHYSICAL_MATERIAL = "default"
 SKIN_WEIGHT_EPSILON = 1e-8
+MAX_W2MESH_CHUNK_VERTICES = 65535
 
 
 def _get_collision_material_name(mesh_obj):
@@ -783,7 +784,16 @@ class MeshExporter(object):
 
             exportMeshdata = get_mesh_info(mesh_for_work, meshObj)
             exportMaterialdata = get_mesh_material_info(mesh_for_work, mesh_obj=original_mesh_obj or meshObj)
-            return (exportMeshdata, exportMaterialdata)
+            split_meshdata = exportMeshdata.split_data(MAX_W2MESH_CHUNK_VERTICES)
+            if len(split_meshdata) > 1:
+                log.info(
+                    "Export mesh '%s' expands to %d vertices after normal/UV splits; "
+                    "auto-split into %d render chunks.",
+                    meshObj.name,
+                    exportMeshdata.meshInfo.numVertices,
+                    len(split_meshdata),
+                )
+            return [(meshdata, exportMaterialdata) for meshdata in split_meshdata]
         finally:
             bpy.data.meshes.remove(mesh_for_work)
 
@@ -909,7 +919,9 @@ class MeshExporter(object):
             for m in self.__meshes:
                 new_meshes = split_mesh_by_material(m)
                 _temp_meshes.extend(new_meshes)
-                mesh_data = [self.__loadMeshData(i, nameMap, original_mesh_obj=m) for i in new_meshes]
+                mesh_data = []
+                for i in new_meshes:
+                    mesh_data.extend(self.__loadMeshData(i, nameMap, original_mesh_obj=m))
                 # Data extracted — remove temp meshes for this LOD
                 for mesh in new_meshes:
                     if mesh.name in bpy.data.objects:
