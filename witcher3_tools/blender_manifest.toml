@@ -19,7 +19,7 @@ wheels = [
   "wheels/h5py-3.16.0-cp311-cp311-win_amd64.whl",
   "wheels/h5py-3.16.0-cp313-cp313-win_amd64.whl",
   "wheels/idna-3.15-py3-none-any.whl",
-  "wheels/numpy-2.4.4-cp311-cp311-win_amd64.whl",
+  "wheels/numpy-1.26.4-cp311-cp311-win_amd64.whl",
   "wheels/numpy-2.4.4-cp313-cp313-win_amd64.whl",
   "wheels/platformdirs-4.9.6-py3-none-any.whl",
   "wheels/pywhispercpp-1.4.1-cp311-cp311-win_amd64.whl",

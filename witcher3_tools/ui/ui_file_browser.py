@@ -3149,6 +3149,7 @@ _sound_preview_state = {
     "item_path": "",
     "wav_path": "",
     "sound_name": "",
+    "backend": "",
 }
 _sound_preview_handle = None
 _sound_preview_device = None
@@ -3222,8 +3223,12 @@ def _sound_preview_matches(cache_type: str, item_path: str) -> bool:
 def _clear_sound_preview(context=None) -> None:
     global _sound_preview_handle, _sound_preview_state
 
+    backend = _sound_preview_state.get("backend") or ""
     try:
-        if _sound_preview_handle is not None:
+        if backend == "winsound":
+            import winsound
+            winsound.PlaySound(None, 0)
+        elif _sound_preview_handle is not None:
             _sound_preview_handle.stop()
     except Exception:
         pass
@@ -3243,6 +3248,7 @@ def _clear_sound_preview(context=None) -> None:
         "item_path": "",
         "wav_path": "",
         "sound_name": "",
+        "backend": "",
     }
     _tag_browser_redraw(context)
 
@@ -3427,24 +3433,40 @@ def play_sound_file_preview(context, sound_abs_path: str, item_path: str, cache_
 
     wav_path = ensure_sound_wav(context, sound_abs_path, item_path)
 
-    try:
-        import aud
-    except Exception as exc:
-        raise RuntimeError(f"Blender aud module is unavailable: {exc}") from exc
-
     _clear_sound_preview(context)
 
-    if _sound_preview_device is None:
-        _sound_preview_device = aud.Device()
+    sound_name = ""
+    backend = "aud"
+    if os.name == "nt":
+        try:
+            import winsound
+            winsound.PlaySound(
+                wav_path,
+                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+            )
+            backend = "winsound"
+        except Exception as exc:
+            raise RuntimeError(f"Windows audio preview failed: {exc}") from exc
+    else:
+        try:
+            import aud
+        except Exception as exc:
+            raise RuntimeError(f"Blender aud module is unavailable: {exc}") from exc
 
-    sound_data = bpy.data.sounds.load(wav_path, check_existing=False)
-    sound_factory = aud.Sound(wav_path)
-    _sound_preview_handle = _sound_preview_device.play(sound_factory)
+        if _sound_preview_device is None:
+            _sound_preview_device = aud.Device()
+
+        sound_data = bpy.data.sounds.load(wav_path, check_existing=False)
+        sound_name = getattr(sound_data, "name", "")
+        sound_factory = aud.Sound(wav_path)
+        _sound_preview_handle = _sound_preview_device.play(sound_factory)
+
     _sound_preview_state = {
         "cache_type": cache_type or "",
         "item_path": (item_path or "").replace("/", "\\"),
         "wav_path": wav_path,
-        "sound_name": getattr(sound_data, "name", ""),
+        "sound_name": sound_name,
+        "backend": backend,
     }
     _tag_browser_redraw(context)
     return wav_path
