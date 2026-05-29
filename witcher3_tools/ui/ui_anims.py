@@ -4827,6 +4827,560 @@ def _select_root_orientation_quat(action, armature_obj):
     return best_quat, best_bone, best_up_dot
 
 
+def _retarget_weapon_bone_name(scene):
+    bone_name = str(getattr(scene, "witcher_retarget_weapon_bone", "r_weapon") or "r_weapon")
+    return bone_name if bone_name in {"r_weapon", "l_weapon"} else "r_weapon"
+
+
+def _pose_bone_data_path(bone_name, prop_name):
+    safe_name = str(bone_name).replace('"', '\\"')
+    return f'pose.bones["{safe_name}"].{prop_name}'
+
+
+def _action_curve_map(action, armature_obj, data_path):
+    curves = {}
+    if action is None:
+        return curves
+    for fcurve in iter_action_fcurves(action, target=armature_obj):
+        if getattr(fcurve, "data_path", "") == data_path:
+            curves[int(getattr(fcurve, "array_index", 0) or 0)] = fcurve
+    return curves
+
+
+def _action_curve_frames(curves):
+    frames = set()
+    for fcurve in curves.values():
+        for key in getattr(fcurve, "keyframe_points", []) or []:
+            try:
+                frames.add(float(key.co[0]))
+            except Exception:
+                pass
+    return frames
+
+
+def _eval_curve_values(curves, frame, defaults, count):
+    values = []
+    for idx in range(count):
+        if idx in curves:
+            values.append(float(curves[idx].evaluate(frame)))
+        else:
+            values.append(float(defaults[idx] if idx < len(defaults) else 0.0))
+    return values
+
+
+def _pose_bone_default_location(pose_bone):
+    loc = getattr(pose_bone, "location", None)
+    if loc is None:
+        return (0.0, 0.0, 0.0)
+    return (float(loc.x), float(loc.y), float(loc.z))
+
+
+def _pose_bone_default_quaternion(pose_bone):
+    if pose_bone is None:
+        return (1.0, 0.0, 0.0, 0.0)
+    if getattr(pose_bone, "rotation_mode", "QUATERNION") == 'QUATERNION':
+        q = getattr(pose_bone, "rotation_quaternion", None)
+        if q is not None:
+            return (float(q.w), float(q.x), float(q.y), float(q.z))
+    try:
+        q = pose_bone.rotation_euler.to_quaternion()
+        return (float(q.w), float(q.x), float(q.y), float(q.z))
+    except Exception:
+        return (1.0, 0.0, 0.0, 0.0)
+
+
+def _pose_bone_current_quaternion(pose_bone):
+    if pose_bone is None:
+        return MQuaternion((1.0, 0.0, 0.0, 0.0))
+    mode = getattr(pose_bone, "rotation_mode", "QUATERNION")
+    if mode == 'QUATERNION':
+        q = pose_bone.rotation_quaternion.copy()
+    elif mode == 'AXIS_ANGLE':
+        axis_angle = pose_bone.rotation_axis_angle
+        axis = MVector((axis_angle[1], axis_angle[2], axis_angle[3]))
+        q = MQuaternion(axis.normalized(), axis_angle[0]) if axis.length > 1e-8 else MQuaternion((1.0, 0.0, 0.0, 0.0))
+    else:
+        q = pose_bone.rotation_euler.to_quaternion()
+    if _quat_magnitude(q) <= 1e-8:
+        return MQuaternion((1.0, 0.0, 0.0, 0.0))
+    q.normalize()
+    return q
+
+
+def _set_pose_bone_quaternion(pose_bone, quat):
+    if pose_bone is None:
+        return
+    q = quat.copy()
+    if _quat_magnitude(q) <= 1e-8:
+        q = MQuaternion((1.0, 0.0, 0.0, 0.0))
+    q.normalize()
+    mode = getattr(pose_bone, "rotation_mode", "QUATERNION")
+    if mode == 'QUATERNION':
+        pose_bone.rotation_quaternion = q
+    elif mode == 'AXIS_ANGLE':
+        axis, angle = q.to_axis_angle()
+        pose_bone.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+    else:
+        order = mode if mode in {'XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX'} else 'XYZ'
+        pose_bone.rotation_euler = q.to_euler(order)
+
+
+def _eval_action_bone_rotation(action, armature_obj, pose_bone, bone_name, frame):
+    quat_path = _pose_bone_data_path(bone_name, "rotation_quaternion")
+    quat_curves = _action_curve_map(action, armature_obj, quat_path)
+    if quat_curves:
+        q = MQuaternion(_eval_curve_values(quat_curves, frame, _pose_bone_default_quaternion(pose_bone), 4))
+        if _quat_magnitude(q) <= 1e-8:
+            return MQuaternion((1.0, 0.0, 0.0, 0.0))
+        q.normalize()
+        return q
+
+    euler_path = _pose_bone_data_path(bone_name, "rotation_euler")
+    euler_curves = _action_curve_map(action, armature_obj, euler_path)
+    if euler_curves:
+        defaults = tuple(float(v) for v in getattr(pose_bone, "rotation_euler", (0.0, 0.0, 0.0)))
+        values = _eval_curve_values(euler_curves, frame, defaults, 3)
+        order = getattr(pose_bone, "rotation_mode", "XYZ")
+        if order not in {'XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX'}:
+            order = 'XYZ'
+        return MEuler(values, order).to_quaternion()
+
+    axis_path = _pose_bone_data_path(bone_name, "rotation_axis_angle")
+    axis_curves = _action_curve_map(action, armature_obj, axis_path)
+    if axis_curves:
+        defaults = tuple(float(v) for v in getattr(pose_bone, "rotation_axis_angle", (0.0, 0.0, 1.0, 0.0)))
+        values = _eval_curve_values(axis_curves, frame, defaults, 4)
+        axis = MVector((values[1], values[2], values[3]))
+        if axis.length <= 1e-8:
+            return MQuaternion((1.0, 0.0, 0.0, 0.0))
+        return MQuaternion(axis.normalized(), values[0])
+
+    return MQuaternion(_pose_bone_default_quaternion(pose_bone))
+
+
+def _eval_action_bone_location(action, armature_obj, pose_bone, bone_name, frame):
+    loc_path = _pose_bone_data_path(bone_name, "location")
+    loc_curves = _action_curve_map(action, armature_obj, loc_path)
+    return MVector(_eval_curve_values(loc_curves, frame, _pose_bone_default_location(pose_bone), 3))
+
+
+def _quat_identity():
+    return MQuaternion((1.0, 0.0, 0.0, 0.0))
+
+
+def _quat_magnitude(quat):
+    try:
+        return math.sqrt(
+            (float(quat.w) * float(quat.w))
+            + (float(quat.x) * float(quat.x))
+            + (float(quat.y) * float(quat.y))
+            + (float(quat.z) * float(quat.z))
+        )
+    except Exception:
+        try:
+            return math.sqrt(sum(float(quat[idx]) * float(quat[idx]) for idx in range(4)))
+        except Exception:
+            return 0.0
+
+
+def _quat_dot_values(a, b):
+    try:
+        return (
+            (float(a.w) * float(b.w))
+            + (float(a.x) * float(b.x))
+            + (float(a.y) * float(b.y))
+            + (float(a.z) * float(b.z))
+        )
+    except Exception:
+        try:
+            return sum(float(a[idx]) * float(b[idx]) for idx in range(4))
+        except Exception:
+            return 1.0
+
+
+def _quat_negated(quat):
+    try:
+        return MQuaternion((-float(quat.w), -float(quat.x), -float(quat.y), -float(quat.z)))
+    except Exception:
+        try:
+            return MQuaternion(tuple(-float(quat[idx]) for idx in range(4)))
+        except Exception:
+            return _quat_identity()
+
+
+def _quat_is_identity(quat, epsilon=1e-8):
+    q = quat.copy()
+    if _quat_magnitude(q) <= epsilon:
+        return True
+    q.normalize()
+    return abs(abs(float(q.w)) - 1.0) <= epsilon
+
+
+def _quat_from_euler_values(values):
+    try:
+        q = MEuler(tuple(float(v) for v in values), 'XYZ').to_quaternion()
+    except Exception:
+        q = _quat_identity()
+    if _quat_magnitude(q) <= 1e-8:
+        return _quat_identity()
+    q.normalize()
+    return q
+
+
+def _quat_to_xyz_euler_tuple(quat):
+    q = quat.copy()
+    if _quat_magnitude(q) <= 1e-8:
+        q = _quat_identity()
+    q.normalize()
+    e = q.to_euler('XYZ')
+    return (float(e.x), float(e.y), float(e.z))
+
+
+def _stable_quat(previous, quat):
+    q = quat.copy()
+    if _quat_magnitude(q) <= 1e-8:
+        q = _quat_identity()
+    q.normalize()
+    if previous is not None and _quat_dot_values(previous, q) < 0.0:
+        q = _quat_negated(q)
+    return q
+
+
+def _retarget_weapon_offset_delta(action, armature_obj, pose_bone, bone_name, frame, offset, space):
+    delta = MVector(offset)
+    if str(space or "SOCKET").upper() == "SOCKET":
+        delta = _eval_action_bone_rotation(action, armature_obj, pose_bone, bone_name, frame) @ delta
+    return delta
+
+
+def _retarget_weapon_rotation_delta(base_quat, rot_offset, space):
+    delta = rot_offset.copy()
+    if _quat_magnitude(delta) <= 1e-8:
+        return base_quat.copy()
+    delta.normalize()
+    if str(space or "SOCKET").upper() == "SOCKET":
+        out = base_quat @ delta
+    else:
+        out = delta @ base_quat
+    out.normalize()
+    return out
+
+
+def _resolve_retarget_action(context, armature):
+    source_mode = getattr(getattr(context, "scene", None), "witcher_w3_anim_source", "NLA")
+    return export_anims.resolve_action(armature, context=context, source_mode=source_mode, prefer_tracks=("anim_import",))
+
+
+def _weapon_offset_frames(action, armature_obj, bone_name):
+    frames = set()
+    paths = (
+        _pose_bone_data_path(bone_name, "location"),
+        _pose_bone_data_path(bone_name, "rotation_quaternion"),
+        _pose_bone_data_path(bone_name, "rotation_euler"),
+        _pose_bone_data_path(bone_name, "rotation_axis_angle"),
+    )
+    for path in paths:
+        frames.update(_action_curve_frames(_action_curve_map(action, armature_obj, path)))
+    if not frames:
+        try:
+            frames.add(float(action.frame_range[0]))
+        except Exception:
+            frames.add(1.0)
+    return sorted(frames)
+
+
+def _write_weapon_location_curves(action, armature_obj, bone_name, baked_locations):
+    loc_path = _pose_bone_data_path(bone_name, "location")
+    for fcurve in list(_action_curve_map(action, armature_obj, loc_path).values()):
+        remove_action_fcurve(action, fcurve, target=armature_obj)
+    for idx in range(3):
+        fcurve = new_action_fcurve(action, armature_obj, data_path=loc_path, index=idx, group_name=bone_name)
+        for frame, loc in baked_locations:
+            key = fcurve.keyframe_points.insert(float(frame), float(loc[idx]), options={'FAST'})
+            key.interpolation = 'LINEAR'
+        try:
+            fcurve.update()
+        except Exception:
+            pass
+
+
+def _write_weapon_rotation_curves(action, armature_obj, bone_name, baked_rotations):
+    for prop_name in ("rotation_quaternion", "rotation_euler", "rotation_axis_angle"):
+        path = _pose_bone_data_path(bone_name, prop_name)
+        for fcurve in list(_action_curve_map(action, armature_obj, path).values()):
+            remove_action_fcurve(action, fcurve, target=armature_obj)
+    quat_path = _pose_bone_data_path(bone_name, "rotation_quaternion")
+    for idx in range(4):
+        fcurve = new_action_fcurve(action, armature_obj, data_path=quat_path, index=idx, group_name=bone_name)
+        for frame, quat in baked_rotations:
+            values = (quat.w, quat.x, quat.y, quat.z)
+            key = fcurve.keyframe_points.insert(float(frame), float(values[idx]), options={'FAST'})
+            key.interpolation = 'LINEAR'
+        try:
+            fcurve.update()
+        except Exception:
+            pass
+
+
+def _bake_weapon_offset_to_action(
+    action,
+    armature_obj,
+    bone_name,
+    offset,
+    rotation_offset=(0.0, 0.0, 0.0),
+    space="SOCKET",
+    invert=False,
+):
+    pose_bone = getattr(getattr(armature_obj, "pose", None), "bones", {}).get(bone_name)
+    if action is None or pose_bone is None:
+        return 0
+
+    offset_vec = MVector(offset)
+    rot_delta = _quat_from_euler_values(rotation_offset)
+    if invert:
+        offset_vec.negate()
+        rot_delta = rot_delta.inverted()
+
+    has_location = offset_vec.length > 1e-9
+    has_rotation = not _quat_is_identity(rot_delta)
+    if not has_location and not has_rotation:
+        return 0
+
+    baked_locations = []
+    baked_rotations = []
+    previous_quat = None
+    for frame in _weapon_offset_frames(action, armature_obj, bone_name):
+        base_loc = _eval_action_bone_location(action, armature_obj, pose_bone, bone_name, frame)
+        base_quat = _eval_action_bone_rotation(action, armature_obj, pose_bone, bone_name, frame)
+        if has_location:
+            delta = _retarget_weapon_offset_delta(action, armature_obj, pose_bone, bone_name, frame, offset_vec, space)
+            baked_locations.append((frame, base_loc + delta))
+        if has_rotation:
+            quat = _retarget_weapon_rotation_delta(base_quat, rot_delta, space)
+            quat = _stable_quat(previous_quat, quat)
+            previous_quat = quat
+            baked_rotations.append((frame, quat))
+
+    if baked_locations:
+        _write_weapon_location_curves(action, armature_obj, bone_name, baked_locations)
+    if baked_rotations:
+        _write_weapon_rotation_curves(action, armature_obj, bone_name, baked_rotations)
+        pose_bone.rotation_mode = 'QUATERNION'
+    return max(len(baked_locations), len(baked_rotations))
+
+
+def _capture_weapon_offset_from_current_pose(action, armature_obj, bone_name, frame, space):
+    pose_bone = getattr(getattr(armature_obj, "pose", None), "bones", {}).get(bone_name)
+    if action is None or pose_bone is None:
+        return None
+
+    base_loc = _eval_action_bone_location(action, armature_obj, pose_bone, bone_name, frame)
+    current_loc = MVector(_pose_bone_default_location(pose_bone))
+    base_quat = _eval_action_bone_rotation(action, armature_obj, pose_bone, bone_name, frame)
+    current_quat = _pose_bone_current_quaternion(pose_bone)
+
+    if str(space or "SOCKET").upper() == "SOCKET":
+        loc_offset = base_quat.inverted() @ (current_loc - base_loc)
+        rot_delta = base_quat.inverted() @ current_quat
+    else:
+        loc_offset = current_loc - base_loc
+        rot_delta = current_quat @ base_quat.inverted()
+    if _quat_magnitude(rot_delta) <= 1e-8:
+        rot_delta = _quat_identity()
+    rot_delta.normalize()
+    return loc_offset, rot_delta
+
+
+class WITCH_OT_RetargetWeaponOffsetPreview(bpy.types.Operator):
+    bl_idname = "witcher.retarget_weapon_offset_preview"
+    bl_label = "Preview Weapon Offset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        armature = _find_character_armature(context)
+        if not armature or getattr(armature, "type", None) != 'ARMATURE':
+            return False
+        bone_name = _retarget_weapon_bone_name(getattr(context, "scene", None))
+        return bone_name in (getattr(getattr(armature, "pose", None), "bones", {}) or {})
+
+    def execute(self, context):
+        scene = context.scene
+        armature = _find_character_armature(context)
+        bone_name = _retarget_weapon_bone_name(scene)
+        pose_bone = armature.pose.bones.get(bone_name)
+        if pose_bone is None:
+            self.report({'ERROR'}, f"Bone not found: {bone_name}")
+            return {'CANCELLED'}
+
+        action, _info = _resolve_retarget_action(context, armature)
+        frame = float(scene.frame_current)
+        try:
+            scene.frame_set(scene.frame_current)
+            context.view_layer.update()
+        except Exception:
+            pass
+
+        offset = MVector(getattr(scene, "witcher_retarget_weapon_offset", (0.0, 0.0, 0.0)))
+        space = getattr(scene, "witcher_retarget_weapon_offset_space", "SOCKET")
+        rotation_offset = getattr(scene, "witcher_retarget_weapon_rotation_offset", (0.0, 0.0, 0.0))
+        rot_delta = _quat_from_euler_values(rotation_offset)
+        if offset.length <= 1e-9 and _quat_is_identity(rot_delta):
+            self.report({'INFO'}, "Weapon offset is zero.")
+            return {'FINISHED'}
+
+        base_loc = _eval_action_bone_location(action, armature, pose_bone, bone_name, frame)
+        base_quat = _eval_action_bone_rotation(action, armature, pose_bone, bone_name, frame)
+        delta = _retarget_weapon_offset_delta(action, armature, pose_bone, bone_name, frame, offset, space)
+        pose_bone.location = base_loc + delta
+        if not _quat_is_identity(rot_delta):
+            _set_pose_bone_quaternion(pose_bone, _retarget_weapon_rotation_delta(base_quat, rot_delta, space))
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+        self.report({'INFO'}, f"Previewed {bone_name} offset on frame {int(frame)}.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_RetargetWeaponOffsetCapture(bpy.types.Operator):
+    bl_idname = "witcher.retarget_weapon_offset_capture"
+    bl_label = "Capture Weapon Offset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bake: BoolProperty(
+        name="Bake",
+        description="Bake the captured current-pose offset immediately",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        armature = _find_character_armature(context)
+        if not armature or getattr(armature, "type", None) != 'ARMATURE':
+            return False
+        action, _info = _resolve_retarget_action(context, armature)
+        if action is None:
+            return False
+        bone_name = _retarget_weapon_bone_name(getattr(context, "scene", None))
+        return bone_name in (getattr(getattr(armature, "pose", None), "bones", {}) or {})
+
+    def execute(self, context):
+        scene = context.scene
+        armature = _find_character_armature(context)
+        action, info = _resolve_retarget_action(context, armature)
+        if action is None:
+            self.report({'ERROR'}, "No current action found.")
+            return {'CANCELLED'}
+
+        bone_name = _retarget_weapon_bone_name(scene)
+        frame = float(scene.frame_current)
+        space = getattr(scene, "witcher_retarget_weapon_offset_space", "SOCKET")
+        captured = _capture_weapon_offset_from_current_pose(action, armature, bone_name, frame, space)
+        if captured is None:
+            self.report({'ERROR'}, f"Could not capture {bone_name}.")
+            return {'CANCELLED'}
+
+        loc_offset, rot_delta = captured
+        scene.witcher_retarget_weapon_offset = (float(loc_offset.x), float(loc_offset.y), float(loc_offset.z))
+        scene.witcher_retarget_weapon_rotation_offset = _quat_to_xyz_euler_tuple(rot_delta)
+
+        if not self.bake:
+            self.report({'INFO'}, f"Captured {bone_name} offset from current pose.")
+            return {'FINISHED'}
+
+        changed = _bake_weapon_offset_to_action(
+            action,
+            armature,
+            bone_name,
+            scene.witcher_retarget_weapon_offset,
+            rotation_offset=scene.witcher_retarget_weapon_rotation_offset,
+            space=space,
+        )
+        if not changed:
+            self.report({'INFO'}, "No weapon offset baked.")
+            return {'CANCELLED'}
+        try:
+            scene.frame_set(scene.frame_current)
+            context.view_layer.update()
+        except Exception:
+            pass
+        source = str((info or {}).get("source", "") or "ACTION")
+        self.report({'INFO'}, f"Baked current {bone_name} pose to {action.name} ({changed} frames, {source}).")
+        return {'FINISHED'}
+
+
+class WITCH_OT_RetargetWeaponOffsetBake(bpy.types.Operator):
+    bl_idname = "witcher.retarget_weapon_offset_bake"
+    bl_label = "Bake Weapon Offset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    invert: BoolProperty(
+        name="Invert",
+        description="Apply the negative of the current offset",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        armature = _find_character_armature(context)
+        if not armature or getattr(armature, "type", None) != 'ARMATURE':
+            return False
+        action, _info = _resolve_retarget_action(context, armature)
+        if action is None:
+            return False
+        bone_name = _retarget_weapon_bone_name(getattr(context, "scene", None))
+        return bone_name in (getattr(getattr(armature, "pose", None), "bones", {}) or {})
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        scene = context.scene
+        armature = _find_character_armature(context)
+        action, info = _resolve_retarget_action(context, armature)
+        if action is None:
+            self.report({'ERROR'}, "No current action found.")
+            return {'CANCELLED'}
+
+        bone_name = _retarget_weapon_bone_name(scene)
+        offset = getattr(scene, "witcher_retarget_weapon_offset", (0.0, 0.0, 0.0))
+        rotation_offset = getattr(scene, "witcher_retarget_weapon_rotation_offset", (0.0, 0.0, 0.0))
+        space = getattr(scene, "witcher_retarget_weapon_offset_space", "SOCKET")
+        changed = _bake_weapon_offset_to_action(
+            action,
+            armature,
+            bone_name,
+            offset,
+            rotation_offset=rotation_offset,
+            space=space,
+            invert=bool(self.invert),
+        )
+        if not changed:
+            self.report({'INFO'}, "No weapon offset baked.")
+            return {'CANCELLED'}
+
+        try:
+            action["w3_retarget_weapon_offset_bone"] = bone_name
+            action["w3_retarget_weapon_offset_space"] = str(space)
+            action["w3_retarget_weapon_offset"] = tuple(float(v) for v in offset)
+            action["w3_retarget_weapon_rotation_offset"] = tuple(float(v) for v in rotation_offset)
+            action["w3_retarget_weapon_offset_inverted"] = bool(self.invert)
+        except Exception:
+            pass
+
+        try:
+            scene.frame_set(scene.frame_current)
+            context.view_layer.update()
+        except Exception:
+            pass
+
+        source = str((info or {}).get("source", "") or "ACTION")
+        direction = "inverse " if self.invert else ""
+        self.report({'INFO'}, f"Baked {direction}{bone_name} offset to {action.name} ({changed} frames, {source}).")
+        return {'FINISHED'}
+
+
 class WITCH_OT_ApplyRootOrientation(bpy.types.Operator):
     """Apply orientation correction to Root bone animation (Z+ up, X+ towards Y-)"""
     bl_idname = "witcher.apply_root_orientation"
@@ -5584,10 +6138,6 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             opts.prop(scene, "witcher_bake_every_frame", text="Bake Every Frame")
             opts.prop(scene, "witcher_smooth_missing_frames", text="Smooth Missing Frames")
             opts.prop(scene, "witcher_scale_keys_to_duration", text="Scale Keys to Duration")
-            opts.separator()
-            opts.prop(scene, "witcher_w2_retarget_to_w3", text="Retarget W2 to W3")
-            opts.prop(scene, "witcher_w2_retarget_in_place", text="In Place")
-            opts.prop(scene, "witcher_w2_retarget_source_rig", text="W2 Source Rig")
 
             motion_box = box.box()
             motion_box.label(text="Motion Extraction Debug", icon='ACTION')
@@ -5617,6 +6167,44 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                     info.label(text=f"Additive: {item.AdditiveType}")
                 info.label(text=f"Root Motion: {item.RootMotion}")
 
+        body = section("witcher_anim_retarget_tools", "Retarget", 'ARMATURE_DATA') if anim_tab == "CLIPS" else None
+        if body:
+            col = body.column(align=True)
+
+            w2_box = col.box()
+            w2_box.label(text="W2 Import", icon='IMPORT')
+            w2_box.prop(scene, "witcher_w2_retarget_to_w3", text="Retarget W2 to W3")
+            w2_box.prop(scene, "witcher_w2_retarget_in_place", text="In Place")
+            w2_box.prop(scene, "witcher_w2_retarget_hand_fit", text="Hand Fit")
+            w2_box.prop(scene, "witcher_w2_retarget_source_rig", text="Source Rig")
+
+            weapon_box = col.box()
+            weapon_box.label(text="Weapon Socket Offset", icon='CONSTRAINT_BONE')
+            row = weapon_box.row(align=True)
+            row.prop(scene, "witcher_retarget_weapon_bone", text="Bone")
+            row.prop(scene, "witcher_retarget_weapon_offset_space", text="Space")
+            weapon_box.prop(scene, "witcher_retarget_weapon_offset", text="Location")
+            weapon_box.prop(scene, "witcher_retarget_weapon_rotation_offset", text="Rotation")
+
+            action, _info = (None, None)
+            if display_armature:
+                action, _info = _resolve_retarget_action(context, display_armature)
+            status = weapon_box.row(align=True)
+            if not display_armature:
+                status.label(text="No character armature.", icon='INFO')
+            elif action is None:
+                status.label(text="No current action.", icon='INFO')
+            else:
+                status.label(text="Current action ready.", icon='CHECKMARK')
+
+            capture_row = weapon_box.row(align=True)
+            capture_row.operator(WITCH_OT_RetargetWeaponOffsetCapture.bl_idname, text="Capture Pose", icon='EYEDROPPER').bake = False
+            capture_row.operator(WITCH_OT_RetargetWeaponOffsetCapture.bl_idname, text="Bake Pose", icon='KEY_HLT').bake = True
+            op_row = weapon_box.row(align=True)
+            op_row.operator(WITCH_OT_RetargetWeaponOffsetPreview.bl_idname, text="Preview Values", icon='HIDE_OFF')
+            op_row.operator(WITCH_OT_RetargetWeaponOffsetBake.bl_idname, text="Bake Values", icon='KEY_HLT').invert = False
+            op_row.operator(WITCH_OT_RetargetWeaponOffsetBake.bl_idname, text="Bake Inverse", icon='LOOP_BACK').invert = True
+
         body = section("witcher_anim_quick_browser", "Quick Animation Browser", 'PRESET') if anim_tab == "CLIPS" else None
         if body:
             from . import ui_anims_list as _ui_anims_list
@@ -5641,12 +6229,6 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 col.prop(scene, "witcher_quick_anim_auto_collapse_categories", text="Auto Collapse Categories")
             if hasattr(scene, "witcher_quick_anim_source"):
                 col.prop(scene, "witcher_quick_anim_source", text="Source")
-                if getattr(scene, "witcher_quick_anim_source", "AUTO") == "W2":
-                    w2_box = col.box()
-                    w2_box.label(text="W2 Retarget", icon='ARMATURE_DATA')
-                    w2_box.prop(scene, "witcher_w2_retarget_to_w3", text="Retarget to W3")
-                    w2_box.prop(scene, "witcher_w2_retarget_in_place", text="In Place")
-                    w2_box.prop(scene, "witcher_w2_retarget_source_rig", text="Source Rig")
             if hasattr(scene, "witcher_quick_anim_show_all"):
                 col.prop(scene, "witcher_quick_anim_show_all", text="Show All Animations")
 
@@ -6824,6 +7406,9 @@ classes = [
     WITCH_OT_ToggleAutoMotionController,
     WITCH_OT_ResetAutoMotionController,
     WITCH_OT_RemoveAutoMotionController,
+    WITCH_OT_RetargetWeaponOffsetPreview,
+    WITCH_OT_RetargetWeaponOffsetCapture,
+    WITCH_OT_RetargetWeaponOffsetBake,
     WITCH_OT_ApplyRootOrientation,
     WITCH_OT_ResampleAnimation,
     WITCH_OT_BakePelvisToTrajectory,
@@ -7078,11 +7663,53 @@ def register():
         description="Neutralize W2 retargeted trajectory/root motion while preserving pelvis motion",
         default=False,
     )
+    bpy.types.Scene.witcher_w2_retarget_hand_fit = EnumProperty(
+        name="W2 Hand Fit",
+        description="Additional hand placement fitting applied during W2 to W3 retarget",
+        items=[
+            ("WEAPON", "Weapon Grip", "Preserve W2 left-hand offset to the right weapon socket when the weapon socket is animated"),
+            ("OFF", "Rotation Only", "Use model-space rotation retarget only; do not translate hands for weapon grip"),
+        ],
+        default="WEAPON",
+    )
     bpy.types.Scene.witcher_w2_retarget_source_rig = StringProperty(
         name="W2 Source Rig",
         description="Optional W2 source .w2rig path; empty auto-selects the stock W2 player/man/woman rig",
         default="",
         subtype='FILE_PATH',
+    )
+    bpy.types.Scene.witcher_retarget_weapon_bone = EnumProperty(
+        name="Weapon Bone",
+        description="Weapon attachment bone to adjust on the current action",
+        items=[
+            ("r_weapon", "Right", "Adjust r_weapon"),
+            ("l_weapon", "Left", "Adjust l_weapon"),
+        ],
+        default="r_weapon",
+    )
+    bpy.types.Scene.witcher_retarget_weapon_offset_space = EnumProperty(
+        name="Offset Space",
+        description="How the offset vector is applied to weapon location keys",
+        items=[
+            ("SOCKET", "Socket Local", "Rotate the offset by the weapon bone rotation on each frame"),
+            ("CHANNEL", "Channel", "Add the offset directly to the weapon location channels"),
+        ],
+        default="SOCKET",
+    )
+    bpy.types.Scene.witcher_retarget_weapon_offset = FloatVectorProperty(
+        name="Weapon Offset",
+        description="Offset added to the selected weapon socket, in meters",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype='XYZ',
+        unit='LENGTH',
+    )
+    bpy.types.Scene.witcher_retarget_weapon_rotation_offset = FloatVectorProperty(
+        name="Weapon Rotation Offset",
+        description="XYZ Euler rotation offset added to the selected weapon socket",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
     )
     bpy.types.Scene.witcher_bake_every_frame = BoolProperty(
         name="Bake Every Frame",
@@ -7169,7 +7796,12 @@ def unregister():
         "witcher_prefer_uncompressed_anims",
         "witcher_w2_retarget_to_w3",
         "witcher_w2_retarget_in_place",
+        "witcher_w2_retarget_hand_fit",
         "witcher_w2_retarget_source_rig",
+        "witcher_retarget_weapon_bone",
+        "witcher_retarget_weapon_offset_space",
+        "witcher_retarget_weapon_offset",
+        "witcher_retarget_weapon_rotation_offset",
         "witcher_bake_every_frame",
         "witcher_smooth_missing_frames",
         "witcher_scale_keys_to_duration",

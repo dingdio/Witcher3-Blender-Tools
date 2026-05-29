@@ -155,6 +155,130 @@ def _vec_sub(a: Vec3, b: Vec3) -> Vec3:
     return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
 
 
+def _vec_length(a: Vec3) -> float:
+    return math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+
+
+def _vec_scale_components(a: Vec3, scale: Vec3) -> Vec3:
+    return (a[0] * scale[0], a[1] * scale[1], a[2] * scale[2])
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _safe_abs_ratio(
+    numerator: float,
+    denominator: float,
+    default: float = 1.0,
+    minimum: float = 0.75,
+    maximum: float = 1.6,
+) -> float:
+    if abs(denominator) <= _EPSILON or abs(numerator) <= _EPSILON:
+        return default
+    return _clamp(abs(numerator) / abs(denominator), minimum, maximum)
+
+
+def _blend_scale_from_identity(value: float, weight: float) -> float:
+    return 1.0 + ((value - 1.0) * weight)
+
+
+def _rest_pos_by_name(bones: Sequence, rest_positions: Sequence[Vec3], name: str) -> Optional[Vec3]:
+    name = name.lower()
+    for idx, bone in enumerate(bones):
+        if _bone_name(bone).lower() == name and idx < len(rest_positions):
+            return rest_positions[idx]
+    return None
+
+
+def _weapon_position_scale_for_side(
+    source_bones: Sequence,
+    target_bones: Sequence,
+    source_rest_pos: Sequence[Vec3],
+    target_rest_pos: Sequence[Vec3],
+    side: str,
+) -> Optional[Vec3]:
+    source_weapon = _rest_pos_by_name(source_bones, source_rest_pos, f"{side}_weapon")
+    target_weapon = _rest_pos_by_name(target_bones, target_rest_pos, f"{side}_weapon")
+    if source_weapon is None or target_weapon is None:
+        return None
+
+    # Only compensate for the W2->W3 weapon socket layout mismatch:
+    # W2 sockets are inside the hand, while W3 sockets rest near the wrist.
+    if _vec_length(source_weapon) < 0.02 or _vec_length(target_weapon) > 0.01:
+        return None
+
+    source_middle = _rest_pos_by_name(source_bones, source_rest_pos, f"{side}_middle1")
+    target_middle = _rest_pos_by_name(target_bones, target_rest_pos, f"{side}_middle1")
+    source_index = _rest_pos_by_name(source_bones, source_rest_pos, f"{side}_index1")
+    target_index = _rest_pos_by_name(target_bones, target_rest_pos, f"{side}_index1")
+    source_ring = _rest_pos_by_name(source_bones, source_rest_pos, f"{side}_ring1")
+    target_ring = _rest_pos_by_name(target_bones, target_rest_pos, f"{side}_ring1")
+    source_thumb = _rest_pos_by_name(source_bones, source_rest_pos, f"{side}_thumb1")
+    target_thumb = _rest_pos_by_name(target_bones, target_rest_pos, f"{side}_thumb1")
+    if not all((
+        source_middle,
+        target_middle,
+        source_index,
+        target_index,
+        source_ring,
+        target_ring,
+        source_thumb,
+        target_thumb,
+    )):
+        return None
+
+    raw_x_scale = _safe_abs_ratio(target_middle[0], source_middle[0], minimum=0.85, maximum=1.55)
+    x_scale = _blend_scale_from_identity(raw_x_scale, 0.8)
+    y_scale = _safe_abs_ratio(target_thumb[1], source_thumb[1], minimum=0.90, maximum=1.15)
+    z_scale = _safe_abs_ratio(
+        target_index[2] - target_ring[2],
+        source_index[2] - source_ring[2],
+        minimum=0.85,
+        maximum=1.35,
+    )
+    return (x_scale, y_scale, z_scale)
+
+
+def _attachment_position_scales(
+    source_bones: Sequence,
+    target_bones: Sequence,
+    source_rest_pos: Sequence[Vec3],
+    target_rest_pos: Sequence[Vec3],
+) -> Dict[str, Vec3]:
+    out = {}
+    for side in ("l", "r"):
+        scale = _weapon_position_scale_for_side(
+            source_bones,
+            target_bones,
+            source_rest_pos,
+            target_rest_pos,
+            side,
+        )
+        if scale is not None:
+            out[f"{side}_weapon"] = scale
+    return out
+
+
+def _position_track_is_animated(anim_bone) -> bool:
+    if anim_bone is None:
+        return False
+    frames = [_vec3(frame) for frame in (getattr(anim_bone, "positionFrames", []) or [])]
+    return len(frames) > 1 and not _frames_all_close(frames)
+
+
+def _rotation_track_is_animated(anim_bone) -> bool:
+    if anim_bone is None:
+        return False
+    rot_frames = getattr(anim_bone, "rotationFramesQuat", None) or getattr(anim_bone, "rotationFrames", None) or []
+    frames = [_quat(frame) for frame in (rot_frames or [])]
+    return len(frames) > 1 and not _quat_frames_all_close(frames)
+
+
+def _anim_bone_is_animated(anim_bone) -> bool:
+    return _position_track_is_animated(anim_bone) or _rotation_track_is_animated(anim_bone)
+
+
 def _frames_all_close(frames: Sequence[Sequence[float]], epsilon=1e-7) -> bool:
     if len(frames) <= 1:
         return True
@@ -254,6 +378,24 @@ def _world_rest_rotations(skeleton) -> List[Quat]:
     return world
 
 
+def _world_positions_from_local(
+    bones: Sequence,
+    local_positions: Sequence[Vec3],
+    world_rotations: Sequence[Quat],
+) -> List[Vec3]:
+    world = []
+    for idx, bone in enumerate(bones):
+        local_pos = local_positions[idx] if idx < len(local_positions) else (0.0, 0.0, 0.0)
+        parent_idx = _bone_parent_id(bone)
+        if 0 <= parent_idx < idx and parent_idx < len(world):
+            parent_pos = world[parent_idx]
+            parent_rot = world_rotations[parent_idx] if parent_idx < len(world_rotations) else (0.0, 0.0, 0.0, 1.0)
+            world.append(_vec_add(parent_pos, _quat_rotate_vec(parent_rot, local_pos)))
+        else:
+            world.append(local_pos)
+    return world
+
+
 def _animation_frame_count(anim_buffer, bones: Sequence) -> int:
     num_frames = int(getattr(anim_buffer, "numFrames", 0) or 0)
     if num_frames > 0:
@@ -320,6 +462,57 @@ def _default_bone_map(source_skeleton, target_skeleton, overrides=None) -> Dict[
             if target_name and source_name:
                 out[str(target_name)] = str(source_name)
     return out
+
+
+def _hand_fit_mode_enabled(hand_fit: str, mode_name: str) -> bool:
+    value = str(hand_fit or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if value in {"", "off", "none", "rotation_only"}:
+        return False
+    if mode_name == "weapon_grip":
+        return value in {"weapon", "weapon_grip", "two_hand", "two_handed", "two_handed_weapon"}
+    return False
+
+
+def _apply_weapon_grip_hand_fit(
+    *,
+    source_by_name: Dict[str, int],
+    target_by_name: Dict[str, int],
+    source_bones: Sequence,
+    target_bones: Sequence,
+    source_world_pos: Sequence[Vec3],
+    target_world_pos: List[Vec3],
+    target_world_rot: Sequence[Quat],
+    target_local_pos: List[Vec3],
+    yaw_180: Quat,
+) -> bool:
+    """Move the secondary hand so its W2 hand-to-weapon offset is preserved."""
+    source_hand_idx = source_by_name.get("l_hand")
+    source_weapon_idx = source_by_name.get("r_weapon")
+    target_hand_idx = target_by_name.get("l_hand")
+    target_weapon_idx = target_by_name.get("r_weapon")
+    if None in (source_hand_idx, source_weapon_idx, target_hand_idx, target_weapon_idx):
+        return False
+    if target_hand_idx >= len(target_bones) or target_weapon_idx >= len(target_world_pos):
+        return False
+
+    source_rel_world = _vec_sub(source_world_pos[source_hand_idx], source_world_pos[source_weapon_idx])
+    desired_rel_world = _quat_rotate_vec(yaw_180, source_rel_world)
+    desired_hand_world = _vec_add(target_world_pos[target_weapon_idx], desired_rel_world)
+
+    parent_idx = _bone_parent_id(target_bones[target_hand_idx])
+    if 0 <= parent_idx < len(target_world_pos):
+        parent_pos = target_world_pos[parent_idx]
+        parent_rot = target_world_rot[parent_idx]
+    else:
+        parent_pos = (0.0, 0.0, 0.0)
+        parent_rot = (0.0, 0.0, 0.0, 1.0)
+
+    target_local_pos[target_hand_idx] = _quat_rotate_vec(
+        _quat_inv(parent_rot),
+        _vec_sub(desired_hand_world, parent_pos),
+    )
+    target_world_pos[:] = _world_positions_from_local(target_bones, target_local_pos, target_world_rot)
+    return True
 
 
 def _stable_quat_sequence_append(frames: List[Quat], q: Quat) -> None:
@@ -405,6 +598,7 @@ def retarget_w2_animation_entry(
     target_skeleton,
     *,
     in_place: bool = False,
+    hand_fit: str = "weapon_grip",
     bone_map: Optional[Dict[str, str]] = None,
 ):
     """Return a copy of ``animation_entry`` retargeted onto ``target_skeleton``.
@@ -425,6 +619,7 @@ def retarget_w2_animation_entry(
         return animation_entry
 
     source_by_name = {_bone_name(bone).lower(): idx for idx, bone in enumerate(source_bones)}
+    target_by_name = {_bone_name(bone).lower(): idx for idx, bone in enumerate(target_bones)}
     target_map = _default_bone_map(source_skeleton, target_skeleton, overrides=bone_map)
     anim_bones_by_name = _source_anim_bone_map(anim_buffer)
     num_frames = _animation_frame_count(anim_buffer, list(anim_bones_by_name.values()))
@@ -439,6 +634,16 @@ def retarget_w2_animation_entry(
     source_rest_rot = [_bone_rest_rot(bone) for bone in source_bones]
     target_rest_pos = [_bone_rest_pos(bone) for bone in target_bones]
     target_rest_rot = [_bone_rest_rot(bone) for bone in target_bones]
+    attachment_position_scales = _attachment_position_scales(
+        source_bones,
+        target_bones,
+        source_rest_pos,
+        target_rest_pos,
+    )
+    weapon_grip_fit = (
+        _hand_fit_mode_enabled(hand_fit, "weapon_grip")
+        and _anim_bone_is_animated(anim_bones_by_name.get("r_weapon"))
+    )
 
     yaw_180 = (0.0, 0.0, 1.0, 0.0)
     yaw_180_inv = _quat_inv(yaw_180)
@@ -449,22 +654,28 @@ def retarget_w2_animation_entry(
 
     for frame_idx in range(num_frames):
         source_world_rot: List[Quat] = []
+        source_local_pos: List[Vec3] = []
         for src_idx, src_bone in enumerate(source_bones):
             src_name = _bone_name(src_bone)
             anim_bone = anim_bones_by_name.get(src_name.lower())
-            _pos, local_rot = _sample_source_local(
+            local_pos, local_rot = _sample_source_local(
                 anim_bone,
                 source_rest_pos[src_idx],
                 source_rest_rot[src_idx],
                 frame_idx,
                 base_dt,
             )
+            source_local_pos.append(local_pos)
             parent_idx = _bone_parent_id(src_bone)
             if 0 <= parent_idx < src_idx:
                 local_rot = _quat_mul(source_world_rot[parent_idx], local_rot)
             source_world_rot.append(local_rot)
+        source_world_pos = _world_positions_from_local(source_bones, source_local_pos, source_world_rot)
 
         target_world_rot: List[Quat] = []
+        target_local_rot: List[Quat] = []
+        target_local_pos: List[Vec3] = []
+        target_world_pos: List[Vec3] = []
         for tgt_idx, tgt_bone in enumerate(target_bones):
             target_name = _bone_name(tgt_bone)
             target_key = target_name.lower()
@@ -480,12 +691,6 @@ def retarget_w2_animation_entry(
             if target_key == "root":
                 local_rot = target_rest_rot[tgt_idx]
                 desired_world_rot = _quat_mul(parent_world_rot, local_rot)
-            elif target_key in _ATTACHMENT_TRANSFER_BONES and source_idx is not None:
-                # W3 weapon attachment bones rest at the wrist; W2 weapon bones
-                # are already posed in the hand. Transfer the full W2 hand-space
-                # transform instead of only the animation delta from rest.
-                desired_world_rot = _quat_mul(_quat_mul(yaw_180, source_world_rot[source_idx]), yaw_180_inv)
-                local_rot = _quat_mul(_quat_inv(parent_world_rot), desired_world_rot)
             elif source_idx is not None:
                 src_delta_world = _quat_mul(source_world_rot[source_idx], _quat_inv(source_rest_world_rot[source_idx]))
                 rotated_delta = _quat_mul(_quat_mul(yaw_180, src_delta_world), yaw_180_inv)
@@ -504,6 +709,12 @@ def retarget_w2_animation_entry(
                     frame_idx,
                     base_dt,
                 )
+                position_scale = attachment_position_scales.get(target_key)
+                if (
+                    position_scale is not None
+                    and (target_key == "r_weapon" or _position_track_is_animated(anim_bone))
+                ):
+                    source_local_pos = _vec_scale_components(source_local_pos, position_scale)
                 source_parent_idx = _bone_parent_id(source_bones[source_idx])
                 source_parent_world_rot = (
                     source_world_rot[source_parent_idx]
@@ -527,8 +738,31 @@ def retarget_w2_animation_entry(
                 local_pos = target_rest_pos[tgt_idx]
 
             target_world_rot.append(desired_world_rot)
-            pos_by_name[target_name].append(local_pos)
-            _stable_quat_sequence_append(rot_by_name[target_name], local_rot)
+            target_local_rot.append(local_rot)
+            target_local_pos.append(local_pos)
+            if 0 <= parent_idx < len(target_world_pos):
+                parent_world_pos = target_world_pos[parent_idx]
+                target_world_pos.append(_vec_add(parent_world_pos, _quat_rotate_vec(parent_world_rot, local_pos)))
+            else:
+                target_world_pos.append(local_pos)
+
+        if weapon_grip_fit:
+            _apply_weapon_grip_hand_fit(
+                source_by_name=source_by_name,
+                target_by_name=target_by_name,
+                source_bones=source_bones,
+                target_bones=target_bones,
+                source_world_pos=source_world_pos,
+                target_world_pos=target_world_pos,
+                target_world_rot=target_world_rot,
+                target_local_pos=target_local_pos,
+                yaw_180=yaw_180,
+            )
+
+        for tgt_idx, target_bone in enumerate(target_bones):
+            target_name = _bone_name(target_bone)
+            pos_by_name[target_name].append(target_local_pos[tgt_idx])
+            _stable_quat_sequence_append(rot_by_name[target_name], target_local_rot[tgt_idx])
             scale_by_name[target_name].append((1.0, 1.0, 1.0))
 
     rest_pos_by_name = {_bone_name(bone): target_rest_pos[idx] for idx, bone in enumerate(target_bones)}

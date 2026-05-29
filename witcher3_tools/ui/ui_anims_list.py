@@ -1652,12 +1652,14 @@ def _retarget_w2_animation_entry(context, animation_entry, source_rig_path, targ
         raise RuntimeError("W2 retarget needs both source W2 rig and target W3 rig paths.")
     source_skeleton = load_bin_skeleton(source_rig_path)
     target_skeleton = load_bin_skeleton(target_rig_path)
-    in_place = bool(getattr(getattr(context, "scene", None), "witcher_w2_retarget_in_place", True))
+    in_place = bool(getattr(getattr(context, "scene", None), "witcher_w2_retarget_in_place", False))
+    hand_fit = str(getattr(getattr(context, "scene", None), "witcher_w2_retarget_hand_fit", "WEAPON") or "WEAPON")
     return retarget_w2_animation_entry(
         animation_entry,
         source_skeleton,
         target_skeleton,
         in_place=in_place,
+        hand_fit=hand_fit,
     )
 
 
