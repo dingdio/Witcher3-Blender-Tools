@@ -2006,6 +2006,62 @@ def is_node_export_enabled(node) -> bool:
     return bool(getattr(node, "witcher_export", True))
 
 
+_AUXILIARY_TEXTURE_ALPHA_LINKS = {
+    "Roughness": "Normal",
+    "Alpha": "Diffuse",
+}
+
+
+def _node_material_param_name(node) -> str:
+    if node is None:
+        return ""
+    for prop_name in ("witcher_material_source_param", "witcher_param_name"):
+        value = _node_string_prop(node, prop_name)
+        if value:
+            return _NUMERIC_SUFFIX_RE.sub("", value.strip())
+    for attr_name in ("name", "label"):
+        value = str(getattr(node, attr_name, "") or "").strip()
+        if value:
+            return _NUMERIC_SUFFIX_RE.sub("", value)
+    return ""
+
+
+def _linked_node_feeds_group_input(input_socket, linked_node, param_name: str) -> bool:
+    group_node = getattr(input_socket, "node", None)
+    target_socket = find_group_input_socket(group_node, param_name) if group_node is not None else None
+    if target_socket is None or not getattr(target_socket, "is_linked", False):
+        return False
+    for link in getattr(target_socket, "links", []) or []:
+        if getattr(link, "from_node", None) is linked_node:
+            return True
+    return False
+
+
+def is_auxiliary_material_display_link(input_socket, linked_socket=None, linked_node=None) -> bool:
+    """Return True for Blender preview links that should not become export params."""
+    if input_socket is None:
+        return False
+    if linked_socket is None:
+        links = getattr(input_socket, "links", None) or []
+        linked_socket = getattr(links[0], "from_socket", None) if links else None
+    if linked_node is None and linked_socket is not None:
+        linked_node = getattr(linked_socket, "node", None)
+    if linked_node is None or getattr(linked_node, "type", "") != 'TEX_IMAGE':
+        return False
+
+    linked_socket_name = str(getattr(linked_socket, "name", "") or getattr(linked_socket, "identifier", "") or "")
+    if linked_socket_name != "Alpha":
+        return False
+
+    input_name = str(getattr(input_socket, "name", "") or "")
+    source_param = _AUXILIARY_TEXTURE_ALPHA_LINKS.get(input_name)
+    if not source_param:
+        return False
+
+    node_param = _node_material_param_name(linked_node)
+    return node_param == source_param or _linked_node_feeds_group_input(input_socket, linked_node, source_param)
+
+
 def _expected_export_param_type(mat_props, node_ng, input_socket, linked_node) -> str:
     item = _find_base_read_item_for_socket(mat_props, node_ng, input_socket)
     if item is not None:
@@ -2063,6 +2119,8 @@ def _export_param_type_matches(expected: str, actual: str) -> bool:
 def _linked_socket_type_validation_issue(material, input_socket, primary_node, *, store: bool = True) -> str:
     if material is None or input_socket is None or primary_node is None:
         return ""
+    if is_auxiliary_material_display_link(input_socket, linked_node=primary_node):
+        return ""
     props = getattr(material, "witcher_props", None)
     node_ng = get_active_witcher_group_node(material)
     expected_type = _expected_export_param_type(props, node_ng, input_socket, primary_node)
@@ -2091,6 +2149,8 @@ def validate_material_export_params(material) -> list[str]:
             continue
         linked_socket = input_socket.links[0].from_socket
         linked_node = linked_socket.node
+        if is_auxiliary_material_display_link(input_socket, linked_socket, linked_node):
+            continue
         if not bool(getattr(linked_node, "witcher_include", False)):
             continue
         if not is_node_export_enabled(linked_node):
@@ -2309,6 +2369,8 @@ class WITCH_PT_materials(bpy.types.Panel):
             return None
         linked_socket = input_socket.links[0].from_socket
         linked_node = linked_socket.node
+        if is_auxiliary_material_display_link(input_socket, linked_socket, linked_node):
+            return None
         promoted = bool(getattr(linked_node, "witcher_include", False))
         user_linked = _is_user_created_linked_node(linked_node)
         if not promoted and not user_linked:

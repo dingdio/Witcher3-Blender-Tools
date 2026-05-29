@@ -125,6 +125,7 @@ from ..w3_material_nodes import (
     get_socket_value,
     get_repo_from_abs_path,
     get_texarray_group_value,
+    is_auxiliary_material_display_link,
     is_node_export_enabled,
     is_path_resolved,
     validate_material_export_params,
@@ -278,6 +279,8 @@ def get_mesh_material_info(mesh_bl, mesh_obj=None):
                 for input_socket in group_inputs:
                     if input_socket.is_linked:
                         linked_socket = input_socket.links[0].from_socket
+                        if is_auxiliary_material_display_link(input_socket, linked_socket, linked_socket.node):
+                            continue
                         if linked_socket.node.witcher_include and is_node_export_enabled(linked_socket.node):
 
                             if linked_socket.node.type == 'GROUP':
