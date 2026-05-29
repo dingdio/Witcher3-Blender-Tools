@@ -35,7 +35,7 @@ _WORLD_LAYER_INDEX_CACHE = {}
 _WORLD_LAYER_RUNTIME_CACHE = {}
 _LAYER_VISIBILITY_CACHE = {}
 _DEFAULT_HIDDEN_GROUP_CACHE = {}
-_WORLD_LAYER_SCAN_CACHE_VERSION = 6
+_WORLD_LAYER_SCAN_CACHE_VERSION = 7
 _WORLD_LAYER_SPATIAL_CELL_SIZE = 10.0
 _LAYER_SCAN_BATCH_SIZE = 16
 _LAYER_LOAD_BATCH_SIZE = 8
@@ -48,6 +48,7 @@ _LAYER_SCAN_TIMING_PROGRESS_INTERVAL = 100
 _LAYER_LOAD_TIMING_ENABLED = True
 _LAYER_LOAD_LAYER_WARN_THRESHOLD = 0.25
 _LAYER_LOAD_TIMING_PROGRESS_INTERVAL = 25
+_LAYER_SCAN_DEPENDENCY_RESOLVE_LOCK = threading.RLock()
 _MAP_IMPORT_PROFILE_LOG_FORMAT = "%(asctime)s %(levelname)8s %(name)s %(message)s"
 _MAP_IMPORT_PROFILE_LOG_DATEFMT = "%H:%M:%S"
 _layer_stream_last_redraw_ts = 0.0
@@ -1036,13 +1037,14 @@ def _resolve_level_dependency_for_scan(level_path, version, resolve_config):
         return ""
 
     def try_repo_file():
-        for rel in variants:
-            try:
-                candidate = repo_file(rel, version)
-            except Exception:
-                candidate = ""
-            if candidate and os.path.isfile(candidate):
-                return os.path.normpath(candidate)
+        with _LAYER_SCAN_DEPENDENCY_RESOLVE_LOCK:
+            for rel in variants:
+                try:
+                    candidate = repo_file(rel, version)
+                except Exception:
+                    candidate = ""
+                if candidate and os.path.isfile(candidate):
+                    return os.path.normpath(candidate)
         return ""
 
     resolved = try_roots(primary_roots)
@@ -1105,7 +1107,11 @@ def _open_world_layer_cache_db(cache_path):
             max_y REAL,
             object_count INTEGER NOT NULL,
             has_manifest INTEGER NOT NULL,
+            manifest_complete INTEGER NOT NULL,
             import_item_count INTEGER NOT NULL,
+            scan_backend TEXT NOT NULL,
+            unresolved_json TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
             items_json TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS item_spatial (
@@ -1157,6 +1163,22 @@ def _reset_world_layer_cache_db(conn, world_path=""):
     )
 
 
+def _world_layer_plan_hash(items, manifest_complete=True):
+    if not manifest_complete:
+        return ""
+    try:
+        payload = json.dumps(list(items or []), sort_keys=True, separators=(",", ":"))
+    except Exception:
+        payload = "[]"
+    return hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest()
+
+
+def _entry_manifest_complete(entry):
+    if not isinstance(entry, dict):
+        return False
+    return bool(entry.get("has_manifest", False)) and bool(entry.get("manifest_complete", True))
+
+
 def _load_world_layer_cache_entry(conn, level_key, *, include_items=False):
     if conn is None or not level_key:
         return None
@@ -1164,7 +1186,8 @@ def _load_world_layer_cache_entry(conn, level_key, *, include_items=False):
         """
         SELECT level_path, resolved_path, file_mtime, file_size,
                has_bounds, min_x, min_y, max_x, max_y,
-               object_count, has_manifest, import_item_count, items_json
+               object_count, has_manifest, manifest_complete, import_item_count,
+               scan_backend, unresolved_json, plan_hash, items_json
         FROM layers
         WHERE level_key = ?
         """,
@@ -1181,9 +1204,17 @@ def _load_world_layer_cache_entry(conn, level_key, *, include_items=False):
         "file_size": int(row["file_size"] or 0),
         "has_bounds": has_bounds,
         "has_manifest": bool(int(row["has_manifest"] or 0)),
+        "manifest_complete": bool(int(row["manifest_complete"] or 0)),
         "object_count": int(row["object_count"] or 0),
         "import_item_count": int(row["import_item_count"] or 0),
+        "scan_backend": str(row["scan_backend"] or ""),
+        "plan_hash": str(row["plan_hash"] or ""),
     }
+    try:
+        unresolved = json.loads(str(row["unresolved_json"] or "[]"))
+    except Exception:
+        unresolved = []
+    entry["unresolved_dependencies"] = unresolved if isinstance(unresolved, list) else []
     if has_bounds:
         entry.update({
             "min_x": float(row["min_x"] or 0.0),
@@ -1225,13 +1256,24 @@ def _store_world_layer_cache_entry(conn, level_key, entry):
     except Exception:
         items_json = "[]"
     has_bounds = bool(entry.get("has_bounds", False))
+    has_manifest = bool(entry.get("has_manifest", False))
+    manifest_complete = has_manifest and bool(entry.get("manifest_complete", True))
+    unresolved_dependencies = list(entry.get("unresolved_dependencies", []) or [])
+    if unresolved_dependencies:
+        manifest_complete = False
+    try:
+        unresolved_json = json.dumps(unresolved_dependencies, separators=(",", ":"))
+    except Exception:
+        unresolved_json = "[]"
+    plan_hash = _world_layer_plan_hash(items, manifest_complete=manifest_complete) if has_manifest else ""
     conn.execute(
         """
         INSERT INTO layers (
             level_key, level_path, resolved_path, file_mtime, file_size,
             has_bounds, min_x, min_y, max_x, max_y,
-            object_count, has_manifest, import_item_count, items_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            object_count, has_manifest, manifest_complete, import_item_count,
+            scan_backend, unresolved_json, plan_hash, items_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(level_key) DO UPDATE SET
             level_path = excluded.level_path,
             resolved_path = excluded.resolved_path,
@@ -1244,7 +1286,11 @@ def _store_world_layer_cache_entry(conn, level_key, entry):
             max_y = excluded.max_y,
             object_count = excluded.object_count,
             has_manifest = excluded.has_manifest,
+            manifest_complete = excluded.manifest_complete,
             import_item_count = excluded.import_item_count,
+            scan_backend = excluded.scan_backend,
+            unresolved_json = excluded.unresolved_json,
+            plan_hash = excluded.plan_hash,
             items_json = excluded.items_json
         """,
         (
@@ -1259,14 +1305,22 @@ def _store_world_layer_cache_entry(conn, level_key, entry):
             float(entry.get("max_x", 0.0) or 0.0) if has_bounds else None,
             float(entry.get("max_y", 0.0) or 0.0) if has_bounds else None,
             int(entry.get("object_count", 0) or 0),
-            1 if entry.get("has_manifest", False) else 0,
+            1 if has_manifest else 0,
+            1 if manifest_complete else 0,
             int(entry.get("import_item_count", 0) or 0),
+            str(entry.get("scan_backend", "") or ""),
+            unresolved_json,
+            plan_hash,
             items_json,
         ),
     )
+    entry["manifest_complete"] = manifest_complete
+    entry["unresolved_dependencies"] = unresolved_dependencies
+    entry["plan_hash"] = plan_hash
     conn.execute("DELETE FROM item_spatial WHERE level_key = ?", (level_key,))
     spatial_rows = []
-    for item in items:
+    spatial_items = items if manifest_complete else []
+    for item in spatial_items:
         if not isinstance(item, dict) or not _manifest_countable_item(item):
             continue
         position = _manifest_item_position(item)
@@ -1304,6 +1358,10 @@ def _make_world_layer_index_entry(collection_name, level_path, level_key, cache_
         "object_count": int(cache_entry.get("object_count", 0) or 0),
         "import_item_count": int(cache_entry.get("import_item_count", 0) or 0),
         "has_manifest": bool(cache_entry.get("has_manifest", False)),
+        "manifest_complete": bool(cache_entry.get("manifest_complete", True)),
+        "scan_backend": str(cache_entry.get("scan_backend", "") or ""),
+        "plan_hash": str(cache_entry.get("plan_hash", "") or ""),
+        "unresolved_dependencies": list(cache_entry.get("unresolved_dependencies", []) or []),
     }
     if cache_entry.get("has_bounds", False):
         entry.update({
@@ -1447,7 +1505,22 @@ def _query_world_layer_cache_nearby_counts(index, camera_position, radius, skip_
         _close_world_layer_cache_db(conn)
     if row is None:
         return 0, 0
-    return int(row["nearby_items"] or 0), int(row["nearby_layers"] or 0)
+    nearby_items = int(row["nearby_items"] or 0)
+    nearby_layers = int(row["nearby_layers"] or 0)
+    fallback_layers = 0
+    for entry in index.get("entries", []) or []:
+        level_key = str(entry.get("level_key", "") or "").strip()
+        if not level_key or level_key in skip_level_keys or _entry_manifest_complete(entry):
+            continue
+        if "min_x" not in entry:
+            continue
+        if _distance_sq_to_bounds_xy(
+            float(camera_position[0]),
+            float(camera_position[1]),
+            entry,
+        ) <= radius_sq:
+            fallback_layers += 1
+    return nearby_items, nearby_layers + fallback_layers
 
 
 def _new_layer_load_timing_totals():
@@ -1501,19 +1574,33 @@ def _world_layer_complete_level_keys(index, camera_position=None, radius=None, m
             return cached
     started = time.perf_counter()
     skip_level_keys = set()
+    entry_by_level_key = _world_layer_entry_map(index)
     collection_total = 0
     complete_count = 0
     covered_count = 0
     for collection in bpy.data.collections:
         collection_total += 1
-        if _collection_has_loaded_content(collection, mode_signature=mode_signature):
-            level_key = _collection_level_key(collection)
+        level_key = _collection_level_key(collection)
+        entry = entry_by_level_key.get(level_key) if level_key else None
+        if entry is not None and not _entry_manifest_complete(entry):
+            continue
+        expected_plan_hash = str((entry or {}).get("plan_hash", "") or "")
+        if _collection_has_loaded_content(
+            collection,
+            mode_signature=mode_signature,
+            expected_plan_hash=expected_plan_hash,
+        ):
             if level_key:
                 skip_level_keys.add(level_key)
                 complete_count += 1
             continue
-        if use_cover_check and _layer_covered_by_previous_load(collection, camera_position, radius, mode_signature=mode_signature):
-            level_key = _collection_level_key(collection)
+        if use_cover_check and _layer_covered_by_previous_load(
+            collection,
+            camera_position,
+            radius,
+            mode_signature=mode_signature,
+            expected_plan_hash=expected_plan_hash,
+        ):
             if level_key:
                 skip_level_keys.add(level_key)
                 covered_count += 1
@@ -1543,7 +1630,11 @@ def _update_world_layer_complete_state(index, entry=None, collection=None):
     target_collection = collection
     if target_collection is None and isinstance(entry, dict):
         target_collection = bpy.data.collections.get(str(entry.get("collection_name", "") or ""))
-    if _collection_has_loaded_content(target_collection):
+    if isinstance(entry, dict) and not _entry_manifest_complete(entry):
+        complete_level_keys.discard(level_key)
+        return
+    expected_plan_hash = str((entry or {}).get("plan_hash", "") or "") if isinstance(entry, dict) else ""
+    if _collection_has_loaded_content(target_collection, expected_plan_hash=expected_plan_hash):
         complete_level_keys.add(level_key)
     else:
         complete_level_keys.discard(level_key)
@@ -1664,8 +1755,13 @@ def _query_world_layer_runtime_nearby(index, camera_position, radius, skip_compl
     skip_collection_names = set()
     if skip_complete:
         for entry in index.get("entries", []):
+            if not _entry_manifest_complete(entry):
+                continue
             collection = bpy.data.collections.get(entry.get("collection_name", ""))
-            if collection is not None and _collection_has_loaded_content(collection):
+            if collection is not None and _collection_has_loaded_content(
+                collection,
+                expected_plan_hash=str(entry.get("plan_hash", "") or ""),
+            ):
                 skip_collection_names.add(collection.name)
 
     nearby_layers = set()
@@ -1966,6 +2062,9 @@ def _build_fast_empty_layer_cache_entry(level_path, resolved_path, file_mtime, f
         "has_bounds": False,
         "object_count": 0,
         "has_manifest": False,
+        "manifest_complete": True,
+        "unresolved_dependencies": [],
+        "scan_backend": "empty",
         "import_item_count": 0,
         "items": [],
         "_fast_skip": True,
@@ -2260,7 +2359,14 @@ def _build_level_and_manifest(
     timing_info=None,
 ):
     if cr2w_file is None:
-        return {"has_manifest": False, "import_item_count": 0, "items": []}
+        return {
+            "has_manifest": False,
+            "manifest_complete": False,
+            "unresolved_dependencies": [],
+            "scan_backend": "full",
+            "import_item_count": 0,
+            "items": [],
+        }
     manifest_started = time.perf_counter()
     create_level_seconds = 0.0
     resolve_plan_seconds = 0.0
@@ -2303,7 +2409,20 @@ def _build_level_and_manifest(
         resolve_plan_seconds = time.perf_counter() - resolve_started
     except Exception as exc:
         log.warning("Failed to resolve layer manifest for %s: %s", resolved_path, exc)
-        return {"has_manifest": False, "import_item_count": 0, "items": []}
+        return {
+            "has_manifest": False,
+            "manifest_complete": False,
+            "unresolved_dependencies": [
+                {
+                    "path": str(resolved_path or ""),
+                    "source": str(resolved_path or ""),
+                    "reason": str(exc),
+                }
+            ],
+            "scan_backend": "full",
+            "import_item_count": 0,
+            "items": [],
+        }
     finally:
         if timing_info is not None:
             timing_info["create_level_seconds"] = create_level_seconds
@@ -2317,6 +2436,9 @@ def _build_level_and_manifest(
             import_item_count += 1
     return {
         "has_manifest": True,
+        "manifest_complete": True,
+        "unresolved_dependencies": [],
+        "scan_backend": "full",
         "import_item_count": int(import_item_count),
         "items": items,
     }
@@ -2340,13 +2462,14 @@ def _scan_level_cache_entry(
     resolve_config=None,
     mesh_fbx_uncook_path=None,
     mesh_uncook_path=None,
+    force_full_parse=False,
 ):
     layer_started = time.perf_counter()
     parse_started = time.perf_counter()
     export_summary = _summarize_level_exports_for_fast_scan(
         _read_level_export_names_lightweight(resolved_path)
     )
-    if export_summary is not None and not export_summary.get("requires_full_parse", True):
+    if not force_full_parse and export_summary is not None and not export_summary.get("requires_full_parse", True):
         parse_seconds = time.perf_counter() - parse_started
         entry = _build_fast_empty_layer_cache_entry(
             level_path,
@@ -2373,30 +2496,31 @@ def _scan_level_cache_entry(
                 resolve_config,
             )
         )
-    fast_entry = fast_cache_scan.scan_cache_entry(
-        level_path,
-        resolved_path,
-        file_mtime,
-        file_size,
-        dependency_resolver=dependency_resolver,
-        dependency_loader=(
-            (lambda dep_path: _load_layer_scan_fast_dependency(dep_path, dependency_cache, resolve_config=resolve_config))
-            if dependency_cache is not None
-            else None
-        ),
-    )
-    if fast_entry is not None:
-        parse_seconds = time.perf_counter() - parse_started
-        fast_entry["_timing"] = {
-            "parse_seconds": parse_seconds,
-            "bounds_seconds": 0.0,
-            "manifest_seconds": 0.0,
-            "create_level_seconds": 0.0,
-            "resolve_plan_seconds": 0.0,
-            "total_seconds": time.perf_counter() - layer_started,
-        }
-        fast_entry["_fast_scan"] = True
-        return fast_entry
+    if not force_full_parse:
+        fast_entry = fast_cache_scan.scan_cache_entry(
+            level_path,
+            resolved_path,
+            file_mtime,
+            file_size,
+            dependency_resolver=dependency_resolver,
+            dependency_loader=(
+                (lambda dep_path: _load_layer_scan_fast_dependency(dep_path, dependency_cache, resolve_config=resolve_config))
+                if dependency_cache is not None
+                else None
+            ),
+        )
+        if fast_entry is not None:
+            parse_seconds = time.perf_counter() - parse_started
+            fast_entry["_timing"] = {
+                "parse_seconds": parse_seconds,
+                "bounds_seconds": 0.0,
+                "manifest_seconds": 0.0,
+                "create_level_seconds": 0.0,
+                "resolve_plan_seconds": 0.0,
+                "total_seconds": time.perf_counter() - layer_started,
+            }
+            fast_entry["_fast_scan"] = True
+            return fast_entry
 
     cr2w_file = _parse_level_cr2w(resolved_path)
     parse_seconds = time.perf_counter() - parse_started
@@ -2468,6 +2592,7 @@ def _get_world_layer_index(context, root_collection, rebuild=False, show_progres
         "missing": 0,
         "no_bounds": 0,
         "fast_skipped": 0,
+        "incomplete_manifests": 0,
     }
     progress_context = (
         _OperatorProgress(context, len(layer_collections), progress_title)
@@ -2611,6 +2736,7 @@ def _hydrate_world_layer_index_from_disk(context, root_collection):
             "missing": 0,
             "no_bounds": 0,
             "fast_skipped": 0,
+            "incomplete_manifests": 0,
         }
         for collection in _iter_layer_info_collections(root_collection):
             level_path = str(collection.get("level_path", "")).strip()
@@ -2919,6 +3045,7 @@ def _start_layer_scan_phase(job, context, root_collection, rebuild=False, title=
             "missing": 0,
             "no_bounds": 0,
             "fast_skipped": 0,
+            "incomplete_manifests": 0,
             "template_cache_hits": 0,
             "template_cache_misses": 0,
             "template_cache_stores": 0,
@@ -2995,6 +3122,7 @@ def _finalize_layer_scan_index(job, root_collection):
             f"fast-path {int(stats.get('fast_scanned', 0))}, missing {int(stats.get('missing', 0))}, "
             f"no bounds {int(stats.get('no_bounds', 0))}, "
             f"fast-skipped {int(stats.get('fast_skipped', 0))}, "
+            f"incomplete {int(stats.get('incomplete_manifests', 0))}, "
             f"template reuse {int(stats.get('template_cache_hits', 0))} hits / {int(stats.get('template_cache_stores', 0))} unique)"
         ),
     )
@@ -3043,6 +3171,8 @@ def _finalize_layer_scan_index(job, root_collection):
 
 
 def _record_scan_entry(scan, work_item, updated_entry):
+    if updated_entry.get("has_manifest", False) and not _entry_manifest_complete(updated_entry):
+        scan["stats"]["incomplete_manifests"] = int(scan["stats"].get("incomplete_manifests", 0) or 0) + 1
     if not updated_entry.get("has_bounds", False):
         scan["stats"]["no_bounds"] += 1
         if updated_entry.get("_fast_skip", False):
@@ -3231,6 +3361,15 @@ def _process_layer_scan_batch(job, context):
                         "file_size": item["file_size"],
                         "has_bounds": False,
                         "has_manifest": False,
+                        "manifest_complete": False,
+                        "unresolved_dependencies": [
+                            {
+                                "path": item["resolved_path"],
+                                "source": item["resolved_path"],
+                                "reason": str(exc),
+                            }
+                        ],
+                        "scan_backend": "failed",
                         "import_item_count": 0,
                         "items": [],
                     }
@@ -3375,20 +3514,18 @@ def _query_world_layer_cache_nearby_candidates(
         )
     materialize_seconds = time.perf_counter() - materialize_started
 
-    # Fallback for layers missing manifest rows: use bounds-only candidate selection.
+    # Fallback for layers missing a complete manifest: use bounds-only candidate selection.
     fallback_started = time.perf_counter()
     for entry in index.get("entries", []):
         level_key = str(entry.get("level_key", "") or "").strip()
         if not level_key or level_key in seen_level_keys or level_key in skip_level_keys:
             continue
-        if entry.get("has_manifest", False):
+        if _entry_manifest_complete(entry):
             continue
         if "min_x" not in entry:
             continue
         collection = bpy.data.collections.get(entry.get("collection_name", ""))
         if collection is None:
-            continue
-        if skip_complete and _layer_should_skip_for_load(collection, camera_position, radius_value, mode_signature=mode_signature):
             continue
         distance_sq = _distance_sq_to_bounds_xy(
             float(camera_position[0]),
@@ -3420,9 +3557,9 @@ def _query_world_layer_cache_nearby_candidates(
 def _load_cached_plan_items_for_entry(index, entry):
     if not isinstance(entry, dict):
         return None
-    if "items" in entry:
+    if "items" in entry and _entry_manifest_complete(entry):
         return list(entry.get("items", []) or [])
-    if not entry.get("has_manifest", False):
+    if not _entry_manifest_complete(entry):
         return None
     if str(index.get("cache_backend", "") or "").strip().lower() != "sqlite":
         return None
@@ -3439,6 +3576,88 @@ def _load_cached_plan_items_for_entry(index, entry):
         _close_world_layer_cache_db(conn)
     entry["items"] = list(items or [])
     return entry["items"]
+
+
+def _repair_incomplete_layer_manifest_for_load(context, root_collection, index, entry):
+    if _entry_manifest_complete(entry):
+        return True
+    if root_collection is None or not isinstance(index, dict) or not isinstance(entry, dict):
+        return False
+
+    level_path = str(entry.get("level_path", "") or "").strip()
+    level_key = str(entry.get("level_key", "") or "").strip()
+    collection_name = str(entry.get("collection_name", "") or "").strip()
+    if not level_path or not level_key:
+        return False
+
+    resolved_path = _resolve_level_file(context, level_path, root_collection)
+    if not resolved_path or not os.path.isfile(resolved_path):
+        return False
+    try:
+        file_mtime = float(os.path.getmtime(resolved_path))
+        file_size = int(os.path.getsize(resolved_path))
+    except OSError:
+        return False
+
+    try:
+        mesh_fbx_uncook_path = get_fbx_uncook_path(context)
+    except Exception:
+        mesh_fbx_uncook_path = ""
+    try:
+        mesh_uncook_path = get_uncook_path(context)
+    except Exception:
+        mesh_uncook_path = ""
+
+    repair_started = time.perf_counter()
+    repaired_entry = _scan_level_cache_entry(
+        level_path,
+        resolved_path,
+        file_mtime,
+        file_size,
+        dependency_cache=_new_layer_scan_dependency_cache(),
+        resolve_config=_build_scan_resolve_config(context, root_collection),
+        mesh_fbx_uncook_path=mesh_fbx_uncook_path,
+        mesh_uncook_path=mesh_uncook_path,
+        force_full_parse=True,
+    )
+    if not isinstance(repaired_entry, dict):
+        return False
+    repaired_entry.pop("_timing", None)
+
+    cache_path = str(index.get("cache_path", "") or "").strip()
+    if cache_path:
+        conn = _open_world_layer_cache_db(cache_path)
+        if conn is not None:
+            try:
+                _store_world_layer_cache_entry(conn, level_key, repaired_entry)
+                _close_world_layer_cache_db(conn, commit=True)
+                conn = None
+            finally:
+                if conn is not None:
+                    _close_world_layer_cache_db(conn, rollback=True)
+
+    repaired_index_entry = _make_world_layer_index_entry(
+        collection_name,
+        level_path,
+        level_key,
+        repaired_entry,
+        include_items=_entry_manifest_complete(repaired_entry),
+    )
+    entry.clear()
+    entry.update(repaired_index_entry)
+    if _entry_manifest_complete(repaired_entry):
+        entry["items"] = list(repaired_entry.get("items", []) or [])
+
+    unresolved_count = len(repaired_entry.get("unresolved_dependencies", []) or [])
+    _log_layer_load_timing_warning(
+        "repaired layer manifest %s with full parser in %s (complete %s, items %d, unresolved %d)",
+        collection_name or level_path,
+        _format_layer_scan_timing(time.perf_counter() - repair_started),
+        "yes" if _entry_manifest_complete(repaired_entry) else "no",
+        int(repaired_entry.get("import_item_count", 0) or 0),
+        int(unresolved_count),
+    )
+    return _entry_manifest_complete(repaired_entry)
 
 
 def _prepare_layer_load_phase(job, context):
@@ -3482,7 +3701,13 @@ def _prepare_layer_load_phase(job, context):
             collection = bpy.data.collections.get(entry["collection_name"])
             if collection is None:
                 continue
-            if skip_complete and _layer_should_skip_for_load(collection, camera_position, radius, mode_signature=mode_signature):
+            if skip_complete and _entry_manifest_complete(entry) and _layer_should_skip_for_load(
+                collection,
+                camera_position,
+                radius,
+                mode_signature=mode_signature,
+                expected_plan_hash=str(entry.get("plan_hash", "") or ""),
+            ):
                 skipped_complete += 1
                 continue
             nearby_item_count, nearest_item_sq = _count_nearby_manifest_items_for_entry(
@@ -3642,6 +3867,7 @@ def _process_layer_load_batch(job, context):
     total = int(load.get("total", 0) or 0)
     if total <= 0:
         return True
+    root_collection = bpy.data.collections.get(job.get("root_collection_name", ""))
 
     batch_end = min(int(load.get("index", 0) or 0) + _LAYER_LOAD_BATCH_SIZE, total)
     while int(load.get("index", 0) or 0) < batch_end and not job.get("cancel_requested"):
@@ -3662,6 +3888,20 @@ def _process_layer_load_batch(job, context):
             resolved = ""
             err = "Collection no longer exists"
         else:
+            if not _entry_manifest_complete(entry):
+                _set_layer_stream_progress(
+                    job,
+                    "Loading nearby layers",
+                    load["index"] - 1,
+                    total,
+                    f"Rebuilding layer manifest {load['index']}/{total}: {collection_name}",
+                )
+                _repair_incomplete_layer_manifest_for_load(
+                    context,
+                    root_collection,
+                    job.get("index_data") or {},
+                    entry,
+                )
             plan_started = time.perf_counter()
             cached_plan_items = _load_cached_plan_items_for_entry(job.get("index_data") or {}, entry)
             plan_load_seconds = time.perf_counter() - plan_started
@@ -3678,6 +3918,7 @@ def _process_layer_load_batch(job, context):
                 cancel_check=lambda: bool(job.get("cancel_requested")),
                 import_settings=job.get("import_kwargs"),
                 mode_signature=job.get("mode_signature"),
+                plan_hash=entry.get("plan_hash"),
             )
             import_seconds = time.perf_counter() - import_started
 
@@ -3796,6 +4037,7 @@ def _finish_layer_stream_job(operator, context, cancelled=False, failed=False):
                 f"cached {int(stats.get('cache_hits', 0)):,}, fast-path {int(stats.get('fast_scanned', 0)):,}, "
                 f"missing {int(stats.get('missing', 0)):,}, "
                 f"no bounds {int(stats.get('no_bounds', 0)):,}, fast-skipped {int(stats.get('fast_skipped', 0)):,}, "
+                f"incomplete {int(stats.get('incomplete_manifests', 0)):,}, "
                 f"template reuse {int(stats.get('template_cache_hits', 0)):,} hits "
                 f"across {int(stats.get('template_cache_stores', 0)):,} unique dependencies."
             )
@@ -3807,6 +4049,7 @@ def _finish_layer_stream_job(operator, context, cancelled=False, failed=False):
                 f"fast-path {int(stats.get('fast_scanned', 0))}, missing {int(stats.get('missing', 0))}, "
                 f"no bounds {int(stats.get('no_bounds', 0))}, "
                 f"fast-skipped {int(stats.get('fast_skipped', 0))}, "
+                f"incomplete {int(stats.get('incomplete_manifests', 0))}, "
                 f"template reuse {int(stats.get('template_cache_hits', 0))} hits / {int(stats.get('template_cache_stores', 0))} unique)"
             )
             level = 'INFO'
@@ -3854,7 +4097,7 @@ def _finish_layer_stream_job(operator, context, cancelled=False, failed=False):
     return {'CANCELLED'} if (cancelled or failed) else {'FINISHED'}
 
 
-def _collection_has_loaded_content(collection, mode_signature=None):
+def _collection_has_loaded_content(collection, mode_signature=None, expected_plan_hash=None):
     if collection is None:
         return False
     state = str(collection.get("witcher_layer_import_state", "") or "").strip().lower()
@@ -3864,10 +4107,15 @@ def _collection_has_loaded_content(collection, mode_signature=None):
         prev_mode = str(collection.get("witcher_layer_load_mode", "") or "")
         if prev_mode and prev_mode != str(mode_signature):
             return False
+    expected_hash = str(expected_plan_hash or "").strip()
+    if expected_hash:
+        previous_hash = str(collection.get("witcher_layer_import_plan_hash", "") or "").strip()
+        if previous_hash != expected_hash:
+            return False
     return True
 
 
-def _layer_covered_by_previous_load(collection, camera_position, radius, mode_signature=None):
+def _layer_covered_by_previous_load(collection, camera_position, radius, mode_signature=None, expected_plan_hash=None):
     if collection is None or camera_position is None:
         return False
     state = str(collection.get("witcher_layer_import_state", "") or "").strip().lower()
@@ -3878,6 +4126,11 @@ def _layer_covered_by_previous_load(collection, camera_position, radius, mode_si
     if mode_signature is not None:
         prev_mode = str(collection.get("witcher_layer_load_mode", "") or "")
         if prev_mode and prev_mode != str(mode_signature):
+            return False
+    expected_hash = str(expected_plan_hash or "").strip()
+    if expected_hash:
+        previous_hash = str(collection.get("witcher_layer_import_plan_hash", "") or "").strip()
+        if previous_hash != expected_hash:
             return False
     try:
         prev_radius = float(collection.get("witcher_layer_load_radius", 0.0) or 0.0)
@@ -3896,10 +4149,16 @@ def _layer_covered_by_previous_load(collection, camera_position, radius, mode_si
     return (math.sqrt(dx * dx + dy * dy) + new_radius) <= (prev_radius + epsilon)
 
 
-def _layer_should_skip_for_load(collection, camera_position, radius, mode_signature=None):
-    if _collection_has_loaded_content(collection, mode_signature=mode_signature):
+def _layer_should_skip_for_load(collection, camera_position, radius, mode_signature=None, expected_plan_hash=None):
+    if _collection_has_loaded_content(collection, mode_signature=mode_signature, expected_plan_hash=expected_plan_hash):
         return True
-    return _layer_covered_by_previous_load(collection, camera_position, radius, mode_signature=mode_signature)
+    return _layer_covered_by_previous_load(
+        collection,
+        camera_position,
+        radius,
+        mode_signature=mode_signature,
+        expected_plan_hash=expected_plan_hash,
+    )
 
 
 def _layer_visibility_token_name(obj):
@@ -4524,6 +4783,7 @@ def _import_level_from_collection(
     cancel_check=None,
     import_settings=None,
     mode_signature=None,
+    plan_hash=None,
 ):
     level_path = str(coll.get("level_path", "")).strip()
     if not level_path:
@@ -4552,6 +4812,8 @@ def _import_level_from_collection(
         import_kwargs.update(import_settings)
         if mode_signature:
             import_kwargs["_layer_import_mode_signature"] = str(mode_signature)
+        if plan_hash:
+            import_kwargs["_layer_import_plan_hash"] = str(plan_hash)
         if dev_empty_only:
             import_kwargs["_dev_empty_only"] = True
         if callable(cancel_check):

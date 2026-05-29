@@ -216,7 +216,36 @@ def _new_scan_result():
         "sector_items": [],
         "foliage_items": [],
         "bounds_markers": [],
+        "complete": True,
+        "unresolved_dependencies": [],
     }
+
+
+def _unresolved_dependency_record(depot_path, source_name, reason):
+    return {
+        "path": str(depot_path or "").strip(),
+        "source": str(source_name or "").strip(),
+        "reason": str(reason or "unresolved").strip(),
+    }
+
+
+def _mark_unresolved_dependency(result, depot_path, source_name, reason):
+    if not isinstance(result, dict):
+        return
+    result["complete"] = False
+    result.setdefault("unresolved_dependencies", []).append(
+        _unresolved_dependency_record(depot_path, source_name, reason)
+    )
+
+
+def _merge_scan_completeness(target, source):
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return
+    if not bool(source.get("complete", True)):
+        target["complete"] = False
+    target.setdefault("unresolved_dependencies", []).extend(
+        list(source.get("unresolved_dependencies", []) or [])
+    )
 
 
 def _merge_scan_result(target, source):
@@ -227,6 +256,7 @@ def _merge_scan_result(target, source):
     target["sector_items"].extend(list(source.get("sector_items", []) or []))
     target["foliage_items"].extend(list(source.get("foliage_items", []) or []))
     target["bounds_markers"].extend(list(source.get("bounds_markers", []) or []))
+    _merge_scan_completeness(target, source)
 
 
 def _scan_cr2w_structure(
@@ -296,6 +326,13 @@ def _scan_cr2w_structure(
             )
             if entity_scan is None:
                 return None
+            if entity_scan.get("unresolved_dependencies"):
+                result["complete"] = False
+                result.setdefault("unresolved_dependencies", []).extend(
+                    list(entity_scan.get("unresolved_dependencies", []) or [])
+                )
+            if entity_scan.get("template") is not None:
+                _merge_scan_completeness(result, entity_scan.get("template"))
             pending_entities.append(entity_scan)
             marker = _bounds_marker_from_transform(
                 entity_scan.get("transform"),
@@ -732,6 +769,12 @@ def _scan_template_export(
     for include_path in list(props.get("includes", []) or []):
         resolved_path = _resolve_dependency_path(include_path, cr2w_file, dependency_resolver)
         if not resolved_path:
+            _mark_unresolved_dependency(
+                result,
+                include_path,
+                source_name,
+                "include not resolved",
+            )
             continue
         dependency_scan = None
         if dependency_loader is not None:
@@ -746,6 +789,7 @@ def _scan_template_export(
             return None
         if dependency_scan is not None:
             result["includes"].append(dependency_scan)
+            _merge_scan_completeness(result, dependency_scan)
 
     embedded_scan = _scan_embedded_template_data(
         handle,
@@ -783,6 +827,7 @@ def _scan_entity_export(
     streaming_buffer = props.get("streamingDataBuffer") or {}
     template_path = str(props.get("template", "") or "").strip()
     template_scan = None
+    unresolved_dependencies = []
     if template_path:
         resolved_template = _resolve_dependency_path(template_path, cr2w_file, dependency_resolver)
         if resolved_template:
@@ -793,9 +838,17 @@ def _scan_entity_export(
                     resolved_template,
                     dependency_resolver=dependency_resolver,
                     dependency_loader=dependency_loader,
-                )
+            )
             if template_scan is None:
                 return None
+        else:
+            unresolved_dependencies.append(
+                _unresolved_dependency_record(
+                    template_path,
+                    source_name,
+                    "template not resolved",
+                )
+            )
 
     stream_items = []
     buffer_bytes = _extract_buffer_bytes(cr2w_file, streaming_buffer)
@@ -833,6 +886,7 @@ def _scan_entity_export(
         "component_indices": component_indices,
         "components": [],
         "streaming_distance": float(props.get("streamingDistance", 0.0) or 0.0),
+        "unresolved_dependencies": unresolved_dependencies,
     }
 
 
@@ -1043,6 +1097,23 @@ def _build_cache_entry(level_path, resolved_path, file_mtime, file_size, scan_re
         if item.get("world_position") is not None:
             import_item_count += 1
 
+    unresolved_dependencies = []
+    seen_unresolved = set()
+    for dep in list(scan_result.get("unresolved_dependencies", []) or []):
+        if not isinstance(dep, dict):
+            continue
+        record = {
+            "path": str(dep.get("path", "") or "").strip(),
+            "source": str(dep.get("source", "") or "").strip(),
+            "reason": str(dep.get("reason", "") or "unresolved").strip(),
+        }
+        key = (record["path"].lower(), record["source"].lower(), record["reason"].lower())
+        if not record["path"] or key in seen_unresolved:
+            continue
+        seen_unresolved.add(key)
+        unresolved_dependencies.append(record)
+    manifest_complete = bool(scan_result.get("complete", True)) and not unresolved_dependencies
+
     entry = {
         "level_path": level_path,
         "resolved_path": resolved_path,
@@ -1051,6 +1122,9 @@ def _build_cache_entry(level_path, resolved_path, file_mtime, file_size, scan_re
         "has_bounds": bool(bounds is not None),
         "object_count": int(bounds.get("object_count", 0) if bounds is not None else 0),
         "has_manifest": True,
+        "manifest_complete": manifest_complete,
+        "unresolved_dependencies": unresolved_dependencies,
+        "scan_backend": "fast",
         "import_item_count": int(import_item_count),
         "items": items,
     }

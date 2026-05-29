@@ -147,7 +147,7 @@ def _layer_load_mode_signature(dev_empty_only=False):
     return f"dev_empty={int(bool(dev_empty_only))}"
 
 
-def _set_layer_import_state(collection, level_file, state, progress_count=0, error_count=0, filtered_count=0, *, nearby_filter=None, mode_signature=None):
+def _set_layer_import_state(collection, level_file, state, progress_count=0, error_count=0, filtered_count=0, *, nearby_filter=None, mode_signature=None, plan_hash=None):
     if collection is None or not hasattr(collection, "__setitem__"):
         return
     try:
@@ -167,6 +167,11 @@ def _set_layer_import_state(collection, level_file, state, progress_count=0, err
             collection["witcher_layer_load_radius"] = float(nearby_filter.get("radius", 0.0) or 0.0)
             if mode_signature is not None:
                 collection["witcher_layer_load_mode"] = str(mode_signature)
+        except Exception:
+            pass
+    if plan_hash is not None:
+        try:
+            collection["witcher_layer_import_plan_hash"] = str(plan_hash or "")
         except Exception:
             pass
 
@@ -4420,6 +4425,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
             filtered_count,
             nearby_filter=nearby_filter,
             mode_signature=mode_signature,
+            plan_hash=kwargs.get("_layer_import_plan_hash"),
         )
     except LayerImportCancelled:
         filtered_count = int(nearby_stats.get("filtered", 0) or 0)
@@ -4583,6 +4589,7 @@ def loadLevelFromCachedPlan(level_file, plan_items, context=None, **kwargs):
             filtered_count,
             nearby_filter=nearby_filter,
             mode_signature=mode_signature,
+            plan_hash=kwargs.get("_layer_import_plan_hash"),
         )
     except LayerImportCancelled:
         filtered_count = int(nearby_stats.get("filtered", 0) or 0)
