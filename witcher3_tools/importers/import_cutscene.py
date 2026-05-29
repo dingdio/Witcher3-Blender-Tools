@@ -39,6 +39,34 @@ def loadCutsceneFile(filename):
         return load_bin_cutscene(filename)
     return None
 
+
+def _is_w2_cutscene_file(filename):
+    """True if the cutscene is a Witcher 2 (CR2W version <=115) container.
+
+    W2 cutscene actor templates are W2 .w2ent files that must be resolved
+    against the W2 depot/game roots rather than the W3 uncook path.
+    """
+    from ..CR2W.dc_w2_havok import is_w2_cr2w_version_file
+
+    try:
+        return bool(is_w2_cr2w_version_file(filename))
+    except Exception:
+        return False
+
+
+def _resolve_cutscene_actor_template_path(template_path, cutscene_filename, is_w2):
+    """Resolve a cutscene actor template to an absolute path.
+
+    For W2 cutscenes the template is a W2 .w2ent; resolving it needs the W2
+    repo version (115) and the W2 source context (so the game-data root that
+    holds the cutscene is searched). import_ent_template then auto-detects W2
+    from the file version and resolves nested dependencies the same way.
+    """
+    if is_w2:
+        with redkit_repo_context(cutscene_filename):
+            return repo_file(template_path, version=115)
+    return repo_file(template_path)
+
 import bpy
 from .import_anims import NewW2ANIMSListItem#, set_global_set #!USE NEW METHOD
 
@@ -1064,10 +1092,12 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
             imported_new = actor_obj is not None
     if not actor_obj and template_path:
         try:
-            resolved_template_path = repo_file(template_path)
+            is_w2 = _is_w2_cutscene_file(filename)
+            resolved_template_path = _resolve_cutscene_actor_template_path(template_path, filename, is_w2)
             log.info(
-                "Cutscene actor '%s' template resolved: %s -> %s",
+                "Cutscene actor '%s' template resolved (%s): %s -> %s",
                 actor_name or actor_index,
+                "w2" if is_w2 else "w3",
                 template_path,
                 resolved_template_path,
             )

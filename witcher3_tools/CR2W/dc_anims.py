@@ -7,6 +7,13 @@ import math
 from .dc_skeleton import create_CMimicFace, create_Skeleton, load_bin_skeleton
 from .common_blender import repo_file, win_safe_path
 from .CR2W_types import getCR2W, CArray, CBufferUInt32, CVariantSizeType
+from .dc_cutscene_w2 import load_w2_cutscene_anim, load_w2_cutscene_template
+from .dc_w2_havok import (
+    apply_decoded_animation_entry as _apply_decoded_animation_entry,
+    get_fallback_w2_skeleton_names as _get_fallback_w2_skeleton_names,
+    is_w2_cr2w_version_file as _is_w2_cr2w_version_file,
+    is_w2_cutscene_file as _w2_file_is_cutscene,
+)
 from .havok_parser import HavokPackfile
 from .prop_utils import (
     read_array_string_prop as _read_array_string_prop,
@@ -32,8 +39,6 @@ from .bin_helpers import (ReadUlong40, ReadUlong48, ReadVLQInt32, readU32, readU
                         readUByteCheck)
 from .bStream import *
 
-
-W2_MIMIC_FLOATTRACKS_RIG = r"characters\templates\mimics\floattracks.w2rig"
 _W2_LIPSYNC_DAT_NAME_RE = re.compile(rb"VO_[A-Z0-9]+_[0-9]+_[0-9]+(?:_face)?")
 
 class CVector3D:
@@ -1439,19 +1444,10 @@ def load_bin_anims_info(fileName, anim_name = None, rigPath = None) -> w3_types.
     return create_anim_set_info_only(theFile)
 
 
-def _is_w2_cr2w_version_file(file_name):
-    try:
-        with open(file_name, "rb") as f:
-            if f.read(4) != b"CR2W":
-                return False
-            version = struct.unpack("<I", f.read(4))[0]
-            return version <= 115
-    except Exception:
-        return False
-
-
 def load_bin_anims_single(fileName, anim_name = None, rigPath = None) -> w3_types.CSkeletalAnimationSet:
     if _is_w2_cr2w_version_file(fileName):
+        if _w2_file_is_cutscene(fileName):
+            return load_w2_cutscene_anim(fileName, rigPath=rigPath, anim_name=anim_name)
         return load_w2_anims_full(fileName, rigPath=rigPath, anim_name=anim_name)
 
     if not rigPath:
@@ -1678,93 +1674,6 @@ def load_w2_anims_info(fileName) -> w3_types.CSkeletalAnimationSet:
         theFile = getCR2W(f)
 
     return create_anim_set_info_only(theFile, havok_infos=havok_infos)
-
-
-def _get_fallback_w2_bone_names(rigPath=None):
-    names, _tracks = _get_fallback_w2_skeleton_names(rigPath)
-    return names
-
-
-def _load_w2_skeleton_name_sets(rigPath=None):
-    if not rigPath:
-        return None, None
-    try:
-        rig = load_base_skeleton(rigPath)
-    except Exception as exc:
-        log.warning("Failed to load fallback rig for W2 bone mapping: %s", exc)
-        return None, None
-    names = getattr(rig, 'names', None)
-    tracks = getattr(rig, 'tracks', None)
-    return (names or None), (tracks or None)
-
-
-def _resolve_default_w2_floattrack_rig(source_file=None):
-    candidates = []
-    if source_file:
-        try:
-            from ..source_game_paths import resolve_w2_repo_file_from_source
-
-            resolved = resolve_w2_repo_file_from_source(
-                W2_MIMIC_FLOATTRACKS_RIG,
-                source_file,
-                version=115,
-            )
-            if resolved:
-                candidates.append(resolved)
-        except Exception:
-            pass
-
-    try:
-        candidates.append(repo_file(W2_MIMIC_FLOATTRACKS_RIG, version=115))
-    except Exception:
-        candidates.append(W2_MIMIC_FLOATTRACKS_RIG)
-
-    seen = set()
-    for candidate in candidates:
-        if not candidate:
-            continue
-        key = os.path.normcase(os.path.normpath(str(candidate)))
-        if key in seen:
-            continue
-        seen.add(key)
-        if os.path.exists(win_safe_path(candidate)):
-            return candidate
-    return None
-
-
-def _get_fallback_w2_skeleton_names(rigPath=None, source_file=None):
-    names, tracks = _load_w2_skeleton_name_sets(rigPath)
-    if tracks:
-        return names, tracks
-
-    # Witcher 2 support: mimic/lipsync animsets usually do not embed the Havok
-    # skeleton, and entity face rigs are not always the float-track name rig.
-    # Use the inherited stock float-track skeleton as the deterministic fallback.
-    floattrack_rig = _resolve_default_w2_floattrack_rig(source_file)
-    default_names, default_tracks = _load_w2_skeleton_name_sets(floattrack_rig)
-    return (names or default_names), (tracks or default_tracks)
-
-
-def _apply_decoded_animation_entry(entry, decoded):
-    if not entry or not entry.animation or not decoded or not getattr(decoded, 'buffer', None):
-        return
-
-    anim = entry.animation
-    anim.animBuffer = decoded.buffer
-    if decoded.duration > 0.0:
-        anim.duration = decoded.duration
-        anim.animBuffer.duration = decoded.duration
-
-    if decoded.num_frames > 0:
-        anim.animBuffer.numFrames = decoded.num_frames
-
-    if anim.animBuffer.dt <= 0.0 and anim.duration > 0.0 and anim.animBuffer.numFrames > 1:
-        anim.animBuffer.dt = anim.duration / float(anim.animBuffer.numFrames - 1)
-
-    if anim.animBuffer.dt > 0.0:
-        anim.framesPerSecond = 1.0 / anim.animBuffer.dt
-    elif anim.duration > 0.0 and anim.animBuffer.numFrames > 1:
-        anim.framesPerSecond = float(anim.animBuffer.numFrames - 1) / anim.duration
 
 
 def load_w2_anims_full(fileName, rigPath=None, anim_name=None) -> w3_types.CSkeletalAnimationSet:
@@ -2194,6 +2103,9 @@ def create_CCutscene(file):
     return final_set
 
 def load_bin_cutscene(fileName) -> w3_types.CCutsceneTemplate:
+    if _is_w2_cr2w_version_file(fileName):
+        return load_w2_cutscene_template(fileName)
+
     with open(fileName, "rb") as f:
         theFile = getCR2W(f, do_read_anim_buffer=True)
         f.close()

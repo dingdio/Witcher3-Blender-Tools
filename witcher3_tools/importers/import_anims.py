@@ -4,7 +4,6 @@ from ..file_helpers import getFilenameFile, rm_ns
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.dc_anims import (
-    W2_MIMIC_FLOATTRACKS_RIG,
     load_base_skeleton,
     load_bin_anims,
     load_lipsync_file,
@@ -12,6 +11,7 @@ from ..CR2W.dc_anims import (
     load_bin_anims_info,
     load_w2_anims_info,
 )
+from ..CR2W.dc_w2_havok import W2_MIMIC_FLOATTRACKS_RIG
 from ..CR2W.CR2W_helpers import Enums
 log = logging.getLogger(__name__)
 
@@ -1245,12 +1245,24 @@ class AnimImporter:
             self.__animFile.filepath,
             SkeletalAnimation.name,
         ) and _is_standard_cutscene_root_motion_rig(armObj)
+        # W2 cutscenes author each actor's world placement on the Root bone
+        # (e.g. a 180 deg yaw). W3 cutscenes instead force the Root to identity
+        # and carry placement on Trajectory. So for W2 we keep the authored Root
+        # transform; zeroing it negates the actor's X/Y and puts it on the wrong
+        # side relative to the camera/trajectory actors (which always keep Root).
+        preserve_cutscene_root = cutscene_root_component and _is_w2_cr2w_version(
+            self.__animFile.filepath
+        )
+        zero_cutscene_root = cutscene_root_component and not preserve_cutscene_root
         if cutscene_root_component:
             log.debug(
-                "Animation '%s': keeping cutscene Root bone identity.",
+                "Animation '%s': %s cutscene Root bone.",
                 SkeletalAnimation.name,
+                "keeping authored" if preserve_cutscene_root else "zeroing",
             )
 
+        # Skip the Trajectory->Root swap for all cutscene root components; for W2
+        # this leaves the authored Root (placement) intact, for W3 it is zeroed below.
         use_root_source_bone = not cutscene_root_component
         if use_root_source_bone:
             root_bone = _find_anim_bone(anim_desc.bones, "Root")
@@ -1482,7 +1494,7 @@ class AnimImporter:
                         pos = pos_fix if mdl_bone.BoneName.lower() in ['Root', 'pelvis'] else Vector(( 0, 0, 0 ))
                     else:
                         pos = pos_fix
-                    if cutscene_root_component and _base_bone_name(mdl_bone.BoneName).lower() == "root":
+                    if zero_cutscene_root and _base_bone_name(mdl_bone.BoneName).lower() == "root":
                         pos = Vector((0.0, 0.0, 0.0))
                     for i in range(3):
                         pos_curves[i].keyframe_points.add(1)
@@ -1564,7 +1576,7 @@ class AnimImporter:
                             fixed_rot = z_minus_90 @ fixed_rot @ z_plus_90
                             fixed_rot.normalize()
 
-                    if cutscene_root_component and _base_bone_name(mdl_bone.BoneName).lower() == "root":
+                    if zero_cutscene_root and _base_bone_name(mdl_bone.BoneName).lower() == "root":
                         fixed_rot = Quaternion((1.0, 0.0, 0.0, 0.0))
 
                     if fixed_rot.dot(fixed_rot) <= 1e-12:

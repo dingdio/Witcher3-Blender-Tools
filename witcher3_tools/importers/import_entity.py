@@ -4362,7 +4362,7 @@ def process_regular_attachment(constraint, objdict, meshdict):
         target_mesh_obj.parent = target_transform
 
         parent_arm = objdict[parent_arm_name]
-        p_bone = parent_arm.pose.bones.get(p_bone_name)
+        p_bone = parent_arm.pose.bones.get(p_bone_name) if p_bone_name else None
         if p_bone is not None:
             target_transform.parent = parent_arm
             target_transform.parent_type = "BONE"

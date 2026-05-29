@@ -1583,7 +1583,7 @@ def FilterData(context):
 
 def _is_w2_animation_file(filepath):
     filepath = str(filepath or "")
-    if not filepath.lower().endswith(".w2anims"):
+    if not filepath.lower().endswith((".w2anims", ".w2cutscene")):
         return False
     try:
         return bool(import_anims._is_w2_cr2w_version(filepath))
