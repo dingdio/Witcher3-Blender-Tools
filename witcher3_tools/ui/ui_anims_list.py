@@ -7,12 +7,14 @@ from ..CR2W.dc_anims import load_bin_anims_single
 from ..source_game_paths import (
     normalize_source_game,
     repo_file_for_source,
+    resolve_w2_repo_file_from_source,
     source_game_for_rig_settings,
     source_roots,
 )
 
 import csv
 import os
+import re
 import bpy
 from bpy.types import PropertyGroup
 from bpy.props import (
@@ -39,6 +41,51 @@ DIALOGSET_BODY_TRACK = "SceneDialogsetIdle"
 _DIALOGSET_BODY_ITEMS_CACHE = None
 _DIALOGSET_BODY_RESOLVE_CACHE = {}
 _UPDATING_DIALOGSET_BODY = False
+
+W2_PLAYER_ENTITY_PATH = r"characters\templates\witcher\player.w2ent"
+W2_PLAYER_FALLBACK_ANIMSETS = (
+    r"characters\templates\interaction\carry\carry_arian__witcher.w2anims",
+    r"characters\templates\interaction\dialog\d_sit.w2anims",
+    r"characters\templates\interaction\dialog\d_stand.w2anims",
+    r"characters\templates\interaction\dialog\d_stand_agressive.w2anims",
+    r"characters\templates\interaction\dialog\d_stand_assured.w2anims",
+    r"characters\templates\interaction\dialog\d_stand_expressive.w2anims",
+    r"characters\templates\interaction\dialog\d_stand_insincere.w2anims",
+    r"characters\templates\interaction\dialog\d_stand_intimidiate.w2anims",
+    r"characters\templates\interaction\dialog\d_stand_submissive.w2anims",
+    r"characters\templates\interaction\dialog\d_stand_unwilling.w2anims",
+    r"characters\templates\interaction\fistfight\fistfight_witcher.w2anims",
+    r"characters\templates\interaction\gameplay\gameplay_man.w2anims",
+    r"characters\templates\interaction\takedowns\fin_1man\witcher.w2anims",
+    r"characters\templates\interaction\takedowns\fin_2man\witcher.w2anims",
+    r"characters\templates\interaction\takedowns\takedowns_man\takedowns_witcher.w2anims",
+    r"characters\templates\interaction\wrist_wrestling\wrist_wrestling_witcher.w2anims",
+    r"characters\templates\mimics\base_mimics.w2anims",
+    r"characters\templates\mimics\custom_gest.w2anims",
+    r"characters\templates\mimics\gest.w2anims",
+    r"characters\templates\witcher\animation\c_combo.w2anims",
+    r"characters\templates\witcher\animation\c_fsv.w2anims",
+    r"characters\templates\witcher\animation\c_guards.w2anims",
+    r"characters\templates\witcher\animation\c_st.w2anims",
+    r"characters\templates\witcher\animation\c_sword.w2anims",
+    r"characters\templates\witcher\animation\combat_signs.w2anims",
+    r"characters\templates\witcher\animation\combat_zagnica.w2anims",
+    r"characters\templates\witcher\animation\containers.w2anims",
+    r"characters\templates\witcher\animation\dragon_a3_combat.w2anims",
+    r"characters\templates\witcher\animation\exploration_animset.w2anims",
+    r"characters\templates\witcher\animation\meditation.w2anims",
+    r"characters\templates\witcher\animation\obstacle.w2anims",
+    r"characters\templates\witcher\animation\prisoner.w2anims",
+    r"characters\templates\witcher\animation\prototype.w2anims",
+    r"characters\templates\witcher\animation\quest.w2anims",
+    r"characters\templates\witcher\animation\weapon_draw.w2anims",
+    r"characters\templates\witcher\animation\witcher_fistfight.w2anims",
+    r"characters\templates\witcher\animation\witcher_stealth.w2anims",
+    r"characters\templates\witcher\animation\witcher_steel.w2anims",
+)
+_W2_PLAYER_ANIMSETS_CACHE = {}
+_W2_ANIMSET_PATH_BYTES_RE = re.compile(rb"[A-Za-z0-9_./\\-]+\.w2anims", re.IGNORECASE)
+_W2_ANIMSET_PATH_TEXT_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.w2anims", re.IGNORECASE)
 
 
 def _source_game_for_armature_obj(armature_obj, fallback="w3"):
@@ -67,6 +114,134 @@ def _resolve_main_armature(context, main_arm_obj=None):
         fallback=True,
         allow_auxiliary_active=True,
     )
+
+
+def _armature_identity_text(armature_obj) -> str:
+    if armature_obj is None:
+        return ""
+    parts = [str(getattr(armature_obj, "name", "") or "")]
+    for prop_name in ("witcher_path", "witcher_source_game"):
+        try:
+            value = str(armature_obj.get(prop_name, "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            parts.append(value)
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    if rig_settings:
+        for attr_name in ("entity_name", "repo_path", "main_entity_skeleton", "main_face_skeleton"):
+            value = str(getattr(rig_settings, attr_name, "") or "").strip()
+            if value:
+                parts.append(value)
+    return " ".join(parts).lower().replace("/", "\\")
+
+
+def _target_looks_like_w3_player(armature_obj) -> bool:
+    if armature_obj is None or getattr(armature_obj, "type", None) != "ARMATURE":
+        return False
+    if _source_game_for_armature_obj(armature_obj) == "w2":
+        return False
+    text = _armature_identity_text(armature_obj)
+    if "gameplay\\templates\\characters\\player\\player.w2ent" in text:
+        return True
+    if "\\player\\player.w2ent" in text and "ciri" not in text:
+        return True
+    is_man_base = "characters\\base_entities\\man_base\\man_base.w2rig" in text
+    return is_man_base and any(term in text for term in ("geralt", "player", "witcher"))
+
+
+def _uses_w2_player_animsets(main_arm_obj, source_game="") -> bool:
+    return normalize_source_game(source_game) == "w2" and _target_looks_like_w3_player(main_arm_obj)
+
+
+def _clean_w2_animset_path(path_value) -> str:
+    text = str(path_value or "").replace("/", "\\").strip().strip("\x00").lstrip("\\")
+    lower_text = text.lower()
+    marker = "characters\\"
+    marker_index = lower_text.find(marker)
+    if marker_index >= 0:
+        text = text[marker_index:]
+        lower_text = text.lower()
+    if not lower_text.endswith(".w2anims"):
+        return ""
+    return text
+
+
+def _iter_w2_player_entity_candidates(context):
+    seen = set()
+
+    def emit(path_value):
+        path_value = str(path_value or "").strip()
+        if not path_value:
+            return
+        key = os.path.normcase(os.path.normpath(path_value))
+        if key in seen or not os.path.exists(path_value):
+            return
+        seen.add(key)
+        yield path_value
+
+    try:
+        for root in source_roots(context, "w2", existing_only=True):
+            yield from emit(os.path.join(root, W2_PLAYER_ENTITY_PATH))
+    except Exception:
+        pass
+    try:
+        yield from emit(repo_file_for_source(W2_PLAYER_ENTITY_PATH, "w2"))
+    except Exception:
+        pass
+
+
+def _scan_w2_animsets_from_entity(path_value):
+    try:
+        with open(path_value, "rb") as handle:
+            data = handle.read()
+    except Exception:
+        return ()
+
+    hits = set()
+    for raw_path in _W2_ANIMSET_PATH_BYTES_RE.findall(data):
+        try:
+            clean = _clean_w2_animset_path(raw_path.decode("ascii", "ignore"))
+        except Exception:
+            clean = ""
+        if clean:
+            hits.add(clean)
+
+    try:
+        text = data.decode("utf-16le", "ignore")
+    except Exception:
+        text = ""
+    for raw_path in _W2_ANIMSET_PATH_TEXT_RE.findall(text):
+        clean = _clean_w2_animset_path(raw_path)
+        if clean:
+            hits.add(clean)
+
+    return tuple(sorted(hits, key=str.lower))
+
+
+def _w2_player_animsets(context=None):
+    candidates = tuple(_iter_w2_player_entity_candidates(context))
+    cache_key = []
+    for path_value in candidates:
+        try:
+            stat = os.stat(path_value)
+            cache_key.append((os.path.normcase(os.path.normpath(path_value)), int(stat.st_mtime), int(stat.st_size)))
+        except Exception:
+            cache_key.append((os.path.normcase(os.path.normpath(path_value)), 0, 0))
+    cache_key = tuple(cache_key)
+    cached = _W2_PLAYER_ANIMSETS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    paths = set()
+    for path_value in candidates:
+        paths.update(_scan_w2_animsets_from_entity(path_value))
+    if not paths:
+        paths.update(W2_PLAYER_FALLBACK_ANIMSETS)
+
+    result = tuple(sorted(paths, key=str.lower))
+    _W2_PLAYER_ANIMSETS_CACHE[cache_key] = result
+    return result
 
 
 def _dialogset_body_item_tuple(values, fallback):
@@ -270,6 +445,7 @@ def resolve_quick_dialogset_body(context, force=False):
         show_all=show_all,
         quiet=True,
         compatible_only=True,
+        source_game=source_override,
     )
     if resolved_anim_name and fdir:
         info["resolved_anim_name"] = str(resolved_anim_name)
@@ -851,12 +1027,14 @@ def _get_quick_anim_source_key(main_arm_obj, show_all=False, source_override: st
         if ":" not in set.path
     )
     effective_source = normalize_source_game(source_override) if source_override else _source_game_for_armature_obj(main_arm_obj)
+    player_compat = "w2_player" if _uses_w2_player_animsets(main_arm_obj, effective_source) else ""
     return (
         main_arm_obj.name,
         effective_source,
         getattr(rig_settings, "main_entity_skeleton", ""),
         getattr(rig_settings, "main_face_skeleton", ""),
         anim_paths,
+        player_compat,
     )
 
 
@@ -944,10 +1122,11 @@ def _load_selected_quick_anim(context):
     anim_name, fdir = manager.getAnimationName(anim_id)
     if not anim_name or not fdir:
         return False
-    fdir_abs = repo_file_for_source(fdir, _source_game_for_armature_obj(main_arm_obj))
+    source_override = _resolve_quick_anim_source(context.scene, main_arm_obj)
+    fdir_abs = repo_file_for_source(fdir, source_override)
     _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
     _nla_mode = _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
-    load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj, nla_mode=_nla_mode)
+    load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj, nla_mode=_nla_mode, source_game=source_override)
     if getattr(context.scene, "witcher_auto_orient_root", True):
         try:
             from ..ui.ui_anims import apply_root_orientation
@@ -1204,7 +1383,7 @@ def _normalize_catalog_path(path):
     return str(path or "").replace("/", "\\").strip().lower()
 
 
-def _actor_compatible_animation_paths(main_arm_obj):
+def _actor_compatible_animation_paths(main_arm_obj, source_game=""):
     if main_arm_obj is None or getattr(main_arm_obj, "type", None) != "ARMATURE":
         return set(), set()
     rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
@@ -1219,6 +1398,10 @@ def _actor_compatible_animation_paths(main_arm_obj):
             continue
         exact_paths.add(path)
         normalized_paths.add(_normalize_catalog_path(path))
+    if _uses_w2_player_animsets(main_arm_obj, source_game):
+        for path in _w2_player_animsets(getattr(bpy, "context", None)):
+            exact_paths.add(path)
+            normalized_paths.add(_normalize_catalog_path(path))
     return exact_paths, normalized_paths
 
 
@@ -1232,13 +1415,14 @@ def _normal_animation_manager(manager=None, source_game: str = "w3"):
     return manager
 
 
-def _get_actor_compatible_animation_path_by_name(anim_name, main_arm_obj, manager=None):
-    exact_paths, normalized_paths = _actor_compatible_animation_paths(main_arm_obj)
+def _get_actor_compatible_animation_path_by_name(anim_name, main_arm_obj, manager=None, source_game=""):
+    source_game = normalize_source_game(source_game) if source_game else _source_game_for_armature_obj(main_arm_obj)
+    exact_paths, normalized_paths = _actor_compatible_animation_paths(main_arm_obj, source_game=source_game)
     if not exact_paths and not normalized_paths:
         return None
 
     try:
-        manager = _normal_animation_manager(manager, source_game=_source_game_for_armature_obj(main_arm_obj))
+        manager = _normal_animation_manager(manager, source_game=source_game)
     except Exception:
         return None
 
@@ -1252,8 +1436,9 @@ def _get_actor_compatible_animation_path_by_name(anim_name, main_arm_obj, manage
     return None
 
 
-def GetAnimationInfoByName(anim_name, main_arm_obj=None, show_all=False, prefer_mimic=False, quiet=False, compatible_only=False):
-    source_game = _source_game_for_armature_obj(main_arm_obj)
+def GetAnimationInfoByName(anim_name, main_arm_obj=None, show_all=False, prefer_mimic=False, quiet=False,
+                           compatible_only=False, source_game=""):
+    source_game = normalize_source_game(source_game) if source_game else _source_game_for_armature_obj(main_arm_obj)
     fdir = None
     if prefer_mimic:
         fdir = _get_mimic_animation_path_by_name(anim_name, main_arm_obj=main_arm_obj, show_all=show_all)
@@ -1266,7 +1451,12 @@ def GetAnimationInfoByName(anim_name, main_arm_obj=None, show_all=False, prefer_
             manager = None
         actor_aware = main_arm_obj is not None and not show_all
         if actor_aware:
-            fdir = _get_actor_compatible_animation_path_by_name(anim_name, main_arm_obj, manager=manager)
+            fdir = _get_actor_compatible_animation_path_by_name(
+                anim_name,
+                main_arm_obj,
+                manager=manager,
+                source_game=source_game,
+            )
         if fdir is None and manager is not None and getattr(manager, "_animMeta", None) is not None and not (compatible_only and actor_aware):
             active_list = getattr(getattr(manager, "active", manager), "active_list", None)
             active_items = getattr(active_list, "_items", []) or []
@@ -1311,6 +1501,13 @@ def SetupActor(main_arm_obj, context=None, show_all=False):
             for set in animset_list:
                 if ":" not in set.path:
                     actor._animPaths.append(set.path)
+            if _uses_w2_player_animsets(main_arm_obj, source_game):
+                seen_paths = {_normalize_catalog_path(path) for path in actor._animPaths}
+                for path in _w2_player_animsets(context):
+                    norm_path = _normalize_catalog_path(path)
+                    if norm_path and norm_path not in seen_paths:
+                        actor._animPaths.append(path)
+                        seen_paths.add(norm_path)
 
     animListsManager.lazyLoad(source_game)
 
@@ -1384,8 +1581,88 @@ def FilterData(context):
         _set_quick_anim_cache(cache_key, cached_items)
         _apply_cached_items_to_scene(scene, cached_items)
 
+def _is_w2_animation_file(filepath):
+    filepath = str(filepath or "")
+    if not filepath.lower().endswith(".w2anims"):
+        return False
+    try:
+        return bool(import_anims._is_w2_cr2w_version(filepath))
+    except Exception:
+        return False
+
+
+def _resolve_w2_retarget_source_rig(context, target_rig_path="", target_name_hint="", source_anim_path=""):
+    from ..CR2W.retarget_anims import infer_w2_source_rig_path
+
+    scene = getattr(context, "scene", None)
+    configured = str(getattr(scene, "witcher_w2_retarget_source_rig", "") or "").strip().strip('"')
+    candidates = []
+    if configured:
+        candidates.append(configured)
+        if not os.path.isabs(configured):
+            try:
+                candidates.append(repo_file_for_source(configured, "w2"))
+            except Exception:
+                pass
+
+    inferred = infer_w2_source_rig_path(target_rig_path, target_name_hint)
+    if inferred:
+        try:
+            resolved_from_source = resolve_w2_repo_file_from_source(inferred, source_anim_path, version=115)
+            if resolved_from_source:
+                candidates.append(resolved_from_source)
+        except Exception:
+            pass
+        try:
+            candidates.append(repo_file_for_source(inferred, "w2"))
+        except Exception:
+            candidates.append(inferred)
+
+    seen = set()
+    for candidate in candidates:
+        candidate = str(candidate or "").strip()
+        if not candidate:
+            continue
+        key = os.path.normcase(os.path.normpath(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def _should_retarget_w2_to_w3(context, source_game, target_armatures, face_animation):
+    if face_animation or normalize_source_game(source_game) != "w2":
+        return False
+    scene = getattr(context, "scene", None)
+    if scene is not None and not bool(getattr(scene, "witcher_w2_retarget_to_w3", True)):
+        return False
+    target = target_armatures[0] if target_armatures else None
+    if target is None or getattr(target, "type", None) != "ARMATURE":
+        return False
+    return _source_game_for_armature_obj(target) != "w2"
+
+
+def _retarget_w2_animation_entry(context, animation_entry, source_rig_path, target_rig_path):
+    from ..CR2W.dc_skeleton import load_bin_skeleton
+    from ..CR2W.retarget_anims import retarget_w2_animation_entry
+
+    if not source_rig_path or not target_rig_path:
+        raise RuntimeError("W2 retarget needs both source W2 rig and target W3 rig paths.")
+    source_skeleton = load_bin_skeleton(source_rig_path)
+    target_skeleton = load_bin_skeleton(target_rig_path)
+    in_place = bool(getattr(getattr(context, "scene", None), "witcher_w2_retarget_in_place", True))
+    return retarget_w2_animation_entry(
+        animation_entry,
+        source_skeleton,
+        target_skeleton,
+        in_place=in_place,
+    )
+
+
 def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0,
-                         face_target_mode="auto", nla_mode='replace', target_component=""):
+                         face_target_mode="auto", nla_mode='replace', target_component="", source_game=""):
     face_animation = is_face_animation(anim_name, fdir)
     if face_target_mode == "owner" and face_animation:
         main_arm_obj, owner_armature, rig_path = resolve_owner_face_animation_context(
@@ -1405,14 +1682,45 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
     if face_target_mode != "owner" and face_animation and NLA_track == 'anim_import':
         effective_track = 'mimic_import'
 
+    effective_source_game = normalize_source_game(source_game) if source_game else (
+        "w2" if _is_w2_animation_file(fdir) else _source_game_for_armature_obj(main_arm_obj)
+    )
+    retarget_w2 = _should_retarget_w2_to_w3(
+        context,
+        effective_source_game,
+        target_armatures,
+        face_animation,
+    )
+    retarget_source_rig_path = ""
+    load_rig_path = rig_path
+    if retarget_w2:
+        target_hint = _armature_identity_text(target_armatures[0]) if target_armatures else ""
+        retarget_source_rig_path = _resolve_w2_retarget_source_rig(
+            context,
+            target_rig_path=rig_path,
+            target_name_hint=target_hint,
+            source_anim_path=fdir,
+        )
+        if not retarget_source_rig_path:
+            roots = "; ".join(source_roots(context, "w2")) or "<no configured W2 roots>"
+            raise RuntimeError(f"W2 source rig for retarget was not found. Configure W2 Retarget Source Rig. Roots: {roots}")
+        load_rig_path = retarget_source_rig_path
+
     result = load_bin_anims_single(
         fdir,
         anim_name,
-        rigPath=rig_path,
+        rigPath=load_rig_path,
     )
     if not result or not result.animations:
         raise RuntimeError(f"Animation '{anim_name}' was not found in {fdir}")
     animation = result.animations[0]
+    if retarget_w2:
+        animation = _retarget_w2_animation_entry(
+            context,
+            animation,
+            retarget_source_rig_path,
+            rig_path,
+        )
 
     try:
         anim_data = getattr(animation, "animation", None)
@@ -1424,6 +1732,8 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
             scene["_w3_last_anim_fps"] = float(getattr(anim_data, "framesPerSecond", 0.0) or 0.0)
             scene["_w3_last_anim_duration"] = float(getattr(anim_data, "duration", 0.0) or 0.0)
             scene["_w3_last_anim_path"] = str(fdir or "")
+            scene["_w3_last_anim_source_game"] = effective_source_game
+            scene["_w3_last_anim_target_component"] = str(target_component or "")
     except Exception:
         pass
 

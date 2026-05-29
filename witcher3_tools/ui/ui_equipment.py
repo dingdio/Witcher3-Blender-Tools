@@ -3465,6 +3465,12 @@ def find_slot_empty(entity_name, slot_name, armature=None):
             candidates.sort(key=lambda pair: pair[0], reverse=True)
             return candidates[0][1]
 
+        # When a caller scopes lookup to an armature, do not fall back to the
+        # global object table. Multiple imported entities can share entity names
+        # such as "player", and a global "player:slot" lookup can bind equipment
+        # to a different character instance.
+        return None
+
     # Fallback: Slot empties are named like "entity_name:slot_name"
     full_name = f"{entity_name}:{slot_name}"
     return bpy.data.objects.get(full_name)

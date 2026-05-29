@@ -4248,6 +4248,48 @@ class TOOL_OT_List_LoadAnim(Operator):
         return {'FINISHED'}
 
 
+class WITCH_OT_QuickAnimLoadLastSet(Operator):
+    """Load the last quick animation source set into Imported Animation Clips"""
+    bl_idname = "witcher.quick_anim_load_last_set"
+    bl_label = "Load Last Set to Clips"
+    bl_description = "Load the last quick animation's .w2anims file into Imported Animation Clips"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    path: StringProperty(default="")
+
+    def execute(self, context):
+        scene = getattr(context, "scene", None)
+        if scene is None:
+            return {'CANCELLED'}
+
+        anim_path = str(self.path or scene.get("_w3_last_anim_path", "") or "").strip()
+        if not anim_path:
+            self.report({'WARNING'}, "No last loaded animation file.")
+            return {'CANCELLED'}
+
+        if not os.path.exists(anim_path) and os.path.exists(anim_path + ".json"):
+            anim_path = anim_path + ".json"
+        if not os.path.exists(anim_path):
+            self.report({'WARNING'}, f"Animation file not found: {anim_path}")
+            return {'CANCELLED'}
+
+        target_component = str(scene.get("_w3_last_anim_target_component", "") or "").strip()
+        import_anims.start_import(context, anim_path, target_component=target_component)
+
+        last_name = str(scene.get("_w3_last_anim_name", "") or "").strip()
+        if last_name:
+            try:
+                for idx, item in enumerate(scene.witcher_w2anims_list):
+                    if str(getattr(item, "name", "") or "") == last_name:
+                        scene.witcher_w2anims_list_index = idx
+                        break
+            except Exception:
+                pass
+
+        self.report({'INFO'}, "Loaded animation set into Imported Animation Clips.")
+        return {'FINISHED'}
+
+
 class TOOL_OT_List_Add(Operator):
     """ Add an Item to the UIList"""
     bl_idname = "witcher.list_add"
@@ -5542,6 +5584,10 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             opts.prop(scene, "witcher_bake_every_frame", text="Bake Every Frame")
             opts.prop(scene, "witcher_smooth_missing_frames", text="Smooth Missing Frames")
             opts.prop(scene, "witcher_scale_keys_to_duration", text="Scale Keys to Duration")
+            opts.separator()
+            opts.prop(scene, "witcher_w2_retarget_to_w3", text="Retarget W2 to W3")
+            opts.prop(scene, "witcher_w2_retarget_in_place", text="In Place")
+            opts.prop(scene, "witcher_w2_retarget_source_rig", text="W2 Source Rig")
 
             motion_box = box.box()
             motion_box.label(text="Motion Extraction Debug", icon='ACTION')
@@ -5595,6 +5641,12 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 col.prop(scene, "witcher_quick_anim_auto_collapse_categories", text="Auto Collapse Categories")
             if hasattr(scene, "witcher_quick_anim_source"):
                 col.prop(scene, "witcher_quick_anim_source", text="Source")
+                if getattr(scene, "witcher_quick_anim_source", "AUTO") == "W2":
+                    w2_box = col.box()
+                    w2_box.label(text="W2 Retarget", icon='ARMATURE_DATA')
+                    w2_box.prop(scene, "witcher_w2_retarget_to_w3", text="Retarget to W3")
+                    w2_box.prop(scene, "witcher_w2_retarget_in_place", text="In Place")
+                    w2_box.prop(scene, "witcher_w2_retarget_source_rig", text="Source Rig")
             if hasattr(scene, "witcher_quick_anim_show_all"):
                 col.prop(scene, "witcher_quick_anim_show_all", text="Show All Animations")
 
@@ -5638,7 +5690,17 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                     info.label(text=f"Length: {round(duration, 2)} sec")
                 anim_path = scene.get("_w3_last_anim_path", "")
                 if anim_path:
-                    info.label(text=f"File: {os.path.basename(anim_path)}")
+                    source_game = normalize_source_game(scene.get("_w3_last_anim_source_game", "") or "w3")
+                    file_row = info.row(align=True)
+                    file_row.label(text=f"File: {os.path.basename(anim_path)}", icon='FILE')
+                    reveal_op = file_row.operator("witcher.reveal_anim_in_explorer", text="", icon='FILE_FOLDER')
+                    reveal_op.path = anim_path
+                    reveal_op.source_game = source_game
+                    path_info_op = file_row.operator("witcher.animset_path_info", text="", icon='QUESTION')
+                    path_info_op.path = anim_path
+                    path_info_op.source_game = source_game
+                    clips_op = file_row.operator("witcher.quick_anim_load_last_set", text="To Clips", icon='ACTION')
+                    clips_op.path = anim_path
 
         dialogset_body = section("witcher_anim_dialogset_body_preset", "Dialogset Body Preset", 'ARMATURE_DATA') if anim_tab == "CLIPS" else None
         if dialogset_body:
@@ -6773,6 +6835,7 @@ classes = [
     TOOL_OT_List_Add,
     TOOL_OT_List_Remove,
     TOOL_OT_List_Reorder,
+    WITCH_OT_QuickAnimLoadLastSet,
     WITCHER_PT_animset_panel,
     TOOL_OT_List_LoadAnim,
     WITCH_OT_ImportW2Rig,
@@ -7005,6 +7068,22 @@ def register():
         description="For uncooked .w2anims files, use embedded uncompressed keyframe data instead of compressed buffers (experimental)",
         default=False
     )
+    bpy.types.Scene.witcher_w2_retarget_to_w3 = BoolProperty(
+        name="Retarget W2 to W3",
+        description="Convert W2 body animation data to the selected W3 skeleton before import",
+        default=True,
+    )
+    bpy.types.Scene.witcher_w2_retarget_in_place = BoolProperty(
+        name="In Place",
+        description="Neutralize W2 retargeted trajectory/root motion while preserving pelvis motion",
+        default=False,
+    )
+    bpy.types.Scene.witcher_w2_retarget_source_rig = StringProperty(
+        name="W2 Source Rig",
+        description="Optional W2 source .w2rig path; empty auto-selects the stock W2 player/man/woman rig",
+        default="",
+        subtype='FILE_PATH',
+    )
     bpy.types.Scene.witcher_bake_every_frame = BoolProperty(
         name="Bake Every Frame",
         description="Insert keyframes on every frame after resampling (more accurate, less smooth)",
@@ -7088,6 +7167,9 @@ def unregister():
         "witcher_w2scene_list_index",
         "witcher_loaded_w2scene_path",
         "witcher_prefer_uncompressed_anims",
+        "witcher_w2_retarget_to_w3",
+        "witcher_w2_retarget_in_place",
+        "witcher_w2_retarget_source_rig",
         "witcher_bake_every_frame",
         "witcher_smooth_missing_frames",
         "witcher_scale_keys_to_duration",
