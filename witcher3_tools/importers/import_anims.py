@@ -1192,6 +1192,12 @@ class AnimImporter:
             bind_strip_action_slot(target_strip, resolve_action_slot(action, target=target, ensure=True))
             target_strip.frame_end = frame_pos + strip_length
             target_strip.blend_type = 'REPLACE'
+            try:
+                target_strip.influence = 1.0
+                if hasattr(target_strip, "use_animated_influence"):
+                    target_strip.use_animated_influence = False
+            except Exception:
+                pass
 
             if self.__NLA_track:
                 track_name = str(self.__NLA_track or "")
@@ -1349,12 +1355,15 @@ class AnimImporter:
         curve_per_bone = {}
         valid_bones = []
         for bone_data in anim_desc.bones:
-            bl_bone = armObj.pose.bones.get(bone_data.BoneName)
+            bone_name = getattr(bone_data, "BoneName", "")
+            if not isinstance(bone_name, str) or not bone_name:
+                log.warning("Animation data has unresolved numeric/empty bone id %r", bone_name)
+                continue
+            bl_bone = armObj.pose.bones.get(bone_name)
             if bl_bone is None:
-                log.warning('Animation data has unknown bone ' + bone_data.BoneName)
+                log.warning('Animation data has unknown bone ' + bone_name)
                 continue
             valid_bones.append(bone_data)
-            bone_name = bone_data.BoneName
             pos_curves = [dummy_keyframe_points] * 3
             rot_curves = [dummy_keyframe_points] * 4
             fcurves_rot = [dummy_keyframe_points]*4 # r0, r1, r2, (r3)

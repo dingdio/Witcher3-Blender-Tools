@@ -10,6 +10,7 @@ from bpy.props import StringProperty, BoolProperty
 from mathutils import Vector
 
 from ..CR2W.common_blender import repo_file, mod_loading_context
+from ..source_game_paths import resolve_w2_repo_file_from_source
 from ..ui.ui_utils import WITCH_PT_Base
 from ..ui.armature_context import get_main_armature_and_rig_settings, set_main_armature
 from ..importers import import_anims
@@ -1513,7 +1514,15 @@ def _resolve_w2_mimic_face_source(main_obj):
         or str(main_obj.get("witcher_w2_mimic_faces", "") or "").strip()
     )
     if face_file:
-        resolved = face_file if os.path.isabs(face_file) else repo_file(face_file, 115)
+        resolved = face_file if os.path.isabs(face_file) else ""
+        source_entity_path = str(main_obj.get("witcher_source_entity_path", "") or "").strip()
+        if not resolved and source_entity_path:
+            try:
+                resolved = resolve_w2_repo_file_from_source(face_file, source_entity_path, version=115)
+            except Exception:
+                resolved = ""
+        if not resolved:
+            resolved = repo_file(face_file, 115)
         return (resolved, None)
     return None
 
@@ -1526,7 +1535,15 @@ def _resolve_w2_mimic_track_skeleton_source(main_obj):
     skeleton_file = str(main_obj.get("witcher_w2_mimic_float_track_skeleton", "") or "").strip()
     if not skeleton_file:
         return None
-    resolved = skeleton_file if os.path.isabs(skeleton_file) else repo_file(skeleton_file, 115)
+    resolved = skeleton_file if os.path.isabs(skeleton_file) else ""
+    source_entity_path = str(main_obj.get("witcher_source_entity_path", "") or "").strip()
+    if not resolved and source_entity_path:
+        try:
+            resolved = resolve_w2_repo_file_from_source(skeleton_file, source_entity_path, version=115)
+        except Exception:
+            resolved = ""
+    if not resolved:
+        resolved = repo_file(skeleton_file, 115)
     return resolved if resolved and os.path.exists(resolved) else None
 
 

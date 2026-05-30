@@ -17,11 +17,12 @@ import json
 import shutil
 import sys
 from contextlib import contextmanager
-from ..extension_paths import get_dev_override
+from ..extension_paths import get_dev_override, get_w2_uncook_root
 from ..source_game_paths import (
     coerce_w2_data_root,
     iter_w2_repo_path_variants,
     normalize_roots,
+    w2_source_repo_root,
 )
 import logging
 log = logging.getLogger(__name__)
@@ -201,6 +202,9 @@ _repo_override_roots = []
 _repo_override_read_only = False
 _redkit_repo_context_stack = []
 _w2_repo_context_stack = []
+_w2_bundle_reset_attempted_paths = set()
+_w2_auto_detect_game_path_ready = False
+_w2_auto_detect_game_path = ""
 _mod_priority_enabled = False
 _mod_priority_high = True
 _overwrite_existing = False
@@ -256,6 +260,9 @@ def _w2_repo_context_for_source(source_path=None, roots=None):
             return {"kind": "redkit_data", "root": game_data_root}
         if unbundle_root and _is_under_root(candidate, unbundle_root):
             return {"kind": "extracted", "root": unbundle_root}
+        source_root = w2_source_repo_root(candidate)
+        if source_root:
+            return {"kind": "extracted", "root": source_root}
     return None
 
 
@@ -372,11 +379,22 @@ def mod_loading_context(context=None, prefer_mods=None, overwrite=None):
 
 def _is_under_root(path, root):
     try:
-        return os.path.commonpath([os.path.normpath(path), os.path.normpath(root)]) == os.path.normpath(root)
+        path_key = os.path.normcase(os.path.normpath(path))
+        root_key = os.path.normcase(os.path.normpath(root))
+        return os.path.commonpath([path_key, root_key]) == root_key
     except Exception:
         return False
 
+def _is_configured_w2_extract_target(path):
+    prefs = _get_addon_prefs()
+    if not prefs:
+        return False
+    w2_unbundle_root = str(getattr(prefs, "w2_unbundle_path", "") or "").strip()
+    return bool(w2_unbundle_root and _is_under_root(path, w2_unbundle_root))
+
 def _is_readonly_target(path):
+    if _is_configured_w2_extract_target(path):
+        return False
     return _repo_override_read_only and any(_is_under_root(path, root) for root in _repo_override_roots)
 
 def _get_source_map_path(uncook_path: str) -> str:
@@ -675,18 +693,131 @@ def _find_w2_existing_repo_file(root: str, filepath: str, skip_path: str = "") -
     return ""
 
 
-def _find_w2_bundle_items(filepath: str):
+def _load_w2_bundle_manager(*, game_path: str = "", reset_cache: bool = False):
     try:
-        manager = LoadWitcher2BundleManager()
-        items = None
-        for rel_path in iter_w2_repo_path_variants(filepath):
-            items = manager.find_item_by_hash(rel_path)
-            if items:
-                return items
-        return None
+        from .witcher_cache.Witcher2Bundles import LoadWitcher2BundleManager as _load_manager
     except Exception:
-        log.debug("Witcher 2 DZIP lookup failed for %s", filepath, exc_info=True)
+        log.debug("Failed to import Witcher 2 DZIP manager", exc_info=True)
         return None
+    try:
+        return _load_manager(reset_cache=reset_cache, game_path=game_path)
+    except Exception:
+        log.debug("Failed to load Witcher 2 DZIP manager for %s", game_path or "<configured>", exc_info=True)
+        return None
+
+
+def _current_w2_bundle_manager():
+    try:
+        from .witcher_cache.Witcher2Bundles.DzipManager import DzipManager
+
+        return DzipManager.InstanceManager
+    except Exception:
+        return None
+
+
+def _configured_w2_game_path_for_bundles():
+    prefs = _get_addon_prefs()
+    if not prefs:
+        return ""
+    return str(getattr(prefs, "witcher2_game_path", "") or "").strip()
+
+
+def _is_valid_w2_game_path_for_bundles(game_path: str) -> bool:
+    return bool(game_path and os.path.isdir(os.path.join(game_path, "CookedPC")))
+
+
+def _iter_w2_bundle_game_path_candidates(current_base: str = ""):
+    seen = set()
+
+    def emit(path):
+        path = str(path or "").strip()
+        if not _is_valid_w2_game_path_for_bundles(path):
+            return None
+        key = os.path.normcase(os.path.normpath(path))
+        if key in seen:
+            return None
+        seen.add(key)
+        return os.path.normpath(path)
+
+    for candidate in (
+        current_base,
+        _configured_w2_game_path_for_bundles(),
+        _auto_detect_w2_game_path_for_bundles(),
+    ):
+        candidate = emit(candidate)
+        if candidate:
+            yield candidate
+
+
+def _find_w2_bundle_items_in_manager(manager, filepath: str):
+    if manager is None:
+        return None
+    for rel_path in iter_w2_repo_path_variants(filepath):
+        items = manager.find_item_by_hash(rel_path)
+        if items:
+            return items
+    return None
+
+
+def _auto_detect_w2_game_path_for_bundles():
+    global _w2_auto_detect_game_path_ready, _w2_auto_detect_game_path
+    if _w2_auto_detect_game_path_ready:
+        return _w2_auto_detect_game_path
+    try:
+        from ..read_game_bin import auto_detect_witcher2_game_path
+
+        _w2_auto_detect_game_path = auto_detect_witcher2_game_path()
+    except Exception:
+        _w2_auto_detect_game_path = ""
+    _w2_auto_detect_game_path_ready = True
+    return _w2_auto_detect_game_path
+
+
+def _find_w2_bundle_items(filepath: str):
+    current_manager = _current_w2_bundle_manager()
+    current_base = str(getattr(current_manager, "base_path", "") or "")
+    candidate_paths = list(_iter_w2_bundle_game_path_candidates(current_base))
+    if not candidate_paths:
+        if current_manager is None:
+            current_manager = _load_w2_bundle_manager()
+            current_base = str(getattr(current_manager, "base_path", "") or "")
+        items = _find_w2_bundle_items_in_manager(current_manager, filepath)
+        if items:
+            return items
+        log.debug(
+            "Witcher 2 DZIP item not found: %s (configured game path: %s, detected game path: %s)",
+            filepath,
+            current_base or "<unset>",
+            "<none>",
+        )
+        return None
+
+    managers = []
+    for game_path in candidate_paths:
+        manager = _load_w2_bundle_manager(game_path=game_path)
+        managers.append(manager)
+        items = _find_w2_bundle_items_in_manager(manager, filepath)
+        if items:
+            return items
+
+        base_key = os.path.normcase(os.path.normpath(game_path))
+        item_count = len(getattr(manager, "Items", {}) or {}) if manager is not None else 0
+        if not item_count and base_key not in _w2_bundle_reset_attempted_paths:
+            _w2_bundle_reset_attempted_paths.add(base_key)
+            reset_manager = _load_w2_bundle_manager(game_path=game_path, reset_cache=True)
+            managers[-1] = reset_manager
+            items = _find_w2_bundle_items_in_manager(reset_manager, filepath)
+            if items:
+                log.warning("Witcher 2 DZIP cache rebuilt to resolve: %s", filepath)
+                return items
+
+    log.debug(
+        "Witcher 2 DZIP item not found: %s (configured game path: %s, detected game path: %s)",
+        filepath,
+        _configured_w2_game_path_for_bundles() or "<unset>",
+        _auto_detect_w2_game_path_for_bundles() or "<none>",
+    )
+    return None
 
 
 def _extract_w2_bundle_repo_file(filepath: str, extract_root: str) -> str:
@@ -702,11 +833,71 @@ def _extract_w2_bundle_repo_file(filepath: str, extract_root: str) -> str:
     item_name = getattr(final_item, "name", "") or filepath
     out_rel_path = item_name.replace("/", "\\")
     out_path = os.path.join(extract_root, out_rel_path)
-    if prepare_extraction_target(out_path, extract_root):
-        final_item.extract_to_file(out_path)
+    try:
+        target_ready = prepare_extraction_target(out_path, extract_root)
+    except Exception:
+        log.warning("Failed to prepare Witcher 2 extraction target: %s", out_path, exc_info=True)
+        return ""
+    if target_ready:
+        try:
+            final_item.extract_to_file(out_path)
+        except Exception:
+            log.warning("Failed to extract Witcher 2 bundle item %s to %s", item_name, out_path, exc_info=True)
+            return ""
         set_source_for_path(extract_root, out_rel_path, "witcher2")
         if os.path.exists(win_safe_path(out_path)):
             return out_path
+    return ""
+
+
+def _w2_cache_extract_root() -> str:
+    try:
+        return os.path.normpath(get_w2_uncook_root(create=True))
+    except Exception:
+        log.debug("Failed to get Witcher 2 fallback extraction cache", exc_info=True)
+        return ""
+
+
+def _warn_w2_cache_fallback(filepath: str, resolved_path: str) -> None:
+    log.warning(
+        "WITCHER 2 CACHE FALLBACK: using extension cache for '%s' after the configured W2 uncook root did not produce a file: %s",
+        filepath,
+        resolved_path,
+    )
+
+
+def _find_w2_existing_in_roots(filepath: str, roots, *, skip_path: str = "") -> str:
+    for root in normalize_roots(roots):
+        candidate = _find_w2_existing_repo_file(root, filepath, skip_path=skip_path)
+        if candidate:
+            return candidate
+    return ""
+
+
+def _extract_w2_bundle_to_roots(filepath: str, roots, *, primary_root: str = "") -> str:
+    primary_key = os.path.normcase(os.path.normpath(primary_root)) if primary_root else ""
+    for root in normalize_roots(roots):
+        extracted_candidate = _extract_w2_bundle_repo_file(filepath, root)
+        if not extracted_candidate:
+            continue
+        root_key = os.path.normcase(os.path.normpath(root))
+        if primary_key and root_key != primary_key:
+            _warn_w2_cache_fallback(filepath, extracted_candidate)
+        return extracted_candidate
+    return ""
+
+
+def _resolve_w2_cache_fallback(filepath: str, cache_extract_root: str) -> str:
+    if not cache_extract_root:
+        return ""
+    cache_candidate = _find_w2_existing_repo_file(cache_extract_root, filepath)
+    if cache_candidate:
+        _warn_w2_cache_fallback(filepath, cache_candidate)
+        return cache_candidate
+    cache_candidate = _extract_w2_bundle_repo_file(filepath, cache_extract_root)
+    if cache_candidate:
+        _warn_w2_cache_fallback(filepath, cache_candidate)
+        return cache_candidate
     return ""
 
 
@@ -736,6 +927,7 @@ def _warn_w2_bundle_fallback(filepath: str, resolved_path: str) -> None:
 
 def _resolve_w2_repo_file(filepath: str, extract_root: str, abs_filename: str) -> str:
     unbundle_root, game_data_root = _get_w2_repo_roots_from_prefs()
+    cache_extract_root = _w2_cache_extract_root()
     context = _active_w2_repo_context() or {}
     context_kind = context.get("kind", "")
     context_root = context.get("root", "")
@@ -750,16 +942,23 @@ def _resolve_w2_repo_file(filepath: str, extract_root: str, abs_filename: str) -
 
         fallback_roots = normalize_roots([extract_root, unbundle_root])
         if not _overwrite_existing:
-            for root in fallback_roots:
-                extracted_candidate = _find_w2_existing_repo_file(root, filepath)
-                if extracted_candidate:
-                    _warn_w2_uncook_fallback(filepath, extracted_candidate)
-                    return extracted_candidate
+            extracted_candidate = _find_w2_existing_in_roots(filepath, fallback_roots)
+            if extracted_candidate:
+                _warn_w2_uncook_fallback(filepath, extracted_candidate)
+                return extracted_candidate
 
-        extracted_candidate = _extract_w2_bundle_repo_file(filepath, extract_root)
+        extracted_candidate = _extract_w2_bundle_to_roots(
+            filepath,
+            [extract_root],
+            primary_root=extract_root,
+        )
         if extracted_candidate:
             _warn_w2_bundle_fallback(filepath, extracted_candidate)
             return extracted_candidate
+
+        cache_candidate = _resolve_w2_cache_fallback(filepath, cache_extract_root)
+        if cache_candidate:
+            return cache_candidate
 
         return abs_filename
 
@@ -769,12 +968,15 @@ def _resolve_w2_repo_file(filepath: str, extract_root: str, abs_filename: str) -
     extracted_roots = normalize_roots(extracted_roots)
 
     if not _overwrite_existing:
-        for root in extracted_roots:
-            extracted_candidate = _find_w2_existing_repo_file(root, filepath)
-            if extracted_candidate:
-                return extracted_candidate
+        extracted_candidate = _find_w2_existing_in_roots(filepath, extracted_roots)
+        if extracted_candidate:
+            return extracted_candidate
 
-    extracted_candidate = _extract_w2_bundle_repo_file(filepath, extract_root)
+    extracted_candidate = _extract_w2_bundle_to_roots(
+        filepath,
+        [extract_root],
+        primary_root=extract_root,
+    )
     if extracted_candidate:
         return extracted_candidate
 
@@ -790,9 +992,17 @@ def _resolve_w2_repo_file(filepath: str, extract_root: str, abs_filename: str) -
             return game_data_candidate
 
     if _overwrite_existing:
-        extracted_candidate = _extract_w2_bundle_repo_file(filepath, extract_root)
+        extracted_candidate = _extract_w2_bundle_to_roots(
+            filepath,
+            [extract_root],
+            primary_root=extract_root,
+        )
         if extracted_candidate:
             return extracted_candidate
+
+    cache_candidate = _resolve_w2_cache_fallback(filepath, cache_extract_root)
+    if cache_candidate:
+        return cache_candidate
 
     return abs_filename
 
@@ -887,6 +1097,11 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
         return os.path.join(fbx_uncook_path, filepath)
     else:
         if not extract_root:
+            if version <= 115:
+                extract_root = _w2_cache_extract_root()
+                if extract_root:
+                    abs_filename = os.path.join(extract_root, filepath)
+                    return _resolve_w2_repo_file(filepath, extract_root, abs_filename)
             if is_texture_repo and texture_path:
                 return os.path.join(texture_path, filepath)
             return filepath

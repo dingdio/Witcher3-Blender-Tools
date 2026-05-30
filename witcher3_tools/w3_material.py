@@ -6,7 +6,9 @@ log = logging.getLogger(__name__)
 
 from pathlib import Path
 from math import radians
+import hashlib
 import time
+import tempfile
 from .CR2W import CR2W_reader
 import bpy, os
 from typing import Any, List, Dict, Optional, Set, Tuple
@@ -37,6 +39,7 @@ from .w3_material_reader import (
     resolve_w2mg,
 )
 from . import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext, get_texture_path
+from .extension_paths import get_texture_root
 from .CR2W.texture_converters import (
     convert_texarray_to_dds,
     convert_xbm_to_dds,
@@ -62,6 +65,7 @@ tex_types = [
 _MATERIAL_PROFILE_ENABLED = True
 _MATERIAL_PROFILE_WARN_THRESHOLD = 0.25
 _TEXTURE_PROFILE_WARN_THRESHOLD = 0.10
+_MISSING_W2_TEXTURE_LOG_KEYS: Set[str] = set()
 
 
 def _log_material_profile_warning(message, *args):
@@ -315,6 +319,94 @@ def _texture_xbm_repo_path(texture_path: str) -> str:
     if ext.lower() in {".dds", ".tga", ".png", ".xbm"}:
         return root + ".xbm"
     return texture_path
+
+
+def _resolve_existing_texture_xbm(texture_path: str, repo_version: int) -> str:
+    xbm_repo_path = _texture_xbm_repo_path(texture_path)
+    if not xbm_repo_path:
+        return ""
+    try:
+        resolved_path = repo_file(xbm_repo_path, version=repo_version)
+    except Exception:
+        resolved_path = ""
+        log.debug("Failed to resolve texture XBM through repo_file: %s", xbm_repo_path, exc_info=True)
+    if resolved_path and os.path.exists(win_safe_path(resolved_path)):
+        return resolved_path
+    if repo_version <= 115:
+        log_key = normalize_depot_path(xbm_repo_path)
+        if log_key not in _MISSING_W2_TEXTURE_LOG_KEYS:
+            _MISSING_W2_TEXTURE_LOG_KEYS.add(log_key)
+            log.critical(
+                "Witcher 2 texture was not found or extracted from bundles: %s -> %s",
+                xbm_repo_path,
+                resolved_path or "<unresolved>",
+            )
+    return ""
+
+
+def _source_file_cache_identity(path_value: str) -> Tuple[str, int, int]:
+    source_path = os.path.abspath(win_safe_path(str(path_value or "")))
+    try:
+        stat = os.stat(source_path)
+        mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1000000000)))
+        size = int(stat.st_size)
+    except OSError:
+        mtime_ns = 0
+        size = 0
+    return source_path, mtime_ns, size
+
+
+def _derived_file_is_current(output_path: str, source_path: str) -> bool:
+    if not output_path or not os.path.exists(win_safe_path(output_path)):
+        return False
+    try:
+        source_mtime = os.path.getmtime(win_safe_path(source_path))
+        output_mtime = os.path.getmtime(win_safe_path(output_path))
+    except OSError:
+        return False
+    return output_mtime >= source_mtime
+
+
+def _cached_dds_path_for_xbm(xbm_path: str) -> str:
+    source_path, mtime_ns, size = _source_file_cache_identity(xbm_path)
+    key = f"{source_path.lower()}|{mtime_ns}|{size}"
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
+    stem = Path(source_path).stem or "texture"
+    try:
+        texture_root = get_texture_root(True)
+    except OSError:
+        texture_root = os.path.join(tempfile.gettempdir(), "witcher3_tools", "witcher_textures")
+    cache_dir = os.path.join(texture_root, "converted_xbm", digest[:2])
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        cache_dir = os.path.join(tempfile.gettempdir(), "witcher3_tools", "witcher_textures", "converted_xbm", digest[:2])
+        os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"{stem}_{digest[:16]}.dds")
+
+
+def _convert_xbm_to_writable_dds(xbm_path: str, preferred_dds_path: str = "") -> str:
+    preferred_dds_path = preferred_dds_path or (os.path.splitext(xbm_path)[0] + ".dds")
+    if preferred_dds_path and _derived_file_is_current(preferred_dds_path, xbm_path):
+        return preferred_dds_path
+    try:
+        converted_path = convert_xbm_to_dds(xbm_path, out_path=preferred_dds_path)
+        if converted_path and _derived_file_is_current(converted_path, xbm_path):
+            return converted_path
+        if preferred_dds_path and _derived_file_is_current(preferred_dds_path, xbm_path):
+            return preferred_dds_path
+    except OSError:
+        log.debug("Could not write DDS beside XBM, using texture cache: %s", xbm_path, exc_info=True)
+
+    cached_dds_path = _cached_dds_path_for_xbm(xbm_path)
+    if _derived_file_is_current(cached_dds_path, xbm_path):
+        return cached_dds_path
+    converted_path = convert_xbm_to_dds(xbm_path, out_path=cached_dds_path)
+    if converted_path and _derived_file_is_current(converted_path, xbm_path):
+        return converted_path
+    if _derived_file_is_current(cached_dds_path, xbm_path):
+        return cached_dds_path
+    return ""
 
 
 def _local_handle_ref_chunk(source_chunk, handle):
@@ -2064,9 +2156,11 @@ def create_node_texture(
         if not os.path.exists(win_safe_path(dds_path)):
             try:
                 convert_started = time.perf_counter()
-                convert_xbm_to_dds(tex_path, out_path=dds_path)
+                converted_dds_path = _convert_xbm_to_writable_dds(tex_path, dds_path)
                 conversion_seconds = time.perf_counter() - convert_started
-                converted_from_xbm = True
+                if converted_dds_path:
+                    dds_path = converted_dds_path
+                    converted_from_xbm = True
             except Exception as e:
                 conversion_seconds = time.perf_counter() - convert_started
                 log.warning("Failed to convert xbm_to_dds: %s (%s)", tex_path, e)
@@ -2102,7 +2196,7 @@ def create_node_texture(
                     xbm_path = xbm_path.replace(TEXTURE_PATH, GAME_UNCOOK_PATH)
                     dds_path = dds_path.replace(TEXTURE_PATH, GAME_UNCOOK_PATH)
                 # Last fallback: repo_file() will use bundle fallback extraction in uncook for textures.
-                bundle_xbm_path = repo_file(_texture_xbm_repo_path(par_value), version=repo_version)
+                bundle_xbm_path = _resolve_existing_texture_xbm(par_value, repo_version)
                 if bundle_xbm_path and os.path.exists(win_safe_path(bundle_xbm_path)):
                     xbm_path = bundle_xbm_path
                     dds_path = os.path.splitext(bundle_xbm_path)[0] + ".dds"
@@ -2111,9 +2205,11 @@ def create_node_texture(
             elif os.path.exists(win_safe_path(xbm_path)):
                 try:
                     convert_started = time.perf_counter()
-                    convert_xbm_to_dds(xbm_path)
+                    converted_dds_path = _convert_xbm_to_writable_dds(xbm_path, dds_path)
                     conversion_seconds = time.perf_counter() - convert_started
-                    converted_from_xbm = True
+                    if converted_dds_path:
+                        dds_path = converted_dds_path
+                        converted_from_xbm = True
                 except Exception as e:
                     conversion_seconds = time.perf_counter() - convert_started
                     log.warning("Failed to convert xbm_to_dds: %s (%s)", xbm_path, e)
@@ -2173,7 +2269,8 @@ def create_node_cubemap(
     par_value = param.get('value')
 
     # Resolve the .w2cube file path
-    w2cube_path = repo_file(par_value) if par_value and not os.path.isabs(par_value) else par_value
+    repo_version = _material_repo_version(mat)
+    w2cube_path = repo_file(par_value, version=repo_version) if par_value and not os.path.isabs(par_value) else par_value
     if not w2cube_path or not os.path.exists(win_safe_path(w2cube_path)):
         w2cube_path = os.path.join(uncook_path, par_value) if par_value else None
 

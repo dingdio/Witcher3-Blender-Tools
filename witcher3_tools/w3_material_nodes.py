@@ -43,6 +43,7 @@ from . import get_all_addon_prefs, get_texture_path, get_uncook_path
 from .extension_paths import get_cache_root
 from .source_game_paths import (
     normalize_source_game as _normalize_material_source_game,
+    w2_source_repo_root,
     w2_source_roots,
 )
 import os
@@ -3236,10 +3237,23 @@ def get_repo_from_abs_path(texture_path_input, extension='.xbm'):
 
     def _try_strip_root(path, root):
         """Strip a root directory from the path, returning game-relative path or None."""
-        root = win_unprefix_path(os.path.realpath(bpy.path.abspath(root)))
-        if root and Path(root).exists() and root in path:
-            return path.replace(root + '\\', '')
-        return None
+        root = str(root or "").strip()
+        if not root:
+            return None
+        root = win_unprefix_path(os.path.realpath(bpy.path.abspath(root))).rstrip("\\/")
+        if not root or not os.path.isdir(win_safe_path(root)):
+            return None
+        try:
+            root_key = os.path.normcase(os.path.normpath(root))
+            path_key = os.path.normcase(os.path.normpath(path))
+            if os.path.commonpath([root_key, path_key]) != root_key:
+                return None
+            rel_path = os.path.relpath(path, root)
+        except Exception:
+            return None
+        if not rel_path or rel_path == os.curdir or rel_path.startswith("..") or os.path.isabs(rel_path):
+            return None
+        return rel_path
 
     # Check paths in path_list first (user custom roots)
     for path_item in addon_prefs.path_list:
@@ -3267,6 +3281,13 @@ def get_repo_from_abs_path(texture_path_input, extension='.xbm'):
     if result:
         return result
 
+    # Witcher 2 roots. These need to be checked independently of the W3
+    # texture/uncook roots so N-panel texture paths remain depot-relative.
+    for root in w2_source_roots(bpy.context):
+        result = _try_strip_root(texture_path, root)
+        if result:
+            return result
+
     # Texture uncook path
     result = _try_strip_root(texture_path, TEXTURE_PATH)
     if result:
@@ -3288,6 +3309,11 @@ def get_repo_from_abs_path(texture_path_input, extension='.xbm'):
 
     # Modded texture path
     result = _try_strip_root(texture_path, MOD_TEX_PATH)
+    if result:
+        return result
+
+    source_root = w2_source_repo_root(texture_path)
+    result = _try_strip_root(texture_path, source_root)
     if result:
         return result
 

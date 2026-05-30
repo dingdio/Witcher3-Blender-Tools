@@ -592,7 +592,7 @@ class ELEMENT:
                             elif (exists(More, "More[0].Value")):
                                 #SPrintf(title, "%s = %Ld", More.Type.name, More.More[0].Value)
                                 title = "%s = %Ld" % (More.Type.name, More.More[0].Value)
-                        elif (doesExist(More.Type.type, "Ref") and exists(More.Path)):
+                        elif (doesExist(More.Type.type, "Ref") and exists(More, "Path.Path")):
                             title = More.Path.Path
                     if (not doesExist(CR2WFILE.gType, "loat") and not doesExist(CR2WFILE.gType, "Uint8")):
                         pass #SetBackColor(cNone)

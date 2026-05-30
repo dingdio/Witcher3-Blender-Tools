@@ -7593,6 +7593,7 @@ class FileActionOperatorImportToScene(Operator):
         return request
 
     def _execute_resolved_import(self, context, resolved):
+        import_started = time.perf_counter()
         cache_type = resolved["cache_type"]
         overwrite_existing = resolved["overwrite_existing"]
         full_path = resolved["full_path"]
@@ -7907,7 +7908,8 @@ class FileActionOperatorImportToScene(Operator):
         add_recent_import(context, full_path, cache_type)
 
         filename = os.path.basename(full_path)
-        self.report({'INFO'}, f"Successfully imported: {filename}")
+        elapsed_seconds = time.perf_counter() - import_started
+        self.report({'INFO'}, f"Successfully imported: {filename} ({elapsed_seconds:.1f}s)")
         return {'FINISHED'}
 
 

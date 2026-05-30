@@ -495,7 +495,7 @@ def create_CCutscene_w2(file, raw_data):
             log.warning("Failed to read W2 cutscene animation entry %d", idx, exc_info=True)
 
     final_set = w3_types.CCutsceneTemplate(animations=animations, SCutsceneActorDefs=actors)
-    final_set.animevents = []  # W2 events (CAnimEventSerializer) not parsed yet
+    final_set.animevents = []  # W2 events (CAnimEventSerializer) need structured parsing with timing.
 
     present_fields = {
         str(getattr(prop, "theName", "") or "").strip()

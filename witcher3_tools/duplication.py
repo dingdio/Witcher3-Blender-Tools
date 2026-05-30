@@ -479,12 +479,19 @@ def _retarget_duplicate_character_metadata(source_armature, duplicate_armature, 
         except Exception:
             pass
 
-        mimic_face_name = str(source_obj.get("mimicFace", "") or "").strip()
-        if mimic_face_name:
-            duplicate_face = object_map.get(mimic_face_name, (None, None))[1]
-            if duplicate_face is not None:
+        for prop_name in (
+            "mimicFace",
+            "witcher_w2_mimic_armature",
+            "witcher_w2_mimic_parent_armature",
+            "witcher_w2_head_parent_armature",
+        ):
+            target_name = str(source_obj.get(prop_name, "") or "").strip()
+            if not target_name:
+                continue
+            duplicate_target = object_map.get(target_name, (None, None))[1]
+            if duplicate_target is not None:
                 try:
-                    duplicate_obj["mimicFace"] = duplicate_face.name
+                    duplicate_obj[prop_name] = duplicate_target.name
                 except Exception:
                     pass
         for prop_name in (

@@ -46,6 +46,7 @@ from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
 from ..CR2W.common_blender import repo_file, redkit_repo_context, win_safe_path
 from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
+from ..source_game_paths import W2_REPO_ROOT_MARKERS, resolve_w2_repo_file_from_source, w2_source_repo_root
 from .dlc_mounters import (
     append_dlc_entity_template_params,
     append_dlc_external_appearances,
@@ -1716,7 +1717,7 @@ def _ensure_imported_entity_face_morphs_loaded(context, armature_obj):
 
 def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                         parent_transform = None, selected_appearance_name = "",
-                        mesh_import_settings = None):
+                        mesh_import_settings = None, entity_namespace = ""):
     base_context = bpy.context
     mesh_import_settings = get_entity_mesh_import_settings(mesh_import_settings)
     if not getattr(import_ent_template, "_repo_context_active", False):
@@ -1730,6 +1731,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                     parent_transform,
                     selected_appearance_name,
                     mesh_import_settings=mesh_import_settings,
+                    entity_namespace=entity_namespace,
                 )
         finally:
             import_ent_template._repo_context_active = False
@@ -1749,6 +1751,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                 parent_transform,
                 selected_appearance_name,
                 mesh_import_settings=mesh_import_settings,
+                entity_namespace=entity_namespace,
             )
         if result is not None:
             _focus_main_armature(base_context, result)
@@ -1759,6 +1762,9 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
     target_collection = _get_import_target_collection(context)
     _activate_target_collection(context, target_collection)
     entity = test_load_entity(filename)
+    namespace_override = str(entity_namespace or "").strip().rstrip(":")
+    if namespace_override:
+        entity.name = namespace_override
     entity_state = _build_entity_armature_state(
         entity,
         filename=filename,
@@ -1781,6 +1787,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
         entity,
         entity_root,
         direct_entity_path=entity_repo_path,
+        source_entity_path=filename if filename and os.path.isabs(str(filename)) else "",
         source_game=entity_source_game,
         target_collection=target_collection,
         mesh_import_settings=mesh_import_settings,
@@ -1878,6 +1885,7 @@ def _derive_repo_root_hint(path: str) -> str:
     norm_path = os.path.normpath(path)
     lower_path = norm_path.lower()
     markers = (
+        *W2_REPO_ROOT_MARKERS,
         "\\game\\",
         "\\gameplay\\",
         "\\items\\",
@@ -1887,6 +1895,15 @@ def _derive_repo_root_hint(path: str) -> str:
         "\\levels\\",
         "\\living_world\\",
         "\\environment\\",
+        "\\environment_levels\\",
+        "\\templates\\",
+        "\\cutscenes\\",
+        "\\engine\\",
+        "\\animations\\",
+        "\\fx\\",
+        "\\globals\\",
+        "\\gui\\",
+        "\\ui\\",
     )
     hits = [lower_path.find(marker) for marker in markers if lower_path.find(marker) > 2]
     if hits:
@@ -1998,6 +2015,7 @@ def _build_entity_armature_state(entity, *, filename="", import_apperance=0,
 
     return {
         "source_roots": source_roots,
+        "source_path": filename if filename and os.path.isabs(filename) else "",
         "entity_name": str(getattr(entity, "name", "") or "").strip() or Path(str(filename or "")).stem,
         "repo_path": repo_path,
         "main_entity_skeleton": main_entity_skeleton,
@@ -2032,6 +2050,12 @@ def initialize_entity_armature_state(armature_obj, entity, *, filename="", impor
         armature_obj["_w3_source_roots_json"] = json.dumps(source_roots or [])
     except Exception:
         pass
+    source_path = str(entity_state.get("source_path", "") or "").strip()
+    if source_path:
+        try:
+            armature_obj["_w3_entity_source_path"] = source_path
+        except Exception:
+            pass
     try:
         armature_obj["_w3_entity_context_role"] = str(context_role or "primary")
     except Exception:
@@ -2178,6 +2202,12 @@ def _get_armature_source_roots(armature):
 
 
 def _repo_context_source_for_armature(armature) -> str:
+    try:
+        source_path = str(armature.get("_w3_entity_source_path", "") or "").strip()
+    except Exception:
+        source_path = ""
+    if source_path and os.path.isabs(source_path):
+        return source_path
     for root in _get_armature_source_roots(armature):
         if root and os.path.isabs(str(root)):
             return str(root)
@@ -2558,6 +2588,7 @@ def _store_w2_head_metadata(obj, chunk):
     for src_key, prop_key in (
         ("w2_head_name", "witcher_w2_head_name"),
         ("w2_head_mesh_role", "witcher_w2_head_mesh_role"),
+        ("w2_head_parent_slot_name", "witcher_w2_head_parent_slot_name"),
     ):
         value = str(_get_entry_attr(chunk, src_key, "") or "").strip()
         if value:
@@ -2602,6 +2633,27 @@ def _hide_w2_base_head_objects_for_mimic(head_name, objdict, meshdict):
     return hidden
 
 
+def _hide_w2_mimic_fallback_objects(objects):
+    hidden = 0
+    seen = set()
+    for obj in objects or []:
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        try:
+            obj.hide_set(True)
+        except Exception:
+            pass
+        try:
+            obj.hide_viewport = True
+            obj.hide_render = True
+        except Exception:
+            pass
+        obj["witcher_w2_mimic_hidden_without_face_rig"] = True
+        hidden += 1
+    return hidden
+
+
 def _w2_mimic_metadata_from_chunk(chunk):
     if not _is_w2_mimic_support_chunk(chunk):
         return {}
@@ -2626,6 +2678,11 @@ def _w2_mimic_metadata_from_chunk(chunk):
         "faces_low_embedded_chunk_index": _get_entry_attr(chunk, "w2_mimic_faces_low_embedded_chunk_index", -1),
         "bone_mapping": _get_entry_attr(chunk, "w2_mimic_bone_mapping", []) or [],
         "bone_mapping_low": _get_entry_attr(chunk, "w2_mimic_bone_mapping_low", []) or [],
+        "parent_slot_name": str(
+            _get_entry_attr(chunk, "w2_mimic_parent_slot_name", "")
+            or _get_entry_attr(chunk, "w2_head_parent_slot_name", "")
+            or ""
+        ),
         "dist_for_default_head": (
             _get_entry_attr(chunk, "w2_mimic_dist_for_default_head", None)
             if _get_entry_attr(chunk, "w2_mimic_dist_for_default_head", None) is not None
@@ -2662,6 +2719,19 @@ def _store_w2_mimic_metadata(obj, metadata, *, armature_name="", mesh_object_nam
     if obj is None or not metadata:
         return
     obj["witcher_w2_mimic_support"] = True
+    obj["witcher_source_game"] = "w2"
+    rig_settings = getattr(getattr(obj, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is not None:
+        try:
+            rig_settings.source_game = "w2"
+        except Exception:
+            pass
+        float_track_skeleton = str(metadata.get("float_track_skeleton", "") or "").strip()
+        if float_track_skeleton and not str(getattr(rig_settings, "main_face_skeleton", "") or "").strip():
+            try:
+                rig_settings.main_face_skeleton = float_track_skeleton
+            except Exception:
+                pass
     for src_key, prop_key in (
         ("head_name", "witcher_w2_mimic_head_name"),
         ("mesh_role", "witcher_w2_mimic_mesh_role"),
@@ -2678,6 +2748,7 @@ def _store_w2_mimic_metadata(obj, metadata, *, armature_name="", mesh_object_nam
         ("faces_low", "witcher_w2_mimic_faces_low"),
         ("faces_high_embedded_source", "witcher_w2_mimic_faces_high_embedded_source"),
         ("faces_low_embedded_source", "witcher_w2_mimic_faces_low_embedded_source"),
+        ("parent_slot_name", "witcher_w2_mimic_parent_slot_name"),
     ):
         value = str(metadata.get(src_key, "") or "").strip()
         if value:
@@ -2725,6 +2796,30 @@ def _store_entity_w2_mimic_metadata(armature_obj, entity):
         pass
 
 
+def _store_armature_bone_order_from_skeleton(armature_obj, skeleton_data):
+    if armature_obj is None or skeleton_data is None:
+        return
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is None:
+        return
+    bone_order = getattr(rig_settings, "bone_order_list", None)
+    if bone_order is None:
+        return
+    try:
+        bone_order.clear()
+    except Exception:
+        pass
+    for bone_data in getattr(skeleton_data, "bones", []) or []:
+        name = str(getattr(bone_data, "name", "") or "").strip()
+        if not name:
+            continue
+        try:
+            item = bone_order.add()
+            item.name = name
+        except Exception:
+            break
+
+
 def _load_w2_embedded_skeleton_data(source_path, chunk_index):
     source_path = str(source_path or "").strip()
     if not source_path or not os.path.exists(win_safe_path(source_path)):
@@ -2737,9 +2832,11 @@ def _load_w2_embedded_skeleton_data(source_path, chunk_index):
         return None
     try:
         from ..CR2W.CR2W_file import read_CR2W
-        from ..CR2W.dc_skeleton import create_Skeleton_w2, read_skelly
+        from ..CR2W.dc_skeleton import _read_w2_mimic_skeleton, create_Skeleton_w2, read_skelly
 
         cr2w_file = read_CR2W(source_path)
+        with open(source_path, "rb") as f:
+            raw_data = f.read()
         chunks = list(getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or [])
         candidate_indices = [chunk_index]
         if chunk_index > 0:
@@ -2750,16 +2847,17 @@ def _load_w2_embedded_skeleton_data(source_path, chunk_index):
             chunk = chunks[candidate_index]
             if getattr(chunk, "Type", None) != "CSkeleton":
                 continue
-            rig = None
+            rig = _read_w2_mimic_skeleton(cr2w_file, raw_data, candidate_index)
             if getattr(getattr(cr2w_file, "HEADER", None), "version", 999) <= 115:
-                class _ChunkList:
-                    CHUNKS = [chunk]
+                if rig is None or not getattr(rig, "names", None):
+                    class _ChunkList:
+                        CHUNKS = [chunk]
 
-                class _SingleChunkFile:
-                    CHUNKS = _ChunkList()
+                    class _SingleChunkFile:
+                        CHUNKS = _ChunkList()
 
-                with open(source_path, "rb") as f:
-                    rig = create_Skeleton_w2(f, _SingleChunkFile())
+                    with open(source_path, "rb") as f:
+                        rig = create_Skeleton_w2(f, _SingleChunkFile())
             if rig is None or not getattr(rig, "names", None):
                 rig = read_skelly(chunk)
             if not getattr(rig, "names", None):
@@ -2891,6 +2989,94 @@ def _apply_w2_mimic_bone_mapping_constraints(parent_armature, child_armature, me
         child_armature["witcher_w2_mimic_parent_armature"] = parent_armature.name
         child_armature["witcher_w2_mimic_mapping_constraint_count"] = changed
     return changed
+
+
+def _w2_armature_slot_bone(parent_armature, slot_name):
+    if parent_armature is None or getattr(parent_armature, "type", "") != 'ARMATURE':
+        return None
+    pose_bones = getattr(getattr(parent_armature, "pose", None), "bones", None)
+    if not pose_bones:
+        return None
+
+    slot_name = str(slot_name or "").strip()
+    if not slot_name:
+        return None
+    bone = pose_bones.get(slot_name)
+    if bone is not None:
+        return bone
+
+    lowered = {str(getattr(bone, "name", "") or "").lower(): bone for bone in pose_bones}
+    return lowered.get(slot_name.lower())
+
+
+def _remove_w2_head_slot_constraints(pose_bone):
+    if pose_bone is None:
+        return
+    for constraint in list(getattr(pose_bone, "constraints", []) or []):
+        if str(getattr(constraint, "name", "") or "").startswith("W2_HEAD_SLOT_"):
+            pose_bone.constraints.remove(constraint)
+
+
+def _attach_w2_head_objects_to_parent_slot(parent_armature, objects, slot_name):
+    p_bone = _w2_armature_slot_bone(parent_armature, slot_name)
+    if p_bone is None:
+        slot_name = str(slot_name or "").strip()
+        if slot_name and parent_armature is not None:
+            log.warning(
+                "Witcher 2 head parent slot '%s' was not found on '%s'",
+                slot_name,
+                getattr(parent_armature, "name", "<unknown>"),
+            )
+        return 0
+
+    attached = 0
+    for obj in _get_import_root_objects(objects or []):
+        if obj is None or obj is parent_armature:
+            continue
+        if getattr(obj, "type", "") == 'ARMATURE' and getattr(obj, "pose", None):
+            _set_parent_keep_world(obj, parent_armature)
+            obj.parent_type = "OBJECT"
+            obj.parent_bone = ""
+            child_bones = list(getattr(obj.pose, "bones", []) or [])
+            if child_bones:
+                child_root = child_bones[0]
+                _remove_w2_head_slot_constraints(child_root)
+                copy_transform = child_root.constraints.new('COPY_TRANSFORMS')
+                copy_transform.name = f"W2_HEAD_SLOT_{p_bone.name}_to_{child_root.name}"
+                copy_transform.target = parent_armature
+                copy_transform.subtarget = p_bone.name
+                try:
+                    copy_transform.owner_space = 'WORLD'
+                    copy_transform.target_space = 'WORLD'
+                except Exception:
+                    pass
+                try:
+                    copy_transform.mix_mode = 'REPLACE'
+                except Exception:
+                    pass
+        else:
+            _set_parent_keep_world(
+                obj,
+                parent_armature,
+                parent_type='BONE',
+                parent_bone=p_bone.name,
+            )
+
+        obj["witcher_w2_head_parent_armature"] = parent_armature.name
+        obj["witcher_w2_head_parent_slot"] = p_bone.name
+        attached += 1
+    return attached
+
+
+def _is_w2_head_slot_attached_object(obj):
+    if obj is None:
+        return False
+    try:
+        if obj.get("witcher_w2_head_parent_armature") and obj.get("witcher_w2_head_parent_slot"):
+            return True
+        return bool(obj.get("witcher_w2_mimic_parent_armature") and obj.get("witcher_w2_mimic_mapping_constraint_count"))
+    except Exception:
+        return False
 
 
 def _attach_w2_mimic_meshes_to_mimic_rig(mimic_armature, mesh_armatures, meshes):
@@ -4402,7 +4588,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                  HardAttachments, hide_shadowmesh, root_skeleton, i,
                  selectedAppearance=None, import_redcloth_enabled=True, morphs_todo=None,
                  bind_root_chunks_to_entity=True, direct_entity_path="", source_game="",
-                 target_collection=None, mesh_import_settings=None):
+                 source_entity_path="", target_collection=None, mesh_import_settings=None):
     if morphs_todo is None:
         morphs_todo = []
     if target_collection is None:
@@ -4414,7 +4600,9 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         selected_appearance_name,
     )
     direct_entity_path = _normalize_repo_path(direct_entity_path)
+    source_entity_path = str(source_entity_path or "").strip()
     source_game = "w2" if str(source_game or "").strip().lower() == "w2" else ("w3" if source_game else "")
+    resource_version = 115 if source_game == "w2" else _coerce_version(getattr(entity, "version", None), 999)
     
     def get_chunk_namespace(chunk):
         return f"{ent_namespace}{chunk['type']}{i}{chunk['chunkIndex']}"
@@ -4424,7 +4612,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         if not path:
             return ""
         try:
-            resolved = path if os.path.isabs(path) else repo_file(path, entity.version)
+            resolved = path if os.path.isabs(path) else repo_file(path, resource_version)
         except Exception:
             resolved = path
         try:
@@ -4439,17 +4627,36 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 f"Empty {field_name} path for {label} on "
                 f"{chunk.get('type')} #{chunk.get('chunkIndex')}"
             )
+        source_expected_path = ""
+        if source_game == "w2" and source_entity_path and os.path.isabs(source_entity_path):
+            try:
+                resolved_from_source = resolve_w2_repo_file_from_source(
+                    repo_path,
+                    source_entity_path,
+                    version=resource_version,
+                )
+            except Exception:
+                resolved_from_source = ""
+            if resolved_from_source and os.path.exists(win_safe_path(resolved_from_source)):
+                return resolved_from_source
+            source_root = w2_source_repo_root(source_entity_path)
+            if source_root:
+                source_expected_path = os.path.join(source_root, repo_path.replace("/", "\\").lstrip("\\"))
         try:
-            resolved_path = repo_file(repo_path, entity.version)
+            resolved_path = repo_file(repo_path, resource_version)
         except Exception as exc:
             raise FileNotFoundError(
                 f"Failed to resolve {label} for {chunk.get('type')} "
-                f"#{chunk.get('chunkIndex')}: {repo_path}"
+                f"#{chunk.get('chunkIndex')}: {repo_path} (version={resource_version}, source_game={source_game or '<unset>'})"
             ) from exc
         if not resolved_path or not os.path.exists(win_safe_path(resolved_path)):
+            detail = f"{repo_path} -> {resolved_path}"
+            if source_expected_path and os.path.normcase(os.path.normpath(source_expected_path)) != os.path.normcase(os.path.normpath(str(resolved_path or ""))):
+                detail = f"{detail} (source root candidate: {source_expected_path})"
+            detail = f"{detail} (version={resource_version}, source_game={source_game or '<unset>'})"
             raise FileNotFoundError(
                 f"Missing {label} for {chunk.get('type')} "
-                f"#{chunk.get('chunkIndex')}: {repo_path} -> {resolved_path}"
+                f"#{chunk.get('chunkIndex')}: {detail}"
             )
         return resolved_path
 
@@ -4508,6 +4715,8 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 obj['witcher_path'] = path
             if direct_entity_path:
                 obj['witcher_entity_path'] = direct_entity_path
+            if source_entity_path and os.path.isabs(source_entity_path):
+                obj['witcher_source_entity_path'] = source_entity_path
             if source_game:
                 obj['witcher_source_game'] = source_game
 
@@ -4525,6 +4734,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         imported_armature = None
         imported_meshes = []
         imported_mesh_armatures = []
+        deferred_skeleton_warning = ""
 
         skeleton_repo = str(metadata.get("skeleton", "") or "").strip()
         skeleton_embedded_source = str(metadata.get("skeleton_embedded_source", "") or "").strip()
@@ -4551,6 +4761,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                             f"{chunk_ns}_rig",
                             fileName=skeleton_embedded_source,
                         )
+                        _store_armature_bone_order_from_skeleton(imported_armature, embedded_skeleton)
                         add_chunk_metadata(
                             imported_armature,
                             chunk,
@@ -4567,9 +4778,13 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                             exc_info=True,
                         )
                 else:
-                    log.warning(
+                    deferred_skeleton_warning = (
+                        skeleton_repo
+                        or f"{skeleton_embedded_source} #{skeleton_embedded_chunk_index}"
+                    )
+                    log.debug(
                         "Failed to import Witcher 2 mimic skeleton: %s",
-                        skeleton_repo or f"{skeleton_embedded_source} #{skeleton_embedded_chunk_index}",
+                        deferred_skeleton_warning,
                         exc_info=True,
                     )
 
@@ -4589,7 +4804,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     resolved_mesh_path = embedded_source_path
                     selected_cmesh_chunk_index = int(embedded_cmesh_chunk_index)
                 else:
-                    resolved_mesh_path = repo_file(mesh_repo, entity.version)
+                    resolved_mesh_path = _resolve_required_chunk_resource(chunk, 'mesh', 'mesh')
                     if not resolved_mesh_path or not os.path.exists(win_safe_path(resolved_mesh_path)):
                         raise FileNotFoundError(f"{mesh_repo} -> {resolved_mesh_path}")
 
@@ -4630,6 +4845,11 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 armatures=imported_mesh_armatures,
                 meshes=imported_meshes,
             )
+        if deferred_skeleton_warning and not imported_mesh_armatures:
+            log.warning(
+                "Failed to import Witcher 2 mimic skeleton and no mesh armature fallback was available: %s",
+                deferred_skeleton_warning,
+            )
 
         metadata_targets = []
         for target_obj in (
@@ -4650,8 +4870,10 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             )
 
         parent_armature = root_skeleton if getattr(root_skeleton, "type", "") == 'ARMATURE' else objdict.get(entity.name)
+        constrained = 0
+        slot_attached = 0
         if getattr(parent_armature, "type", "") == 'ARMATURE':
-            constrained = 0
+            parent_slot_name = str(metadata.get("parent_slot_name", "") or "")
             if imported_armature is not None and getattr(imported_armature, "type", "") == 'ARMATURE':
                 constrained += _apply_w2_mimic_bone_mapping_constraints(parent_armature, imported_armature, metadata)
             if constrained:
@@ -4662,6 +4884,12 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
 
             if imported_armature is not None and imported_armature is not parent_armature:
                 _set_parent_keep_world(imported_armature, parent_armature)
+                if not constrained:
+                    slot_attached = _attach_w2_head_objects_to_parent_slot(
+                        parent_armature,
+                        [imported_armature],
+                        parent_slot_name,
+                    )
             attached_meshes = _attach_w2_mimic_meshes_to_mimic_rig(
                 imported_armature,
                 imported_mesh_armatures,
@@ -4673,19 +4901,48 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                         target_obj["witcher_w2_mimic_mesh_attachment_count"] = attached_meshes
 
             if imported_armature is None:
-                for target_obj in _get_import_root_objects(list(imported_mesh_armatures or []) + list(imported_meshes or [])):
-                    if target_obj is not None and target_obj is not parent_armature:
-                        _set_parent_keep_world(target_obj, parent_armature)
+                slot_attached = _attach_w2_head_objects_to_parent_slot(
+                    parent_armature,
+                    list(imported_mesh_armatures or []) + list(imported_meshes or []),
+                    parent_slot_name,
+                )
+                if not slot_attached:
+                    for target_obj in _get_import_root_objects(list(imported_mesh_armatures or []) + list(imported_meshes or [])):
+                        if target_obj is not None and target_obj is not parent_armature:
+                            _set_parent_keep_world(target_obj, parent_armature)
+            if slot_attached:
+                for target_obj in metadata_targets:
+                    if target_obj is not None:
+                        target_obj["witcher_w2_head_slot_attachment_count"] = slot_attached
 
-        hidden_base_heads = _hide_w2_base_head_objects_for_mimic(
-            metadata.get("head_name", ""),
-            objdict,
-            meshdict,
+        use_visible_mimic_head = bool(
+            imported_armature is not None
+            and constrained
+            and (imported_meshes or imported_mesh_armatures)
         )
+        hidden_fallback_mimics = 0
+        if not use_visible_mimic_head:
+            hidden_fallback_mimics = _hide_w2_mimic_fallback_objects(
+                list(imported_mesh_armatures or []) + list(imported_meshes or [])
+            )
+            if imported_armature is not None and not constrained:
+                hidden_fallback_mimics += _hide_w2_mimic_fallback_objects([imported_armature])
+
+        hidden_base_heads = 0
+        if use_visible_mimic_head:
+            hidden_base_heads = _hide_w2_base_head_objects_for_mimic(
+                metadata.get("head_name", ""),
+                objdict,
+                meshdict,
+            )
         if hidden_base_heads:
             for target_obj in metadata_targets:
                 if target_obj is not None:
                     target_obj["witcher_w2_base_heads_hidden_for_mimic"] = hidden_base_heads
+        if hidden_fallback_mimics:
+            for target_obj in metadata_targets:
+                if target_obj is not None:
+                    target_obj["witcher_w2_mimic_hidden_without_face_rig_count"] = hidden_fallback_mimics
 
         if imported_armature is not None:
             objdict[chunk_ns] = imported_armature
@@ -4750,12 +5007,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                             f"#{chunk.get('chunkIndex')}: {mesh_path} -> {embedded_source_path}"
                         )
                 else:
-                    resolved_mesh_path = repo_file(mesh_path, entity.version)
-                    if not resolved_mesh_path or not os.path.exists(win_safe_path(resolved_mesh_path)):
-                        raise FileNotFoundError(
-                            f"Missing mesh for chunk {chunk.get('type')} "
-                            f"#{chunk.get('chunkIndex')}: {mesh_path} -> {resolved_mesh_path}"
-                        )
+                    resolved_mesh_path = _resolve_required_chunk_resource(chunk, 'mesh', 'mesh')
                 if selected_cmesh_chunk_index is not None:
                     log.debug(
                         "Importing embedded Witcher 2 CMesh chunk %s for %s from %s",
@@ -4808,6 +5060,17 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                             _force_shadowmesh_hidden(mesh)
 
                 _apply_chunk_transform_to_import_roots(chunk, armatures=armatures, meshes=meshes)
+                if _is_w2_head_base_chunk(chunk):
+                    parent_armature = root_skeleton if getattr(root_skeleton, "type", "") == 'ARMATURE' else objdict.get(entity.name)
+                    head_slot_attached = _attach_w2_head_objects_to_parent_slot(
+                        parent_armature,
+                        list(armatures or []) + list(meshes or []),
+                        _get_entry_attr(chunk, "w2_head_parent_slot_name", ""),
+                    )
+                    if head_slot_attached:
+                        for target_obj in list(armatures or []) + list(meshes or []):
+                            if target_obj is not None:
+                                target_obj["witcher_w2_head_slot_attachment_count"] = head_slot_attached
 
         # Handle cloth resources
         if "resource" in chunk and not import_redcloth_enabled:
@@ -4840,7 +5103,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
 
         if "resource" in chunk and import_redcloth_enabled:
             redcloth_resource = chunk["resource"]
-            redcloth_mat_path = repo_file(redcloth_resource, entity.version)
+            redcloth_mat_path = repo_file(redcloth_resource, resource_version)
             component_name = _get_chunk_component_name(chunk)
             owner_armature = objdict.get(entity.name)
             cloth_arma, cloth_grp, cloth_meshes = import_or_reuse_redcloth(
@@ -4869,8 +5132,8 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
 
         # Handle morphs
         if "morphComponentId" in chunk:
-            morph_source_path = repo_file(chunk['morphSource'], entity.version)
-            morph_target_path = repo_file(chunk['morphTarget'], entity.version)
+            morph_source_path = repo_file(chunk['morphSource'], resource_version)
+            morph_target_path = repo_file(chunk['morphTarget'], resource_version)
             if (
                 not morph_source_path
                 or not morph_target_path
@@ -4952,7 +5215,13 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 has_moving_agent = True
                 _apply_chunk_transform_to_import_roots(chunk, armatures=[moving_agent])
         elif "skeleton" in chunk and chunk['skeleton'] is not None:
-            skeleton_path = _resolve_required_chunk_resource(chunk, 'skeleton', 'skeleton')
+            try:
+                skeleton_path = _resolve_required_chunk_resource(chunk, 'skeleton', 'skeleton')
+            except FileNotFoundError as exc:
+                if source_game == "w2" and str(chunk.get("type", "") or "") != "CMovingPhysicalAgentComponent":
+                    log.warning("Skipping optional Witcher 2 skeleton component: %s", exc)
+                    continue
+                raise
             root_bone = import_rig.import_w3_rig(
                 skeleton_path,
                 chunk_ns
@@ -5181,8 +5450,8 @@ def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_
 
 
 
-def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_entity_path="", source_game="", target_collection=None,
-                                        mesh_import_settings=None):
+def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_entity_path="", source_game="", source_entity_path="",
+                                        target_collection=None, mesh_import_settings=None):
     #entity = fixed_chunk_paths(entity, entity.version)
     ent_namespace = entity.name+":"
     if target_collection is None:
@@ -5221,6 +5490,7 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
             i='',
             direct_entity_path=direct_entity_path,
             source_game=source_game,
+            source_entity_path=source_entity_path,
             target_collection=target_collection,
             mesh_import_settings=mesh_import_settings,
         )
@@ -5479,6 +5749,7 @@ def add_app_template(   entity,
         bind_root_chunks_to_entity=bind_root_chunks_to_entity,
         direct_entity_path=templateFilename,
         source_game=template_source_game,
+        source_entity_path=source_context_path,
         target_collection=target_collection,
         mesh_import_settings=mesh_import_settings,
     )
@@ -5517,7 +5788,8 @@ def add_app_template(   entity,
                 if id(obj) not in seen:
                     group_objects.append(obj)
         for obj in group_objects:
-            _set_parent_keep_world(obj, empty_transform)
+            if not _is_w2_head_slot_attached_object(obj):
+                _set_parent_keep_world(obj, empty_transform)
         if use_app_drivers:
             # Drive only the imported template roots. Driving the shared appearance
             # empty causes later equipment/template imports to overwrite the empty's

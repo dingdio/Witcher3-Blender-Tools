@@ -185,7 +185,7 @@ class BundleManager(WitcherArchiveManager):
         #self.RebuildRootNode()
     
     @staticmethod
-    def Get(loadmods = True, reset_cache = True):
+    def Get(loadmods = True, reset_cache = False):
         current_base_path = refresh_game_configuration_path()
         instance_manager = BundleManager.InstanceManagerMods if loadmods else BundleManager.InstanceManager
         cache_name = "bundle_cache_mods.pkl" if loadmods else "bundle_cache.pkl"

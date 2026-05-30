@@ -31,6 +31,37 @@ from .Types.SBufferInfos import MMatrix, SBufferInfos, SVertexBufferInfos, SMesh
 log = logging.getLogger(__name__)
 
 _W2_IMPORT_FILE_MATERIAL_NAMES_CACHE = {}
+_W2_EMBEDDED_CMESH_FILE_CACHE = {}
+_W2_EMBEDDED_CMESH_FILE_CACHE_MAX = 4
+
+
+def _w2_embedded_cmesh_cache_key(filename):
+    try:
+        safe_path = os.path.abspath(win_safe_path(filename))
+        stat = os.stat(safe_path)
+        return (os.path.normcase(safe_path), int(getattr(stat, "st_mtime_ns", 0)), int(stat.st_size))
+    except Exception:
+        return None
+
+
+def _load_cached_w2_embedded_cmesh_file(filename):
+    cache_key = _w2_embedded_cmesh_cache_key(filename)
+    if cache_key and cache_key in _W2_EMBEDDED_CMESH_FILE_CACHE:
+        return _W2_EMBEDDED_CMESH_FILE_CACHE[cache_key]
+
+    with open(win_safe_path(filename), "rb") as f:
+        mesh_file = getCR2W(f)
+        if getattr(getattr(mesh_file, "HEADER", None), "version", 999) > 115:
+            return mesh_file, None
+        f.seek(0)
+        raw_data = f.read()
+
+    result = (mesh_file, raw_data)
+    if cache_key:
+        _W2_EMBEDDED_CMESH_FILE_CACHE[cache_key] = result
+        while len(_W2_EMBEDDED_CMESH_FILE_CACHE) > _W2_EMBEDDED_CMESH_FILE_CACHE_MAX:
+            _W2_EMBEDDED_CMESH_FILE_CACHE.pop(next(iter(_W2_EMBEDDED_CMESH_FILE_CACHE)))
+    return result
 
 
 def _derive_mesh_is_static(mesh_infos):
@@ -838,8 +869,16 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
     # with open(filename,"rb") as meshFileReader:
     #     meshFile = getCR2W(meshFileReader)
     #     #f.close()
-    f = open(win_safe_path(filename),"rb")
-    meshFile = getCR2W(f)
+    f = None
+    raw_data = None
+    if embedded_cmesh_chunk_index is not None:
+        meshFile, raw_data = _load_cached_w2_embedded_cmesh_file(filename)
+    else:
+        f = open(win_safe_path(filename),"rb")
+        meshFile = getCR2W(f)
+    if f is None and getattr(getattr(meshFile, "HEADER", None), "version", 999) > 115:
+        f = open(win_safe_path(filename),"rb")
+        meshFile = getCR2W(f)
     meshName = Path(meshFile.fileName).stem
     if "proxy" in meshName and keep_proxy_meshes:
         keep_lod_meshes = True
@@ -856,10 +895,12 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
     #?#### WITCHER 2 ####?#
     #?###################?#
     if meshFile.HEADER.version <= 115: #? WITCHER 2
-        f.seek(0)
-        raw_data = f.read()
+        if raw_data is None:
+            f.seek(0)
+            raw_data = f.read()
         br:bStream = bStream(data = raw_data)
-        f.close()
+        if f is not None:
+            f.close()
         the_material_names = []
         the_materials = SimpleNamespace(Count=0, Handles=[])
         cmesh_count = sum(1 for item in meshFile.CHUNKS.CHUNKS if getattr(item, "Type", None) == "CMesh")
@@ -880,15 +921,20 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                     or raw_props.get("importFile")
                 )
                 import_file_stem = _w2_import_file_stem(import_file_path)
-                fallback_prefix = meshName
+                chunk_mesh_name = meshName
+                if embedded_cmesh_chunk_index is not None and import_file_stem:
+                    chunk_mesh_name = import_file_stem
+                    meshName = chunk_mesh_name
+                    CData.modelName = chunk_mesh_name
+                fallback_prefix = chunk_mesh_name
                 if cmesh_count > 1 or embedded_cmesh_chunk_index is not None:
-                    fallback_prefix = f"{meshName}_cmesh{getattr(chunk, 'ChunkIndex', 0)}"
+                    fallback_prefix = f"{chunk_mesh_name}_cmesh{getattr(chunk, 'ChunkIndex', 0)}"
                 if the_material_names_chunk:
                     for mat_name in _w2_string_array_values(the_material_names_chunk):
-                        the_material_names.append(meshName+"_"+mat_name)
+                        the_material_names.append(chunk_mesh_name+"_"+mat_name)
                 elif raw_props.get("materialNames"):
                     for mat_name in raw_props.get("materialNames") or []:
-                        the_material_names.append(meshName+"_"+mat_name)
+                        the_material_names.append(chunk_mesh_name+"_"+mat_name)
                 else:
                     if the_materials:
                         matched_names = _w2_material_names_from_matching_mesh(
@@ -903,7 +949,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                             for idx in range(the_materials.Count):
                                 the_material_names.append(
                                     _w2_fallback_material_name(
-                                        meshName,
+                                        chunk_mesh_name,
                                         import_file_stem,
                                         fallback_prefix,
                                         idx,

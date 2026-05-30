@@ -2402,9 +2402,10 @@ def _import_item_entity(export_path, final_item_name, entity, armature, appearan
     for template in included_templates:
         template_filename = template.get('templateFilename', '') if isinstance(template, dict) else getattr(template, 'templateFilename', '')
         if template_filename:
+            template_payload = template if (isinstance(template, dict) or hasattr(template, 'chunks')) else None
             _import_equipment_template(
                 template_filename,
-                template_data=template if isinstance(template, dict) else None,
+                template_data=template_payload,
             )
     return {
         "template_keys": imported_template_keys,

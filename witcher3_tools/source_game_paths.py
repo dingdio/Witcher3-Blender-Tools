@@ -6,13 +6,22 @@ W3_REPO_VERSION = 999
 W2_REPO_ROOT_MARKERS = (
     "\\levels\\",
     "\\templates\\",
+    "\\cutscenes\\",
     "\\environment_levels\\",
     "\\environment\\",
     "\\game\\",
+    "\\gameplay\\",
     "\\characters\\",
     "\\items\\",
     "\\engine\\",
     "\\dlc\\",
+    "\\quests\\",
+    "\\living_world\\",
+    "\\animations\\",
+    "\\fx\\",
+    "\\globals\\",
+    "\\gui\\",
+    "\\ui\\",
 )
 
 
@@ -84,15 +93,16 @@ def _existing_path(path_value) -> bool:
         return False
 
 
-def resolve_w2_repo_file_from_root(filepath, root, *, extract_from_bundles=True) -> str:
+def resolve_w2_repo_file_from_root(filepath, root, *, extract_from_bundles=False) -> str:
     root = str(root or "").strip()
     rel_path = str(filepath or "").replace("/", "\\").lstrip("\\")
     if not root or not rel_path or os.path.isabs(rel_path):
         return ""
 
-    candidate = os.path.join(root, rel_path)
-    if _existing_path(candidate):
-        return candidate
+    for rel_candidate in iter_w2_repo_path_variants(rel_path):
+        candidate = os.path.join(root, rel_candidate)
+        if _existing_path(candidate):
+            return candidate
     if not extract_from_bundles:
         return ""
 
@@ -104,13 +114,17 @@ def resolve_w2_repo_file_from_root(filepath, root, *, extract_from_bundles=True)
         return ""
 
 
-def resolve_w2_repo_file_from_source(filepath, source_filename, *, version=None) -> str:
+def resolve_w2_repo_file_from_source(filepath, source_filename, *, version=None, extract_from_bundles=False) -> str:
     if version is not None and source_game_from_version(version) != "w2":
         return ""
     source_root = w2_source_repo_root(source_filename)
     if not source_root:
         return ""
-    return resolve_w2_repo_file_from_root(filepath, source_root)
+    return resolve_w2_repo_file_from_root(
+        filepath,
+        source_root,
+        extract_from_bundles=extract_from_bundles,
+    )
 
 
 def source_game_for_rig_settings(rig_settings, fallback="w3") -> str:

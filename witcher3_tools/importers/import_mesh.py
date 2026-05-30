@@ -26,6 +26,7 @@ from ..CR2W.Types.SBufferInfos import SMeshInfos, EMeshVertexType, VertexSkinnin
 from ..CR2W.dc_entity import CCollisionShapeConvex, CCollisionShapeTriMesh, CCollisionShapeBox, CCollisionShapeCapsule, CCollisionShapeSphere
 from ..importers.import_nxs import createCol, createTri, createBox, createCapsule, createSphere, create_from_nxs
 from .. import get_do_fix_tail, set_rig_rot90_enabled
+from ..source_game_paths import w2_source_repo_root
 
 log = logging.getLogger(__name__)
 
@@ -1038,7 +1039,9 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
         
         
         if meshFile.HEADER.version <= 115:
-            uncook_path = (get_w2_unbundle_path(bpy.context) or "").strip()
+            uncook_path = w2_source_repo_root(getattr(meshFile, "fileName", "") or "")
+            if not uncook_path:
+                uncook_path = (get_w2_unbundle_path(bpy.context) or "").strip()
             if not uncook_path:
                 uncook_path = get_witcher2_game_path(bpy.context)+"\\data"
             uncook_path = uncook_path.rstrip("\\/") + "\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES

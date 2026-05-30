@@ -8,6 +8,7 @@ from ..importers import import_entity
 from ..action_compat import iter_action_fcurves, remove_action_fcurve
 from ..CR2W.dc_anims import load_bin_cutscene
 from ..CR2W.common_blender import repo_file, redkit_repo_context, win_path_isfile
+from ..source_game_paths import resolve_w2_repo_file_from_source, w2_source_repo_root
 from ..duplication import duplicate_character_hierarchy
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,14 @@ def _resolve_cutscene_actor_template_path(template_path, cutscene_filename, is_w
     from the file version and resolves nested dependencies the same way.
     """
     if is_w2:
+        resolved = resolve_w2_repo_file_from_source(template_path, cutscene_filename, version=115)
+        if resolved:
+            return resolved
+        source_root = w2_source_repo_root(cutscene_filename)
+        if source_root:
+            source_candidate = os.path.join(source_root, str(template_path or "").replace("/", "\\").lstrip("\\"))
+            if win_path_isfile(source_candidate):
+                return source_candidate
         with redkit_repo_context(cutscene_filename):
             return repo_file(template_path, version=115)
     return repo_file(template_path)
@@ -722,6 +731,35 @@ def _iter_object_descendants(root_obj):
         pending.extend(getattr(child, "children", []) or [])
         yield child
 
+
+def _w2_mimic_armature_for_actor(actor_obj):
+    if actor_obj is None or getattr(actor_obj, "type", None) != 'ARMATURE':
+        return None
+
+    actor_name = str(getattr(actor_obj, "name", "") or "").strip()
+    mimic_name = str(actor_obj.get("witcher_w2_mimic_armature", "") or "").strip()
+    if mimic_name:
+        mimic_obj = bpy.data.objects.get(mimic_name)
+        if mimic_obj is not None and getattr(mimic_obj, "type", None) == 'ARMATURE':
+            return mimic_obj
+
+    for obj in _iter_object_descendants(actor_obj):
+        if getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        try:
+            if str(obj.get("witcher_w2_mimic_armature", "") or "").strip() == getattr(obj, "name", ""):
+                return obj
+            if (
+                actor_name
+                and str(obj.get("witcher_w2_mimic_parent_armature", "") or "").strip() == actor_name
+                and bool(obj.get("witcher_w2_mimic_mapping_constraint_count", 0))
+            ):
+                return obj
+        except Exception:
+            continue
+    return None
+
+
 def _iter_additional_cutscene_armatures(actor_obj):
     if actor_obj is None:
         return
@@ -730,6 +768,9 @@ def _iter_additional_cutscene_armatures(actor_obj):
         mimic_obj = bpy.data.objects.get(mimic_name)
         if mimic_obj is not None and getattr(mimic_obj, "type", None) == 'ARMATURE':
             yield mimic_obj
+    w2_mimic_obj = _w2_mimic_armature_for_actor(actor_obj)
+    if w2_mimic_obj is not None:
+        yield w2_mimic_obj
 
     actor_name = str(actor_obj.get("cutscene_actor_name", "") or "").strip()
     if actor_name:
@@ -871,10 +912,30 @@ def _resolve_cutscene_actor_appearance(entity, preferred_name=""):
 
     preferred_name = str(preferred_name or "").strip()
     if preferred_name:
-        for idx, appearance in enumerate(appearances):
-            appearance_name = str(getattr(appearance, "name", "") or "").strip()
-            if appearance_name == preferred_name:
-                return appearance, idx, appearance_name
+        preferred_candidates = [preferred_name]
+        if ":" in preferred_name:
+            body_part, state = preferred_name.split(":", 1)
+            preferred_candidates.extend([body_part.strip(), state.strip()])
+        seen_candidates = set()
+        for candidate in preferred_candidates:
+            candidate = str(candidate or "").strip()
+            key = candidate.lower()
+            if not candidate or key in seen_candidates:
+                continue
+            seen_candidates.add(key)
+            for idx, appearance in enumerate(appearances):
+                appearance_name = str(getattr(appearance, "name", "") or "").strip()
+                if appearance_name == candidate or appearance_name.lower() == key:
+                    return appearance, idx, appearance_name
+                if ":" not in candidate and appearance_name.lower().startswith(f"{key}:"):
+                    return appearance, idx, appearance_name
+                w2_parts = {
+                    str(part or "").strip().lower()
+                    for part in (getattr(appearance, "w2_parts", None) or [])
+                    if str(part or "").strip()
+                }
+                if key in w2_parts:
+                    return appearance, idx, appearance_name
 
     first_appearance = appearances[0]
     return first_appearance, 0, str(getattr(first_appearance, "name", "") or "").strip()
@@ -954,14 +1015,38 @@ def _current_actor_appearance_name(actor_obj):
         return ""
 
 
-def _ensure_cutscene_face_setup(actor_obj):
+def _ensure_cutscene_w2_face_setup(actor_obj, force=False):
+    if _w2_mimic_armature_for_actor(actor_obj) is None:
+        return False
+    try:
+        from ..ui.ui_anims_list import ensure_face_animation_setup, _resolve_face_animation_targets
+
+        loaded, _target_armature = ensure_face_animation_setup(
+            bpy.context,
+            actor_obj,
+            _resolve_face_animation_targets(actor_obj),
+            force=force,
+        )
+        return bool(loaded)
+    except Exception:
+        log.warning(
+            "Failed to prepare Witcher 2 face setup for cutscene actor '%s'.",
+            getattr(actor_obj, "name", "<unknown>"),
+            exc_info=True,
+        )
+    return False
+
+
+def _ensure_cutscene_face_setup(actor_obj, force=False):
     if actor_obj is None or getattr(actor_obj, "type", None) != 'ARMATURE':
         return False
+    if _w2_mimic_armature_for_actor(actor_obj) is not None:
+        return _ensure_cutscene_w2_face_setup(actor_obj, force=force)
     if 'mimicFaceFile' not in actor_obj or 'mimicFace' not in actor_obj:
         return False
     current_appearance = _current_actor_appearance_name(actor_obj)
     last_face_appearance = str(actor_obj.get(FACE_MORPHS_APPEARANCE_PROP, "") or "").strip()
-    force_reload = bool(current_appearance and current_appearance != last_face_appearance)
+    force_reload = bool(force or (current_appearance and current_appearance != last_face_appearance))
     try:
         from ..ui.ui_anims_list import ensure_owner_face_animation_setup
 
@@ -1106,6 +1191,7 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
                 load_face_poses=True,
                 import_apperance=1,
                 selected_appearance_name=preferred_appearance_name,
+                entity_namespace=actor_name,
             )
         except Exception:
             log.exception("Failed to import cutscene actor '%s' from '%s'", actor_name or actor_index, template_path)
@@ -1409,6 +1495,21 @@ def _resolve_cutscene_event_fps(event, animation_contexts, fallback_fps):
     return float(fallback_fps or 30.0)
 
 
+def _cutscene_body_part_event_appearance(event):
+    appearance = str(_cutscene_event_value(event, "appearance", "") or "").strip()
+    if appearance:
+        return appearance
+    body_part = str(
+        _cutscene_event_value(event, "bodyPart", "")
+        or _cutscene_event_value(event, "body_part", "")
+        or ""
+    ).strip()
+    state = str(_cutscene_event_value(event, "state", "") or "").strip()
+    if body_part and state:
+        return f"{body_part}:{state}"
+    return body_part or state
+
+
 def _iter_cutscene_body_part_events(cutscene_template, animation_contexts, actor_name=""):
     actor_name = str(actor_name or "").strip()
     animation_contexts = list(animation_contexts or [])
@@ -1430,7 +1531,7 @@ def _iter_cutscene_body_part_events(cutscene_template, animation_contexts, actor
             if str(_cutscene_event_value(event, "type_name", "") or "") != "CExtAnimCutsceneBodyPartEvent":
                 continue
 
-            appearance = str(_cutscene_event_value(event, "appearance", "") or "").strip()
+            appearance = _cutscene_body_part_event_appearance(event)
             if not appearance:
                 continue
 
@@ -1447,7 +1548,7 @@ def _iter_cutscene_body_part_events(cutscene_template, animation_contexts, actor
         if str(_cutscene_event_value(event, "type_name", "") or "") != "CExtAnimCutsceneBodyPartEvent":
             continue
 
-        appearance = str(_cutscene_event_value(event, "appearance", "") or "").strip()
+        appearance = _cutscene_body_part_event_appearance(event)
         if not appearance:
             continue
 
@@ -1586,6 +1687,13 @@ def _bake_cutscene_body_part_events(cutscene_template, animation_contexts, actor
         if not baked_events:
             return 0
 
+        if (
+            _w2_mimic_armature_for_actor(actor_obj) is not None
+            and getattr(getattr(actor_obj, "pose", None), "bones", None) is not None
+            and actor_obj.pose.bones.get("w2_face_poses") is not None
+        ):
+            _ensure_cutscene_face_setup(actor_obj, force=True)
+
         actor_obj.data.keyframe_insert(data_path=CUTSCENE_APPEARANCE_DATA_PATH, frame=0.0)
         for event in sorted(baked_events, key=lambda item: (float(item["frame"]), int(item["order"]))):
             rig_settings.app_list_index = int(event["app_idx"])
@@ -1601,6 +1709,12 @@ def _bake_cutscene_body_part_events(cutscene_template, animation_contexts, actor
             rig_settings.app_list_index = int(default_app_idx)
         except Exception:
             pass
+        if baked_events and scene is not None:
+            try:
+                scene.frame_set(scene.frame_current)
+                bpy.context.view_layer.update()
+            except Exception:
+                pass
         if restore_auto_load is not None and scene is not None:
             try:
                 scene.witcher_load_app_on_select = bool(restore_auto_load)
@@ -1636,8 +1750,11 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
         animation_track_name = _cutscene_track_name_for_animation(anim_name, base_track=track_name)
 
         try:
+            face_target_mode = "owner"
             if _is_face_cutscene_animation(anim_name):
                 _ensure_cutscene_face_setup(actor_obj)
+                if _w2_mimic_armature_for_actor(actor_obj) is not None:
+                    face_target_mode = "auto"
             target_armatures = load_anim_into_scene(
                 bpy.context,
                 anim_name,
@@ -1645,7 +1762,8 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
                 actor_obj,
                 NLA_track=animation_track_name,
                 at_frame=at_frame,
-                face_target_mode="owner",
+                face_target_mode=face_target_mode,
+                target_component=component_name,
             )
             _tag_cutscene_animation_actions(
                 target_armatures,

@@ -640,6 +640,12 @@ def _iter_related_scene_armatures(root_obj):
         if root_name and str(obj.get("mimicFace", "") or "").strip() == root_name:
             yield obj
             continue
+        if root_name and str(obj.get("witcher_w2_mimic_armature", "") or "").strip() == root_name:
+            yield obj
+            continue
+        if root_name and str(obj.get("witcher_w2_mimic_parent_armature", "") or "").strip() == root_name:
+            yield obj
+            continue
         if root_actor_name and str(obj.get("cutscene_actor_name", "") or "").strip() == root_actor_name:
             yield obj
             continue
@@ -701,7 +707,8 @@ def _resolve_face_animation_targets(main_arm_obj):
 def _iter_animation_buffers(animation):
     if animation is None:
         return
-    anim_buffer = getattr(animation, "animBuffer", None)
+    anim_data = getattr(animation, "animation", None) or animation
+    anim_buffer = getattr(anim_data, "animBuffer", None)
     if anim_buffer is None:
         return
     parts = getattr(anim_buffer, "parts", None)
@@ -753,7 +760,9 @@ def _iter_owner_armatures_for_mimic(mimic_arm_obj):
             continue
         if _is_mimic_component_armature(obj):
             continue
-        if str(obj.get("mimicFace", "") or "").strip() != mimic_name:
+        has_w3_mimic_ref = str(obj.get("mimicFace", "") or "").strip() == mimic_name
+        has_w2_mimic_ref = str(obj.get("witcher_w2_mimic_armature", "") or "").strip() == mimic_name
+        if not has_w3_mimic_ref and not has_w2_mimic_ref:
             continue
         if mimic_actor_name and str(obj.get("cutscene_actor_name", "") or "").strip() == mimic_actor_name:
             actor_matches.append(obj)
@@ -847,8 +856,20 @@ def _resolve_entity_rig_path(main_arm_obj):
             skeleton_path = candidate
     if not skeleton_path:
         return None
+    if os.path.isabs(skeleton_path) and os.path.exists(skeleton_path):
+        return skeleton_path
+    source_game = _source_game_for_armature_obj(main_arm_obj)
+    if source_game == "w2":
+        source_entity_path = str(main_arm_obj.get("witcher_source_entity_path", "") or "").strip()
+        if source_entity_path:
+            try:
+                candidate = resolve_w2_repo_file_from_source(skeleton_path, source_entity_path, version=115)
+                if candidate and os.path.exists(candidate):
+                    return candidate
+            except Exception:
+                pass
     try:
-        return repo_file_for_source(skeleton_path, _source_game_for_armature_obj(main_arm_obj))
+        return repo_file_for_source(skeleton_path, source_game)
     except Exception:
         return None
 
@@ -866,10 +887,12 @@ def _resolve_component_armature(main_arm_obj, component_name):
     if not component_key or component_key in {"root", "body"}:
         return main_arm_obj
     if component_key in {"face", "mimic"}:
-        mimic_name = str(main_arm_obj.get("mimicFace", "") or "").strip() if main_arm_obj else ""
-        mimic_obj = bpy.data.objects.get(mimic_name) if mimic_name else None
+        mimic_obj = _find_named_mimic_armature(main_arm_obj)
         if getattr(mimic_obj, "type", None) == "ARMATURE":
             return mimic_obj
+        face_targets = _resolve_face_animation_targets(main_arm_obj)
+        if face_targets:
+            return face_targets[0]
 
     candidates = [main_arm_obj] + list(_iter_object_descendants(main_arm_obj))
     for obj in candidates:
@@ -890,27 +913,47 @@ def _resolve_face_rig_path(main_arm_obj, target_armatures):
         candidates.append(main_arm_obj)
     candidates.extend(target_armatures or [])
     main_source_game = _source_game_for_armature_obj(main_arm_obj)
+
+    def _resolve_for_armature(path, armature_obj, source_game):
+        path = str(path or "").strip()
+        if not path:
+            return None
+        if os.path.isabs(path) and os.path.exists(path):
+            return path
+        if source_game == "w2":
+            source_entity_path = str(armature_obj.get("witcher_source_entity_path", "") or "").strip() if armature_obj else ""
+            if not source_entity_path and main_arm_obj is not None:
+                source_entity_path = str(main_arm_obj.get("witcher_source_entity_path", "") or "").strip()
+            if source_entity_path:
+                try:
+                    candidate = resolve_w2_repo_file_from_source(path, source_entity_path, version=115)
+                    if candidate and os.path.exists(candidate):
+                        return candidate
+                except Exception:
+                    pass
+        try:
+            return repo_file_for_source(path, source_game)
+        except Exception:
+            return None
+
     for armature_obj in _unique_armatures(candidates):
         w2_track_skeleton = str(armature_obj.get("witcher_w2_mimic_float_track_skeleton", "") or "").strip()
         mimic_face_file = str(armature_obj.get("mimicFaceFile", "") or "").strip()
         source_game = _source_game_for_armature_obj(armature_obj, fallback=main_source_game)
         if w2_track_skeleton:
-            try:
-                return repo_file_for_source(w2_track_skeleton, source_game)
-            except Exception:
-                pass
+            resolved = _resolve_for_armature(w2_track_skeleton, armature_obj, source_game)
+            if resolved:
+                return resolved
         if mimic_face_file:
-            try:
-                return repo_file_for_source(mimic_face_file, source_game)
-            except Exception:
-                pass
+            resolved = _resolve_for_armature(mimic_face_file, armature_obj, source_game)
+            if resolved:
+                return resolved
         rig_settings = getattr(armature_obj.data, "witcherui_RigSettings", None)
         skeleton_path = str(getattr(rig_settings, "main_face_skeleton", "") or "").strip() if rig_settings else ""
         if skeleton_path:
-            try:
-                return repo_file_for_source(skeleton_path, source_game)
-            except Exception:
-                pass
+            resolved = _resolve_for_armature(skeleton_path, armature_obj, source_game)
+            if resolved:
+                return resolved
     return None
 
 
@@ -1291,8 +1334,20 @@ def _face_rig_path_for_armature(main_arm_obj):
         face_skeleton = str(main_arm_obj.get("mimicFaceFile", "") or "").strip()
     if not face_skeleton:
         return None
+    if os.path.isabs(face_skeleton) and os.path.exists(face_skeleton):
+        return face_skeleton
+    source_game = _source_game_for_armature_obj(main_arm_obj)
+    if source_game == "w2":
+        source_entity_path = str(main_arm_obj.get("witcher_source_entity_path", "") or "").strip()
+        if source_entity_path:
+            try:
+                candidate = resolve_w2_repo_file_from_source(face_skeleton, source_entity_path, version=115)
+                if candidate and os.path.exists(candidate):
+                    return candidate
+            except Exception:
+                pass
     try:
-        return repo_file_for_source(face_skeleton, _source_game_for_armature_obj(main_arm_obj))
+        return repo_file_for_source(face_skeleton, source_game)
     except Exception:
         return None
 
@@ -2280,4 +2335,3 @@ def unregister():
 
 if __name__ == "__main__":
     register()
-
