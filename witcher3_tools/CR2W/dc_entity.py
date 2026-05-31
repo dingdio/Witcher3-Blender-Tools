@@ -3270,7 +3270,7 @@ def create_CEntity(file, _inherit_visited=None):
                             setattr(CEquipmentDefinition, 'entries', final_entries) # Replace pointers with chunks
                             final_CEquipmentDefinitions.append(CEquipmentDefinition)
                         elif def_chunk.Type == 'CInventoryDefinition':
-                            # Parse inventory definition for auto-mount items
+                            # Parse inventory definitions separately from appearance equipment.
                             inv_def = _parse_inventory_definition(def_chunk)
                             # Store on appearance for later processing
                             if not hasattr(currentApp, 'inventoryDefinitions'):

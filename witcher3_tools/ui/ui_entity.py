@@ -362,8 +362,28 @@ def _collect_inventory_preview(filepath):
     def _get_attr(obj, key, default=None):
         """Get attribute from object or dict."""
         if isinstance(obj, dict):
+            if key in obj:
+                value = obj.get(key, default)
+                if value is not None:
+                    return value
+            native_key = f"m_{key}"
+            if native_key in obj:
+                return obj.get(native_key, default)
             return obj.get(key, default)
-        return getattr(obj, key, default)
+        value = getattr(obj, key, None)
+        if value is not None:
+            return value
+        native_key = f"m_{key}"
+        if hasattr(obj, native_key):
+            return getattr(obj, native_key, default)
+        return value if hasattr(obj, key) else default
+
+    def _coerce_bool(value):
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     def _collect_from_inv_defs(inv_defs, app_name=""):
         for inv_def in inv_defs:
@@ -386,11 +406,7 @@ def _collect_inventory_preview(filepath):
                 qty_max = _get_attr(entry, "quantityMax", 0) or 0
                 probability = _get_attr(entry, "probability", 0.0) or 0.0
                 is_lootable = bool(_get_attr(entry, "isLootable", False))
-                is_mount = _get_attr(entry, "isMount", None)
-                if is_mount is None:
-                    is_mount = bool(category)
-                else:
-                    is_mount = bool(is_mount)
+                is_mount = _coerce_bool(_get_attr(entry, "isMount", None))
                 display_item = f"{category}:{item_name}" if category else str(item_name)
                 preview.append((display_item, category, item_name, app_name, is_mount, qty, qty_min, qty_max, probability, is_lootable))
 

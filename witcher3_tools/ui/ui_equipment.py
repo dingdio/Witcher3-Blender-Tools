@@ -4367,6 +4367,34 @@ class IncludedTemplateEntry(bpy.types.PropertyGroup):
             # Clear the data if templateFilename is empty
             self.data = ''
 
+
+class InventoryDefinitionEntry(bpy.types.PropertyGroup):
+    source_game: bpy.props.StringProperty(name="Source Game", default="w3")
+    entry_key: bpy.props.StringProperty(name="Entry Key", default="")
+    source_label: bpy.props.StringProperty(name="Source", default="")
+    category: bpy.props.StringProperty(name="Category", default="")
+    item_name: bpy.props.StringProperty(name="Item", default="")
+    resolved_item_name: bpy.props.StringProperty(name="Resolved Item", default="")
+    equip_template: bpy.props.StringProperty(name="Equip Template", default="")
+    source_is_mount: bpy.props.BoolProperty(
+        name="Source Is Mount",
+        description="Mount flag stored on the inventory definition",
+        default=False,
+    )
+    is_mount: bpy.props.BoolProperty(
+        name="Mounted",
+        description="Current scene override for this inventory item",
+        default=False,
+    )
+    is_loaded: bpy.props.BoolProperty(name="Loaded", default=False)
+    is_lootable: bpy.props.BoolProperty(name="Lootable", default=False)
+    quantity: bpy.props.IntProperty(name="Quantity", default=0)
+    quantity_min: bpy.props.IntProperty(name="Quantity Min", default=0)
+    quantity_max: bpy.props.IntProperty(name="Quantity Max", default=0)
+    probability: bpy.props.FloatProperty(name="Probability", default=0.0)
+    slot_index: bpy.props.IntProperty(name="Slot Index", default=-1, options={'HIDDEN'})
+
+
 # Temporary data storage in WindowManager
 class WitcherUITempData(bpy.types.PropertyGroup):
     equipment_entries: bpy.props.CollectionProperty(type=EquipmentDefinitionEntry)
@@ -4385,6 +4413,9 @@ class WitcherUITempData(bpy.types.PropertyGroup):
     included_template_entries: bpy.props.CollectionProperty(type=IncludedTemplateEntry)
     included_template_entries_index: bpy.props.IntProperty()
 
+    inventory_entries: bpy.props.CollectionProperty(type=InventoryDefinitionEntry)
+    inventory_entries_index: bpy.props.IntProperty()
+
 # Define the UI list to display equipment categories
 class EQUIPMENT_UL_CategoryList(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
@@ -4400,6 +4431,16 @@ class EQUIPMENT_UL_CategoryList(bpy.types.UIList):
         op = right.operator("witcher.equipment_search_default_item",
                             text=getattr(item, "defaultItemName", "") or "None")
         op.entry_index = index
+
+
+class EQUIPMENT_UL_InventoryList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        toggle_icon = 'CHECKMARK' if getattr(item, "is_mount", False) else 'RADIOBUT_OFF'
+        op = row.operator("witcher.equipment_toggle_inventory_mount", text="", icon=toggle_icon)
+        op.entry_index = index
+        label = f"{getattr(item, 'category', '') or 'None'}: {getattr(item, 'item_name', '') or 'None'}"
+        row.label(text=label)
 
 
 class EQUIPMENT_OT_SearchCategory(bpy.types.Operator):
@@ -5461,6 +5502,7 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
             temp_data.last_entity_state_token = entity_state_token
             temp_data.equipment_entries.clear()
             temp_data.included_template_entries.clear()
+            temp_data.inventory_entries.clear()
 
             if app_list_index >= 0 and app_list_index < len(appearances):
                 selected_appearance = appearances[app_list_index]
@@ -5558,6 +5600,7 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
         layout.use_property_split = False
         tab_row = layout.row(align=True)
         tab_row.prop_enum(rig_settings, "equipment_ui_tab", 'EQUIPMENT')
+        tab_row.prop_enum(rig_settings, "equipment_ui_tab", 'INVENTORY')
         tab_row.prop_enum(rig_settings, "equipment_ui_tab", 'TEMPLATES')
         tab_row.prop_enum(rig_settings, "equipment_ui_tab", 'SLOTS')
         layout.use_property_split = prev_split
@@ -5638,6 +5681,59 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                 box.prop(entry, "templateFilename")
                 box.prop(entry, "ns")
                 box.operator("witcher.equipment_load_included_template_data", text="Load Template Data")
+            return
+
+        if tab == "INVENTORY":
+            _maybe_validate_equipment_slots(rig_settings)
+            sync_inventory_entries_to_temp(context, rig_settings, entity_data=entity_data)
+
+            box = layout.box()
+            box.label(text=f"Inventory Items ({len(temp_data.inventory_entries)})", icon='PACKAGE')
+
+            if len(temp_data.inventory_entries) == 0:
+                box.label(text="No inventory entries for this appearance.", icon='INFO')
+                box.operator("witcher.equipment_refresh_inventory", text="Refresh", icon='FILE_REFRESH')
+                return
+
+            row = box.row()
+            row.template_list("EQUIPMENT_UL_InventoryList", "", temp_data, "inventory_entries", temp_data, "inventory_entries_index")
+            col = row.column(align=True)
+            col.operator("witcher.equipment_refresh_inventory", icon="FILE_REFRESH", text="")
+
+            index = temp_data.inventory_entries_index
+            if index >= 0 and index < len(temp_data.inventory_entries):
+                entry = temp_data.inventory_entries[index]
+                action_row = box.row(align=True)
+                op = action_row.operator(
+                    "witcher.equipment_toggle_inventory_mount",
+                    text="Unmount" if entry.is_mount else "Mount",
+                    icon='CHECKMARK' if entry.is_mount else 'IMPORT',
+                )
+                op.entry_index = index
+                action_row.label(
+                    text="Loaded" if entry.is_loaded else ("Mounted" if entry.is_mount else "Inventory"),
+                    icon='CHECKMARK' if entry.is_loaded else 'RADIOBUT_OFF',
+                )
+
+                details = box.box()
+                values = details.column()
+                values.enabled = False
+                values.prop(entry, "source_label")
+                values.prop(entry, "category")
+                values.prop(entry, "item_name")
+                if entry.resolved_item_name and entry.resolved_item_name != entry.item_name:
+                    values.prop(entry, "resolved_item_name")
+                values.prop(entry, "equip_template")
+                values.prop(entry, "source_is_mount")
+                values.prop(entry, "is_loaded")
+                if entry.quantity or entry.quantity_min or entry.quantity_max:
+                    values.prop(entry, "quantity")
+                    values.prop(entry, "quantity_min")
+                    values.prop(entry, "quantity_max")
+                if entry.probability:
+                    values.prop(entry, "probability")
+                if entry.is_lootable:
+                    values.prop(entry, "is_lootable")
             return
 
         if tab == "EQUIPMENT":
@@ -6034,6 +6130,81 @@ class EQUIPMENT_OT_RemoveCategory(bpy.types.Operator):
                 context.area.tag_redraw()
         return {'FINISHED'}
 
+
+class EQUIPMENT_OT_ToggleInventoryMount(bpy.types.Operator):
+    bl_idname = "witcher.equipment_toggle_inventory_mount"
+    bl_label = "Toggle Inventory Mount"
+    bl_description = "Mount or unmount this inventory item over the selected appearance"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    entry_index: bpy.props.IntProperty(default=-1, options={'HIDDEN'})
+
+    def execute(self, context):
+        armature, rig_settings = _get_armature_and_rig_settings(context)
+        if not armature or not rig_settings:
+            self.report({'WARNING'}, "No valid armature selected.")
+            return {'CANCELLED'}
+
+        temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
+        if temp_data is None:
+            return {'CANCELLED'}
+        index = self.entry_index
+        if index < 0:
+            index = temp_data.inventory_entries_index
+        if index < 0 or index >= len(temp_data.inventory_entries):
+            self.report({'WARNING'}, "No inventory item selected.")
+            return {'CANCELLED'}
+
+        entry = temp_data.inventory_entries[index]
+        category = getattr(entry, "category", "") or ""
+        item_name = getattr(entry, "item_name", "") or ""
+        desired_mount = not bool(getattr(entry, "is_mount", False))
+        source_mount = bool(getattr(entry, "source_is_mount", False))
+
+        _set_inventory_mount_override(rig_settings, category, item_name, desired_mount, source_mount)
+
+        with _preserve_selection(context):
+            if desired_mount:
+                try:
+                    _apply_inventory_mount_overrides(context, armature, rig_settings)
+                except Exception:
+                    log.warning("Failed to mount inventory item %s:%s", category, item_name, exc_info=True)
+                    self.report({'WARNING'}, "Inventory mount failed.")
+                    return {'CANCELLED'}
+            else:
+                _unmount_inventory_entry(context, armature, rig_settings, entry)
+                try:
+                    _refresh_variants_and_reload(context, armature, rig_settings)
+                except Exception:
+                    pass
+
+        sync_equipment_slots_to_temp(context, rig_settings)
+        _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+        sync_inventory_entries_to_temp(context, rig_settings, entity_data=entity_data)
+        if context.area:
+            context.area.tag_redraw()
+        self.report({'INFO'}, f"{'Mounted' if desired_mount else 'Unmounted'} inventory item: {category}:{item_name}")
+        return {'FINISHED'}
+
+
+class EQUIPMENT_OT_RefreshInventoryEntries(bpy.types.Operator):
+    bl_idname = "witcher.equipment_refresh_inventory"
+    bl_label = "Refresh Inventory"
+    bl_description = "Refresh the inventory item list for the selected appearance"
+
+    def execute(self, context):
+        armature, rig_settings = _get_armature_and_rig_settings(context)
+        if not rig_settings:
+            self.report({'WARNING'}, "No valid armature selected.")
+            return {'CANCELLED'}
+        _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+        sync_inventory_entries_to_temp(context, rig_settings, entity_data=entity_data)
+        if context.area:
+            context.area.tag_redraw()
+        self.report({'INFO'}, "Inventory list refreshed.")
+        return {'FINISHED'}
+
+
 # Operator to insert all default categories into the equipment entries list
 class EQUIPMENT_OT_InsertDefaultCategories(bpy.types.Operator):
     bl_idname = "witcher.equipment_insert_default_categories"
@@ -6208,6 +6379,451 @@ def sync_equipment_slots_to_temp(context, rig_settings):
         temp_data.equipment_entries_index = -1
     else:
         temp_data.equipment_entries_index = min(max(0, temp_data.equipment_entries_index), len(temp_data.equipment_entries) - 1)
+
+
+def _get_selected_appearance_data(entity_data, rig_settings):
+    if entity_data is None or rig_settings is None:
+        return None
+    try:
+        app_index = int(getattr(rig_settings, "app_list_index", -1))
+    except Exception:
+        app_index = -1
+    if app_index < 0:
+        return None
+    appearances = entity_data.get("appearances", []) if isinstance(entity_data, dict) else getattr(entity_data, "appearances", [])
+    if 0 <= app_index < len(appearances):
+        return appearances[app_index]
+    return None
+
+
+def _get_inventory_defs(source):
+    if not source:
+        return []
+    try:
+        return import_entity._get_entry_attr(source, "inventoryDefinitions", []) or []
+    except Exception:
+        if isinstance(source, dict):
+            return source.get("inventoryDefinitions", []) or []
+        return getattr(source, "inventoryDefinitions", []) or []
+
+
+def _get_inventory_def_entries(inv_def):
+    if not inv_def:
+        return []
+    try:
+        return import_entity._get_entry_attr(inv_def, "entries", []) or []
+    except Exception:
+        if isinstance(inv_def, dict):
+            return inv_def.get("entries", []) or []
+        return getattr(inv_def, "entries", []) or []
+
+
+def _iter_inventory_entries_for_ui(selected_appearance, entity_data):
+    def _source_name(source, fallback):
+        try:
+            name = import_entity._get_entry_attr(source, "name", "") or ""
+        except Exception:
+            name = ""
+        return name or fallback
+
+    for source, label in (
+        (selected_appearance, _source_name(selected_appearance, "Appearance")),
+        (entity_data, "Entity"),
+    ):
+        for inv_def in _get_inventory_defs(source):
+            for entry in _get_inventory_def_entries(inv_def):
+                yield label, entry
+
+
+def _inventory_item_match_keys(*values):
+    keys = set()
+    for value in values:
+        if not value:
+            continue
+        try:
+            for key in import_entity._candidate_item_keys(value):
+                if key:
+                    keys.add(key)
+        except Exception:
+            pass
+        try:
+            key = import_entity._normalize_key(value)
+        except Exception:
+            key = str(value).strip().lower()
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _resolve_inventory_item_for_ui(
+    category,
+    item_name,
+    source_roots=None,
+    item_lookup=None,
+    template_lookup=None,
+    category_items=None,
+):
+    resolved_category = ""
+    resolved_item_name = ""
+    resolved_template = ""
+    try:
+        if item_lookup is None or template_lookup is None:
+            item_lookup, template_lookup = import_entity._build_equipment_lookup(source_roots)
+        resolved = import_entity._resolve_inventory_item(item_name, item_lookup, template_lookup)
+    except Exception:
+        resolved = None
+    if resolved:
+        resolved_category, resolved_item_name, resolved_template = resolved
+
+    if not resolved_template and category:
+        if category_items is None:
+            try:
+                category_items, _item_attributes = get_equipment_catalog_for_search_roots(source_roots)
+            except Exception:
+                category_items = {}
+        wanted = import_entity._normalize_key(item_name)
+        for name, _display, tmpl in category_items.get(category, []):
+            if import_entity._normalize_key(name) == wanted:
+                resolved_category = resolved_category or category
+                resolved_item_name = resolved_item_name or name
+                resolved_template = tmpl or ""
+                break
+
+    if not resolved_template:
+        try:
+            resolved_template = import_entity._derive_template_from_item(item_name)
+        except Exception:
+            resolved_template = ""
+
+    return resolved_category, resolved_item_name, resolved_template
+
+
+def _get_inventory_source_roots_for_rig(armature, rig_settings):
+    try:
+        source_roots = import_entity._get_armature_source_roots(armature) if armature else []
+    except Exception:
+        source_roots = []
+    if not source_roots and rig_settings is not None:
+        repo_path_hint = getattr(rig_settings, "repo_path", "") or ""
+        if repo_path_hint and os.path.isabs(repo_path_hint):
+            try:
+                source_roots = import_entity._build_entity_source_roots(repo_path_hint)
+            except Exception:
+                source_roots = []
+    return source_roots
+
+
+def _find_inventory_slot_index(
+    rig_settings,
+    category,
+    item_name,
+    resolved_category="",
+    resolved_item_name="",
+    equip_template="",
+    allow_category_fallback=False,
+):
+    if rig_settings is None:
+        return -1
+    category_keys = _inventory_item_match_keys(category, resolved_category)
+    item_keys = _inventory_item_match_keys(item_name, resolved_item_name, equip_template)
+    best_category_match = -1
+    for idx, slot in enumerate(rig_settings.equipment_slots):
+        if not getattr(slot, "is_inventory", False):
+            continue
+        slot_category_key = import_entity._normalize_key(getattr(slot, "category", ""))
+        slot_item_keys = _inventory_item_match_keys(
+            getattr(slot, "item_name", ""),
+            getattr(slot, "equip_template", ""),
+            getattr(slot, "base_equip_template", ""),
+        )
+        category_matches = not category_keys or slot_category_key in category_keys
+        item_matches = bool(item_keys and slot_item_keys.intersection(item_keys))
+        if category_matches and item_matches:
+            return idx
+        if best_category_match < 0 and category_matches:
+            best_category_match = idx
+        if item_matches and not category_keys:
+            return idx
+    return best_category_match if (allow_category_fallback or not item_keys) else -1
+
+
+def _get_inventory_mount_overrides_for_write(rig_settings):
+    try:
+        overrides = import_entity._get_inventory_mount_overrides(rig_settings)
+    except Exception:
+        overrides = {}
+    return dict(overrides) if isinstance(overrides, dict) else {}
+
+
+def _set_inventory_mount_override(rig_settings, category, item_name, mounted, source_mounted=False):
+    if rig_settings is None:
+        return
+    try:
+        key = import_entity._inventory_mount_override_key(category, item_name)
+    except Exception:
+        key = ""
+    if not key:
+        return
+    overrides = _get_inventory_mount_overrides_for_write(rig_settings)
+    if bool(mounted) == bool(source_mounted):
+        overrides.pop(key, None)
+    else:
+        overrides[key] = bool(mounted)
+    try:
+        rig_settings.inventory_mount_overrides_json = json.dumps(overrides, sort_keys=True)
+    except Exception:
+        rig_settings.inventory_mount_overrides_json = "{}"
+
+
+def sync_inventory_entries_to_temp(context, rig_settings, entity_data=None):
+    try:
+        temp_data = context.window_manager.witcherui_temp_data
+    except Exception:
+        return
+    if rig_settings is None:
+        temp_data.inventory_entries.clear()
+        temp_data.inventory_entries_index = -1
+        return
+
+    if entity_data is None:
+        _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+    selected_appearance = _get_selected_appearance_data(entity_data, rig_settings)
+    try:
+        armature, _active_rig_settings = _get_armature_and_rig_settings(context)
+    except Exception:
+        armature = None
+    source_roots = _get_inventory_source_roots_for_rig(armature, rig_settings)
+    try:
+        source_game = _infer_source_game_from_rig_settings(rig_settings, armature)
+    except Exception:
+        source_game = "w3"
+    try:
+        item_lookup, template_lookup = import_entity._build_equipment_lookup(source_roots)
+    except Exception:
+        item_lookup, template_lookup = {}, {}
+    try:
+        category_items, _item_attributes = get_equipment_catalog_for_search_roots(source_roots)
+    except Exception:
+        category_items, _item_attributes = _get_equipment_catalog(source_game)
+
+    old_key = ""
+    try:
+        if 0 <= temp_data.inventory_entries_index < len(temp_data.inventory_entries):
+            old_key = temp_data.inventory_entries[temp_data.inventory_entries_index].entry_key
+    except Exception:
+        old_key = ""
+
+    temp_data.inventory_entries.clear()
+    occurrence_counts = {}
+    selected_index = -1
+
+    for source_label, inv_entry in _iter_inventory_entries_for_ui(selected_appearance, entity_data):
+        try:
+            category = import_entity._get_inventory_category(inv_entry)
+            item_name = import_entity._get_inventory_item_name(inv_entry)
+        except Exception:
+            category = ""
+            item_name = ""
+        base_key = import_entity._inventory_mount_override_key(category, item_name)
+        occurrence = occurrence_counts.get(base_key, 0) + 1
+        occurrence_counts[base_key] = occurrence
+        entry_key = f"{base_key}#{occurrence}"
+
+        resolved_category, resolved_item_name, equip_template = _resolve_inventory_item_for_ui(
+            category,
+            item_name,
+            source_roots,
+            item_lookup=item_lookup,
+            template_lookup=template_lookup,
+            category_items=category_items,
+        )
+        slot_index = _find_inventory_slot_index(
+            rig_settings,
+            category,
+            item_name,
+            resolved_category=resolved_category,
+            resolved_item_name=resolved_item_name,
+            equip_template=equip_template,
+        )
+        source_is_mount = import_entity._inventory_entry_is_mount(inv_entry)
+        override = import_entity._get_inventory_mount_override(rig_settings, category, item_name)
+        if override is None:
+            is_mount = bool(source_is_mount or slot_index >= 0)
+        else:
+            is_mount = bool(override)
+
+        row = temp_data.inventory_entries.add()
+        row.source_game = source_game
+        row.entry_key = entry_key
+        row.source_label = source_label
+        row.category = category or ""
+        row.item_name = item_name or ""
+        row.resolved_item_name = resolved_item_name or ""
+        row.equip_template = equip_template or ""
+        row.source_is_mount = bool(source_is_mount)
+        row.is_mount = bool(is_mount)
+        row.slot_index = int(slot_index)
+        row.is_loaded = bool(
+            0 <= slot_index < len(rig_settings.equipment_slots)
+            and getattr(rig_settings.equipment_slots[slot_index], "is_loaded", False)
+        )
+        try:
+            row.quantity = int(import_entity._get_entry_attr(inv_entry, "quantity", 0) or 0)
+            row.quantity_min = int(import_entity._get_entry_attr(inv_entry, "quantityMin", 0) or 0)
+            row.quantity_max = int(import_entity._get_entry_attr(inv_entry, "quantityMax", 0) or 0)
+            row.probability = float(import_entity._get_entry_attr(inv_entry, "probability", 0.0) or 0.0)
+            row.is_lootable = bool(import_entity._get_entry_attr(inv_entry, "isLootable", False))
+        except Exception:
+            pass
+        if entry_key == old_key:
+            selected_index = len(temp_data.inventory_entries) - 1
+
+    if len(temp_data.inventory_entries) == 0:
+        temp_data.inventory_entries_index = -1
+    elif selected_index >= 0:
+        temp_data.inventory_entries_index = selected_index
+    else:
+        temp_data.inventory_entries_index = min(max(0, temp_data.inventory_entries_index), len(temp_data.inventory_entries) - 1)
+
+
+def _get_appearance_equipment_entry_for_category(entity_data, rig_settings, category):
+    selected_appearance = _get_selected_appearance_data(entity_data, rig_settings)
+    if selected_appearance is None:
+        return None
+    try:
+        appearance_params = import_entity._get_entry_attr(selected_appearance, "appearanceParams", []) or []
+    except Exception:
+        appearance_params = []
+    if not appearance_params:
+        return None
+    try:
+        entries = import_entity._get_entry_attr(appearance_params[0], "entries", []) or []
+    except Exception:
+        entries = []
+    category_key = import_entity._normalize_key(category)
+    for entry in entries:
+        try:
+            entry_category = import_entity._get_entry_attr(entry, "category", "") or ""
+        except Exception:
+            entry_category = ""
+        if import_entity._normalize_key(entry_category) == category_key:
+            return entry
+    return None
+
+
+def _restore_appearance_equipment_slot_for_category(context, armature, rig_settings, category):
+    if rig_settings is None or not category:
+        return False
+    _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+    entry_data = _get_appearance_equipment_entry_for_category(entity_data, rig_settings, category)
+    if entry_data is None:
+        return False
+
+    category_val = import_entity._get_entry_attr(entry_data, "category", "") or category
+    item_name = import_entity._get_entry_attr(entry_data, "defaultItemName", "") or "None"
+    category_key = import_entity._normalize_key(category_val)
+    for slot in rig_settings.equipment_slots:
+        if getattr(slot, "is_inventory", False):
+            continue
+        if import_entity._normalize_key(getattr(slot, "category", "")) == category_key:
+            return False
+
+    source_roots = _get_inventory_source_roots_for_rig(armature, rig_settings)
+    try:
+        source_game = _infer_source_game_from_rig_settings(rig_settings, armature)
+    except Exception:
+        source_game = "w3"
+    try:
+        category_items, item_attributes = get_equipment_catalog_for_search_roots(source_roots)
+    except Exception:
+        category_items, item_attributes = _get_equipment_catalog(source_game)
+
+    equip_template = import_entity._get_entry_attr(entry_data, "equip_template", "") or ""
+    if not equip_template and item_name and item_name != "None":
+        item_key = import_entity._normalize_key(item_name)
+        for name, _display, tmpl in category_items.get(category_val, []):
+            if import_entity._normalize_key(name) == item_key:
+                equip_template = tmpl or ""
+                break
+    if not equip_template and item_name and item_name != "None":
+        _resolved_category, resolved_item_name, resolved_template = _resolve_inventory_item_for_ui(category_val, item_name, source_roots)
+        if resolved_item_name:
+            item_name = resolved_item_name
+        equip_template = resolved_template or ""
+    if not equip_template and item_name and item_name != "None":
+        equip_template = item_name
+
+    slot = rig_settings.equipment_slots.add()
+    slot_index = len(rig_settings.equipment_slots) - 1
+    slot.source_game = source_game
+    slot.category = category_val
+    slot.item_name = item_name if item_name != "None" else ""
+    slot.equip_template = equip_template or ""
+    slot.base_equip_template = equip_template or ""
+    slot.resolved_repo_path = ""
+    slot.is_inventory = False
+    slot.keep_across_appearances = False
+    try:
+        attrs = item_attributes.get(item_name, {})
+        if attrs:
+            slot.equip_slot = attrs.get('equip_slot', slot.equip_slot)
+            slot.hold_slot = attrs.get('hold_slot', slot.hold_slot)
+            slot.weapon = attrs.get('weapon', slot.weapon)
+            slot.attachment_type = attrs.get('attachment_type', '')
+            slot.variants_json = json.dumps(attrs.get('variants', []))
+            slot.bound_items_json = json.dumps(attrs.get('bound_items', []))
+    except Exception:
+        pass
+
+    if armature and slot.equip_template and slot.equip_template != "None":
+        try:
+            load_equipment_item(context, armature, slot_index, rig_settings)
+        except Exception:
+            log.warning("Failed to restore appearance equipment for %s", category_val, exc_info=True)
+    return True
+
+
+def _unmount_inventory_entry(context, armature, rig_settings, entry):
+    if rig_settings is None or entry is None:
+        return False
+    slot_index = _find_inventory_slot_index(
+        rig_settings,
+        getattr(entry, "category", ""),
+        getattr(entry, "item_name", ""),
+        resolved_item_name=getattr(entry, "resolved_item_name", ""),
+        equip_template=getattr(entry, "equip_template", ""),
+        allow_category_fallback=True,
+    )
+    if slot_index < 0 or slot_index >= len(rig_settings.equipment_slots):
+        return False
+    slot = rig_settings.equipment_slots[slot_index]
+    try:
+        unload_equipment_item(slot)
+    except Exception:
+        pass
+    try:
+        rig_settings.equipment_slots.remove(slot_index)
+    except Exception:
+        return False
+    return _restore_appearance_equipment_slot_for_category(context, armature, rig_settings, getattr(entry, "category", ""))
+
+
+def _apply_inventory_mount_overrides(context, armature, rig_settings):
+    if rig_settings is None:
+        return
+    _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+    selected_appearance = _get_selected_appearance_data(entity_data, rig_settings)
+    source_roots = _get_inventory_source_roots_for_rig(armature, rig_settings)
+    prepared_context = {"source_roots": source_roots} if source_roots else None
+    import_entity._apply_inventory_mounts(
+        context,
+        armature,
+        selected_appearance,
+        rig_settings,
+        entity=entity_data,
+        shared_inventory=True,
+        prepared_context=prepared_context,
+    )
 
 
 def _get_entity_and_appearance(rig_settings):
@@ -7526,13 +8142,17 @@ class EQUIPMENT_OT_SetMasterAppearance(bpy.types.Operator):
 classes = [
     EquipmentDefinitionEntry,
     IncludedTemplateEntry,
+    InventoryDefinitionEntry,
     WitcherUITempData,
     EQUIPMENT_UL_CategoryList,
+    EQUIPMENT_UL_InventoryList,
     EQUIPMENT_UL_IncludedTemplateList,
     EQUIPMENT_OT_SearchCategory,
     EQUIPMENT_OT_SearchDefaultItem,
     EQUIPMENT_OT_AddCategory,
     EQUIPMENT_OT_RemoveCategory,
+    EQUIPMENT_OT_ToggleInventoryMount,
+    EQUIPMENT_OT_RefreshInventoryEntries,
     EQUIPMENT_OT_AddIncludedTemplate,
     EQUIPMENT_OT_RemoveIncludedTemplate,
     EQUIPMENT_OT_LoadIncludedTemplateData,

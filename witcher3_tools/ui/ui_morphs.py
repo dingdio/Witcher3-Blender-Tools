@@ -595,9 +595,15 @@ class witcherui_RigSettings(bpy.types.PropertyGroup):
                             ('APPEARANCE', "Appearance", "Select and load appearances"),
                             ('TEMPLATES', "Templates", "Manage included templates"),
                             ('EQUIPMENT', "Equipment", "Manage equipment entries and slots"),
+                            ('INVENTORY', "Inventory", "View inventory entries and mount overrides"),
                             ('SLOTS', "Slots", "View entity slots and mounting points"),
                         ],
                         default='EQUIPMENT')
+    inventory_mount_overrides_json: StringProperty(
+                        name="Inventory Mount Overrides",
+                        description="JSON map of inventory items manually mounted or unmounted in this scene",
+                        default="{}",
+                        options={'HIDDEN'})
     def poll_mesh(self, object):
         return object.type == 'MESH'
     model_body: bpy.props.PointerProperty(name = "Model Body",

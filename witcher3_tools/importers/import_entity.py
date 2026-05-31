@@ -2561,8 +2561,69 @@ def try_apply_inventory_file_to_selected_character(context, filename, import_mod
 
 def _get_entry_attr(entry, key, default=None):
     if isinstance(entry, dict):
+        if key in entry:
+            value = entry.get(key, default)
+            if value is not None:
+                return value
+        native_key = f"m_{key}"
+        if native_key in entry:
+            return entry.get(native_key, default)
         return entry.get(key, default)
-    return getattr(entry, key, default)
+    value = getattr(entry, key, None)
+    if value is not None:
+        return value
+    native_key = f"m_{key}"
+    if hasattr(entry, native_key):
+        return getattr(entry, native_key, default)
+    return value if hasattr(entry, key) else default
+
+
+def _coerce_engine_bool(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _inventory_entry_is_mount(entry) -> bool:
+    # Native CInventoryDefinitionEntry defaults m_isMount to false. Missing
+    # mount data must not be inferred from category or item names.
+    return _coerce_engine_bool(_get_entry_attr(entry, "isMount", None))
+
+
+def _inventory_mount_override_key(category, item_name) -> str:
+    category_key = _normalize_key(category)
+    item_key = _normalize_key(item_name)
+    if not category_key and not item_key:
+        return ""
+    return f"{category_key}::{item_key}"
+
+
+def _get_inventory_mount_overrides(rig_settings):
+    if rig_settings is None:
+        return {}
+    raw_value = getattr(rig_settings, "inventory_mount_overrides_json", "") or ""
+    if not raw_value:
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _get_inventory_mount_override(rig_settings, category, item_name):
+    key = _inventory_mount_override_key(category, item_name)
+    if not key:
+        return None
+    overrides = _get_inventory_mount_overrides(rig_settings)
+    if key not in overrides:
+        return None
+    value = overrides.get(key)
+    if value is None:
+        return None
+    return _coerce_engine_bool(value)
 
 
 # ============================================================
@@ -3951,11 +4012,17 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
         if existing_inventory_slots:
             desired_mounts = set()
             for entry in inv_entries:
+                category_raw = _get_inventory_category(entry)
                 item_raw = _get_inventory_item_name(entry)
+                override = _get_inventory_mount_override(rig_settings, category_raw, item_raw)
+                if override is False:
+                    continue
+                if override is not True and not _inventory_entry_is_mount(entry):
+                    continue
                 item_key = _normalize_key(item_raw)
                 if not item_key or item_key in {"none", "random", "null"}:
                     continue
-                category_key = _normalize_key(_get_inventory_category(entry))
+                category_key = _normalize_key(category_raw)
                 desired_mounts.add((category_key, item_key))
 
             existing_mounts = {
@@ -3976,11 +4043,6 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
             if desired_mounts and desired_mounts.issubset(existing_mounts) and existing_loaded:
                 return
     seen_entries = set()
-    equip_category_keywords = (
-        "sword", "weapon", "armor", "boots", "gloves", "pants", "trousers",
-        "crossbow", "head", "hair", "body", "torso", "dress", "robe",
-        "jacket", "shirt", "axe", "mace",
-    )
 
     category_items, item_attributes = get_equipment_catalog_for_search_roots(source_roots)
     slots_to_load = []
@@ -4006,18 +4068,12 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
     for entry in inv_entries:
         category_raw = _get_inventory_category(entry)
         item_raw = _get_inventory_item_name(entry)
-        is_mount = _get_entry_attr(entry, "isMount", None)
-        if is_mount is None:
-            # Some inventory entries omit isMount but are equipment categories
-            if category_raw in slot_by_category:
-                is_mount = True
-            else:
-                cat_lower = str(category_raw).lower() if category_raw else ""
-                item_lower = str(item_raw).lower() if item_raw else ""
-                is_mount = any(token in cat_lower for token in equip_category_keywords) or \
-                           any(token in item_lower for token in equip_category_keywords)
-        if not is_mount:
+        override = _get_inventory_mount_override(rig_settings, category_raw, item_raw)
+        if override is False:
             continue
+        if override is not True and not _inventory_entry_is_mount(entry):
+            continue
+        is_mount = True
         dedupe_key = (_normalize_key(category_raw), _normalize_key(item_raw))
         if dedupe_key in seen_entries:
             continue
