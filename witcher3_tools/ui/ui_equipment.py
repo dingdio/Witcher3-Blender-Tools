@@ -2751,6 +2751,59 @@ def _item_entity_is_visual(item_entity, attachment_profile=None):
     return getattr(attachment_profile, "kind", "") != "inventory_wrapper"
 
 
+# Witcher 2 catalog attachment_type values that skin an item directly onto the
+# main body skeleton. Animated prefixed items keep their own rig and use a
+# prefix-aware owner-armature bridge instead.
+_W2_BODY_BOUND_ATTACHMENT_TYPES = {"skinning"}
+
+
+def _is_w2_source_game(source_game):
+    return str(source_game or "").strip().lower() == "w2"
+
+
+def _w2_attachment_binds_to_body(source_game, attachment_type):
+    """Whether a W2 item's mesh should be name-skinned to the body armature."""
+    if not _is_w2_source_game(source_game):
+        return False
+    return str(attachment_type or "").strip().lower() in _W2_BODY_BOUND_ATTACHMENT_TYPES
+
+
+def _w2_prefixed_animated_attachment_binds_to_owner(source_game, attachment_type, attachment_prefix):
+    if not _is_w2_source_game(source_game):
+        return False
+    if str(attachment_type or "").strip().lower() != "animated":
+        return False
+    return bool(str(attachment_prefix or "").strip())
+
+
+def _value_mentions_scabbard(*values):
+    for value in values:
+        if "scabbard" in str(value or "").replace("/", "\\").lower():
+            return True
+    return False
+
+
+def _w2_bound_entity_binds_animated_to_owner(source_game, bound_name, template, export_path, attrs, attachment_profile):
+    if not _is_w2_source_game(source_game):
+        return False
+    if _w2_prefixed_animated_attachment_binds_to_owner(
+        source_game,
+        (attrs or {}).get("attachment_type", ""),
+        (attrs or {}).get("attachment_prefix", ""),
+    ):
+        return True
+
+    category = str((attrs or {}).get("category", "") or "").strip().lower()
+    if category in {"steel_scabbard", "silver_scabbard"}:
+        return True
+
+    if not _value_mentions_scabbard(bound_name, template, export_path):
+        return False
+    profile_kind = str(getattr(attachment_profile, "kind", "") or "").strip()
+    root_type = str(getattr(attachment_profile, "root_component_type", "") or "").strip()
+    return profile_kind == "slot_animated" and root_type == "CAnimatedComponent"
+
+
 def _infer_equipment_mount_strategy(attachment_profile, target_info, *, allow_unmounted_visual=False):
     profile_kind = str(getattr(attachment_profile, "kind", "") or "").strip()
     target_valid = bool((target_info or {}).get("is_valid"))
@@ -2951,6 +3004,16 @@ def _bind_objects_to_armature(objects, target_armature):
             mod = obj.modifiers.new(name="W2_Skin", type='ARMATURE')
             mod.object = target_armature
 
+
+def _set_armature_pose_position(armature, pose_position="POSE"):
+    if not armature or armature.type != 'ARMATURE':
+        return
+    try:
+        armature.data.pose_position = pose_position
+    except Exception:
+        pass
+
+
 def _constrain_bound_armature_to_target(bound_armature, target_armature):
     """Constrain bound armature bones to target armature bones (skinning behavior)."""
     if not bound_armature or not target_armature:
@@ -3021,22 +3084,22 @@ def _attach_imported_objects_via_skinning(objects, target_armature):
         obj for obj in object_set
         if obj.type == 'ARMATURE' and (obj.parent is None or obj.parent not in object_set)
     ]
+    for arm in candidate_root_armatures:
+        _set_armature_pose_position(arm, "POSE")
     root_armatures = [
         arm for arm in candidate_root_armatures
         if not _armature_has_external_binding(arm, object_set)
     ]
     if root_armatures:
         for arm in root_armatures:
-            try:
-                arm.data.pose_position = target_armature.data.pose_position
-            except Exception:
-                arm.data.pose_position = "POSE"
+            _set_armature_pose_position(arm, "POSE")
             saved_world = arm.matrix_world.copy()
             arm.parent = target_armature
             arm.parent_type = 'OBJECT'
             arm.matrix_world = saved_world
             _snap_armature_to_target(arm, target_armature)
             _constrain_bound_armature_to_target(arm, target_armature)
+            _set_armature_pose_position(arm, "POSE")
         return True
 
     if candidate_root_armatures:
@@ -3044,6 +3107,34 @@ def _attach_imported_objects_via_skinning(objects, target_armature):
 
     _bind_objects_to_armature(object_set, target_armature)
     return bool(object_set)
+
+
+def _attach_imported_armatures_to_owner(objects, target_armature):
+    """Attach imported animated bound rigs to the owner armature."""
+    if not target_armature:
+        return False
+
+    object_set = {obj for obj in (objects or []) if obj is not None}
+    root_armatures = [
+        obj for obj in object_set
+        if obj.type == 'ARMATURE' and (obj.parent is None or obj.parent not in object_set)
+    ]
+    if not root_armatures:
+        return False
+
+    for arm in root_armatures:
+        _set_armature_pose_position(arm, "POSE")
+        try:
+            saved_world = arm.matrix_world.copy()
+            arm.parent = target_armature
+            arm.parent_type = 'OBJECT'
+            arm.matrix_world = saved_world
+        except Exception:
+            pass
+        _constrain_bound_armature_to_target(arm, target_armature)
+        _set_armature_pose_position(arm, "POSE")
+    return True
+
 
 def _snap_armature_to_target(bound_armature, target_armature):
     """Snap a bound armature object to the target armature's evaluated world matrix."""
@@ -3216,7 +3307,17 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
 
     target_armature = _get_slot_target_armature(slot_empty, target_armature or armature)
     source_roots = prepared.get("source_roots", [])
-    source_game = get_equipment_source_game_for_search_roots(source_roots)
+    source_game = _normalize_source_game(
+        getattr(slot, "source_game", "")
+        or get_equipment_source_game_for_search_roots(source_roots)
+    )
+    if source_game != "w2":
+        source_candidates = {
+            get_equipment_source_game_for_search_roots(source_roots),
+            _infer_source_game_from_rig_settings(rig_settings, armature),
+        }
+        if "w2" in source_candidates:
+            source_game = "w2"
 
     loaded = []
     seen_template_keys = set(imported_template_keys or ())
@@ -3230,6 +3331,9 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
         if not final_item:
             log.warning(f"Bound item not found for template: {template}")
             continue
+        bound_source_game = source_game
+        if bound_source_game != "w2" and _is_w2_search([export_path]):
+            bound_source_game = "w2"
 
         current_template_keys = set()
         current_template_keys.update(_template_match_keys(bound_name))
@@ -3243,9 +3347,9 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
         attrs = {}
         bound_equip_slot = ""
         try:
-            attrs = _lookup_item_attributes(bound_name, source_game)
+            attrs = get_item_attributes_by_identifier(bound_name, bound_source_game)
             if not attrs and template and template != bound_name:
-                attrs = _lookup_item_attributes(template, source_game)
+                attrs = get_item_attributes_by_identifier(template, bound_source_game)
             bound_equip_slot = attrs.get("equip_slot", "")
         except Exception:
             attrs = {}
@@ -3281,7 +3385,7 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
             if bound_target_info.get("armature") is not None:
                 target_armature = bound_target_info.get("armature")
             if not bound_target_info.get("is_valid"):
-                log_fn = log.debug if source_game == "w2" else log.warning
+                log_fn = log.debug if bound_source_game == "w2" else log.warning
                 log_fn(
                     "Bound item '%s' requested target '%s' but no slot or bone was found",
                     bound_name,
@@ -3296,12 +3400,26 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
             bound_target_info,
             allow_unmounted_visual=allow_bound_unmounted_visual,
         )
+        attachment_type = str(attrs.get("attachment_type", "") or "").strip()
+        attachment_prefix = str(attrs.get("attachment_prefix", "") or "").strip()
+        w2_body_bound = bool(armature and _w2_attachment_binds_to_body(bound_source_game, attachment_type))
+        w2_owner_animated_bound = bool(
+            armature
+            and _w2_bound_entity_binds_animated_to_owner(
+                bound_source_game,
+                bound_name,
+                template,
+                export_path,
+                attrs,
+                bound_attachment_profile,
+            )
+        )
         prefixed_animated_binding = (
-            str(attrs.get("attachment_type", "") or "").strip().lower() == "animated"
-            and bool(str(attrs.get("attachment_prefix", "") or "").strip())
+            attachment_type.lower() == "animated"
+            and bool(attachment_prefix)
             and getattr(bound_attachment_profile, "kind", "") == "slot_animated"
         )
-        if prefixed_animated_binding:
+        if prefixed_animated_binding or w2_owner_animated_bound:
             bound_mount_strategy = "owner_graph_bound"
         bound_bind_armature = _resolve_bound_owner_bind_armature(
             slot,
@@ -3318,14 +3436,23 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
             bound_equip_slot,
             bound_bind_armature,
         )
+        bound_use_owner_animated_bridge = False
+        if w2_body_bound:
+            bound_mount_strategy = "owner_graph_bound"
+            bound_bind_armature = armature
+            bound_use_skinning_bridge = True
+        elif w2_owner_animated_bound:
+            bound_bind_armature = armature
+            bound_use_owner_animated_bridge = True
         log.debug(
-            "Bound equipment attachment '%s': profile=%s strategy=%s target=%s bind_armature=%s skinning_bridge=%s",
+            "Bound equipment attachment '%s': profile=%s strategy=%s target=%s bind_armature=%s skinning_bridge=%s owner_animated_bridge=%s",
             bound_name or template,
             getattr(bound_attachment_profile, "kind", "") or "unknown",
             bound_mount_strategy,
             _describe_mount_target(bound_target_info),
             getattr(bound_bind_armature, "name", ""),
             bound_use_skinning_bridge,
+            bound_use_owner_animated_bridge,
         )
 
         # Create a visible group for non-slot bound visuals that are not owner-bound.
@@ -3397,6 +3524,12 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
         roots = _collect_mount_roots(new_objects, ignored_objects={parent_empty, bound_group})
         if bound_use_skinning_bridge:
             _attach_imported_objects_via_skinning(new_objects, bound_bind_armature)
+        elif bound_use_owner_animated_bridge:
+            if not _attach_imported_armatures_to_owner(new_objects, bound_bind_armature):
+                log.warning(
+                    "W2 animated bound item '%s' imported without an armature to bind to the owner",
+                    bound_name or template,
+                )
         elif bound_mount_strategy == "slot_mount_animated" and bound_slot_empty:
             bound_anchor = _mount_animated_roots_with_anchor(
                 roots,

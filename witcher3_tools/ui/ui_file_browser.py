@@ -8841,6 +8841,10 @@ class WITCHER_PT_AssetBrowser(Panel):
         quick_row.scale_y = 1.4
         quick_row.operator("witcher.import_geralt", text="Geralt", icon='USER')
         quick_row.operator("witcher.import_ciri", text="Ciri", icon='USER')
+        w2_row = char_col.row(align=True)
+        w2_row.scale_y = 1.2
+        w2_row.operator("witcher.import_geralt_w2", text="Geralt W2", icon='USER')
+        w2_row.operator("witcher.import_triss_w2", text="Triss W2", icon='USER')
         char_col.separator()
         ref_row = char_col.row(align=True)
         ref_row.operator("witcher.image_browser", text="Bestiary", icon='BOOKMARKS')

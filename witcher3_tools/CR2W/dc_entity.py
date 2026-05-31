@@ -1045,6 +1045,21 @@ class CStaticMeshComponent(CMeshComponent):
         self.fadeOnCameraCollision = None #Type="Bool"
         self.physicalCollisionType = None #Type="CPhysicalCollision"
 
+class CRagdollMeshComponent(CMeshComponent):
+    """Witcher 2 mesh component backed by a havok ragdoll / cloth body.
+    """
+    def __init__(self, *args, **kwargs):
+        self.ragdollResource = None    #Type="handle:CRagdoll"
+        self.baseBodyName = None       #Type="CName"
+        self.initialMotionType = None  #Type="EMotionType"
+        super(CRagdollMeshComponent, self).__init__(*args, **kwargs)
+
+    def convert_for_io(self):
+        super(CRagdollMeshComponent, self).convert_for_io()
+        if self.ragdollResource is not None and hasattr(self.ragdollResource, "Value"):
+            self.ragdollResource = self.ragdollResource.Value - 1
+        return self
+
 class CClothComponent(JsonChunk):
     """docstring for CClothComponent."""
     def __init__(self, resource, name: str = ""):
@@ -1479,6 +1494,60 @@ def _iter_struct_items(prop):
     if getattr(prop, "Count", None) == 1 and all(getattr(item, "theName", None) for item in items):
         return [prop]
     return items
+
+
+def _handle_value_to_chunk(CHUNKS, handle_value):
+    """Resolve a 1-based CR2W handle/soft value to its chunk (CHUNKS is 0-based)."""
+    try:
+        idx = int(handle_value) - 1
+    except (TypeError, ValueError):
+        return None
+    if 0 <= idx < len(CHUNKS):
+        return CHUNKS[idx]
+    return None
+
+
+def _prop_handle_list(prop):
+    """Return the list of (1-based) chunk indices referenced by an array-of-handles prop."""
+    if prop is None:
+        return []
+    value = getattr(prop, "value", None)
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, int)]
+    return []
+
+
+def _extract_w2_ragdoll_meta(component_chunk, CHUNKS):
+    base_body = _chunk_prop_string(component_chunk, "baseBodyName") or None
+    motion = _prop_to_string(_find_prop_by_name(component_chunk, "initialMotionType")) or None
+
+    ragdoll_handle = _find_prop_by_name(component_chunk, "ragdollResource")
+    ragdoll_value = _prop_to_string(ragdoll_handle)
+    ragdoll_chunk = _handle_value_to_chunk(CHUNKS, ragdoll_value)
+    if ragdoll_chunk is None or getattr(ragdoll_chunk, "Type", None) != "CRagdoll":
+        if not (base_body or motion):
+            return None
+        return {"base_body": base_body, "initial_motion_type": motion}
+
+    meta = {
+        "base_body": base_body,
+        "initial_motion_type": motion,
+        "import_file": _chunk_prop_string(ragdoll_chunk, "importFile") or None,
+        "skeleton_low": _chunk_prop_string(ragdoll_chunk, "lowResSkeletonName") or None,
+        "skeleton_high": _chunk_prop_string(ragdoll_chunk, "highResSkeletonName") or None,
+        "bodies": [],
+        "num_constraints": len(_prop_handle_list(_find_prop_by_name(ragdoll_chunk, "ragdollConstraints"))),
+    }
+    for body_handle in _prop_handle_list(_find_prop_by_name(ragdoll_chunk, "ragdollBodies")):
+        body = _handle_value_to_chunk(CHUNKS, body_handle)
+        if body is None or getattr(body, "Type", None) != "CRagdollBody":
+            continue
+        meta["bodies"].append({
+            "name": _chunk_prop_string(body, "bodyName") or None,
+            "inertia": _prop_to_string(_find_prop_by_name(body, "inertiaFactor")),
+            "gravity": _prop_to_string(_find_prop_by_name(body, "gravityFactor")),
+        })
+    return meta
 
 
 def _find_chunk_by_name(chunks, name, chunk_type=None):
@@ -3289,17 +3358,26 @@ def create_CEntity(file, _inherit_visited=None):
                                 f"props={_chunk_props_summary(chunk)}"
                             )
                     elif (chunk.Type == "CRigidMeshComponent" or chunk.Type == "CRagdollMeshComponent"):
-                        mesh_component = CMeshComponent(chunk).convert_for_io()
-                        mesh_component.mesh = _resolve_mesh_path(chunk, mesh_component.mesh)
-                        if not mesh_component.mesh:
-                            mesh_component.mesh = _next_mesh_import_path()
-                        if mesh_component.mesh:
-                            _append_unique_chunk(chunk, mesh_component, added_chunks)
-                        else:
-                            log.warning(
-                                f"Skipping {chunk.Type} with invalid mesh ref: {chunk.ChunkIndex}; "
+                        if chunk.Type == "CRagdollMeshComponent" and chunk.GetVariableByName("mesh") is None:
+                            log.debug(
+                                f"Skipping physics-only CRagdollMeshComponent (no mesh ref): {chunk.ChunkIndex}; "
                                 f"props={_chunk_props_summary(chunk)}"
                             )
+                        else:
+                            mesh_cls = CRagdollMeshComponent if chunk.Type == "CRagdollMeshComponent" else CMeshComponent
+                            mesh_component = mesh_cls(chunk).convert_for_io()
+                            mesh_component.mesh = _resolve_mesh_path(chunk, mesh_component.mesh)
+                            if not mesh_component.mesh:
+                                mesh_component.mesh = _next_mesh_import_path()
+                            if chunk.Type == "CRagdollMeshComponent":
+                                mesh_component.ragdoll_meta = _extract_w2_ragdoll_meta(chunk, CHUNKS)
+                            if mesh_component.mesh:
+                                _append_unique_chunk(chunk, mesh_component, added_chunks)
+                            else:
+                                log.warning(
+                                    f"Skipping {chunk.Type} with invalid mesh ref: {chunk.ChunkIndex}; "
+                                    f"props={_chunk_props_summary(chunk)}"
+                                )
                     elif (chunk.Type == "CFurComponent"):
                         fur_component = CMeshComponent(chunk).convert_for_io()
                         fur_component.mesh = _resolve_mesh_path(chunk, fur_component.mesh)
@@ -3356,7 +3434,12 @@ def create_CEntity(file, _inherit_visited=None):
                             mc = CStaticMeshComponent(buf_chunk).convert_for_io()
                         elif buf_chunk.Type == 'CMeshComponent':
                             mc = CMeshComponent(buf_chunk).convert_for_io()
-                        elif buf_chunk.Type in ('CRigidMeshComponent', 'CRagdollMeshComponent'):
+                        elif buf_chunk.Type == 'CRagdollMeshComponent':
+                            if buf_chunk.GetVariableByName("mesh") is None:
+                                continue
+                            mc = CRagdollMeshComponent(buf_chunk).convert_for_io()
+                            mc.ragdoll_meta = _extract_w2_ragdoll_meta(buf_chunk, buf_cr2w.CHUNKS.CHUNKS)
+                        elif buf_chunk.Type == 'CRigidMeshComponent':
                             mc = CMeshComponent(buf_chunk).convert_for_io()
                         else:
                             continue
@@ -3466,17 +3549,26 @@ def create_CEntity(file, _inherit_visited=None):
                     f"props={_chunk_props_summary(chunk)}"
                 )
         elif (chunk.Type == "CRigidMeshComponent" or chunk.Type == "CRagdollMeshComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
-            mc = CMeshComponent(chunk).convert_for_io()
-            mc.mesh = _resolve_mesh_path(chunk, mc.mesh)
-            if not mc.mesh:
-                mc.mesh = _next_mesh_import_path()
-            if mc.mesh:
-                _append_unique_chunk(chunk, mc, added_chunks)
-            else:
-                log.warning(
-                    f"Skipping top-level {chunk.Type} with invalid mesh ref at chunk {chunk.ChunkIndex}; "
+            if chunk.Type == "CRagdollMeshComponent" and chunk.GetVariableByName("mesh") is None:
+                log.debug(
+                    f"Skipping top-level physics-only CRagdollMeshComponent (no mesh ref) at chunk {chunk.ChunkIndex}; "
                     f"props={_chunk_props_summary(chunk)}"
                 )
+            else:
+                mesh_cls = CRagdollMeshComponent if chunk.Type == "CRagdollMeshComponent" else CMeshComponent
+                mc = mesh_cls(chunk).convert_for_io()
+                mc.mesh = _resolve_mesh_path(chunk, mc.mesh)
+                if not mc.mesh:
+                    mc.mesh = _next_mesh_import_path()
+                if chunk.Type == "CRagdollMeshComponent":
+                    mc.ragdoll_meta = _extract_w2_ragdoll_meta(chunk, CHUNKS)
+                if mc.mesh:
+                    _append_unique_chunk(chunk, mc, added_chunks)
+                else:
+                    log.warning(
+                        f"Skipping top-level {chunk.Type} with invalid mesh ref at chunk {chunk.ChunkIndex}; "
+                        f"props={_chunk_props_summary(chunk)}"
+                    )
         elif (chunk.Type == "CClothComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
             if chunk.GetVariableByName("resource"): #! sometimes there are no resource in files??
                 cloth = chunk.GetVariableByName("resource").ToString()

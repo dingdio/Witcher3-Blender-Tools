@@ -5044,6 +5044,24 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 for arm in armatures:
                     add_chunk_metadata(arm, chunk, mesh_path, component_name=component_name)
                     _store_w2_head_metadata(arm, chunk)
+                    # Witcher 2 CRagdollMeshComponent (hair/cloth) ships its dangle
+                    # bones flat in the mesh.  Rebuild the parent hierarchy (W2
+                    # analog of the W3 .w3dyng) and stash the ragdoll physics
+                    # metadata for later simulation.  The shared anchor bones
+                    # (head/neck/...) are constrained to the main skeleton later
+                    # by the standard CreateConstraints2 name-matching pass.
+                    if chunk.get('type') == "CRagdollMeshComponent":
+                        try:
+                            from . import ragdoll_hierarchy
+                            ragdoll_hierarchy.apply_ragdoll_hierarchy(
+                                arm, anchor_bone=str(chunk.get('baseBodyName') or ""),
+                            )
+                            ragdoll_hierarchy.store_ragdoll_metadata(arm, chunk.get('ragdoll_meta'))
+                        except Exception:
+                            log.warning(
+                                "Failed to apply Witcher 2 ragdoll hierarchy for %s #%s",
+                                chunk.get('type'), chunk.get('chunkIndex'), exc_info=True,
+                            )
                     objdict[chunk_ns] = arm
 
                 for mesh in meshes:

@@ -617,6 +617,12 @@ def ensure_witcher3_game_path_initialized(context) -> bool:
     return not bool(get_witcher3_game_path_issue(context))
 
 
+def ensure_witcher2_game_path_initialized(context) -> bool:
+    prefs = get_all_addon_prefs(context)
+    _auto_initialize_game_and_audio_paths(prefs, context)
+    return not bool(get_witcher2_game_path_issue(context))
+
+
 def _invalidate_dlc_mounter_settings(_self=None, _context=None):
     try:
         from .importers import dlc_mounters

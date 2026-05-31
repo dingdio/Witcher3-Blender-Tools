@@ -38,6 +38,7 @@ from ..read_game_bin import (
 from ..CR2W.common_blender import (
     repo_file,
     mod_loading_context,
+    win_safe_path,
 )
 from ..source_game_paths import (
     existing_repo_file_for_source,
@@ -298,6 +299,17 @@ def _ensure_witcher3_game_path_initialized(context) -> bool:
             addon_prefs.witcher_game_path = detected_game_path
     update_witcher_game_path(addon_prefs, context)
     return not bool(_get_witcher3_game_path_issue(context))
+
+
+def _is_witcher2_detected(context) -> bool:
+    """Cheap check (prefs read + exe stat) used to gate Witcher 2 imports in the UI."""
+    try:
+        # Imported lazily: these live in the package __init__, which imports this
+        # module before defining them, so a top-level import would be circular.
+        from .. import get_witcher2_game_path_issue
+        return not bool(get_witcher2_game_path_issue(context))
+    except Exception:
+        return False
 
 
 class WITCH_UL_InventoryPreview(UIList):
@@ -1346,6 +1358,120 @@ class WITCH_OT_ENTITY_import_ciri(bpy.types.Operator):
             return {'FINISHED'}
 
 
+_WITCHER2_NOT_DETECTED_MSG = (
+    'Install "The Witcher 2: Assassins of Kings" and set its install folder in '
+    'the addon preferences to enable importing Witcher 2 characters.'
+)
+
+
+class WITCH_OT_ENTITY_import_geralt_w2(bpy.types.Operator):
+    """Import Witcher 2 Geralt (player.w2ent) from the Witcher 2 DZIP bundles"""
+    bl_idname = "witcher.import_geralt_w2"
+    bl_label = "Import Geralt (Witcher 2)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # Game-relative path of the Witcher 2 player template inside the DZIP bundles.
+    REL_PATH = "characters\\templates\\witcher\\player.w2ent"
+
+    @classmethod
+    def poll(cls, context):
+        if _is_witcher2_detected(context):
+            return True
+        cls.poll_message_set(_WITCHER2_NOT_DETECTED_MSG)
+        return False
+
+    @classmethod
+    def description(cls, context, properties):
+        if _is_witcher2_detected(context):
+            return (
+                "Import Witcher 2 Geralt (characters\\templates\\witcher\\player.w2ent) "
+                "from the Witcher 2 DZIP bundles"
+            )
+        return _WITCHER2_NOT_DETECTED_MSG
+
+    def execute(self, context):
+        s = time.time()
+
+        from .. import ensure_witcher2_game_path_initialized, get_witcher2_game_path_issue
+        ensure_witcher2_game_path_initialized(context)
+        if not _is_witcher2_detected(context):
+            self.report({'ERROR'}, _WITCHER2_NOT_DETECTED_MSG)
+            self.report({'WARNING'}, get_witcher2_game_path_issue(context))
+            return {'CANCELLED'}
+
+        with mod_loading_context(context):
+            # version=115 routes resolution through the Witcher 2 repo/DZIP fallback.
+            path = repo_file_for_source(self.REL_PATH, "w2")
+            if not path or not os.path.exists(win_safe_path(path)):
+                self.report(
+                    {'ERROR'},
+                    f"Witcher 2 player.w2ent not found and could not be extracted "
+                    f"from the DZIP bundles at: {path}",
+                )
+                return {'CANCELLED'}
+
+            import_entity.import_ent_template(path, False, 1, parent_transform=None)
+
+            message = f'Imported Witcher 2 Geralt in {time.time() - s:.2f} seconds.'
+            log.info(message)
+            self.report({'INFO'}, message)
+            return {'FINISHED'}
+
+
+class WITCH_OT_ENTITY_import_triss_w2(bpy.types.Operator):
+    """Import Witcher 2 Triss (triss.w2ent) from the Witcher 2 DZIP bundles"""
+    bl_idname = "witcher.import_triss_w2"
+    bl_label = "Import Triss (Witcher 2)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # Game-relative path of the Witcher 2 Triss template inside the DZIP bundles.
+    REL_PATH = "game\\npc\\triss.w2ent"
+
+    @classmethod
+    def poll(cls, context):
+        if _is_witcher2_detected(context):
+            return True
+        cls.poll_message_set(_WITCHER2_NOT_DETECTED_MSG)
+        return False
+
+    @classmethod
+    def description(cls, context, properties):
+        if _is_witcher2_detected(context):
+            return (
+                "Import Witcher 2 Triss (game\\npc\\triss.w2ent) "
+                "from the Witcher 2 DZIP bundles"
+            )
+        return _WITCHER2_NOT_DETECTED_MSG
+
+    def execute(self, context):
+        s = time.time()
+
+        from .. import ensure_witcher2_game_path_initialized, get_witcher2_game_path_issue
+        ensure_witcher2_game_path_initialized(context)
+        if not _is_witcher2_detected(context):
+            self.report({'ERROR'}, _WITCHER2_NOT_DETECTED_MSG)
+            self.report({'WARNING'}, get_witcher2_game_path_issue(context))
+            return {'CANCELLED'}
+
+        with mod_loading_context(context):
+            # version=115 routes resolution through the Witcher 2 repo/DZIP fallback.
+            path = repo_file_for_source(self.REL_PATH, "w2")
+            if not path or not os.path.exists(win_safe_path(path)):
+                self.report(
+                    {'ERROR'},
+                    f"Witcher 2 triss.w2ent not found and could not be extracted "
+                    f"from the DZIP bundles at: {path}",
+                )
+                return {'CANCELLED'}
+
+            import_entity.import_ent_template(path, False, 1, parent_transform=None)
+
+            message = f'Imported Witcher 2 Triss in {time.time() - s:.2f} seconds.'
+            log.info(message)
+            self.report({'INFO'}, message)
+            return {'FINISHED'}
+
+
 class WITCH_OT_ENTITY_duplicate_linked(bpy.types.Operator):
     """Duplicate the selected character hierarchy without re-importing assets"""
     bl_idname = "witcher.duplicate_character_linked"
@@ -1925,6 +2051,8 @@ classes = [
     WITCH_OT_ENTITY_import_inventory,
     WITCH_OT_ENTITY_import_geralt,
     WITCH_OT_ENTITY_import_ciri,
+    WITCH_OT_ENTITY_import_geralt_w2,
+    WITCH_OT_ENTITY_import_triss_w2,
     WITCH_OT_ENTITY_duplicate_linked,
     WITCH_OT_ENTITY_list_loadapp,
     WITCH_OT_ENTITY_lod_toggle,

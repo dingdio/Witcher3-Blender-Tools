@@ -208,6 +208,8 @@ def iter_w2_known_alias_paths(filepath: str):
     folder = scabbard_folders.get(stem)
     if folder:
         yield f"items\\geralt\\geralt_scabbards\\{folder}\\{base}"
+        if stem in ("scabbardsilver", "scabbardsabre"):
+            yield "items\\geralt\\geralt_scabbards\\scabbard_steel\\scabbardsteel.w2rig"
     witcher_rig_aliases = {
         "witcher_moj": "characters\\templates\\witcher\\model\\witcher_without_ponytail.w2rig",
         "witcher_with_ponytail": "characters\\templates\\witcher\\model\\witcher_rig.w2rig",
