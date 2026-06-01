@@ -33,19 +33,22 @@ def refresh_dialog_language_consumers(context, refresh_audio=False):
         reset_string_manager=False,
     )
 
+    ui_package = __package__ or "witcher3_tools.ui"
+    root_package = ui_package.rsplit(".", 1)[0]
     refreshers = (
-        ("ui_cutscene", "refresh_cutscene_dialog_language"),
-        ("ui_scene", "refresh_w2scene_dialog_language"),
-        ("ui_voice", "refresh_voice_dialog_language"),
+        (f"{ui_package}.ui_cutscene", "refresh_cutscene_dialog_language"),
+        (f"{ui_package}.ui_scene", "refresh_w2scene_dialog_language"),
+        (f"{ui_package}.ui_voice", "refresh_voice_dialog_language"),
+        (f"{root_package}.strings_browser.ui_strings_browser", "refresh_strings_browser_dialog_language"),
     )
-    for module_name, func_name in refreshers:
+    for module_path, func_name in refreshers:
         try:
-            module = __import__(f"{__package__}.{module_name}", fromlist=[func_name])
+            module = __import__(module_path, fromlist=[func_name])
             refresh_func = getattr(module, func_name, None)
             if callable(refresh_func):
                 refresh_func(context, refresh_audio=refresh_audio)
         except Exception:
-            log.warning("Dialog language refresh failed in %s.%s", module_name, func_name, exc_info=True)
+            log.warning("Dialog language refresh failed in %s.%s", module_path, func_name, exc_info=True)
 
     _tag_dialog_language_redraw(context)
     return scene
@@ -97,7 +100,7 @@ def _on_voice_language_update(self, context):
             voice_language=dialog_language.get_active_voice_language(context),
             reset_string_manager=False,
         )
-        _tag_dialog_language_redraw(context)
+        refresh_dialog_language_consumers(context, refresh_audio=True)
     finally:
         _LANGUAGE_REFRESHING = False
 

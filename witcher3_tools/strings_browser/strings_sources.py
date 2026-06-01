@@ -7,9 +7,11 @@ Builds a flat list of StringRecord dicts from:
   * The Witcher 3 REDkit SQLite DB (``LocalEditorStringDataBaseW3_UTF8*.db``)
   * The Witcher 2 REDkit SQLite DB (``LocalEditorStringDataBaseW2_UTF8*.db``)
 
-Speaker names are resolved by reusing the Dialogue Browser data sources
-(``voice_names.json`` + ``actor_voicelines.csv``) and falling back to
-``STRING_INFO.VOICEOVER_NAME`` derived speaker strings.
+Speaker names are resolved by reusing the Dialogue Browser data sources.
+For Witcher 3, ``scene_voice_tags`` is the canonical code-to-voicetag registry
+and ``voice_names.json`` is only the line-id-to-code cache. For Witcher 3
+SQLite data, ``STRING_INFO.VOICEOVER_NAME`` can also provide a speaker-like
+code. Witcher 2 ``VOICEOVER_NAME`` values are not treated as speakers.
 
 The browser uses these records read-only (browse only, no editing).
 """
@@ -55,13 +57,13 @@ W2_REDKIT_DB_NAMES = (
 _DB_SUBDIRS = ("r4data", "bin")
 
 
-# Maximum number of records assembled per build. The full W3 string table is
-# around 64k rows; the SQLite DB can have more. We cap to keep the UI responsive
-# without paging the underlying list (paging is applied at the UI layer).
-MAX_RECORDS_PER_SOURCE = 200000
+# Optional maximum number of records assembled per build. 0 means unlimited.
+# The REDkit W3 SQLite DB can exceed one million rows, and the browser's UI
+# paging is applied after this source list is built.
+MAX_RECORDS_PER_SOURCE = 0
 
 
-_SPEAKER_CACHE = {"voice_names": None, "csv_speakers": None, "speaker_codes": None}
+_SPEAKER_CACHE = {"voice_names": None, "csv_speakers": None, "speaker_codes": None, "scene_voice_tags": None}
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +189,21 @@ def _load_speaker_codes_map():
     return out
 
 
+def _load_scene_voice_tags():
+    cached = _SPEAKER_CACHE.get("scene_voice_tags")
+    if cached is not None:
+        return cached
+    registry = None
+    try:
+        from ..CR2W.witcher_cache.SceneDialog.scene_dialog_voice_tags import LoadSceneVoiceTags
+
+        registry = LoadSceneVoiceTags()
+    except Exception:
+        log.debug("Could not read scene_voice_tags registry", exc_info=True)
+    _SPEAKER_CACHE["scene_voice_tags"] = registry
+    return registry
+
+
 def _load_voice_names_json():
     cached = _SPEAKER_CACHE.get("voice_names")
     if cached is not None:
@@ -277,10 +294,10 @@ def _format_speaker_display(value):
 def _speaker_code_from_voiceover(voiceover, line_id):
     """Return just the speaker abbreviation chunk of a VOICEOVER_NAME.
 
-    REDkit voiceover ids follow ``<SPEAKER>_<CATEGORY>_<ID>`` (e.g.
-    ``GRLT_GC_152469``, ``TRSS_MT_00153025``, ``SHPK_TEMPLATE_30262``). The
-    first underscore-separated chunk is the speaker abbreviation; everything
-    after it is category + line id and is not part of the speaker name.
+    Witcher 3 REDkit voiceover ids commonly follow
+    ``<SPEAKER>_<CATEGORY>_<ID>`` (e.g. ``GRLT_GC_152469``). The first
+    underscore-separated chunk is the speaker abbreviation; everything after it
+    is category + line id and is not part of the speaker name.
     """
     voiceover = str(voiceover or "").strip()
     line_id = str(line_id or "").strip()
@@ -321,6 +338,12 @@ def _speaker_from_voiceover(voiceover, line_id):
     if resolved:
         return resolved
 
+    scene_voice_tags = _load_scene_voice_tags()
+    if scene_voice_tags is not None:
+        resolved = scene_voice_tags.display_for_id(code)
+        if resolved:
+            return resolved
+
     voiceover = str(voiceover or "").strip()
     line_id = str(line_id or "").strip()
     if line_id and voiceover.upper().endswith("_" + line_id.upper()):
@@ -340,7 +363,8 @@ def resolve_speaker(string_id, voiceover):
     1. ``voice_names.json`` — maps voice-line id to a short speaker code.
        The code is then translated to a full name via the reverse map.
     2. ``actor_voicelines.csv`` — already-Title-cased character names.
-    3. The voiceover column on STRING_INFO (``GRLT_GC_152469`` → ``Geralt``).
+    3. The voiceover column on Witcher 3 STRING_INFO
+       (``GRLT_GC_152469`` → ``Geralt``).
     """
 
     sid_str = str(string_id or "").strip()
@@ -353,6 +377,11 @@ def resolve_speaker(string_id, voiceover):
         resolved = codes_map.get(str(candidate).strip().lower())
         if resolved:
             return resolved
+        scene_voice_tags = _load_scene_voice_tags()
+        if scene_voice_tags is not None:
+            resolved = scene_voice_tags.display_for_id(candidate)
+            if resolved:
+                return resolved
         return _format_speaker_display(candidate)
 
     # actor_voicelines.csv is already a display name.
@@ -373,6 +402,13 @@ def clear_speaker_cache():
     _SPEAKER_CACHE["voice_names"] = None
     _SPEAKER_CACHE["csv_speakers"] = None
     _SPEAKER_CACHE["speaker_codes"] = None
+    _SPEAKER_CACHE["scene_voice_tags"] = None
+    try:
+        from ..CR2W.witcher_cache.SceneDialog.scene_dialog_voice_tags import ClearSceneVoiceTagsCache
+
+        ClearSceneVoiceTagsCache()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -535,8 +571,8 @@ def find_string_db_paths(game, override_path=""):
 
     The override can be either a ``.db``/``.sqlite`` file or a directory. When a
     directory is given, we scan it (and its ``r4data``/``bin`` subfolders) for
-    the known DB filenames. This lets users paste a REDkit install root like
-    ``C:\\w3.modding\\The Witcher 3 REDkit`` and have both DBs picked up.
+    the known DB filenames. This lets users paste a REDkit install root and
+    have both DBs picked up.
     """
 
     game_upper = str(game or "").upper()
@@ -709,6 +745,14 @@ def _connect_readonly(db_path):
     return conn
 
 
+def _positive_record_limit(max_records):
+    try:
+        limit = int(max_records or 0)
+    except (TypeError, ValueError):
+        return None
+    return limit if limit > 0 else None
+
+
 def _query_latest_strings(cursor, language_id):
     """Return [(string_id, text)] for the requested LANG id via LATEST_STRINGS."""
     try:
@@ -751,7 +795,7 @@ def _resolve_language_id(cursor, language, has_languages_table):
     return _FALLBACK_LANG_ID_BY_HANDLE.get(handle, _FALLBACK_LANG_ID_BY_HANDLE.get("en"))
 
 
-def read_sqlite_strings(db_path, language="en", max_records=MAX_RECORDS_PER_SOURCE):
+def read_sqlite_strings(db_path, language="en", max_records=MAX_RECORDS_PER_SOURCE, only_with_text=False):
     """Load all STRING_INFO rows joined with the language-specific text.
 
     Returns: (list_of_tuple_rows, used_language_column).
@@ -794,6 +838,7 @@ def read_sqlite_strings(db_path, language="en", max_records=MAX_RECORDS_PER_SOUR
 
             if has_latest_view and language_id is not None:
                 # Best case: REDkit-built view already collapses VERSION.
+                text_where = " WHERE ls.TEXT IS NOT NULL AND TRIM(ls.TEXT) <> ''" if only_with_text else ""
                 query = (
                     "SELECT si.STRING_ID, "
                     "       COALESCE(si.STRING_KEY,'') AS K, "
@@ -804,12 +849,14 @@ def read_sqlite_strings(db_path, language="en", max_records=MAX_RECORDS_PER_SOUR
                     "FROM STRING_INFO si "
                     "LEFT JOIN LATEST_STRINGS ls "
                     "  ON ls.STRING_ID = si.STRING_ID AND ls.LANG = ?"
+                    f"{text_where}"
                 )
                 cursor.execute(query, (int(language_id),))
             elif has_strings_table and language_id is not None:
                 # W2 path: derive the newest VERSION per STRING_ID inside the
                 # requested LANG with a correlated subquery, then LEFT JOIN
                 # STRING_INFO for the metadata columns.
+                text_where = " WHERE s.TEXT IS NOT NULL AND TRIM(s.TEXT) <> ''" if only_with_text else ""
                 query = (
                     "SELECT si.STRING_ID, "
                     "       COALESCE(si.STRING_KEY,'') AS K, "
@@ -824,11 +871,13 @@ def read_sqlite_strings(db_path, language="en", max_records=MAX_RECORDS_PER_SOUR
                     "    SELECT MAX(VERSION) FROM STRINGS s2 "
                     "    WHERE s2.STRING_ID = si.STRING_ID AND s2.LANG = ? "
                     "  )"
+                    f"{text_where}"
                 )
                 cursor.execute(query, (int(language_id), int(language_id)))
             else:
                 # Wide-column STRING_INFO with TEXT in a language column.
                 lang_col_quoted = f'"{text_column}"'
+                text_where = f" WHERE {lang_col_quoted} IS NOT NULL AND TRIM({lang_col_quoted}) <> ''" if only_with_text else ""
                 query = (
                     f"SELECT STRING_ID, "
                     f"       COALESCE(STRING_KEY,''), "
@@ -837,10 +886,12 @@ def read_sqlite_strings(db_path, language="en", max_records=MAX_RECORDS_PER_SOUR
                     f"       COALESCE(PROPERTY_NAME,''), "
                     f"       COALESCE({lang_col_quoted},'') "
                     f"FROM STRING_INFO"
+                    f"{text_where}"
                 )
                 try:
                     cursor.execute(query)
                 except Exception:
+                    empty_text_where = " WHERE 0" if only_with_text else ""
                     cursor.execute(
                         "SELECT STRING_ID, "
                         "       COALESCE(STRING_KEY,''), "
@@ -849,10 +900,21 @@ def read_sqlite_strings(db_path, language="en", max_records=MAX_RECORDS_PER_SOUR
                         "       COALESCE(PROPERTY_NAME,''), "
                         "       '' "
                         "FROM STRING_INFO"
+                        f"{empty_text_where}"
                     )
 
-            for row in cursor.fetchmany(max_records):
-                rows_out.append(row)
+            limit = _positive_record_limit(max_records)
+            remaining = limit
+            while True:
+                batch_size = 10000 if remaining is None else min(10000, remaining)
+                batch = cursor.fetchmany(batch_size)
+                if not batch:
+                    break
+                rows_out.extend(batch)
+                if remaining is not None:
+                    remaining -= len(batch)
+                    if remaining <= 0:
+                        break
         finally:
             conn.close()
     except Exception as exc:
@@ -941,8 +1003,9 @@ def build_w2_binary_records(
     source_by_id = getattr(manager, "SourcePathById", {}) or {}
     cache_files = getattr(manager, "cache_files", []) or [""]
     records = []
+    limit = _positive_record_limit(max_records)
     for sid, text in lines.items():
-        if len(records) >= max_records:
+        if limit is not None and len(records) >= limit:
             break
         try:
             sid_int = int(sid)
@@ -988,9 +1051,10 @@ def build_w3_binary_records(language="en", max_records=MAX_RECORDS_PER_SOURCE):
         return []
 
     records = []
+    limit = _positive_record_limit(max_records)
     count = 0
     for sid, text in lines.items():
-        if count >= max_records:
+        if limit is not None and count >= limit:
             break
         try:
             sid_int = int(sid)
@@ -1022,8 +1086,14 @@ def build_sqlite_records(
     db_path,
     language="en",
     max_records=MAX_RECORDS_PER_SOURCE,
+    only_with_text=False,
 ):
-    rows, lang_column = read_sqlite_strings(db_path, language=language, max_records=max_records)
+    rows, lang_column = read_sqlite_strings(
+        db_path,
+        language=language,
+        max_records=max_records,
+        only_with_text=only_with_text,
+    )
     if not rows:
         return []
 
@@ -1038,7 +1108,8 @@ def build_sqlite_records(
         resource = row[3] if len(row) > 3 else ""
         property_name = row[4] if len(row) > 4 else ""
         text = row[5] if len(row) > 5 else ""
-        speaker_code = _speaker_code_from_voiceover(voiceover, sid_int)
+        speaker_voiceover = "" if game == GAME_W2 else voiceover
+        speaker_code = "" if game == GAME_W2 else _speaker_code_from_voiceover(voiceover, sid_int)
         if game == GAME_W3 and not speaker_code:
             speaker_code = _load_voice_names_json().get(str(sid_int), "")
 
@@ -1050,7 +1121,7 @@ def build_sqlite_records(
                 string_key=string_key,
                 text=text,
                 voiceover=voiceover,
-                speaker=resolve_speaker(sid_int, voiceover),
+                speaker=resolve_speaker(sid_int, speaker_voiceover),
                 speaker_code=speaker_code,
                 resource=resource,
                 property_name=property_name,
@@ -1065,8 +1136,8 @@ def build_sqlite_records(
 # Build orchestrator + in-memory cache
 # ---------------------------------------------------------------------------
 
-# Cache key: (game, source, db_path_or_'', language). Each value is a list of
-# StringRecord dicts.
+# Cache key: (game, source, db_path_or_'', language, only_with_text). Each
+# value is a list of StringRecord dicts.
 _RECORDS_CACHE = {}
 _RECORDS_BUILT_AT = {}
 _CACHE_TTL_SECONDS = 300.0
@@ -1083,21 +1154,22 @@ def cache_clear():
     clear_speaker_cache()
 
 
-def get_last_error(game, source, db_path="", language="en"):
+def get_last_error(game, source, db_path="", language="en", only_with_text=False):
     """Return the diagnostic captured during the most recent build, or ''."""
-    return _LAST_BUILD_ERROR.get(_cache_key(game, source, db_path, language), "")
+    return _LAST_BUILD_ERROR.get(_cache_key(game, source, db_path, language, only_with_text), "")
 
 
-def _cache_key(game, source, db_path, language):
+def _cache_key(game, source, db_path, language, only_with_text=False):
     return (
         str(game or "").upper(),
         str(source or "").lower(),
         str(db_path or ""),
         str(language or "en").lower(),
+        bool(only_with_text),
     )
 
 
-def get_records(game, source, *, language="en", db_path="", force_reload=False):
+def get_records(game, source, *, language="en", db_path="", force_reload=False, only_with_text=False):
     """Return the StringRecord list for the requested source, building once.
 
     Non-empty build results are cached in memory for ``_CACHE_TTL_SECONDS``
@@ -1107,7 +1179,7 @@ def get_records(game, source, *, language="en", db_path="", force_reload=False):
     just retrying. A forced reload bypasses the cache unconditionally.
     """
 
-    key = _cache_key(game, source, db_path, language)
+    key = _cache_key(game, source, db_path, language, only_with_text)
     now = time.time()
     if not force_reload:
         cached = _RECORDS_CACHE.get(key)
@@ -1138,7 +1210,12 @@ def get_records(game, source, *, language="en", db_path="", force_reload=False):
                 records = []
                 error_message = "No database path set (auto-detect found nothing; use the override field)."
             else:
-                records = build_sqlite_records(game_upper, db_path, language=language)
+                records = build_sqlite_records(
+                    game_upper,
+                    db_path,
+                    language=language,
+                    only_with_text=only_with_text,
+                )
         else:
             records = []
     except Exception as exc:

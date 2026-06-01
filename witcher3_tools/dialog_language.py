@@ -111,8 +111,14 @@ _LANGUAGE_SCAN_CACHE = {
     "text": tuple(),
     "voice": tuple(),
 }
+_W2_VOICE_LANGUAGE_SCAN_CACHE = {
+    "roots": tuple(),
+    "scanned_at": 0.0,
+    "voice": tuple(),
+}
 _LANGUAGE_SCAN_TTL_SECONDS = 30.0
 _LANGUAGE_SCAN_IN_PROGRESS = False
+_W2_VOICE_LANGUAGE_SCAN_IN_PROGRESS = False
 
 _TEXT_ENUM_ITEMS = []
 _VOICE_ENUM_ITEMS = []
@@ -176,6 +182,10 @@ def _ordered_languages(handles, preferred_order):
 
 
 def _get_game_base_path():
+    return _get_addon_pref_path("witcher_game_path")
+
+
+def _get_addon_pref_path(attr_name):
     try:
         import bpy
 
@@ -194,7 +204,7 @@ def _get_game_base_path():
                         addon_entry = addons[key]
                         break
             prefs = getattr(addon_entry, "preferences", None) if addon_entry is not None else None
-            game_path = str(getattr(prefs, "witcher_game_path", "") or "").strip()
+            game_path = str(getattr(prefs, attr_name, "") or "").strip()
             if game_path:
                 return os.path.normpath(os.path.abspath(game_path))
     except Exception:
@@ -213,6 +223,32 @@ def _language_scan_roots(base_path):
             roots.append(folder)
     roots.append(base_path)
     return roots
+
+
+def _w2_voice_scan_roots():
+    roots = []
+    for attr in ("witcher2_game_path", "w2_unbundle_path"):
+        path = _get_addon_pref_path(attr)
+        if not path:
+            continue
+        for candidate in (
+            path,
+            os.path.join(path, "CookedPC"),
+            os.path.join(path, "data"),
+            os.path.join(path, "data", "CookedPC"),
+        ):
+            if candidate and os.path.isdir(candidate):
+                roots.append(os.path.normpath(os.path.abspath(candidate)))
+
+    unique = []
+    seen = set()
+    for root in roots:
+        key = os.path.normcase(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return tuple(unique)
 
 
 def _scan_installed_languages(force=False):
@@ -277,8 +313,58 @@ def _scan_installed_languages(force=False):
     return text, voice
 
 
+def _scan_installed_w2_voice_languages(force=False):
+    global _W2_VOICE_LANGUAGE_SCAN_IN_PROGRESS
+    roots = _w2_voice_scan_roots()
+    now = time.time()
+    if (
+        not force
+        and _W2_VOICE_LANGUAGE_SCAN_CACHE.get("roots") == roots
+        and now - float(_W2_VOICE_LANGUAGE_SCAN_CACHE.get("scanned_at") or 0.0) < _LANGUAGE_SCAN_TTL_SECONDS
+    ):
+        return _W2_VOICE_LANGUAGE_SCAN_CACHE["voice"]
+    if _W2_VOICE_LANGUAGE_SCAN_IN_PROGRESS:
+        return _W2_VOICE_LANGUAGE_SCAN_CACHE["voice"]
+    if not roots:
+        _W2_VOICE_LANGUAGE_SCAN_CACHE.update({
+            "roots": roots,
+            "scanned_at": now,
+            "voice": tuple(),
+        })
+        return tuple()
+
+    voice_languages = set()
+    speech_pattern = re.compile(r"^(.+?)0?\.w2speech$", re.IGNORECASE)
+    _W2_VOICE_LANGUAGE_SCAN_IN_PROGRESS = True
+    try:
+        for root in roots:
+            try:
+                for filename in sorted(os.listdir(root)):
+                    path = os.path.join(root, filename)
+                    if not os.path.isfile(path):
+                        continue
+                    match = speech_pattern.match(filename)
+                    if match:
+                        voice_languages.add(_canonical_language_handle(match.group(1)))
+            except Exception:
+                pass
+    finally:
+        _W2_VOICE_LANGUAGE_SCAN_IN_PROGRESS = False
+
+    voice = _ordered_languages(voice_languages, _VOICE_LANGUAGE_ORDER)
+    _W2_VOICE_LANGUAGE_SCAN_CACHE.update({
+        "roots": roots,
+        "scanned_at": now,
+        "voice": voice,
+    })
+    return voice
+
+
 def refresh_language_capability_cache():
-    return _scan_installed_languages(force=True)
+    text, w3_voice = _scan_installed_languages(force=True)
+    w2_voice = _scan_installed_w2_voice_languages(force=True)
+    voice = _ordered_languages(tuple(w3_voice) + tuple(w2_voice), _VOICE_LANGUAGE_ORDER)
+    return text, voice
 
 
 def installed_text_languages():
@@ -287,8 +373,9 @@ def installed_text_languages():
 
 
 def installed_voice_languages():
-    _text, voice = _scan_installed_languages()
-    return voice
+    _text, w3_voice = _scan_installed_languages()
+    w2_voice = _scan_installed_w2_voice_languages()
+    return _ordered_languages(tuple(w3_voice) + tuple(w2_voice), _VOICE_LANGUAGE_ORDER)
 
 
 def has_installed_voice_language(language):
@@ -330,6 +417,20 @@ def _language_enum_items(kind, context=None):
         active = _scene_language_value(context, DIALOG_VOICE_LANGUAGE_PROP, "")
         description = "Use this language for speech audio and lipsync imports"
         preferred_order = _VOICE_LANGUAGE_ORDER
+        scene = getattr(context, "scene", None) if context is not None else None
+        voice_game = str(getattr(scene, "witcher_voice_game", "") or "").upper() if scene is not None else ""
+        if voice_game == "W2":
+            installed_voice = set(_scan_installed_w2_voice_languages())
+            install_status_known = bool(_w2_voice_scan_roots())
+        elif voice_game == "W3":
+            _text, w3_voice = _scan_installed_languages()
+            installed_voice = set(w3_voice)
+            w3_base_path = _get_game_base_path()
+            install_status_known = bool(w3_base_path and os.path.isdir(w3_base_path))
+        else:
+            installed_voice = set(installed_voice_languages())
+            w3_base_path = _get_game_base_path()
+            install_status_known = bool((w3_base_path and os.path.isdir(w3_base_path)) or _w2_voice_scan_roots())
     else:
         handles = list(supported_dialog_languages())
         active = (
@@ -338,6 +439,8 @@ def _language_enum_items(kind, context=None):
         )
         description = "Use this language for dialog text and viewport subtitles"
         preferred_order = _TEXT_LANGUAGE_ORDER
+        installed_voice = set()
+        install_status_known = False
 
     active = normalize_dialog_language(active) if active else ""
     if active and active != "0" and active not in handles:
@@ -348,7 +451,14 @@ def _language_enum_items(kind, context=None):
     items = []
     for handle in _ordered_languages(handles, preferred_order):
         label = f"{handle.upper()} - {_LANGUAGE_LABELS.get(handle, handle)}"
-        items.append((handle, label, description))
+        item_description = description
+        if kind == "voice" and install_status_known:
+            if handle in installed_voice:
+                item_description = f"{description}. Voice pack detected."
+            else:
+                label = f"{label} (not installed)"
+                item_description = f"{description}. Voice pack was not detected; imports will fall back when possible."
+        items.append((handle, label, item_description))
     return items
 
 

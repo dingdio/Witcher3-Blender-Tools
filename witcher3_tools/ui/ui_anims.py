@@ -65,6 +65,23 @@ SCRATCH_CUTSCENE_FACE_TRACK_NAME = "cutscene_anim_face"
 SCRATCH_CUTSCENE_ROOT_COMPONENT = "Root"
 
 
+def _split_ui_label_text(text, width=110):
+    words = str(text or "").split(" ")
+    lines = []
+    current = ""
+    for word in words:
+        if not current:
+            current = word
+        elif len(current) + 1 + len(word) <= width:
+            current = current + " " + word
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [str(text or "")]
+
+
 def _find_character_armature(context):
     return get_main_armature(
         context,
@@ -6421,6 +6438,14 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             settings_col = settings_box.column(align=True)
             settings_col.use_property_split = True
             settings_col.use_property_decorate = False
+            voice_game = "W3"
+            if _ui_voice and hasattr(_ui_voice, "get_active_voice_game"):
+                try:
+                    voice_game = _ui_voice.get_active_voice_game(context)
+                except Exception:
+                    voice_game = "W3"
+            if hasattr(scene, "witcher_voice_game"):
+                settings_col.prop(scene, "witcher_voice_game", text="Game", expand=True)
             ui_dialog_language.draw_dialog_language_selector(
                 settings_col,
                 context,
@@ -6433,9 +6458,9 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 settings_col.prop(scene, "witcher_voice_show_details", text="Show IDs and Duration")
             if hasattr(scene, "witcher_voice_replace_audio"):
                 settings_col.prop(scene, "witcher_voice_replace_audio", text="Replace Audio")
-            if hasattr(scene, "witcher_voice_recreate_phonemes"):
+            if voice_game != "W2" and hasattr(scene, "witcher_voice_recreate_phonemes"):
                 settings_col.prop(scene, "witcher_voice_recreate_phonemes", text="Recreate Phonemes")
-            if getattr(scene, "witcher_voice_recreate_phonemes", False):
+            if voice_game != "W2" and getattr(scene, "witcher_voice_recreate_phonemes", False):
                 if hasattr(scene, "witcher_voice_phoneme_accuracy"):
                     settings_col.prop(scene, "witcher_voice_phoneme_accuracy", text="Phoneme Accuracy", slider=True)
             if hasattr(scene, "witcher_anim_nla_mode"):
@@ -6460,25 +6485,50 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                     status_box.operator("witcher.clear_lipsync", text="Clear Lipsync", icon='TRASH')
 
             filter_box = col.box()
-            filter_box.label(text="Search and Speaker Filters", icon='VIEWZOOM')
+            filter_box.label(text="Search, Speaker, and Scene Filters", icon='VIEWZOOM')
             raw_search = ""
             eff_speaker = ""
+            eff_scene = ""
             if _ui_voice and hasattr(_ui_voice, "_get_effective_speaker"):
                 try:
                     eff_speaker = _ui_voice._get_effective_speaker(scene)
                 except Exception:
                     eff_speaker = ""
+            if _ui_voice and hasattr(_ui_voice, "_get_effective_scene_filter"):
+                try:
+                    eff_scene = _ui_voice._get_effective_scene_filter(scene)
+                except Exception:
+                    eff_scene = ""
             if hasattr(scene, "witcher_voice_search_text"):
                 raw_search = getattr(scene, "witcher_voice_search_text", "").strip()
                 search_row = filter_box.row(align=True)
                 search_row.prop(scene, "witcher_voice_search_text", text="", icon='VIEWZOOM')
+                speaker_picker = search_row.operator(
+                    "witcher.strings_browser_search_speakers",
+                    text="",
+                    icon='USER',
+                )
+                speaker_picker.target = "dialogue"
+                back_btn = search_row.row(align=True)
+                back_btn.enabled = bool(
+                    getattr(scene, "witcher_voice_previous_selected_id", "")
+                    or getattr(scene, "witcher_voice_filter_anchor_id", "")
+                )
+                back_btn.operator("witcher.quick_voice_back_select", text="", icon='BACK')
                 clear_btn = search_row.row(align=True)
-                clear_btn.enabled = bool(raw_search or eff_speaker)
+                clear_btn.enabled = bool(raw_search or eff_speaker or eff_scene)
                 clear_btn.operator("witcher.quick_voice_clear_filter", text="", icon='X')
+
+                if eff_scene and hasattr(scene, "witcher_voice_scene_filter"):
+                    scene_row = filter_box.row(align=True)
+                    scene_row.prop(scene, "witcher_voice_scene_filter", text="Scene")
+                    scene_row.operator("witcher.quick_voice_clear_scene", text="", icon='X')
 
                 hint_parts = []
                 if eff_speaker:
                     hint_parts.append(f"speaker={eff_speaker}")
+                if eff_scene:
+                    hint_parts.append("scene")
                 if raw_search and _ui_voice and hasattr(_ui_voice, "_parse_search_tokens"):
                     try:
                         _toks, _sp = _ui_voice._parse_search_tokens(raw_search)
@@ -6579,20 +6629,22 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                             chip_row.operator("witcher.quick_voice_clear_speaker", text="Clear", icon='PANEL_CLOSE')
 
                 list_box = col.box()
-                list_box.label(text="Dialogue Lines", icon='TEXT')
+                list_box.label(
+                    text="Witcher 2 Dialogue Lines" if voice_game == "W2" else "Witcher 3 Dialogue Lines",
+                    icon='TEXT',
+                )
 
                 # --- Pager ---
                 if _ui_voice and hasattr(_ui_voice, "get_voice_browser_stats"):
                     stats = _ui_voice.get_voice_browser_stats(scene)
-                    if all(hasattr(scene, p) for p in ("witcher_voice_page_size", "witcher_voice_page_index")):
+                    if all(hasattr(scene, p) for p in ("witcher_voice_page_size", "witcher_voice_page_index", "witcher_voice_page_number")):
                         pager = list_box.row(align=True)
                         pager.prop(scene, "witcher_voice_page_size", text="Rows")
                         nav = list_box.row(align=True)
-                        nav.operator("witcher.quick_voice_page", text="<<").action = "first"
-                        nav.operator("witcher.quick_voice_page", text="<").action = "prev"
-                        nav.label(text=f"{stats['page_index'] + 1}/{stats['total_pages']}")
-                        nav.operator("witcher.quick_voice_page", text=">").action = "next"
-                        nav.operator("witcher.quick_voice_page", text=">>").action = "last"
+                        nav.operator("witcher.quick_voice_page", text="", icon='TRIA_LEFT').action = "prev"
+                        nav.prop(scene, "witcher_voice_page_number", text="Page")
+                        nav.label(text=f"/ {stats['total_pages']}")
+                        nav.operator("witcher.quick_voice_page", text="", icon='TRIA_RIGHT').action = "next"
                     list_box.label(
                         text=(
                             f"Showing {stats['visible_start']}-{stats['visible_end']} "
@@ -6616,10 +6668,107 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                     rows=7,
                 )
 
+                selected_dialogue = 0 <= scene.witcher_voice_list_index < len(scene.witcher_voice_list)
+                if selected_dialogue:
+                    selected_item = scene.witcher_voice_list[scene.witcher_voice_list_index]
+                    detail_box = list_box.box()
+                    detail_box.label(text="Selected Line", icon='OUTLINER_DATA_FONT')
+                    meta_row = detail_box.row(align=True)
+                    line_id = str(getattr(selected_item, "voiceLineId", "") or "")
+                    speaker = str(getattr(selected_item, "speaker", "") or "")
+                    duration = str(getattr(selected_item, "duration", "") or "")
+                    meta_text = line_id
+                    if speaker:
+                        meta_text += f" [{speaker}]"
+                    if duration:
+                        meta_text += f" |{duration}"
+                    meta_row.label(text=meta_text or "Selected dialogue")
+                    text_value = str(getattr(selected_item, "text", "") or "")
+                    if not text_value:
+                        text_value = str(getattr(selected_item, "display_full", "") or getattr(selected_item, "name", "") or "")
+                    text_col = detail_box.column(align=True)
+                    text_chunks = _split_ui_label_text(text_value, 110) if text_value else ["<empty>"]
+                    text_col.label(text=f"Text: {text_chunks[0]}")
+                    for chunk in text_chunks[1:]:
+                        text_col.label(text=chunk)
+
                 # --- Actions (first thing under the list) ---
                 act_row = list_box.row(align=True)
                 act_row.operator("witcher.quick_voice_debug", text="Load", icon='PLAY').action = "load"
-                act_row.operator("witcher.quick_voice_debug", text="Rebuild", icon='FILE_REFRESH').action = "reset3"
+                act_row.operator("witcher.quick_voice_debug", text="Refresh List", icon='FILE_REFRESH').action = "refresh"
+                scene_audio_row = list_box.row(align=True)
+                scene_audio_row.operator(
+                    "witcher.quick_voice_clear_scene_dialogue_audio",
+                    text="Clear Audio/Subtitles",
+                    icon='TRASH',
+                )
+
+                if _ui_voice and hasattr(_ui_voice, "refresh_selected_voice_associated_paths"):
+                    try:
+                        _ui_voice.refresh_selected_voice_associated_paths(context)
+                    except Exception:
+                        pass
+                associated_paths = getattr(scene, "witcher_voice_associated_paths", None)
+                if associated_paths is not None and selected_dialogue:
+                    path_count = len(associated_paths)
+                    assoc_header, assoc_body = list_box.panel("witcher_dialogue_associated_files", default_closed=False)
+                    assoc_header.label(text=f"Associated Files ({path_count})", icon='FILE_FOLDER')
+                    if assoc_body:
+                        voicetag_entity_count = 0
+                        if _ui_voice and hasattr(_ui_voice, "get_selected_voice_voicetag_entity_count"):
+                            try:
+                                voicetag_entity_count = int(_ui_voice.get_selected_voice_voicetag_entity_count(context))
+                            except Exception:
+                                voicetag_entity_count = 0
+                        if voicetag_entity_count:
+                            show_all = bool(getattr(scene, "witcher_voice_show_all_voicetag_entities", False))
+                            toggle_text = (
+                                "Hide VoiceTag Entities"
+                                if show_all
+                                else f"Show All VoiceTag Entities ({voicetag_entity_count})"
+                            )
+                            assoc_body.operator(
+                                "witcher.quick_voice_toggle_voicetag_entities",
+                                text=toggle_text,
+                                icon='COMMUNITY',
+                            )
+                        if path_count == 0:
+                            assoc_body.label(text="No scene or template paths found.", icon='INFO')
+                        for assoc in associated_paths:
+                            kind = str(getattr(assoc, "kind", "") or "")
+                            game = str(getattr(assoc, "game", voice_game) or voice_game)
+                            repo_path = str(getattr(assoc, "repo_path", "") or "")
+                            appearance = str(getattr(assoc, "appearance", "") or "")
+                            source = str(getattr(assoc, "source", "") or "")
+                            icon = 'OUTLINER_OB_ARMATURE' if kind == "entity" else 'SCENE_DATA'
+                            resolved = bool(str(getattr(assoc, "resolved_path", "") or ""))
+                            entry_col = assoc_body.column(align=True)
+                            path_row = entry_col.row(align=True)
+                            path_row.label(text="", icon='CHECKMARK' if resolved else 'ERROR')
+                            path_row.label(text="", icon=icon)
+                            if kind == "entity":
+                                path_row.label(text="", icon='USER' if source == "scene_actor" else 'COMMUNITY')
+                            path_row.prop(assoc, "repo_path", text="")
+                            if appearance:
+                                path_row.prop(assoc, "appearance", text="")
+                            if kind == "scene":
+                                filter_op = path_row.operator("witcher.quick_voice_filter_scene", text="", icon='FILTER')
+                                filter_op.scene_path = repo_path
+                                filter_op.clear_other_filters = True
+                            copy_op = path_row.operator("witcher.quick_voice_copy_associated_path", text="", icon='COPYDOWN')
+                            copy_op.path = repo_path
+                            open_op = path_row.operator("witcher.quick_voice_open_associated_path", text="", icon='FILEBROWSER')
+                            open_op.repo_path = repo_path
+                            open_op.game = game
+                            if kind == "entity":
+                                import_op = path_row.operator("witcher.quick_voice_import_associated_entity", text="", icon='IMPORT')
+                                import_op.repo_path = repo_path
+                                import_op.game = game
+                                import_op.appearance = appearance
+                            elif kind == "scene" and game.upper() == "W3":
+                                import_op = path_row.operator("witcher.quick_voice_import_associated_scene", text="", icon='IMPORT')
+                                import_op.repo_path = repo_path
+                                import_op.game = game
 
                 # --- Utility row (visually separated) ---
                 util_row = list_box.row(align=True)
@@ -6633,30 +6782,54 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             cache_header, cache_body = col.panel("witcher_dialogue_cache_tools", default_closed=True)
             cache_header.label(text="Cache Tools", icon='FILE_FOLDER')
             if cache_body:
-                # Paths are configured in Addon Preferences; just expose an open button here.
-                cache_body.operator(
-                    "witcher.open_voice_audio_path",
-                    text="Open Audio Folder",
-                    icon='FILE_FOLDER',
-                )
-                if all(hasattr(scene, p) for p in (
-                    "witcher_speech_pair_total",
-                    "witcher_speech_pair_extracted",
-                    "witcher_speech_pair_cr2w",
-                    "witcher_speech_pair_wem",
-                )):
-                    counts = cache_body.box()
-                    counts.label(text=f"Bundle pairs: {scene.witcher_speech_pair_total}")
-                    counts.label(text=f"Extracted pairs: {scene.witcher_speech_pair_extracted}")
-                    counts.label(text=f".cr2w files: {scene.witcher_speech_pair_cr2w}")
-                    counts.label(text=f".wem files: {scene.witcher_speech_pair_wem}")
-                    if getattr(scene, "witcher_speech_pair_last_refresh", ""):
-                        counts.label(text=f"Last refresh: {scene.witcher_speech_pair_last_refresh}")
-                cache_body.operator(
-                    "witcher.refresh_speech_counts",
-                    text="Refresh Counts",
+                dialog_cache = cache_body.box()
+                dialog_cache.label(text="Dialogue List", icon='TEXT')
+                rebuild_op = dialog_cache.operator(
+                    "witcher.quick_voice_debug",
+                    text="Rebuild Voice Cache",
                     icon='FILE_REFRESH',
                 )
+                rebuild_op.action = "rebuild_cache"
+                scan_op = dialog_cache.operator(
+                    "witcher.quick_voice_debug",
+                    text="Scan Scene Files",
+                    icon='VIEWZOOM',
+                )
+                scan_op.action = "rebuild_scene_metadata"
+                clear_scene_op = dialog_cache.operator(
+                    "witcher.quick_voice_debug",
+                    text="Clear Scene Index",
+                    icon='TRASH',
+                )
+                clear_scene_op.action = "clear_scene_index"
+
+                if voice_game == "W2":
+                    cache_body.label(text="Uses Witcher 2 speech and string caches.", icon='SPEAKER')
+                else:
+                    # Paths are configured in Addon Preferences; just expose an open button here.
+                    cache_body.operator(
+                        "witcher.open_voice_audio_path",
+                        text="Open Audio Folder",
+                        icon='FILE_FOLDER',
+                    )
+                    if all(hasattr(scene, p) for p in (
+                        "witcher_speech_pair_total",
+                        "witcher_speech_pair_extracted",
+                        "witcher_speech_pair_cr2w",
+                        "witcher_speech_pair_wem",
+                    )):
+                        counts = cache_body.box()
+                        counts.label(text=f"Bundle pairs: {scene.witcher_speech_pair_total}")
+                        counts.label(text=f"Extracted pairs: {scene.witcher_speech_pair_extracted}")
+                        counts.label(text=f".cr2w files: {scene.witcher_speech_pair_cr2w}")
+                        counts.label(text=f".wem files: {scene.witcher_speech_pair_wem}")
+                        if getattr(scene, "witcher_speech_pair_last_refresh", ""):
+                            counts.label(text=f"Last refresh: {scene.witcher_speech_pair_last_refresh}")
+                    cache_body.operator(
+                        "witcher.refresh_speech_counts",
+                        text="Refresh Counts",
+                        icon='FILE_REFRESH',
+                    )
 
         body = section("witcher_anim_playback", "Playback / Root Motion", 'CON_LOCLIKE', default_closed=False) if anim_tab == "CLIPS" else None
         if body:

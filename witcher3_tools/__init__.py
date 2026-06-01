@@ -1770,6 +1770,13 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         min=0,
         max=500,
     )
+    strings_browser_page_size: bpy.props.IntProperty(
+        name="Strings Browser Rows",
+        description="Rows shown per page in the Strings Browser popup",
+        default=1000,
+        min=50,
+        soft_max=100000,
+    )
     browser_grid_max_rows: bpy.props.IntProperty(
         name="Asset Browser Grid Rows Per Page",
         description="Optional fixed number of full grid rows shown before pagination is used. Set to 0 to auto-size from about 80% of monitor height",
@@ -2026,6 +2033,7 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         layout_col.prop(self, "browser_grid_columns", text="Grid Columns")
         layout_col.prop(self, "browser_grid_max_rows", text="Grid Rows Per Page")
         layout_col.prop(self, "browser_file_page_size", text="List Files Per Page")
+        layout_col.prop(self, "strings_browser_page_size", text="Strings Rows Per Page")
 
         # External command-line tool paths
         _tools_box, tools_col = section("External Tools", 'TOOL_SETTINGS')

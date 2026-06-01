@@ -70,8 +70,10 @@ def _update_layer_visibility_settings(self, context):
         pass
 from ..importers.import_entity import test_load_entity, fixed_chunk_paths
 import os
+import time
 import numpy as np
 import struct
+import wave
 import zlib
 from typing import Dict, Tuple, Optional
 
@@ -3153,6 +3155,7 @@ _sound_preview_state = {
 }
 _sound_preview_handle = None
 _sound_preview_device = None
+_sound_preview_token = 0
 
 
 def _tag_browser_redraw(context) -> None:
@@ -3170,6 +3173,40 @@ def _tag_browser_redraw(context) -> None:
                 for region in getattr(area, "regions", []):
                     if hasattr(region, "tag_redraw"):
                         region.tag_redraw()
+    except Exception:
+        pass
+
+
+def _sound_preview_duration_seconds(wav_path: str) -> float:
+    try:
+        with wave.open(win_safe_path(wav_path), "rb") as wav_file:
+            frame_rate = float(wav_file.getframerate() or 0)
+            if frame_rate <= 0:
+                return 0.0
+            return float(wav_file.getnframes() or 0) / frame_rate
+    except Exception:
+        return 0.0
+
+
+def _sound_preview_is_expired() -> bool:
+    stop_at = float(_sound_preview_state.get("stop_at", 0.0) or 0.0)
+    return bool(stop_at and time.monotonic() >= stop_at)
+
+
+def _schedule_sound_preview_expiry(context, token, duration_seconds: float) -> None:
+    if duration_seconds <= 0:
+        return
+
+    def _expire_sound_preview():
+        if _sound_preview_state.get("token") != token:
+            return None
+        if not _sound_preview_is_expired():
+            return 0.15
+        _clear_sound_preview(bpy.context if context is None else context)
+        return None
+
+    try:
+        bpy.app.timers.register(_expire_sound_preview, first_interval=max(0.1, float(duration_seconds) + 0.05))
     except Exception:
         pass
 
@@ -3214,6 +3251,9 @@ def _set_external_export_status(
 
 
 def _sound_preview_matches(cache_type: str, item_path: str) -> bool:
+    if _sound_preview_is_expired():
+        _clear_sound_preview(bpy.context)
+        return False
     return (
         _sound_preview_state.get("cache_type") == (cache_type or "")
         and _sound_preview_state.get("item_path") == (item_path or "").replace("/", "\\")
@@ -3221,7 +3261,8 @@ def _sound_preview_matches(cache_type: str, item_path: str) -> bool:
 
 
 def _clear_sound_preview(context=None) -> None:
-    global _sound_preview_handle, _sound_preview_state
+    global _sound_preview_handle, _sound_preview_state, _sound_preview_token
+    _sound_preview_token += 1
 
     backend = _sound_preview_state.get("backend") or ""
     try:
@@ -3249,6 +3290,8 @@ def _clear_sound_preview(context=None) -> None:
         "wav_path": "",
         "sound_name": "",
         "backend": "",
+        "token": _sound_preview_token,
+        "stop_at": 0.0,
     }
     _tag_browser_redraw(context)
 
@@ -3429,11 +3472,14 @@ def clear_sound_preview(context=None) -> None:
 
 
 def play_sound_file_preview(context, sound_abs_path: str, item_path: str, cache_type: str = "Sound") -> str:
-    global _sound_preview_device, _sound_preview_handle, _sound_preview_state
+    global _sound_preview_device, _sound_preview_handle, _sound_preview_state, _sound_preview_token
 
     wav_path = ensure_sound_wav(context, sound_abs_path, item_path)
+    duration_seconds = _sound_preview_duration_seconds(wav_path)
 
     _clear_sound_preview(context)
+    _sound_preview_token += 1
+    preview_token = _sound_preview_token
 
     sound_name = ""
     backend = "aud"
@@ -3467,7 +3513,10 @@ def play_sound_file_preview(context, sound_abs_path: str, item_path: str, cache_
         "wav_path": wav_path,
         "sound_name": sound_name,
         "backend": backend,
+        "token": preview_token,
+        "stop_at": time.monotonic() + duration_seconds if duration_seconds > 0 else 0.0,
     }
+    _schedule_sound_preview_expiry(context, preview_token, duration_seconds)
     _tag_browser_redraw(context)
     return wav_path
 
@@ -4446,7 +4495,6 @@ def load_browser_state(context):
 
 
 import json
-import time
 
 MAX_RECENT_ITEMS = 20
 RECENT_KIND_IMPORT = "import"
