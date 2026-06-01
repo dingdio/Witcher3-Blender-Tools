@@ -147,14 +147,28 @@ def read_array_string_prop(prop):
         elements = getattr(chunks, "elements", None) if chunks is not None else None
     if elements is None:
         elements = getattr(prop, "PROPS", None)
+    if elements is None:
+        index = getattr(prop, "Index", None)
+        if isinstance(index, (list, tuple)):
+            elements = index
     if not elements:
         return []
 
     values = []
     for elem in elements:
         value = read_string_prop(elem) or read_cname_prop(elem)
+        if not value and hasattr(elem, "ToString"):
+            try:
+                value = elem.ToString()
+            except Exception:
+                value = ""
         if not value:
-            value = getattr(elem, "Value", None) or getattr(elem, "val", None) or ""
+            value = (
+                getattr(elem, "Value", None)
+                or getattr(elem, "String", None)
+                or getattr(elem, "val", None)
+                or ""
+            )
         value = str(value or "").strip()
         if value:
             values.append(value)
