@@ -26,6 +26,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .. import dialogue_browser_core as browser_core
+
 log = logging.getLogger(__name__)
 
 
@@ -1258,21 +1260,8 @@ def collect_speakers(records, *, top=200):
 
 def filter_records(records, *, search_text="", speaker_filter=""):
     """Apply substring search + speaker equality. Returns filtered list."""
-
-    search_text = str(search_text or "").strip().lower()
-    speaker_filter = str(speaker_filter or "").strip().upper()
-    if not search_text and not speaker_filter:
-        return list(records)
-
-    terms = [token for token in search_text.split() if token] if search_text else []
-
-    out = []
-    for rec in records:
-        if speaker_filter and rec.get("speaker") != speaker_filter:
-            continue
-        if terms:
-            blob = rec.get("search_blob", "")
-            if not all(term in blob for term in terms):
-                continue
-        out.append(rec)
-    return out
+    return browser_core.filter_items_simple(
+        records,
+        search_text=search_text,
+        speaker_filter=speaker_filter,
+    )

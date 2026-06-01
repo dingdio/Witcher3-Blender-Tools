@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import html
-import math
 import os
 import re
 from pathlib import Path
@@ -26,6 +25,7 @@ from bpy.props import (
     StringProperty,
 )
 
+from .. import dialogue_browser_core as browser_core
 from . import strings_sources as ss
 
 log = logging.getLogger(__name__)
@@ -185,22 +185,11 @@ def _string_record_state_id(rec):
 
 
 def _normalize_scene_filter_path(value):
-    return str(value or "").strip().replace("/", "\\").lstrip("\\").lower()
+    return browser_core.normalize_repo_path(value)
 
 
 def _record_matches_scene_filter(rec, scene_filter):
-    scene_filter = _normalize_scene_filter_path(scene_filter)
-    if not scene_filter:
-        return True
-    paths = []
-    for value in rec.get("source_scenes", []) or []:
-        norm = _normalize_scene_filter_path(value)
-        if norm and norm not in paths:
-            paths.append(norm)
-    primary = _normalize_scene_filter_path(rec.get("scene_path", ""))
-    if primary and primary not in paths:
-        paths.insert(0, primary)
-    return scene_filter in paths
+    return browser_core.item_matches_scene_filter(rec, scene_filter)
 
 
 def _record_has_text(rec):
@@ -210,31 +199,11 @@ def _record_has_text(rec):
 
 
 def _normalize_resource_filter_value(value):
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    match = re.search(r'"([^"]+)"', text)
-    if match:
-        text = match.group(1).strip()
-    text = text.replace("/", "\\").lstrip("\\").lower()
-    return re.sub(r"\s+", " ", text)
+    return browser_core.normalize_resource_filter_value(value)
 
 
 def _record_matches_resource_filter(rec, resource_filter):
-    resource_filter = _normalize_resource_filter_value(resource_filter)
-    if not resource_filter:
-        return True
-    candidates = [
-        rec.get("resource", ""),
-        rec.get("scene_path", ""),
-    ]
-    for value in rec.get("source_scenes", []) or []:
-        candidates.append(value)
-    for value in candidates:
-        norm = _normalize_resource_filter_value(value)
-        if norm and (norm == resource_filter or resource_filter in norm):
-            return True
-    return False
+    return browser_core.item_matches_resource_filter(rec, resource_filter)
 
 
 def _record_has_voice_tag(rec):
@@ -342,8 +311,8 @@ def _on_active_index_update(self, context):
 def _strings_total_pages(settings):
     if settings is None:
         return 1
-    page_size = max(PAGE_SIZE_MIN, settings.page_size or PAGE_SIZE_DEFAULT)
-    return max(1, int(math.ceil(settings.last_filtered / page_size)))
+    page_size = browser_core.clamp_page_size(settings.page_size, PAGE_SIZE_DEFAULT, PAGE_SIZE_MIN)
+    return browser_core.page_count(settings.last_filtered, page_size)
 
 
 def _addon_preferences(context):
@@ -360,7 +329,7 @@ def _strings_page_size_pref(context):
         value = int(getattr(prefs, "strings_browser_page_size", 0) or 0)
     except Exception:
         value = 0
-    return max(PAGE_SIZE_MIN, value or PAGE_SIZE_DEFAULT)
+    return browser_core.clamp_page_size(value or PAGE_SIZE_DEFAULT, PAGE_SIZE_DEFAULT, PAGE_SIZE_MIN)
 
 
 def _save_strings_page_size_pref(context, page_size):
@@ -368,7 +337,7 @@ def _save_strings_page_size_pref(context, page_size):
     if prefs is None or not hasattr(prefs, "strings_browser_page_size"):
         return
     try:
-        value = max(PAGE_SIZE_MIN, int(page_size or PAGE_SIZE_DEFAULT))
+        value = browser_core.clamp_page_size(page_size, PAGE_SIZE_DEFAULT, PAGE_SIZE_MIN)
     except Exception:
         value = PAGE_SIZE_DEFAULT
     try:
@@ -392,7 +361,7 @@ def _sync_strings_page_number(settings, total_pages=None):
         return
     if total_pages is None:
         total_pages = _strings_total_pages(settings)
-    page_number = max(1, min(int(settings.page_index or 0) + 1, int(total_pages or 1)))
+    page_number = browser_core.page_number_from_index(settings.page_index, total_pages)
     if int(getattr(settings, "page_number", 1) or 1) == page_number:
         return
     _STRINGS_PAGE_SYNCING = True
@@ -408,18 +377,14 @@ def _on_page_number_update(self, context):
         return
     settings = self
     total_pages = _strings_total_pages(settings)
-    try:
-        page_number = int(settings.page_number or 1)
-    except Exception:
-        page_number = 1
-    page_number = max(1, min(page_number, total_pages))
+    target_index = browser_core.page_index_from_number(settings.page_number, total_pages)
+    page_number = target_index + 1
     if settings.page_number != page_number:
         _STRINGS_PAGE_SYNCING = True
         try:
             settings.page_number = page_number
         finally:
             _STRINGS_PAGE_SYNCING = False
-    target_index = page_number - 1
     if settings.page_index != target_index:
         settings.page_index = target_index
         _refresh_page(context, settings, select_first=True)
@@ -427,7 +392,7 @@ def _on_page_number_update(self, context):
 
 def _on_page_size_update(self, context):
     settings = self
-    clamped = max(PAGE_SIZE_MIN, settings.page_size or PAGE_SIZE_DEFAULT)
+    clamped = browser_core.clamp_page_size(settings.page_size, PAGE_SIZE_DEFAULT, PAGE_SIZE_MIN)
     if settings.page_size != clamped:
         settings.page_size = clamped
         return
@@ -1360,20 +1325,24 @@ def _refresh_page(context, settings, *, selected_id="", jump_to_selected=False, 
         _refresh_selected_string_associated_paths(context, force=True)
         return False
 
-    page_size = max(PAGE_SIZE_MIN, settings.page_size or PAGE_SIZE_DEFAULT)
-    total_pages = max(1, int(math.ceil(len(filtered) / page_size)))
-    page_index = max(0, min(settings.page_index, total_pages - 1))
+    page_size = browser_core.clamp_page_size(settings.page_size, PAGE_SIZE_DEFAULT, PAGE_SIZE_MIN)
+    total_pages = browser_core.page_count(len(filtered), page_size)
+    page_index = browser_core.clamp_page_index(settings.page_index, total_pages)
     if jump_to_selected and selected_id:
         for rec_idx, rec in enumerate(filtered):
             if _string_record_state_id(rec) == selected_id:
                 page_index = rec_idx // page_size
                 break
+    page_index = browser_core.clamp_page_index(page_index, total_pages)
     if settings.page_index != page_index:
         settings.page_index = page_index
     _sync_strings_page_number(settings, total_pages)
 
-    start = page_index * page_size
-    end = min(start + page_size, len(filtered))
+    start, end, _page_index, _total_pages = browser_core.page_bounds(
+        len(filtered),
+        page_index,
+        page_size,
+    )
     page = filtered[start:end]
 
     for cache_idx, rec in enumerate(page, start=start):
@@ -2338,18 +2307,11 @@ class WITCHER_OT_strings_browser_page(bpy.types.Operator):
         settings = getattr(scene, "witcher_strings_browser", None)
         if settings is None:
             return {'CANCELLED'}
-        page_size = max(PAGE_SIZE_MIN, settings.page_size or PAGE_SIZE_DEFAULT)
-        total_pages = max(1, int(math.ceil(settings.last_filtered / page_size)))
+        page_size = browser_core.clamp_page_size(settings.page_size, PAGE_SIZE_DEFAULT, PAGE_SIZE_MIN)
+        total_pages = browser_core.page_count(settings.last_filtered, page_size)
         current = settings.page_index
-        if self.action == "first":
-            target = 0
-        elif self.action == "prev":
-            target = max(0, current - 1)
-        elif self.action == "next":
-            target = min(total_pages - 1, current + 1)
-        elif self.action == "last":
-            target = total_pages - 1
-        else:
+        target = browser_core.page_target(self.action, current, total_pages)
+        if target is None:
             return {'CANCELLED'}
         if target != current:
             settings.page_index = target

@@ -8,6 +8,7 @@ from ..action_compat import bind_strip_action_slot, new_action_fcurve, resolve_a
 from ..CR2W.witcher_cache.Speech import LoadSpeechManager
 from ..CR2W.witcher_cache.Speech.W3Speech import SpeechEntry
 from ..CR2W.witcher_cache.W3Strings import LoadStringsManager
+from .. import dialogue_browser_core as browser_core
 from . import phoneme_helper
 from .ui_morphs import get_face_meshs
 
@@ -775,129 +776,11 @@ def _get_display_text(scene, item):
 # Returns a list of token dicts consumed by _matches_voice_filter_fast.
 
 def _parse_search_tokens(raw_text):
-    """Parse raw search text into a list of match-token dicts.
-
-    Each token dict has:
-      'type':  'and' | 'not' | 'phrase' | 'id' | 'or'
-      'terms': list[str]   — one str for 'and'/'not'/'phrase'/'id', N for 'or'
-
-    Also returns the extracted speaker filter string (may be "").
-    """
-    if not raw_text:
-        return [], ""
-
-    tokens = []
-    speaker_filter = ""
-    pos = 0
-    text = raw_text.strip()
-    n = len(text)
-
-    while pos < n:
-        # skip whitespace
-        while pos < n and text[pos] == ' ':
-            pos += 1
-        if pos >= n:
-            break
-
-        ch = text[pos]
-
-        # --- quoted phrase ---
-        if ch == '"':
-            end = text.find('"', pos + 1)
-            if end == -1:
-                phrase = text[pos + 1:].strip().lower()
-                pos = n
-            else:
-                phrase = text[pos + 1:end].strip().lower()
-                pos = end + 1
-            if phrase:
-                tokens.append({'type': 'phrase', 'terms': [phrase]})
-            continue
-
-        # --- find end of token (space-delimited) ---
-        end = pos
-        while end < n and text[end] != ' ':
-            end += 1
-        raw = text[pos:end]
-        pos = end
-
-        lower = raw.lower()
-
-        # --- speaker prefix: speaker:NAME or @NAME ---
-        if lower.startswith('speaker:'):
-            val = raw[8:].strip(' [](){}"').upper()
-            if val:
-                speaker_filter = val
-            continue
-        if raw.startswith('@'):
-            val = raw[1:].strip(' [](){}"').upper()
-            if val:
-                speaker_filter = val
-            continue
-        # old [NAME] bracket syntax
-        if raw.startswith('[') and raw.endswith(']') and len(raw) > 2:
-            val = raw[1:-1].strip().upper()
-            if val and not val.isdigit():
-                speaker_filter = val
-                continue
-
-        # --- id: prefix ---
-        if lower.startswith('id:'):
-            val = raw[3:].strip().lower()
-            if val:
-                tokens.append({'type': 'id', 'terms': [val]})
-            continue
-
-        # --- negation: -term ---
-        if raw.startswith('-') and len(raw) > 1:
-            val = lower[1:]
-            if val:
-                tokens.append({'type': 'not', 'terms': [val]})
-            continue
-
-        # --- OR alternatives: word1|word2|word3 ---
-        if '|' in raw:
-            parts = [p.strip().lower() for p in raw.split('|') if p.strip()]
-            if parts:
-                tokens.append({'type': 'or', 'terms': parts})
-            continue
-
-        # --- plain AND term ---
-        if lower:
-            tokens.append({'type': 'and', 'terms': [lower]})
-
-    return tokens, speaker_filter
+    return browser_core.parse_search_tokens(raw_text)
 
 
 def _matches_voice_filter_fast(blob, speaker, search_tokens, speaker_filter):
-    """Return True if this voice node passes all search filters.
-
-    blob           — pre-lowercased search blob string
-    speaker        — uppercased speaker string from node
-    search_tokens  — list of dicts from _parse_search_tokens
-    speaker_filter — uppercased speaker name or '' to disable
-    """
-    # Speaker gate (fast exit)
-    if speaker_filter and speaker != speaker_filter:
-        return False
-
-    for tok in search_tokens:
-        ttype = tok['type']
-        terms = tok['terms']
-        if ttype == 'and' or ttype == 'phrase':
-            if terms[0] not in blob:
-                return False
-        elif ttype == 'not':
-            if terms[0] in blob:
-                return False
-        elif ttype == 'id':
-            # blob starts with voice_id — do prefix check
-            if not blob.startswith(terms[0]):
-                return False
-        elif ttype == 'or':
-            if not any(t in blob for t in terms):
-                return False
-    return True
+    return browser_core.matches_search_tokens(blob, speaker, search_tokens, speaker_filter)
 
 
 # Keep old name for any external callers (falls back to fast version)
@@ -926,11 +809,12 @@ def _get_speaker_count(speaker):
 
 
 def _clamp_voice_page_size(value):
-    try:
-        size = int(value)
-    except Exception:
-        size = VOICE_PAGE_SIZE_DEFAULT
-    return max(VOICE_PAGE_SIZE_MIN, min(VOICE_PAGE_SIZE_MAX, size))
+    return browser_core.clamp_page_size(
+        value,
+        VOICE_PAGE_SIZE_DEFAULT,
+        VOICE_PAGE_SIZE_MIN,
+        VOICE_PAGE_SIZE_MAX,
+    )
 
 
 def get_voice_filtered_count():
@@ -942,9 +826,8 @@ def get_voice_browser_stats(scene):
     total = len(_voice_node_cache)
     filtered = len(_voice_filtered_indices)
     page_size = _clamp_voice_page_size(getattr(scene, "witcher_voice_page_size", VOICE_PAGE_SIZE_DEFAULT))
-    total_pages = max(1, int(math.ceil(filtered / page_size))) if filtered else 1
-    page_index = int(getattr(scene, "witcher_voice_page_index", 0) or 0)
-    page_index = max(0, min(page_index, total_pages - 1))
+    total_pages = browser_core.page_count(filtered, page_size)
+    page_index = browser_core.clamp_page_index(getattr(scene, "witcher_voice_page_index", 0), total_pages)
     start = page_index * page_size
     end = min(start + page_size, filtered)
     return {
@@ -964,7 +847,10 @@ def _sync_voice_page_number(scene, total_pages=None):
         return
     if total_pages is None:
         total_pages = get_voice_browser_stats(scene)["total_pages"]
-    page_number = max(1, min(int(getattr(scene, "witcher_voice_page_index", 0) or 0) + 1, int(total_pages or 1)))
+    page_number = browser_core.page_number_from_index(
+        getattr(scene, "witcher_voice_page_index", 0),
+        total_pages,
+    )
     if int(getattr(scene, "witcher_voice_page_number", 1) or 1) == page_number:
         return
     _voice_page_syncing = True
@@ -1041,32 +927,15 @@ def _set_list_item_from_node(item, node):
 
 
 def _normalize_voice_scene_path(value):
-    return str(value or "").strip().replace("/", "\\").lstrip("\\").lower()
+    return browser_core.normalize_repo_path(value)
 
 
 def _node_scene_paths(node):
-    paths = []
-    if isinstance(node, dict):
-        raw_paths = node.get("source_scenes") or []
-        if isinstance(raw_paths, str):
-            raw_paths = [raw_paths]
-        for path in raw_paths:
-            norm = _normalize_voice_scene_path(path)
-            if norm and norm not in paths:
-                paths.append(norm)
-        primary = _normalize_voice_scene_path(node.get("scene_path", ""))
-    else:
-        primary = _normalize_voice_scene_path(getattr(node, "scene_path", ""))
-    if primary and primary not in paths:
-        paths.insert(0, primary)
-    return paths
+    return browser_core.item_scene_paths(node)
 
 
 def _node_matches_scene_filter(node, scene_filter):
-    scene_filter = _normalize_voice_scene_path(scene_filter)
-    if not scene_filter:
-        return True
-    return scene_filter in _node_scene_paths(node)
+    return browser_core.item_matches_scene_filter(node, scene_filter)
 
 
 def _is_dialogue_preview_playing(game, line_id):
@@ -1094,18 +963,21 @@ def _refresh_voice_page(scene, selected_id=None, *, jump_to_selected=False):
         scene.witcher_voice_page_size = page_size
 
     filtered_total = len(_voice_filtered_indices)
-    total_pages = max(1, int(math.ceil(filtered_total / page_size))) if filtered_total else 1
-    page_index = int(getattr(scene, "witcher_voice_page_index", 0) or 0)
+    total_pages = browser_core.page_count(filtered_total, page_size)
+    page_index = browser_core.clamp_page_index(getattr(scene, "witcher_voice_page_index", 0), total_pages)
     if jump_to_selected and selected_id:
         selected_pos = _filtered_voice_position(selected_id)
         if selected_pos >= 0:
             page_index = selected_pos // page_size
-    page_index = max(0, min(page_index, total_pages - 1))
+    page_index = browser_core.clamp_page_index(page_index, total_pages)
     scene.witcher_voice_page_index = page_index
     _sync_voice_page_number(scene, total_pages)
 
-    page_start = page_index * page_size
-    page_end = min(page_start + page_size, filtered_total)
+    page_start, page_end, _page_index, _total_pages = browser_core.page_bounds(
+        filtered_total,
+        page_index,
+        page_size,
+    )
     page_indices = _voice_filtered_indices[page_start:page_end]
 
     display_list = scene.witcher_voice_list
@@ -1133,16 +1005,7 @@ def _refresh_voice_page(scene, selected_id=None, *, jump_to_selected=False):
     return selected_visible_idx >= 0
 
 def _parse_search_text(text):
-    """Legacy helper — extracts a cleaned text and speaker tag for backward compat.
-    New code uses _parse_search_tokens directly."""
-    _tokens, speaker = _parse_search_tokens(text)
-    clean_parts = []
-    for tok in _tokens:
-        if tok['type'] in ('and', 'phrase', 'id'):
-            clean_parts.append(tok['terms'][0])
-        elif tok['type'] == 'or':
-            clean_parts.append('|'.join(tok['terms']))
-    return ' '.join(clean_parts), speaker
+    return browser_core.parse_search_text(text)
 
 def _strip_speaker_tags(text):
     clean_text, _ = _parse_search_text(text)
@@ -1909,18 +1772,17 @@ def _on_voice_page_number_update(self, context):
     if not _voice_filtered_indices and _voice_node_cache:
         _apply_voice_filter(context)
     stats = get_voice_browser_stats(scene)
-    try:
-        page_number = int(getattr(scene, "witcher_voice_page_number", 1) or 1)
-    except Exception:
-        page_number = 1
-    page_number = max(1, min(page_number, stats["total_pages"]))
+    target_index = browser_core.page_index_from_number(
+        getattr(scene, "witcher_voice_page_number", 1),
+        stats["total_pages"],
+    )
+    page_number = target_index + 1
     if scene.witcher_voice_page_number != page_number:
         _voice_page_syncing = True
         try:
             scene.witcher_voice_page_number = page_number
         finally:
             _voice_page_syncing = False
-    target_index = page_number - 1
     if scene.witcher_voice_page_index != target_index:
         scene.witcher_voice_page_index = target_index
         _refresh_voice_page(scene, selected_id=_get_selected_voice_id(scene))
@@ -3107,17 +2969,12 @@ class MyVoiceList_Page(bpy.types.Operator):
         if not _voice_filtered_indices and _voice_node_cache:
             _apply_voice_filter(context)
         stats = get_voice_browser_stats(scene)
-        current = stats["page_index"]
-        last = max(0, stats["total_pages"] - 1)
-        if self.action == "first":
-            target = 0
-        elif self.action == "prev":
-            target = max(0, current - 1)
-        elif self.action == "next":
-            target = min(last, current + 1)
-        elif self.action == "last":
-            target = last
-        else:
+        target = browser_core.page_target(
+            self.action,
+            stats["page_index"],
+            stats["total_pages"],
+        )
+        if target is None:
             return {'CANCELLED'}
         scene.witcher_voice_page_index = target
         _refresh_voice_page(scene, selected_id=_get_selected_voice_id(scene))
