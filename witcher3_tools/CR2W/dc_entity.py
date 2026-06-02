@@ -1934,6 +1934,48 @@ def _collect_w2_body_part_component_names(template_chunk):
     return names
 
 
+def _collect_w2_body_part_state_table(template_chunk):
+    states_by_part = {}
+    for part_name, body_part in _iter_w2_body_parts(template_chunk):
+        part_key = _w2_part_key(part_name)
+        if not part_key:
+            continue
+        state_map = states_by_part.setdefault(part_key, {})
+        for state_name, state in _iter_w2_body_part_states(body_part):
+            state_key = str(state_name or "").strip().lower()
+            if not state_key:
+                continue
+            components = [
+                str(component_name or "").strip()
+                for component_name, _class_name in _iter_w2_component_refs(state)
+                if str(component_name or "").strip()
+            ]
+            if components:
+                state_map[state_key] = components
+    return states_by_part
+
+
+def _merge_w2_body_part_state_table(target, source):
+    target = dict(target or {})
+    for part_name, states in (source or {}).items():
+        part_key = _w2_part_key(part_name)
+        if not part_key:
+            continue
+        target_states = target.setdefault(part_key, {})
+        for state_name, components in (states or {}).items():
+            state_key = str(state_name or "").strip().lower()
+            if not state_key or state_key in target_states:
+                continue
+            values = [
+                str(component or "").strip()
+                for component in (components or [])
+                if str(component or "").strip()
+            ]
+            if values:
+                target_states[state_key] = values
+    return target
+
+
 def _iter_w2_head_param_names(chunks):
     seen = set()
 
@@ -2468,6 +2510,7 @@ def create_CEntity(file, _inherit_visited=None):
     this_Entity.appearances = []
     this_Entity.coloringEntries = []
     this_Entity.slots = []
+    this_Entity.w2_body_part_states = {}
     new_mesh = ModelEnt("staticMeshes", "staticMeshes")
     added_chunks = set()  # Track chunk indices already added to avoid duplicates
     seen_streamed_mesh_paths = set()  # Track mesh paths already added via streamingDataBuffer to avoid duplicates
@@ -2982,6 +3025,10 @@ def create_CEntity(file, _inherit_visited=None):
 
         for template_chunk in CHUNKS:
             if template_chunk.name == "CEntityTemplate":
+                this_Entity.w2_body_part_states = _merge_w2_body_part_state_table(
+                    this_Entity.w2_body_part_states,
+                    _collect_w2_body_part_state_table(template_chunk),
+                )
                 w2_body_part_chunk_indices.update(
                     _collect_w2_body_part_chunk_indices(template_chunk, CHUNKS)
                 )
@@ -3027,6 +3074,10 @@ def create_CEntity(file, _inherit_visited=None):
 
         for related_chunk in w2_related_search_chunks:
             if related_chunk.name == "CEntityTemplate":
+                this_Entity.w2_body_part_states = _merge_w2_body_part_state_table(
+                    this_Entity.w2_body_part_states,
+                    _collect_w2_body_part_state_table(related_chunk),
+                )
                 w2_body_part_component_names.update(
                     _collect_w2_body_part_component_names(related_chunk)
                 )
@@ -3841,6 +3892,10 @@ def create_CEntity(file, _inherit_visited=None):
                 this_Entity.MovingPhysicalAgentComponent = copy.deepcopy(related_entity.MovingPhysicalAgentComponent)
                 hasCMovingPhysicalAgentComponent = True
             _merge_related_appearances(related_entity)
+            this_Entity.w2_body_part_states = _merge_w2_body_part_state_table(
+                this_Entity.w2_body_part_states,
+                getattr(related_entity, "w2_body_part_states", None),
+            )
             if getattr(related_entity, "slots", None):
                 this_Entity.slots = _merge_related_slots(this_Entity.slots, related_entity.slots)
             if getattr(related_entity, "inventoryDefinitions", None):

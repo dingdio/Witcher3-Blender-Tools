@@ -2065,7 +2065,7 @@ class CStoryScene(base_w3): # CResource
         return cls(data)
 
 class CExtAnimEventData:
-    """Lightweight container for a single parsed CExtAnimEvent* from a w2cutscene."""
+    """Lightweight container for a single parsed CExtAnimEvent*."""
 
     # Event type categories
     DIALOG_TYPES = {
@@ -2363,6 +2363,7 @@ class Entity(base_w3):
                 inventoryDefinitions = None,
                 beh_paths = None,
                 included_template_paths = None,
+                w2_body_part_states = None,
                 **kwargs):
         self.name:str = name
         self.MovingPhysicalAgentComponent = MovingPhysicalAgentComponent
@@ -2376,6 +2377,7 @@ class Entity(base_w3):
         self.inventoryDefinitions = inventoryDefinitions if inventoryDefinitions is not None else []
         self.beh_paths: list = beh_paths if beh_paths is not None else []
         self.included_template_paths: list = included_template_paths if included_template_paths is not None else []
+        self.w2_body_part_states: dict = w2_body_part_states if w2_body_part_states is not None else {}
 
     @classmethod
     def from_json(cls, data):

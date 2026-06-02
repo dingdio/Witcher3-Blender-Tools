@@ -10,6 +10,12 @@ from ..CR2W.dc_anims import load_bin_cutscene
 from ..CR2W.common_blender import repo_file, redkit_repo_context, win_path_isfile
 from ..source_game_paths import resolve_w2_repo_file_from_source, w2_source_repo_root
 from ..duplication import duplicate_character_hierarchy
+from .cutscene_appearance_events import (
+    body_part_event_has_body_state,
+    body_part_event_request_name,
+    is_body_part_event,
+    resolve_body_part_event_appearance,
+)
 
 log = logging.getLogger(__name__)
 
@@ -905,10 +911,19 @@ def unload_cutscene_actor(actor_obj):
     _clear_cutscene_actor_tags(actor_obj)
     return 0
 
-def _resolve_cutscene_actor_appearance(entity, preferred_name=""):
+
+def _resolve_cutscene_actor_appearance(entity, preferred_name="", event=None):
     appearances = list(getattr(entity, "appearances", None) or [])
     if not appearances:
         return None, -1, ""
+
+    if event is not None:
+        event_resolved = resolve_body_part_event_appearance(entity, event)
+        if event_resolved is not None:
+            return event_resolved
+        if body_part_event_has_body_state(event):
+            return None, -1, ""
+        preferred_name = preferred_name or body_part_event_request_name(event)
 
     preferred_name = str(preferred_name or "").strip()
     if preferred_name:
@@ -952,7 +967,7 @@ def _has_loaded_appearance_group(actor_obj, appearance_name):
             return True
     return False
 
-def _ensure_cutscene_actor_appearance(actor_obj, preferred_name=""):
+def _ensure_cutscene_actor_appearance(actor_obj, preferred_name="", event=None):
     if actor_obj is None or getattr(actor_obj, "type", "") != 'ARMATURE':
         return False, ""
 
@@ -964,7 +979,11 @@ def _ensure_cutscene_actor_appearance(actor_obj, preferred_name=""):
     if entity is None:
         return False, ""
 
-    selected_appearance, app_idx, resolved_name = _resolve_cutscene_actor_appearance(entity, preferred_name)
+    selected_appearance, app_idx, resolved_name = _resolve_cutscene_actor_appearance(
+        entity,
+        preferred_name,
+        event=event,
+    )
     if selected_appearance is None or app_idx < 0:
         return False, ""
 
@@ -1496,18 +1515,7 @@ def _resolve_cutscene_event_fps(event, animation_contexts, fallback_fps):
 
 
 def _cutscene_body_part_event_appearance(event):
-    appearance = str(_cutscene_event_value(event, "appearance", "") or "").strip()
-    if appearance:
-        return appearance
-    body_part = str(
-        _cutscene_event_value(event, "bodyPart", "")
-        or _cutscene_event_value(event, "body_part", "")
-        or ""
-    ).strip()
-    state = str(_cutscene_event_value(event, "state", "") or "").strip()
-    if body_part and state:
-        return f"{body_part}:{state}"
-    return body_part or state
+    return body_part_event_request_name(event)
 
 
 def _iter_cutscene_body_part_events(cutscene_template, animation_contexts, actor_name=""):
@@ -1528,7 +1536,7 @@ def _iter_cutscene_body_part_events(cutscene_template, animation_contexts, actor
 
     for context in animation_contexts:
         for event in getattr(context.get("node"), "entries", None) or []:
-            if str(_cutscene_event_value(event, "type_name", "") or "") != "CExtAnimCutsceneBodyPartEvent":
+            if not is_body_part_event(event):
                 continue
 
             appearance = _cutscene_body_part_event_appearance(event)
@@ -1538,6 +1546,7 @@ def _iter_cutscene_body_part_events(cutscene_template, animation_contexts, actor
             start_time = float(_cutscene_event_value(event, "start_time", 0.0) or 0.0)
             fps = float(context.get("frames_per_second", 0.0) or fallback_fps or 30.0)
             body_part_events.append({
+                "event": event,
                 "appearance": appearance,
                 "frame": float(context.get("at_frame", 0.0) or 0.0) + (start_time * fps),
                 "order": order,
@@ -1545,7 +1554,7 @@ def _iter_cutscene_body_part_events(cutscene_template, animation_contexts, actor
             order += 1
 
     for event in getattr(cutscene_template, "animevents", None) or []:
-        if str(_cutscene_event_value(event, "type_name", "") or "") != "CExtAnimCutsceneBodyPartEvent":
+        if not is_body_part_event(event):
             continue
 
         appearance = _cutscene_body_part_event_appearance(event)
@@ -1562,6 +1571,7 @@ def _iter_cutscene_body_part_events(cutscene_template, animation_contexts, actor
         fps = _resolve_cutscene_event_fps(event, animation_contexts, fallback_fps)
         start_time = float(_cutscene_event_value(event, "start_time", 0.0) or 0.0)
         body_part_events.append({
+            "event": event,
             "appearance": appearance,
             "frame": start_time * fps,
             "order": order,
@@ -1658,7 +1668,12 @@ def _bake_cutscene_body_part_events(cutscene_template, animation_contexts, actor
             if not requested_appearance:
                 continue
 
-            success, resolved_name = _ensure_cutscene_actor_appearance(actor_obj, requested_appearance)
+            source_event = event.get("event")
+            success, resolved_name = _ensure_cutscene_actor_appearance(
+                actor_obj,
+                requested_appearance,
+                event=source_event,
+            )
             if not success:
                 log.warning(
                     "Cutscene appearance event '%s' could not be resolved for actor '%s'.",
@@ -1667,7 +1682,11 @@ def _bake_cutscene_body_part_events(cutscene_template, animation_contexts, actor
                 )
                 continue
 
-            _selected_appearance, app_idx, _resolved_name = _resolve_cutscene_actor_appearance(entity, resolved_name)
+            _selected_appearance, app_idx, _resolved_name = _resolve_cutscene_actor_appearance(
+                entity,
+                resolved_name,
+                event=source_event,
+            )
             if app_idx < 0:
                 log.warning(
                     "Cutscene appearance event '%s' resolved to '%s' but no app index was found.",

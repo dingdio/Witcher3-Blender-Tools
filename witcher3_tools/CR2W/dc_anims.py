@@ -7,6 +7,7 @@ import math
 from .dc_skeleton import create_CMimicFace, create_Skeleton, load_bin_skeleton
 from .common_blender import repo_file, win_safe_path
 from .CR2W_types import getCR2W, CArray, CBufferUInt32, CVariantSizeType
+from .cutscene_event_schema import GAME_W3, build_event_data, event_declared_fields
 from .dc_cutscene_w2 import load_w2_cutscene_anim, load_w2_cutscene_template
 from .dc_w2_havok import (
     apply_decoded_animation_entry as _apply_decoded_animation_entry,
@@ -1789,46 +1790,98 @@ def _read_cutscene_field_from_prop(field_name, prop, chunks):
     return _read_prop_value(prop, chunks)
 
 
-def _parse_event_chunk(chunk):
+def _event_prop_by_name(event_obj, prop_name):
+    if event_obj is None:
+        return None
+    getter = getattr(event_obj, "GetVariableByName", None)
+    if callable(getter):
+        try:
+            prop = getter(prop_name)
+        except Exception:
+            prop = None
+        if prop is not None:
+            return prop
+    for attr_name in ("MoreProps", "More", "PROPS"):
+        for prop in getattr(event_obj, attr_name, None) or []:
+            if str(getattr(prop, "theName", "") or "") == prop_name:
+                return prop
+    return None
+
+
+def _read_event_field_prop(prop, type_name, chunks):
+    type_name = str(type_name or "")
+    if prop is None:
+        return None
+    if type_name == "CName":
+        return _read_cname_prop(prop)
+    if type_name in {"String", "StringAnsi"}:
+        return _read_string_prop(prop)
+    if type_name in {"Float", "CFloat"}:
+        return _read_float_prop(prop)
+    if type_name == "Bool":
+        return _read_bool_prop(prop)
+    if type_name == "TagList":
+        return _read_taglist_prop(prop)
+    if type_name in {"Uint", "Uint8", "Uint16", "Uint32", "Int8", "Int16", "Int32"}:
+        return _read_int_prop(prop)
+    if type_name.startswith("E"):
+        enum_value = _read_enum_prop(prop)
+        if enum_value:
+            return enum_value
+    return _read_prop_value(prop, chunks or [])
+
+
+def _event_type_name(event_obj):
+    return str(
+        getattr(event_obj, "name", None)
+        or getattr(event_obj, "theType", "")
+        or getattr(getattr(event_obj, "Type", None), "type", "")
+        or ""
+    )
+
+
+def _event_raw_fields_from_chunk(chunk, game=GAME_W3, chunks=None):
+    type_name = _event_type_name(chunk)
+    if not type_name:
+        return {}
+
+    fields = {}
+    declared_fields = event_declared_fields(game, type_name)
+    if declared_fields:
+        for field in declared_fields:
+            prop = _event_prop_by_name(chunk, field.name)
+            if prop is not None:
+                fields[field.name] = _read_event_field_prop(prop, field.type_name, chunks)
+        return fields
+
+    for field_name, type_name in (
+        ("eventName", "CName"),
+        ("startTime", "Float"),
+        ("animationName", "CName"),
+        ("trackName", "String"),
+        ("duration", "Float"),
+        ("effectName", "CName"),
+        ("effect", "CName"),
+        ("appearance", "CName"),
+    ):
+        prop = _event_prop_by_name(chunk, field_name)
+        if prop is not None:
+            fields[field_name] = _read_event_field_prop(prop, type_name, chunks)
+    return fields
+
+
+def _parse_event_chunk(chunk, chunks=None, game=GAME_W3):
     """
     Build a CExtAnimEventData from a parsed CExtAnimEvent* chunk.
     Returns None if the chunk can't be read.
     """
     if chunk is None:
         return None
-    type_name = str(getattr(chunk, 'name', None) or getattr(chunk, 'theType', '') or '')
+    type_name = _event_type_name(chunk)
     if not type_name:
         return None
 
-    event_name    = _read_cname_prop(chunk.GetVariableByName('eventName'))
-    start_time    = _read_float_prop(chunk.GetVariableByName('startTime'))
-    anim_name     = _read_cname_prop(chunk.GetVariableByName('animationName'))
-    track_name    = _read_string_prop(chunk.GetVariableByName('trackName'))
-
-    # duration events (CExtAnimDurationEvent subclasses)
-    duration_prop = chunk.GetVariableByName('duration')
-    duration = _read_float_prop(duration_prop) if duration_prop else 0.0
-
-    # effect-specific fields
-    extra = {}
-    effect_name_prop = chunk.GetVariableByName('effectName')
-    if effect_name_prop is None:
-        effect_name_prop = chunk.GetVariableByName('effect')
-    if effect_name_prop is not None:
-        extra['effect_name'] = _read_cname_prop(effect_name_prop)
-    appearance_prop = chunk.GetVariableByName('appearance')
-    if appearance_prop is not None:
-        extra['appearance'] = _read_cname_prop(appearance_prop)
-
-    return w3_types.CExtAnimEventData(
-        type_name=type_name,
-        event_name=event_name,
-        start_time=start_time,
-        duration=duration,
-        animation_name=anim_name,
-        track_name=track_name,
-        **extra,
-    )
+    return build_event_data(game, type_name, _event_raw_fields_from_chunk(chunk, game=game, chunks=chunks))
 
 
 def _read_buffered_cutscene_events(chunk_set, cr2w_file):
@@ -1960,7 +2013,7 @@ def _read_cutscene_events(chunk_set, CHUNKS, cr2w_file=None):
                     idx = int(ptr)
                     if idx < 1 or idx > len(CHUNKS):
                         continue
-                    ev = _parse_event_chunk(CHUNKS[idx - 1])
+                    ev = _parse_event_chunk(CHUNKS[idx - 1], chunks=CHUNKS)
                     if ev is not None:
                         events.append(ev)
                 except Exception as e:
@@ -1989,7 +2042,7 @@ def _read_cutscene_events(chunk_set, CHUNKS, cr2w_file=None):
                                     sub_idx = int(sub_ptr)
                                     if sub_idx < 1 or sub_idx > len(CHUNKS):
                                         continue
-                                    ev = _parse_event_chunk(CHUNKS[sub_idx - 1])
+                                    ev = _parse_event_chunk(CHUNKS[sub_idx - 1], chunks=CHUNKS)
                                     if ev is not None:
                                         events.append(ev)
                                 except Exception as e2:

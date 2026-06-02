@@ -5,6 +5,10 @@ import re
 
 from . import w3_types
 from .CR2W_types import getCR2W
+from .dc_cutscene_events_w2 import (
+    read_w2_cutscene_entry_events,
+    read_w2_cutscene_root_events,
+)
 from .dc_w2_havok import apply_decoded_animation_entry, get_fallback_w2_skeleton_names
 from .havok_parser import HavokPackfile
 from .prop_utils import (
@@ -251,7 +255,7 @@ def _group_w2_cutscene_havok_infos(havok_infos, anim_count, part_count):
     return groups
 
 
-def _build_w2_cutscene_anim_entry(entry_chunk, anim_chunk, hk_infos, default_fps=30.0):
+def _build_w2_cutscene_anim_entry(entry_chunk, anim_chunk, hk_infos, default_fps=30.0, events=None):
     name = _read_w2_cutscene_anim_name(anim_chunk)
 
     duration = 0.0
@@ -317,7 +321,7 @@ def _build_w2_cutscene_anim_entry(entry_chunk, anim_chunk, hk_infos, default_fps
         AdditiveType=None,
         motionExtraction={"duration": duration, "frames": [], "deltaTimes": [], "flags": 0} if has_motion else None,
     )
-    return w3_types.CSkeletalAnimationSetEntry(anim, [])
+    return w3_types.CSkeletalAnimationSetEntry(anim, list(events or []))
 
 
 def _w2_entry_part_count(entry):
@@ -488,14 +492,15 @@ def create_CCutscene_w2(file, raw_data):
             if anim_chunk is None:
                 continue
             hk_infos = havok_info_groups[idx] if idx < len(havok_info_groups) else []
-            entry = _build_w2_cutscene_anim_entry(entry_chunk, anim_chunk, hk_infos)
+            events = read_w2_cutscene_entry_events(file, raw_data, entry_chunk, chunks)
+            entry = _build_w2_cutscene_anim_entry(entry_chunk, anim_chunk, hk_infos, events=events)
             animations.append(entry)
             log.info("%d %s", idx, entry.animation.name)
         except Exception:
             log.warning("Failed to read W2 cutscene animation entry %d", idx, exc_info=True)
 
     final_set = w3_types.CCutsceneTemplate(animations=animations, SCutsceneActorDefs=actors)
-    final_set.animevents = []  # W2 events (CAnimEventSerializer) need structured parsing with timing.
+    final_set.animevents = read_w2_cutscene_root_events(file, raw_data, set_chunk, chunks)
 
     present_fields = {
         str(getattr(prop, "theName", "") or "").strip()
