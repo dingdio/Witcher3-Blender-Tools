@@ -5,6 +5,7 @@ import re
 import time
 import bpy
 import json
+import copy
 
 log = logging.getLogger(__name__)
 from ..lod_utils import object_lod_level
@@ -696,6 +697,81 @@ def _import_inventory_items(context, armature, rig_settings, preview_items):
     return result
 
 
+def _collect_inventory_definitions_from_entity_data(entity_data):
+    if entity_data is None:
+        return []
+    plain_data = entity_data if isinstance(entity_data, dict) else import_entity._to_plain_data(entity_data)
+    if not isinstance(plain_data, dict):
+        return []
+
+    inventory_defs = []
+
+    def _append_defs(defs):
+        for inv_def in defs or []:
+            try:
+                entries = import_entity._get_entry_attr(inv_def, "entries", []) or []
+            except Exception:
+                entries = []
+            if entries:
+                inventory_defs.append(copy.deepcopy(inv_def))
+
+    _append_defs(plain_data.get("inventoryDefinitions", []) or [])
+    for appearance in plain_data.get("appearances", []) or []:
+        if isinstance(appearance, dict):
+            _append_defs(appearance.get("inventoryDefinitions", []) or [])
+
+    return inventory_defs
+
+
+def _write_inventory_preview_mount_overrides(rig_settings, preview_items, import_mode):
+    if rig_settings is None:
+        return
+    overrides = {}
+    for item in preview_items or []:
+        category = str(getattr(item, "category", "") or "")
+        item_name = str(getattr(item, "item_name", "") or "")
+        try:
+            key = import_entity._inventory_mount_override_key(category, item_name)
+        except Exception:
+            key = ""
+        if not key:
+            continue
+
+        source_mount = bool(getattr(item, "is_mount", False))
+        selected = bool(getattr(item, "selected", False))
+        imported_as_mount = selected and (import_mode == 'ALL' or source_mount)
+        if bool(imported_as_mount) != source_mount:
+            overrides[key] = bool(imported_as_mount)
+
+    try:
+        rig_settings.inventory_mount_overrides_json = json.dumps(overrides, sort_keys=True)
+    except Exception:
+        rig_settings.inventory_mount_overrides_json = "{}"
+
+
+def _cache_imported_inventory_on_rig(rig_settings, inventory_entity, filepath, preview_items, import_mode):
+    if rig_settings is None or inventory_entity is None:
+        return False
+
+    inventory_defs = _collect_inventory_definitions_from_entity_data(inventory_entity)
+    if not inventory_defs:
+        return False
+
+    _target_entity, target_data = import_entity.get_rig_entity_state(rig_settings)
+    if target_data is None:
+        return False
+
+    target_data = copy.deepcopy(target_data)
+    target_data["inventoryDefinitions"] = inventory_defs
+    target_data["witcher_imported_inventory_path"] = str(filepath or "")
+
+    if import_entity.cache_rig_entity_state_from_data(rig_settings, target_data, update_json=True) is None:
+        return False
+
+    _write_inventory_preview_mount_overrides(rig_settings, preview_items, import_mode)
+    return True
+
+
 def _import_standalone_item(context, category, item_name, template, result):
     """Import an equipment item without binding to a character."""
     from ..CR2W.witcher_cache.Bundles import LoadBundleManager
@@ -1235,12 +1311,26 @@ class WITCH_OT_ENTITY_import_inventory(bpy.types.Operator, ImportHelper):
 
             # Sync persistent equipment slots back to temp UI entries so
             # category dropdowns reflect the inventory changes
-            if rig_settings and result.get('imported', 0) > 0:
+            if rig_settings and preview_items:
                 try:
-                    from ..ui.ui_equipment import sync_equipment_slots_to_temp
-                    sync_equipment_slots_to_temp(context, rig_settings)
+                    inventory_entity = test_load_entity(fdir)
+                    _cache_imported_inventory_on_rig(
+                        rig_settings,
+                        inventory_entity,
+                        fdir,
+                        self.inventory_preview_items,
+                        self.import_mode,
+                    )
                 except Exception as e:
-                    log.warning(f"Failed to sync equipment slots to temp: {e}")
+                    log.warning(f"Failed to cache imported inventory state: {e}")
+
+                try:
+                    from ..ui.ui_equipment import sync_equipment_slots_to_temp, sync_inventory_entries_to_temp
+                    sync_equipment_slots_to_temp(context, rig_settings)
+                    _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+                    sync_inventory_entries_to_temp(context, rig_settings, entity_data=entity_data)
+                except Exception as e:
+                    log.warning(f"Failed to sync inventory equipment UI: {e}")
         finally:
             if armature is not None and rig_settings is not None:
                 try:
@@ -1282,11 +1372,56 @@ class WITCH_OT_ENTITY_import_inventory(bpy.types.Operator, ImportHelper):
         return ImportHelper.invoke(self, context, event)
 
 
+def _resolve_geralt_inventory_preset_id(context, explicit_preset_id="", source_game="w3"):
+    explicit_preset_id = str(explicit_preset_id or "").strip()
+    if explicit_preset_id and explicit_preset_id != "__none__":
+        return explicit_preset_id
+    try:
+        from ..ui import ui_equipment
+        return ui_equipment._get_geralt_default_inventory_preset_id(context, source_game=source_game)
+    except Exception:
+        return ""
+
+
+def _apply_geralt_inventory_preset(context, preset_id, operator=None, source_game="w3"):
+    preset_id = str(preset_id or "").strip()
+    if not preset_id or preset_id == "__none__":
+        return ""
+    try:
+        from ..ui import ui_equipment
+        source_game = ui_equipment._normalize_source_game(source_game)
+        preset = ui_equipment._get_inventory_preset(preset_id, source_game=source_game)
+        if not preset:
+            return ""
+        result = bpy.ops.witcher.equipment_apply_inventory_preset(
+            'EXEC_DEFAULT',
+            preset_id=preset_id,
+        )
+        if isinstance(result, set) and 'FINISHED' in result and preset:
+            return str(preset.get("name", "") or "")
+    except Exception:
+        log.warning("Failed to apply Geralt inventory preset", exc_info=True)
+    if operator is not None:
+        try:
+            operator.report({'WARNING'}, "Geralt imported, but inventory preset apply failed.")
+        except Exception:
+            pass
+    return ""
+
+
 class WITCH_OT_ENTITY_import_geralt(bpy.types.Operator):
     """Import Geralt (player.w2ent) with default equipment"""
     bl_idname = "witcher.import_geralt"
     bl_label = "Import Geralt"
     bl_options = {'REGISTER', 'UNDO'}
+
+    inventory_preset_id: bpy.props.StringProperty(
+        name="Inventory Preset",
+        default="",
+    )
+
+    def invoke(self, context, event):
+        return self.execute(context)
 
     def execute(self, context):
         s = time.time()
@@ -1321,10 +1456,24 @@ class WITCH_OT_ENTITY_import_geralt(bpy.types.Operator):
             import_entity.import_ent_template(path, False, 1,
                                               parent_transform=None)
 
+            inventory_preset_id = _resolve_geralt_inventory_preset_id(
+                context,
+                self.inventory_preset_id,
+                source_game="w3",
+            )
+            preset_name = _apply_geralt_inventory_preset(
+                context,
+                inventory_preset_id,
+                operator=self,
+                source_game="w3",
+            )
+
             # 3. Auto-load default equipment items (handled in import_entity.py)
             # The equipment slots are automatically populated during import
 
             message = f'Imported Geralt with slots and default equipment in {time.time() - s:.2f} seconds.'
+            if preset_name:
+                message = f'Imported Geralt with inventory preset "{preset_name}" in {time.time() - s:.2f} seconds.'
             log.info(message)
             self.report({'INFO'}, message)
             return {'FINISHED'}
@@ -1389,6 +1538,11 @@ class WITCH_OT_ENTITY_import_geralt_w2(bpy.types.Operator):
     # Game-relative path of the Witcher 2 player template inside the DZIP bundles.
     REL_PATH = "characters\\templates\\witcher\\player.w2ent"
 
+    inventory_preset_id: bpy.props.StringProperty(
+        name="Inventory Preset",
+        default="",
+    )
+
     @classmethod
     def poll(cls, context):
         if _is_witcher2_detected(context):
@@ -1428,7 +1582,21 @@ class WITCH_OT_ENTITY_import_geralt_w2(bpy.types.Operator):
 
             import_entity.import_ent_template(path, False, 1, parent_transform=None)
 
+            inventory_preset_id = _resolve_geralt_inventory_preset_id(
+                context,
+                self.inventory_preset_id,
+                source_game="w2",
+            )
+            preset_name = _apply_geralt_inventory_preset(
+                context,
+                inventory_preset_id,
+                operator=self,
+                source_game="w2",
+            )
+
             message = f'Imported Witcher 2 Geralt in {time.time() - s:.2f} seconds.'
+            if preset_name:
+                message = f'Imported Witcher 2 Geralt with inventory preset "{preset_name}" in {time.time() - s:.2f} seconds.'
             log.info(message)
             self.report({'INFO'}, message)
             return {'FINISHED'}

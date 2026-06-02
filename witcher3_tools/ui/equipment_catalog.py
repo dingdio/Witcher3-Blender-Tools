@@ -55,6 +55,14 @@ _W2_CATEGORY_CACHE_LOADED = False
 _XML_DECL_RE = re.compile(r'^\s*<\?xml[^>]*\?>', re.IGNORECASE)
 _XML_DECL_ENCODING_BYTES_RE = re.compile(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', re.IGNORECASE)
 _XML_HASH_COMMENT_LINE_RE = re.compile(r'(?m)^[ \t]*#.*(?:\r?\n|$)')
+_GERALT_BODYPART_CATEGORY_BY_FOLDER = {
+    "trunk": "armor",
+    "legs": "pants",
+    "gloves": "gloves",
+    "shoes": "boots",
+    "coif": "head",
+    "heads": "head",
+}
 _ICON_CACHE_CLEAR_CALLBACK = None
 _TEMPLATE_CACHE_CLEAR_CALLBACK = None
 
@@ -121,6 +129,68 @@ def _norm_root_path(path):
         return os.path.normcase(os.path.normpath(str(path)))
     except Exception:
         return str(path).lower()
+
+
+def _template_key(value):
+    text = str(value or "").replace("/", "\\").strip().strip("\\").lower()
+    if text.endswith(".w2ent"):
+        text = text[:-6]
+    if "\\" in text:
+        text = text.rsplit("\\", 1)[-1]
+    return text
+
+
+def _candidate_geralt_bodypart_roots(folder_path):
+    try:
+        current = Path(folder_path)
+    except Exception:
+        return []
+    candidates = []
+    seen = set()
+    for parent in [current] + list(current.parents):
+        if parent.name.lower() != "gameplay":
+            continue
+        depot_root = parent.parent
+        bodypart_root = depot_root / "items" / "bodyparts" / "geralt_items"
+        try:
+            norm = os.path.normcase(os.path.normpath(str(bodypart_root)))
+        except Exception:
+            norm = str(bodypart_root).lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if bodypart_root.is_dir():
+            candidates.append((depot_root, bodypart_root))
+    return candidates
+
+
+def build_geralt_bodypart_template_index(folder_path):
+    """Map bodypart .w2ent basenames to repo-relative geralt item paths."""
+    index = {}
+    for depot_root, bodypart_root in _candidate_geralt_bodypart_roots(folder_path):
+        for file_path in sorted(bodypart_root.rglob("*.w2ent")):
+            template_key = _template_key(file_path.stem)
+            if not template_key:
+                continue
+            try:
+                rel_path = str(file_path.relative_to(depot_root)).replace("/", "\\")
+            except Exception:
+                rel_path = str(file_path.name)
+            try:
+                local_rel = str(file_path.relative_to(bodypart_root)).replace("/", "\\")
+            except Exception:
+                local_rel = ""
+            parts = local_rel.split("\\") if local_rel else []
+            bodypart_folder = parts[0] if len(parts) >= 3 else ""
+            set_folder = parts[1] if len(parts) >= 3 else ""
+            category = _GERALT_BODYPART_CATEGORY_BY_FOLDER.get(bodypart_folder, bodypart_folder)
+            index.setdefault(template_key, {
+                "path": rel_path,
+                "category": category,
+                "bodypart_folder": bodypart_folder,
+                "set_folder": set_folder,
+            })
+    return index
 
 
 def set_catalog_cache_flags(source_game="w3", *, schema_version=0, icon_path=False, hold_template=False):
@@ -524,6 +594,7 @@ def get_item_icon_path(identifier, source_game="w3", strict: bool = False):
 def extract_categories_from_xml(folder_path):
     categories = {}
     attrs_by_item = {}
+    bodypart_index = build_geralt_bodypart_template_index(folder_path)
 
     if not folder_path or not os.path.isdir(folder_path):
         return [], categories, attrs_by_item
@@ -606,7 +677,21 @@ def extract_categories_from_xml(folder_path):
                         if item_tuple not in categories[category]:
                             categories[category].append(item_tuple)
 
-                        attrs_by_item[name] = {
+                        bodypart_info = bodypart_index.get(_template_key(template_name))
+                        variant_bodyparts = []
+                        for variant in variants:
+                            variant_template = variant.get("equip_template", "")
+                            variant_info = bodypart_index.get(_template_key(variant_template))
+                            if not variant_info:
+                                continue
+                            variant_bodyparts.append({
+                                "equip_template": variant_template,
+                                "category": variant.get("category", "") or variant_info.get("category", ""),
+                                "path": variant_info.get("path", ""),
+                                "set_folder": variant_info.get("set_folder", ""),
+                            })
+
+                        attrs = {
                             "item_name": name,
                             "category": category,
                             "equip_template": equip_template,
@@ -623,6 +708,12 @@ def extract_categories_from_xml(folder_path):
                             "tags": tags,
                             "source_game": source_game,
                         }
+                        if bodypart_info:
+                            attrs["bodypart_entity_path"] = bodypart_info.get("path", "")
+                            attrs["bodypart_set_folder"] = bodypart_info.get("set_folder", "")
+                        if variant_bodyparts:
+                            attrs["variant_bodypart_entity_paths"] = variant_bodyparts
+                        attrs_by_item[name] = attrs
 
             except (ET.ParseError, ValueError, UnicodeError) as e:
                 if source_game == "w2":

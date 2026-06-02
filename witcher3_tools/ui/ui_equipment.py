@@ -36,11 +36,19 @@ from ..source_game_paths import normalize_source_game as _normalize_source_game
 from . import equipment_catalog
 from .equipment_item_picker import (
     EquipmentItemPickerRow,
+    EquipmentPresetPickerRow,
     EQUIPMENT_OT_PickDefaultItem,
+    EQUIPMENT_OT_PickInventoryPreset,
+    EQUIPMENT_OT_DeleteInventoryPreset,
+    EQUIPMENT_OT_ShowInventoryPresetDetails,
     EQUIPMENT_OT_ItemPickerPage,
+    EQUIPMENT_OT_PresetPickerPage,
     EQUIPMENT_OT_SearchDefaultItem,
     _on_equipment_item_picker_index_changed,
     _on_equipment_item_picker_filter_changed,
+    _on_equipment_preset_picker_filter_changed,
+    draw_inventory_preset_picker,
+    inventory_preset_picker_width,
 )
 
 _UNCOOK_ITEM_ENT_INDEX = {}
@@ -327,6 +335,469 @@ def _cache_operator_enum_items(cache_key, items):
     _OPERATOR_ENUM_CACHE[cache_key] = stable_items
     _clear_cache_if_oversized(_OPERATOR_ENUM_CACHE, max_entries=128)
     return stable_items
+
+
+def _inventory_preset_store_path():
+    return Path(get_cache_root(create=True)) / "inventory_presets.json"
+
+
+def _inventory_preset_defaults_path():
+    return Path(get_cache_root(create=True)) / "inventory_preset_defaults.json"
+
+
+def _shipped_inventory_preset_store_path():
+    return Path(__file__).resolve().parents[1] / "CR2W" / "data" / "inventory_presets_shipped.json"
+
+
+def _load_inventory_preset_store():
+    path = _inventory_preset_store_path()
+    if not path.exists():
+        return {"version": 1, "presets": []}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        log.warning("Failed to read inventory preset store: %s", path, exc_info=True)
+        return {"version": 1, "presets": []}
+    if not isinstance(data, dict):
+        return {"version": 1, "presets": []}
+    presets = data.get("presets", [])
+    if not isinstance(presets, list):
+        presets = []
+    return {"version": int(data.get("version", 1) or 1), "presets": presets}
+
+
+def _save_inventory_preset_store(data):
+    path = _inventory_preset_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "presets": list(data.get("presets", []) if isinstance(data, dict) else []),
+    }
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=False)
+
+
+def _load_inventory_preset_defaults():
+    path = _inventory_preset_defaults_path()
+    if not path.exists():
+        return {"version": 1, "defaults": {}}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        log.warning("Failed to read inventory preset defaults: %s", path, exc_info=True)
+        return {"version": 1, "defaults": {}}
+    if not isinstance(data, dict):
+        return {"version": 1, "defaults": {}}
+    defaults = data.get("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+    return {"version": int(data.get("version", 1) or 1), "defaults": defaults}
+
+
+def _save_inventory_preset_defaults(data):
+    path = _inventory_preset_defaults_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "defaults": dict(data.get("defaults", {}) if isinstance(data, dict) else {}),
+    }
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=False)
+
+
+def _load_shipped_inventory_preset_store():
+    path = _shipped_inventory_preset_store_path()
+    if not path.exists():
+        return {"version": 1, "presets": []}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        log.warning("Failed to read shipped inventory presets: %s", path, exc_info=True)
+        return {"version": 1, "presets": []}
+    if not isinstance(data, dict):
+        return {"version": 1, "presets": []}
+    presets = data.get("presets", [])
+    if not isinstance(presets, list):
+        presets = []
+    return {"version": int(data.get("version", 1) or 1), "presets": presets}
+
+
+def _normalize_inventory_preset(preset, source="user", is_shipped=False):
+    if not isinstance(preset, dict):
+        return None
+    preset_id = str(preset.get("id", "") or "").strip()
+    name = str(preset.get("name", "") or "").strip()
+    entries = preset.get("entries", [])
+    if not preset_id or not name or not isinstance(entries, list):
+        return None
+    source_game = _normalize_source_game(preset.get("source_game", "w3"))
+    normalized_entries = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        normalized_entry = dict(entry)
+        normalized_entry["source_game"] = _normalize_source_game(normalized_entry.get("source_game", source_game))
+        normalized_entries.append(normalized_entry)
+    normalized = dict(preset)
+    normalized["id"] = preset_id
+    normalized["name"] = name
+    normalized["entries"] = normalized_entries
+    normalized["source"] = str(source or normalized.get("source") or "user")
+    normalized["source_game"] = source_game
+    normalized["is_shipped"] = bool(is_shipped)
+    return normalized
+
+
+def _load_shipped_inventory_presets():
+    presets = []
+    for preset in _load_shipped_inventory_preset_store().get("presets", []) or []:
+        normalized = _normalize_inventory_preset(preset, source="shipped", is_shipped=True)
+        if normalized:
+            presets.append(normalized)
+    return presets
+
+
+def _load_user_inventory_presets():
+    presets = []
+    for preset in _load_inventory_preset_store().get("presets", []) or []:
+        normalized = _normalize_inventory_preset(
+            preset,
+            source=str(preset.get("source", "") or "user") if isinstance(preset, dict) else "user",
+            is_shipped=False,
+        )
+        if normalized:
+            presets.append(normalized)
+    return presets
+
+
+def _load_inventory_presets(source_game=None):
+    presets = _load_shipped_inventory_presets() + _load_user_inventory_presets()
+    if source_game is None:
+        return presets
+    source_game = _normalize_source_game(source_game)
+    return [
+        preset for preset in presets
+        if _normalize_source_game(preset.get("source_game", "w3")) == source_game
+    ]
+
+
+def _get_inventory_preset(preset_id, source_game=None):
+    preset_id = str(preset_id or "").strip()
+    if not preset_id:
+        return None
+    for preset in _load_inventory_presets(source_game=source_game):
+        if str(preset.get("id", "") or "") == preset_id:
+            return preset
+    return None
+
+
+def _inventory_preset_label(preset_id, fallback="Select Preset", source_game=None):
+    preset = _get_inventory_preset(preset_id, source_game=source_game)
+    if preset:
+        return str(preset.get("name", "") or fallback)
+    return fallback
+
+
+def _normalize_inventory_preset_selection_target(target):
+    target = str(target or "INVENTORY").strip().upper()
+    if target in {"GERALT", "GERALT_W3", "W3_GERALT"}:
+        return "GERALT_W3"
+    if target in {"GERALT_W2", "W2_GERALT"}:
+        return "GERALT_W2"
+    return "INVENTORY"
+
+
+def _inventory_preset_default_key_for_target(target):
+    target = _normalize_inventory_preset_selection_target(target)
+    if target == "GERALT_W3":
+        return "geralt_w3"
+    if target == "GERALT_W2":
+        return "geralt_w2"
+    return ""
+
+
+def _inventory_preset_target_label(target):
+    target = _normalize_inventory_preset_selection_target(target)
+    if target == "GERALT_W3":
+        return "Geralt Default"
+    if target == "GERALT_W2":
+        return "Geralt W2 Default"
+    return "Inventory Preset"
+
+
+def _inventory_preset_source_game_for_target(context=None, target="INVENTORY"):
+    target = _normalize_inventory_preset_selection_target(target)
+    if target == "GERALT_W2":
+        return "w2"
+    if target == "GERALT_W3":
+        return "w3"
+    temp_data = _get_temp_equipment_data(context) if context is not None else None
+    return _normalize_source_game(getattr(temp_data, "equipment_source_game", "") if temp_data is not None else "w3")
+
+
+def _get_inventory_preset_selection(context=None, target="INVENTORY"):
+    target = _normalize_inventory_preset_selection_target(target)
+    if target == "INVENTORY":
+        temp_data = _get_temp_equipment_data(context) if context is not None else None
+        preset_id = str(getattr(temp_data, "inventory_preset_id", "") or "") if temp_data is not None else ""
+        if not preset_id:
+            return ""
+        source_game = _inventory_preset_source_game_for_target(context, target)
+        return preset_id if _get_inventory_preset(preset_id, source_game=source_game) is not None else ""
+
+    default_key = _inventory_preset_default_key_for_target(target)
+    if not default_key:
+        return ""
+    preset_id = str(_load_inventory_preset_defaults().get("defaults", {}).get(default_key, "") or "").strip()
+    source_game = _inventory_preset_source_game_for_target(context, target)
+    return preset_id if _get_inventory_preset(preset_id, source_game=source_game) is not None else ""
+
+
+def _set_inventory_preset_selection(context, preset_id, target="INVENTORY"):
+    target = _normalize_inventory_preset_selection_target(target)
+    preset_id = str(preset_id or "").strip()
+    if preset_id == "__none__":
+        preset_id = ""
+    source_game = _inventory_preset_source_game_for_target(context, target)
+    if preset_id and _get_inventory_preset(preset_id, source_game=source_game) is None:
+        return False
+
+    if target == "INVENTORY":
+        temp_data = _get_temp_equipment_data(context)
+        if temp_data is None:
+            return False
+        temp_data.inventory_preset_id = preset_id
+    else:
+        default_key = _inventory_preset_default_key_for_target(target)
+        if not default_key:
+            return False
+        store = _load_inventory_preset_defaults()
+        defaults = dict(store.get("defaults", {}) or {})
+        if preset_id:
+            defaults[default_key] = preset_id
+        else:
+            defaults.pop(default_key, None)
+        store["defaults"] = defaults
+        _save_inventory_preset_defaults(store)
+
+    try:
+        if context and context.area:
+            context.area.tag_redraw()
+    except Exception:
+        pass
+    return True
+
+
+def _get_geralt_default_inventory_preset_id(context=None, source_game="w3"):
+    target = "GERALT_W2" if _normalize_source_game(source_game) == "w2" else "GERALT_W3"
+    return _get_inventory_preset_selection(context, target=target)
+
+
+def _normal_inventory_item_name(item_name, equip_template=""):
+    item_name = str(item_name or "").strip()
+    if item_name and item_name.lower() not in {"none", "null"}:
+        return item_name
+    equip_template = str(equip_template or "").strip()
+    if equip_template and equip_template.lower() not in {"none", "null"}:
+        return equip_template
+    return ""
+
+
+def _make_inventory_preset_entry(category, item_name, equip_template="", is_mount=True,
+                                 quantity=1, quantity_min=0, quantity_max=0,
+                                 probability=0.0, is_lootable=False, source_game="w3"):
+    category = str(category or "").strip()
+    item_name = _normal_inventory_item_name(item_name, equip_template)
+    equip_template = str(equip_template or "").strip()
+    entry = {
+        "category": category,
+        "item": item_name,
+        "quantity": int(quantity or 1),
+        "isMount": bool(is_mount),
+        "isLootable": bool(is_lootable),
+        "source_game": _normalize_source_game(source_game),
+    }
+    if quantity_min:
+        entry["quantityMin"] = int(quantity_min)
+    if quantity_max:
+        entry["quantityMax"] = int(quantity_max)
+    if probability:
+        entry["probability"] = float(probability)
+    if item_name:
+        entry["initializer"] = {"itemName": item_name}
+    if equip_template:
+        entry["equip_template"] = equip_template
+    return entry
+
+
+def _inventory_preset_entries_from_equipment_slots(rig_settings):
+    entries = []
+    if rig_settings is None:
+        return entries
+    for slot in getattr(rig_settings, "equipment_slots", []):
+        category = str(getattr(slot, "category", "") or "").strip()
+        item_name = str(getattr(slot, "item_name", "") or "").strip()
+        equip_template = str(getattr(slot, "equip_template", "") or "").strip()
+        if not category and not item_name and not equip_template:
+            continue
+        if not _normal_inventory_item_name(item_name, equip_template):
+            continue
+        entries.append(_make_inventory_preset_entry(
+            category,
+            item_name,
+            equip_template=equip_template,
+            is_mount=True,
+            source_game=getattr(slot, "source_game", "") or getattr(rig_settings, "source_game", "") or "w3",
+        ))
+    return entries
+
+
+def _inventory_preset_entries_from_inventory_rows(temp_data):
+    entries = []
+    if temp_data is None:
+        return entries
+    for row in getattr(temp_data, "inventory_entries", []):
+        item_name = str(getattr(row, "item_name", "") or getattr(row, "resolved_item_name", "") or "").strip()
+        equip_template = str(getattr(row, "equip_template", "") or "").strip()
+        if not _normal_inventory_item_name(item_name, equip_template):
+            continue
+        entries.append(_make_inventory_preset_entry(
+            getattr(row, "category", ""),
+            item_name,
+            equip_template=equip_template,
+            is_mount=bool(getattr(row, "is_mount", False)),
+            quantity=getattr(row, "quantity", 1) or 1,
+            quantity_min=getattr(row, "quantity_min", 0) or 0,
+            quantity_max=getattr(row, "quantity_max", 0) or 0,
+            probability=getattr(row, "probability", 0.0) or 0.0,
+            is_lootable=bool(getattr(row, "is_lootable", False)),
+            source_game=getattr(row, "source_game", "") or getattr(temp_data, "equipment_source_game", "") or "w3",
+        ))
+    return entries
+
+
+def _make_inventory_preset(name, entries, source="equipment", source_game="w3"):
+    source_game = _normalize_source_game(source_game)
+    normalized_entries = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        entry = dict(entry)
+        entry["source_game"] = _normalize_source_game(entry.get("source_game", source_game))
+        normalized_entries.append(entry)
+    return {
+        "id": f"p_{uuid.uuid4().hex}",
+        "name": str(name or "Inventory Preset").strip() or "Inventory Preset",
+        "source": str(source or "equipment"),
+        "source_game": source_game,
+        "created": int(time.time()),
+        "entries": normalized_entries,
+    }
+
+
+def _save_new_inventory_preset(name, entries, source="equipment", source_game="w3"):
+    preset = _make_inventory_preset(name, entries, source=source, source_game=source_game)
+    store = _load_inventory_preset_store()
+    presets = list(store.get("presets", []) or [])
+    presets.append(preset)
+    store["presets"] = presets
+    _save_inventory_preset_store(store)
+    return preset
+
+
+def _delete_user_inventory_preset(preset_id, context=None):
+    preset_id = str(preset_id or "").strip()
+    if not preset_id:
+        return None
+
+    store = _load_inventory_preset_store()
+    presets = list(store.get("presets", []) or [])
+    kept = []
+    removed = None
+    for preset in presets:
+        if isinstance(preset, dict) and str(preset.get("id", "") or "") == preset_id:
+            removed = preset
+            continue
+        kept.append(preset)
+    if removed is None:
+        return None
+
+    store["presets"] = kept
+    _save_inventory_preset_store(store)
+
+    defaults_store = _load_inventory_preset_defaults()
+    defaults = dict(defaults_store.get("defaults", {}) or {})
+    filtered_defaults = {
+        key: value for key, value in defaults.items()
+        if str(value or "") != preset_id
+    }
+    if filtered_defaults != defaults:
+        defaults_store["defaults"] = filtered_defaults
+        _save_inventory_preset_defaults(defaults_store)
+
+    temp_data = _get_temp_equipment_data(context) if context is not None else None
+    if temp_data is not None:
+        if str(getattr(temp_data, "inventory_preset_id", "") or "") == preset_id:
+            temp_data.inventory_preset_id = ""
+        try:
+            temp_data.preset_picker_filter_token = ""
+            temp_data.preset_picker_rows.clear()
+        except Exception:
+            pass
+
+    try:
+        if context and context.area:
+            context.area.tag_redraw()
+    except Exception:
+        pass
+    return removed
+
+
+def _set_entity_inventory_definitions_for_preset(rig_settings, preset):
+    if rig_settings is None or not preset:
+        return None
+    _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+    if entity_data is None:
+        return None
+    entity_data = json.loads(json.dumps(entity_data, sort_keys=False))
+    entity_data["inventoryDefinitions"] = [{
+        "wasIncluded": False,
+        "entries": json.loads(json.dumps(preset.get("entries", []) or [], sort_keys=False)),
+    }]
+    entity_data["witcher_inventory_preset_id"] = str(preset.get("id", "") or "")
+    entity_data["witcher_inventory_preset_name"] = str(preset.get("name", "") or "")
+    entity_data["witcher_inventory_preset_source_game"] = _normalize_source_game(preset.get("source_game", "w3"))
+    if import_entity.cache_rig_entity_state_from_data(rig_settings, entity_data, update_json=True) is None:
+        return None
+    try:
+        rig_settings.inventory_mount_overrides_json = "{}"
+    except Exception:
+        pass
+    return entity_data
+
+
+def _remove_inventory_slots_for_preset_apply(rig_settings):
+    if rig_settings is None:
+        return 0
+    removed = 0
+    slots = rig_settings.equipment_slots
+    for slot_index in reversed(range(len(slots))):
+        slot = slots[slot_index]
+        if not getattr(slot, "is_inventory", False):
+            continue
+        try:
+            unload_equipment_item(slot)
+        except Exception:
+            pass
+        try:
+            slots.remove(slot_index)
+            removed += 1
+        except Exception:
+            pass
+    return removed
 
 
 def _set_last_equipment_load_failure(armature, slot_index, reason):
@@ -4750,6 +5221,11 @@ class WitcherUITempData(bpy.types.PropertyGroup):
 
     inventory_entries: bpy.props.CollectionProperty(type=InventoryDefinitionEntry)
     inventory_entries_index: bpy.props.IntProperty()
+    inventory_preset_id: bpy.props.StringProperty(
+        name="Inventory Preset",
+        default="",
+        options={'HIDDEN'},
+    )
 
     item_picker_rows: bpy.props.CollectionProperty(type=EquipmentItemPickerRow)
     item_picker_index: bpy.props.IntProperty(default=-1, update=_on_equipment_item_picker_index_changed)
@@ -4798,6 +5274,50 @@ class WitcherUITempData(bpy.types.PropertyGroup):
         update=_on_equipment_item_picker_filter_changed,
     )
     item_picker_page: bpy.props.IntProperty(default=0, min=0, options={'HIDDEN'})
+
+    preset_picker_rows: bpy.props.CollectionProperty(type=EquipmentPresetPickerRow)
+    preset_picker_index: bpy.props.IntProperty(default=-1, options={'HIDDEN'})
+    preset_picker_target: bpy.props.StringProperty(default="INVENTORY", options={'HIDDEN'})
+    preset_picker_filter_token: bpy.props.StringProperty(default="", options={'HIDDEN'})
+    preset_picker_match_count: bpy.props.IntProperty(default=0, options={'HIDDEN'})
+    preset_picker_all_count: bpy.props.IntProperty(default=0, options={'HIDDEN'})
+    preset_picker_search: bpy.props.StringProperty(
+        name="Search",
+        default="",
+        options={'TEXTEDIT_UPDATE'},
+        update=_on_equipment_preset_picker_filter_changed,
+    )
+    preset_picker_view: bpy.props.EnumProperty(
+        name="View",
+        items=[
+            ('LIST', "List", "Show set item icons", 'SHORTDISPLAY', 0),
+            ('GRID', "Grid", "Show torso thumbnails", 'IMGDISPLAY', 1),
+        ],
+        default='LIST',
+        update=_on_equipment_preset_picker_filter_changed,
+    )
+    preset_picker_sort: bpy.props.EnumProperty(
+        name="Sort",
+        items=[
+            ('ORDER', "Preset Order", "Keep bundled presets in shipped order", 'SORTSIZE', 0),
+            ('NAME_ASC', "Name A-Z", "Sort by name ascending", 'SORTALPHA', 1),
+            ('NAME_DESC', "Name Z-A", "Sort by name descending", 'SORTALPHA', 2),
+        ],
+        default='ORDER',
+        update=_on_equipment_preset_picker_filter_changed,
+    )
+    preset_picker_grid_size: bpy.props.EnumProperty(
+        name="Tile Size",
+        description="Thumbnail size in grid view",
+        items=[
+            ('S', "Small", "Small thumbnails (more per row)", 'NODE_TEXTURE', 0),
+            ('M', "Medium", "Medium thumbnails", 'TEXTURE', 1),
+            ('L', "Large", "Large thumbnails (asset-browser size)", 'IMAGE_DATA', 2),
+        ],
+        default='L',
+        update=_on_equipment_preset_picker_filter_changed,
+    )
+    preset_picker_page: bpy.props.IntProperty(default=0, min=0, options={'HIDDEN'})
 
 
 # Define the UI list to display equipment categories
@@ -5646,6 +6166,26 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
             box = layout.box()
             box.label(text=f"Inventory Items ({len(temp_data.inventory_entries)})", icon='PACKAGE')
 
+            active_inventory_preset_id = _get_inventory_preset_selection(context, target="INVENTORY")
+            preset_row = box.row(align=True)
+            preset_row.label(text="Preset:")
+            preset_row.operator(
+                "witcher.equipment_select_inventory_preset",
+                text=_inventory_preset_label(
+                    active_inventory_preset_id,
+                    source_game=_inventory_preset_source_game_for_target(context, "INVENTORY"),
+                ),
+                icon='DOWNARROW_HLT',
+            )
+            apply_row = preset_row.row(align=True)
+            apply_row.enabled = bool(_get_inventory_preset(
+                active_inventory_preset_id,
+                source_game=_inventory_preset_source_game_for_target(context, "INVENTORY"),
+            ))
+            apply_row.operator("witcher.equipment_apply_inventory_preset", text="", icon='IMPORT')
+            save_op = preset_row.operator("witcher.equipment_save_inventory_preset", text="", icon='FILE_TICK')
+            save_op.source = 'INVENTORY'
+
             if len(temp_data.inventory_entries) == 0:
                 box.label(text="No inventory entries for this appearance.", icon='INFO')
                 box.operator("witcher.equipment_refresh_inventory", text="Refresh", icon='FILE_REFRESH')
@@ -5837,6 +6377,14 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
             row.operator("witcher.equipment_unload_equipment", text="Unload All", icon='X').slot_index = -1
             row.operator("witcher.equipment_validate", text="", icon='FILE_REFRESH')
 
+            preset_row = box.row(align=True)
+            preset_op = preset_row.operator(
+                "witcher.equipment_save_inventory_preset",
+                text="Save as Inventory Preset",
+                icon='FILE_TICK',
+            )
+            preset_op.source = 'EQUIPMENT'
+
             if temp_data.equipment_source_game != "w3":
                 info = box.box()
                 info.label(text="Witcher 2 categories can be edited from the list below.", icon='INFO')
@@ -5854,10 +6402,16 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                 col = row.column(align=True)
                 col.operator("witcher.equipment_add_category", icon="ADD", text="")
                 col.operator("witcher.equipment_remove_category", icon="REMOVE", text="")
+                col.separator(factor=0.5)
+                col.operator("witcher.equipment_move_category", icon="TRIA_UP", text="").direction = 'UP'
+                col.operator("witcher.equipment_move_category", icon="TRIA_DOWN", text="").direction = 'DOWN'
             else:
                 col = row.column(align=True)
                 col.operator("witcher.equipment_add_category", icon="ADD", text="")
                 col.operator("witcher.equipment_remove_category", icon="REMOVE", text="")
+                col.separator(factor=0.5)
+                col.operator("witcher.equipment_move_category", icon="TRIA_UP", text="").direction = 'UP'
+                col.operator("witcher.equipment_move_category", icon="TRIA_DOWN", text="").direction = 'DOWN'
 
             # Display attributes of the selected equipment entry
             index = temp_data.equipment_entries_index
@@ -6095,6 +6649,65 @@ class EQUIPMENT_OT_RemoveCategory(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class EQUIPMENT_OT_MoveCategory(bpy.types.Operator):
+    bl_idname = "witcher.equipment_move_category"
+    bl_label = "Move Category"
+    bl_description = "Move the selected equipment category up or down"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: bpy.props.EnumProperty(
+        name="Direction",
+        items=[
+            ('UP', "Up", "Move category up"),
+            ('DOWN', "Down", "Move category down"),
+        ],
+        default='UP',
+        options={'HIDDEN'},
+    )
+
+    def execute(self, context):
+        armature, rig_settings = _get_armature_and_rig_settings(context)
+        temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
+        if rig_settings is None or temp_data is None:
+            self.report({'WARNING'}, "No valid armature selected.")
+            return {'CANCELLED'}
+        index = int(getattr(temp_data, "equipment_entries_index", -1))
+        if index < 0 or index >= len(temp_data.equipment_entries):
+            self.report({'WARNING'}, "No equipment category selected.")
+            return {'CANCELLED'}
+
+        entry = temp_data.equipment_entries[index]
+        slot_index = int(getattr(entry, "slot_index", -1))
+        if slot_index < 0 or slot_index >= len(rig_settings.equipment_slots):
+            slot_index = index if index < len(rig_settings.equipment_slots) else -1
+        if slot_index < 0:
+            self.report({'WARNING'}, "Selected category has no editable slot.")
+            return {'CANCELLED'}
+
+        delta = -1 if self.direction == 'UP' else 1
+        target_index = slot_index + delta
+        if target_index < 0 or target_index >= len(rig_settings.equipment_slots):
+            return {'CANCELLED'}
+
+        try:
+            rig_settings.equipment_slots.move(slot_index, target_index)
+        except Exception:
+            self.report({'WARNING'}, "Could not move equipment category.")
+            return {'CANCELLED'}
+
+        sync_equipment_slots_to_temp(context, rig_settings)
+        try:
+            for temp_index, temp_entry in enumerate(temp_data.equipment_entries):
+                if int(getattr(temp_entry, "slot_index", -1)) == target_index:
+                    temp_data.equipment_entries_index = temp_index
+                    break
+        except Exception:
+            pass
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+
 class EQUIPMENT_OT_ToggleInventoryMount(bpy.types.Operator):
     bl_idname = "witcher.equipment_toggle_inventory_mount"
     bl_label = "Toggle Inventory Mount"
@@ -6200,6 +6813,218 @@ class EQUIPMENT_OT_RefreshInventoryEntries(bpy.types.Operator):
         if context.area:
             context.area.tag_redraw()
         self.report({'INFO'}, "Inventory list refreshed.")
+        return {'FINISHED'}
+
+
+class EQUIPMENT_OT_SaveInventoryPreset(bpy.types.Operator):
+    bl_idname = "witcher.equipment_save_inventory_preset"
+    bl_label = "Save Inventory Preset"
+    bl_description = "Save the current equipment or inventory rows as an inventory preset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    source: bpy.props.EnumProperty(
+        name="Source",
+        items=[
+            ('EQUIPMENT', "Equipment", "Save current equipped slots as mounted inventory entries"),
+            ('INVENTORY', "Inventory", "Save current inventory rows and mount states"),
+        ],
+        default='EQUIPMENT',
+        options={'HIDDEN'},
+    )
+    preset_name: bpy.props.StringProperty(name="Preset Name", default="")
+
+    def invoke(self, context, event):
+        _armature, rig_settings = _get_armature_and_rig_settings(context)
+        if rig_settings and not self.preset_name:
+            app_name = get_current_appearance_name(rig_settings) or ""
+            base_name = app_name or getattr(rig_settings, "entity_name", "") or "Inventory Preset"
+            self.preset_name = str(base_name).strip() or "Inventory Preset"
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        self.layout.prop(self, "preset_name")
+
+    def execute(self, context):
+        _armature, rig_settings = _get_armature_and_rig_settings(context)
+        if rig_settings is None:
+            self.report({'WARNING'}, "No valid armature selected.")
+            return {'CANCELLED'}
+        temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
+        source_game = _normalize_source_game(
+            getattr(rig_settings, "source_game", "")
+            or getattr(temp_data, "equipment_source_game", "")
+            or "w3"
+        )
+        if self.source == 'INVENTORY':
+            try:
+                _entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+                sync_inventory_entries_to_temp(context, rig_settings, entity_data=entity_data)
+            except Exception:
+                pass
+            entries = _inventory_preset_entries_from_inventory_rows(temp_data)
+            source_label = "inventory"
+        else:
+            entries = _inventory_preset_entries_from_equipment_slots(rig_settings)
+            source_label = "equipment"
+
+        if not entries:
+            self.report({'WARNING'}, "No inventory preset items to save.")
+            return {'CANCELLED'}
+
+        preset = _save_new_inventory_preset(
+            self.preset_name,
+            entries,
+            source=source_label,
+            source_game=source_game,
+        )
+        if temp_data is not None:
+            temp_data.inventory_preset_id = str(preset.get("id", "") or "")
+        if context.area:
+            context.area.tag_redraw()
+        self.report({'INFO'}, f"Saved inventory preset: {preset.get('name', '')}")
+        return {'FINISHED'}
+
+
+class EQUIPMENT_OT_SelectInventoryPreset(bpy.types.Operator):
+    bl_idname = "witcher.equipment_select_inventory_preset"
+    bl_label = "Select Inventory Preset"
+    bl_description = "Select an inventory preset"
+
+    target: bpy.props.EnumProperty(
+        name="Target",
+        items=[
+            ('INVENTORY', "Inventory", "Select the current Inventory tab preset"),
+            ('GERALT_W3', "Geralt", "Select the preset used by the Geralt quick import"),
+            ('GERALT_W2', "Geralt W2", "Select the preset used by the Geralt W2 quick import"),
+        ],
+        default='INVENTORY',
+        options={'HIDDEN'},
+    )
+    tooltip: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+
+    @classmethod
+    def description(cls, context, properties):
+        tip = str(getattr(properties, "tooltip", "") or "").strip()
+        if tip:
+            return tip
+        return cls.bl_description
+
+    def invoke(self, context, event):
+        temp_data = _get_temp_equipment_data(context)
+        if temp_data is None:
+            return {'CANCELLED'}
+        target = _normalize_inventory_preset_selection_target(self.target)
+        try:
+            temp_data.preset_picker_target = target
+            temp_data.preset_picker_search = ""
+            temp_data.preset_picker_page = 0
+            temp_data.preset_picker_filter_token = ""
+        except Exception:
+            pass
+        _get_equipment_placeholder_icon_id()
+        try:
+            context.window_manager.invoke_props_dialog(
+                self,
+                width=inventory_preset_picker_width(),
+                confirm_text="Done",
+            )
+        except TypeError:
+            context.window_manager.invoke_props_dialog(self, width=inventory_preset_picker_width())
+        return {'RUNNING_MODAL'}
+
+    def draw(self, context):
+        draw_inventory_preset_picker(context, self.layout)
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+class EQUIPMENT_OT_ClearInventoryPreset(bpy.types.Operator):
+    bl_idname = "witcher.equipment_clear_inventory_preset"
+    bl_label = "Disable Inventory Preset"
+    bl_description = "Do not apply an inventory preset for this target"
+    bl_options = {'INTERNAL'}
+
+    target: bpy.props.EnumProperty(
+        name="Target",
+        items=[
+            ('INVENTORY', "Inventory", "Clear the current Inventory tab preset"),
+            ('GERALT_W3', "Geralt", "Disable the Geralt quick import preset"),
+            ('GERALT_W2', "Geralt W2", "Disable the Geralt W2 quick import preset"),
+        ],
+        default='INVENTORY',
+        options={'HIDDEN'},
+    )
+
+    @classmethod
+    def description(cls, context, properties):
+        target = _normalize_inventory_preset_selection_target(getattr(properties, "target", "INVENTORY"))
+        if target == "GERALT_W2":
+            return "Import Geralt W2 without applying an inventory preset"
+        if target == "GERALT_W3":
+            return "Import Geralt without applying an inventory preset"
+        return cls.bl_description
+
+    def execute(self, context):
+        if not _set_inventory_preset_selection(context, "", target=self.target):
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Inventory preset disabled.")
+        return {'FINISHED'}
+
+
+class EQUIPMENT_OT_ApplyInventoryPreset(bpy.types.Operator):
+    bl_idname = "witcher.equipment_apply_inventory_preset"
+    bl_label = "Apply Inventory Preset"
+    bl_description = "Apply the selected inventory preset to the current character"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    preset_id: bpy.props.StringProperty(default="", options={'HIDDEN'})
+
+    def execute(self, context):
+        armature, rig_settings = _get_armature_and_rig_settings(context)
+        if not armature or rig_settings is None:
+            self.report({'WARNING'}, "No valid armature selected.")
+            return {'CANCELLED'}
+
+        temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
+        source_game = _infer_source_game_from_rig_settings(rig_settings, armature)
+        preset_id = str(self.preset_id or _get_inventory_preset_selection(context, target="INVENTORY") or "").strip()
+        preset = _get_inventory_preset(preset_id, source_game=source_game)
+        if not preset:
+            self.report({'WARNING'}, "No inventory preset selected.")
+            return {'CANCELLED'}
+
+        entity_data = _set_entity_inventory_definitions_for_preset(rig_settings, preset)
+        if entity_data is None:
+            self.report({'WARNING'}, "Could not update character inventory state.")
+            return {'CANCELLED'}
+
+        source_roots = _get_inventory_source_roots_for_rig(armature, rig_settings)
+        prepared_context = {"source_roots": source_roots} if source_roots else None
+        with _preserve_selection(context):
+            _remove_inventory_slots_for_preset_apply(rig_settings)
+            try:
+                import_entity._apply_inventory_mounts(
+                    context,
+                    armature,
+                    None,
+                    rig_settings,
+                    entity=entity_data,
+                    shared_inventory=True,
+                    prepared_context=prepared_context,
+                )
+            except Exception:
+                log.warning("Failed to apply inventory preset", exc_info=True)
+                self.report({'WARNING'}, "Inventory preset apply failed.")
+                return {'CANCELLED'}
+
+        sync_equipment_slots_to_temp(context, rig_settings)
+        sync_inventory_entries_to_temp(context, rig_settings, entity_data=entity_data)
+        if temp_data is not None:
+            temp_data.inventory_preset_id = str(preset.get("id", "") or "")
+        if context.area:
+            context.area.tag_redraw()
+        self.report({'INFO'}, f"Applied inventory preset: {preset.get('name', '')}")
         return {'FINISHED'}
 
 
@@ -8380,19 +9205,29 @@ classes = [
     IncludedTemplateEntry,
     InventoryDefinitionEntry,
     EquipmentItemPickerRow,
+    EquipmentPresetPickerRow,
     WitcherUITempData,
     EQUIPMENT_UL_CategoryList,
     EQUIPMENT_UL_InventoryList,
     EQUIPMENT_UL_IncludedTemplateList,
     EQUIPMENT_OT_SearchCategory,
     EQUIPMENT_OT_PickDefaultItem,
+    EQUIPMENT_OT_PickInventoryPreset,
+    EQUIPMENT_OT_DeleteInventoryPreset,
+    EQUIPMENT_OT_ShowInventoryPresetDetails,
     EQUIPMENT_OT_ItemPickerPage,
+    EQUIPMENT_OT_PresetPickerPage,
     EQUIPMENT_OT_SearchDefaultItem,
     EQUIPMENT_OT_AddCategory,
     EQUIPMENT_OT_RemoveCategory,
+    EQUIPMENT_OT_MoveCategory,
     EQUIPMENT_OT_ToggleInventoryMount,
     EQUIPMENT_OT_ToggleEquipmentInitializers,
     EQUIPMENT_OT_RefreshInventoryEntries,
+    EQUIPMENT_OT_SaveInventoryPreset,
+    EQUIPMENT_OT_SelectInventoryPreset,
+    EQUIPMENT_OT_ClearInventoryPreset,
+    EQUIPMENT_OT_ApplyInventoryPreset,
     EQUIPMENT_OT_AddIncludedTemplate,
     EQUIPMENT_OT_RemoveIncludedTemplate,
     EQUIPMENT_OT_LoadIncludedTemplateData,

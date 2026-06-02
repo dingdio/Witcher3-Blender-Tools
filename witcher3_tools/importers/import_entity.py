@@ -3830,6 +3830,14 @@ def _get_inventory_item_name(entry):
 def _get_inventory_category(entry):
     return _get_entry_attr(entry, "category", "") or ""
 
+def _get_inventory_equip_template(entry):
+    return (
+        _get_entry_attr(entry, "equip_template", "")
+        or _get_entry_attr(entry, "template", "")
+        or _get_entry_attr(entry, "templateName", "")
+        or ""
+    )
+
 def _normalize_key(value):
     if value is None:
         return ""
@@ -4060,12 +4068,13 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
             for entry in inv_entries:
                 category_raw = _get_inventory_category(entry)
                 item_raw = _get_inventory_item_name(entry)
+                entry_template = _get_inventory_equip_template(entry)
                 override = _get_inventory_mount_override(rig_settings, category_raw, item_raw)
                 if override is False:
                     continue
                 if override is not True and not _inventory_entry_is_mount(entry):
                     continue
-                item_key = _normalize_key(item_raw)
+                item_key = _normalize_key(item_raw) or _normalize_key(entry_template)
                 if not item_key or item_key in {"none", "random", "null"}:
                     continue
                 category_key = _normalize_key(category_raw)
@@ -4117,17 +4126,18 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
     for entry in inv_entries:
         category_raw = _get_inventory_category(entry)
         item_raw = _get_inventory_item_name(entry)
+        entry_template = _get_inventory_equip_template(entry)
         override = _get_inventory_mount_override(rig_settings, category_raw, item_raw)
         if override is False:
             continue
         if override is not True and not _inventory_entry_is_mount(entry):
             continue
         is_mount = True
-        dedupe_key = (_normalize_key(category_raw), _normalize_key(item_raw))
+        dedupe_key = (_normalize_key(category_raw), _normalize_key(item_raw) or _normalize_key(entry_template))
         if dedupe_key in seen_entries:
             continue
         seen_entries.add(dedupe_key)
-        item_key = _normalize_key(item_raw)
+        item_key = _normalize_key(item_raw) or _normalize_key(entry_template)
         if not item_key or item_key in {"none", "random", "null"}:
             continue
 
@@ -4137,6 +4147,8 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
         resolved_item_name = ""
         resolved_template = ""
         resolved = _resolve_inventory_item(item_raw, item_lookup, template_lookup)
+        if not resolved and entry_template:
+            resolved = _resolve_inventory_item(entry_template, item_lookup, template_lookup)
         if resolved:
             resolved_category, resolved_item_name, resolved_template = resolved
 
@@ -4152,6 +4164,8 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
             slot = slots[slot_index] if 0 <= slot_index < len(slots) else None
         else:
             slot_index, _stale_slot = _find_slot_by_item_or_template(slot_search_list, item_raw)
+            if slot_index is None and entry_template:
+                slot_index, _stale_slot = _find_slot_by_item_or_template(slot_search_list, entry_template)
             slot = slots[slot_index] if (slot_index is not None and 0 <= slot_index < len(slots)) else None
 
         slot_was_created = False
@@ -4198,9 +4212,9 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
         if resolved_item_name:
             item_name = resolved_item_name
         else:
-            item_name = _derive_template_from_item(item_raw) or str(item_raw)
+            item_name = _derive_template_from_item(item_raw) or str(item_raw or entry_template)
 
-        template = resolved_template
+        template = entry_template or resolved_template
         if not template:
             # Try category-specific lookup for this item name.
             for name, _display, tmpl in _category_items(category_raw):
@@ -4216,6 +4230,8 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
                 # If item ID is abstract (e.g. Q1_axe1h), fall back to first
                 # concrete template from the category.
                 template = _first_template_for_category(category_raw) or _first_template_for_category(resolved_category)
+            if not template and entry_template:
+                template = entry_template
             if not template:
                 template = _derive_template_from_item(item_raw)
         if not template:

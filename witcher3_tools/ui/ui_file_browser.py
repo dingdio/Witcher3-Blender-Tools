@@ -68,6 +68,52 @@ def _update_layer_visibility_settings(self, context):
         ui_map.apply_layer_visibility_settings(context, self)
     except Exception:
         pass
+
+
+def _geralt_inventory_preset_state(context, target):
+    try:
+        from . import ui_equipment
+
+        preset_id = ui_equipment._get_inventory_preset_selection(context, target=target)
+        source_game = ui_equipment._inventory_preset_source_game_for_target(context, target)
+        label = ui_equipment._inventory_preset_label(
+            preset_id,
+            fallback="No preset",
+            source_game=source_game,
+        )
+        return str(preset_id or ""), str(label or "No preset")
+    except Exception:
+        return "", "No preset"
+
+
+def _draw_geralt_inventory_preset_controls(row, context, target):
+    preset_id, preset_label = _geralt_inventory_preset_state(context, target)
+    active = bool(preset_id)
+    target_label = "Geralt W2" if str(target or "").upper() == "GERALT_W2" else "Geralt"
+    tooltip = (
+        f"{target_label} preset active: {preset_label}"
+        if active
+        else f"{target_label} preset off: import without applying an inventory preset"
+    )
+    picker = row.operator(
+        "witcher.equipment_select_inventory_preset",
+        text="",
+        icon='CHECKBOX_HLT' if active else 'CHECKBOX_DEHLT',
+        depress=active,
+    )
+    picker.target = target
+    picker.tooltip = tooltip
+
+    clear_row = row.row(align=True)
+    clear_row.enabled = active
+    clear = clear_row.operator(
+        "witcher.equipment_clear_inventory_preset",
+        text="",
+        icon='X' if active else 'BLANK1',
+    )
+    clear.target = target
+
+
 from ..importers.import_entity import test_load_entity, fixed_chunk_paths
 import os
 import time
@@ -9198,11 +9244,15 @@ class WITCHER_PT_AssetBrowser(Panel):
         char_col = char_box.column(align=True)
         quick_row = char_col.row(align=True)
         quick_row.scale_y = 1.4
-        quick_row.operator("witcher.import_geralt", text="Geralt", icon='USER')
+        geralt_row = quick_row.row(align=True)
+        geralt_row.operator("witcher.import_geralt", text="Geralt", icon='USER')
+        _draw_geralt_inventory_preset_controls(geralt_row, context, 'GERALT_W3')
         quick_row.operator("witcher.import_ciri", text="Ciri", icon='USER')
         w2_row = char_col.row(align=True)
         w2_row.scale_y = 1.2
-        w2_row.operator("witcher.import_geralt_w2", text="Geralt W2", icon='USER')
+        geralt_w2_row = w2_row.row(align=True)
+        geralt_w2_row.operator("witcher.import_geralt_w2", text="Geralt W2", icon='USER')
+        _draw_geralt_inventory_preset_controls(geralt_w2_row, context, 'GERALT_W2')
         w2_row.operator("witcher.import_triss_w2", text="Triss W2", icon='USER')
         char_col.separator()
         ref_row = char_col.row(align=True)
