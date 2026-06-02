@@ -5,6 +5,8 @@ import time
 import uuid
 import logging
 import re
+import hashlib
+import shutil
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from bpy.app.handlers import persistent
@@ -41,6 +43,19 @@ _UNCOOK_ITEM_ENT_INDEX = {}
 _LAST_EQUIPMENT_LOAD_FAILURES = {}
 _LOADED_EQUIPMENT_XML_DIRS = set()
 _OPERATOR_ENUM_CACHE = {}
+_EQUIPMENT_ITEM_ICON_ID_CACHE = {}
+_EQUIPMENT_ITEM_ICON_REQUESTS = []
+_EQUIPMENT_ITEM_ICON_PENDING_KEYS = set()
+_EQUIPMENT_ITEM_ICON_TIMER_RUNNING = False
+_EQUIPMENT_ITEM_PICKER_RECENTS = {}
+# Persistent icon cache: resolved preview images are copied into a cache dir and
+# their paths recorded to JSON so icons load once and survive Blender restarts
+# (no re-resolution / no UI lag on later sessions).
+_EQUIPMENT_ICON_PREVIEWS = None
+_EQUIPMENT_ICON_PATH_DISK = None          # stable_key(str) -> persistent image path ("" = unresolvable)
+_EQUIPMENT_ICON_PATH_DISK_DIRTY = False
+_EQUIPMENT_ICON_PATH_CACHE_FILE = Path(get_cache_root(create=True)) / "equipment_icon_paths.json"
+_EQUIPMENT_ICON_PERSIST_DIR = Path(get_cache_root(create=True)) / "equipment_icons"
 _W2_CATEGORY_CACHE_LOADED = False
 _W2_CATEGORY_ITEMS = {}
 _W2_ITEM_ATTRIBUTES = {}
@@ -59,10 +74,189 @@ _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP = {
     "w3": None,
     "w2": None,
 }
+_EQUIPMENT_ITEM_PICKER_PANEL_ICON_SCALE = 2.0
+_EQUIPMENT_ITEM_PICKER_RECENT_LIMIT = 24
+# How many icons the background timer resolves per tick. Resolution happens on
+# the main thread (DDS extraction), so keep this small to avoid UI stutter.
+# Placeholders are shown instantly, so a low value here only affects how fast
+# real thumbnails stream in — not whether the grid looks complete.
+_EQUIPMENT_ITEM_ICON_BATCH_SIZE = 2
+_EQUIPMENT_ITEM_PICKER_WIDTH = 720
+# Grid view: a paged thumbnail grid (only the visible page requests icons).
+# Selectable tile sizes -> (columns, template_icon scale). 'L' matches the
+# asset/character browser's default thumbnail size and is the default here.
+_EQUIPMENT_ITEM_PICKER_GRID_PAGE_ROWS = 4
+_EQUIPMENT_ITEM_PICKER_GRID_SIZES = {
+    'S': (6, 5.0),
+    'M': (5, 6.5),
+    'L': (4, 8.0),
+}
+_EQUIPMENT_ITEM_PICKER_GRID_DEFAULT_SIZE = 'L'
+
+
+def _equipment_grid_size_params(size):
+    columns, scale = _EQUIPMENT_ITEM_PICKER_GRID_SIZES.get(
+        str(size or _EQUIPMENT_ITEM_PICKER_GRID_DEFAULT_SIZE),
+        _EQUIPMENT_ITEM_PICKER_GRID_SIZES[_EQUIPMENT_ITEM_PICKER_GRID_DEFAULT_SIZE],
+    )
+    label_chars = max(10, 8 + (7 - columns) * 3)
+    return columns, scale, label_chars
+# List view: a paged single-column list with a large (~3x) leading thumbnail.
+_EQUIPMENT_ITEM_PICKER_LIST_PAGE_ROWS = 8
+_EQUIPMENT_ITEM_PICKER_LIST_ICON_SCALE = 3.0
+_EQUIPMENT_ITEM_PICKER_LIST_LABEL_CHARS = 60
+
+# Lazily-built neutral placeholder shown at the exact size of a real icon while
+# the real one is still resolving (or can't be resolved at all).
+_EQUIPMENT_PLACEHOLDER_PREVIEWS = None
+_EQUIPMENT_PLACEHOLDER_ICON_ID = 0
 
 def _clear_cache_if_oversized(cache, max_entries=64):
     if len(cache) > max_entries:
         cache.clear()
+
+
+def _clear_equipment_item_icon_cache():
+    _EQUIPMENT_ITEM_ICON_ID_CACHE.clear()
+    _EQUIPMENT_ITEM_ICON_REQUESTS.clear()
+    _EQUIPMENT_ITEM_ICON_PENDING_KEYS.clear()
+
+
+def _get_equipment_placeholder_icon_id():
+    """Return a stable icon_id for a neutral 'unresolved item' placeholder.
+
+    Reuses the browser dummy-icon generator so the placeholder is a real preview
+    image and therefore scales identically to a resolved icon when drawn with
+    ``template_icon(scale=...)`` — giving same-sized tiles whether or not the
+    real icon has loaded yet.
+    """
+    global _EQUIPMENT_PLACEHOLDER_PREVIEWS, _EQUIPMENT_PLACEHOLDER_ICON_ID
+    if _EQUIPMENT_PLACEHOLDER_ICON_ID:
+        return _EQUIPMENT_PLACEHOLDER_ICON_ID
+    try:
+        from .browser_dummy_icons import ensure_browser_dummy_icon_path
+
+        png_path = ensure_browser_dummy_icon_path("ITEM", "item")
+        if not png_path:
+            return 0
+        if _EQUIPMENT_PLACEHOLDER_PREVIEWS is None:
+            _EQUIPMENT_PLACEHOLDER_PREVIEWS = bpy.utils.previews.new()
+        key = "equipment_item_placeholder"
+        icon = _EQUIPMENT_PLACEHOLDER_PREVIEWS.get(key)
+        if icon is None:
+            icon = _EQUIPMENT_PLACEHOLDER_PREVIEWS.load(key, png_path, 'IMAGE')
+        _EQUIPMENT_PLACEHOLDER_ICON_ID = int(getattr(icon, "icon_id", 0) or 0)
+    except Exception:
+        log.debug("Failed to build equipment placeholder icon", exc_info=True)
+        _EQUIPMENT_PLACEHOLDER_ICON_ID = 0
+    return _EQUIPMENT_PLACEHOLDER_ICON_ID
+
+
+def _clear_equipment_placeholder_icon():
+    global _EQUIPMENT_PLACEHOLDER_PREVIEWS, _EQUIPMENT_PLACEHOLDER_ICON_ID
+    if _EQUIPMENT_PLACEHOLDER_PREVIEWS is not None:
+        try:
+            bpy.utils.previews.remove(_EQUIPMENT_PLACEHOLDER_PREVIEWS)
+        except Exception:
+            pass
+    _EQUIPMENT_PLACEHOLDER_PREVIEWS = None
+    _EQUIPMENT_PLACEHOLDER_ICON_ID = 0
+
+
+# --- Persistent equipment icon cache (load once, survive restart, no lag) -----
+
+def _equipment_icon_stable_key(cache_key_tuple):
+    """Stable, JSON-safe key for the cross-session icon path cache."""
+    return hashlib.sha1(repr(cache_key_tuple).encode("utf-8", "ignore")).hexdigest()
+
+
+def _load_equipment_icon_path_disk():
+    global _EQUIPMENT_ICON_PATH_DISK
+    if _EQUIPMENT_ICON_PATH_DISK is not None:
+        return _EQUIPMENT_ICON_PATH_DISK
+    data = {}
+    try:
+        if _EQUIPMENT_ICON_PATH_CACHE_FILE.exists():
+            with open(_EQUIPMENT_ICON_PATH_CACHE_FILE, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                data = {str(k): str(v or "") for k, v in loaded.items()}
+    except Exception:
+        log.debug("Failed to load equipment icon path cache", exc_info=True)
+        data = {}
+    _EQUIPMENT_ICON_PATH_DISK = data
+    return data
+
+
+def _mark_equipment_icon_disk_dirty():
+    global _EQUIPMENT_ICON_PATH_DISK_DIRTY
+    _EQUIPMENT_ICON_PATH_DISK_DIRTY = True
+
+
+def _save_equipment_icon_path_disk():
+    global _EQUIPMENT_ICON_PATH_DISK_DIRTY
+    if _EQUIPMENT_ICON_PATH_DISK is None or not _EQUIPMENT_ICON_PATH_DISK_DIRTY:
+        return
+    try:
+        _EQUIPMENT_ICON_PATH_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = str(_EQUIPMENT_ICON_PATH_CACHE_FILE) + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(_EQUIPMENT_ICON_PATH_DISK, handle)
+        os.replace(tmp_path, str(_EQUIPMENT_ICON_PATH_CACHE_FILE))
+        _EQUIPMENT_ICON_PATH_DISK_DIRTY = False
+    except Exception:
+        log.debug("Failed to save equipment icon path cache", exc_info=True)
+
+
+def _persist_equipment_icon_image(src_path, stable_key):
+    """Copy a resolved preview image into the persistent cache dir so it survives
+    temp-dir cleanup and Blender restarts. Returns the persistent path or ""."""
+    try:
+        from ..CR2W.common_blender import win_path_exists, win_safe_path
+
+        if not src_path or not win_path_exists(src_path):
+            return ""
+        ext = os.path.splitext(str(src_path))[1].lower() or ".png"
+        _EQUIPMENT_ICON_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+        dst_path = str(_EQUIPMENT_ICON_PERSIST_DIR / f"{stable_key}{ext}")
+        if not win_path_exists(dst_path):
+            shutil.copyfile(win_safe_path(src_path), dst_path)
+        return dst_path
+    except Exception:
+        log.debug("Failed to persist equipment icon image", exc_info=True)
+        return ""
+
+
+def _equipment_icon_id_from_path(stable_key, image_path):
+    """Lazily load a persisted preview image into our previews collection and
+    return its icon_id. Loading is cheap (Blender decodes lazily on draw)."""
+    global _EQUIPMENT_ICON_PREVIEWS
+    try:
+        from ..CR2W.common_blender import win_path_exists, win_safe_path
+
+        if not image_path or not win_path_exists(image_path):
+            return 0
+        if _EQUIPMENT_ICON_PREVIEWS is None:
+            _EQUIPMENT_ICON_PREVIEWS = bpy.utils.previews.new()
+        pcoll = _EQUIPMENT_ICON_PREVIEWS
+        icon = pcoll.get(stable_key)
+        if icon is None:
+            icon = pcoll.load(stable_key, win_safe_path(image_path), 'IMAGE')
+        return int(getattr(icon, "icon_id", 0) or 0)
+    except Exception:
+        log.debug("Failed to load persisted equipment icon: %s", image_path, exc_info=True)
+        return 0
+
+
+def _clear_equipment_icon_previews():
+    global _EQUIPMENT_ICON_PREVIEWS
+    _save_equipment_icon_path_disk()
+    if _EQUIPMENT_ICON_PREVIEWS is not None:
+        try:
+            bpy.utils.previews.remove(_EQUIPMENT_ICON_PREVIEWS)
+        except Exception:
+            pass
+    _EQUIPMENT_ICON_PREVIEWS = None
 
 
 def _set_catalog_cache_flags(source_game="w3", *, schema_version=0, icon_path=False, hold_template=False):
@@ -129,6 +323,7 @@ def _get_equipment_catalog(source_game="w3"):
 
 
 def _clear_item_attribute_identifier_lookup(source_game=None):
+    _clear_equipment_item_icon_cache()
     if source_game is None:
         for key in _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP:
             _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP[key] = None
@@ -363,12 +558,21 @@ def _request_sync_templates():
 
 def _cache_operator_enum_items(cache_key, items):
     stable_items = []
-    for item in items or [("None", "None", "")]:
+    for index, item in enumerate(items or [("None", "None", "")]):
         identifier = str(item[0] or "None")
         label = str(item[1] or identifier)
         description = str(item[2] or "")
-        stable_items.append((identifier, label, description))
+        if len(item) >= 5:
+            icon = item[3]
+            try:
+                number = int(item[4])
+            except Exception:
+                number = index + 1
+            stable_items.append((identifier, label, description, icon, number))
+        else:
+            stable_items.append((identifier, label, description))
     _OPERATOR_ENUM_CACHE[cache_key] = stable_items
+    _clear_cache_if_oversized(_OPERATOR_ENUM_CACHE, max_entries=128)
     return stable_items
 
 
@@ -648,6 +852,729 @@ def get_item_attributes_by_identifier(identifier, source_game="w3", strict: bool
 def get_item_icon_path(identifier, source_game="w3", strict: bool = False):
     attrs = get_item_attributes_by_identifier(identifier, source_game=source_game, strict=strict)
     return str(attrs.get("icon_path", "") or "")
+
+
+def _get_active_equipment_source_path(context):
+    armature, rig_settings = _get_safe_context_armature_and_rig_settings(context)
+    if armature is not None:
+        try:
+            source_path = str(armature.get("_w3_entity_source_path", "") or "").strip()
+            if source_path:
+                return source_path
+        except Exception:
+            pass
+    if rig_settings is not None:
+        try:
+            repo_path = str(getattr(rig_settings, "repo_path", "") or "").strip()
+            if repo_path and os.path.isabs(repo_path):
+                return repo_path
+        except Exception:
+            pass
+    return ""
+
+
+@contextmanager
+def _equipment_icon_repo_context(context):
+    source_path = _get_active_equipment_source_path(context)
+    if not source_path:
+        yield
+        return
+    try:
+        from ..CR2W.common_blender import redkit_repo_context
+    except Exception:
+        yield
+        return
+    with redkit_repo_context(source_path=source_path):
+        yield
+
+
+def _get_equipment_icon_loadmods(context):
+    try:
+        return bool(context.scene.witcher_file_browser.loadmods)
+    except Exception:
+        return False
+
+
+def _iter_equipment_icon_identifiers(item_name, attrs=None, fallback_template=""):
+    attrs = attrs if isinstance(attrs, dict) else {}
+    seen = set()
+    for value in (
+        item_name,
+        attrs.get("equip_template", ""),
+        attrs.get("hold_template", ""),
+        attrs.get("template_name", ""),
+        fallback_template,
+    ):
+        text = str(value or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        yield text
+
+
+def _get_equipment_item_attrs_for_enum(entry, item_name, source_game="w3"):
+    source_game = _normalize_source_game(source_game)
+    item_name = str(item_name or "").strip()
+    if not item_name or item_name == "None":
+        return {}, ""
+
+    category_items, item_attributes = _get_equipment_catalog(source_game)
+    attrs = item_attributes.get(item_name, {})
+    if isinstance(attrs, dict) and attrs:
+        return attrs, str(attrs.get("template_name", "") or attrs.get("equip_template", "") or attrs.get("hold_template", ""))
+
+    category = str(getattr(entry, "category", "") or "None")
+    fallback_template = ""
+    for name, _display, template_name in category_items.get(category, []):
+        if str(name or "") == item_name:
+            fallback_template = str(template_name or "")
+            break
+
+    if fallback_template:
+        attrs = get_item_attributes_by_identifier(fallback_template, source_game=source_game, strict=True)
+        if isinstance(attrs, dict) and attrs:
+            return attrs, fallback_template
+
+    attrs = get_item_attributes_by_identifier(item_name, source_game=source_game, strict=True)
+    return (attrs if isinstance(attrs, dict) else {}), fallback_template
+
+
+def _resolve_equipment_item_icon_path(item_name, attrs=None, source_game="w3", fallback_template=""):
+    source_game = _normalize_source_game(source_game)
+    attrs = attrs if isinstance(attrs, dict) else {}
+    raw_icon_path = str(attrs.get("icon_path", "") or "").strip()
+    if raw_icon_path:
+        return raw_icon_path
+
+    for identifier in _iter_equipment_icon_identifiers(item_name, attrs, fallback_template=fallback_template):
+        raw_icon_path = str(get_item_icon_path(identifier, source_game=source_game, strict=True) or "").strip()
+        if raw_icon_path:
+            return raw_icon_path
+    return ""
+
+
+def _iter_equipment_icon_candidate_paths(ui_file_browser, context, raw_icon_path):
+    seen = set()
+
+    def _add(path_value):
+        normalized = str(path_value or "").replace("/", "\\").strip("\\")
+        if not normalized:
+            return
+        key = normalized.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        yield normalized
+
+    def _add_preview_lookup_paths(path_value):
+        try:
+            lookup_paths = ui_file_browser._iter_preview_lookup_paths(path_value)
+        except Exception:
+            lookup_paths = [path_value]
+        for lookup_path in lookup_paths:
+            for normalized in _add(lookup_path):
+                yield normalized
+
+    for candidate in _add_preview_lookup_paths(raw_icon_path):
+        yield candidate
+    try:
+        expanded = ui_file_browser._expand_scaleform_icon_candidates(context, raw_icon_path)
+    except Exception:
+        expanded = []
+    for candidate in expanded:
+        for normalized in _add_preview_lookup_paths(candidate):
+            yield normalized
+
+
+def _get_equipment_icon_cache_type(ui_file_browser, source_game="w3"):
+    if _normalize_source_game(source_game) == "w2":
+        return ui_file_browser.WITCHER2_BUNDLE_CACHE_TYPE
+    return "Bundle"
+
+
+def _iter_equipment_icon_template_candidates(item_name, attrs=None, fallback_template=""):
+    attrs = attrs if isinstance(attrs, dict) else {}
+    seen = set()
+    for value in (
+        attrs.get("equip_template", ""),
+        attrs.get("hold_template", ""),
+        attrs.get("template_name", ""),
+        fallback_template,
+    ):
+        text = _normalize_template_path(value)
+        key = text.lower()
+        if not text or key == "none" or key in seen:
+            continue
+        seen.add(key)
+        yield text
+
+    try:
+        derived = _normalize_template_path(import_entity._derive_template_from_item(item_name))
+    except Exception:
+        derived = ""
+    key = derived.lower()
+    if derived and key != "none" and key not in seen:
+        yield derived
+
+
+def _iter_equipment_template_browser_paths(template_name):
+    rel_template = _normalize_template_path(template_name)
+    if not rel_template:
+        return
+
+    candidates = []
+    if rel_template.lower().endswith(".w2ent"):
+        candidates.append(rel_template)
+    else:
+        candidates.append(rel_template + ".w2ent")
+
+    if "\\" not in rel_template:
+        short_path = candidates[0]
+        candidates.append(os.path.join("items", short_path).replace("/", "\\"))
+
+    seen = set()
+    for candidate in candidates:
+        key = candidate.lower()
+        if not candidate or key in seen:
+            continue
+        seen.add(key)
+        yield candidate
+
+
+def _resolve_equipment_item_entity_preview_path(
+    context,
+    ui_file_browser,
+    source_game,
+    item_name,
+    attrs=None,
+    fallback_template="",
+    loadmods=False,
+):
+    cache_type = _get_equipment_icon_cache_type(ui_file_browser, source_game)
+    armature, rig_settings = _get_safe_context_armature_and_rig_settings(context)
+    seen_paths = set()
+
+    for template_name in _iter_equipment_icon_template_candidates(item_name, attrs, fallback_template):
+        try:
+            repo_path, _resolved_abs_path = _resolve_equipment_paths_for_template(
+                template_name,
+                armature=armature,
+                rig_settings=rig_settings,
+            )
+        except Exception:
+            repo_path = ""
+
+        path_candidates = []
+        if repo_path:
+            path_candidates.append(repo_path)
+        path_candidates.extend(_iter_equipment_template_browser_paths(template_name))
+
+        for item_path in path_candidates:
+            normalized = str(item_path or "").replace("/", "\\").strip("\\")
+            key = normalized.lower()
+            if not normalized or key in seen_paths:
+                continue
+            seen_paths.add(key)
+
+            icon_info = ui_file_browser._get_browser_item_icon_info(
+                context,
+                cache_type,
+                normalized,
+                loadmods=loadmods,
+            )
+            if icon_info.get("is_dummy"):
+                continue
+            preview_path = str(icon_info.get("preview_path", "") or "")
+            if preview_path:
+                return preview_path
+    return ""
+
+
+def _get_equipment_item_icon_cache_key(context, item_name, attrs=None, source_game="w3", fallback_template=""):
+    raw_icon_path = _resolve_equipment_item_icon_path(
+        item_name,
+        attrs,
+        source_game=source_game,
+        fallback_template=fallback_template,
+    )
+    source_game = _normalize_source_game(source_game)
+    loadmods = _get_equipment_icon_loadmods(context)
+    source_roots = _get_active_equipment_source_roots(context)
+    source_path = _get_active_equipment_source_path(context)
+    template_keys = tuple(
+        template.lower()
+        for template in _iter_equipment_icon_template_candidates(item_name, attrs, fallback_template)
+    )
+    if not raw_icon_path and not template_keys:
+        return None, raw_icon_path, template_keys, loadmods
+    return (
+        source_game,
+        int(bool(loadmods)),
+        raw_icon_path.replace("/", "\\").strip("\\").lower(),
+        template_keys,
+        _norm_root_path(source_path),
+        tuple(_norm_root_path(root) for root in source_roots),
+    ), raw_icon_path, template_keys, loadmods
+
+
+def _resolve_equipment_item_preview_path(context, item_name, attrs=None, source_game="w3", fallback_template=""):
+    """Run the (expensive) icon resolution and return the resolved preview image
+    path on disk, or "" if none. This is the slow path run in the background; its
+    result is persisted so it only happens once per item, ever."""
+    raw_icon_path = _resolve_equipment_item_icon_path(
+        item_name,
+        attrs,
+        source_game=source_game,
+        fallback_template=fallback_template,
+    )
+    preview_path = ""
+    try:
+        from . import ui_file_browser
+
+        cache_type = _get_equipment_icon_cache_type(ui_file_browser, source_game)
+        loadmods = _get_equipment_icon_loadmods(context)
+        with _equipment_icon_repo_context(context):
+            if raw_icon_path:
+                for candidate_path in _iter_equipment_icon_candidate_paths(ui_file_browser, context, raw_icon_path):
+                    icon_info = ui_file_browser._get_browser_item_icon_info(
+                        context,
+                        cache_type,
+                        candidate_path,
+                        loadmods=loadmods,
+                    )
+                    if icon_info.get("is_dummy"):
+                        continue
+                    preview_path = str(icon_info.get("preview_path", "") or "")
+                    if preview_path:
+                        break
+            if not preview_path:
+                preview_path = _resolve_equipment_item_entity_preview_path(
+                    context,
+                    ui_file_browser,
+                    source_game,
+                    item_name,
+                    attrs,
+                    fallback_template=fallback_template,
+                    loadmods=loadmods,
+                )
+    except Exception:
+        log.debug("Failed to resolve equipment item icon for %s", item_name, exc_info=True)
+    return preview_path
+
+
+def _tag_equipment_item_icon_redraw():
+    try:
+        wm = bpy.context.window_manager
+        for window in getattr(wm, "windows", []) or []:
+            screen = getattr(window, "screen", None)
+            if not screen:
+                continue
+            for area in getattr(screen, "areas", []) or []:
+                try:
+                    area.tag_redraw()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _equipment_item_icon_timer():
+    global _EQUIPMENT_ITEM_ICON_TIMER_RUNNING
+
+    if not _EQUIPMENT_ITEM_ICON_REQUESTS:
+        _EQUIPMENT_ITEM_ICON_TIMER_RUNNING = False
+        _save_equipment_icon_path_disk()
+        return None
+
+    context = bpy.context
+    disk = _load_equipment_icon_path_disk()
+    resolved_any = False
+    for _i in range(min(_EQUIPMENT_ITEM_ICON_BATCH_SIZE, len(_EQUIPMENT_ITEM_ICON_REQUESTS))):
+        request = _EQUIPMENT_ITEM_ICON_REQUESTS.pop(0)
+        cache_key = request.get("cache_key")
+        stable_key = request.get("stable_key")
+        try:
+            src_path = _resolve_equipment_item_preview_path(
+                context,
+                request.get("item_name", ""),
+                request.get("attrs", {}),
+                source_game=request.get("source_game", "w3"),
+                fallback_template=request.get("fallback_template", ""),
+            )
+            # Persist a copy + record the path so this never has to resolve again.
+            persistent = _persist_equipment_icon_image(src_path, stable_key) if src_path else ""
+            disk[stable_key] = persistent
+            _mark_equipment_icon_disk_dirty()
+            icon_id = _equipment_icon_id_from_path(stable_key, persistent) if persistent else 0
+            if cache_key is not None:
+                _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = int(icon_id or 0)
+            resolved_any = True
+        except Exception:
+            if cache_key is not None:
+                _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = 0
+        finally:
+            if cache_key is not None:
+                _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(cache_key)
+
+    if resolved_any:
+        _tag_equipment_item_icon_redraw()
+
+    if _EQUIPMENT_ITEM_ICON_REQUESTS:
+        return 0.03
+
+    _EQUIPMENT_ITEM_ICON_TIMER_RUNNING = False
+    _save_equipment_icon_path_disk()
+    return None
+
+
+def _ensure_equipment_item_icon_timer():
+    global _EQUIPMENT_ITEM_ICON_TIMER_RUNNING
+    if _EQUIPMENT_ITEM_ICON_TIMER_RUNNING:
+        return
+    try:
+        bpy.app.timers.register(_equipment_item_icon_timer, first_interval=0.03)
+        _EQUIPMENT_ITEM_ICON_TIMER_RUNNING = True
+    except Exception:
+        _EQUIPMENT_ITEM_ICON_TIMER_RUNNING = False
+
+
+def _get_cached_or_queue_equipment_item_icon_id(context, item_name, attrs=None, source_game="w3", fallback_template=""):
+    cache_key, _raw_icon_path, _template_keys, _loadmods = _get_equipment_item_icon_cache_key(
+        context,
+        item_name,
+        attrs,
+        source_game=source_game,
+        fallback_template=fallback_template,
+    )
+    if cache_key is None:
+        return 0
+
+    # Fast path: already loaded this session.
+    cached = _EQUIPMENT_ITEM_ICON_ID_CACHE.get(cache_key)
+    if cached is not None:
+        return int(cached or 0)
+
+    # Cross-session path: we resolved this icon in a previous run. Just lazily
+    # (re)load the persisted image — cheap, no resolution, no UI lag.
+    stable_key = _equipment_icon_stable_key(cache_key)
+    disk = _load_equipment_icon_path_disk()
+    if stable_key in disk:
+        path = disk[stable_key]
+        if not path:
+            # Known to be unresolvable — don't keep retrying.
+            _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = 0
+            return 0
+        icon_id = _equipment_icon_id_from_path(stable_key, path)
+        if icon_id:
+            _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = icon_id
+            return icon_id
+        # Persisted file disappeared (e.g. cache dir wiped) — fall through and
+        # re-resolve it in the background.
+
+    if cache_key not in _EQUIPMENT_ITEM_ICON_PENDING_KEYS:
+        _EQUIPMENT_ITEM_ICON_PENDING_KEYS.add(cache_key)
+        _EQUIPMENT_ITEM_ICON_REQUESTS.append({
+            "cache_key": cache_key,
+            "stable_key": stable_key,
+            "item_name": str(item_name or ""),
+            "attrs": dict(attrs) if isinstance(attrs, dict) else {},
+            "source_game": _normalize_source_game(source_game),
+            "fallback_template": str(fallback_template or ""),
+        })
+        _ensure_equipment_item_icon_timer()
+    return 0
+
+
+def _get_equipment_entry_item_icon_id(context, entry):
+    if entry is None:
+        return 0
+    source_game = getattr(entry, "source_game", "") or _get_temp_source_game(context)
+    item_name = str(getattr(entry, "defaultItemName", "") or "").strip()
+    attrs, fallback_template = _get_equipment_item_attrs_for_enum(entry, item_name, source_game)
+    if not attrs:
+        attrs = get_item_attributes_by_identifier(
+            getattr(entry, "equip_template", ""),
+            source_game=source_game,
+            strict=True,
+        )
+    return _get_cached_or_queue_equipment_item_icon_id(
+        context,
+        item_name,
+        attrs,
+        source_game=source_game,
+        fallback_template=fallback_template or getattr(entry, "equip_template", ""),
+    )
+
+
+def _equipment_item_picker_search_blob(identifier, label, description, attrs=None, fallback_template=""):
+    attrs = attrs if isinstance(attrs, dict) else {}
+    parts = [
+        identifier,
+        label,
+        description,
+        fallback_template,
+        attrs.get("item_name", ""),
+        attrs.get("category", ""),
+        attrs.get("equip_template", ""),
+        attrs.get("hold_template", ""),
+        attrs.get("template_name", ""),
+        attrs.get("equip_slot", ""),
+        attrs.get("hold_slot", ""),
+        attrs.get("attachment_type", ""),
+        attrs.get("attachment_prefix", ""),
+    ]
+    tags = attrs.get("tags", [])
+    if isinstance(tags, str):
+        parts.append(tags)
+    else:
+        try:
+            parts.extend(str(tag) for tag in tags if tag)
+        except Exception:
+            pass
+    return " ".join(str(part or "") for part in parts).lower()
+
+
+def _equipment_item_picker_terms(search_text):
+    return [term for term in str(search_text or "").strip().lower().split() if term]
+
+
+def _equipment_item_picker_matches(identifier, label, description, attrs, fallback_template, search_terms):
+    if not search_terms:
+        return True
+    blob = _equipment_item_picker_search_blob(identifier, label, description, attrs, fallback_template)
+    return all(term in blob for term in search_terms)
+
+
+def _equipment_item_recent_key(source_game, category):
+    return (_normalize_source_game(source_game), str(category or "None"))
+
+
+def _get_equipment_item_recents(source_game, category):
+    return list(_EQUIPMENT_ITEM_PICKER_RECENTS.get(_equipment_item_recent_key(source_game, category), []))
+
+
+def _remember_equipment_item_recent(source_game, category, item_name):
+    item_name = str(item_name or "").strip()
+    if not item_name:
+        return
+    key = _equipment_item_recent_key(source_game, category)
+    recents = [name for name in _EQUIPMENT_ITEM_PICKER_RECENTS.get(key, []) if name != item_name]
+    recents.insert(0, item_name)
+    _EQUIPMENT_ITEM_PICKER_RECENTS[key] = recents[:_EQUIPMENT_ITEM_PICKER_RECENT_LIMIT]
+
+
+def _sort_equipment_item_picker_rows(rows, source_game, category, sort_mode):
+    sort_mode = str(sort_mode or "NAME_ASC")
+    if sort_mode == "NAME_DESC":
+        rows.sort(key=lambda row: str(row.get("label", "") or row.get("identifier", "")).lower(), reverse=True)
+        return rows
+    if sort_mode == "RECENT":
+        recent_order = {
+            item_name: index
+            for index, item_name in enumerate(_get_equipment_item_recents(source_game, category))
+        }
+        rows.sort(
+            key=lambda row: (
+                recent_order.get(row.get("identifier", ""), 999999),
+                str(row.get("label", "") or row.get("identifier", "")).lower(),
+            )
+        )
+        return rows
+    rows.sort(key=lambda row: str(row.get("label", "") or row.get("identifier", "")).lower())
+    return rows
+
+
+def _get_default_item_picker_rows(context, entry, source_game="w3", search_text="", sort_mode="NAME_ASC", limit=None):
+    rows = []
+    match_count = 0
+    all_count = 0
+    search_terms = _equipment_item_picker_terms(search_text)
+
+    try:
+        items = entry.get_default_items(context)
+    except Exception:
+        items = [("None", "None", "")]
+
+    for item in items or [("None", "None", "")]:
+        all_count += 1
+        identifier = str(item[0] or "None")
+        label = str(item[1] or identifier)
+        description = str(item[2] or "")
+        attrs, fallback_template = _get_equipment_item_attrs_for_enum(entry, identifier, source_game)
+        if not _equipment_item_picker_matches(
+            identifier,
+            label,
+            description,
+            attrs,
+            fallback_template,
+            search_terms,
+        ):
+            continue
+        match_count += 1
+        rows.append({
+            "identifier": identifier,
+            "label": label,
+            "description": description,
+            "attrs": attrs,
+            "fallback_template": fallback_template,
+        })
+    _sort_equipment_item_picker_rows(rows, source_game, getattr(entry, "category", "None"), sort_mode)
+    if limit is not None:
+        rows = rows[:max(0, int(limit))]
+    return rows, match_count, all_count
+
+
+def _set_equipment_default_item(context, entry_index, item_name):
+    temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
+    if not temp_data or not (0 <= int(entry_index) < len(temp_data.equipment_entries)):
+        return False
+    entry = temp_data.equipment_entries[int(entry_index)]
+    entry.defaultItemName = str(item_name or "None")
+    _remember_equipment_item_recent(
+        getattr(entry, "source_game", "") or _get_temp_source_game(context),
+        getattr(entry, "category", "None"),
+        item_name,
+    )
+    try:
+        if context.area:
+            context.area.tag_redraw()
+    except Exception:
+            pass
+    return True
+
+
+def _encode_equipment_item_attrs(attrs):
+    if not isinstance(attrs, dict):
+        return "{}"
+    try:
+        return json.dumps(attrs, sort_keys=True, default=str)
+    except Exception:
+        return "{}"
+
+
+def _decode_equipment_item_attrs(attrs_json):
+    try:
+        value = json.loads(str(attrs_json or "{}"))
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _equipment_item_picker_filter_token(entry, entry_index, source_game, search_text, sort_mode):
+    try:
+        category = getattr(entry, "category", "") or "None"
+        item_name = getattr(entry, "defaultItemName", "") or "None"
+    except Exception:
+        category = "None"
+        item_name = "None"
+    return "\x1f".join((
+        str(entry_index),
+        _normalize_source_game(source_game),
+        str(category),
+        str(item_name),
+        str(search_text or ""),
+        str(sort_mode or "NAME_ASC"),
+    ))
+
+
+def _populate_equipment_item_picker_rows(context, entry, entry_index, source_game, search_text, sort_mode):
+    temp_data = _get_temp_equipment_data(context)
+    if temp_data is None or entry is None:
+        return 0, 0
+
+    source_game = _normalize_source_game(source_game or getattr(entry, "source_game", "") or "w3")
+    token = _equipment_item_picker_filter_token(entry, entry_index, source_game, search_text, sort_mode)
+    if getattr(temp_data, "item_picker_filter_token", "") == token:
+        return (
+            int(getattr(temp_data, "item_picker_match_count", 0) or 0),
+            int(getattr(temp_data, "item_picker_all_count", 0) or 0),
+        )
+
+    rows, match_count, all_count = _get_default_item_picker_rows(
+        context,
+        entry,
+        source_game=source_game,
+        search_text=search_text,
+        sort_mode=sort_mode,
+        limit=None,
+    )
+    current_name = str(getattr(entry, "defaultItemName", "") or "")
+    active_index = -1
+
+    previous_suppress = bool(getattr(temp_data, "item_picker_suppress_select", False))
+    temp_data.item_picker_suppress_select = True
+    try:
+        temp_data.item_picker_rows.clear()
+        for index, row_data in enumerate(rows):
+            row = temp_data.item_picker_rows.add()
+            identifier = str(row_data.get("identifier", "") or "None")
+            label = str(row_data.get("label", "") or identifier)
+            row.identifier = identifier
+            row.label = label
+            row.description = str(row_data.get("description", "") or "")
+            row.fallback_template = str(row_data.get("fallback_template", "") or "")
+            row.attrs_json = _encode_equipment_item_attrs(row_data.get("attrs", {}))
+            row.source_game = source_game
+            try:
+                row.name = label
+            except Exception:
+                pass
+            if identifier == current_name:
+                active_index = index
+        temp_data.item_picker_entry_index = int(entry_index)
+        temp_data.item_picker_source_game = source_game
+        temp_data.item_picker_match_count = int(match_count)
+        temp_data.item_picker_all_count = int(all_count)
+        temp_data.item_picker_filter_token = token
+        temp_data.item_picker_index = active_index
+    finally:
+        temp_data.item_picker_suppress_select = previous_suppress
+
+    return match_count, all_count
+
+
+def _get_equipment_item_picker_active_row(temp_data):
+    if temp_data is None:
+        return None
+    try:
+        index = int(getattr(temp_data, "item_picker_index", -1))
+    except Exception:
+        index = -1
+    if 0 <= index < len(temp_data.item_picker_rows):
+        return temp_data.item_picker_rows[index]
+    return None
+
+
+def _on_equipment_item_picker_index_changed(self, context):
+    if bool(getattr(self, "item_picker_suppress_select", False)):
+        return
+    active_row = _get_equipment_item_picker_active_row(self)
+    if active_row is None:
+        return
+    try:
+        entry_index = int(getattr(self, "item_picker_entry_index", -1))
+    except Exception:
+        entry_index = -1
+    if entry_index < 0:
+        return
+    _set_equipment_default_item(context, entry_index, getattr(active_row, "identifier", "None"))
+
+
+def _on_equipment_item_picker_filter_changed(self, context):
+    # Search / view / sort changes invalidate the current page offset.
+    try:
+        if int(getattr(self, "item_picker_page", 0) or 0) != 0:
+            self.item_picker_page = 0
+    except Exception:
+        pass
+
+
+def _equipment_picker_short_label(text, max_chars=32):
+    text = str(text or "")
+    if len(text) <= max_chars:
+        return text
+    return text[:max(0, max_chars - 3)].rstrip() + "..."
 
 
 def _apply_catalog_attributes_to_slot(slot, source_game=None):
@@ -4215,6 +5142,14 @@ class EquipmentDefinitionEntry(bpy.types.PropertyGroup):
         update=update_item_attributes,
     )
 
+    # The default item this category had when the entity was imported. The
+    # picker's "Default" button restores this so users can revert experiments.
+    import_default_item: bpy.props.StringProperty(
+        name="Imported Default Item",
+        default="None",
+        options={'HIDDEN'},
+    )
+
     # Store the selected equip_template for the current item
     equip_template: bpy.props.StringProperty(
         name="Equip Template",
@@ -4396,6 +5331,15 @@ class InventoryDefinitionEntry(bpy.types.PropertyGroup):
     slot_index: bpy.props.IntProperty(name="Slot Index", default=-1, options={'HIDDEN'})
 
 
+class EquipmentItemPickerRow(bpy.types.PropertyGroup):
+    identifier: bpy.props.StringProperty(name="Identifier", default="")
+    label: bpy.props.StringProperty(name="Name", default="")
+    description: bpy.props.StringProperty(name="Description", default="")
+    fallback_template: bpy.props.StringProperty(name="Template", default="")
+    attrs_json: bpy.props.StringProperty(name="Attributes", default="{}")
+    source_game: bpy.props.StringProperty(name="Source Game", default="w3")
+
+
 # Temporary data storage in WindowManager
 class WitcherUITempData(bpy.types.PropertyGroup):
     equipment_entries: bpy.props.CollectionProperty(type=EquipmentDefinitionEntry)
@@ -4405,9 +5349,9 @@ class WitcherUITempData(bpy.types.PropertyGroup):
     last_entity_state_token: bpy.props.StringProperty(default="")
     equipment_source_game: bpy.props.StringProperty(default="w3")
     auto_apply_equipment_selection: bpy.props.BoolProperty(
-        name="Auto Apply Dropdown Changes",
-        description="Immediately unload and reload the edited equipment slot when you change its category or item selection. This affects the current scene only",
-        default=False,
+        name="Auto Toggle",
+        description="Automatically unload and reload the changed equipment slot when you select a new asset.",
+        default=True,
     )
     suspend_auto_apply_updates: bpy.props.BoolProperty(default=False, options={'HIDDEN'})
 
@@ -4416,6 +5360,55 @@ class WitcherUITempData(bpy.types.PropertyGroup):
 
     inventory_entries: bpy.props.CollectionProperty(type=InventoryDefinitionEntry)
     inventory_entries_index: bpy.props.IntProperty()
+
+    item_picker_rows: bpy.props.CollectionProperty(type=EquipmentItemPickerRow)
+    item_picker_index: bpy.props.IntProperty(default=-1, update=_on_equipment_item_picker_index_changed)
+    item_picker_entry_index: bpy.props.IntProperty(default=-1, options={'HIDDEN'})
+    item_picker_source_game: bpy.props.StringProperty(default="w3", options={'HIDDEN'})
+    item_picker_filter_token: bpy.props.StringProperty(default="", options={'HIDDEN'})
+    item_picker_match_count: bpy.props.IntProperty(default=0, options={'HIDDEN'})
+    item_picker_all_count: bpy.props.IntProperty(default=0, options={'HIDDEN'})
+    item_picker_suppress_select: bpy.props.BoolProperty(default=False, options={'HIDDEN'})
+    # Live picker state. Stored here (not on the operator) so it survives the
+    # close+reopen the "close on select" popup mode uses to navigate pages.
+    item_picker_search: bpy.props.StringProperty(
+        name="Search",
+        default="",
+        options={'TEXTEDIT_UPDATE'},
+        update=_on_equipment_item_picker_filter_changed,
+    )
+    item_picker_view: bpy.props.EnumProperty(
+        name="View",
+        items=[
+            ('LIST', "List", "Show a list with large thumbnails", 'SHORTDISPLAY', 0),
+            ('GRID', "Grid", "Show a thumbnail grid", 'IMGDISPLAY', 1),
+        ],
+        default='LIST',
+        update=_on_equipment_item_picker_filter_changed,
+    )
+    item_picker_sort: bpy.props.EnumProperty(
+        name="Sort",
+        items=[
+            ('RECENT', "Recent", "Recently picked items first", 'TIME', 0),
+            ('NAME_ASC', "Name A-Z", "Sort by name ascending", 'SORTALPHA', 1),
+            ('NAME_DESC', "Name Z-A", "Sort by name descending", 'SORTALPHA', 2),
+        ],
+        default='NAME_ASC',
+        update=_on_equipment_item_picker_filter_changed,
+    )
+    item_picker_grid_size: bpy.props.EnumProperty(
+        name="Tile Size",
+        description="Thumbnail size in grid view",
+        items=[
+            ('S', "Small", "Small thumbnails (more per row)", 'NODE_TEXTURE', 0),
+            ('M', "Medium", "Medium thumbnails", 'TEXTURE', 1),
+            ('L', "Large", "Large thumbnails (asset-browser size)", 'IMAGE_DATA', 2),
+        ],
+        default='L',
+        update=_on_equipment_item_picker_filter_changed,
+    )
+    item_picker_page: bpy.props.IntProperty(default=0, min=0, options={'HIDDEN'})
+
 
 # Define the UI list to display equipment categories
 class EQUIPMENT_UL_CategoryList(bpy.types.UIList):
@@ -4495,55 +5488,278 @@ class EQUIPMENT_OT_SearchCategory(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class EQUIPMENT_OT_PickDefaultItem(bpy.types.Operator):
+    bl_idname = "witcher.equipment_pick_default_item"
+    bl_label = "Pick Item"
+    bl_description = "Pick this equipment item"
+    bl_options = {'INTERNAL'}
+
+    entry_index: bpy.props.IntProperty(default=-1, options={'HIDDEN'})
+    item_name: bpy.props.StringProperty(default="", options={'HIDDEN'})
+    # Full label shown as the hover tooltip — grid/list buttons truncate the
+    # visible text, so this lets users read the complete name on hover.
+    tooltip: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+
+    @classmethod
+    def description(cls, context, properties):
+        tip = str(getattr(properties, "tooltip", "") or "").strip()
+        return tip or cls.bl_description
+
+    def execute(self, context):
+        if not _set_equipment_default_item(context, self.entry_index, self.item_name):
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class EQUIPMENT_OT_ItemPickerPage(bpy.types.Operator):
+    bl_idname = "witcher.equipment_item_picker_page"
+    bl_label = "Picker Page"
+    bl_description = "Show the previous or next page of items"
+    bl_options = {'INTERNAL'}
+
+    direction: bpy.props.EnumProperty(
+        items=[('PREV', "Previous", ""), ('NEXT', "Next", "")],
+        default='NEXT',
+        options={'HIDDEN'},
+    )
+    max_page: bpy.props.IntProperty(default=0, options={'HIDDEN'})
+
+    def execute(self, context):
+        temp_data = _get_temp_equipment_data(context)
+        if temp_data is None:
+            return {'CANCELLED'}
+        page = int(getattr(temp_data, "item_picker_page", 0) or 0)
+        page += -1 if self.direction == 'PREV' else 1
+        temp_data.item_picker_page = max(0, min(page, max(0, int(self.max_page))))
+        # The dialog stays open (KEEP_OPEN) and redraws in place on the new page.
+        return {'FINISHED'}
+
+
 class EQUIPMENT_OT_SearchDefaultItem(bpy.types.Operator):
     bl_idname = "witcher.equipment_search_default_item"
-    bl_label = "Search Item"
+    bl_label = "Select Item"
     bl_description = "Search and pick an item for the selected category"
-    bl_property = "item_name"
 
     entry_index: bpy.props.IntProperty(default=-1, options={'HIDDEN'})
 
-    def _enum_default_items(self, context):
+    def _get_entry(self, context):
         temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
         if temp_data and 0 <= self.entry_index < len(temp_data.equipment_entries):
-            entry = temp_data.equipment_entries[self.entry_index]
-            try:
-                items = entry.get_default_items(context)
-                if items:
-                    cache_key = (
-                        "default_item",
-                        int(self.entry_index),
-                        str(getattr(entry, "category", "") or "None"),
-                        _get_temp_source_game(context),
-                    )
-                    return _cache_operator_enum_items(cache_key, items)
-            except Exception:
-                pass
-        return [("None", "None", "")]
-
-    item_name: bpy.props.EnumProperty(name="Item", items=_enum_default_items)
+            return temp_data.equipment_entries[self.entry_index]
+        return None
 
     def invoke(self, context, event):
-        temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
-        if temp_data and 0 <= self.entry_index < len(temp_data.equipment_entries):
-            current = temp_data.equipment_entries[self.entry_index].defaultItemName
-            if current:
-                try:
-                    self.item_name = current
-                except Exception:
-                    pass
-        context.window_manager.invoke_search_popup(self)
+        temp_data = _get_temp_equipment_data(context)
+        entry = self._get_entry(context)
+        if temp_data is None or entry is None:
+            return {'CANCELLED'}
+
+        temp_data.item_picker_entry_index = int(self.entry_index)
+        # Fresh open: clear the transient search/page state.
+        temp_data.item_picker_search = ""
+        temp_data.item_picker_page = 0
+
+        # Warm the placeholder so the first frame already shows same-sized tiles.
+        _get_equipment_placeholder_icon_id()
+
+        # Draggable dialog with a title bar to grab; stays open while you browse
+        # so you can try several items. Picking applies instantly; "Done"/Esc/
+        # click-away closes it. confirm_text is only available on Blender 4.1+.
+        try:
+            context.window_manager.invoke_props_dialog(
+                self,
+                width=_EQUIPMENT_ITEM_PICKER_WIDTH,
+                confirm_text="Done",
+            )
+        except TypeError:
+            context.window_manager.invoke_props_dialog(self, width=_EQUIPMENT_ITEM_PICKER_WIDTH)
         return {'RUNNING_MODAL'}
 
+    @staticmethod
+    def _row_icon_id(context, row):
+        attrs = _decode_equipment_item_attrs(getattr(row, "attrs_json", "{}"))
+        return _get_cached_or_queue_equipment_item_icon_id(
+            context,
+            getattr(row, "identifier", ""),
+            attrs,
+            source_game=getattr(row, "source_game", "") or "w3",
+            fallback_template=getattr(row, "fallback_template", ""),
+        )
+
+    def _pick_op(self, layout, identifier, *, text, current, icon_value=None, tooltip=None):
+        kwargs = {"text": text, "depress": (identifier == current)}
+        if icon_value is not None:
+            kwargs["icon_value"] = icon_value
+        op = layout.operator("witcher.equipment_pick_default_item", **kwargs)
+        op.entry_index = self.entry_index
+        op.item_name = identifier
+        if tooltip:
+            op.tooltip = tooltip
+        return op
+
+    def _draw_grid(self, context, layout, page_rows, current, placeholder_id, columns, scale, label_chars):
+        grid = layout.grid_flow(
+            row_major=True,
+            columns=columns,
+            even_columns=True,
+            even_rows=True,
+            align=True,
+        )
+        for row in page_rows:
+            identifier = getattr(row, "identifier", "") or "None"
+            label = getattr(row, "label", "") or identifier
+            icon_id = self._row_icon_id(context, row) or placeholder_id
+
+            cell = grid.box().column(align=True)
+            icon_row = cell.row(align=True)
+            icon_row.alignment = 'CENTER'
+            icon_row.template_icon(icon_value=icon_id, scale=scale)
+            self._pick_op(
+                cell,
+                identifier,
+                text=_equipment_picker_short_label(label, max_chars=label_chars),
+                current=current,
+                tooltip=label,
+            )
+
+        # Pad the final row so the tiles stay aligned in a clean rectangle.
+        fill = (columns - (len(page_rows) % columns)) % columns
+        for _ in range(fill):
+            spacer = grid.column(align=True)
+            spacer.enabled = False
+            spacer.label(text="")
+
+    def _draw_list(self, context, layout, page_rows, current, placeholder_id):
+        col = layout.column(align=True)
+        for row in page_rows:
+            identifier = getattr(row, "identifier", "") or "None"
+            label = getattr(row, "label", "") or identifier
+            icon_id = self._row_icon_id(context, row) or placeholder_id
+
+            # Large (~3x) thumbnail on the left, clickable label filling the row.
+            line = col.box().row(align=True)
+            thumb = line.row(align=True)
+            thumb.alignment = 'LEFT'
+            thumb.template_icon(icon_value=icon_id, scale=_EQUIPMENT_ITEM_PICKER_LIST_ICON_SCALE)
+            label_col = line.column(align=True)
+            label_col.scale_y = _EQUIPMENT_ITEM_PICKER_LIST_ICON_SCALE
+            self._pick_op(
+                label_col,
+                identifier,
+                text=_equipment_picker_short_label(label, max_chars=_EQUIPMENT_ITEM_PICKER_LIST_LABEL_CHARS),
+                current=current,
+                tooltip=label,
+            )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.separator()  # a little headway under the (draggable) title bar
+        temp_data = _get_temp_equipment_data(context)
+        entry = self._get_entry(context)
+        if temp_data is None or entry is None:
+            layout.label(text="No equipment entry selected", icon='ERROR')
+            return
+
+        source_game = getattr(entry, "source_game", "") or _get_temp_source_game(context)
+        is_grid = (temp_data.item_picker_view == 'GRID')
+        placeholder_id = _get_equipment_placeholder_icon_id()
+        search_text = str(temp_data.item_picker_search or "")
+        grid_columns, grid_scale, grid_label_chars = _equipment_grid_size_params(temp_data.item_picker_grid_size)
+
+        # --- Search / view / sort header --------------------------------------
+        header = layout.row(align=True)
+        header.prop(temp_data, "item_picker_search", text="", icon='VIEWZOOM')
+        header.prop(temp_data, "item_picker_view", text="", icon_only=True, expand=True)
+        if is_grid:
+            # Compact size dropdown, same pattern as the asset browser.
+            header.prop(temp_data, "item_picker_grid_size", text="", icon_only=True)
+        header.prop(temp_data, "item_picker_sort", text="")
+        header.prop(temp_data, "auto_apply_equipment_selection", text="", icon='FILE_REFRESH')
+
+        # --- Filter + sort (token-cached so this is cheap on redraw) ----------
+        match_count, all_count = _populate_equipment_item_picker_rows(
+            context,
+            entry,
+            self.entry_index,
+            source_game,
+            search_text,
+            temp_data.item_picker_sort,
+        )
+        rows = list(temp_data.item_picker_rows)
+        total = len(rows)
+
+        # --- Paging math (read-only clamp; the page op commits writes) --------
+        page_size = (
+            grid_columns * _EQUIPMENT_ITEM_PICKER_GRID_PAGE_ROWS
+            if is_grid
+            else _EQUIPMENT_ITEM_PICKER_LIST_PAGE_ROWS
+        )
+        page_count = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(int(temp_data.item_picker_page), page_count - 1))
+
+        # --- Status line: result count + current value + clear ----------------
+        info = layout.row(align=True)
+        count_box = info.row(align=True)
+        count_box.alignment = 'LEFT'
+        if search_text:
+            count_box.label(text=f"{match_count} of {all_count} items", icon='VIEWZOOM')
+        else:
+            count_box.label(text=f"{total} items", icon='PRESET')
+
+        current = str(getattr(entry, "defaultItemName", "") or "None")
+        current_box = info.row(align=True)
+        current_box.alignment = 'CENTER'
+        current_box.label(text="Current: " + _equipment_picker_short_label(current, max_chars=28))
+
+        action_box = info.row(align=True)
+        action_box.alignment = 'RIGHT'
+        import_default = str(getattr(entry, "import_default_item", "") or "None")
+        default_btn = action_box.row(align=True)
+        # Only enable when there is an imported default that differs from current.
+        default_btn.enabled = bool(import_default) and import_default != current
+        default_op = default_btn.operator(
+            "witcher.equipment_pick_default_item", text="Default", icon='LOOP_BACK'
+        )
+        default_op.entry_index = self.entry_index
+        default_op.item_name = import_default
+        clear_op = action_box.operator("witcher.equipment_pick_default_item", text="None", icon='X')
+        clear_op.entry_index = self.entry_index
+        clear_op.item_name = "None"
+
+        # --- Pagination (character-browser style prev / page / next) ----------
+        if page_count > 1:
+            nav = layout.row(align=True)
+            nav.alignment = 'CENTER'
+            prev_op = nav.operator("witcher.equipment_item_picker_page", text="", icon='TRIA_LEFT')
+            prev_op.direction = 'PREV'
+            prev_op.max_page = page_count - 1
+            nav.label(text=f"Page {page + 1} / {page_count}")
+            next_op = nav.operator("witcher.equipment_item_picker_page", text="", icon='TRIA_RIGHT')
+            next_op.direction = 'NEXT'
+            next_op.max_page = page_count - 1
+
+        if total == 0:
+            empty = layout.box()
+            empty.alert = True
+            empty.label(text="No items match your search.", icon='ERROR')
+            return
+
+        # --- Item tiles (only the current page resolves icons) ----------------
+        start = page * page_size
+        page_rows = rows[start:start + page_size]
+
+        body = layout.box()
+        if is_grid:
+            self._draw_grid(
+                context, body, page_rows, current, placeholder_id,
+                grid_columns, grid_scale, grid_label_chars,
+            )
+        else:
+            self._draw_list(context, body, page_rows, current, placeholder_id)
+
     def execute(self, context):
-        temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
-        if not temp_data or not (0 <= self.entry_index < len(temp_data.equipment_entries)):
-            return {'CANCELLED'}
-        entry = temp_data.equipment_entries[self.entry_index]
-        try:
-            entry.defaultItemName = self.item_name
-        except Exception:
-            return {'CANCELLED'}
+        # Selection is committed by the per-item pick operator. In dialog mode
+        # this also runs when the user confirms with OK — nothing extra to do.
         return {'FINISHED'}
 
 # Function to extract categories and items from XML files, including additional attributes
@@ -5563,6 +6779,7 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                             entry.source_game = temp_data.equipment_source_game
                             entry.category = category_val
                             entry.defaultItemName = default_item_name
+                            entry.import_default_item = default_item_name
                             entry.update_item_attributes(context)
 
                         # Also create persistent equipment_slots from appearance data
@@ -5942,9 +7159,13 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                                   text=entry.category or "None", icon='DOWNARROW_HLT')
                 op.entry_index = index
                 row = box.row(align=True)
+                row.scale_y = 2.2
                 row.label(text="Item:")
-                op = row.operator("witcher.equipment_search_default_item",
-                                  text=entry.defaultItemName or "None", icon='DOWNARROW_HLT')
+                op = row.operator(
+                    "witcher.equipment_search_default_item",
+                    text=entry.defaultItemName or "None",
+                    icon='DOWNARROW_HLT',
+                )
                 op.entry_index = index
                 box.prop(entry, "equip_template")
                 box.prop(entry, "equip_slot")
@@ -6124,6 +7345,7 @@ class EQUIPMENT_OT_AddCategory(bpy.types.Operator):
                 entry.defaultItemName = item_items[0][0] if item_items else "None"
             except Exception:
                 entry.defaultItemName = "None"
+            entry.import_default_item = entry.defaultItemName
         finally:
             _set_temp_equipment_auto_apply_suspended(context, False)
         temp_data.equipment_entries_index = len(temp_data.equipment_entries) - 1
@@ -6397,6 +7619,7 @@ def sync_equipment_slots_to_temp(context, rig_settings):
             entry.source_game = _normalize_source_game(getattr(slot, "source_game", "") or temp_data.equipment_source_game)
             entry.category = slot.category
             entry.defaultItemName = item_name
+            entry.import_default_item = item_name
             entry.equip_template = slot.equip_template or ""
             entry.resolved_repo_path = slot.resolved_repo_path or ""
             entry.equip_slot = slot.equip_slot or ""
@@ -8442,11 +9665,14 @@ classes = [
     EquipmentDefinitionEntry,
     IncludedTemplateEntry,
     InventoryDefinitionEntry,
+    EquipmentItemPickerRow,
     WitcherUITempData,
     EQUIPMENT_UL_CategoryList,
     EQUIPMENT_UL_InventoryList,
     EQUIPMENT_UL_IncludedTemplateList,
     EQUIPMENT_OT_SearchCategory,
+    EQUIPMENT_OT_PickDefaultItem,
+    EQUIPMENT_OT_ItemPickerPage,
     EQUIPMENT_OT_SearchDefaultItem,
     EQUIPMENT_OT_AddCategory,
     EQUIPMENT_OT_RemoveCategory,
@@ -8497,6 +9723,9 @@ def register():
 
 def unregister():
     _unregister_equipment_load_handler()
+    _clear_equipment_item_icon_cache()
+    _clear_equipment_placeholder_icon()
+    _clear_equipment_icon_previews()
     if hasattr(bpy.types.WindowManager, "witcherui_temp_data"):
         del bpy.types.WindowManager.witcherui_temp_data
     for c in reversed(classes):

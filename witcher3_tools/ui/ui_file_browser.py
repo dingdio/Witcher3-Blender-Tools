@@ -3125,6 +3125,7 @@ def _get_browser_item_icon_info(context, cache_type: str, item_path: str, loadmo
             "is_dummy": is_dummy,
             "type_label": type_label,
             "has_preview_target": bool(preview_target),
+            "preview_path": "",
         }
 
     preview_key = f"{cache_key}|{preview_path.lower()}"
@@ -3152,6 +3153,10 @@ def _get_browser_item_icon_info(context, cache_type: str, item_path: str, loadmo
         "is_dummy": is_dummy,
         "type_label": type_label,
         "has_preview_target": bool(preview_target),
+        # Absolute path of the resolved preview image on disk. Callers that want
+        # to persist an icon across sessions can copy/reload this file directly
+        # instead of re-running the (expensive) resolution.
+        "preview_path": preview_path,
     }
 
 
