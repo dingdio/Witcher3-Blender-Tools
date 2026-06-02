@@ -203,14 +203,17 @@ def _sync_path_to_address_bar(self, context):
     if self.path_input != self.current_folder:
         self.path_input = self.current_folder
     self.file_page_index = 0
+    self.search_page_index = 0
 
 
 def _on_browser_query_filter_update(self, context):
     self.file_page_index = 0
+    self.search_page_index = 0
 
 
 def _on_browser_grid_layout_update(self, context):
     self.file_page_index = 0
+    self.search_page_index = 0
 
 
 def _on_external_extract_root_update(self, context):
@@ -290,6 +293,7 @@ class MySettings(PropertyGroup):
     # Phase 2 QoL
     path_input: StringProperty(default="", description="Navigate to path")
     file_page_index: IntProperty(default=0, min=0, options={'HIDDEN', 'SKIP_SAVE'})
+    search_page_index: IntProperty(default=0, min=0, options={'HIDDEN', 'SKIP_SAVE'})
     file_display_mode: EnumProperty(
         name="Layout",
         description="Display files as a list or icon grid",
@@ -298,6 +302,7 @@ class MySettings(PropertyGroup):
             ('GRID', 'Grid', 'Show files as icon tiles', 'IMGDISPLAY', 1),
         ],
         default='LIST',
+        update=_on_browser_grid_layout_update,
     )
     grid_size_mode_live: EnumProperty(
         name="Icon Size",
@@ -668,6 +673,7 @@ _EXTERNAL_BROWSER_EXPORT_STATUS = {
 DEFAULT_BROWSER_FILE_PAGE_SIZE = 0
 MIN_BROWSER_FILE_PAGE_SIZE = 0
 MAX_BROWSER_FILE_PAGE_SIZE = 500
+BROWSER_SEARCH_RESULT_LIMIT = 1000
 DEFAULT_BROWSER_GRID_MAX_ROWS = 0
 MIN_BROWSER_GRID_MAX_ROWS = 0
 MAX_BROWSER_GRID_MAX_ROWS = 12
@@ -1289,6 +1295,22 @@ def _sort_browser_search_results(results, browser):
             return (ext, path.lower())
     else:
         key_fn = lambda path: path.lower()
+    return sorted(results, key=key_fn, reverse=not ascending)
+
+
+def _sort_browser_global_search_results(results, browser):
+    """Sort global search result tuples as (cache_type, path)."""
+    sort_by, ascending = _get_browser_sort_prefs(browser)
+    if sort_by == "EXT":
+        def key_fn(result):
+            cache_type, path = result
+            dot = path.rfind(".")
+            ext = path[dot + 1:].lower() if dot >= 0 else ""
+            return (ext, path.lower(), cache_type.lower())
+    else:
+        def key_fn(result):
+            cache_type, path = result
+            return (path.lower(), cache_type.lower())
     return sorted(results, key=key_fn, reverse=not ascending)
 
 
@@ -4043,22 +4065,24 @@ def get_cached_search_results(query, cache_type, folder_struct, loadmods=False):
         return _search_cache['results']
 
     # Perform the search
-    MAX_RESULTS = 100
     results = []
 
     if cache_type:
         # Search within specific cache (uses folder_structure.index)
-        results = folder_struct.search_items(query, max_results=MAX_RESULTS)
+        results = folder_struct.search_items(query, max_results=BROWSER_SEARCH_RESULT_LIMIT)
     else:
         # Global search across all caches - do this ONCE
-        for ct, loader in [
+        cache_loaders = [
             ("Bundle", lambda: LoadBundleManager(loadmods=loadmods)),
             (WITCHER2_BUNDLE_CACHE_TYPE, lambda: LoadWitcher2BundleManager()),
             (WITCHER2_SPEECH_CACHE_TYPE, lambda: LoadWitcher2SpeechManager()),
             ("Collision", lambda: LoadCollisionManager(loadmods=loadmods)),
             ("Texture", lambda: LoadTextureManager(loadmods=loadmods)),
             ("Sound", lambda: LoadSoundManager(loadmods=loadmods)),
-        ]:
+        ]
+        for ct, loader in cache_loaders:
+            if len(results) >= BROWSER_SEARCH_RESULT_LIMIT:
+                break
             try:
                 manager = loader()
                 tokens = query.lower().replace('_', ' ').split()
@@ -4072,7 +4096,7 @@ def get_cached_search_results(query, cache_type, folder_struct, loadmods=False):
                     normalized = key_str.lower().replace('_', ' ')
                     if all(token in normalized for token in tokens):
                         results.append((ct, key_str))
-                        if len(results) >= MAX_RESULTS * 4:
+                        if len(results) >= BROWSER_SEARCH_RESULT_LIMIT:
                             break
             except Exception as e:
                 log.error("Failed to search %s: %s", ct, e)
@@ -5524,6 +5548,411 @@ class SimpleFileBrowser(Operator):
         for line_text in draw_name_lines[:target_line_count]:
             name_col.label(text=line_text, translate=False)
 
+    def _get_search_result_display_label(
+        self,
+        context,
+        witcher_file_browser,
+        cache_type: str,
+        item_path: str,
+        *,
+        grid_mode: bool = False,
+        include_cache: bool = False,
+    ) -> str:
+        normalized_path = _normalize_virtual_path(item_path)
+        if grid_mode:
+            if "\\" in normalized_path:
+                parent_path, leaf_name = normalized_path.rsplit("\\", 1)
+            else:
+                parent_path, leaf_name = "", normalized_path
+            display_label = leaf_name or normalized_path
+            parent_leaf = parent_path.rsplit("\\", 1)[-1] if parent_path else ""
+            if parent_leaf:
+                display_label = f"{display_label} ({parent_leaf})"
+            if include_cache:
+                cache_abbrev = get_effective_cache_type(cache_type)[:3] or cache_type[:3]
+                display_label = f"[{cache_abbrev}] {display_label}"
+        else:
+            display_label = normalized_path
+
+        if get_effective_cache_type(cache_type) == "Collision":
+            ext = collision_extension_map.get(normalized_path, "")
+            if ext:
+                display_label = f"{display_label} [{ext}]"
+
+        source_label = get_source_label(
+            context,
+            normalized_path,
+            loadmods=witcher_file_browser.loadmods,
+            cache_type=cache_type,
+        )
+        if source_label.startswith("mod:"):
+            display_label = f"{display_label} [src:{source_label[4:]}]"
+        elif source_label == "vanilla" and witcher_file_browser.loadmods:
+            display_label = f"{display_label} [src:vanilla]"
+        elif witcher_file_browser.use_mods_priority:
+            mod_label = get_mod_override_label(normalized_path, loadmods=witcher_file_browser.loadmods)
+            if mod_label:
+                display_label = f"{display_label} [ovr:{mod_label}]"
+
+        w2ter_label = get_w2ter_buffer_label(normalized_path)
+        if w2ter_label:
+            display_label = f"{display_label} [{w2ter_label}]"
+        return display_label
+
+    def _draw_search_result_toolbar(
+        self,
+        col,
+        context,
+        witcher_file_browser,
+        stats,
+        page_size: int,
+        *,
+        limit_reached: bool = False,
+    ):
+        header = col.row(align=True)
+        if stats["total"] > page_size:
+            header.label(
+                text=f"{stats['visible_start']}-{stats['visible_end']} / {stats['total']} result(s)",
+                icon='FILE',
+            )
+        else:
+            header.label(text=f"{stats['total']} result(s)", icon='FILE')
+        header.operator("witcher.copy_all_search_paths", text="Copy All Paths", icon="COPYDOWN")
+
+        tools_row = col.row(align=True)
+        layout_mode = tools_row.row(align=True)
+        layout_mode.prop(witcher_file_browser, "file_display_mode", text="", icon_only=True, expand=True)
+        tools_row.separator_spacer()
+        tools_sub = tools_row.row(align=True)
+        tools_sub.prop(witcher_file_browser, "sort_by", text="", icon_only=True)
+        asc_icon = 'SORT_ASC' if witcher_file_browser.sort_ascending else 'SORT_DESC'
+        tools_sub.prop(witcher_file_browser, "sort_ascending", text="", icon=asc_icon, toggle=True)
+        size_sub = tools_sub.row(align=True)
+        size_sub.enabled = witcher_file_browser.file_display_mode == 'GRID'
+        size_sub.prop(witcher_file_browser, "grid_size_mode_live", text="", icon_only=True)
+
+        if stats["total"] > page_size:
+            page_row = col.row(align=True)
+            page_row.scale_y = 0.9
+            page_row.label(text=f"Page {stats['page_index'] + 1} / {stats['total_pages']}")
+            prev_row = page_row.row(align=True)
+            prev_row.enabled = stats["page_index"] > 0
+            prev_row.operator("witcher.browser_page", text="<").action = "prev"
+            next_row = page_row.row(align=True)
+            next_row.enabled = stats["page_index"] < (stats["total_pages"] - 1)
+            next_row.operator("witcher.browser_page", text=">").action = "next"
+
+        if limit_reached:
+            col.label(text=f"Search capped at {BROWSER_SEARCH_RESULT_LIMIT} matches", icon='INFO')
+
+    def _draw_search_result_action_buttons(
+        self,
+        layout,
+        context,
+        witcher_file_browser,
+        cache_type: str,
+        item_path: str,
+        *,
+        is_global: bool,
+        file_exists: bool,
+        preview_slot: bool,
+    ):
+        if preview_slot:
+            _add_browser_preview_button_slot(
+                layout,
+                context,
+                cache_type,
+                item_path,
+                loadmods=witcher_file_browser.loadmods,
+            )
+        else:
+            _add_browser_preview_button(
+                layout,
+                context,
+                cache_type,
+                item_path,
+                loadmods=witcher_file_browser.loadmods,
+            )
+
+        copy_op = layout.operator("witcher.copy_path", text="", icon="COPYDOWN")
+        copy_op.path = item_path
+
+        if is_global:
+            op_goto = layout.operator("witcher.goto_global_search_result", text="", icon='FILE_PARENT')
+            op_goto.cache_type = cache_type
+        else:
+            op_goto = layout.operator("witcher.goto_search_result", text="", icon='FILE_PARENT')
+        op_goto.file_path = item_path
+
+        loc_sub = layout.row(align=True)
+        loc_sub.enabled = file_exists
+        op_loc = loc_sub.operator("witcher.open_file_location", text="", icon="FILEBROWSER")
+        op_loc.file_path = item_path
+        op_loc.cache_type = cache_type
+
+        if cache_supports_sound_preview(cache_type):
+            is_playing = _sound_preview_matches(cache_type, item_path)
+            op_sound = layout.operator(
+                "witcher.sound_preview_toggle",
+                text="",
+                icon='CANCEL' if is_playing else 'PLAY',
+            )
+            op_sound.file_path = item_path
+            op_sound.cache_type = cache_type
+
+        if cache_supports_scene_import(cache_type):
+            if is_global:
+                op = layout.operator("witcher.file_action_global_import", text="", icon='IMPORT')
+                op.cache_type = cache_type
+            else:
+                op = layout.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
+        else:
+            if is_global:
+                op = layout.operator("witcher.file_action_global_export", text="", icon='EXPORT')
+                op.cache_type = cache_type
+            else:
+                op = layout.operator("witcher.file_action", text="", icon='EXPORT')
+        op.file_path = item_path
+
+        stats_op = layout.operator("witcher.file_item_stats", text="", icon='INFO')
+        stats_op.file_path = item_path
+        stats_op.cache_type = cache_type
+        stats_op.loadmods = witcher_file_browser.loadmods
+
+    def _draw_search_result_list_row(
+        self,
+        col,
+        context,
+        witcher_file_browser,
+        cache_type: str,
+        item_path: str,
+        *,
+        is_global: bool = False,
+    ):
+        if is_global:
+            row_split = col.split(factor=0.1, align=True)
+            cache_abbrev = get_effective_cache_type(cache_type)[:3] or cache_type[:3]
+            row_split.label(text=f"[{cache_abbrev}]")
+            path_btn_split = row_split.split(factor=0.78, align=True)
+        else:
+            path_btn_split = col.split(factor=0.70, align=True)
+
+        path_row = path_btn_split.row(align=True)
+        file_exists, _file_size = get_file_info(
+            context,
+            cache_type,
+            item_path,
+            loadmods=witcher_file_browser.loadmods,
+        )
+        status_icon = get_status_icon(
+            context,
+            cache_type,
+            item_path,
+            loadmods=witcher_file_browser.loadmods,
+        )
+        path_row.label(text="", icon=status_icon)
+        display_label = self._get_search_result_display_label(
+            context,
+            witcher_file_browser,
+            cache_type,
+            item_path,
+        )
+        icon_info = _get_browser_item_icon_info(
+            context,
+            cache_type,
+            item_path,
+            loadmods=witcher_file_browser.loadmods,
+        )
+        icon_id = int(icon_info.get("icon_id", 0) or 0)
+        _draw_browser_list_preview_label(path_row, display_label, icon_id, fallback_icon='FILE')
+
+        btns = path_btn_split.row(align=True)
+        self._draw_search_result_action_buttons(
+            btns,
+            context,
+            witcher_file_browser,
+            cache_type,
+            item_path,
+            is_global=is_global,
+            file_exists=file_exists,
+            preview_slot=True,
+        )
+
+    def _draw_search_result_grid_entry(
+        self,
+        grid,
+        context,
+        witcher_file_browser,
+        cache_type: str,
+        item_path: str,
+        display_label: str,
+        *,
+        is_global: bool,
+        grid_columns: int,
+        name_lines,
+        reserved_name_lines: int,
+    ):
+        box = grid.box()
+        icon_info = _get_browser_item_icon_info(
+            context,
+            cache_type,
+            item_path,
+            loadmods=witcher_file_browser.loadmods,
+        )
+        status_icon = get_status_icon(
+            context,
+            cache_type,
+            item_path,
+            loadmods=witcher_file_browser.loadmods,
+        )
+        file_exists, _file_size = get_file_info(
+            context,
+            cache_type,
+            item_path,
+            loadmods=witcher_file_browser.loadmods,
+        )
+
+        icon_row = box.row()
+        icon_row.alignment = 'CENTER'
+        icon_id = int(icon_info.get("icon_id", 0) or 0)
+        if icon_id:
+            icon_row.template_icon(icon_value=icon_id, scale=_get_browser_grid_icon_scale(context, columns=grid_columns))
+        else:
+            icon_row.label(text="", icon=status_icon or 'FILE')
+
+        actions_row = box.row(align=True)
+        self._draw_search_result_action_buttons(
+            actions_row,
+            context,
+            witcher_file_browser,
+            cache_type,
+            item_path,
+            is_global=is_global,
+            file_exists=file_exists,
+            preview_slot=False,
+        )
+
+        draw_name_lines = [str(line or "") for line in (name_lines or [display_label])]
+        target_line_count = max(1, int(reserved_name_lines or len(draw_name_lines)))
+        while len(draw_name_lines) < target_line_count:
+            draw_name_lines.append(" ")
+        name_col = box.column(align=True)
+        for line_text in draw_name_lines[:target_line_count]:
+            name_col.label(text=line_text, translate=False)
+
+    def _draw_search_results_grid(
+        self,
+        col,
+        context,
+        witcher_file_browser,
+        results,
+        *,
+        is_global: bool,
+    ):
+        grid_columns = _get_browser_grid_columns(context)
+        grid_entries = []
+        reserved_name_lines = 1
+        for result in results:
+            if is_global:
+                cache_type, item_path = result
+            else:
+                cache_type, item_path = witcher_file_browser.active_cache_type, result
+            display_label = self._get_search_result_display_label(
+                context,
+                witcher_file_browser,
+                cache_type,
+                item_path,
+                grid_mode=True,
+                include_cache=is_global,
+            )
+            name_lines = _split_grid_display_name_lines(
+                context,
+                display_label,
+                columns=grid_columns,
+            )
+            grid_entries.append((cache_type, item_path, display_label, name_lines))
+            reserved_name_lines = max(reserved_name_lines, len(name_lines))
+
+        grid = col.grid_flow(
+            row_major=True,
+            columns=grid_columns,
+            even_columns=True,
+            even_rows=True,
+            align=True,
+        )
+        for cache_type, item_path, display_label, name_lines in grid_entries:
+            self._draw_search_result_grid_entry(
+                grid,
+                context,
+                witcher_file_browser,
+                cache_type,
+                item_path,
+                display_label,
+                is_global=is_global,
+                grid_columns=grid_columns,
+                name_lines=name_lines,
+                reserved_name_lines=reserved_name_lines,
+            )
+
+        placeholder_count = (grid_columns - (len(grid_entries) % grid_columns)) % grid_columns
+        for _ in range(placeholder_count):
+            placeholder = grid.column(align=True)
+            placeholder.enabled = False
+            placeholder.label(text="")
+
+    def _draw_search_results(
+        self,
+        layout,
+        context,
+        witcher_file_browser,
+        results,
+        *,
+        is_global: bool,
+        limit_reached: bool = False,
+    ):
+        col = layout.column(align=True)
+        if not results:
+            col.label(text="No results found", icon='ERROR')
+            return
+
+        page_size = _get_browser_file_page_size(context, witcher_file_browser.file_display_mode)
+        stats = _get_browser_page_stats(results, witcher_file_browser.search_page_index, page_size)
+        if witcher_file_browser.search_page_index != stats["page_index"]:
+            witcher_file_browser.search_page_index = stats["page_index"]
+
+        self._draw_search_result_toolbar(
+            col,
+            context,
+            witcher_file_browser,
+            stats,
+            page_size,
+            limit_reached=limit_reached,
+        )
+        col.separator(factor=0.3)
+
+        if witcher_file_browser.file_display_mode == 'GRID':
+            self._draw_search_results_grid(
+                col,
+                context,
+                witcher_file_browser,
+                stats["items"],
+                is_global=is_global,
+            )
+        else:
+            for result in stats["items"]:
+                if is_global:
+                    cache_type, item_path = result
+                else:
+                    cache_type, item_path = witcher_file_browser.active_cache_type, result
+                self._draw_search_result_list_row(
+                    col,
+                    context,
+                    witcher_file_browser,
+                    cache_type,
+                    item_path,
+                    is_global=is_global,
+                )
+
     def draw(self, context):
         layout = self.layout
         witcher_file_browser = context.scene.witcher_file_browser
@@ -5761,102 +6190,20 @@ class SimpleFileBrowser(Operator):
 
         # If searching, show search results (uses cached results)
         if witcher_file_browser.search_query:
-            col = layout.column(align=True)
-            MAX_SEARCH_RESULTS = 100
             search_results = get_cached_search_results(witcher_file_browser.search_query, witcher_file_browser.active_cache_type, folder_structure, loadmods=witcher_file_browser.loadmods)
+            search_limit_reached = len(search_results) >= BROWSER_SEARCH_RESULT_LIMIT
             filter_text = witcher_file_browser.extension_filter.strip().lower()
             if filter_text:
                 search_results = [item for item in search_results if filter_text in item.lower()]
             search_results = _sort_browser_search_results(search_results, witcher_file_browser)
-            if not search_results:
-                col.label(text="No results found", icon='ERROR')
-            else:
-                results_header = col.row(align=True)
-                capped = search_results[:MAX_SEARCH_RESULTS]
-                results_header.label(text=f"{len(capped)} result(s)", icon='FILE')
-                results_header.operator("witcher.copy_all_search_paths", text="Copy All Paths", icon="COPYDOWN")
-                col.separator(factor=0.3)
-                for item in capped:
-                    # Use split for path / buttons (go to source + import)
-                    row_split = col.split(factor=0.70, align=True)
-                    # Checkmark indicator (always present for alignment)
-                    file_exists, file_size = get_file_info(context, witcher_file_browser.active_cache_type, item, loadmods=witcher_file_browser.loadmods)
-                    path_row = row_split.row(align=True)
-                    source_label = get_source_label(
-                        context,
-                        item,
-                        loadmods=witcher_file_browser.loadmods,
-                        cache_type=witcher_file_browser.active_cache_type,
-                    )
-                    status_icon = get_status_icon(
-                        context,
-                        witcher_file_browser.active_cache_type,
-                        item,
-                        loadmods=witcher_file_browser.loadmods,
-                    )
-                    path_row.label(text="", icon=status_icon)
-                    display_label = item
-                    if get_effective_cache_type(witcher_file_browser.active_cache_type) == "Collision":
-                        ext = collision_extension_map.get(item, "")
-                        if ext:
-                            display_label = f"{display_label} [{ext}]"
-                    if source_label.startswith("mod:"):
-                        display_label = f"{display_label} [src:{source_label[4:]}]"
-                    elif source_label == "vanilla" and witcher_file_browser.loadmods:
-                        display_label = f"{display_label} [src:vanilla]"
-                    elif witcher_file_browser.use_mods_priority:
-                        mod_label = get_mod_override_label(item, loadmods=witcher_file_browser.loadmods)
-                        if mod_label:
-                            display_label = f"{display_label} [ovr:{mod_label}]"
-                    icon_info = _get_browser_item_icon_info(
-                        context,
-                        witcher_file_browser.active_cache_type,
-                        item,
-                        loadmods=witcher_file_browser.loadmods,
-                    )
-                    icon_id = int(icon_info.get("icon_id", 0) or 0)
-                    _draw_browser_list_preview_label(path_row, display_label, icon_id, fallback_icon='FILE')
-                    btns = row_split.row(align=True)
-                    # Copy path
-                    copy_op = btns.operator("witcher.copy_path", text="", icon="COPYDOWN")
-                    copy_op.path = item
-                    # Go to source button - navigate to containing folder
-                    op_goto = btns.operator("witcher.goto_search_result", text="", icon='FILE_PARENT')
-                    op_goto.file_path = item
-                    # Open file location on disk (always present for alignment)
-                    loc_sub = btns.row(align=True)
-                    loc_sub.enabled = file_exists
-                    op_loc = loc_sub.operator("witcher.open_file_location", text="", icon="FILEBROWSER")
-                    op_loc.file_path = item
-                    op_loc.cache_type = witcher_file_browser.active_cache_type
-                    _add_browser_preview_button_slot(
-                        btns,
-                        context,
-                        witcher_file_browser.active_cache_type,
-                        item,
-                        loadmods=witcher_file_browser.loadmods,
-                    )
-                    if cache_supports_sound_preview(witcher_file_browser.active_cache_type):
-                        is_playing = _sound_preview_matches(witcher_file_browser.active_cache_type, item)
-                        op_sound = btns.operator(
-                            "witcher.sound_preview_toggle",
-                            text="",
-                            icon='CANCEL' if is_playing else 'PLAY',
-                        )
-                        op_sound.file_path = item
-                        op_sound.cache_type = witcher_file_browser.active_cache_type
-                    if cache_supports_scene_import(witcher_file_browser.active_cache_type):
-                        op = btns.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
-                    else:
-                        op = btns.operator("witcher.file_action", text="", icon='EXPORT')
-                    op.file_path = item
-                    # Item stats popup (cache metadata)
-                    stats_op = btns.operator("witcher.file_item_stats", text="", icon='INFO')
-                    stats_op.file_path = item
-                    stats_op.cache_type = witcher_file_browser.active_cache_type
-                    stats_op.loadmods = witcher_file_browser.loadmods
-                if len(search_results) > MAX_SEARCH_RESULTS:
-                    col.label(text="Showing first 100 results. Refine search for more.", icon='INFO')
+            self._draw_search_results(
+                layout,
+                context,
+                witcher_file_browser,
+                search_results,
+                is_global=False,
+                limit_reached=search_limit_reached,
+            )
         else:
             # Split layout: left = folders, right = files
             split = layout.split(factor=_get_browser_folder_split_factor(context))
@@ -6178,98 +6525,22 @@ class SimpleFileBrowser(Operator):
 
     def draw_global_search_results(self, layout, query):
         """Search across all cache types and display results with cache source."""
-        MAX_RESULTS = 100
-        witcher_file_browser = bpy.context.scene.witcher_file_browser
+        context = bpy.context
+        witcher_file_browser = context.scene.witcher_file_browser
         loadmods = witcher_file_browser.loadmods
 
         # Use cached search results (avoids re-searching on every UI redraw)
         results = get_cached_search_results(query, "", folder_structure, loadmods=loadmods)
-
-        # Display results
-        col = layout.column(align=True)
-        if not results:
-            col.label(text="No results found", icon='ERROR')
-            return
-
-        results_header = col.row(align=True)
-        capped_count = min(len(results), MAX_RESULTS)
-        results_header.label(text=f"{capped_count} result(s)", icon='FILE')
-        results_header.operator("witcher.copy_all_search_paths", text="Copy All Paths", icon="COPYDOWN")
-        col.separator(factor=0.3)
-
-        for cache_type, path in results[:MAX_RESULTS]:
-            # Use split for proper proportions: 10% cache type, 65% path, 25% buttons
-            row_split = col.split(factor=0.1, align=True)
-            cache_abbrev = cache_type[:3]
-            row_split.label(text=f"[{cache_abbrev}]")
-            path_btn_split = row_split.split(factor=0.78, align=True)
-            # Checkmark indicator (always present for alignment)
-            path_row = path_btn_split.row(align=True)
-            file_exists, file_size = get_file_info(bpy.context, cache_type, path, loadmods=loadmods)
-            source_label = get_source_label(bpy.context, path, loadmods=loadmods, cache_type=cache_type)
-            status_icon = get_status_icon(bpy.context, cache_type, path, loadmods=loadmods)
-            path_row.label(text="", icon=status_icon)
-            display_label = path
-            if source_label.startswith("mod:"):
-                display_label = f"{display_label} [src:{source_label[4:]}]"
-            elif source_label == "vanilla" and witcher_file_browser.loadmods:
-                display_label = f"{display_label} [src:vanilla]"
-            elif witcher_file_browser.use_mods_priority:
-                mod_label = get_mod_override_label(path, loadmods=loadmods)
-                if mod_label:
-                    display_label = f"{display_label} [ovr:{mod_label}]"
-            icon_info = _get_browser_item_icon_info(
-                bpy.context,
-                cache_type,
-                path,
-                loadmods=loadmods,
-            )
-            icon_id = int(icon_info.get("icon_id", 0) or 0)
-            _draw_browser_list_preview_label(path_row, display_label, icon_id, fallback_icon='FILE')
-            btns = path_btn_split.row(align=True)
-            # Copy path
-            copy_op = btns.operator("witcher.copy_path", text="", icon="COPYDOWN")
-            copy_op.path = path
-            # Go to source button - navigate to cache and folder
-            op_goto = btns.operator("witcher.goto_global_search_result", text="", icon='FILE_PARENT')
-            op_goto.file_path = path
-            op_goto.cache_type = cache_type
-            # Open file location on disk (always present for alignment)
-            loc_sub = btns.row(align=True)
-            loc_sub.enabled = file_exists
-            op_loc = loc_sub.operator("witcher.open_file_location", text="", icon="FILEBROWSER")
-            op_loc.file_path = path
-            op_loc.cache_type = cache_type
-            _add_browser_preview_button_slot(
-                btns,
-                bpy.context,
-                cache_type,
-                path,
-                loadmods=loadmods,
-            )
-            if cache_supports_sound_preview(cache_type):
-                is_playing = _sound_preview_matches(cache_type, path)
-                op_sound = btns.operator(
-                    "witcher.sound_preview_toggle",
-                    text="",
-                    icon='CANCEL' if is_playing else 'PLAY',
-                )
-                op_sound.file_path = path
-                op_sound.cache_type = cache_type
-            if cache_supports_scene_import(cache_type):
-                op = btns.operator("witcher.file_action_global_import", text="", icon='IMPORT')
-            else:
-                op = btns.operator("witcher.file_action_global_export", text="", icon='EXPORT')
-            op.file_path = path
-            op.cache_type = cache_type
-            # Item stats popup (cache metadata)
-            stats_op = btns.operator("witcher.file_item_stats", text="", icon='INFO')
-            stats_op.file_path = path
-            stats_op.cache_type = cache_type
-            stats_op.loadmods = loadmods
-
-        if len(results) > MAX_RESULTS:
-            col.label(text=f"... and {len(results) - MAX_RESULTS} more results", icon='INFO')
+        limit_reached = len(results) >= BROWSER_SEARCH_RESULT_LIMIT
+        results = _sort_browser_global_search_results(results, witcher_file_browser)
+        self._draw_search_results(
+            layout,
+            context,
+            witcher_file_browser,
+            results,
+            is_global=True,
+            limit_reached=limit_reached,
+        )
 
     def draw_recent_view(self, layout, context):
         """Draw the recent activity view."""
@@ -6435,6 +6706,7 @@ class ClearSearchOperator(Operator):
         witcher_file_browser = context.scene.witcher_file_browser
         witcher_file_browser.search_query = ""
         clear_search_cache()
+        witcher_file_browser.search_page_index = 0
         return {'FINISHED'}
 
 class StatusIconHelpOperator(Operator):
@@ -6563,6 +6835,7 @@ class GoHomeOperator(Operator):
         witcher_file_browser.path_input = ""
         witcher_file_browser.extension_filter = ""
         witcher_file_browser.file_page_index = 0
+        witcher_file_browser.search_page_index = 0
 
         # Clear folder structure completely
         folder_structure.items = {}
@@ -6576,7 +6849,7 @@ class GoHomeOperator(Operator):
         _nav_index = -1
 
         # Clear search cache
-        _search_cache = {'query': '', 'cache_type': '', 'results': []}
+        _search_cache = {'query': '', 'cache_type': '', 'loadmods': False, 'results': []}
 
         return {'FINISHED'}
 
@@ -6797,7 +7070,39 @@ class BrowserPageOperator(Operator):
     def execute(self, context):
         browser = context.scene.witcher_file_browser
         if browser.search_query:
-            return {'CANCELLED'}
+            if browser.active_cache_type:
+                items = get_cached_search_results(
+                    browser.search_query,
+                    browser.active_cache_type,
+                    folder_structure,
+                    loadmods=browser.loadmods,
+                )
+                filter_text = browser.extension_filter.strip().lower()
+                if filter_text:
+                    items = [item for item in items if filter_text in item.lower()]
+                items = _sort_browser_search_results(items, browser)
+            else:
+                items = get_cached_search_results(
+                    browser.search_query,
+                    "",
+                    folder_structure,
+                    loadmods=browser.loadmods,
+                )
+                items = _sort_browser_global_search_results(items, browser)
+
+            page_size = _get_browser_file_page_size(context, browser.file_display_mode)
+            stats = _get_browser_page_stats(items, browser.search_page_index, page_size)
+            current = stats["page_index"]
+            last = max(0, stats["total_pages"] - 1)
+            if self.action == "prev":
+                target_index = max(0, current - 1)
+            elif self.action == "next":
+                target_index = min(last, current + 1)
+            else:
+                return {'CANCELLED'}
+
+            browser.search_page_index = target_index
+            return {'FINISHED'}
 
         folder_items = folder_structure.get_items(browser.current_folder)
         filter_text = browser.extension_filter.strip().lower()
@@ -8645,8 +8950,9 @@ class FileActionOperator(Operator):
             return {'CANCELLED'}
 
         # Build full path
-        full_path = (witcher_file_browser.current_folder + "\\" + self.file_path
-                     if witcher_file_browser.current_folder else self.file_path)
+        full_path = self.file_path
+        if "\\" not in full_path and witcher_file_browser.current_folder:
+            full_path = witcher_file_browser.current_folder + "\\" + self.file_path
         log.debug("Action on file [%s]: %s", cache_type, full_path)
         if is_external_cache(cache_type):
             output_root = _get_external_archive_output_root(context, cache_type, create=True)

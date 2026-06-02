@@ -584,6 +584,9 @@ class witcherui_RigSettings(bpy.types.PropertyGroup):
     variants_auto: bpy.props.BoolProperty(default=True,
                         name="Variants Auto",
                         description="Auto-enable variants when their category is equipped")
+    use_equipment_initializers: bpy.props.BoolProperty(default=True,
+                        name="Use Initializers",
+                        description="Use equipment initializer items when available; disable to load entity default items")
     master_equipment_appearance: EnumProperty(
         name="Master Appearance",
         items=_get_master_equipment_appearances,

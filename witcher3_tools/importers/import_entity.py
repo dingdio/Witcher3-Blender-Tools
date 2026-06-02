@@ -2578,6 +2578,45 @@ def _get_entry_attr(entry, key, default=None):
     return value if hasattr(entry, key) else default
 
 
+def _coerce_equipment_item_name(value):
+    item_name = str(value or "").strip()
+    if not item_name or item_name.lower() in {"none", "null"}:
+        return ""
+    return item_name
+
+
+def get_equipment_entry_default_item_name(entry):
+    return _coerce_equipment_item_name(_get_entry_attr(entry, "defaultItemName", ""))
+
+
+def get_equipment_entry_initializer_item_name(entry):
+    initializer = _get_entry_attr(entry, "initializer", None)
+    if initializer is None:
+        return ""
+    item_name = (
+        _get_entry_attr(initializer, "itemName", None)
+        or _get_entry_attr(initializer, "item", None)
+    )
+    return _coerce_equipment_item_name(item_name)
+
+
+def should_use_equipment_initializers(rig_settings=None) -> bool:
+    if rig_settings is None:
+        return True
+    return bool(getattr(rig_settings, "use_equipment_initializers", True))
+
+
+def get_equipment_entry_item_name(entry, rig_settings=None, use_initializers=None):
+    default_item = get_equipment_entry_default_item_name(entry)
+    if use_initializers is None:
+        use_initializers = should_use_equipment_initializers(rig_settings)
+    if use_initializers:
+        initializer_item = get_equipment_entry_initializer_item_name(entry)
+        if initializer_item:
+            return initializer_item
+    return default_item
+
+
 def _coerce_engine_bool(value) -> bool:
     if value is None:
         return False
@@ -3953,6 +3992,7 @@ def _find_slot_by_item_or_template(slots, item_raw):
 def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings, entity=None, shared_inventory=False,
                             prepared_context=None, post_refresh=True):
     """Apply mounted inventory items to equipment slots and load them."""
+    _mounts_started = time.perf_counter()
     inv_entries = list(_iter_inventory_entries(selected_appearance, entity))
     if not inv_entries:
         return
@@ -3987,7 +4027,13 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
     prepared = _prepare_equipment_load_context(armature, rig_settings, prepared)
     source_roots = prepared.get("source_roots", source_roots)
 
+    _lookup_started = time.perf_counter()
     item_lookup, template_lookup = _build_equipment_lookup(source_roots)
+    _lookup_seconds = time.perf_counter() - _lookup_started
+    log.info(
+        "[mounts-profile] _build_equipment_lookup %.3fs (%d inv entries, items=%d templates=%d)",
+        _lookup_seconds, len(inv_entries), len(item_lookup), len(template_lookup),
+    )
     _rig_source_game_raw = str(getattr(rig_settings, "source_game", "") or "").strip().lower()
     source_game = _rig_source_game_raw
     if source_game not in {"w2", "w3"}:
@@ -4044,7 +4090,10 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
                 return
     seen_entries = set()
 
+    _catalog_started = time.perf_counter()
     category_items, item_attributes = get_equipment_catalog_for_search_roots(source_roots)
+    _catalog_seconds = time.perf_counter() - _catalog_started
+    _resolveloop_started = time.perf_counter()
     slots_to_load = []
 
     def _category_items(category_name):
@@ -4269,6 +4318,8 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
 
         slots_to_load.append(slot_index)
 
+    _resolveloop_seconds = time.perf_counter() - _resolveloop_started
+    _batch_started = time.perf_counter()
     if slots_to_load:
         try:
             load_equipment_items_batch(
@@ -4286,6 +4337,15 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
                 exc,
                 exc_info=True,
             )
+    _batch_seconds = time.perf_counter() - _batch_started
+
+    log.info(
+        "[mounts-profile] _apply_inventory_mounts total %.3fs (lookup %.3fs, catalog %.3fs, "
+        "resolve_loop %.3fs, batch_load %.3fs; %d inv entries -> %d slots to load)",
+        time.perf_counter() - _mounts_started,
+        _lookup_seconds, _catalog_seconds, _resolveloop_seconds, _batch_seconds,
+        len(inv_entries), len(slots_to_load),
+    )
 
     # Update variant state after all mounts applied
     try:
@@ -6204,9 +6264,7 @@ def import_app(context,
         category = entry_data.get('category', '') if isinstance(entry_data, dict) else getattr(entry_data, 'category', '')
         if category and category in protected_categories:
             continue
-        default_item = entry_data.get('defaultItemName', '') if isinstance(entry_data, dict) else getattr(entry_data, 'defaultItemName', '')
-        if default_item is None:
-            default_item = ''
+        default_item = get_equipment_entry_item_name(entry_data, rig_settings) or ''
 
         # Create persistent equipment slot
         slot = rig_settings.equipment_slots.add()

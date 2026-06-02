@@ -812,8 +812,35 @@ def _write_uncooked_w2cube_raw_tail_payload_to_dds(fdir: str, file_bytes: bytes)
     return dds_path
 
 
+#! TODO need to fix this for Witcher 2 cubemaps. Temp hack
 def convert_w2cube_to_dds(fdir):
     """Parse a cooked .w2cube file and write a cubemap DDS."""
+    # The output path is deterministic, so if a valid DDS already exists reuse it
+    # without re-reading/re-parsing the .w2cube. The same shared cubemap (e.g.
+    # metal1.w2cube) is referenced by many materials on one character; without
+    # this guard every reference re-exported the DDS from scratch.
+    dds_path = fdir.replace('.w2cube', '_cubemap.dds')
+    if os.path.exists(dds_path) and is_valid_dds_file(dds_path):
+        return dds_path
+
+    # Cache .w2cube files that previously raised (e.g. uncooked source cubes like
+    # dot3.w2cube with no runtime payload) so repeated material references don't
+    # re-parse and re-raise the same failure on every slot.
+    norm_key = os.path.normcase(os.path.abspath(fdir))
+    if norm_key in _W2CUBE_CONVERT_FAILED:
+        raise _W2CUBE_CONVERT_FAILED[norm_key]
+
+    try:
+        return _convert_w2cube_to_dds_impl(fdir, dds_path)
+    except Exception as exc:
+        _W2CUBE_CONVERT_FAILED[norm_key] = exc
+        raise
+
+
+_W2CUBE_CONVERT_FAILED = {}  # normalized .w2cube path -> exception raised on first attempt
+
+
+def _convert_w2cube_to_dds_impl(fdir, dds_path):
     with open(fdir, "rb") as f:
         file_bytes = f.read()
     file_size = len(file_bytes)
@@ -848,10 +875,6 @@ def convert_w2cube_to_dds(fdir):
         mipmapscount = br.readUInt16()
         filesize = br.readUInt32()
         sentinel = br.readInt32()
-
-        dds_path = fdir.replace('.w2cube', '_cubemap.dds')
-        if os.path.exists(dds_path):
-            return dds_path
 
         data_pos = br.tell()
         remaining = max(0, file_size - data_pos)
