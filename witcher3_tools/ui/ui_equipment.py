@@ -7,7 +7,6 @@ import logging
 import re
 import hashlib
 import shutil
-import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from bpy.app.handlers import persistent
 from mathutils import Matrix
@@ -22,13 +21,11 @@ from ..importers import import_entity
 from ..importers import import_isolation
 from ..importers.import_anims import load_idle_animation_for_armature as _load_idle_anim
 from ..CR2W.dc_entity import LoadCEntityTemplateFile  # Import the function as per your setup
-from ..extension_paths import get_cache_root, get_dev_override
+from ..extension_paths import get_cache_root
 from .. import (
     get_all_addon_prefs,
     get_uncook_path,
     get_do_import_redcloth,
-    get_w2_unbundle_path,
-    get_witcher2_game_path,
 )
 from pathlib import Path
 from .. import get_rig_rot90_enabled
@@ -36,18 +33,23 @@ from .armature_context import (
     get_main_armature_and_rig_settings,
 )
 from ..source_game_paths import normalize_source_game as _normalize_source_game
+from . import equipment_catalog
+from .equipment_item_picker import (
+    EquipmentItemPickerRow,
+    EQUIPMENT_OT_PickDefaultItem,
+    EQUIPMENT_OT_ItemPickerPage,
+    EQUIPMENT_OT_SearchDefaultItem,
+    _on_equipment_item_picker_index_changed,
+    _on_equipment_item_picker_filter_changed,
+)
 
-# Category cache file path (extension-safe user cache)
-_CATEGORY_CACHE_FILE = Path(get_cache_root(create=True)) / "equipment_categories.json"
 _UNCOOK_ITEM_ENT_INDEX = {}
 _LAST_EQUIPMENT_LOAD_FAILURES = {}
-_LOADED_EQUIPMENT_XML_DIRS = set()
 _OPERATOR_ENUM_CACHE = {}
 _EQUIPMENT_ITEM_ICON_ID_CACHE = {}
 _EQUIPMENT_ITEM_ICON_REQUESTS = []
 _EQUIPMENT_ITEM_ICON_PENDING_KEYS = set()
 _EQUIPMENT_ITEM_ICON_TIMER_RUNNING = False
-_EQUIPMENT_ITEM_PICKER_RECENTS = {}
 # Persistent icon cache: resolved preview images are copied into a cache dir and
 # their paths recorded to JSON so icons load once and survive Blender restarts
 # (no re-resolution / no UI lag on later sessions).
@@ -56,55 +58,14 @@ _EQUIPMENT_ICON_PATH_DISK = None          # stable_key(str) -> persistent image 
 _EQUIPMENT_ICON_PATH_DISK_DIRTY = False
 _EQUIPMENT_ICON_PATH_CACHE_FILE = Path(get_cache_root(create=True)) / "equipment_icon_paths.json"
 _EQUIPMENT_ICON_PERSIST_DIR = Path(get_cache_root(create=True)) / "equipment_icons"
-_W2_CATEGORY_CACHE_LOADED = False
-_W2_CATEGORY_ITEMS = {}
-_W2_ITEM_ATTRIBUTES = {}
 _ENTITY_APPEARANCE_CACHE = {}
 _EQUIPMENT_ENTITY_CACHE = {}
 _TEMPLATE_PATH_RESOLVE_CACHE = {}  # (template_key, roots_tuple) -> (repo_path, export_path)
-_XML_DECL_RE = re.compile(r'^\s*<\?xml[^>]*\?>', re.IGNORECASE)
-_XML_DECL_ENCODING_BYTES_RE = re.compile(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', re.IGNORECASE)
-_XML_HASH_COMMENT_LINE_RE = re.compile(r'(?m)^[ \t]*#.*(?:\r?\n|$)')
-_CATEGORY_CACHE_SCHEMA_VERSION = 2
-_CATALOG_CACHE_FLAGS = {
-    "w3": {"schema_version": 0, "icon_path": False, "hold_template": False},
-    "w2": {"schema_version": 0, "icon_path": False, "hold_template": False},
-}
-_ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP = {
-    "w3": None,
-    "w2": None,
-}
-_EQUIPMENT_ITEM_PICKER_PANEL_ICON_SCALE = 2.0
-_EQUIPMENT_ITEM_PICKER_RECENT_LIMIT = 24
 # How many icons the background timer resolves per tick. Resolution happens on
 # the main thread (DDS extraction), so keep this small to avoid UI stutter.
 # Placeholders are shown instantly, so a low value here only affects how fast
 # real thumbnails stream in — not whether the grid looks complete.
 _EQUIPMENT_ITEM_ICON_BATCH_SIZE = 2
-_EQUIPMENT_ITEM_PICKER_WIDTH = 720
-# Grid view: a paged thumbnail grid (only the visible page requests icons).
-# Selectable tile sizes -> (columns, template_icon scale). 'L' matches the
-# asset/character browser's default thumbnail size and is the default here.
-_EQUIPMENT_ITEM_PICKER_GRID_PAGE_ROWS = 4
-_EQUIPMENT_ITEM_PICKER_GRID_SIZES = {
-    'S': (6, 5.0),
-    'M': (5, 6.5),
-    'L': (4, 8.0),
-}
-_EQUIPMENT_ITEM_PICKER_GRID_DEFAULT_SIZE = 'L'
-
-
-def _equipment_grid_size_params(size):
-    columns, scale = _EQUIPMENT_ITEM_PICKER_GRID_SIZES.get(
-        str(size or _EQUIPMENT_ITEM_PICKER_GRID_DEFAULT_SIZE),
-        _EQUIPMENT_ITEM_PICKER_GRID_SIZES[_EQUIPMENT_ITEM_PICKER_GRID_DEFAULT_SIZE],
-    )
-    label_chars = max(10, 8 + (7 - columns) * 3)
-    return columns, scale, label_chars
-# List view: a paged single-column list with a large (~3x) leading thumbnail.
-_EQUIPMENT_ITEM_PICKER_LIST_PAGE_ROWS = 8
-_EQUIPMENT_ITEM_PICKER_LIST_ICON_SCALE = 3.0
-_EQUIPMENT_ITEM_PICKER_LIST_LABEL_CHARS = 60
 
 # Lazily-built neutral placeholder shown at the exact size of a real icon while
 # the real one is still resolving (or can't be resolved at all).
@@ -134,9 +95,9 @@ def _get_equipment_placeholder_icon_id():
     if _EQUIPMENT_PLACEHOLDER_ICON_ID:
         return _EQUIPMENT_PLACEHOLDER_ICON_ID
     try:
-        from .browser_dummy_icons import ensure_browser_dummy_icon_path
+        from . import asset_previews
 
-        png_path = ensure_browser_dummy_icon_path("ITEM", "item")
+        png_path = asset_previews.ensure_dummy_icon_path("ITEM", "item")
         if not png_path:
             return 0
         if _EQUIPMENT_PLACEHOLDER_PREVIEWS is None:
@@ -259,126 +220,65 @@ def _clear_equipment_icon_previews():
     _EQUIPMENT_ICON_PREVIEWS = None
 
 
+def _clear_template_path_resolve_cache():
+    _TEMPLATE_PATH_RESOLVE_CACHE.clear()
+
+
+equipment_catalog.set_icon_cache_clear_callback(_clear_equipment_item_icon_cache)
+equipment_catalog.set_template_cache_clear_callback(_clear_template_path_resolve_cache)
+
+
 def _set_catalog_cache_flags(source_game="w3", *, schema_version=0, icon_path=False, hold_template=False):
-    source_game = _normalize_source_game(source_game)
-    _CATALOG_CACHE_FLAGS[source_game] = {
-        "schema_version": int(schema_version or 0),
-        "icon_path": bool(icon_path),
-        "hold_template": bool(hold_template),
-    }
+    return equipment_catalog.set_catalog_cache_flags(
+        source_game,
+        schema_version=schema_version,
+        icon_path=icon_path,
+        hold_template=hold_template,
+    )
 
 
 def _infer_catalog_cache_flags(item_attributes):
-    has_icon_path = False
-    has_hold_template = False
-    for attrs in item_attributes.values():
-        if not isinstance(attrs, dict):
-            continue
-        if "icon_path" in attrs:
-            has_icon_path = True
-        if "hold_template" in attrs:
-            has_hold_template = True
-        if has_icon_path and has_hold_template:
-            break
-    return has_icon_path, has_hold_template
+    return equipment_catalog.infer_catalog_cache_flags(item_attributes)
 
 
 def _catalog_has_browser_icon_fields(source_game="w3"):
-    source_game = _normalize_source_game(source_game)
-    flags = _CATALOG_CACHE_FLAGS.get(source_game, {})
-    if flags.get("icon_path") and flags.get("hold_template"):
-        return True
-
-    _category_items, item_attributes = _get_equipment_catalog(source_game)
-    has_icon_path, has_hold_template = _infer_catalog_cache_flags(item_attributes)
-    if item_attributes:
-        _set_catalog_cache_flags(
-            source_game,
-            schema_version=flags.get("schema_version", 0),
-            icon_path=has_icon_path,
-            hold_template=has_hold_template,
-        )
-    return has_icon_path and has_hold_template
+    return equipment_catalog.catalog_has_browser_icon_fields(source_game)
 
 
 def _get_category_cache_file(source_game="w3"):
-    source_game = _normalize_source_game(source_game)
-    if source_game == "w2":
-        return Path(get_cache_root(create=True)) / "equipment_categories_w2.json"
-    return _CATEGORY_CACHE_FILE
+    return equipment_catalog.get_category_cache_file(source_game)
 
 
 def _catalog_key_for_source_game(source_game="w3"):
-    source_game = _normalize_source_game(source_game)
-    if source_game == "w2":
-        return ("_W2_CATEGORY_ITEMS", "_W2_ITEM_ATTRIBUTES")
-    return ("category_items", "item_attributes")
+    return equipment_catalog.catalog_key_for_source_game(source_game)
 
 
 def _get_equipment_catalog(source_game="w3"):
-    source_game = _normalize_source_game(source_game)
-    if source_game == "w2":
-        return (_W2_CATEGORY_ITEMS, _W2_ITEM_ATTRIBUTES)
-    return (EquipmentDefinitionEntry.category_items, EquipmentDefinitionEntry.item_attributes)
+    return equipment_catalog.get_equipment_catalog(source_game)
 
 
 def _clear_item_attribute_identifier_lookup(source_game=None):
-    _clear_equipment_item_icon_cache()
-    if source_game is None:
-        for key in _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP:
-            _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP[key] = None
-        return
-    _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP[_normalize_source_game(source_game)] = None
+    return equipment_catalog.clear_item_attribute_identifier_lookup(source_game)
 
 
 def _normalize_item_attribute_identifier(value):
-    if value is None:
-        return ""
-    return str(value).replace("/", "\\").strip().strip("\\").lower()
+    return equipment_catalog.normalize_item_attribute_identifier(value)
 
 
 def _iter_item_attribute_identifier_aliases(value):
-    normalized = _normalize_item_attribute_identifier(value)
-    if not normalized:
-        return
-    seen = set()
-    for alias in (
-        normalized,
-        os.path.basename(normalized),
-        os.path.splitext(os.path.basename(normalized))[0],
-    ):
-        alias = _normalize_item_attribute_identifier(alias)
-        if not alias or alias in seen:
-            continue
-        seen.add(alias)
-        yield alias
+    return equipment_catalog.iter_item_attribute_identifier_aliases(value)
 
 
 def _get_item_attribute_identifier_lookup(source_game="w3"):
-    source_game = _normalize_source_game(source_game)
-    cached = _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP.get(source_game)
-    if cached is not None:
-        return cached
-
-    _category_items, item_attributes = _get_equipment_catalog(source_game)
-    lookup = {}
-    for field_name in ("equip_template", "hold_template", "item_name"):
-        for item_name, attrs in item_attributes.items():
-            if not isinstance(attrs, dict):
-                continue
-            value = attrs.get(field_name, "") if field_name != "item_name" else (item_name or attrs.get("item_name", ""))
-            for alias in _iter_item_attribute_identifier_aliases(value):
-                lookup.setdefault(alias, attrs)
-    _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP[source_game] = lookup
-    return lookup
+    return equipment_catalog.get_item_attribute_identifier_lookup(source_game)
 
 
 def get_equipment_source_game_for_search_roots(search_roots=None):
-    return "w2" if _is_w2_search(search_roots) else "w3"
+    return equipment_catalog.get_equipment_source_game_for_search_roots(search_roots)
 
 
 def get_equipment_catalog_for_search_roots(search_roots=None):
-    return _get_equipment_catalog(get_equipment_source_game_for_search_roots(search_roots))
+    return equipment_catalog.get_equipment_catalog_for_search_roots(search_roots)
 
 
 def _get_active_equipment_catalog(context):
@@ -386,169 +286,22 @@ def _get_active_equipment_catalog(context):
 
 
 def _save_category_cache(source_game="w3"):
-    """Save loaded categories to the appropriate cache file."""
-    try:
-        category_items, item_attributes = _get_equipment_catalog(source_game)
-        cache_file = _get_category_cache_file(source_game)
-        has_icon_path, has_hold_template = _infer_catalog_cache_flags(item_attributes)
-        cache_data = {
-            'schema_version': _CATEGORY_CACHE_SCHEMA_VERSION,
-            'feature_flags': {
-                'icon_path': has_icon_path,
-                'hold_template': has_hold_template,
-            },
-            'category_items': category_items,
-            'item_attributes': item_attributes,
-        }
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_file, 'w', encoding='utf-8') as f:
-            json.dump(cache_data, f, indent=2)
-        _set_catalog_cache_flags(
-            source_game,
-            schema_version=_CATEGORY_CACHE_SCHEMA_VERSION,
-            icon_path=has_icon_path,
-            hold_template=has_hold_template,
-        )
-        log.debug("Saved %s category cache to %s", _normalize_source_game(source_game), cache_file)
-    except Exception as e:
-        log.warning("Failed to save category cache: %s", e)
+    return equipment_catalog.save_category_cache(source_game)
 
 
 def _load_category_cache(source_game="w3"):
-    """Load categories from the appropriate cache file if it exists."""
-    source_game = _normalize_source_game(source_game)
-    cache_file = _get_category_cache_file(source_game)
-    if not cache_file.exists():
-        return False
-    try:
-        with open(cache_file, 'r', encoding='utf-8') as f:
-            cache_data = json.load(f)
-
-        category_items = cache_data.get('category_items', {})
-        item_attributes = cache_data.get('item_attributes', {})
-        feature_flags = cache_data.get('feature_flags', {}) if isinstance(cache_data, dict) else {}
-        schema_version = int(cache_data.get('schema_version', 0) or 0) if isinstance(cache_data, dict) else 0
-        target_categories, target_attributes = _get_equipment_catalog(source_game)
-
-        for category, items in category_items.items():
-            filtered_items = []
-            for item in items:
-                item_name = item[0] if item else ""
-                attrs = item_attributes.get(item_name, {}) if item_name else {}
-                item_source_game = _normalize_source_game(attrs.get("source_game", source_game))
-                if item_source_game != source_game:
-                    continue
-                filtered_items.append(item)
-            if not filtered_items:
-                continue
-            if category not in target_categories:
-                target_categories[category] = filtered_items
-            else:
-                existing_set = set(tuple(item) for item in target_categories[category])
-                for item in filtered_items:
-                    if tuple(item) not in existing_set:
-                        target_categories[category].append(item)
-                        existing_set.add(tuple(item))
-
-        for item_name, attrs in item_attributes.items():
-            if not isinstance(attrs, dict):
-                continue
-            item_source_game = _normalize_source_game(attrs.get("source_game", source_game))
-            if item_source_game != source_game:
-                continue
-            target_attributes[item_name] = attrs
-
-        inferred_icon_path, inferred_hold_template = _infer_catalog_cache_flags(item_attributes)
-        _set_catalog_cache_flags(
-            source_game,
-            schema_version=schema_version,
-            icon_path=feature_flags.get("icon_path", inferred_icon_path),
-            hold_template=feature_flags.get("hold_template", inferred_hold_template),
-        )
-        _clear_item_attribute_identifier_lookup(source_game)
-        log.debug("Loaded %d %s categories from cache", len(category_items), source_game)
-        return True
-    except Exception as e:
-        log.warning("Failed to load category cache: %s", e)
-        return False
+    return equipment_catalog.load_category_cache(source_game)
 
 
 def _candidate_w2_items_dirs(search_roots=None, *, include_configured_roots=True):
-    candidates = []
-    seen = set()
-    roots = list(search_roots or [])
-    if include_configured_roots:
-        roots.extend(_get_w2_repo_roots())
-    roots = _normalize_unique_roots(roots)
-    for root in roots:
-        try:
-            current = Path(root)
-        except Exception:
-            continue
-        for parent in [current] + list(current.parents):
-            for candidate in (
-                parent,
-                parent / "items",
-                parent / "data" / "items",
-            ):
-                try:
-                    candidate_path = str(candidate)
-                    norm = os.path.normcase(os.path.normpath(candidate_path))
-                except Exception:
-                    continue
-                if norm in seen:
-                    continue
-                seen.add(norm)
-                if os.path.basename(norm).lower() != "items":
-                    continue
-                if os.path.isdir(candidate_path) and any(
-                    name.lower().endswith(".xml") for name in os.listdir(candidate_path)
-                ):
-                    candidates.append(candidate_path)
-    return candidates
+    return equipment_catalog.candidate_w2_items_dirs(
+        search_roots,
+        include_configured_roots=include_configured_roots,
+    )
 
 
 def ensure_equipment_catalog_for_search_roots(search_roots=None):
-    """Load additional XML catalogs required by the active repo roots."""
-    if not _is_w2_search(search_roots):
-        return False
-
-    global _W2_CATEGORY_CACHE_LOADED
-    if not _W2_CATEGORY_CACHE_LOADED:
-        _load_category_cache("w2")
-        _W2_CATEGORY_CACHE_LOADED = True
-
-    w2_category_items, w2_item_attributes = _get_equipment_catalog("w2")
-    merged_any = False
-    for folder_path in _candidate_w2_items_dirs(search_roots):
-        try:
-            norm = os.path.normcase(os.path.normpath(folder_path))
-        except Exception:
-            norm = folder_path.lower()
-        if norm in _LOADED_EQUIPMENT_XML_DIRS:
-            continue
-
-        _, category_items_from_xml, item_attributes_from_xml = extract_categories_from_xml(folder_path)
-        if category_items_from_xml or item_attributes_from_xml:
-            _merge_equipment_xml_data(
-                w2_category_items,
-                w2_item_attributes,
-                category_items_from_xml,
-                item_attributes_from_xml,
-            )
-            merged_any = True
-            log.info(
-                "Loaded Witcher 2 equipment XMLs from '%s' (%d cats, %d items)",
-                folder_path,
-                len(category_items_from_xml),
-                len(item_attributes_from_xml),
-            )
-        _LOADED_EQUIPMENT_XML_DIRS.add(norm)
-
-    if merged_any:
-        _clear_item_attribute_identifier_lookup("w2")
-        _save_category_cache("w2")
-    return merged_any
+    return equipment_catalog.ensure_equipment_catalog_for_search_roots(search_roots)
 
 
 def _request_sync_templates():
@@ -617,14 +370,7 @@ def _normalize_unique_roots(roots):
 
 
 def _source_game_from_xml_path(path_value):
-    lowered = str(path_value or "").replace("/", "\\").lower()
-    if "\\gameplay\\items" in lowered:
-        return "w3"
-    if lowered.endswith("\\gameplay\\items"):
-        return "w3"
-    if "\\items\\" in lowered or lowered.endswith("\\items"):
-        return "w2"
-    return ""
+    return equipment_catalog.source_game_from_xml_path(path_value)
 
 
 def _norm_root_path(path):
@@ -637,41 +383,11 @@ def _norm_root_path(path):
 
 
 def _get_w2_repo_roots():
-    roots = []
-    try:
-        w2_unbundle = (get_w2_unbundle_path(bpy.context) or "").strip()
-    except Exception:
-        w2_unbundle = ""
-    if w2_unbundle:
-        roots.append(w2_unbundle)
-    try:
-        w2_game = (get_witcher2_game_path(bpy.context) or "").strip()
-    except Exception:
-        w2_game = ""
-    if w2_game:
-        roots.append(os.path.join(w2_game, "data"))
-        roots.append(w2_game)
-    return _normalize_unique_roots(roots)
+    return equipment_catalog.get_w2_repo_roots()
 
 
 def _is_w2_search(search_roots):
-    norm_search_roots = [_norm_root_path(root) for root in (search_roots or []) if root]
-    if not norm_search_roots:
-        return False
-    for root in _get_w2_repo_roots():
-        norm_root = _norm_root_path(root)
-        if not norm_root:
-            continue
-        prefix = norm_root + os.sep
-        for candidate in norm_search_roots:
-            if candidate == norm_root or candidate.startswith(prefix):
-                return True
-    # Do not let globally configured W2 roots classify an unrelated W3 entity
-    # import as W2. Catalog loading may include configured W2 roots later, but
-    # source-game detection must only consider the active search roots.
-    if _candidate_w2_items_dirs(search_roots, include_configured_roots=False):
-        return True
-    return False
+    return equipment_catalog.is_w2_search(search_roots)
 
 
 def _get_safe_context_armature_and_rig_settings(context):
@@ -800,58 +516,28 @@ def _get_catalog_for_rig_settings(rig_settings, armature=None):
 
 
 def _lookup_item_attributes(item_name, source_game="w3"):
-    if not item_name:
-        return {}
-    _category_items, item_attributes = _get_equipment_catalog(source_game)
-    attrs = item_attributes.get(item_name, {})
-    if isinstance(attrs, dict):
-        return attrs
-    return {}
+    return equipment_catalog.lookup_item_attributes(item_name, source_game)
 
 
 def ensure_equipment_catalog_ready(source_game="w3", search_roots=None, context=None, require_browser_icon_fields=False):
-    """Ensure the equipment catalog is loaded for the requested source game."""
-    source_game = _normalize_source_game(source_game)
-    _category_items, item_attributes = _get_equipment_catalog(source_game)
-    if source_game == "w2":
-        ensure_equipment_catalog_for_search_roots(search_roots)
-        _category_items, item_attributes = _get_equipment_catalog(source_game)
-        return bool(item_attributes)
-    if not item_attributes:
-        _load_category_cache(source_game)
-        _category_items, item_attributes = _get_equipment_catalog(source_game)
-    if source_game == "w3" and context is not None:
-        needs_w3_refresh = not item_attributes
-        if require_browser_icon_fields and not _catalog_has_browser_icon_fields(source_game):
-            needs_w3_refresh = True
-        if needs_w3_refresh and _refresh_w3_catalog_from_xml(context):
-            _category_items, item_attributes = _get_equipment_catalog(source_game)
-    return bool(item_attributes)
+    return equipment_catalog.ensure_equipment_catalog_ready(
+        source_game,
+        search_roots=search_roots,
+        context=context,
+        require_browser_icon_fields=require_browser_icon_fields,
+    )
 
 
 def get_item_attributes_by_identifier(identifier, source_game="w3", strict: bool = False):
-    """Resolve equipment catalog attributes by item name or template identifier."""
-    _ = strict  # Kept for API compatibility; lookups are exact aliases only.
-    source_game = _normalize_source_game(source_game)
-    raw_value = str(identifier or "").strip()
-    if not raw_value:
-        return {}
-
-    direct = _lookup_item_attributes(raw_value, source_game)
-    if direct:
-        return direct
-
-    lookup = _get_item_attribute_identifier_lookup(source_game)
-    for alias in _iter_item_attribute_identifier_aliases(raw_value):
-        attrs = lookup.get(alias)
-        if attrs:
-            return attrs
-    return {}
+    return equipment_catalog.get_item_attributes_by_identifier(
+        identifier,
+        source_game=source_game,
+        strict=strict,
+    )
 
 
 def get_item_icon_path(identifier, source_game="w3", strict: bool = False):
-    attrs = get_item_attributes_by_identifier(identifier, source_game=source_game, strict=strict)
-    return str(attrs.get("icon_path", "") or "")
+    return equipment_catalog.get_item_icon_path(identifier, source_game=source_game, strict=strict)
 
 
 def _get_active_equipment_source_path(context):
@@ -954,7 +640,7 @@ def _resolve_equipment_item_icon_path(item_name, attrs=None, source_game="w3", f
     return ""
 
 
-def _iter_equipment_icon_candidate_paths(ui_file_browser, context, raw_icon_path):
+def _iter_equipment_icon_candidate_paths(asset_previews, context, raw_icon_path):
     seen = set()
 
     def _add(path_value):
@@ -968,28 +654,22 @@ def _iter_equipment_icon_candidate_paths(ui_file_browser, context, raw_icon_path
         yield normalized
 
     def _add_preview_lookup_paths(path_value):
-        try:
-            lookup_paths = ui_file_browser._iter_preview_lookup_paths(path_value)
-        except Exception:
-            lookup_paths = [path_value]
+        lookup_paths = asset_previews.iter_preview_lookup_paths(path_value)
         for lookup_path in lookup_paths:
             for normalized in _add(lookup_path):
                 yield normalized
 
     for candidate in _add_preview_lookup_paths(raw_icon_path):
         yield candidate
-    try:
-        expanded = ui_file_browser._expand_scaleform_icon_candidates(context, raw_icon_path)
-    except Exception:
-        expanded = []
+    expanded = asset_previews.expand_scaleform_icon_candidates(context, raw_icon_path)
     for candidate in expanded:
         for normalized in _add_preview_lookup_paths(candidate):
             yield normalized
 
 
-def _get_equipment_icon_cache_type(ui_file_browser, source_game="w3"):
+def _get_equipment_icon_cache_type(asset_previews, source_game="w3"):
     if _normalize_source_game(source_game) == "w2":
-        return ui_file_browser.WITCHER2_BUNDLE_CACHE_TYPE
+        return asset_previews.get_witcher2_bundle_cache_type()
     return "Bundle"
 
 
@@ -1044,14 +724,14 @@ def _iter_equipment_template_browser_paths(template_name):
 
 def _resolve_equipment_item_entity_preview_path(
     context,
-    ui_file_browser,
+    asset_previews,
     source_game,
     item_name,
     attrs=None,
     fallback_template="",
     loadmods=False,
 ):
-    cache_type = _get_equipment_icon_cache_type(ui_file_browser, source_game)
+    cache_type = _get_equipment_icon_cache_type(asset_previews, source_game)
     armature, rig_settings = _get_safe_context_armature_and_rig_settings(context)
     seen_paths = set()
 
@@ -1077,7 +757,7 @@ def _resolve_equipment_item_entity_preview_path(
                 continue
             seen_paths.add(key)
 
-            icon_info = ui_file_browser._get_browser_item_icon_info(
+            icon_info = asset_previews.get_browser_item_icon_info(
                 context,
                 cache_type,
                 normalized,
@@ -1130,14 +810,14 @@ def _resolve_equipment_item_preview_path(context, item_name, attrs=None, source_
     )
     preview_path = ""
     try:
-        from . import ui_file_browser
+        from . import asset_previews
 
-        cache_type = _get_equipment_icon_cache_type(ui_file_browser, source_game)
+        cache_type = _get_equipment_icon_cache_type(asset_previews, source_game)
         loadmods = _get_equipment_icon_loadmods(context)
         with _equipment_icon_repo_context(context):
             if raw_icon_path:
-                for candidate_path in _iter_equipment_icon_candidate_paths(ui_file_browser, context, raw_icon_path):
-                    icon_info = ui_file_browser._get_browser_item_icon_info(
+                for candidate_path in _iter_equipment_icon_candidate_paths(asset_previews, context, raw_icon_path):
+                    icon_info = asset_previews.get_browser_item_icon_info(
                         context,
                         cache_type,
                         candidate_path,
@@ -1151,7 +831,7 @@ def _resolve_equipment_item_preview_path(context, item_name, attrs=None, source_
             if not preview_path:
                 preview_path = _resolve_equipment_item_entity_preview_path(
                     context,
-                    ui_file_browser,
+                    asset_previews,
                     source_game,
                     item_name,
                     attrs,
@@ -1305,276 +985,6 @@ def _get_equipment_entry_item_icon_id(context, entry):
         source_game=source_game,
         fallback_template=fallback_template or getattr(entry, "equip_template", ""),
     )
-
-
-def _equipment_item_picker_search_blob(identifier, label, description, attrs=None, fallback_template=""):
-    attrs = attrs if isinstance(attrs, dict) else {}
-    parts = [
-        identifier,
-        label,
-        description,
-        fallback_template,
-        attrs.get("item_name", ""),
-        attrs.get("category", ""),
-        attrs.get("equip_template", ""),
-        attrs.get("hold_template", ""),
-        attrs.get("template_name", ""),
-        attrs.get("equip_slot", ""),
-        attrs.get("hold_slot", ""),
-        attrs.get("attachment_type", ""),
-        attrs.get("attachment_prefix", ""),
-    ]
-    tags = attrs.get("tags", [])
-    if isinstance(tags, str):
-        parts.append(tags)
-    else:
-        try:
-            parts.extend(str(tag) for tag in tags if tag)
-        except Exception:
-            pass
-    return " ".join(str(part or "") for part in parts).lower()
-
-
-def _equipment_item_picker_terms(search_text):
-    return [term for term in str(search_text or "").strip().lower().split() if term]
-
-
-def _equipment_item_picker_matches(identifier, label, description, attrs, fallback_template, search_terms):
-    if not search_terms:
-        return True
-    blob = _equipment_item_picker_search_blob(identifier, label, description, attrs, fallback_template)
-    return all(term in blob for term in search_terms)
-
-
-def _equipment_item_recent_key(source_game, category):
-    return (_normalize_source_game(source_game), str(category or "None"))
-
-
-def _get_equipment_item_recents(source_game, category):
-    return list(_EQUIPMENT_ITEM_PICKER_RECENTS.get(_equipment_item_recent_key(source_game, category), []))
-
-
-def _remember_equipment_item_recent(source_game, category, item_name):
-    item_name = str(item_name or "").strip()
-    if not item_name:
-        return
-    key = _equipment_item_recent_key(source_game, category)
-    recents = [name for name in _EQUIPMENT_ITEM_PICKER_RECENTS.get(key, []) if name != item_name]
-    recents.insert(0, item_name)
-    _EQUIPMENT_ITEM_PICKER_RECENTS[key] = recents[:_EQUIPMENT_ITEM_PICKER_RECENT_LIMIT]
-
-
-def _sort_equipment_item_picker_rows(rows, source_game, category, sort_mode):
-    sort_mode = str(sort_mode or "NAME_ASC")
-    if sort_mode == "NAME_DESC":
-        rows.sort(key=lambda row: str(row.get("label", "") or row.get("identifier", "")).lower(), reverse=True)
-        return rows
-    if sort_mode == "RECENT":
-        recent_order = {
-            item_name: index
-            for index, item_name in enumerate(_get_equipment_item_recents(source_game, category))
-        }
-        rows.sort(
-            key=lambda row: (
-                recent_order.get(row.get("identifier", ""), 999999),
-                str(row.get("label", "") or row.get("identifier", "")).lower(),
-            )
-        )
-        return rows
-    rows.sort(key=lambda row: str(row.get("label", "") or row.get("identifier", "")).lower())
-    return rows
-
-
-def _get_default_item_picker_rows(context, entry, source_game="w3", search_text="", sort_mode="NAME_ASC", limit=None):
-    rows = []
-    match_count = 0
-    all_count = 0
-    search_terms = _equipment_item_picker_terms(search_text)
-
-    try:
-        items = entry.get_default_items(context)
-    except Exception:
-        items = [("None", "None", "")]
-
-    for item in items or [("None", "None", "")]:
-        all_count += 1
-        identifier = str(item[0] or "None")
-        label = str(item[1] or identifier)
-        description = str(item[2] or "")
-        attrs, fallback_template = _get_equipment_item_attrs_for_enum(entry, identifier, source_game)
-        if not _equipment_item_picker_matches(
-            identifier,
-            label,
-            description,
-            attrs,
-            fallback_template,
-            search_terms,
-        ):
-            continue
-        match_count += 1
-        rows.append({
-            "identifier": identifier,
-            "label": label,
-            "description": description,
-            "attrs": attrs,
-            "fallback_template": fallback_template,
-        })
-    _sort_equipment_item_picker_rows(rows, source_game, getattr(entry, "category", "None"), sort_mode)
-    if limit is not None:
-        rows = rows[:max(0, int(limit))]
-    return rows, match_count, all_count
-
-
-def _set_equipment_default_item(context, entry_index, item_name):
-    temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
-    if not temp_data or not (0 <= int(entry_index) < len(temp_data.equipment_entries)):
-        return False
-    entry = temp_data.equipment_entries[int(entry_index)]
-    entry.defaultItemName = str(item_name or "None")
-    _remember_equipment_item_recent(
-        getattr(entry, "source_game", "") or _get_temp_source_game(context),
-        getattr(entry, "category", "None"),
-        item_name,
-    )
-    try:
-        if context.area:
-            context.area.tag_redraw()
-    except Exception:
-            pass
-    return True
-
-
-def _encode_equipment_item_attrs(attrs):
-    if not isinstance(attrs, dict):
-        return "{}"
-    try:
-        return json.dumps(attrs, sort_keys=True, default=str)
-    except Exception:
-        return "{}"
-
-
-def _decode_equipment_item_attrs(attrs_json):
-    try:
-        value = json.loads(str(attrs_json or "{}"))
-    except Exception:
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def _equipment_item_picker_filter_token(entry, entry_index, source_game, search_text, sort_mode):
-    try:
-        category = getattr(entry, "category", "") or "None"
-        item_name = getattr(entry, "defaultItemName", "") or "None"
-    except Exception:
-        category = "None"
-        item_name = "None"
-    return "\x1f".join((
-        str(entry_index),
-        _normalize_source_game(source_game),
-        str(category),
-        str(item_name),
-        str(search_text or ""),
-        str(sort_mode or "NAME_ASC"),
-    ))
-
-
-def _populate_equipment_item_picker_rows(context, entry, entry_index, source_game, search_text, sort_mode):
-    temp_data = _get_temp_equipment_data(context)
-    if temp_data is None or entry is None:
-        return 0, 0
-
-    source_game = _normalize_source_game(source_game or getattr(entry, "source_game", "") or "w3")
-    token = _equipment_item_picker_filter_token(entry, entry_index, source_game, search_text, sort_mode)
-    if getattr(temp_data, "item_picker_filter_token", "") == token:
-        return (
-            int(getattr(temp_data, "item_picker_match_count", 0) or 0),
-            int(getattr(temp_data, "item_picker_all_count", 0) or 0),
-        )
-
-    rows, match_count, all_count = _get_default_item_picker_rows(
-        context,
-        entry,
-        source_game=source_game,
-        search_text=search_text,
-        sort_mode=sort_mode,
-        limit=None,
-    )
-    current_name = str(getattr(entry, "defaultItemName", "") or "")
-    active_index = -1
-
-    previous_suppress = bool(getattr(temp_data, "item_picker_suppress_select", False))
-    temp_data.item_picker_suppress_select = True
-    try:
-        temp_data.item_picker_rows.clear()
-        for index, row_data in enumerate(rows):
-            row = temp_data.item_picker_rows.add()
-            identifier = str(row_data.get("identifier", "") or "None")
-            label = str(row_data.get("label", "") or identifier)
-            row.identifier = identifier
-            row.label = label
-            row.description = str(row_data.get("description", "") or "")
-            row.fallback_template = str(row_data.get("fallback_template", "") or "")
-            row.attrs_json = _encode_equipment_item_attrs(row_data.get("attrs", {}))
-            row.source_game = source_game
-            try:
-                row.name = label
-            except Exception:
-                pass
-            if identifier == current_name:
-                active_index = index
-        temp_data.item_picker_entry_index = int(entry_index)
-        temp_data.item_picker_source_game = source_game
-        temp_data.item_picker_match_count = int(match_count)
-        temp_data.item_picker_all_count = int(all_count)
-        temp_data.item_picker_filter_token = token
-        temp_data.item_picker_index = active_index
-    finally:
-        temp_data.item_picker_suppress_select = previous_suppress
-
-    return match_count, all_count
-
-
-def _get_equipment_item_picker_active_row(temp_data):
-    if temp_data is None:
-        return None
-    try:
-        index = int(getattr(temp_data, "item_picker_index", -1))
-    except Exception:
-        index = -1
-    if 0 <= index < len(temp_data.item_picker_rows):
-        return temp_data.item_picker_rows[index]
-    return None
-
-
-def _on_equipment_item_picker_index_changed(self, context):
-    if bool(getattr(self, "item_picker_suppress_select", False)):
-        return
-    active_row = _get_equipment_item_picker_active_row(self)
-    if active_row is None:
-        return
-    try:
-        entry_index = int(getattr(self, "item_picker_entry_index", -1))
-    except Exception:
-        entry_index = -1
-    if entry_index < 0:
-        return
-    _set_equipment_default_item(context, entry_index, getattr(active_row, "identifier", "None"))
-
-
-def _on_equipment_item_picker_filter_changed(self, context):
-    # Search / view / sort changes invalidate the current page offset.
-    try:
-        if int(getattr(self, "item_picker_page", 0) or 0) != 0:
-            self.item_picker_page = 0
-    except Exception:
-        pass
-
-
-def _equipment_picker_short_label(text, max_chars=32):
-    text = str(text or "")
-    if len(text) <= max_chars:
-        return text
-    return text[:max(0, max_chars - 3)].rstrip() + "..."
 
 
 def _apply_catalog_attributes_to_slot(slot, source_game=None):
@@ -4884,24 +4294,13 @@ def template_belongs_to_appearance(slot, appearance_name):
     app_names.discard('')
     return appearance_name in app_names
 
-# Updated default categories with equip_template strings
-default_categories = {
-    "pants": [("None", "None", ""), ("Body underwear 01", "Body underwear 01", "l_01_mg__body_underwear")],
-    "armor": [("None", "None", ""), ("Body torso 01", "Body torso 01", "t_01_mg__body")],
-    "gloves": [("None", "None", ""), ("Body palms 01", "Body palms 01", "g_01_mg__body")],
-    "boots": [("None", "None", ""), ("Body feet 01", "Body feet 01", "s_01_mg__body")],
-    "steelsword": [("None", "None", "")],
-    "silversword": [("None", "None", "")],
-    "crossbow": [("None", "None", "")],
-    "head": [("None", "None", ""), ("head_2", "head_2", "h_02_mg__geralt")],
-    "hair": [("None", "None", ""), ("Preview Hair", "Preview Hair", "c_01b_mg__witcher")]
-}
+default_categories = equipment_catalog.default_categories
 
 # Define the EquipmentDefinitionEntry property group
 class EquipmentDefinitionEntry(bpy.types.PropertyGroup):
-    # Class variable to store all categories and items, including those from XML
-    category_items = default_categories.copy()
-    item_attributes = {}  # New dictionary to store attributes for each item
+    # Class aliases retained for existing UI code; catalog owns the storage.
+    category_items = equipment_catalog.category_items
+    item_attributes = equipment_catalog.item_attributes
 
     # Use property getters and setters for instance_items
     @property
@@ -5331,15 +4730,6 @@ class InventoryDefinitionEntry(bpy.types.PropertyGroup):
     slot_index: bpy.props.IntProperty(name="Slot Index", default=-1, options={'HIDDEN'})
 
 
-class EquipmentItemPickerRow(bpy.types.PropertyGroup):
-    identifier: bpy.props.StringProperty(name="Identifier", default="")
-    label: bpy.props.StringProperty(name="Name", default="")
-    description: bpy.props.StringProperty(name="Description", default="")
-    fallback_template: bpy.props.StringProperty(name="Template", default="")
-    attrs_json: bpy.props.StringProperty(name="Attributes", default="{}")
-    source_game: bpy.props.StringProperty(name="Source Game", default="w3")
-
-
 # Temporary data storage in WindowManager
 class WitcherUITempData(bpy.types.PropertyGroup):
     equipment_entries: bpy.props.CollectionProperty(type=EquipmentDefinitionEntry)
@@ -5488,732 +4878,59 @@ class EQUIPMENT_OT_SearchCategory(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class EQUIPMENT_OT_PickDefaultItem(bpy.types.Operator):
-    bl_idname = "witcher.equipment_pick_default_item"
-    bl_label = "Pick Item"
-    bl_description = "Pick this equipment item"
-    bl_options = {'INTERNAL'}
-
-    entry_index: bpy.props.IntProperty(default=-1, options={'HIDDEN'})
-    item_name: bpy.props.StringProperty(default="", options={'HIDDEN'})
-    # Full label shown as the hover tooltip — grid/list buttons truncate the
-    # visible text, so this lets users read the complete name on hover.
-    tooltip: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
-
-    @classmethod
-    def description(cls, context, properties):
-        tip = str(getattr(properties, "tooltip", "") or "").strip()
-        return tip or cls.bl_description
-
-    def execute(self, context):
-        if not _set_equipment_default_item(context, self.entry_index, self.item_name):
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-
-class EQUIPMENT_OT_ItemPickerPage(bpy.types.Operator):
-    bl_idname = "witcher.equipment_item_picker_page"
-    bl_label = "Picker Page"
-    bl_description = "Show the previous or next page of items"
-    bl_options = {'INTERNAL'}
-
-    direction: bpy.props.EnumProperty(
-        items=[('PREV', "Previous", ""), ('NEXT', "Next", "")],
-        default='NEXT',
-        options={'HIDDEN'},
-    )
-    max_page: bpy.props.IntProperty(default=0, options={'HIDDEN'})
-
-    def execute(self, context):
-        temp_data = _get_temp_equipment_data(context)
-        if temp_data is None:
-            return {'CANCELLED'}
-        page = int(getattr(temp_data, "item_picker_page", 0) or 0)
-        page += -1 if self.direction == 'PREV' else 1
-        temp_data.item_picker_page = max(0, min(page, max(0, int(self.max_page))))
-        # The dialog stays open (KEEP_OPEN) and redraws in place on the new page.
-        return {'FINISHED'}
-
-
-class EQUIPMENT_OT_SearchDefaultItem(bpy.types.Operator):
-    bl_idname = "witcher.equipment_search_default_item"
-    bl_label = "Select Item"
-    bl_description = "Search and pick an item for the selected category"
-
-    entry_index: bpy.props.IntProperty(default=-1, options={'HIDDEN'})
-
-    def _get_entry(self, context):
-        temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
-        if temp_data and 0 <= self.entry_index < len(temp_data.equipment_entries):
-            return temp_data.equipment_entries[self.entry_index]
-        return None
-
-    def invoke(self, context, event):
-        temp_data = _get_temp_equipment_data(context)
-        entry = self._get_entry(context)
-        if temp_data is None or entry is None:
-            return {'CANCELLED'}
-
-        temp_data.item_picker_entry_index = int(self.entry_index)
-        # Fresh open: clear the transient search/page state.
-        temp_data.item_picker_search = ""
-        temp_data.item_picker_page = 0
-
-        # Warm the placeholder so the first frame already shows same-sized tiles.
-        _get_equipment_placeholder_icon_id()
-
-        # Draggable dialog with a title bar to grab; stays open while you browse
-        # so you can try several items. Picking applies instantly; "Done"/Esc/
-        # click-away closes it. confirm_text is only available on Blender 4.1+.
-        try:
-            context.window_manager.invoke_props_dialog(
-                self,
-                width=_EQUIPMENT_ITEM_PICKER_WIDTH,
-                confirm_text="Done",
-            )
-        except TypeError:
-            context.window_manager.invoke_props_dialog(self, width=_EQUIPMENT_ITEM_PICKER_WIDTH)
-        return {'RUNNING_MODAL'}
-
-    @staticmethod
-    def _row_icon_id(context, row):
-        attrs = _decode_equipment_item_attrs(getattr(row, "attrs_json", "{}"))
-        return _get_cached_or_queue_equipment_item_icon_id(
-            context,
-            getattr(row, "identifier", ""),
-            attrs,
-            source_game=getattr(row, "source_game", "") or "w3",
-            fallback_template=getattr(row, "fallback_template", ""),
-        )
-
-    def _pick_op(self, layout, identifier, *, text, current, icon_value=None, tooltip=None):
-        kwargs = {"text": text, "depress": (identifier == current)}
-        if icon_value is not None:
-            kwargs["icon_value"] = icon_value
-        op = layout.operator("witcher.equipment_pick_default_item", **kwargs)
-        op.entry_index = self.entry_index
-        op.item_name = identifier
-        if tooltip:
-            op.tooltip = tooltip
-        return op
-
-    def _draw_grid(self, context, layout, page_rows, current, placeholder_id, columns, scale, label_chars):
-        grid = layout.grid_flow(
-            row_major=True,
-            columns=columns,
-            even_columns=True,
-            even_rows=True,
-            align=True,
-        )
-        for row in page_rows:
-            identifier = getattr(row, "identifier", "") or "None"
-            label = getattr(row, "label", "") or identifier
-            icon_id = self._row_icon_id(context, row) or placeholder_id
-
-            cell = grid.box().column(align=True)
-            icon_row = cell.row(align=True)
-            icon_row.alignment = 'CENTER'
-            icon_row.template_icon(icon_value=icon_id, scale=scale)
-            self._pick_op(
-                cell,
-                identifier,
-                text=_equipment_picker_short_label(label, max_chars=label_chars),
-                current=current,
-                tooltip=label,
-            )
-
-        # Pad the final row so the tiles stay aligned in a clean rectangle.
-        fill = (columns - (len(page_rows) % columns)) % columns
-        for _ in range(fill):
-            spacer = grid.column(align=True)
-            spacer.enabled = False
-            spacer.label(text="")
-
-    def _draw_list(self, context, layout, page_rows, current, placeholder_id):
-        col = layout.column(align=True)
-        for row in page_rows:
-            identifier = getattr(row, "identifier", "") or "None"
-            label = getattr(row, "label", "") or identifier
-            icon_id = self._row_icon_id(context, row) or placeholder_id
-
-            # Large (~3x) thumbnail on the left, clickable label filling the row.
-            line = col.box().row(align=True)
-            thumb = line.row(align=True)
-            thumb.alignment = 'LEFT'
-            thumb.template_icon(icon_value=icon_id, scale=_EQUIPMENT_ITEM_PICKER_LIST_ICON_SCALE)
-            label_col = line.column(align=True)
-            label_col.scale_y = _EQUIPMENT_ITEM_PICKER_LIST_ICON_SCALE
-            self._pick_op(
-                label_col,
-                identifier,
-                text=_equipment_picker_short_label(label, max_chars=_EQUIPMENT_ITEM_PICKER_LIST_LABEL_CHARS),
-                current=current,
-                tooltip=label,
-            )
-
-    def draw(self, context):
-        layout = self.layout
-        layout.separator()  # a little headway under the (draggable) title bar
-        temp_data = _get_temp_equipment_data(context)
-        entry = self._get_entry(context)
-        if temp_data is None or entry is None:
-            layout.label(text="No equipment entry selected", icon='ERROR')
-            return
-
-        source_game = getattr(entry, "source_game", "") or _get_temp_source_game(context)
-        is_grid = (temp_data.item_picker_view == 'GRID')
-        placeholder_id = _get_equipment_placeholder_icon_id()
-        search_text = str(temp_data.item_picker_search or "")
-        grid_columns, grid_scale, grid_label_chars = _equipment_grid_size_params(temp_data.item_picker_grid_size)
-
-        # --- Search / view / sort header --------------------------------------
-        header = layout.row(align=True)
-        header.prop(temp_data, "item_picker_search", text="", icon='VIEWZOOM')
-        header.prop(temp_data, "item_picker_view", text="", icon_only=True, expand=True)
-        if is_grid:
-            # Compact size dropdown, same pattern as the asset browser.
-            header.prop(temp_data, "item_picker_grid_size", text="", icon_only=True)
-        header.prop(temp_data, "item_picker_sort", text="")
-        header.prop(temp_data, "auto_apply_equipment_selection", text="", icon='FILE_REFRESH')
-
-        # --- Filter + sort (token-cached so this is cheap on redraw) ----------
-        match_count, all_count = _populate_equipment_item_picker_rows(
-            context,
-            entry,
-            self.entry_index,
-            source_game,
-            search_text,
-            temp_data.item_picker_sort,
-        )
-        rows = list(temp_data.item_picker_rows)
-        total = len(rows)
-
-        # --- Paging math (read-only clamp; the page op commits writes) --------
-        page_size = (
-            grid_columns * _EQUIPMENT_ITEM_PICKER_GRID_PAGE_ROWS
-            if is_grid
-            else _EQUIPMENT_ITEM_PICKER_LIST_PAGE_ROWS
-        )
-        page_count = max(1, (total + page_size - 1) // page_size)
-        page = max(0, min(int(temp_data.item_picker_page), page_count - 1))
-
-        # --- Status line: result count + current value + clear ----------------
-        info = layout.row(align=True)
-        count_box = info.row(align=True)
-        count_box.alignment = 'LEFT'
-        if search_text:
-            count_box.label(text=f"{match_count} of {all_count} items", icon='VIEWZOOM')
-        else:
-            count_box.label(text=f"{total} items", icon='PRESET')
-
-        current = str(getattr(entry, "defaultItemName", "") or "None")
-        current_box = info.row(align=True)
-        current_box.alignment = 'CENTER'
-        current_box.label(text="Current: " + _equipment_picker_short_label(current, max_chars=28))
-
-        action_box = info.row(align=True)
-        action_box.alignment = 'RIGHT'
-        import_default = str(getattr(entry, "import_default_item", "") or "None")
-        default_btn = action_box.row(align=True)
-        # Only enable when there is an imported default that differs from current.
-        default_btn.enabled = bool(import_default) and import_default != current
-        default_op = default_btn.operator(
-            "witcher.equipment_pick_default_item", text="Default", icon='LOOP_BACK'
-        )
-        default_op.entry_index = self.entry_index
-        default_op.item_name = import_default
-        clear_op = action_box.operator("witcher.equipment_pick_default_item", text="None", icon='X')
-        clear_op.entry_index = self.entry_index
-        clear_op.item_name = "None"
-
-        # --- Pagination (character-browser style prev / page / next) ----------
-        if page_count > 1:
-            nav = layout.row(align=True)
-            nav.alignment = 'CENTER'
-            prev_op = nav.operator("witcher.equipment_item_picker_page", text="", icon='TRIA_LEFT')
-            prev_op.direction = 'PREV'
-            prev_op.max_page = page_count - 1
-            nav.label(text=f"Page {page + 1} / {page_count}")
-            next_op = nav.operator("witcher.equipment_item_picker_page", text="", icon='TRIA_RIGHT')
-            next_op.direction = 'NEXT'
-            next_op.max_page = page_count - 1
-
-        if total == 0:
-            empty = layout.box()
-            empty.alert = True
-            empty.label(text="No items match your search.", icon='ERROR')
-            return
-
-        # --- Item tiles (only the current page resolves icons) ----------------
-        start = page * page_size
-        page_rows = rows[start:start + page_size]
-
-        body = layout.box()
-        if is_grid:
-            self._draw_grid(
-                context, body, page_rows, current, placeholder_id,
-                grid_columns, grid_scale, grid_label_chars,
-            )
-        else:
-            self._draw_list(context, body, page_rows, current, placeholder_id)
-
-    def execute(self, context):
-        # Selection is committed by the per-item pick operator. In dialog mode
-        # this also runs when the user confirms with OK — nothing extra to do.
-        return {'FINISHED'}
-
-# Function to extract categories and items from XML files, including additional attributes
+# Equipment catalog XML wrappers. The implementation lives in equipment_catalog;
+# these names remain for older callers and operators in this module.
 def extract_categories_from_xml(folder_path):
-    category_items = {}
-    item_attributes = {}
-
-    if not folder_path or not os.path.isdir(folder_path):
-        return [], category_items, item_attributes
-
-    for dirpath, dirnames, file_names in os.walk(folder_path):
-        dirnames.sort()
-        for file_name in sorted(file_names):
-            if not file_name.lower().endswith(".xml"):
-                continue
-            file_path = os.path.join(dirpath, file_name)
-            if not _is_plaintext_xml_candidate(file_path):
-                log.debug("Skipping non-text XML file %s", file_path)
-                continue
-            source_game = _source_game_from_xml_path(file_path)
-            try:
-                root = _parse_xml_root_with_fallbacks(file_path)
-
-                for item in root.findall(".//item"):
-                    category = item.get("category")
-                    name = item.get("name")
-                    equip_template = item.get("equip_template", "")
-                    hold_template = item.get("hold_template", "")
-                    template_name = equip_template or hold_template
-                    icon_path = item.get("icon_path", "") or ""
-                    if not icon_path:
-                        icon_node = item.find("icon_path")
-                        if icon_node is not None and icon_node.text:
-                            icon_path = icon_node.text.strip()
-                    # Extract additional attributes
-                    equip_slot = item.get("equip_slot", "")
-                    hold_slot = item.get("hold_slot", "")
-                    weapon = item.get("weapon", "false").lower() == "true"
-                    attachment_type = item.get("attachment_type", "")
-                    attachment_prefix = item.get("attachment_prefix", "")
-                    tags_text = ""
-                    tags_node = item.find("tags")
-                    if tags_node is not None and tags_node.text:
-                        tags_text = tags_node.text
-                    tags = _split_tags(tags_text)
-
-                    # Parse variants
-                    variants = []
-                    variants_node = item.find("variants")
-                    if variants_node is not None:
-                        for var in variants_node.findall("variant"):
-                            v_template = var.get("equip_template", "")
-                            v_category = var.get("category", "")
-                            v_equip_slot = var.get("equip_slot", "")
-                            v_hold_slot = var.get("hold_slot", "")
-                            if v_template or v_category:
-                                variants.append({
-                                    "equip_template": v_template,
-                                    "category": v_category,
-                                    "equip_slot": v_equip_slot,
-                                    "hold_slot": v_hold_slot
-                                })
-
-                    # Parse bound items
-                    bound_items = []
-
-                    def _collect_bound_items(bound_items_node):
-                        if bound_items_node is None:
-                            return
-                        for bi in bound_items_node.findall("item"):
-                            if not bi.text:
-                                continue
-                            bi_name = bi.text.strip()
-                            if bi_name and bi_name not in bound_items:
-                                bound_items.append(bi_name)
-
-                    _collect_bound_items(item.find("bound_items"))
-
-                    player_override = item.find("player_override")
-                    if player_override is not None:
-                        _collect_bound_items(player_override.find("bound_items"))
-                    # ... extract other attributes as needed
-
-                    if category and name and template_name:
-                        # Initialize the category if it doesn't exist
-                        if category not in category_items:
-                            category_items[category] = [("None", "None", "")]
-
-                        # Add item as a tuple without modifying names or adding suffixes
-                        item_tuple = (name, name, template_name)
-
-                        # Only add if item is not already in the list for this category
-                        if item_tuple not in category_items[category]:
-                            category_items[category].append(item_tuple)
-
-                        # Store attributes
-                        item_attributes[name] = {
-                            'item_name': name,
-                            'category': category,
-                            'equip_template': equip_template,
-                            'hold_template': hold_template,
-                            'template_name': template_name,
-                            'icon_path': icon_path,
-                            'equip_slot': equip_slot,
-                            'hold_slot': hold_slot,
-                            'weapon': weapon,
-                            'attachment_type': attachment_type,
-                            'attachment_prefix': attachment_prefix,
-                            'variants': variants,
-                            'bound_items': bound_items,
-                            'tags': tags,
-                            'source_game': source_game,
-                            # ... store other attributes
-                        }
-
-            except (ET.ParseError, ValueError, UnicodeError) as e:
-                if source_game == "w2":
-                    log.debug("Skipping malformed Witcher 2 XML %s (%s).", file_path, e)
-                else:
-                    log.warning("Error parsing XML %s (%s). Skipping file.", file_path, e)
-                continue
-            except Exception as e:
-                if source_game == "w2":
-                    log.debug("Skipping Witcher 2 XML %s after unexpected parse error: %s", file_path, e)
-                else:
-                    log.warning("Unexpected error parsing XML %s (%s). Skipping file.", file_path, e)
-                continue
-
-    return sorted(category_items.keys()), category_items, item_attributes
+    return equipment_catalog.extract_categories_from_xml(folder_path)
 
 
 def _flatten_bundle_item_candidates(items):
-    if items is None:
-        return []
-    if not isinstance(items, list):
-        return [items]
-    flat = []
-    stack = list(items)
-    while stack:
-        value = stack.pop(0)
-        if isinstance(value, list):
-            stack = list(value) + stack
-            continue
-        flat.append(value)
-    return flat
+    return equipment_catalog.flatten_bundle_item_candidates(items)
 
 
 def _select_final_bundle_item(items):
-    flat = _flatten_bundle_item_candidates(items)
-    for candidate in reversed(flat):
-        if hasattr(candidate, "name"):
-            return candidate
-    return None
+    return equipment_catalog.select_final_bundle_item(items)
 
 
 def _get_equipment_xml_bundle_cache_root():
-    cache_root = Path(get_cache_root(create=True)) / "equipment_items_xml_bundle"
-    cache_root.mkdir(parents=True, exist_ok=True)
-    return str(cache_root)
+    return equipment_catalog.get_equipment_xml_bundle_cache_root()
 
 
 def _extract_equipment_xmls_from_bundles():
-    out_root = _get_equipment_xml_bundle_cache_root()
-
-    # Early exit: if XML files are already extracted to the cache directory,
-    # skip loading BundleManager entirely (expensive on every refresh).
-    if os.path.isdir(out_root):
-        for _dp, _dns, fnames in os.walk(out_root):
-            if any(f.lower().endswith(".xml") for f in fnames):
-                return out_root
-
-    try:
-        bundle_manager = LoadBundleManager()
-    except Exception as e:
-        log.warning("Failed to load bundle manager for equipment XMLs: %s", e)
-        return ""
-
-    items = getattr(bundle_manager, "Items", None) or {}
-    if not items:
-        return ""
-    found = 0
-
-    for key, value in items.items():
-        rel_key = str(key or "").replace("/", "\\").lstrip("\\")
-        rel_lower = rel_key.lower()
-        if not rel_lower.endswith(".xml"):
-            continue
-        if "\\gameplay\\items\\" not in ("\\" + rel_lower):
-            continue
-
-        final_item = _select_final_bundle_item(value)
-        if not final_item or not hasattr(final_item, "extract_to_file"):
-            continue
-
-        found += 1
-        export_path = os.path.join(out_root, rel_key)
-        export_dir = os.path.dirname(export_path)
-        if export_dir:
-            os.makedirs(export_dir, exist_ok=True)
-        if not os.path.exists(export_path):
-            try:
-                final_item.extract_to_file(export_path)
-            except Exception as e:
-                log.warning("Failed to extract equipment XML '%s': %s", rel_key, e)
-
-    if found == 0:
-        return ""
-    return out_root
+    return equipment_catalog.extract_equipment_xmls_from_bundles()
 
 
 def _get_equipment_xml_sources(context, addon_prefs):
-    prefer_redkit = bool(getattr(addon_prefs, "prefer_redkit_equipment_xml", False))
-
-    try:
-        uncook_root = get_uncook_path(context)
-    except Exception:
-        uncook_root = ""
-    uncook_items = os.path.join(uncook_root, "gameplay", "items") if uncook_root else ""
-
-    bundle_items_root = _extract_equipment_xmls_from_bundles()
-
-    redkit_depot = getattr(addon_prefs, "redkit_depot_path", "") or ""
-    redkit_items = os.path.join(redkit_depot, "gameplay", "items") if redkit_depot else ""
-
-    dev_override = get_dev_override("equipment_items_xml_root", "")
-
-    ordered = []
-    if prefer_redkit:
-        ordered.extend([
-            ("REDkit r4data", redkit_items),
-            ("Uncook", uncook_items),
-            ("Bundles", bundle_items_root),
-        ])
-    else:
-        ordered.extend([
-            ("Uncook", uncook_items),
-            ("Bundles", bundle_items_root),
-            ("REDkit r4data", redkit_items),
-        ])
-
-    if dev_override:
-        ordered.append(("Dev Override", dev_override))
-
-    # Deduplicate by normalized path while preserving order.
-    result = []
-    seen = set()
-    for label, path in ordered:
-        if not path:
-            result.append((label, path, False))
-            continue
-        try:
-            norm = os.path.normcase(os.path.normpath(path))
-        except Exception:
-            norm = path.lower()
-        if norm in seen:
-            continue
-        seen.add(norm)
-        result.append((label, path, os.path.isdir(path)))
-    return result
+    return equipment_catalog.get_equipment_xml_sources(context, addon_prefs)
 
 
 def _refresh_w3_catalog_from_xml(context):
-    try:
-        addon_prefs = get_all_addon_prefs(context)
-        sources = _get_equipment_xml_sources(context, addon_prefs)
-    except Exception:
-        log.debug("Failed to resolve equipment XML sources for catalog refresh", exc_info=True)
-        return False
-
-    valid_sources = [(label, path) for (label, path, is_valid) in sources if is_valid]
-    if not valid_sources:
-        return False
-
-    merged_category_items = {}
-    merged_item_attributes = {}
-    for _label, folder_path in valid_sources:
-        _all_categories, category_items_from_xml, item_attributes_from_xml = extract_categories_from_xml(folder_path)
-        _merge_equipment_xml_data(
-            merged_category_items,
-            merged_item_attributes,
-            category_items_from_xml,
-            item_attributes_from_xml,
-        )
-
-    if not merged_item_attributes:
-        return False
-
-    target_categories, target_attributes = _get_equipment_catalog("w3")
-    target_categories.clear()
-    target_attributes.clear()
-    _merge_equipment_xml_data(
-        target_categories,
-        target_attributes,
-        merged_category_items,
-        merged_item_attributes,
-    )
-    _clear_item_attribute_identifier_lookup("w3")
-    _save_category_cache("w3")
-    _TEMPLATE_PATH_RESOLVE_CACHE.clear()
-    return True
+    return equipment_catalog.refresh_w3_catalog_from_xml(context)
 
 
 def _merge_equipment_xml_data(target_categories, target_attributes, source_categories, source_attributes):
-    for category, items in source_categories.items():
-        if category not in target_categories:
-            target_categories[category] = list(items)
-            continue
-        existing_items_set = set(tuple(item) for item in target_categories[category])
-        for item in items:
-            item_tuple = tuple(item)
-            if item_tuple not in existing_items_set:
-                target_categories[category].append(item)
-                existing_items_set.add(item_tuple)
-
-    # Preserve earlier sources as higher priority.
-    for item_name, attrs in source_attributes.items():
-        target_attributes.setdefault(item_name, attrs)
+    return equipment_catalog.merge_equipment_xml_data(
+        target_categories,
+        target_attributes,
+        source_categories,
+        source_attributes,
+    )
 
 
 def _strip_duplicate_xml_attributes(xml_text):
-    """Pre-process XML text to remove duplicate attributes, keeping the first occurrence.
-
-    Some Witcher 3 gameplay XMLs contain duplicate attributes on a single element
-    (e.g. ``player_level_min`` appearing twice on a ``<loot>`` tag), which is
-    technically invalid XML that Python's ElementTree refuses to parse.  This
-    function strips all but the first occurrence of any repeated attribute name so
-    the file can be parsed normally.
-    """
-    import re as _re
-
-    def _fix_tag(match):
-        seen = set()
-
-        def _keep_attr(m):
-            name = m.group(1).lower()
-            if name in seen:
-                return ""
-            seen.add(name)
-            return m.group(0)
-
-        # Match name="value" or name='value' pairs inside the tag
-        return _re.sub(
-            r'([\w\-\.:]+)\s*=\s*(?:"[^"]*"|\'[^\']*\')',
-            _keep_attr,
-            match.group(0),
-        )
-
-    return _re.sub(r'<[\w][^>]*>', _fix_tag, xml_text, flags=_re.DOTALL)
+    return equipment_catalog.strip_duplicate_xml_attributes(xml_text)
 
 
 def _is_plaintext_xml_candidate(file_path):
-    """Return False for packed/binary files that use an .xml extension."""
-    try:
-        with open(file_path, "rb") as f:
-            raw = f.read(512)
-    except Exception:
-        return True
-    if not raw:
-        return False
-    for bom in (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff"):
-        if raw.startswith(bom):
-            raw = raw[len(bom):]
-            break
-    stripped = raw.lstrip(b" \t\r\n\x00")
-    return stripped.startswith((b"<", b"#"))
+    return equipment_catalog.is_plaintext_xml_candidate(file_path)
 
 
 def _parse_xml_text_with_game_fallbacks(text):
-    # ElementTree rejects unicode strings with an XML encoding declaration.
-    text = _XML_DECL_RE.sub("", text, count=1).lstrip("\ufeff")
-    last_exc = None
-    candidates = [text]
-    cleaned = _XML_HASH_COMMENT_LINE_RE.sub("", text)
-    if cleaned != text:
-        candidates.append(cleaned)
-
-    for candidate in candidates:
-        try:
-            return ET.fromstring(candidate)
-        except ET.ParseError as exc:
-            last_exc = exc
-
-        deduped = _strip_duplicate_xml_attributes(candidate)
-        if deduped == candidate:
-            continue
-        try:
-            return ET.fromstring(deduped)
-        except ET.ParseError as exc:
-            last_exc = exc
-
-    if last_exc is not None:
-        raise last_exc
-    raise ET.ParseError("empty XML text")
+    return equipment_catalog.parse_xml_text_with_game_fallbacks(text)
 
 
 def _parse_xml_root_with_fallbacks(file_path):
-    try:
-        return ET.parse(file_path).getroot()
-    except (ET.ParseError, ValueError) as first_exc:
-        last_exc = first_exc
-
-    try:
-        with open(file_path, "rb") as f:
-            raw = f.read()
-    except Exception:
-        raise last_exc
-
-    if not raw:
-        raise last_exc
-
-    encodings = []
-    decl_match = _XML_DECL_ENCODING_BYTES_RE.search(raw[:256])
-    if decl_match:
-        try:
-            declared = decl_match.group(1).decode("ascii", errors="ignore").strip()
-        except Exception:
-            declared = ""
-        if declared:
-            encodings.extend([declared, declared.lower()])
-
-    # Common encodings found in game/editor XML exports.
-    encodings.extend([
-        "utf-8-sig",
-        "utf-8",
-        "utf-16",
-        "utf-16-le",
-        "utf-16-be",
-        "cp1250",
-        "cp1252",
-        "latin-1",
-    ])
-
-    tried = set()
-    for encoding in encodings:
-        key = encoding.lower()
-        if key in tried:
-            continue
-        tried.add(key)
-        try:
-            text = raw.decode(encoding)
-            return _parse_xml_text_with_game_fallbacks(text)
-        except Exception as exc:
-            last_exc = exc
-            continue
-
-    # Final fallback: strip duplicate attributes (invalid but present in some game XMLs)
-    try:
-        text = raw.decode("utf-8", errors="replace")
-        text = _strip_duplicate_xml_attributes(text)
-        return _parse_xml_text_with_game_fallbacks(text)
-    except Exception as exc:
-        last_exc = exc
-
-    raise last_exc
+    return equipment_catalog.parse_xml_root_with_fallbacks(file_path)
 
 # Operator to refresh backend categories and items from XML files
 class EQUIPMENT_OT_RefreshCategories(bpy.types.Operator):
@@ -6690,10 +5407,7 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
         if temp_data.equipment_source_game == "w2":
             # Auto-restore W2 catalog from persistent cache on first draw so the
             # category/item search popups work without a manual "Refresh Categories".
-            global _W2_CATEGORY_CACHE_LOADED
-            if not _W2_CATEGORY_CACHE_LOADED:
-                _load_category_cache("w2")
-                _W2_CATEGORY_CACHE_LOADED = True
+            equipment_catalog.ensure_w2_category_cache_loaded()
             try:
                 ensure_equipment_catalog_for_search_roots(import_entity._get_armature_source_roots(main_arm_obj))
             except Exception:
