@@ -4,6 +4,7 @@ import logging
 import os
 import pickle
 import time
+from io import BytesIO
 
 from .. import cache_meta
 from ....extension_paths import get_cache_root
@@ -18,7 +19,7 @@ class Configuration:
     ExecutablePath = ""
 
 
-_STRING_CACHE_FORMAT_VERSION = 1
+_STRING_CACHE_FORMAT_VERSION = 2
 
 
 def _normalize_path(path: str) -> str:
@@ -122,11 +123,86 @@ def find_w2_strings_files_for_path(override_path: str = "", fallback_roots=None)
     return find_w2_strings_files(resolve_w2_strings_roots(override_path, fallback_roots))
 
 
+def _find_w2_dzip_files(roots):
+    found = []
+    seen = set()
+    for root in _coerce_roots(roots):
+        root_str = str(root or "").strip()
+        if not root_str:
+            continue
+        cooked_root = os.path.join(root_str, "CookedPC")
+        if not os.path.isdir(cooked_root):
+            continue
+        for dirpath, _dirs, filenames in os.walk(cooked_root):
+            for name in sorted(filenames):
+                if not name.lower().endswith(".dzip"):
+                    continue
+                path = os.path.join(dirpath, name)
+                key = os.path.normcase(os.path.normpath(path))
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(path)
+    return found
+
+
+def _dzip_item_source_id(item):
+    archive_path = str(getattr(getattr(item, "bundle", None), "ArchiveAbsolutePath", "") or "")
+    item_name = str(getattr(item, "name", "") or getattr(item, "Name", "") or "")
+    return f"{archive_path}::{item_name}" if archive_path else item_name
+
+
+def _iter_w2_strings_dzip_sources(roots):
+    seen = set()
+    for root in _coerce_roots(roots):
+        root_str = str(root or "").strip()
+        if not root_str or not os.path.isdir(os.path.join(root_str, "CookedPC")):
+            continue
+        try:
+            from ..Witcher2Bundles import LoadWitcher2BundleManager
+
+            manager = LoadWitcher2BundleManager(game_path=root_str)
+        except Exception:
+            log.debug("Could not load Witcher 2 DZIP manager for strings root %s.", root_str, exc_info=True)
+            continue
+
+        for item_name in sorted(getattr(manager, "Items", {}) or {}):
+            if not str(item_name or "").lower().endswith(".w2strings"):
+                continue
+            items = getattr(manager, "Items", {}).get(item_name) or []
+            for item in items[:1]:
+                source_id = _dzip_item_source_id(item)
+                key = os.path.normcase(source_id)
+                if not source_id or key in seen:
+                    continue
+                seen.add(key)
+                yield source_id, item
+
+
+def _find_w2_strings_sources(roots):
+    sources = list(find_w2_strings_files(roots))
+    sources.extend(_iter_w2_strings_dzip_sources(roots))
+    return sources
+
+
+def _w2_strings_source_label(source):
+    if isinstance(source, tuple):
+        return str(source[0] or "")
+    return str(source or "")
+
+
+def _w2_strings_source_language_path(source):
+    if isinstance(source, tuple):
+        item = source[1]
+        return str(getattr(item, "name", "") or getattr(item, "Name", "") or source[0] or "")
+    return str(source or "")
+
+
 def _select_language_files(candidates, language: str):
     handle = normalize_language_handle(language)
 
     def _for_language(target_handle):
-        return [p for p in candidates if language_handle_from_filename(p) == target_handle]
+        return [p for p in candidates if language_handle_from_filename(_w2_strings_source_language_path(p)) == target_handle]
 
     matched = _for_language(handle)
     used_handle = handle
@@ -136,7 +212,7 @@ def _select_language_files(candidates, language: str):
         used_handle = "en"
     if not matched and candidates:
         matched = candidates[:1]
-        used_handle = language_handle_from_filename(matched[0])
+        used_handle = language_handle_from_filename(_w2_strings_source_language_path(matched[0]))
     return matched, used_handle
 
 
@@ -194,25 +270,22 @@ class W2StringManager:
         self.SourcePathById = {}
         self.string_cache_format_version = _STRING_CACHE_FORMAT_VERSION
 
-        candidates = find_w2_strings_files(source_roots)
+        candidates = _find_w2_strings_sources(source_roots)
         if not candidates:
-            log.info("Witcher 2 strings cache skipped: no .w2strings files found in %s", self.base_path or "<unset>")
+            log.info("Witcher 2 strings cache skipped: no loose or archived .w2strings files found in %s", self.base_path or "<unset>")
             return
 
         matched, used_language = _select_language_files(candidates, language)
         self.Language = used_language
-        self.cache_files = list(matched)
+        self.cache_files = [_w2_strings_source_label(source) for source in matched]
 
-        for filename in matched:
-            self.OpenFile(filename)
+        for source in matched:
+            if isinstance(source, tuple):
+                self.OpenDzipItem(source[0], source[1])
+            else:
+                self.OpenFile(source)
 
-    def OpenFile(self, filePath):
-        try:
-            string_file = W2StringFile.from_file(filePath)
-        except (W2StringsParseError, OSError, ValueError):
-            log.warning("Could not read W2 strings file %s", filePath, exc_info=True)
-            return False
-
+    def _ingest_string_file(self, string_file, source_label):
         for sid, text in string_file.texts.items():
             try:
                 sid_int = int(sid)
@@ -220,7 +293,7 @@ class W2StringManager:
                 continue
             if sid_int not in self.Lines:
                 self.Lines[sid_int] = text
-                self.SourcePathById[sid_int] = str(filePath)
+                self.SourcePathById[sid_int] = str(source_label)
 
         for key_name, sid in string_file.keys.items():
             try:
@@ -235,6 +308,25 @@ class W2StringManager:
             self.KeyToId.setdefault(key_text.lower(), sid_int)
             self.IdToKey.setdefault(sid_int, key_text)
         return True
+
+    def OpenFile(self, filePath):
+        try:
+            string_file = W2StringFile.from_file(filePath)
+        except (W2StringsParseError, OSError, ValueError):
+            log.warning("Could not read W2 strings file %s", filePath, exc_info=True)
+            return False
+        return self._ingest_string_file(string_file, filePath)
+
+    def OpenDzipItem(self, source_label, item):
+        try:
+            buffer = BytesIO()
+            item.extract(buffer)
+            source_path = str(getattr(item, "name", "") or getattr(item, "Name", "") or source_label or "")
+            string_file = W2StringFile.from_bytes(buffer.getvalue(), source_path=source_path)
+        except Exception:
+            log.warning("Could not read W2 strings archive item %s", source_label, exc_info=True)
+            return False
+        return self._ingest_string_file(string_file, source_label)
 
     def GetString(self, id: int):
         try:
@@ -265,13 +357,16 @@ class W2StringManager:
         requested_language = normalize_language_handle(language or Configuration.TextLanguage)
         source_roots = resolve_w2_strings_roots(base_path, roots)
         files = find_w2_strings_files(source_roots)
-        signature = cache_meta.compute_signature(files)
+        dzip_files = _find_w2_dzip_files(source_roots)
+        signature_files = files + dzip_files
+        signature = cache_meta.compute_signature(signature_files)
         source = {
             "type": "w2strings",
             "language": requested_language,
             "base_path": _roots_cache_key(source_roots),
             "roots": [_normalize_path(str(root)) for root in source_roots if str(root or "").strip()],
             "files": files,
+            "dzip_files": dzip_files,
         }
         return signature, source
 
@@ -322,7 +417,7 @@ class W2StringManager:
                 cache_meta.save_meta(meta_path, meta)
                 return manager
 
-            if not find_w2_strings_files(source_roots):
+            if not find_w2_strings_files(source_roots) and not _find_w2_dzip_files(source_roots):
                 manager = build_manager()
             elif not os.path.exists(cache_path) or do_reload:
                 if do_reload:

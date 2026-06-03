@@ -1587,6 +1587,7 @@ _DIALOG_AUDIO_STRIP_PROPS = (
     "witcher_cutscene_dialog_sound_event",
     "witcher_cutscene_dialog_item_path",
     "witcher_cutscene_dialog_source_path",
+    "witcher_cutscene_dialog_source_game",
     "witcher_w2scene_dialog_text",
     "witcher_w2scene_dialog_line_id",
     "witcher_w2scene_section_audio",
@@ -1821,12 +1822,16 @@ def _on_voice_game_update(self, context):
     _schedule_deferred_voice_filter()
 
 
-def _voice_dialog_strip_props(line_id, text="", speaker="", source="voice_browser", context=None, source_path=""):
+def _voice_dialog_strip_props(line_id, text="", speaker="", source="voice_browser", context=None, source_path="", source_game=""):
     line_id = str(line_id or "").strip()
     text_language = dialog_language.get_active_text_language(context)
     text = str(text or "").strip()
-    if not text and line_id and source != "voice_browser_w2":
-        text = dialog_language.resolve_localized_text(line_id, language=text_language)
+    source_game = str(source_game or "").upper()
+    if not text and line_id:
+        if source_game == "W2" or source in {"voice_browser_w2", "w2scene"}:
+            text = dialog_language.resolve_localized_text(line_id, language=text_language, source_game="W2")
+        else:
+            text = dialog_language.resolve_localized_text(line_id, language=text_language)
     props = {
         dialog_language.DIALOG_SUBTITLE_TEXT_PROP: text,
         dialog_language.DIALOG_SUBTITLE_LINE_ID_PROP: line_id,
@@ -1855,15 +1860,29 @@ def _merge_voice_dialog_strip_props(line_id, strip_props=None, context=None):
         or line_id
         or ""
     ).strip()
+    source = props.get(dialog_language.DIALOG_SUBTITLE_SOURCE_PROP, "voice")
+    source_game = str(props.get("witcher_cutscene_dialog_source_game", "") or "").upper()
+    if not source_game and source in {"voice_browser_w2", "w2scene"}:
+        source_game = "W2"
     defaults = _voice_dialog_strip_props(
         subtitle_line_id,
         text=text,
         speaker=props.get(dialog_language.DIALOG_SUBTITLE_SPEAKER_PROP, ""),
-        source=props.get(dialog_language.DIALOG_SUBTITLE_SOURCE_PROP, "voice"),
+        source=source,
         context=context,
+        source_game=source_game,
     )
+    resolved_text = str(defaults.get(dialog_language.DIALOG_SUBTITLE_TEXT_PROP, "") or "").strip()
     defaults[dialog_language.DIALOG_SUBTITLE_LANGUAGE_PROP] = text_language
     defaults.update(props)
+    if resolved_text:
+        for text_prop in (
+            dialog_language.DIALOG_SUBTITLE_TEXT_PROP,
+            "witcher_cutscene_dialog_text",
+            "witcher_w2scene_dialog_text",
+        ):
+            if not str(defaults.get(text_prop, "") or "").strip():
+                defaults[text_prop] = resolved_text
     return defaults
 
 
@@ -2724,7 +2743,7 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
     return None
 
 
-def load_w2_voice_and_lipsync(voiceLineId, actor=None, context=None, at_frame=0, strip_props=None, nla_mode=None):
+def load_w2_voice_and_lipsync(voiceLineId, actor=None, context=None, at_frame=None, strip_props=None, nla_mode=None):
     if context is None:
         context = bpy.context
     target_armature = _resolve_voice_target_armature(context, actor=actor)
@@ -2742,6 +2761,8 @@ def load_w2_voice_and_lipsync(voiceLineId, actor=None, context=None, at_frame=0,
         extracted_path,
         active_armature=target_armature,
         use_nla=True,
+        at_frame=at_frame,
+        nla_mode=nla_mode,
     )
 
     if soundstrip is not None:

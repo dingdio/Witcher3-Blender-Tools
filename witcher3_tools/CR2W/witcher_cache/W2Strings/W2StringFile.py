@@ -119,6 +119,14 @@ class W2StringFile:
         instance._parse(data)
         return instance
 
+    @classmethod
+    def from_bytes(cls, data: bytes, source_path=""):
+        instance = cls()
+        instance.source_path = str(source_path or "")
+        instance.filename_language = language_handle_from_filename(source_path)
+        instance._parse(data)
+        return instance
+
     def Read(self, stream):
         self.source_path = str(getattr(stream, "name", "") or "")
         self.filename_language = language_handle_from_filename(self.source_path)

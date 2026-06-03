@@ -2531,6 +2531,14 @@ def ensure_witcher2_speech_item_extracted(context, item_path, overwrite=False) -
     if speech_id is None:
         return ""
 
+    existing_mp2 = get_witcher2_speech_abs_path(context, speech_id, ext=".mp2")
+    existing_dat = get_witcher2_speech_abs_path(context, speech_id, ext=".dat")
+    if not overwrite:
+        if existing_mp2 and win_path_exists(existing_mp2):
+            return existing_mp2
+        if existing_dat and win_path_exists(existing_dat):
+            return existing_dat
+
     manager = LoadWitcher2SpeechManager()
     items = manager.find_item_by_hash(speech_id) if manager else None
     if not items:

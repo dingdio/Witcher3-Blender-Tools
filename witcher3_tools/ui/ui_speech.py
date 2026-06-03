@@ -233,14 +233,17 @@ def _import_w2_sound_strip(context, sound_path, at_frame=0):
     return soundstrip
 
 
-def _import_w2_voice_pair(context, filepath, active_armature=None, use_nla=True):
+def _import_w2_voice_pair(context, filepath, active_armature=None, use_nla=True, at_frame=None, nla_mode=None):
     dat_path, mp2_path = _resolve_w2_voice_pair(filepath, context)
     if not dat_path and not mp2_path:
         raise FileNotFoundError(f"W2 voice pair not found: {filepath}")
 
     _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
-    nla_mode = _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
-    at_frame = float(context.scene.frame_current) if nla_mode == 'append_at_cursor' else 0
+    nla_mode = nla_mode or _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+    if at_frame is None:
+        at_frame = float(context.scene.frame_current) if nla_mode == 'append_at_cursor' else 0
+    else:
+        at_frame = float(at_frame or 0)
 
     if dat_path:
         import_anims.import_lipsync(

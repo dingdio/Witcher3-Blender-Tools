@@ -23,6 +23,7 @@ import_scene_motion = importlib.reload(import_scene_motion)
 from ..importers.import_helpers import set_blender_object_transform#, set_blender_pose_bone_transform
 from ..action_compat import assign_action, bind_strip_action_slot, get_action_channelbag, iter_action_fcurves, new_action_fcurve, resolve_action_slot
 from .import_cutscene import (
+    CUTSCENE_DIALOG_SOURCE_GAME_PROP,
     check_if_actor_already_in_scene,
     _ensure_cutscene_actor_appearance,
     _ensure_cutscene_face_setup,
@@ -50,7 +51,7 @@ from mathutils import Euler, Quaternion
 from math import radians
 import math
 from mathutils import Matrix, Vector
-from ..ui.ui_voice import _find_face_meshes, _get_sequence_editor_strips, load_voice_and_lipsync
+from ..ui.ui_voice import _find_face_meshes, _get_sequence_editor_strips, load_w2_voice_and_lipsync
 from ..ui.ui_anims_list import GetAnimationInfoByName, load_anim_into_scene
 
 def loadSceneFile(fileName):
@@ -6332,28 +6333,39 @@ class SceneImporter():
                         dialog_line_id,
                         self._scene_filepath,
                         language=text_language,
+                        source_game="W2",
                     )
                     if dialog_line_id:
-                        load_voice_and_lipsync(
-                            dialog_line_id,
-                            curr_actor,
-                            context=context,
-                            at_frame=self.__frame_current,
-                            nla_mode='replace',
-                            strip_props={
-                                dialog_language.DIALOG_SUBTITLE_TEXT_PROP: dialog_line_text,
-                                dialog_language.DIALOG_SUBTITLE_LINE_ID_PROP: dialog_line_id,
-                                dialog_language.DIALOG_SUBTITLE_SPEAKER_PROP: str(dialogscript.voicetag or ""),
-                                dialog_language.DIALOG_SUBTITLE_SOURCE_PROP: "w2scene",
-                                dialog_language.DIALOG_SUBTITLE_SOURCE_PATH_PROP: self._scene_filepath,
-                                dialog_language.DIALOG_SUBTITLE_LANGUAGE_PROP: text_language,
-                                "witcher_w2scene_dialog_text": dialog_line_text,
-                                W2SCENE_AUDIO_STRIP_PROP: True,
-                                W2SCENE_AUDIO_SOURCE_PROP: self._scene_filepath,
-                                W2SCENE_AUDIO_SECTION_PROP: self._section_name,
-                            },
-                        )
-                        remember_section_nla_targets([curr_actor])
+                        try:
+                            soundstrip = load_w2_voice_and_lipsync(
+                                dialog_line_id,
+                                curr_actor,
+                                context=context,
+                                at_frame=self.__frame_current,
+                                nla_mode='replace',
+                                strip_props={
+                                    dialog_language.DIALOG_SUBTITLE_TEXT_PROP: dialog_line_text,
+                                    dialog_language.DIALOG_SUBTITLE_LINE_ID_PROP: dialog_line_id,
+                                    dialog_language.DIALOG_SUBTITLE_SPEAKER_PROP: str(dialogscript.voicetag or ""),
+                                    dialog_language.DIALOG_SUBTITLE_SOURCE_PROP: "w2scene",
+                                    dialog_language.DIALOG_SUBTITLE_SOURCE_PATH_PROP: self._scene_filepath,
+                                    dialog_language.DIALOG_SUBTITLE_LANGUAGE_PROP: text_language,
+                                    "witcher_w2scene_dialog_text": dialog_line_text,
+                                    CUTSCENE_DIALOG_SOURCE_GAME_PROP: "W2",
+                                    W2SCENE_AUDIO_STRIP_PROP: True,
+                                    W2SCENE_AUDIO_SOURCE_PROP: self._scene_filepath,
+                                    W2SCENE_AUDIO_SECTION_PROP: self._section_name,
+                                },
+                            )
+                            if soundstrip is not None:
+                                remember_section_nla_targets([curr_actor])
+                        except Exception as exc:
+                            log.warning(
+                                "Failed to load W2 scene voice line %s for actor %s: %s",
+                                dialog_line_id,
+                                dialogscript.voicetag,
+                                exc,
+                            )
                 duration_frames = _dialog_script_duration(dialogscript) * __fps
                 dialogframe = self.__frame_current + duration_frames
                 action = create_default_timeline_action("dialogLine", default_timeline_obj, duration_frames, group_name="dialogLine")

@@ -711,7 +711,7 @@ def _w2scene_localized_line_id(prop):
 
 def _w2scene_resolve_line_text(line_id, scene_filepath="", context=None):
     language = dialog_language.get_active_text_language(context)
-    return dialog_language.resolve_localized_text(line_id, scene_filepath, language=language)
+    return dialog_language.resolve_localized_text(line_id, scene_filepath, language=language, source_game="W2")
 
 
 def _w2scene_dialog_display_name(actor, line_text, line_id, fallback="CStorySceneLine"):

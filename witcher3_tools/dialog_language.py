@@ -874,7 +874,18 @@ def _resolve_from_string_manager(line_key, language):
     return ""
 
 
-def resolve_localized_text(line_id, source_filepath="", language=None):
+def _resolve_from_w2_string_manager(line_key, language):
+    try:
+        from .CR2W.witcher_cache.W2Strings import LoadWitcher2StringsManager
+
+        string_manager = LoadWitcher2StringsManager(language=language)
+        return str(string_manager.GetString(line_key) or "")
+    except Exception:
+        log.debug("Could not resolve dialog string %s from W2StringManager.", line_key, exc_info=True)
+    return ""
+
+
+def resolve_localized_text(line_id, source_filepath="", language=None, source_game=""):
     try:
         line_key = int(str(line_id or "").strip())
     except (TypeError, ValueError):
@@ -883,6 +894,9 @@ def resolve_localized_text(line_id, source_filepath="", language=None):
         return ""
 
     language = normalize_dialog_language(language or get_active_text_language())
+    if str(source_game or "").upper() == "W2":
+        return _resolve_from_w2_string_manager(line_key, language)
+
     text = _resolve_from_redkit_project_strings(line_key, source_filepath, language)
     if text:
         return text

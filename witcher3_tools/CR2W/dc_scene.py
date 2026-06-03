@@ -61,6 +61,11 @@ def get_cutscene_dialog_lines(scene_filepath, cutscene_path):
         log.exception("Failed to open .w2scene for dialog lookup: %s", scene_filepath)
         return []
 
+    if int(getattr(getattr(theFile, "HEADER", None), "version", 999) or 999) <= 115:
+        from .dc_scene_w2 import get_cutscene_dialog_lines as get_w2_cutscene_dialog_lines
+
+        return get_w2_cutscene_dialog_lines(scene_filepath, cutscene_path)
+
     CHUNKS = theFile.CHUNKS.CHUNKS
     cs_basename = os.path.basename(str(cutscene_path or "")).lower()
     if not cs_basename:
@@ -113,6 +118,7 @@ def get_cutscene_dialog_lines(scene_filepath, cutscene_path):
                 "line_id":     line_id,
                 "line_index":  line_idx,
                 "line_text":   line_text,
+                "source_game": "W3",
             })
 
     log.info("Loaded %d dialog lines from %s", len(lines), os.path.basename(scene_filepath))
