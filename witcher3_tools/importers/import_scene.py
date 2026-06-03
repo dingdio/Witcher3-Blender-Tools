@@ -5,7 +5,7 @@ import json
 import importlib
 from collections import deque
 from pathlib import Path
-from .. import dialog_language, get_uncook_path, get_rig_rot90_enabled
+from .. import dialog_language, get_rig_rot90_enabled
 from .. import pose_key_tools
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
@@ -21,6 +21,7 @@ from ..importers import import_scene_animation
 from ..importers import import_scene_motion
 import_scene_motion = importlib.reload(import_scene_motion)
 from ..importers.import_helpers import set_blender_object_transform#, set_blender_pose_bone_transform
+from ..source_game_paths import normalize_source_game, resolve_w2_repo_file_from_source, source_game_from_version, version_for_source_game
 from ..action_compat import assign_action, bind_strip_action_slot, get_action_channelbag, iter_action_fcurves, new_action_fcurve, resolve_action_slot
 from .import_cutscene import (
     CUTSCENE_DIALOG_SOURCE_GAME_PROP,
@@ -81,6 +82,46 @@ def _scene_linked_assets_prefer_bundles():
         return bool(_get_all_addon_prefs(bpy.context).prefer_bundles_for_linked_assets)
     except Exception:
         return False
+
+
+def _scene_source_game_from_version(version, default="w3"):
+    try:
+        return source_game_from_version(int(version))
+    except Exception:
+        return normalize_source_game(default)
+
+
+def _scene_source_game_from_story_scene(story_scene, default="w3"):
+    raw_source_game = str(getattr(story_scene, "source_game", "") or "").strip()
+    if raw_source_game:
+        return normalize_source_game(raw_source_game)
+    return _scene_source_game_from_version(getattr(story_scene, "version", None), default=default)
+
+
+def _scene_source_game_from_file(scene_filepath, default="w3"):
+    scene_filepath = str(scene_filepath or "")
+    if not scene_filepath or not os.path.isfile(scene_filepath):
+        return normalize_source_game(default)
+    try:
+        from ..CR2W.dc_w2_havok import is_w2_cr2w_version_file
+
+        return "w2" if is_w2_cr2w_version_file(scene_filepath) else "w3"
+    except Exception:
+        return normalize_source_game(default)
+
+
+def _scene_source_game_from_context(context, default="w3"):
+    scene = getattr(context, "scene", None)
+    return normalize_source_game(getattr(scene, "witcher_w2scene_source_game", "") or default)
+
+
+def _scene_camera_entity_path(source_game):
+    source_game = normalize_source_game(source_game)
+    return SCENE_CAMERA_ENTITY_PATH_BY_GAME.get(source_game, SCENE_CAMERA_ENTITY_PATH_BY_GAME["w3"])
+
+
+def _scene_camera_existing_object_paths(source_game):
+    return (_scene_camera_entity_path(source_game),)
 
 W2SCENE_AUDIO_STRIP_PROP = "witcher_w2scene_section_audio"
 W2SCENE_AUDIO_SOURCE_PROP = "witcher_w2scene_source"
@@ -157,7 +198,11 @@ W2SCENE_DEFAULT_TIMELINE_ACTION_NAMES = {
     "CStorySceneBlockingElement",
     "CStorySceneCutscenePlayer",
 }
-W2SCENE_CAMERA_ENTITY_PATH = "gameplay\\camera\\scene_camera.w2ent"
+SCENE_CAMERA_ENTITY_PATH_BY_GAME = {
+    "w2": "characters\\templates\\camera\\scene_camera.w2ent",
+    "w3": "gameplay\\camera\\scene_camera.w2ent",
+}
+W2SCENE_CAMERA_ENTITY_PATH = SCENE_CAMERA_ENTITY_PATH_BY_GAME["w2"]
 W2SCENE_CAMERA_LEGACY_RAW_SHOTS_TRACK_NAME = "CameraRawShots"
 W2SCENE_CAMERA_SHOT_TRACK_PREFIX = "CameraShot_"
 W2SCENE_CAMERA_LEGACY_RAW_INTERPOLATION_TRACK_PREFIX = "CameraInterpolation_"
@@ -1655,11 +1700,15 @@ def clear_w2scene_story_scene_prop_nla(story_scene, reset_props=False):
     return removed
 
 
-def clear_w2scene_camera_runtime(context, scene_cam_obj=None, clear_markers=True):
+def clear_w2scene_camera_runtime(context, scene_cam_obj=None, clear_markers=True, source_game=""):
     scene = getattr(context, "scene", None)
     removed = 0
     if scene_cam_obj is None:
-        scene_cam_obj = check_if_actor_already_in_scene(W2SCENE_CAMERA_ENTITY_PATH)
+        source_game = normalize_source_game(source_game or _scene_source_game_from_context(context))
+        for camera_path in _scene_camera_existing_object_paths(source_game):
+            scene_cam_obj = check_if_actor_already_in_scene(camera_path)
+            if scene_cam_obj:
+                break
     if scene_cam_obj:
         removed += clear_nla_tracks(
             scene_cam_obj,
@@ -1686,12 +1735,16 @@ def clear_w2scene_runtime_state(context, story_scene=None, reset_actors=False):
         "camera": 0,
         "debug_empties": 0,
     }
+    source_game = _scene_source_game_from_story_scene(
+        story_scene,
+        default=_scene_source_game_from_context(context),
+    )
     if scene is not None:
         removed["audio"] = clear_w2scene_section_audio(scene)
     removed["debug_empties"] = clear_w2scene_debug_empties(context)
     removed["actor_nla"] = clear_w2scene_story_scene_actor_nla(context, story_scene, reset_actors=reset_actors)
     removed["prop_nla"] = clear_w2scene_story_scene_prop_nla(story_scene, reset_props=reset_actors)
-    removed["camera"] = clear_w2scene_camera_runtime(context)
+    removed["camera"] = clear_w2scene_camera_runtime(context, source_game=source_game)
     return removed
 
 
@@ -1914,19 +1967,27 @@ def _find_scene_prop_object(prop_id):
     return selected
 
 
-def _resolve_w2scene_template_path(template_path, scene_filepath=""):
+def _resolve_scene_template_path(template_path, scene_filepath="", source_game=""):
     template_path = str(template_path or "").strip().replace("/", "\\")
     if not template_path:
         return ""
     if os.path.isabs(template_path):
         return template_path
 
+    source_game = normalize_source_game(source_game or _scene_source_game_from_file(scene_filepath))
+    version = version_for_source_game(source_game)
+
     if _scene_linked_assets_prefer_bundles():
         # User has opted out of REDkit priority for linked assets: skip the
         # scene-adjacent directory walk (which would resolve to REDkit paths)
         # and resolve straight from vanilla bundles.
         with vanilla_only_repo_context():
-            return repo_file(template_path)
+            return repo_file(template_path, version=version)
+
+    if source_game == "w2":
+        resolved = resolve_w2_repo_file_from_source(template_path, scene_filepath, version=version)
+        if resolved:
+            return resolved
 
     source_path = Path(str(scene_filepath or ""))
     if source_path:
@@ -1935,7 +1996,35 @@ def _resolve_w2scene_template_path(template_path, scene_filepath=""):
             if candidate.exists():
                 return str(candidate)
     with redkit_repo_context(scene_filepath):
-        return repo_file(template_path)
+        return repo_file(template_path, version=version)
+
+
+def _resolve_w2scene_template_path(template_path, scene_filepath="", source_game=""):
+    return _resolve_scene_template_path(template_path, scene_filepath, source_game=source_game)
+
+
+def _load_w2scene_camera_entity(context, scene_filepath="", source_game=""):
+    source_game = normalize_source_game(source_game or _scene_source_game_from_file(scene_filepath))
+    camera_path = _scene_camera_entity_path(source_game)
+    for object_path in _scene_camera_existing_object_paths(source_game):
+        scene_cam_obj = check_if_actor_already_in_scene(object_path)
+        if scene_cam_obj:
+            return scene_cam_obj, camera_path
+
+    resolved_path = _resolve_scene_template_path(camera_path, scene_filepath, source_game=source_game)
+    if not resolved_path or not os.path.isfile(resolved_path):
+        raise RuntimeError(f"Could not resolve {source_game.upper()} scene camera entity: {camera_path}")
+    try:
+        scene_cam_obj = import_entity.import_ent_template(resolved_path)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to import {source_game.upper()} scene camera entity: {resolved_path}") from exc
+    if scene_cam_obj is not None:
+        return scene_cam_obj, camera_path
+    raise RuntimeError(f"Import returned no object for {source_game.upper()} scene camera entity: {resolved_path}")
+
+
+def _load_scene_camera_entity(context, scene_filepath="", source_game=""):
+    return _load_w2scene_camera_entity(context, scene_filepath, source_game=source_game)
 
 
 def _create_scene_prop_empty(prop_id, template_path, context):
@@ -1951,7 +2040,7 @@ def _create_scene_prop_empty(prop_id, template_path, context):
     return prop_obj
 
 
-def _import_scene_prop_object(prop, context, scene_filepath=""):
+def _import_scene_prop_object(prop, context, scene_filepath="", source_game=""):
     prop_id = str(getattr(prop, "id", "") or "").strip()
     template_path = str(getattr(prop, "entityTemplate", "") or "").strip()
     prop_obj = _find_scene_prop_object(prop_id)
@@ -1962,7 +2051,7 @@ def _import_scene_prop_object(prop, context, scene_filepath=""):
         return None
 
     before_ids = {id(obj) for obj in bpy.data.objects}
-    resolved_path = _resolve_w2scene_template_path(template_path, scene_filepath)
+    resolved_path = _resolve_scene_template_path(template_path, scene_filepath, source_game=source_game)
     try:
         prop_obj = import_entity.import_ent_template(resolved_path)
     except Exception:
@@ -3372,6 +3461,8 @@ class SceneImporter():
         self._section_name = ""
         self._section_dialogset_name = ""
         self._section_chunk_index = 0
+        self._source_game = "w3"
+        self._resource_version = 999
 
     def __assign_action(self, target: Union[bpy.types.ID, HasAnimationData], action: bpy.types.Action, track_name:str = None, at_frame = False):
         if target.animation_data is None:
@@ -3397,7 +3488,7 @@ class SceneImporter():
                 target_track: bpy.types.NlaTrack = target.animation_data.nla_tracks.new()
                 target_track.name = action.name
             
-            strip_frame = at_frame if at_frame is not False else self.__frame_current
+            strip_frame = float(at_frame if at_frame is not False else self.__frame_current)
             test_strips = []
             for st in target_track.strips:
                 test_strips.append(st)
@@ -3405,14 +3496,18 @@ class SceneImporter():
                 last_strip = target_track.strips[-1]
                 strip_start = last_strip.frame_end
             # else:
+            strip_start = int(round(strip_frame))
             try:
-                target_strip = target_track.strips.new(action.name, strip_frame, action)
-            except Exception as e:
-                target_strip = target_track.strips.new(action.name, int(strip_frame + 1), action)
-                target_strip.frame_start = strip_frame
-                start_frame, end_frame = action.frame_range
-                length = end_frame - start_frame
-                target_strip.frame_end = strip_frame + length
+                target_strip = target_track.strips.new(action.name, strip_start, action)
+            except RuntimeError:
+                strip_start = int(math.ceil(strip_frame))
+                try:
+                    target_strip = target_track.strips.new(action.name, strip_start, action)
+                except RuntimeError:
+                    fallback_track = target.animation_data.nla_tracks.new()
+                    fallback_track.name = _safe_nla_track_name(track_name, action.name)
+                    target_track = fallback_track
+                    target_strip = target_track.strips.new(action.name, strip_start, action)
             bind_strip_action_slot(target_strip, resolve_action_slot(action, target=target, ensure=True))
             target_strip.blend_type = 'REPLACE'
             return target_strip
@@ -3420,6 +3515,11 @@ class SceneImporter():
     def loadSceneFile(self, filePath):
         self._scene_filepath = str(filePath or "")
         self._CStoryScene:w3_types.CStoryScene = loadSceneFile(filePath)
+        self._resource_version = int(getattr(self._CStoryScene, "version", 999) or 999)
+        self._source_game = _scene_source_game_from_story_scene(
+            self._CStoryScene,
+            default=source_game_from_version(self._resource_version),
+        )
 
     def _section_variants(self, section):
         variants = []
@@ -3786,12 +3886,11 @@ class SceneImporter():
             placeCube = bpy.context.object
             placeCube.name = "SCENE_POINT"
 
-        scene_camera_entity_path = W2SCENE_CAMERA_ENTITY_PATH
-        scene_cam_obj = check_if_actor_already_in_scene(scene_camera_entity_path)
-        if not scene_cam_obj:
-            scene_cam_obj = import_entity.import_ent_template(str(Path(get_uncook_path(context)) / scene_camera_entity_path))
-        if scene_cam_obj is None:
-            raise RuntimeError("Could not load gameplay\\camera\\scene_camera.w2ent")
+        scene_cam_obj, scene_camera_entity_path = _load_scene_camera_entity(
+            context,
+            self._scene_filepath,
+            source_game=self._source_game,
+        )
 
         event_frame = self._event_start_frame(event, fps=fps)
         if getattr(context, "scene", None) is not None:
@@ -3861,11 +3960,11 @@ class SceneImporter():
             if removed_audio:
                 log.info("Removed %d previous .w2scene audio strip(s).", removed_audio)
 
-        scene_camera_entity_path = W2SCENE_CAMERA_ENTITY_PATH
-
-        scene_cam_obj = check_if_actor_already_in_scene(scene_camera_entity_path)
-        if not scene_cam_obj:
-            scene_cam_obj = import_entity.import_ent_template(str(Path(get_uncook_path(context)) / scene_camera_entity_path))
+        scene_cam_obj, scene_camera_entity_path = _load_scene_camera_entity(
+            context,
+            self._scene_filepath,
+            source_game=self._source_game,
+        )
         context.view_layer.update()
         _scene_camera_bone, scene_camera_preview_obj = _prepare_w2scene_camera_rig(context, scene_cam_obj, scene_camera_entity_path)
         scene_camera_preview_offset = _camera_preview_offset_matrix(scene_cam_obj)
@@ -4016,8 +4115,13 @@ class SceneImporter():
 
             actor_obj = check_if_actor_already_in_scene(actor.entityTemplate)
             if not actor_obj:
+                resolved_entity_template = _resolve_scene_template_path(
+                    actor.entityTemplate,
+                    self._scene_filepath,
+                    source_game=self._source_game,
+                )
                 actor_obj = import_entity.import_ent_template(
-                    repo_file(actor.entityTemplate),
+                    resolved_entity_template,
                     load_face_poses=actor_needs_face_setup,
                     import_apperance=1,
                     selected_appearance_name=preferred_appearance,
@@ -4082,7 +4186,12 @@ class SceneImporter():
             if prop_id not in used_prop_ids:
                 log.debug("Skipping scene prop %s; not referenced by section %s", prop_id or "<unnamed>", self._section_name or "<unnamed>")
                 continue
-            prop_obj = _import_scene_prop_object(prop, context, self._scene_filepath)
+            prop_obj = _import_scene_prop_object(
+                prop,
+                context,
+                self._scene_filepath,
+                source_game=self._source_game,
+            )
             if prop_obj is None:
                 continue
             if not keep_existing_nla:
@@ -6329,13 +6438,14 @@ class SceneImporter():
                     dialog_line_prop = getattr(getattr(dialogscript, "dialogLine", None), "String", None)
                     dialog_line_id = str(getattr(dialog_line_prop, "val", "") or "").strip()
                     text_language = dialog_language.get_active_text_language(context)
+                    source_game_label = self._source_game.upper()
                     dialog_line_text = dialog_language.resolve_localized_text(
                         dialog_line_id,
                         self._scene_filepath,
                         language=text_language,
-                        source_game="W2",
+                        source_game=source_game_label,
                     )
-                    if dialog_line_id:
+                    if dialog_line_id and self._source_game == "w2":
                         try:
                             soundstrip = load_w2_voice_and_lipsync(
                                 dialog_line_id,
@@ -6351,7 +6461,7 @@ class SceneImporter():
                                     dialog_language.DIALOG_SUBTITLE_SOURCE_PATH_PROP: self._scene_filepath,
                                     dialog_language.DIALOG_SUBTITLE_LANGUAGE_PROP: text_language,
                                     "witcher_w2scene_dialog_text": dialog_line_text,
-                                    CUTSCENE_DIALOG_SOURCE_GAME_PROP: "W2",
+                                    CUTSCENE_DIALOG_SOURCE_GAME_PROP: source_game_label,
                                     W2SCENE_AUDIO_STRIP_PROP: True,
                                     W2SCENE_AUDIO_SOURCE_PROP: self._scene_filepath,
                                     W2SCENE_AUDIO_SECTION_PROP: self._section_name,

@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 from ..CR2W import w3_types
 from ..CR2W.prop_utils import prop_to_string
 from ..CR2W.common_blender import get_repo_override_state, repo_file, set_repo_override_roots
+from ..source_game_paths import normalize_source_game, source_roots, version_for_source_game, w2_source_repo_root
 from .. import dialog_language
 from ..importers import import_cutscene
 from ..importers import import_scene
@@ -23,7 +24,6 @@ from bpy.types import Panel, Operator, UIList, PropertyGroup
 from bpy.props import IntProperty, StringProperty, CollectionProperty, FloatProperty, BoolProperty
 from bpy_extras.io_utils import ImportHelper
 
-from .. import get_all_addon_prefs, get_uncook_path
 from .ui_cutscene import (
     _clear_loaded_cutscene_state,
     _cs_find_camera_armature,
@@ -567,6 +567,8 @@ def _w2scene_clear_loaded_state(scene):
             collection.clear()
     scene.witcher_loaded_w2scene_name = ""
     scene.witcher_loaded_w2scene_path = ""
+    if hasattr(scene, "witcher_w2scene_source_game"):
+        scene.witcher_w2scene_source_game = ""
     scene.witcher_w2scene_repo_path = ""
     scene.witcher_w2scene_summary = ""
     if hasattr(scene, "witcher_w2scene_active_cutscene_path"):
@@ -709,9 +711,21 @@ def _w2scene_localized_line_id(prop):
     return _w2scene_prop_text(prop)
 
 
-def _w2scene_resolve_line_text(line_id, scene_filepath="", context=None):
+def _w2scene_source_game(context_or_scene=None, default="w3"):
+    scene = getattr(context_or_scene, "scene", context_or_scene)
+    raw_source_game = str(getattr(scene, "witcher_w2scene_source_game", "") or "").strip()
+    return normalize_source_game(raw_source_game or default)
+
+
+def _w2scene_resolve_line_text(line_id, scene_filepath="", context=None, source_game=""):
     language = dialog_language.get_active_text_language(context)
-    return dialog_language.resolve_localized_text(line_id, scene_filepath, language=language, source_game="W2")
+    source_game = normalize_source_game(source_game or _w2scene_source_game(context))
+    return dialog_language.resolve_localized_text(
+        line_id,
+        scene_filepath,
+        language=language,
+        source_game=source_game.upper(),
+    )
 
 
 def _w2scene_dialog_display_name(actor, line_text, line_id, fallback="CStorySceneLine"):
@@ -1206,10 +1220,12 @@ def _w2scene_sync_loaded_state(scene, filepath, scene_importer=None):
     story_scene = scene_importer._CStoryScene
     sections = list(getattr(scene_importer, "scene_sections", []) or [])
     section_index_by_chunk = _w2scene_section_display_index_by_chunk(sections)
+    source_game = import_scene._scene_source_game_from_story_scene(story_scene)
     scene.witcher_sections_filepath = filepath
     scene.witcher_loaded_w2scene_path = filepath
     scene.witcher_loaded_w2scene_name = os.path.basename(filepath)
-    scene.witcher_w2scene_repo_path = _derive_w2scene_repo_path(bpy.context, filepath)
+    scene.witcher_w2scene_source_game = source_game.upper()
+    scene.witcher_w2scene_repo_path = _derive_w2scene_repo_path(bpy.context, filepath, source_game=source_game)
     root_field_schema = _w2scene_schema_with_field_types(_W2SCENE_ROOT_FIELD_SCHEMA)
     section_field_schema = _w2scene_schema_with_field_types(_W2SCENE_SECTION_FIELD_SCHEMA)
 
@@ -1684,10 +1700,11 @@ def _w2scene_add_unique_root(roots, root):
         roots.append(root_norm)
 
 
-def _w2scene_repo_root_from_filepath(filepath, repo_path=""):
+def _w2scene_repo_root_from_filepath(filepath, repo_path="", source_game=""):
     normalized = os.path.normpath(str(filepath or ""))
     if not normalized:
         return ""
+    source_game = normalize_source_game(source_game or import_scene._scene_source_game_from_file(normalized))
     repo_path = _w2scene_normalize_repo_path(repo_path)
     if repo_path:
         repo_as_fs = repo_path.replace("\\", os.sep)
@@ -1698,6 +1715,11 @@ def _w2scene_repo_root_from_filepath(filepath, repo_path=""):
             if root:
                 return root
 
+    if source_game == "w2":
+        w2_root = w2_source_repo_root(normalized)
+        if w2_root:
+            return w2_root
+
     lowered = normalized.lower()
     for marker in ("\\r4data\\", "\\workspace\\", "\\content\\content0\\"):
         marker_index = lowered.find(marker)
@@ -1706,57 +1728,39 @@ def _w2scene_repo_root_from_filepath(filepath, repo_path=""):
     return ""
 
 
-def _w2scene_pref_repo_roots(context):
+def _w2scene_pref_repo_roots(context, source_game=""):
     roots = []
     try:
-        prefs = get_all_addon_prefs(context)
-    except Exception:
-        prefs = None
-    if prefs is None:
-        return roots
-
-    try:
-        projects = list(getattr(prefs, "redkit_projects", []) or [])
-    except Exception:
-        projects = []
-    for project in projects:
-        project_path = str(getattr(project, "path", "") or "").strip()
-        if project_path:
-            _w2scene_add_unique_root(roots, os.path.join(bpy.path.abspath(project_path), "workspace"))
-
-    for attr_name in ("redkit_depot_path", "redkit_uncooked_path"):
-        try:
-            _w2scene_add_unique_root(roots, bpy.path.abspath(getattr(prefs, attr_name, "") or ""))
-        except Exception:
-            pass
-
-    try:
-        _w2scene_add_unique_root(roots, get_uncook_path(context))
+        for root in source_roots(context, normalize_source_game(source_game), existing_only=True):
+            _w2scene_add_unique_root(roots, root)
     except Exception:
         pass
     return roots
 
 
-def _w2scene_repo_roots_for_loaded_scene(context, filepath="", repo_path=""):
+def _w2scene_repo_roots_for_loaded_scene(context, filepath="", repo_path="", source_game=""):
     roots = []
     scene = getattr(context, "scene", None)
     filepath = str(filepath or getattr(scene, "witcher_sections_filepath", "") or getattr(scene, "witcher_loaded_w2scene_path", "") or "")
     repo_path = str(repo_path or getattr(scene, "witcher_w2scene_repo_path", "") or "")
-    _w2scene_add_unique_root(roots, _w2scene_repo_root_from_filepath(filepath, repo_path))
-    for root in _w2scene_pref_repo_roots(context):
+    source_game = normalize_source_game(source_game or _w2scene_source_game(scene))
+    _w2scene_add_unique_root(roots, _w2scene_repo_root_from_filepath(filepath, repo_path, source_game=source_game))
+    for root in _w2scene_pref_repo_roots(context, source_game=source_game):
         _w2scene_add_unique_root(roots, root)
     return roots
 
 
-def _w2scene_root_kind(context, root):
+def _w2scene_root_kind(context, root, source_game=""):
     root = os.path.normpath(str(root or ""))
-    try:
-        uncook_root = os.path.normpath(get_uncook_path(context))
-    except Exception:
-        uncook_root = ""
-    if uncook_root and _same_filesystem_path(root, uncook_root):
-        return "cooked r4data"
     lower = root.lower()
+    source_game = normalize_source_game(source_game or _w2scene_source_game(getattr(context, "scene", None)))
+    for game_root in source_roots(context, source_game, existing_only=True):
+        try:
+            game_root = os.path.normpath(game_root)
+            if _same_filesystem_path(root, game_root) or _w2scene_is_under_root(root, game_root):
+                return f"{source_game.upper()} source root"
+        except Exception:
+            pass
     if lower.endswith("\\workspace") or "\\workspace\\" in lower:
         return "REDkit project workspace"
     if lower.endswith("\\r4data") or "\\r4data\\" in lower:
@@ -1766,45 +1770,40 @@ def _w2scene_root_kind(context, root):
     return "repo root"
 
 
-def _w2scene_cutscene_dependency_roots(context, roots):
+def _w2scene_cutscene_dependency_roots(context, roots, source_game=""):
     project_roots = []
     cooked_roots = []
-    source_roots = []
+    redkit_source_roots = []
     other_roots = []
     for root in roots or []:
-        kind = _w2scene_root_kind(context, root)
+        kind = _w2scene_root_kind(context, root, source_game=source_game)
         if kind == "REDkit project workspace":
             _w2scene_add_unique_root(project_roots, root)
         elif kind == "cooked r4data":
             _w2scene_add_unique_root(cooked_roots, root)
         elif kind.startswith("REDkit"):
-            _w2scene_add_unique_root(source_roots, root)
+            _w2scene_add_unique_root(redkit_source_roots, root)
         else:
             _w2scene_add_unique_root(other_roots, root)
 
     ordered = []
-    for root_group in (project_roots, cooked_roots, other_roots, source_roots):
+    for root_group in (project_roots, cooked_roots, other_roots, redkit_source_roots):
         for root in root_group:
             _w2scene_add_unique_root(ordered, root)
     return ordered
 
 
-def _w2scene_log_cutscene_resolution(context, cutscene_repo_path, cutscene_path, dependency_roots):
-    try:
-        uncook_root = os.path.normpath(get_uncook_path(context))
-    except Exception:
-        uncook_root = ""
-    cutscene_kind = _w2scene_root_kind(context, cutscene_path)
-    if uncook_root and not _w2scene_is_under_root(cutscene_path, uncook_root):
-        log.warning(
-            "W2Scene linked cutscene is being loaded from %s, not cooked r4data: %s -> %s",
-            cutscene_kind,
-            cutscene_repo_path,
-            cutscene_path,
-        )
+def _w2scene_log_cutscene_resolution(context, cutscene_repo_path, cutscene_path, dependency_roots, source_game=""):
+    cutscene_kind = _w2scene_root_kind(context, cutscene_path, source_game=source_game)
+    log.warning(
+        "W2Scene linked cutscene resolved from %s: %s -> %s",
+        cutscene_kind,
+        cutscene_repo_path,
+        cutscene_path,
+    )
     if dependency_roots:
         root_summary = "; ".join(
-            f"{idx + 1}. {_w2scene_root_kind(context, root)}={root}"
+            f"{idx + 1}. {_w2scene_root_kind(context, root, source_game=source_game)}={root}"
             for idx, root in enumerate(dependency_roots)
         )
         log.warning(
@@ -1827,7 +1826,7 @@ def _w2scene_repo_path_from_root(filepath, root):
     return rel.replace("/", "\\")
 
 
-def _w2scene_resolve_repo_file(context, repo_path, roots):
+def _w2scene_resolve_repo_file(context, repo_path, roots, source_game=""):
     repo_path = _w2scene_normalize_repo_path(repo_path)
     if not repo_path:
         return ""
@@ -1839,12 +1838,15 @@ def _w2scene_resolve_repo_file(context, repo_path, roots):
         if os.path.isfile(candidate):
             return candidate
     try:
-        return repo_file(repo_path)
+        resolved = repo_file(repo_path, version=version_for_source_game(source_game))
+        if os.path.isabs(resolved) and os.path.isfile(resolved):
+            return resolved
     except Exception:
-        return os.path.join(get_uncook_path(context), repo_as_fs)
+        pass
+    return ""
 
 
-def _resolve_w2scene_cutscene_file(context, section):
+def _resolve_w2scene_cutscene_file(context, section, source_game=""):
     cutscene_repo_path = prop_to_string(getattr(section, "cutscene", None))
     cutscene_repo_path = _w2scene_normalize_repo_path(cutscene_repo_path)
     if not cutscene_repo_path:
@@ -1854,8 +1856,9 @@ def _resolve_w2scene_cutscene_file(context, section):
     scene = getattr(context, "scene", None)
     scene_filepath = str(getattr(scene, "witcher_sections_filepath", "") or getattr(scene, "witcher_loaded_w2scene_path", "") or "")
     scene_repo_path = str(getattr(scene, "witcher_w2scene_repo_path", "") or "")
-    roots = _w2scene_repo_roots_for_loaded_scene(context, scene_filepath, scene_repo_path)
-    cutscene_path = _w2scene_resolve_repo_file(context, cutscene_repo_path, roots)
+    source_game = normalize_source_game(source_game or _w2scene_source_game(scene))
+    roots = _w2scene_repo_roots_for_loaded_scene(context, scene_filepath, scene_repo_path, source_game=source_game)
+    cutscene_path = _w2scene_resolve_repo_file(context, cutscene_repo_path, roots, source_game=source_game)
     return cutscene_repo_path, str(cutscene_path or "").strip(), roots
 
 
@@ -1991,7 +1994,11 @@ def _w2scene_unload_active_cutscene_section(context):
 
 def _load_w2scene_cutscene_section(context, scene_importer, section):
     scene = context.scene
-    cutscene_repo_path, cutscene_path, repo_roots = _resolve_w2scene_cutscene_file(context, section)
+    source_game = import_scene._scene_source_game_from_story_scene(
+        getattr(scene_importer, "_CStoryScene", None),
+        default=_w2scene_source_game(scene),
+    )
+    cutscene_repo_path, cutscene_path, repo_roots = _resolve_w2scene_cutscene_file(context, section, source_game=source_game)
     if not cutscene_path:
         raise RuntimeError("Cutscene section has no linked .w2cutscene file.")
     if not os.path.isfile(cutscene_path):
@@ -2012,10 +2019,8 @@ def _load_w2scene_cutscene_section(context, scene_importer, section):
     previous_roots, previous_read_only = get_repo_override_state()
     try:
         override_roots = list(repo_roots or [])
-        for root in previous_roots:
-            _w2scene_add_unique_root(override_roots, root)
-        override_roots = _w2scene_cutscene_dependency_roots(context, override_roots)
-        _w2scene_log_cutscene_resolution(context, cutscene_repo_path, cutscene_path, override_roots)
+        override_roots = _w2scene_cutscene_dependency_roots(context, override_roots, source_game=source_game)
+        _w2scene_log_cutscene_resolution(context, cutscene_repo_path, cutscene_path, override_roots, source_game=source_game)
         if override_roots:
             set_repo_override_roots(override_roots, read_only=True)
 
@@ -2048,12 +2053,13 @@ def _load_w2scene_cutscene_section(context, scene_importer, section):
     }
 
 
-def _derive_w2scene_repo_path(context, filepath):
+def _derive_w2scene_repo_path(context, filepath, source_game=""):
     normalized = os.path.normpath(str(filepath or ""))
     if not normalized:
         return ""
 
-    for root in _w2scene_repo_roots_for_loaded_scene(context, filepath):
+    source_game = normalize_source_game(source_game or import_scene._scene_source_game_from_file(filepath))
+    for root in _w2scene_repo_roots_for_loaded_scene(context, filepath, source_game=source_game):
         repo_path = _w2scene_repo_path_from_root(normalized, root)
         if repo_path:
             return repo_path
@@ -2089,9 +2095,10 @@ def _update_w2scene_preview(operator, context):
     if same_file:
         return False
 
+    source_game = import_scene._scene_source_game_from_file(filepath)
     operator.w2scene_preview_path = filepath
     operator.w2scene_preview_mtime = mtime
-    operator.w2scene_repo_path = _derive_w2scene_repo_path(context, filepath)
+    operator.w2scene_repo_path = _derive_w2scene_repo_path(context, filepath, source_game=source_game)
 
     if not filepath.lower().endswith(".w2scene"):
         operator.w2scene_preview_status = "Select a .w2scene file"
@@ -2105,6 +2112,8 @@ def _update_w2scene_preview(operator, context):
         scene_importer = import_scene.import_w3_scene(filepath)
         scene_importer.load_sections()
         story_scene = scene_importer._CStoryScene
+        source_game = import_scene._scene_source_game_from_story_scene(story_scene, default=source_game)
+        operator.w2scene_repo_path = _derive_w2scene_repo_path(context, filepath, source_game=source_game)
     except Exception as exc:
         operator.w2scene_preview_status = f"Preview failed: {exc}"
         operator.w2scene_section_summary = ""
@@ -2191,9 +2200,12 @@ class ButtonOperatorImportW2scene(bpy.types.Operator, ImportHelper):
         bpy.context.view_layer.update()
         return {'FINISHED'}
     def invoke(self, context, event):
-        UNCOOK_PATH = os.path.join(get_uncook_path(context),"animations\\")
-        if os.path.exists(UNCOOK_PATH):
-            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        try:
+            roots = source_roots(context, _w2scene_source_game(getattr(context, "scene", None)), existing_only=True)
+        except Exception:
+            roots = []
+        if roots and self.filepath == '':
+            self.filepath = roots[0]
         _update_w2scene_preview(self, context)
         return ImportHelper.invoke(self, context, event)
 
@@ -3253,7 +3265,11 @@ class WITCH_OT_W2SceneImportActorItem(bpy.types.Operator):
             return {'CANCELLED'}
 
         scene_filepath = str(getattr(scene, "witcher_loaded_w2scene_path", "") or "")
-        resolved_path = import_scene._resolve_w2scene_template_path(template_path, scene_filepath)
+        resolved_path = import_scene._resolve_w2scene_template_path(
+            template_path,
+            scene_filepath,
+            source_game=_w2scene_source_game(scene),
+        )
         if not resolved_path or not os.path.isfile(resolved_path):
             self.report({'ERROR'}, f"Could not resolve template path: {template_path}")
             return {'CANCELLED'}
@@ -3495,7 +3511,11 @@ class WITCH_OT_LoadDialogsetSlotActor(bpy.types.Operator):
             return {'CANCELLED'}
 
         scene_filepath = str(getattr(scene, "witcher_loaded_w2scene_path", "") or "")
-        resolved_path = import_scene._resolve_w2scene_template_path(slot.actor_template_path, scene_filepath)
+        resolved_path = import_scene._resolve_w2scene_template_path(
+            slot.actor_template_path,
+            scene_filepath,
+            source_game=_w2scene_source_game(scene),
+        )
         if not resolved_path or not os.path.isfile(resolved_path):
             self.report({'ERROR'}, f"Could not find entity file: {slot.actor_template_path}")
             return {'CANCELLED'}
@@ -3667,6 +3687,7 @@ def register():
     bpy.types.Scene.witcher_sections_filepath = bpy.props.StringProperty(default="")
     bpy.types.Scene.witcher_loaded_w2scene_name = bpy.props.StringProperty(default="")
     bpy.types.Scene.witcher_loaded_w2scene_path = bpy.props.StringProperty(default="")
+    bpy.types.Scene.witcher_w2scene_source_game = bpy.props.StringProperty(default="")
     bpy.types.Scene.witcher_w2scene_repo_path = bpy.props.StringProperty(default="")
     bpy.types.Scene.witcher_w2scene_summary = bpy.props.StringProperty(default="")
     bpy.types.Scene.witcher_w2scene_active_cutscene_path = bpy.props.StringProperty(default="")
@@ -3784,6 +3805,7 @@ def unregister():
     for prop in (
         "witcher_loaded_w2scene_name",
         "witcher_loaded_w2scene_path",
+        "witcher_w2scene_source_game",
         "witcher_w2scene_repo_path",
         "witcher_w2scene_summary",
         "witcher_w2scene_active_cutscene_path",

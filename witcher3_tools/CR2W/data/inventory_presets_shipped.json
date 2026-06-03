@@ -1,0 +1,4618 @@
+{
+  "version": 1,
+  "presets": [
+    {
+      "id": "shipped_witcher_bear_basic",
+      "name": "Bear School - Basic",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Bear Pants 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Pants 1"
+          },
+          "equip_template": "l_01_mg__bear_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_bear\\l_01_mg__bear_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Bear Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Armor"
+          },
+          "equip_template": "t_01_mg__bear_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_bear\\t_01_mg__bear_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Bear Gloves 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Gloves 1"
+          },
+          "equip_template": "g_01a_mg__bear_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_bear\\g_01a_mg__bear_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Bear Boots 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Boots 1"
+          },
+          "equip_template": "s_01_mg__bear_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_bear\\s_01_mg__bear_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Bear School steel sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School steel sword"
+          },
+          "equip_template": "witcher_steel_bear_sword_lvl1",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Bear School silver sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School silver sword"
+          },
+          "equip_template": "witcher_silver_bear_sword_lvl1",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "Bear School Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School Crossbow"
+          },
+          "equip_template": "witcher_crossbow_lvl9",
+          "xml_source_path": "gameplay\\items\\def_item_weapons_crossbow.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_bear_enhanced",
+      "name": "Bear School - Enhanced",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Bear Pants 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Pants 2"
+          },
+          "equip_template": "l_01_mg__bear_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_bear\\l_01_mg__bear_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Bear Armor 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Armor 1"
+          },
+          "equip_template": "t_01_mg__bear_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_bear\\t_01_mg__bear_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Bear Gloves 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Gloves 2"
+          },
+          "equip_template": "g_01a_mg__bear_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_bear\\g_01a_mg__bear_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Bear Boots 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Boots 2"
+          },
+          "equip_template": "s_01_mg__bear_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_bear\\s_01_mg__bear_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Bear School steel sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School steel sword 1"
+          },
+          "equip_template": "witcher_steel_bear_sword_lvl2",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Bear School silver sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School silver sword 1"
+          },
+          "equip_template": "witcher_silver_bear_sword_lvl2",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "Bear School Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School Crossbow"
+          },
+          "equip_template": "witcher_crossbow_lvl9",
+          "xml_source_path": "gameplay\\items\\def_item_weapons_crossbow.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_bear_superior",
+      "name": "Bear School - Superior",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Bear Pants 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Pants 3"
+          },
+          "equip_template": "l_01_mg__bear_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_bear\\l_01_mg__bear_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Bear Armor 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Armor 2"
+          },
+          "equip_template": "t_01_mg__bear_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_bear\\t_01_mg__bear_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Bear Gloves 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Gloves 3"
+          },
+          "equip_template": "g_01a_mg__bear_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_bear\\g_01a_mg__bear_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Bear Boots 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Boots 3"
+          },
+          "equip_template": "s_01_mg__bear_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_bear\\s_01_mg__bear_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Bear School steel sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School steel sword 2"
+          },
+          "equip_template": "witcher_steel_bear_sword_lvl3",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Bear School silver sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School silver sword 2"
+          },
+          "equip_template": "witcher_silver_bear_sword_lvl3",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "Bear School Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School Crossbow"
+          },
+          "equip_template": "witcher_crossbow_lvl9",
+          "xml_source_path": "gameplay\\items\\def_item_weapons_crossbow.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_bear_mastercrafted",
+      "name": "Bear School - Mastercrafted",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Bear Pants 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Pants 4"
+          },
+          "equip_template": "l_01_mg__bear_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_bear\\l_01_mg__bear_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Bear Armor 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Armor 3"
+          },
+          "equip_template": "t_01_mg__bear_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_bear\\t_01_mg__bear_lvl4.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Bear Gloves 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Gloves 4"
+          },
+          "equip_template": "g_01a_mg__bear_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_bear\\g_01a_mg__bear_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Bear Boots 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Boots 4"
+          },
+          "equip_template": "s_01_mg__bear_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_bear\\s_01_mg__bear_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Bear School steel sword 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School steel sword 3"
+          },
+          "equip_template": "witcher_steel_bear_sword_lvl4",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Bear School silver sword 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School silver sword 3"
+          },
+          "equip_template": "witcher_silver_bear_sword_lvl4",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "Bear School Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School Crossbow"
+          },
+          "equip_template": "witcher_crossbow_lvl9",
+          "xml_source_path": "gameplay\\items\\def_item_weapons_crossbow.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_bear_grandmaster",
+      "name": "Bear School - Grandmaster",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Bear Pants 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Pants 5"
+          },
+          "equip_template": "l_01_mg__bear_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_bear\\l_01_mg__bear_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Bear Armor 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Armor 4"
+          },
+          "equip_template": "t_01_mg__bear_lvl5",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_bear\\t_01_mg__bear_lvl5.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Bear Gloves 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Gloves 5"
+          },
+          "equip_template": "g_01a_mg__bear_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_bear\\g_01a_mg__bear_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Bear Boots 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear Boots 5"
+          },
+          "equip_template": "s_01_mg__bear_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_bear\\s_01_mg__bear_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_bear",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Bear School steel sword 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School steel sword 4"
+          },
+          "equip_template": "witcher_steel_bear_sword_lvl5",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Bear School silver sword 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School silver sword 4"
+          },
+          "equip_template": "witcher_silver_bear_sword_lvl5",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "Bear School Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Bear School Crossbow"
+          },
+          "equip_template": "witcher_crossbow_lvl9",
+          "xml_source_path": "gameplay\\items\\def_item_weapons_crossbow.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_gryphon_basic",
+      "name": "Griffin School - Basic",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Gryphon Pants 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Pants 1"
+          },
+          "equip_template": "l_01_mg__gryphon_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_gryphon\\l_01_mg__gryphon_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Gryphon Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Armor"
+          },
+          "equip_template": "t_01_mg__gryphon_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_gryphon\\t_01_mg__gryphon_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Gryphon Gloves 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Gloves 1"
+          },
+          "equip_template": "g_01a_mg__gryphon_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_gryphon\\g_01a_mg__gryphon_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Gryphon Boots 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Boots 1"
+          },
+          "equip_template": "s_01_mg__gryphon_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_gryphon\\s_01_mg__gryphon_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Gryphon School steel sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon School steel sword"
+          },
+          "equip_template": "witcher_steel_gryphon_sword_lvl1",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Gryphon School silver sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon School silver sword"
+          },
+          "equip_template": "witcher_silver_gryphon_sword_lvl1",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_gryphon_enhanced",
+      "name": "Griffin School - Enhanced",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Gryphon Pants 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Pants 2"
+          },
+          "equip_template": "l_01_mg__gryphon_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_gryphon\\l_01_mg__gryphon_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Gryphon Armor 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Armor 1"
+          },
+          "equip_template": "t_01_mg__gryphon_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_gryphon\\t_01_mg__gryphon_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Gryphon Gloves 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Gloves 2"
+          },
+          "equip_template": "g_01a_mg__gryphon_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_gryphon\\g_01a_mg__gryphon_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Gryphon Boots 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Boots 2"
+          },
+          "equip_template": "s_01_mg__gryphon_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_gryphon\\s_01_mg__gryphon_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Gryphon School steel sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon School steel sword 1"
+          },
+          "equip_template": "witcher_steel_gryphon_sword_lvl2",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Gryphon School silver sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon School silver sword 1"
+          },
+          "equip_template": "witcher_silver_gryphon_sword_lvl2",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_gryphon_superior",
+      "name": "Griffin School - Superior",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Gryphon Pants 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Pants 3"
+          },
+          "equip_template": "l_01_mg__gryphon_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_gryphon\\l_01_mg__gryphon_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Gryphon Armor 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Armor 2"
+          },
+          "equip_template": "t_01_mg__gryphon_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_gryphon\\t_01_mg__gryphon_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Gryphon Gloves 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Gloves 3"
+          },
+          "equip_template": "g_01a_mg__gryphon_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_gryphon\\g_01a_mg__gryphon_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Gryphon Boots 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Boots 3"
+          },
+          "equip_template": "s_01_mg__gryphon_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_gryphon\\s_01_mg__gryphon_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Gryphon School steel sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon School steel sword 2"
+          },
+          "equip_template": "witcher_steel_gryphon_sword_lvl3",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Gryphon School silver sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon School silver sword 2"
+          },
+          "equip_template": "witcher_silver_gryphon_sword_lvl3",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_gryphon_mastercrafted",
+      "name": "Griffin School - Mastercrafted",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Gryphon Pants 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Pants 4"
+          },
+          "equip_template": "l_01_mg__gryphon_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_gryphon\\l_01_mg__gryphon_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Gryphon Armor 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Armor 3"
+          },
+          "equip_template": "t_01_mg__gryphon_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_gryphon\\t_01_mg__gryphon_lvl4.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Gryphon Gloves 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Gloves 4"
+          },
+          "equip_template": "g_01a_mg__gryphon_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_gryphon\\g_01a_mg__gryphon_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Gryphon Boots 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Boots 4"
+          },
+          "equip_template": "s_01_mg__gryphon_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_gryphon\\s_01_mg__gryphon_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Gryphon School steel sword 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon School steel sword 3"
+          },
+          "equip_template": "witcher_steel_gryphon_sword_lvl4",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Gryphon School silver sword 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon School silver sword 3"
+          },
+          "equip_template": "witcher_silver_gryphon_sword_lvl4",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_gryphon_grandmaster",
+      "name": "Griffin School - Grandmaster",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Gryphon Pants 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Pants 5"
+          },
+          "equip_template": "l_01_mg__gryphon_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_gryphon\\l_01_mg__gryphon_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Gryphon Armor 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Armor 4"
+          },
+          "equip_template": "t_01_mg__gryphon_lvl5",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_gryphon\\t_01_mg__gryphon_lvl5.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Gryphon Gloves 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Gloves 5"
+          },
+          "equip_template": "g_01a_mg__gryphon_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_gryphon\\g_01a_mg__gryphon_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Gryphon Boots 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon Boots 5"
+          },
+          "equip_template": "s_01_mg__gryphon_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_gryphon\\s_01_mg__gryphon_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_gryphon",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Gryphon School steel sword 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon School steel sword 4"
+          },
+          "equip_template": "witcher_steel_gryphon_sword_lvl5",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Gryphon School silver sword 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gryphon School silver sword 4"
+          },
+          "equip_template": "witcher_silver_gryphon_sword_lvl5",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_lynx_basic",
+      "name": "Cat School (Lynx) - Basic",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Lynx Pants 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Pants 1"
+          },
+          "equip_template": "l_01_mg__lynx_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_lynx\\l_01_mg__lynx_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Lynx Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Armor"
+          },
+          "equip_template": "t_01_mg__lynx_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_lynx\\t_01_mg__lynx_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Lynx Gloves 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Gloves 1"
+          },
+          "equip_template": "g_01a_mg__lynx_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_lynx\\g_01a_mg__lynx_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Lynx Boots 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Boots 1"
+          },
+          "equip_template": "s_01_mg__lynx_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_lynx\\s_01_mg__lynx_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Lynx School steel sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School steel sword"
+          },
+          "equip_template": "witcher_steel_lynx_sword_lvl1",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Lynx School silver sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School silver sword"
+          },
+          "equip_template": "witcher_silver_lynx_sword_lvl1",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "Lynx School Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School Crossbow"
+          },
+          "equip_template": "witcher_crossbow_lvl8",
+          "xml_source_path": "gameplay\\items\\def_item_weapons_crossbow.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_lynx_enhanced",
+      "name": "Cat School (Lynx) - Enhanced",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Lynx Pants 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Pants 2"
+          },
+          "equip_template": "l_01_mg__lynx_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_lynx\\l_01_mg__lynx_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Lynx Armor 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Armor 1"
+          },
+          "equip_template": "t_01_mg__lynx_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_lynx\\t_01_mg__lynx_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Lynx Gloves 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Gloves 2"
+          },
+          "equip_template": "g_01a_mg__lynx_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_lynx\\g_01a_mg__lynx_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Lynx Boots 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Boots 2"
+          },
+          "equip_template": "s_01_mg__lynx_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_lynx\\s_01_mg__lynx_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Lynx School steel sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School steel sword 1"
+          },
+          "equip_template": "witcher_steel_lynx_sword_lvl2",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Lynx School silver sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School silver sword 1"
+          },
+          "equip_template": "witcher_silver_lynx_sword_lvl2",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "Lynx School Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School Crossbow"
+          },
+          "equip_template": "witcher_crossbow_lvl8",
+          "xml_source_path": "gameplay\\items\\def_item_weapons_crossbow.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_lynx_superior",
+      "name": "Cat School (Lynx) - Superior",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Lynx Pants 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Pants 3"
+          },
+          "equip_template": "l_01_mg__lynx_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_lynx\\l_01_mg__lynx_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Lynx Armor 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Armor 2"
+          },
+          "equip_template": "t_01_mg__lynx_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_lynx\\t_01_mg__lynx_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Lynx Gloves 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Gloves 3"
+          },
+          "equip_template": "g_01a_mg__lynx_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_lynx\\g_01a_mg__lynx_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Lynx Boots 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Boots 3"
+          },
+          "equip_template": "s_01_mg__lynx_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_lynx\\s_01_mg__lynx_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Lynx School steel sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School steel sword 2"
+          },
+          "equip_template": "witcher_steel_lynx_sword_lvl3",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Lynx School silver sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School silver sword 2"
+          },
+          "equip_template": "witcher_silver_lynx_sword_lvl3",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "Lynx School Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School Crossbow"
+          },
+          "equip_template": "witcher_crossbow_lvl8",
+          "xml_source_path": "gameplay\\items\\def_item_weapons_crossbow.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_lynx_mastercrafted",
+      "name": "Cat School (Lynx) - Mastercrafted",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Lynx Pants 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Pants 4"
+          },
+          "equip_template": "l_01_mg__lynx_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_lynx\\l_01_mg__lynx_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Lynx Armor 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Armor 3"
+          },
+          "equip_template": "t_01_mg__lynx_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_lynx\\t_01_mg__lynx_lvl4.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Lynx Gloves 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Gloves 4"
+          },
+          "equip_template": "g_01a_mg__lynx_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_lynx\\g_01a_mg__lynx_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Lynx Boots 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Boots 4"
+          },
+          "equip_template": "s_01_mg__lynx_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_lynx\\s_01_mg__lynx_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Lynx School steel sword 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School steel sword 3"
+          },
+          "equip_template": "witcher_steel_lynx_sword_lvl4",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Lynx School silver sword 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School silver sword 3"
+          },
+          "equip_template": "witcher_silver_lynx_sword_lvl4",
+          "xml_source_path": "gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "Lynx School Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School Crossbow"
+          },
+          "equip_template": "witcher_crossbow_lvl8",
+          "xml_source_path": "gameplay\\items\\def_item_weapons_crossbow.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_lynx_grandmaster",
+      "name": "Cat School (Lynx) - Grandmaster",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Lynx Pants 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Pants 5"
+          },
+          "equip_template": "l_01_mg__lynx_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_lynx\\l_01_mg__lynx_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Lynx Armor 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Armor 4"
+          },
+          "equip_template": "t_01_mg__lynx_lvl5",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_lynx\\t_01_mg__lynx_lvl5.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Lynx Gloves 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Gloves 5"
+          },
+          "equip_template": "g_01a_mg__lynx_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_lynx\\g_01a_mg__lynx_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Lynx Boots 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx Boots 5"
+          },
+          "equip_template": "s_01_mg__lynx_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_lynx\\s_01_mg__lynx_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_lynx",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Lynx School steel sword 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School steel sword 4"
+          },
+          "equip_template": "witcher_steel_lynx_sword_lvl5",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Lynx School silver sword 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School silver sword 4"
+          },
+          "equip_template": "witcher_silver_lynx_sword_lvl5",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "Lynx School Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Lynx School Crossbow"
+          },
+          "equip_template": "witcher_crossbow_lvl8",
+          "xml_source_path": "gameplay\\items\\def_item_weapons_crossbow.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_wolf_basic",
+      "name": "Wolf School - Basic",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Wolf Pants 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Pants 1"
+          },
+          "equip_template": "l_01_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Wolf Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Armor"
+          },
+          "equip_template": "t_01_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Wolf Gloves 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Gloves 1"
+          },
+          "equip_template": "g_01a_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Wolf Boots 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Boots 1"
+          },
+          "equip_template": "s_01_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Wolf School steel sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf School steel sword"
+          },
+          "equip_template": "witcher_steel_wolf_sword_lvl1",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_swords.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Wolf School silver sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf School silver sword"
+          },
+          "equip_template": "witcher_silver_wolf_sword_lvl1",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_swords.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_wolf_enhanced",
+      "name": "Wolf School - Enhanced",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Wolf Pants 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Pants 2"
+          },
+          "equip_template": "l_01_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Wolf Armor 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Armor 1"
+          },
+          "equip_template": "t_02_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Wolf Gloves 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Gloves 2"
+          },
+          "equip_template": "g_01a_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Wolf Boots 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Boots 2"
+          },
+          "equip_template": "s_01_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Wolf School steel sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf School steel sword 1"
+          },
+          "equip_template": "witcher_steel_wolf_sword_lvl2",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_swords.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Wolf School silver sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf School silver sword 1"
+          },
+          "equip_template": "witcher_silver_wolf_sword_lvl2",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_swords.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_wolf_superior",
+      "name": "Wolf School - Superior",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Wolf Pants 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Pants 3"
+          },
+          "equip_template": "l_02_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Wolf Armor 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Armor 2"
+          },
+          "equip_template": "t_03_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Wolf Gloves 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Gloves 3"
+          },
+          "equip_template": "g_02a_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Wolf Boots 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Boots 3"
+          },
+          "equip_template": "s_02_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Wolf School steel sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf School steel sword 2"
+          },
+          "equip_template": "witcher_steel_wolf_sword_lvl3",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_swords.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Wolf School silver sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf School silver sword 2"
+          },
+          "equip_template": "witcher_silver_wolf_sword_lvl3",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_swords.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_wolf_mastercrafted",
+      "name": "Wolf School - Mastercrafted",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Wolf Pants 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Pants 4"
+          },
+          "equip_template": "l_02_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Wolf Armor 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Armor 3"
+          },
+          "equip_template": "t_04_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Wolf Gloves 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Gloves 4"
+          },
+          "equip_template": "g_02a_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Wolf Boots 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Boots 4"
+          },
+          "equip_template": "s_02_mg__wolf",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Wolf School steel sword 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf School steel sword 3"
+          },
+          "equip_template": "witcher_steel_wolf_sword_lvl4",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_swords.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Wolf School silver sword 3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf School silver sword 3"
+          },
+          "equip_template": "witcher_silver_wolf_sword_lvl4",
+          "xml_source_path": "dlc\\dlc10\\data\\gameplay\\items\\dlc10_wolf_swords.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_wolf_grandmaster",
+      "name": "Wolf School - Grandmaster",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Wolf Pants 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Pants 5"
+          },
+          "equip_template": "l_01_mg__wolf_lv3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_wolf\\l_01_mg__wolf_lv3.w2ent",
+          "bodypart_set_folder": "witcher_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Wolf Armor 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Armor 4"
+          },
+          "equip_template": "t_01_mg__wolf_lvl5",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_wolf\\t_01_mg__wolf_lvl5.w2ent",
+          "bodypart_set_folder": "witcher_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Wolf Gloves 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Gloves 5"
+          },
+          "equip_template": "g_01a_mg__wolf_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_wolf\\g_01a_mg__wolf_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Wolf Boots 5",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf Boots 5"
+          },
+          "equip_template": "s_01_mg__wolf_lvl3",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_wolf\\s_01_mg__wolf_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Wolf School steel sword 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf School steel sword 4"
+          },
+          "equip_template": "witcher_steel_wolf_sword_lvl5",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Wolf School silver sword 4",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Wolf School silver sword 4"
+          },
+          "equip_template": "witcher_silver_wolf_sword_lvl5",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_viper_hos",
+      "name": "Viper School - Hearts of Stone",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "EP1 Witcher Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "EP1 Witcher Pants"
+          },
+          "equip_template": "l_01_mg__viper_v2",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_viper_v2\\l_01_mg__viper_v2.w2ent",
+          "bodypart_set_folder": "witcher_viper_v2",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "EP1 Witcher Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "EP1 Witcher Armor"
+          },
+          "equip_template": "t_01_mg__viper_v2",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_viper_v2\\t_01_mg__viper_v2.w2ent",
+          "bodypart_set_folder": "witcher_viper_v2",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "EP1 Witcher Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "EP1 Witcher Gloves"
+          },
+          "equip_template": "g_01a_mg__viper_v2",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_viper_v2\\g_01a_mg__viper_v2.w2ent",
+          "bodypart_set_folder": "witcher_viper_v2",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "EP1 Witcher Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "EP1 Witcher Boots"
+          },
+          "equip_template": "s_01_mg__viper_v2",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_viper_v2\\s_01_mg__viper_v2.w2ent",
+          "bodypart_set_folder": "witcher_viper_v2",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "EP1 Viper School steel sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "EP1 Viper School steel sword"
+          },
+          "equip_template": "witcher_steel_viper_v2_sword_lvl1",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "EP1 Viper School silver sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "EP1 Viper School silver sword"
+          },
+          "equip_template": "witcher_silver_viper_v2_sword_lvl1",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_red_wolf_level_1",
+      "name": "Manticore (Red Wolf) - Level 1",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Red Wolf Pants 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf Pants 1"
+          },
+          "equip_template": "l_01_mg__red_wolf_lvl1",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_red_wolf\\l_01_mg__red_wolf_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_red_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Red Wolf Armor 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf Armor 1"
+          },
+          "equip_template": "t_01_mg__red_wolf_lvl1",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_red_wolf\\t_01_mg__red_wolf_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_red_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Red Wolf Gloves 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf Gloves 1"
+          },
+          "equip_template": "g_01a_mg__red_wolf_lvl1",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_red_wolf\\g_01a_mg__red_wolf_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_red_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Red Wolf Boots 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf Boots 1"
+          },
+          "equip_template": "s_01_mg__red_wolf_lvl1",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_red_wolf\\s_01_mg__red_wolf_lvl1.w2ent",
+          "bodypart_set_folder": "witcher_red_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Red Wolf School steel sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf School steel sword 1"
+          },
+          "equip_template": "witcher_steel_manticora_ep2_sword_lvl1",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Red Wolf School silver sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf School silver sword 1"
+          },
+          "equip_template": "witcher_silver_manticora_ep2_sword_lvl1",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_red_wolf_level_2",
+      "name": "Manticore (Red Wolf) - Level 2",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Red Wolf Pants 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf Pants 2"
+          },
+          "equip_template": "l_01_mg__red_wolf_lvl2",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_red_wolf\\l_01_mg__red_wolf_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_red_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Red Wolf Armor 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf Armor 2"
+          },
+          "equip_template": "t_01_mg__red_wolf_lvl2",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_red_wolf\\t_01_mg__red_wolf_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_red_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Red Wolf Gloves 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf Gloves 2"
+          },
+          "equip_template": "g_01a_mg__red_wolf_lvl2",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_red_wolf\\g_01a_mg__red_wolf_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_red_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Red Wolf Boots 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf Boots 2"
+          },
+          "equip_template": "s_01_mg__red_wolf_lvl2",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_red_wolf\\s_01_mg__red_wolf_lvl2.w2ent",
+          "bodypart_set_folder": "witcher_red_wolf",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Red Wolf School steel sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf School steel sword 2"
+          },
+          "equip_template": "witcher_steel_manticora_ep2_sword_lvl1",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Red Wolf School silver sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Red Wolf School silver sword 2"
+          },
+          "equip_template": "witcher_silver_manticora_ep2_sword_lvl2",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_crafting_weapons.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_netflix_level_0",
+      "name": "Forgotten Wolven (Netflix) - Base",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Netflix Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Pants"
+          },
+          "equip_template": "l_01_mg__netflix",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\armor__netflix\\l_01_mg__netflix.w2ent",
+          "bodypart_set_folder": "armor__netflix",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Netflix Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Armor"
+          },
+          "equip_template": "t_01_mg__netflix",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\armor__netflix\\t_01_mg__netflix.w2ent",
+          "bodypart_set_folder": "armor__netflix",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Netflix Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Gloves"
+          },
+          "equip_template": "g_01_mg__netflix",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\armor__netflix\\g_01_mg__netflix.w2ent",
+          "bodypart_set_folder": "armor__netflix",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Netflix Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Boots"
+          },
+          "equip_template": "s_01_mg__netflix",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\armor__netflix\\s_01_mg__netflix.w2ent",
+          "bodypart_set_folder": "armor__netflix",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Netflix steel sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix steel sword"
+          },
+          "equip_template": "witcher_steel_netflix_sword",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_swords.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Netflix silver sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix silver sword"
+          },
+          "equip_template": "witcher_silver_netflix_sword",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_swords.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_netflix_level_1",
+      "name": "Forgotten Wolven (Netflix) - Level 1",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Netflix Pants 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Pants 1"
+          },
+          "equip_template": "l_01_mg__netflix",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\armor__netflix\\l_01_mg__netflix.w2ent",
+          "bodypart_set_folder": "armor__netflix",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Netflix Armor 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Armor 1"
+          },
+          "equip_template": "t_01_mg__netflix",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\armor__netflix\\t_01_mg__netflix.w2ent",
+          "bodypart_set_folder": "armor__netflix",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Netflix Gloves 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Gloves 1"
+          },
+          "equip_template": "g_01_mg__netflix",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\armor__netflix\\g_01_mg__netflix.w2ent",
+          "bodypart_set_folder": "armor__netflix",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Netflix Boots 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Boots 1"
+          },
+          "equip_template": "s_01_mg__netflix",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\armor__netflix\\s_01_mg__netflix.w2ent",
+          "bodypart_set_folder": "armor__netflix",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Netflix steel sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix steel sword 1"
+          },
+          "equip_template": "witcher_steel_netflix_sword",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_swords.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Netflix silver sword 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix silver sword 1"
+          },
+          "equip_template": "witcher_silver_netflix_sword",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_swords.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_netflix_level_2",
+      "name": "Forgotten Wolven (Netflix) - Level 2",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Netflix Pants 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Pants 2"
+          },
+          "equip_template": "l_01_mg__netflix2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_netflix2\\l_01_mg__netflix2.w2ent",
+          "bodypart_set_folder": "witcher_netflix2",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Netflix Armor 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Armor 2"
+          },
+          "equip_template": "t_01_mg__netflix2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_netflix2\\t_01_mg__netflix2.w2ent",
+          "bodypart_set_folder": "witcher_netflix2",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Netflix Gloves 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Gloves 2"
+          },
+          "equip_template": "g_01_mg__netflix2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_netflix2\\g_01_mg__netflix2.w2ent",
+          "bodypart_set_folder": "witcher_netflix2",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Netflix Boots 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix Boots 2"
+          },
+          "equip_template": "s_01_mg__netflix2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_netflix2\\s_01_mg__netflix2.w2ent",
+          "bodypart_set_folder": "witcher_netflix2",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Netflix steel sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix steel sword 2"
+          },
+          "equip_template": "witcher_steel_netflix_sword",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_swords.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "Netflix silver sword 2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Netflix silver sword 2"
+          },
+          "equip_template": "witcher_silver_netflix_sword",
+          "xml_source_path": "gameplay\\items\\dlc18_netflix_swords.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_witcher_vampire",
+      "name": "Vampire Set",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "q702_vampire_pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "q702_vampire_pants"
+          },
+          "equip_template": "q704_l_01_mg__vampire",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\legs\\armor_vampire\\q704_l_01_mg__vampire.w2ent",
+          "bodypart_set_folder": "armor_vampire",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "q702_vampire_armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "q702_vampire_armor"
+          },
+          "equip_template": "q_704_t_01_mg__vampire",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\trunk\\armor_vampire\\q_704_t_01_mg__vampire.w2ent",
+          "bodypart_set_folder": "armor_vampire",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "q702_vampire_gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "q702_vampire_gloves"
+          },
+          "equip_template": "q704_g_01a_mg__vampire",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\gloves\\armor_vampire\\q704_g_01a_mg__vampire.w2ent",
+          "bodypart_set_folder": "armor_vampire",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "q702_vampire_boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "q702_vampire_boots"
+          },
+          "equip_template": "q_704_s_01_mg__vampire_copy",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\shoes\\armor_vampire\\q_704_s_01_mg__vampire_copy.w2ent",
+          "bodypart_set_folder": "armor_vampire",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "q702 vampire steel sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "q702 vampire steel sword"
+          },
+          "equip_template": "q704_steel_vampire",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_weapons.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_outfit_temerian",
+      "name": "Temerian Armor Set",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "DLC1 Temerian Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC1 Temerian Pants"
+          },
+          "equip_template": "l_01_mg__temerian",
+          "xml_source_path": "dlc\\dlc1\\data\\gameplay\\items\\dlc1_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "DLC1 Temerian Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC1 Temerian Armor"
+          },
+          "equip_template": "t_01_mg__temerian",
+          "xml_source_path": "dlc\\dlc1\\data\\gameplay\\items\\dlc1_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "DLC1 Temerian Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC1 Temerian Gloves"
+          },
+          "equip_template": "g_01a_mg__temerian",
+          "xml_source_path": "dlc\\dlc1\\data\\gameplay\\items\\dlc1_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "DLC1 Temerian Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC1 Temerian Boots"
+          },
+          "equip_template": "s_01_mg__temerian",
+          "xml_source_path": "dlc\\dlc1\\data\\gameplay\\items\\dlc1_items.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_outfit_nilfgaardian",
+      "name": "Nilfgaardian Armor Set",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "DLC5 Nilfgaardian Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC5 Nilfgaardian Pants"
+          },
+          "equip_template": "l_01_mg__nilfgaardian",
+          "bodypart_entity_path": "dlc\\dlc5\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_nilfgaardian\\l_01_mg__nilfgaardian.w2ent",
+          "bodypart_set_folder": "witcher_nilfgaardian",
+          "bodypart_scope": "dlc\\dlc5\\data",
+          "xml_source_path": "dlc\\dlc5\\data\\gameplay\\items\\dlc5_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "DLC5 Nilfgaardian Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC5 Nilfgaardian Armor"
+          },
+          "equip_template": "t_01_mg__nilfgaardian",
+          "bodypart_entity_path": "dlc\\dlc5\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_nilfgaardian\\t_01_mg__nilfgaardian.w2ent",
+          "bodypart_set_folder": "witcher_nilfgaardian",
+          "bodypart_scope": "dlc\\dlc5\\data",
+          "xml_source_path": "dlc\\dlc5\\data\\gameplay\\items\\dlc5_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "DLC5 Nilfgaardian Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC5 Nilfgaardian Gloves"
+          },
+          "equip_template": "g_01_mg__nilfgaardian",
+          "bodypart_entity_path": "dlc\\dlc5\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_nilfgaardian\\g_01_mg__nilfgaardian.w2ent",
+          "bodypart_set_folder": "witcher_nilfgaardian",
+          "bodypart_scope": "dlc\\dlc5\\data",
+          "xml_source_path": "dlc\\dlc5\\data\\gameplay\\items\\dlc5_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "DLC5 Nilfgaardian Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC5 Nilfgaardian Boots"
+          },
+          "equip_template": "s_01_mg__nilfgaardian",
+          "bodypart_entity_path": "dlc\\dlc5\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_nilfgaardian\\s_01_mg__nilfgaardian.w2ent",
+          "bodypart_set_folder": "witcher_nilfgaardian",
+          "bodypart_scope": "dlc\\dlc5\\data",
+          "xml_source_path": "dlc\\dlc5\\data\\gameplay\\items\\dlc5_items.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_outfit_skellige",
+      "name": "Skellige Armor Set",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "DLC14 Skellige Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC14 Skellige Pants"
+          },
+          "equip_template": "l_01_mg__skellige",
+          "bodypart_entity_path": "dlc\\dlc14\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_skellige\\l_01_mg__skellige.w2ent",
+          "bodypart_set_folder": "witcher_skellige",
+          "bodypart_scope": "dlc\\dlc14\\data",
+          "xml_source_path": "dlc\\dlc14\\data\\gameplay\\items\\dlc14_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "DLC14 Skellige Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC14 Skellige Armor"
+          },
+          "equip_template": "t_01_mg__skellige",
+          "bodypart_entity_path": "dlc\\dlc14\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_skellige\\t_01_mg__skellige.w2ent",
+          "bodypart_set_folder": "witcher_skellige",
+          "bodypart_scope": "dlc\\dlc14\\data",
+          "xml_source_path": "dlc\\dlc14\\data\\gameplay\\items\\dlc14_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "DLC14 Skellige Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC14 Skellige Gloves"
+          },
+          "equip_template": "g_01a_mg__skellige",
+          "bodypart_entity_path": "dlc\\dlc14\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_skellige\\g_01a_mg__skellige.w2ent",
+          "bodypart_set_folder": "witcher_skellige",
+          "bodypart_scope": "dlc\\dlc14\\data",
+          "xml_source_path": "dlc\\dlc14\\data\\gameplay\\items\\dlc14_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "DLC14 Skellige Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC14 Skellige Boots"
+          },
+          "equip_template": "s_01_mg__skellige",
+          "bodypart_entity_path": "dlc\\dlc14\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_skellige\\s_01_mg__skellige.w2ent",
+          "bodypart_set_folder": "witcher_skellige",
+          "bodypart_scope": "dlc\\dlc14\\data",
+          "xml_source_path": "dlc\\dlc14\\data\\gameplay\\items\\dlc14_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "crossbow",
+          "item": "DLC13 Skellige Crossbow",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "DLC13 Skellige Crossbow"
+          },
+          "equip_template": "witcher_crossbow_skellige",
+          "xml_source_path": "dlc\\dlc13\\data\\gameplay\\items\\dlc13_items.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_outfit_white_tiger",
+      "name": "White Tiger Armor Set",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "White Tiger Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "White Tiger Pants"
+          },
+          "equip_template": "l_01_mg__white_tiger",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_white_tiger\\l_01_mg__white_tiger.w2ent",
+          "bodypart_set_folder": "witcher_white_tiger",
+          "xml_source_path": "gameplay\\items\\def_item_armor_white_tiger.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "White Tiger Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "White Tiger Armor"
+          },
+          "equip_template": "t_01_mg__white_tiger",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_white_tiger\\t_01_mg__white_tiger.w2ent",
+          "bodypart_set_folder": "witcher_white_tiger",
+          "xml_source_path": "gameplay\\items\\def_item_armor_white_tiger.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "White Tiger Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "White Tiger Gloves"
+          },
+          "equip_template": "g_01a_mg__white_tiger",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_white_tiger\\g_01a_mg__white_tiger.w2ent",
+          "bodypart_set_folder": "witcher_white_tiger",
+          "xml_source_path": "gameplay\\items\\def_item_armor_white_tiger.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "White Tiger Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "White Tiger Boots"
+          },
+          "equip_template": "s_01_mg__white_tiger",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_white_tiger\\s_01_mg__white_tiger.w2ent",
+          "bodypart_set_folder": "witcher_white_tiger",
+          "xml_source_path": "gameplay\\items\\def_item_armor_white_tiger.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_outfit_dol_blathanna",
+      "name": "Dol Blathanna Armor Set",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Dol Blathanna Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Dol Blathanna Pants"
+          },
+          "equip_template": "l_01_mg__elven",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_elven\\l_01_mg__elven.w2ent",
+          "bodypart_set_folder": "witcher_elven",
+          "xml_source_path": "gameplay\\items\\def_item_armor_dol_blathanna.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Dol Blathanna Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Dol Blathanna Armor"
+          },
+          "equip_template": "t_01_mg__elven",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_elven\\t_01_mg__elven.w2ent",
+          "bodypart_set_folder": "witcher_elven",
+          "xml_source_path": "gameplay\\items\\def_item_armor_dol_blathanna.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Dol Blathanna Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Dol Blathanna Gloves"
+          },
+          "equip_template": "g_01a_mg__elven",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_elven\\g_01a_mg__elven.w2ent",
+          "bodypart_set_folder": "witcher_elven",
+          "xml_source_path": "gameplay\\items\\def_item_armor_dol_blathanna.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Dol Blathanna Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Dol Blathanna Boots"
+          },
+          "equip_template": "s_01_mg__elven",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_elven\\s_01_mg__elven.w2ent",
+          "bodypart_set_folder": "witcher_elven",
+          "xml_source_path": "gameplay\\items\\def_item_armor_dol_blathanna.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "steelsword",
+          "item": "Dol Blathanna longsword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Dol Blathanna longsword"
+          },
+          "equip_template": "steel_unique_dol_blathanna_longsword",
+          "xml_source_path": "gameplay\\items\\def_item_swords_dol_blathanna.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "silversword",
+          "item": "White Widow of Dol Blathanna",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "White Widow of Dol Blathanna"
+          },
+          "equip_template": "silver_unique_dol_blathanna_white_widow",
+          "xml_source_path": "gameplay\\items\\def_item_swords_dol_blathanna.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_common_light_level_1",
+      "name": "Common Light - Level 1",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "",
+        "set_folder": "common_light",
+        "level": 1
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Pants 01",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Pants 01"
+          },
+          "equip_template": "l_01_mg__common_light_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\common_light\\l_01_mg__common_light_lvl1.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Light armor 01",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Light armor 01"
+          },
+          "equip_template": "t_01_mg__common_light_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\common_light\\t_01_mg__common_light_lvl1.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Gloves 01_crafted",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gloves 01_crafted"
+          },
+          "equip_template": "g_01_mg__common_light_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\common_light\\g_01_mg__common_light_lvl1.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items_plus\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Boots 01",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Boots 01"
+          },
+          "equip_template": "s_01_mg__common_light_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\common_light\\s_01_mg__common_light_lvl1.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_common_heavy_level_1",
+      "name": "Common Heavy - Level 1",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "",
+        "set_folder": "common_heavy",
+        "level": 1
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Heavy pants 01",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy pants 01"
+          },
+          "equip_template": "l_01_mg__common_heavy_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\common_heavy\\l_01_mg__common_heavy_lvl1.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Heavy armor 01",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy armor 01"
+          },
+          "equip_template": "t_01_mg__common_heavy_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\common_heavy\\t_01_mg__common_heavy_lvl1.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Heavy gloves 01_crafted",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy gloves 01_crafted"
+          },
+          "equip_template": "g_01_mg__common_heavy_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\common_heavy\\g_01_mg__common_heavy_lvl1.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items_plus\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Heavy boots 01",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy boots 01"
+          },
+          "equip_template": "s_01_mg__common_heavy_lvl1",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\common_heavy\\s_01_mg__common_heavy_lvl1.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_common_light_level_2",
+      "name": "Common Light - Level 2",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "",
+        "set_folder": "common_light",
+        "level": 2
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Pants 02",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Pants 02"
+          },
+          "equip_template": "l_01_mg__common_light_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\common_light\\l_01_mg__common_light_lvl2.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Light armor 02",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Light armor 02"
+          },
+          "equip_template": "t_01_mg__common_light_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\common_light\\t_01_mg__common_light_lvl2.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Gloves 02_crafted",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gloves 02_crafted"
+          },
+          "equip_template": "g_01_mg__common_light_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\common_light\\g_01_mg__common_light_lvl2.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items_plus\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Boots 02",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Boots 02"
+          },
+          "equip_template": "s_01_mg__common_light_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\common_light\\s_01_mg__common_light_lvl2.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_common_heavy_level_2",
+      "name": "Common Heavy - Level 2",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "",
+        "set_folder": "common_heavy",
+        "level": 2
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Heavy pants 02",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy pants 02"
+          },
+          "equip_template": "l_01_mg__common_heavy_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\common_heavy\\l_01_mg__common_heavy_lvl2.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Heavy armor 02",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy armor 02"
+          },
+          "equip_template": "t_01_mg__common_heavy_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\common_heavy\\t_01_mg__common_heavy_lvl2.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Heavy gloves 02_crafted",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy gloves 02_crafted"
+          },
+          "equip_template": "g_01_mg__common_heavy_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\common_heavy\\g_01_mg__common_heavy_lvl2.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items_plus\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Heavy boots 02",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy boots 02"
+          },
+          "equip_template": "s_01_mg__common_heavy_lvl2",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\common_heavy\\s_01_mg__common_heavy_lvl2.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_common_light_level_3",
+      "name": "Common Light - Level 3",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "",
+        "set_folder": "common_light",
+        "level": 3
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Pants 03",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Pants 03"
+          },
+          "equip_template": "l_01_mg__common_light_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\common_light\\l_01_mg__common_light_lvl3.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Light armor 03",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Light armor 03"
+          },
+          "equip_template": "t_01_mg__common_light_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\common_light\\t_01_mg__common_light_lvl3.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Gloves 03_crafted",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gloves 03_crafted"
+          },
+          "equip_template": "g_01_mg__common_light_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\common_light\\g_01_mg__common_light_lvl3.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items_plus\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Boots 03",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Boots 03"
+          },
+          "equip_template": "s_01_mg__common_light_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\common_light\\s_01_mg__common_light_lvl3.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_common_heavy_level_3",
+      "name": "Common Heavy - Level 3",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "",
+        "set_folder": "common_heavy",
+        "level": 3
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Heavy pants 03",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy pants 03"
+          },
+          "equip_template": "l_01_mg__common_heavy_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\common_heavy\\l_01_mg__common_heavy_lvl3.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Heavy armor 03",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy armor 03"
+          },
+          "equip_template": "t_01_mg__common_heavy_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\common_heavy\\t_01_mg__common_heavy_lvl3.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Heavy gloves 03_crafted",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy gloves 03_crafted"
+          },
+          "equip_template": "g_01_mg__common_heavy_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\common_heavy\\g_01_mg__common_heavy_lvl3.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items_plus\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Heavy boots 03",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy boots 03"
+          },
+          "equip_template": "s_01_mg__common_heavy_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\common_heavy\\s_01_mg__common_heavy_lvl3.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_common_light_level_4",
+      "name": "Common Light - Level 4",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "",
+        "set_folder": "common_light",
+        "level": 4
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Pants 04",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Pants 04"
+          },
+          "equip_template": "l_01_mg__common_light_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\common_light\\l_01_mg__common_light_lvl4.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Light armor 04",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Light armor 04"
+          },
+          "equip_template": "t_01_mg__common_light_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\common_light\\t_01_mg__common_light_lvl4.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Gloves 04_crafted",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Gloves 04_crafted"
+          },
+          "equip_template": "g_01_mg__common_light_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\common_light\\g_01_mg__common_light_lvl4.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items_plus\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Boots 04",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Boots 04"
+          },
+          "equip_template": "s_01_mg__common_light_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\common_light\\s_01_mg__common_light_lvl4.w2ent",
+          "bodypart_set_folder": "common_light",
+          "xml_source_path": "gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_common_heavy_level_4",
+      "name": "Common Heavy - Level 4",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "",
+        "set_folder": "common_heavy",
+        "level": 4
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Heavy pants 04",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy pants 04"
+          },
+          "equip_template": "l_01_mg__common_heavy_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\common_heavy\\l_01_mg__common_heavy_lvl4.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Heavy armor 04",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy armor 04"
+          },
+          "equip_template": "t_01_mg__common_heavy_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\common_heavy\\t_01_mg__common_heavy_lvl4.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Heavy gloves 04_crafted",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy gloves 04_crafted"
+          },
+          "equip_template": "g_01_mg__common_heavy_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\common_heavy\\g_01_mg__common_heavy_lvl4.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items_plus\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Heavy boots 04",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Heavy boots 04"
+          },
+          "equip_template": "s_01_mg__common_heavy_lvl4",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\common_heavy\\s_01_mg__common_heavy_lvl4.w2ent",
+          "bodypart_set_folder": "common_heavy",
+          "xml_source_path": "gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_starting_armor",
+      "name": "Starting Armor Set",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "",
+        "set_folder": "witcher_viper",
+        "level": 3
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Starting Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Starting Pants"
+          },
+          "equip_template": "l_01_mg__viper_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\witcher_viper\\l_01_mg__viper_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_viper",
+          "xml_source_path": "gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Starting Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Starting Armor"
+          },
+          "equip_template": "t_01_mg__viper_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\witcher_viper\\t_01_mg__viper_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_viper",
+          "xml_source_path": "gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Starting Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Starting Gloves"
+          },
+          "equip_template": "g_01a_mg__viper_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\witcher_viper\\g_01a_mg__viper_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_viper",
+          "xml_source_path": "gameplay\\items\\def_item_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Starting Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Starting Boots"
+          },
+          "equip_template": "s_01_mg__viper_lvl3",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\witcher_viper\\s_01_mg__viper_lvl3.w2ent",
+          "bodypart_set_folder": "witcher_viper",
+          "xml_source_path": "gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_ofir",
+      "name": "Ofir Armor Set",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "dlc\\ep1\\data",
+        "set_folder": "witcher_ofir",
+        "level": 1
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Ofir Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Ofir Pants"
+          },
+          "equip_template": "l_01_mg__ofir_lv1",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_ofir\\l_01_mg__ofir_lv1.w2ent",
+          "bodypart_set_folder": "witcher_ofir",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Crafted Ofir Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Crafted Ofir Armor"
+          },
+          "equip_template": "t_01_mg__ofir_lv1",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_ofir\\t_01_mg__ofir_lv1.w2ent",
+          "bodypart_set_folder": "witcher_ofir",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_crafting_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Crafted Ofir Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Crafted Ofir Gloves"
+          },
+          "equip_template": "g_01_mg__ofir_lv1",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_ofir\\g_01_mg__ofir_lv1.w2ent",
+          "bodypart_set_folder": "witcher_ofir",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items_plus\\def_item_crafting_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Ofir Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Ofir Boots"
+          },
+          "equip_template": "s_01_mg__ofir_lv1",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_ofir\\s_01_mg__ofir_lv1.w2ent",
+          "bodypart_set_folder": "witcher_ofir",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_thief",
+      "name": "Thief Armor Set",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "dlc\\ep1\\data",
+        "set_folder": "witcher_thief",
+        "level": 0
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Thief Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Thief Pants"
+          },
+          "equip_template": "l_01_mg__thief",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\legs\\witcher_thief\\l_01_mg__thief.w2ent",
+          "bodypart_set_folder": "witcher_thief",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Thief Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Thief Armor"
+          },
+          "equip_template": "t_01_mg__thief",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\trunk\\witcher_thief\\t_01_mg__thief.w2ent",
+          "bodypart_set_folder": "witcher_thief",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Thief Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Thief Gloves"
+          },
+          "equip_template": "g_01a_mg__thief",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\gloves\\witcher_thief\\g_01a_mg__thief.w2ent",
+          "bodypart_set_folder": "witcher_thief",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Thief Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Thief Boots"
+          },
+          "equip_template": "s_01_mg__thief",
+          "bodypart_entity_path": "dlc\\ep1\\data\\items\\bodyparts\\geralt_items\\shoes\\witcher_thief\\s_01_mg__thief.w2ent",
+          "bodypart_set_folder": "witcher_thief",
+          "bodypart_scope": "dlc\\ep1\\data",
+          "xml_source_path": "dlc\\ep1\\data\\gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_bodyparts_knight_geralt",
+      "name": "Knight Geralt Armor Set",
+      "source": "shipped",
+      "derived_from": {
+        "type": "geralt_bodypart_folder",
+        "bodypart_scope": "dlc\\bob\\data",
+        "set_folder": "errant_knight",
+        "level": 0
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Knight Geralt Pants 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Knight Geralt Pants 1"
+          },
+          "equip_template": "l_01_mg__errant_knight",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\legs\\errant_knight\\l_01_mg__errant_knight.w2ent",
+          "bodypart_set_folder": "errant_knight",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_pants.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Knight Geralt Armor 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Knight Geralt Armor 1"
+          },
+          "equip_template": "t_01_mg__errant_knight",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\trunk\\errant_knight\\t_01_mg__errant_knight.w2ent",
+          "bodypart_set_folder": "errant_knight",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_armor.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Knight Geralt A Gloves 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Knight Geralt A Gloves 1"
+          },
+          "equip_template": "g_02a_mg__errant_knight",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\gloves\\errant_knight\\g_02a_mg__errant_knight.w2ent",
+          "bodypart_set_folder": "errant_knight",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_gloves.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Knight Geralt Boots 1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Knight Geralt Boots 1"
+          },
+          "equip_template": "s_01_mg__errant_knight",
+          "bodypart_entity_path": "dlc\\bob\\data\\items\\bodyparts\\geralt_items\\shoes\\errant_knight\\s_01_mg__errant_knight.w2ent",
+          "bodypart_set_folder": "errant_knight",
+          "bodypart_scope": "dlc\\bob\\data",
+          "xml_source_path": "dlc\\bob\\data\\gameplay\\items\\def_item_boots.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
+      "id": "shipped_w2_geralt_starting",
+      "name": "Witcher 2 - Geralt Starting Gear",
+      "source": "shipped",
+      "source_game": "w2",
+      "derived_from": {
+        "type": "witcher2_item_xml",
+        "data_root": "The Witcher 2\\data",
+        "note": "Baseline Geralt gear from W2 item XML definitions."
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Worn Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Worn Pants"
+          },
+          "equip_template": "01_worn_pants",
+          "xml_source_path": "items\\def_item_pants.xml",
+          "w2_entity_path": "items\\geralt\\geralt_pants\\01_worn_pants.w2ent"
+        },
+        {
+          "category": "armor",
+          "item": "Leather Jacket",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Leather Jacket"
+          },
+          "equip_template": "03_leather_jacket",
+          "xml_source_path": "items\\def_item_armor.xml",
+          "w2_entity_path": "items\\geralt\\geralt_armor\\03_leather_jacket.w2ent"
+        },
+        {
+          "category": "gloves",
+          "item": "Worn Leather Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Worn Leather Gloves"
+          },
+          "equip_template": "01_worn_short_gloves",
+          "xml_source_path": "items\\def_item_gloves.xml",
+          "w2_entity_path": "items\\geralt\\geralt_gloves\\01_worn_short_gloves.w2ent"
+        },
+        {
+          "category": "boots",
+          "item": "Worn Leather Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Worn Leather Boots"
+          },
+          "equip_template": "01_worn_boots",
+          "xml_source_path": "items\\def_item_boots.xml",
+          "w2_entity_path": "items\\geralt\\geralt_boots\\01_worn_boots.w2ent"
+        },
+        {
+          "category": "steelsword",
+          "item": "Long Steel Sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Long Steel Sword"
+          },
+          "equip_template": "steel_18_long",
+          "xml_source_path": "items\\def_item_swordsteel.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\steel_swords\\sword_type_3\\steel_18_long.w2ent"
+        },
+        {
+          "category": "silversword",
+          "item": "Witcher Silver Sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Witcher Silver Sword"
+          },
+          "equip_template": "silver_35_witcher",
+          "xml_source_path": "items\\def_item_swordsilver.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\silver_swords\\sword_type_1\\silver_35_witcher.w2ent"
+        }
+      ]
+    },
+    {
+      "id": "shipped_w2_geralt_temerians",
+      "name": "Witcher 2 - Temerian Gear",
+      "source": "shipped",
+      "source_game": "w2",
+      "derived_from": {
+        "type": "witcher2_item_xml",
+        "data_root": "The Witcher 2\\data",
+        "note": "Temerian-named armor pieces and matching W2 sword XML definitions."
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Temerian Unique Leather Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Temerian Unique Leather Pants"
+          },
+          "equip_template": "10_temerian_pants",
+          "xml_source_path": "items\\def_item_pants.xml",
+          "w2_entity_path": "items\\geralt\\geralt_pants\\10_temerian_pants.w2ent"
+        },
+        {
+          "category": "armor",
+          "item": "Temerian Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Temerian Armor"
+          },
+          "equip_template": "03_leather_jacket",
+          "xml_source_path": "items\\def_item_armor.xml",
+          "w2_entity_path": "items\\geralt\\geralt_armor\\03_leather_jacket.w2ent"
+        },
+        {
+          "category": "gloves",
+          "item": "High Quality Temerian Unique Leather Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "High Quality Temerian Unique Leather Gloves"
+          },
+          "equip_template": "04_worn_long_gloves",
+          "xml_source_path": "items\\def_item_gloves.xml",
+          "w2_entity_path": "items\\geralt\\geralt_gloves\\04_worn_long_gloves.w2ent"
+        },
+        {
+          "category": "boots",
+          "item": "Temerian Unique Leather Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Temerian Unique Leather Boots"
+          },
+          "equip_template": "05_temerian_boots",
+          "xml_source_path": "items\\def_item_boots.xml",
+          "w2_entity_path": "items\\geralt\\geralt_boots\\05_temerian_boots.w2ent"
+        },
+        {
+          "category": "steelsword",
+          "item": "Temerian Steel Sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Temerian Steel Sword"
+          },
+          "equip_template": "steel_05_temerian",
+          "xml_source_path": "items\\def_item_swordsteel.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\steel_swords\\sword_type_1\\steel_05_temerian.w2ent"
+        },
+        {
+          "category": "silversword",
+          "item": "Quality Witcher Silver Sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Quality Witcher Silver Sword"
+          },
+          "equip_template": "silver_36_quality_witcher",
+          "xml_source_path": "items\\def_item_swordsilver.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\silver_swords\\sword_type_1\\silver_36_quality_witcher.w2ent"
+        }
+      ]
+    },
+    {
+      "id": "shipped_w2_geralt_kaedwenian",
+      "name": "Witcher 2 - Kaedwenian Gear",
+      "source": "shipped",
+      "source_game": "w2",
+      "derived_from": {
+        "type": "witcher2_item_xml",
+        "data_root": "The Witcher 2\\data",
+        "note": "Kaedwenian-named armor pieces and matching W2 sword XML definitions."
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Kaedwenian Unique Leather Pants",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Kaedwenian Unique Leather Pants"
+          },
+          "equip_template": "14_kaedwenian_pants",
+          "xml_source_path": "items\\def_item_pants.xml",
+          "w2_entity_path": "items\\geralt\\geralt_pants\\14_kaedwenian_pants.w2ent"
+        },
+        {
+          "category": "armor",
+          "item": "Kaedwenian Leather Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Kaedwenian Leather Armor"
+          },
+          "equip_template": "23_kaedwenian_armor",
+          "xml_source_path": "items\\def_item_armor.xml",
+          "w2_entity_path": "items\\geralt\\geralt_armor\\23_kaedwenian_armor.w2ent"
+        },
+        {
+          "category": "gloves",
+          "item": "High Quality Kaedwenian Unique Leather Gloves",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "High Quality Kaedwenian Unique Leather Gloves"
+          },
+          "equip_template": "05_long_gloves",
+          "xml_source_path": "items\\def_item_gloves.xml",
+          "w2_entity_path": "items\\geralt\\geralt_gloves\\05_long_gloves.w2ent"
+        },
+        {
+          "category": "boots",
+          "item": "Kaedwenian Unique Leather Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Kaedwenian Unique Leather Boots"
+          },
+          "equip_template": "09_kaedwenian_boots",
+          "xml_source_path": "items\\def_item_boots.xml",
+          "w2_entity_path": "items\\geralt\\geralt_boots\\09_kaedwenian_boots.w2ent"
+        },
+        {
+          "category": "steelsword",
+          "item": "Kaedwenian Steel Sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Kaedwenian Steel Sword"
+          },
+          "equip_template": "steel_10_kaedwenian",
+          "xml_source_path": "items\\def_item_swordsteel.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\steel_swords\\sword_type_1\\steel_10_kaedwenian.w2ent"
+        },
+        {
+          "category": "silversword",
+          "item": "Blue Meteorite Silver Sword",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Blue Meteorite Silver Sword"
+          },
+          "equip_template": "silver_38_blue_meteorite",
+          "xml_source_path": "items\\def_item_swordsilver.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\silver_swords\\sword_type_1\\silver_38_blue_meteorite.w2ent"
+        }
+      ]
+    },
+    {
+      "id": "shipped_w2_geralt_elder_blood",
+      "name": "Witcher 2 - Elder Blood Gear",
+      "source": "shipped",
+      "source_game": "w2",
+      "derived_from": {
+        "type": "witcher2_item_xml",
+        "data_root": "The Witcher 2\\data",
+        "note": "Elder Blood/Wild Hunt pieces plus late-game W2 sword definitions."
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Wild Hunt Legguards",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Wild Hunt Legguards"
+          },
+          "equip_template": "16_elder_blood_pants",
+          "xml_source_path": "items\\def_item_pants.xml",
+          "w2_entity_path": "items\\geralt\\geralt_pants\\16_elder_blood_pants.w2ent"
+        },
+        {
+          "category": "armor",
+          "item": "Wild Hunt Hauberk",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Wild Hunt Hauberk"
+          },
+          "equip_template": "31_vran_armor",
+          "xml_source_path": "items\\def_item_armor.xml",
+          "w2_entity_path": "items\\geralt\\geralt_armor\\31_vran_armor.w2ent"
+        },
+        {
+          "category": "gloves",
+          "item": "Wild Hunt Clutches",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Wild Hunt Clutches"
+          },
+          "equip_template": "12_elder_blood_gloves",
+          "xml_source_path": "items\\def_item_gloves.xml",
+          "w2_entity_path": "items\\geralt\\geralt_gloves\\12_elder_blood_gloves.w2ent"
+        },
+        {
+          "category": "boots",
+          "item": "Wild Hunt Treads",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Wild Hunt Treads"
+          },
+          "equip_template": "11_elder_blood_boots",
+          "xml_source_path": "items\\def_item_boots.xml",
+          "w2_entity_path": "items\\geralt\\geralt_boots\\11_elder_blood_boots.w2ent"
+        },
+        {
+          "category": "steelsword",
+          "item": "Forgotten Sword of Vrans",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Forgotten Sword of Vrans"
+          },
+          "equip_template": "steel_34_forgotten_sword_of_vrans",
+          "xml_source_path": "items\\def_item_swordsteel.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\steel_swords\\sword_type_2\\steel_34_forgotten_sword_of_vrans.w2ent"
+        },
+        {
+          "category": "silversword",
+          "item": "Phantom Edge",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Phantom Edge"
+          },
+          "equip_template": "silver_71_phantom_edge",
+          "xml_source_path": "items\\def_item_swordsilver.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\silver_swords\\sword_type_2\\silver_71_phantom_edge.w2ent"
+        }
+      ]
+    },
+    {
+      "id": "shipped_w2_dark_difficulty_a1",
+      "name": "Witcher 2 - Dark Difficulty A1",
+      "source": "shipped",
+      "source_game": "w2",
+      "derived_from": {
+        "type": "witcher2_item_xml",
+        "data_root": "The Witcher 2\\data",
+        "note": "Dark Difficulty A1 armor and sword definitions from W2 XML."
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "DarkDifficultyPantsA1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyPantsA1"
+          },
+          "equip_template": "17_dark_pants",
+          "xml_source_path": "items\\def_item_pants.xml",
+          "w2_entity_path": "items\\geralt\\geralt_pants\\17_dark_pants.w2ent"
+        },
+        {
+          "category": "armor",
+          "item": "DarkDifficultyArmorA1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyArmorA1"
+          },
+          "equip_template": "34_dark_jacket",
+          "xml_source_path": "items\\def_item_armor.xml",
+          "w2_entity_path": "items\\geralt\\geralt_armor\\34_dark_jacket.w2ent"
+        },
+        {
+          "category": "gloves",
+          "item": "DarkDifficultyGlovesA1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyGlovesA1"
+          },
+          "equip_template": "13_dark_gloves",
+          "xml_source_path": "items\\def_item_gloves.xml",
+          "w2_entity_path": "items\\geralt\\geralt_gloves\\13_dark_gloves.w2ent"
+        },
+        {
+          "category": "boots",
+          "item": "DarkDifficultyBootsA1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyBootsA1"
+          },
+          "equip_template": "12_dark_boots",
+          "xml_source_path": "items\\def_item_boots.xml",
+          "w2_entity_path": "items\\geralt\\geralt_boots\\12_dark_boots.w2ent"
+        },
+        {
+          "category": "steelsword",
+          "item": "Dark difficulty steelsword A1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Dark difficulty steelsword A1"
+          },
+          "equip_template": "steel_34_unique_dark",
+          "xml_source_path": "items\\def_item_swordsteel.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\steel_swords\\sword_type_5\\steel_34_unique_dark.w2ent"
+        },
+        {
+          "category": "silversword",
+          "item": "Dark difficulty silversword A1",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Dark difficulty silversword A1"
+          },
+          "equip_template": "silver_61_unique_dark",
+          "xml_source_path": "items\\def_item_swordsilver.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\silver_swords\\sword_type_4\\silver_61_unique_dark.w2ent"
+        }
+      ]
+    },
+    {
+      "id": "shipped_w2_dark_difficulty_a2",
+      "name": "Witcher 2 - Dark Difficulty A2",
+      "source": "shipped",
+      "source_game": "w2",
+      "derived_from": {
+        "type": "witcher2_item_xml",
+        "data_root": "The Witcher 2\\data",
+        "note": "Dark Difficulty A2 armor and sword definitions from W2 XML."
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "DarkDifficultyPantsA2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyPantsA2"
+          },
+          "equip_template": "18_medium_dark_pants",
+          "xml_source_path": "items\\def_item_pants.xml",
+          "w2_entity_path": "items\\geralt\\geralt_pants\\18_medium_dark_pants.w2ent"
+        },
+        {
+          "category": "armor",
+          "item": "DarkDifficultyArmorA2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyArmorA2"
+          },
+          "equip_template": "33_dark_leather",
+          "xml_source_path": "items\\def_item_armor.xml",
+          "w2_entity_path": "items\\geralt\\geralt_armor\\33_dark_leather.w2ent"
+        },
+        {
+          "category": "gloves",
+          "item": "DarkDifficultyGlovesA2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyGlovesA2"
+          },
+          "equip_template": "14_medium_dark_gloves",
+          "xml_source_path": "items\\def_item_gloves.xml",
+          "w2_entity_path": "items\\geralt\\geralt_gloves\\14_medium_dark_gloves.w2ent"
+        },
+        {
+          "category": "boots",
+          "item": "DarkDifficultyBootsA2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyBootsA2"
+          },
+          "equip_template": "14_medium_dark_boots",
+          "xml_source_path": "items\\def_item_boots.xml",
+          "w2_entity_path": "items\\geralt\\geralt_boots\\14_medium_dark_boots.w2ent"
+        },
+        {
+          "category": "steelsword",
+          "item": "Dark difficulty steelsword A2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Dark difficulty steelsword A2"
+          },
+          "equip_template": "steel_35_unique_dark",
+          "xml_source_path": "items\\def_item_swordsteel.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\steel_swords\\sword_type_5\\steel_35_unique_dark.w2ent"
+        },
+        {
+          "category": "silversword",
+          "item": "Dark difficulty silversword A2",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Dark difficulty silversword A2"
+          },
+          "equip_template": "silver_62_unique_dark",
+          "xml_source_path": "items\\def_item_swordsilver.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\silver_swords\\sword_type_4\\silver_62_unique_dark.w2ent"
+        }
+      ]
+    },
+    {
+      "id": "shipped_w2_dark_difficulty_a3",
+      "name": "Witcher 2 - Dark Difficulty A3",
+      "source": "shipped",
+      "source_game": "w2",
+      "derived_from": {
+        "type": "witcher2_item_xml",
+        "data_root": "The Witcher 2\\data",
+        "note": "Dark Difficulty A3 armor and sword definitions from W2 XML."
+      },
+      "entries": [
+        {
+          "category": "pants",
+          "item": "DarkDifficultyPantsA3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyPantsA3"
+          },
+          "equip_template": "19_heavy_dark_pants",
+          "xml_source_path": "items\\def_item_pants.xml",
+          "w2_entity_path": "items\\geralt\\geralt_pants\\19_heavy_dark_pants.w2ent"
+        },
+        {
+          "category": "armor",
+          "item": "DarkDifficultyArmorA3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyArmorA3"
+          },
+          "equip_template": "32_dark_armor",
+          "xml_source_path": "items\\def_item_armor.xml",
+          "w2_entity_path": "items\\geralt\\geralt_armor\\32_dark_armor.w2ent"
+        },
+        {
+          "category": "gloves",
+          "item": "DarkDifficultyGlovesA3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyGlovesA3"
+          },
+          "equip_template": "15_heavy_dark_gloves",
+          "xml_source_path": "items\\def_item_gloves.xml",
+          "w2_entity_path": "items\\geralt\\geralt_gloves\\15_heavy_dark_gloves.w2ent"
+        },
+        {
+          "category": "boots",
+          "item": "DarkDifficultyBootsA3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "DarkDifficultyBootsA3"
+          },
+          "equip_template": "15_heavy_dark_boots",
+          "xml_source_path": "items\\def_item_boots.xml",
+          "w2_entity_path": "items\\geralt\\geralt_boots\\15_heavy_dark_boots.w2ent"
+        },
+        {
+          "category": "steelsword",
+          "item": "Dark difficulty steelsword A3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Dark difficulty steelsword A3"
+          },
+          "equip_template": "steel_36_unique_dark",
+          "xml_source_path": "items\\def_item_swordsteel.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\steel_swords\\sword_type_5\\steel_36_unique_dark.w2ent"
+        },
+        {
+          "category": "silversword",
+          "item": "Dark difficulty silversword A3",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "source_game": "w2",
+          "initializer": {
+            "itemName": "Dark difficulty silversword A3"
+          },
+          "equip_template": "silver_63_unique_dark",
+          "xml_source_path": "items\\def_item_swordsilver.xml",
+          "w2_entity_path": "items\\weapons\\geralt_swords\\silver_swords\\sword_type_4\\silver_63_unique_dark.w2ent"
+        }
+      ]
+    }
+  ]
+}

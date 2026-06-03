@@ -2472,13 +2472,18 @@ def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:
 
     new_mesh = ModelEnt(templateFilename, Path(templateFilename).stem)
     cr2w_file = read_CR2W(fileNameFull)
-    with redkit_repo_context(fileNameFull):
-        parsed_mesh, parsed_entity = ReadTemplate(cr2w_file, new_mesh)
-    has_mesh = any(getattr(c, "mesh", None) for c in getattr(parsed_mesh, "chunks", []))
     is_w2_entity = getattr(getattr(cr2w_file, "HEADER", None), "version", 999) <= 115
-    if has_mesh and not is_w2_entity:
-        _template_file_cache[cache_key] = (parsed_mesh, parsed_entity)
-        return copy.deepcopy(_template_file_cache[cache_key])
+    parsed_entity = None
+    has_mesh = False
+    if not is_w2_entity:
+        with redkit_repo_context(fileNameFull):
+            parsed_mesh, parsed_entity = ReadTemplate(cr2w_file, new_mesh)
+        has_mesh = any(getattr(c, "mesh", None) for c in getattr(parsed_mesh, "chunks", []))
+        if has_mesh:
+            _template_file_cache[cache_key] = (parsed_mesh, parsed_entity)
+            return copy.deepcopy(_template_file_cache[cache_key])
+    else:
+        parsed_mesh = new_mesh
 
     with redkit_repo_context(fileNameFull):
         full_entity = create_CEntity(cr2w_file)
@@ -2498,7 +2503,7 @@ def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:
     if has_mesh:
         _template_file_cache[cache_key] = (parsed_mesh, parsed_entity or full_entity)
         return copy.deepcopy(_template_file_cache[cache_key])
-    _template_file_cache[cache_key] = (parsed_mesh, parsed_entity)
+    _template_file_cache[cache_key] = (parsed_mesh, full_entity if is_w2_entity else parsed_entity)
     return copy.deepcopy(_template_file_cache[cache_key])
 
 def create_CEntity(file, _inherit_visited=None):
@@ -2667,6 +2672,321 @@ def create_CEntity(file, _inherit_visited=None):
             if guid and guid in guids:
                 return True
         return False
+
+    def _w2_prop_chunk_index(chunk, prop_name):
+        if not chunk:
+            return None
+        try:
+            prop = chunk.GetVariableByName(prop_name)
+        except Exception:
+            prop = None
+        if not prop:
+            return None
+        value = getattr(prop, "Value", None)
+        if isinstance(value, int) and 0 < value <= len(CHUNKS):
+            return value - 1
+        for handle in getattr(prop, "Handles", None) or []:
+            ref = getattr(handle, "Reference", None)
+            if isinstance(ref, int) and 0 <= ref < len(CHUNKS):
+                return ref
+        return None
+
+    def _w2_component_indices(entity_chunk):
+        indices = set()
+        for component_index in getattr(entity_chunk, "Components", None) or []:
+            if isinstance(component_index, int) and 0 < component_index <= len(CHUNKS):
+                indices.add(component_index - 1)
+        return indices
+
+    def _w2_selected_entity_root_indices():
+        if file.HEADER.version > 115:
+            return set()
+        roots = set()
+        for template_chunk in CHUNKS:
+            if getattr(template_chunk, "Type", None) != "CEntityTemplate":
+                continue
+            cooked_root = _w2_prop_chunk_index(template_chunk, "cookedEntityObject")
+            editor_root = _w2_prop_chunk_index(template_chunk, "entityObject")
+            selected_root = cooked_root if cooked_root is not None else editor_root
+            if selected_root is None:
+                continue
+            if getattr(CHUNKS[selected_root], "Type", None) in Entity_Type_List:
+                roots.add(selected_root)
+        return roots
+
+    def _w2_attachment_parent_child_indices(chunk):
+        return (
+            _w2_prop_chunk_index(chunk, "parent"),
+            _w2_prop_chunk_index(chunk, "child"),
+        )
+
+    def _w2_reachable_entity_graph_indices(root_indices):
+        if not root_indices:
+            return set()
+        reachable = set(root_indices)
+
+        def add_index(index):
+            if isinstance(index, int) and 0 <= index < len(CHUNKS) and index not in reachable:
+                reachable.add(index)
+                return True
+            return False
+
+        changed = True
+        while changed:
+            changed = False
+            for idx in list(reachable):
+                chunk = CHUNKS[idx]
+                for component_idx in _w2_component_indices(chunk):
+                    changed |= add_index(component_idx)
+                changed |= add_index(_w2_prop_chunk_index(chunk, "transformParent"))
+                changed |= add_index(_w2_prop_chunk_index(chunk, "parentSlot"))
+                changed |= add_index(_w2_prop_chunk_index(chunk, "originalAttachment"))
+                parent_idx, child_idx = _w2_attachment_parent_child_indices(chunk)
+                changed |= add_index(parent_idx)
+                changed |= add_index(child_idx)
+
+            for chunk in CHUNKS:
+                chunk_type = getattr(chunk, "Type", None)
+                if chunk_type not in {
+                    "CMeshSkinningAttachment",
+                    "CAnimatedAttachment",
+                    "CHardAttachment",
+                    "CExternalProxyAttachment",
+                }:
+                    continue
+                chunk_idx = getattr(chunk, "ChunkIndex", None)
+                parent_idx, child_idx = _w2_attachment_parent_child_indices(chunk)
+                original_idx = _w2_prop_chunk_index(chunk, "originalAttachment")
+                if (
+                    parent_idx in reachable
+                    or child_idx in reachable
+                    or original_idx in reachable
+                    or chunk_idx in reachable
+                ):
+                    changed |= add_index(chunk_idx)
+                    changed |= add_index(parent_idx)
+                    changed |= add_index(child_idx)
+                    changed |= add_index(original_idx)
+                    if original_idx is not None:
+                        changed |= add_index(_w2_prop_chunk_index(CHUNKS[original_idx], "parentSlot"))
+        return reachable
+
+    w2_selected_entity_roots = _w2_selected_entity_root_indices()
+    w2_selected_graph_indices = _w2_reachable_entity_graph_indices(w2_selected_entity_roots)
+    w2_external_proxy_original_attachment_indices = {
+        original_idx
+        for idx in w2_selected_graph_indices
+        for original_idx in [_w2_prop_chunk_index(CHUNKS[idx], "originalAttachment")]
+        if original_idx is not None
+    }
+    w2_external_proxy_child_attachment_indices = {}
+    for idx in w2_selected_graph_indices:
+        if getattr(CHUNKS[idx], "Type", None) != "CExternalProxyAttachment":
+            continue
+        original_idx = _w2_prop_chunk_index(CHUNKS[idx], "originalAttachment")
+        _parent_idx, child_idx = _w2_attachment_parent_child_indices(CHUNKS[idx])
+        if original_idx is not None and child_idx is not None:
+            w2_external_proxy_child_attachment_indices[child_idx] = original_idx
+    w2_graph_chunk_types = (
+        set(Entity_Type_List)
+        | _VISUAL_MESH_COMPONENT_TYPES
+        | {
+            "CAnimatedComponent",
+            "CMovingPhysicalAgentComponent",
+            "CMimicComponent",
+            "CAnimDangleBufferComponent",
+            "CAnimDangleComponent",
+            "CStaticMeshComponent",
+            "CClothComponent",
+            "CFurComponent",
+            "CMorphedMeshComponent",
+            "CPointLightComponent",
+            "CSpotLightComponent",
+            "CCameraComponent",
+            "CMeshSkinningAttachment",
+            "CAnimatedAttachment",
+            "CHardAttachment",
+            "CExternalProxyComponent",
+            "CExternalProxyAttachment",
+            "CSkeletonBoneSlot",
+        }
+        | set(CAnimDangleConstraint_types.keys())
+    )
+
+    def _w2_should_skip_unselected_graph_chunk(chunk):
+        if file.HEADER.version > 115 or not w2_selected_graph_indices:
+            return False
+        chunk_type = getattr(chunk, "Type", None)
+        if chunk_type not in w2_graph_chunk_types:
+            return False
+        return getattr(chunk, "ChunkIndex", None) not in w2_selected_graph_indices
+
+    w2_related_proxy_component_cache = {}
+
+    def _w2_chunk_guid(chunk):
+        try:
+            guid_var = chunk.GetVariableByName("guid")
+        except Exception:
+            guid_var = None
+        return getattr(getattr(guid_var, "GUID", None), "GuidString", None)
+
+    def _w2_component_signature(component):
+        return (
+            getattr(component, "type", None),
+            getattr(component, "name", None),
+            _repo_path_key(getattr(component, "skeleton", None)),
+            _repo_path_key(getattr(component, "mesh", None)),
+            _repo_path_key(getattr(component, "resource", None)),
+        )
+
+    def _w2_convert_proxy_component_source(source_chunk, proxy_chunk):
+        source_type = getattr(source_chunk, "Type", None)
+        if source_type == "CAnimatedComponent":
+            component = CAnimatedComponent(source_chunk).convert_for_io()
+            name = _chunk_prop_string(source_chunk, "name")
+            skeleton = _resolve_repo_path(source_chunk, "skeleton", ".w2rig")
+            if not skeleton:
+                skeleton_paths = _collect_rig_import_paths(getattr(source_chunk, "_W_CLASS__CR2WFILE", None))
+                if skeleton_paths:
+                    skeleton = skeleton_paths[0]
+            component.name = name or component.name
+            component.skeleton = skeleton
+            component.animationSets = _resolve_repo_paths_from_array(source_chunk, "animationSets", ".w2anims")
+        elif source_type == "CMovingPhysicalAgentComponent":
+            name = _chunk_prop_string(source_chunk, "name")
+            skeleton = _resolve_repo_path(source_chunk, "skeleton", ".w2rig")
+            if not skeleton:
+                return None
+            component = w3_types.CMovingPhysicalAgentComponent(skeleton, name)
+            component.animationSets = _resolve_repo_paths_from_array(source_chunk, "animationSets", ".w2anims")
+        elif source_type == "CStaticMeshComponent":
+            component = CStaticMeshComponent(source_chunk).convert_for_io()
+            component.mesh = _resolve_mesh_path(source_chunk, component.mesh)
+            if not component.mesh:
+                return None
+        elif source_type in {"CMeshComponent", "CDressMeshComponent"}:
+            component = _coerce_w2_mesh_component_for_io(
+                source_chunk,
+                CMeshComponent(source_chunk).convert_for_io(),
+            )
+            component.mesh = _resolve_mesh_path(source_chunk, component.mesh)
+            if not component.mesh:
+                return None
+        elif source_type == "CRigidMeshComponent":
+            component = CRigidMeshComponent(source_chunk).convert_for_io()
+            component.mesh = _resolve_mesh_path(source_chunk, component.mesh)
+            if not component.mesh:
+                return None
+        elif source_type == "CRagdollMeshComponent":
+            if source_chunk.GetVariableByName("mesh") is None:
+                return None
+            component = CRagdollMeshComponent(source_chunk).convert_for_io()
+            component.mesh = _resolve_mesh_path(source_chunk, component.mesh)
+            if not component.mesh:
+                return None
+            source_file = getattr(source_chunk, "_W_CLASS__CR2WFILE", None)
+            source_chunks = getattr(getattr(source_file, "CHUNKS", None), "CHUNKS", None) or []
+            component.ragdoll_meta = _extract_w2_ragdoll_meta(source_chunk, source_chunks)
+        elif source_type == "CFurComponent":
+            component = CMeshComponent(source_chunk).convert_for_io()
+            component.mesh = _resolve_mesh_path(source_chunk, component.mesh)
+            if not component.mesh:
+                return None
+        elif source_type in {"CPointLightComponent", "CSpotLightComponent"}:
+            light_cls = CSpotLightComponent if source_type == "CSpotLightComponent" else CPointLightComponent
+            component = light_cls(source_chunk).convert_for_io()
+        elif source_type == "CCameraComponent":
+            component = CCameraComponent(_chunk_prop_string(source_chunk, "name"))
+        else:
+            return None
+        component.type = source_type
+        proxy_chunk_index = getattr(proxy_chunk, "ChunkIndex", getattr(source_chunk, "ChunkIndex", 0))
+        component.chunkIndex = proxy_chunk_index
+        if proxy_chunk_index in w2_external_proxy_child_attachment_indices:
+            component.transformParent = w2_external_proxy_child_attachment_indices[proxy_chunk_index]
+        return component
+
+    def _w2_proxy_component_from_related_guid(proxy_chunk):
+        guid = _w2_chunk_guid(proxy_chunk)
+        if not guid:
+            return None
+        if guid not in w2_related_proxy_component_cache:
+            matches = []
+            seen = set()
+            for _depot_path, _full_path, related_file in w2_related_files:
+                for source_chunk in getattr(getattr(related_file, "CHUNKS", None), "CHUNKS", None) or []:
+                    if _w2_chunk_guid(source_chunk) != guid:
+                        continue
+                    component = _w2_convert_proxy_component_source(source_chunk, proxy_chunk)
+                    if component is None:
+                        continue
+                    signature = _w2_component_signature(component)
+                    if signature in seen:
+                        continue
+                    seen.add(signature)
+                    matches.append(component)
+            w2_related_proxy_component_cache[guid] = matches[0] if len(matches) == 1 else None
+        component = w2_related_proxy_component_cache.get(guid)
+        return copy.deepcopy(component) if component is not None else None
+
+    def _w2_proxy_component_replacement(proxy_chunk):
+        return _w2_proxy_component_from_related_guid(proxy_chunk)
+
+    def _append_w2_proxy_component(proxy_chunk):
+        nonlocal hasCMovingPhysicalAgentComponent
+        component = _w2_proxy_component_replacement(proxy_chunk)
+        if component is None:
+            return False
+        component_type = getattr(component, "type", None)
+        if component_type in _VISUAL_MESH_COMPONENT_TYPES or getattr(component, "mesh", None):
+            signature = _mesh_chunk_signature(component)
+            if signature in seen_mesh_signatures:
+                return False
+            seen_mesh_signatures.add(signature)
+        elif component_type in {"CPointLightComponent", "CSpotLightComponent"}:
+            signature = _light_chunk_signature(component)
+            if signature in seen_light_signatures:
+                return False
+            seen_light_signatures.add(signature)
+        elif component_type in {"CMovingPhysicalAgentComponent", "CAnimatedComponent"}:
+            signature = _animated_chunk_signature(component)
+            if signature in seen_animated_signatures:
+                return False
+            seen_animated_signatures.add(signature)
+        new_mesh.chunks.append(component)
+        added_chunks.add(getattr(proxy_chunk, "ChunkIndex", getattr(component, "chunkIndex", 0)))
+        if component_type in {"CMovingPhysicalAgentComponent", "CAnimatedComponent"}:
+            this_Entity.MovingPhysicalAgentComponent = component
+            hasCMovingPhysicalAgentComponent = True
+        return True
+
+    def _materialize_w2_external_proxy_attachment(proxy_chunk):
+        original_idx = _w2_prop_chunk_index(proxy_chunk, "originalAttachment")
+        parent_idx, child_idx = _w2_attachment_parent_child_indices(proxy_chunk)
+        if original_idx is None or parent_idx is None or child_idx is None:
+            return None
+        original_chunk = CHUNKS[original_idx]
+        original_type = getattr(original_chunk, "Type", None)
+        if original_type == "CHardAttachment":
+            attachment = CHardAttachment(original_chunk).convert_for_io()
+            attachment.parent = parent_idx
+            attachment.child = child_idx
+        elif original_type == "CMeshSkinningAttachment":
+            attachment = CMeshSkinningAttachment(parent_idx, child_idx)
+        elif original_type == "CAnimatedAttachment":
+            attachment = CAnimatedAttachment(parent_idx, child_idx)
+        else:
+            return None
+        proxy_is_broken = None
+        try:
+            proxy_is_broken = getattr(proxy_chunk.GetVariableByName("isBroken"), "Value", None)
+        except Exception:
+            proxy_is_broken = None
+        attachment.isBroken = bool(proxy_is_broken) if proxy_is_broken is not None else False
+        attachment.type = original_type
+        attachment.chunkIndex = original_idx
+        attachment.w2_external_proxy_attachment = getattr(proxy_chunk, "ChunkIndex", None)
+        return attachment
 
     def _merge_related_appearances(source_entity):
         source_apps = list(getattr(source_entity, "appearances", []) or [])
@@ -2989,23 +3309,28 @@ def create_CEntity(file, _inherit_visited=None):
         while changed:
             changed = False
             chunk_indices = {getattr(chunk, "chunkIndex", None) for chunk in chunks}
-            orphan_attachment_indices = {
-                getattr(chunk, "chunkIndex", None)
-                for chunk in chunks
-                if getattr(chunk, "type", None) in attachment_types
-                and (
-                    getattr(chunk, "parent", None) not in chunk_indices
-                    or getattr(chunk, "child", None) not in chunk_indices
-                )
-            }
+            orphan_attachment_indices = set()
+            for chunk in chunks:
+                if getattr(chunk, "type", None) not in attachment_types:
+                    continue
+                parent_index = getattr(chunk, "parent", None)
+                child_index = getattr(chunk, "child", None)
+                if parent_index in chunk_indices and child_index in chunk_indices:
+                    continue
+                attachment_index = getattr(chunk, "chunkIndex", None)
+                orphan_attachment_indices.add(attachment_index)
             orphan_attachment_indices.discard(None)
             if not orphan_attachment_indices:
                 break
-            chunks = [
-                chunk for chunk in chunks
-                if getattr(chunk, "chunkIndex", None) not in orphan_attachment_indices
-                and getattr(chunk, "transformParent", None) not in orphan_attachment_indices
-            ]
+            pruned_chunks = []
+            for chunk in chunks:
+                if getattr(chunk, "chunkIndex", None) in orphan_attachment_indices:
+                    continue
+                transform_parent = getattr(chunk, "transformParent", None)
+                if transform_parent in orphan_attachment_indices:
+                    continue
+                pruned_chunks.append(chunk)
+            chunks = pruned_chunks
             changed = True
         new_mesh.chunks = chunks
 
@@ -3022,6 +3347,18 @@ def create_CEntity(file, _inherit_visited=None):
             for _depot_path, _full_path, related_file in w2_related_files
             for chunk in related_file.CHUNKS.CHUNKS
         ]
+        for chunk in CHUNKS:
+            if chunk.name != "CExternalProxyComponent":
+                continue
+            guid = _w2_chunk_guid(chunk)
+            if guid:
+                guids[guid] = chunk
+            else:
+                log.debug(
+                    "Skipping W2 CExternalProxyComponent without guid: chunk=%s props=%s",
+                    getattr(chunk, "ChunkIndex", None),
+                    _chunk_props_summary(chunk),
+                )
 
         for template_chunk in CHUNKS:
             if template_chunk.name == "CEntityTemplate":
@@ -3081,48 +3418,6 @@ def create_CEntity(file, _inherit_visited=None):
                 w2_body_part_component_names.update(
                     _collect_w2_body_part_component_names(related_chunk)
                 )
-
-        for chunk in CHUNKS:
-            if chunk.name == "CExternalProxyComponent":
-                guid_var = chunk.GetVariableByName("guid")
-                guid = getattr(getattr(guid_var, "GUID", None), "GuidString", None)
-                if guid:
-                    guids[guid] = chunk
-                else:
-                    log.debug(
-                        "Skipping W2 CExternalProxyComponent without guid: chunk=%s props=%s",
-                        getattr(chunk, "ChunkIndex", None),
-                        _chunk_props_summary(chunk),
-                    )
-        for _depot_path, _full_path, related_file in w2_related_files:
-            for chunk in related_file.CHUNKS.CHUNKS:
-                guid_var = chunk.GetVariableByName("guid")
-                guid = getattr(getattr(guid_var, "GUID", None), "GuidString", None)
-                if guid:
-                    if guid in guids:
-                        old_chunk = guids[guid]
-                        chunk.ChunkIndex = old_chunk.ChunkIndex
-                        guids[guid] = chunk
-                        CHUNKS[chunk.ChunkIndex] = chunk
-    
-        #CExternalProxyAttachments = {}
-        for chunk in CHUNKS:
-            if chunk.name == "CExternalProxyAttachment":
-                original_attachment = chunk.GetVariableByName("originalAttachment")
-                original_ptr = getattr(original_attachment, "Value", None)
-                if not isinstance(original_ptr, int) or original_ptr <= 0 or original_ptr > len(CHUNKS):
-                    log.debug(
-                        "Skipping W2 CExternalProxyAttachment with invalid originalAttachment=%s: chunk=%s props=%s",
-                        original_ptr,
-                        getattr(chunk, "ChunkIndex", None),
-                        _chunk_props_summary(chunk),
-                    )
-                    continue
-                attachment = CHUNKS[original_ptr-1]
-                attachment.PROPS.extend(chunk.PROPS)
-                #CExternalProxyAttachments[chunk.ChunkIndex] = (chunk, attachment)
-
-    _apply_external_proxy_attachments()
 
     def _resolve_initializer_chunk(init_prop):
         if not init_prop:
@@ -3203,6 +3498,8 @@ def create_CEntity(file, _inherit_visited=None):
         return inv_def
 
     for chunk in CHUNKS:
+        if _w2_should_skip_unselected_graph_chunk(chunk):
+            continue
         if chunk.Type == "CEntityTemplate":
             includes = chunk.GetVariableByName("includes")
             if includes and hasattr(includes, "Handles"):
@@ -3259,6 +3556,8 @@ def create_CEntity(file, _inherit_visited=None):
                 )
 
     for chunk in CHUNKS:
+        if _w2_should_skip_unselected_graph_chunk(chunk):
+            continue
         if chunk.Type in {"CEntityTemplate", "CEntityExternalAppearance"}:
             slots = chunk.GetVariableByName("slots")
             if slots:
@@ -3528,7 +3827,16 @@ def create_CEntity(file, _inherit_visited=None):
                     entity_chunk.Type, entity_chunk.ChunkIndex,
                     sdb, _chunk_props_summary(entity_chunk),
                 )
+        elif chunk.Type == "CExternalProxyComponent":
+            _append_w2_proxy_component(chunk)
+        elif chunk.Type == "CExternalProxyAttachment":
+            attachment = _materialize_w2_external_proxy_attachment(chunk)
+            if attachment is not None:
+                new_mesh.chunks.append(attachment)
+                added_chunks.add(getattr(attachment, "chunkIndex", getattr(chunk, "ChunkIndex", 0)))
         elif (chunk.Type == "CHardAttachment"):
+            if chunk.ChunkIndex in w2_external_proxy_original_attachment_indices:
+                continue
             #if (chunk.GetVariableByName("parentSlot")): 
             chunk_append(new_mesh, chunk, CHardAttachment(chunk).convert_for_io())
         elif (chunk.Type == "CMeshSkinningAttachment"):

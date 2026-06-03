@@ -4,6 +4,7 @@ from .w3_types import CStoryScene
 from .CR2W_types import getCR2W, W_CLASS
 from .prop_utils import prop_to_string as _prop_to_str
 from ..dialog_language import resolve_localized_text
+from ..source_game_paths import source_game_from_version
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,9 @@ def _localized_string_id_and_text(prop, scene_filepath=""):
 
 def create_scene(file):
     storyScene = CStoryScene()
+    version = int(getattr(getattr(file, "HEADER", None), "version", 999) or 999)
+    storyScene.version = version
+    storyScene.source_game = source_game_from_version(version)
     storyScene.chunksRef = file.CHUNKS.CHUNKS
     storyScene.LocalizedStringsRef = file.LocalizedStrings
     chunk:W_CLASS
