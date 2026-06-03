@@ -161,6 +161,23 @@ def _uses_w2_player_animsets(main_arm_obj, source_game="") -> bool:
     return normalize_source_game(source_game) == "w2" and _target_looks_like_w3_player(main_arm_obj)
 
 
+def _target_is_cutscene_camera(armature_obj) -> bool:
+    if armature_obj is None or getattr(armature_obj, "type", None) != "ARMATURE":
+        return False
+    try:
+        if str(armature_obj.get("cutscene_actor_type", "") or "").strip() == "CAT_Camera":
+            return True
+        if str(armature_obj.get("cutscene_actor_name", "") or "").strip().lower() == "camera":
+            return True
+    except Exception:
+        pass
+    try:
+        pose_bones = getattr(getattr(armature_obj, "pose", None), "bones", None)
+        return bool(pose_bones is not None and pose_bones.get("Camera_Node") is not None)
+    except Exception:
+        return False
+
+
 def _clean_w2_animset_path(path_value) -> str:
     text = str(path_value or "").replace("/", "\\").strip().strip("\x00").lstrip("\\")
     lower_text = text.lower()
@@ -1681,15 +1698,39 @@ def _is_w2_animation_file(filepath):
         return False
 
 
-def _resolve_w2_retarget_source_rig(context, target_rig_path="", target_name_hint="", source_anim_path=""):
+def _resolve_w2_retarget_source_rig(context, target_rig_path="", target_name_hint="", source_anim_path="", target_armature=None):
     from ..CR2W.retarget_anims import infer_w2_source_rig_path
 
     scene = getattr(context, "scene", None)
+    actor_configured = ""
+    try:
+        actor_configured = str(target_armature.get("witcher_w2_retarget_source_rig", "") or "").strip().strip('"')
+    except Exception:
+        actor_configured = ""
     configured = str(getattr(scene, "witcher_w2_retarget_source_rig", "") or "").strip().strip('"')
     candidates = []
+    if actor_configured:
+        candidates.append(actor_configured)
+        if not os.path.isabs(actor_configured):
+            try:
+                resolved_from_source = resolve_w2_repo_file_from_source(actor_configured, source_anim_path, version=115)
+                if resolved_from_source:
+                    candidates.append(resolved_from_source)
+            except Exception:
+                pass
+            try:
+                candidates.append(repo_file_for_source(actor_configured, "w2"))
+            except Exception:
+                pass
     if configured:
         candidates.append(configured)
         if not os.path.isabs(configured):
+            try:
+                resolved_from_source = resolve_w2_repo_file_from_source(configured, source_anim_path, version=115)
+                if resolved_from_source:
+                    candidates.append(resolved_from_source)
+            except Exception:
+                pass
             try:
                 candidates.append(repo_file_for_source(configured, "w2"))
             except Exception:
@@ -1730,6 +1771,8 @@ def _should_retarget_w2_to_w3(context, source_game, target_armatures, face_anima
         return False
     target = target_armatures[0] if target_armatures else None
     if target is None or getattr(target, "type", None) != "ARMATURE":
+        return False
+    if _target_is_cutscene_camera(target):
         return False
     return _source_game_for_armature_obj(target) != "w2"
 
@@ -1792,6 +1835,7 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
             target_rig_path=rig_path,
             target_name_hint=target_hint,
             source_anim_path=fdir,
+            target_armature=target_armatures[0] if target_armatures else None,
         )
         if not retarget_source_rig_path:
             roots = "; ".join(source_roots(context, "w2")) or "<no configured W2 roots>"

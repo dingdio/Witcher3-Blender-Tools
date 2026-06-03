@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import time
+from collections import Counter
 
 import bpy
 import blf
@@ -1918,6 +1919,36 @@ class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
         default=True,
         description="Import the cutscene burned-track audio strip into the Blender sequencer",
     )
+    retarget_w2_to_w3: BoolProperty(
+        name="W2 to W3 Retarget",
+        default=False,
+        description="Replace W2 cutscene camera/actors with W3 camera, Geralt and Ciri during import",
+    )
+    retarget_replace_camera: BoolProperty(
+        name="Camera",
+        default=True,
+        description="Use the Witcher 3 cutscene camera entity while keeping the imported camera animation",
+    )
+    retarget_replace_actors: BoolProperty(
+        name="Actors",
+        default=True,
+        description="Replace W2 male/female body actors with W3 Geralt/Ciri and retarget body animation",
+    )
+    retarget_w3_camera_template: StringProperty(
+        name="W3 Camera",
+        default=import_cutscene.W3_CUTSCENE_CAMERA_TEMPLATE,
+        description="Witcher 3 camera entity template",
+    )
+    retarget_w3_male_template: StringProperty(
+        name="W3 Male",
+        default=import_cutscene.W3_CUTSCENE_GERALT_TEMPLATE,
+        description="Witcher 3 template used for W2 male skeleton actors",
+    )
+    retarget_w3_female_template: StringProperty(
+        name="W3 Female",
+        default=import_cutscene.W3_CUTSCENE_CIRI_TEMPLATE,
+        description="Witcher 3 template used for W2 female skeleton actors",
+    )
 
     cutscene_actor_items: CollectionProperty(type=CutsceneActorPreviewItem)
     cutscene_actor_index: IntProperty(default=0)
@@ -1937,6 +1968,15 @@ class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
         auto_box.prop(self, "auto_apply_animations")
         auto_box.prop(self, "auto_apply_dialog")
         auto_box.prop(self, "import_burned_audio")
+        retarget_box = settings_box.box()
+        retarget_box.prop(self, "retarget_w2_to_w3")
+        if self.retarget_w2_to_w3:
+            replace_row = retarget_box.row(align=True)
+            replace_row.prop(self, "retarget_replace_camera")
+            replace_row.prop(self, "retarget_replace_actors")
+            retarget_box.prop(self, "retarget_w3_camera_template", text="Camera")
+            retarget_box.prop(self, "retarget_w3_male_template", text="Male")
+            retarget_box.prop(self, "retarget_w3_female_template", text="Female")
 
         status_box = layout.box()
         status_box.label(text="Cutscene Preview")
@@ -2032,12 +2072,22 @@ class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
             return {'CANCELLED'}
 
         try:
+            if self.retarget_w2_to_w3 and hasattr(context.scene, "witcher_w2_retarget_to_w3"):
+                context.scene.witcher_w2_retarget_to_w3 = True
             cutscene_data = import_cutscene.import_w3_cutscene(
                 self.filepath,
                 selected_actor_indices=selected_actor_indices if self.cutscene_actor_items else None,
                 selected_animation_indices=selected_animation_indices if self.cutscene_animation_items else None,
                 auto_apply_selected_animations=self.auto_apply_animations,
                 import_burned_audio=self.import_burned_audio,
+                retarget_options={
+                    "enabled": self.retarget_w2_to_w3,
+                    "replace_camera": self.retarget_replace_camera,
+                    "replace_actors": self.retarget_replace_actors,
+                    "camera_template": self.retarget_w3_camera_template,
+                    "male_template": self.retarget_w3_male_template,
+                    "female_template": self.retarget_w3_female_template,
+                },
             )
         except Exception as exc:
             log.exception("Failed to import cutscene %s", self.filepath)
@@ -2079,6 +2129,10 @@ class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
                 status_parts.append("no dialog lines found")
         if self.import_burned_audio and burned_audio_info:
             status_parts.append("burned track imported")
+        retarget_counts = dict(getattr(cutscene_data, "w2w3_retarget_counts", {}) or {})
+        retarget_total = sum(int(value or 0) for value in retarget_counts.values())
+        if self.retarget_w2_to_w3 and retarget_total:
+            status_parts.append(f"W2->W3 replaced {retarget_total}")
         total_elapsed = time.perf_counter() - operation_started
         log.info("Imported .w2cutscene '%s' in %.2fs.", os.path.basename(self.filepath), total_elapsed)
         self.report(
@@ -2413,6 +2467,62 @@ class WITCH_OT_CutsceneRemoveActor(Operator):
         return {'FINISHED'}
 
 
+def _scene_cutscene_w2w3_retarget_options(scene):
+    return import_cutscene.normalize_cutscene_w2w3_retarget_options({
+        "enabled": True,
+        "replace_camera": True,
+        "replace_actors": True,
+        "camera_template": getattr(scene, "witcher_cutscene_retarget_camera_template", ""),
+        "male_template": getattr(scene, "witcher_cutscene_retarget_male_template", ""),
+        "female_template": getattr(scene, "witcher_cutscene_retarget_female_template", ""),
+    })
+
+
+def _loaded_actor_active_animation_indices(scene, actor_entry):
+    return [
+        int(animation_entry.source_index)
+        for animation_entry in getattr(scene, "witcher_cutscene_animation_items", [])
+        if bool(getattr(animation_entry, "is_loaded", False))
+        and _animation_matches_actor_entry(scene, animation_entry, actor_entry)
+    ]
+
+
+def _replace_loaded_cutscene_actor_template(scene, actor_entry, old_obj, template_path, *,
+                                            retarget_kind="", retarget_source_rig=""):
+    filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+    if not filepath:
+        raise RuntimeError("No cutscene loaded.")
+    _ensure_actor_custom_props(old_obj)
+    source_index = _coerce_cutscene_index(
+        old_obj.get(import_cutscene.CUTSCENE_SOURCE_INDEX_PROP, getattr(actor_entry, "source_index", -1)),
+        default=getattr(actor_entry, "source_index", -1),
+    )
+    actor_info = import_cutscene.replace_cutscene_actor_template(
+        old_obj,
+        template_path,
+        source_game="W3",
+        cutscene_filename=filepath,
+        actor_name=str(old_obj.get("cutscene_actor_name", "") or getattr(actor_entry, "actor_name", "")),
+        actor_type=str(old_obj.get("cutscene_actor_type", "") or getattr(actor_entry, "actor_type", "CAT_Actor")),
+        appearance_name="",
+        tag=str(old_obj.get("cutscene_actor_tag", "") or getattr(actor_entry, "tag", "")),
+        voice_tag=str(old_obj.get("cutscene_actor_voice_tag", "") or getattr(actor_entry, "voice_tag", "")),
+        final_position=str(old_obj.get("cutscene_actor_final_position", "") or getattr(actor_entry, "final_position", "")),
+        kill_me=bool(old_obj.get("cutscene_actor_kill_me", getattr(actor_entry, "kill_me", False))),
+        use_mimic=bool(old_obj.get("cutscene_actor_use_mimic", getattr(actor_entry, "use_mimic", False))),
+        anim_final_pos=str(old_obj.get("cutscene_actor_anim_final_pos", "") or getattr(actor_entry, "anim_final_pos", "")),
+        source_index=source_index,
+        retarget_kind=retarget_kind,
+        retarget_source_rig=retarget_source_rig,
+        original_template_path=str(old_obj.get("cutscene_actor_template", "") or getattr(actor_entry, "template_path", "")),
+    )
+    _update_loaded_actor_entry_from_result(actor_entry, actor_info)
+    actor_entry.template_path = str(actor_info.get("template_path", "") or template_path)
+    actor_entry.appearance_name = ""
+    actor_entry.source_game = "w3"
+    return actor_info
+
+
 class WITCH_OT_CutsceneReplaceActor(Operator):
     bl_idname = "witcher.cutscene_replace_actor"
     bl_label = "Replace Actor"
@@ -2495,6 +2605,120 @@ class WITCH_OT_CutsceneReplaceActor(Operator):
             self.report({'WARNING'}, message)
         else:
             self.report({'INFO'}, f"Replaced actor with {source_game} template.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneRetargetW2ToW3(Operator):
+    bl_idname = "witcher.cutscene_retarget_w2_to_w3"
+    bl_label = "Replace W2 Actors"
+    bl_description = "Replace loaded W2 cutscene camera/actors with the configured W3 camera, Geralt and Ciri templates"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    replace_camera: BoolProperty(
+        name="Camera",
+        default=True,
+        description="Replace the W2 cutscene camera entity with the configured W3 camera entity",
+    )
+    replace_actors: BoolProperty(
+        name="Actors",
+        default=True,
+        description="Replace W2 male/female actors with configured W3 player templates",
+    )
+
+    def execute(self, context):
+        scene = context.scene
+        filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+        if not filepath:
+            self.report({'WARNING'}, "No cutscene loaded.")
+            return {'CANCELLED'}
+        if self.replace_actors and hasattr(scene, "witcher_w2_retarget_to_w3"):
+            scene.witcher_w2_retarget_to_w3 = True
+
+        retarget = _scene_cutscene_w2w3_retarget_options(scene)
+        replaced = Counter()
+        skipped = 0
+        failed = 0
+        failed_animation_count = 0
+        selected_obj_name = ""
+
+        actor_entries = list(getattr(scene, "witcher_cutscene_actor_items", []))
+        for actor_entry in actor_entries:
+            old_obj = _get_loaded_cutscene_actor_object(actor_entry)
+            if old_obj is None:
+                skipped += 1
+                continue
+            source_game = _loaded_cutscene_actor_source_game(old_obj, fallback=getattr(actor_entry, "source_game", ""))
+            if source_game and source_game != "w2":
+                skipped += 1
+                continue
+            kind = import_cutscene.infer_w2_cutscene_actor_retarget_kind(old_obj)
+            if kind == "camera" and not self.replace_camera:
+                skipped += 1
+                continue
+            if kind in {"male", "female"} and not self.replace_actors:
+                skipped += 1
+                continue
+            if kind not in {"camera", "male", "female"}:
+                skipped += 1
+                continue
+
+            template_path = import_cutscene.cutscene_w2w3_template_for_kind(kind, retarget)
+            if not template_path:
+                skipped += 1
+                continue
+            retarget_source_rig = (
+                import_cutscene.get_cutscene_actor_w2_retarget_source_rig(old_obj, kind)
+                if kind in {"male", "female"}
+                else ""
+            )
+            requested_animation_indices = _loaded_actor_active_animation_indices(scene, actor_entry)
+            try:
+                actor_info = _replace_loaded_cutscene_actor_template(
+                    scene,
+                    actor_entry,
+                    old_obj,
+                    template_path,
+                    retarget_kind=kind,
+                    retarget_source_rig=retarget_source_rig,
+                )
+                new_obj = actor_info.get("actor_obj")
+                if new_obj is not None:
+                    selected_obj_name = str(getattr(new_obj, "name", "") or selected_obj_name)
+                applied_indices, error_messages = _rebuild_cutscene_actor_animations(scene, actor_entry)
+                failed_indices = [idx for idx in requested_animation_indices if idx not in applied_indices]
+                failed_animation_count += len(failed_indices)
+                if failed_indices:
+                    first_error = str(error_messages.get(failed_indices[0], "") or "").strip()
+                    log.warning(
+                        "Retargeted cutscene actor '%s', but %d animation(s) failed to reload%s",
+                        getattr(actor_entry, "actor_name", ""),
+                        len(failed_indices),
+                        f": {first_error}" if first_error else "",
+                    )
+                replaced[kind] += 1
+            except Exception:
+                failed += 1
+                log.exception("Failed to retarget cutscene actor '%s' to W3.", getattr(actor_entry, "actor_name", ""))
+
+        if selected_obj_name:
+            scene.witcher_cutscene_selected_actor_obj = selected_obj_name
+        if not replaced and failed <= 0:
+            self.report({'WARNING'}, "No loaded W2 camera or male/female actors found.")
+            return {'CANCELLED'}
+
+        parts = []
+        for key, label in (("camera", "camera"), ("male", "male"), ("female", "female")):
+            count = int(replaced.get(key, 0) or 0)
+            if count:
+                parts.append(f"{count} {label}")
+        message = "Replaced " + ", ".join(parts) if parts else "No actors replaced"
+        if failed_animation_count:
+            message += f"; {failed_animation_count} animation reload(s) failed"
+        if failed:
+            message += f"; {failed} actor(s) failed"
+        if skipped and not parts:
+            message += f"; {skipped} skipped"
+        self.report({'WARNING' if failed or failed_animation_count else 'INFO'}, message)
         return {'FINISHED'}
 
 
@@ -2758,6 +2982,19 @@ def _draw_cutscene_actors_tab(layout, scene, context=None):
             rm_op.object_name = obj.name
     else:
         layout.label(text="No actors in cutscene.", icon='INFO')
+
+    retarget_box = layout.box()
+    retarget_header = retarget_box.row(align=True)
+    retarget_header.label(text="W2 to W3", icon='ARMATURE_DATA')
+    actor_op = retarget_header.operator(WITCH_OT_CutsceneRetargetW2ToW3.bl_idname, text="Actors", icon='FILE_REFRESH')
+    actor_op.replace_camera = False
+    actor_op.replace_actors = True
+    camera_op = retarget_header.operator(WITCH_OT_CutsceneRetargetW2ToW3.bl_idname, text="", icon='CAMERA_DATA')
+    camera_op.replace_camera = True
+    camera_op.replace_actors = False
+    retarget_box.prop(scene, "witcher_cutscene_retarget_camera_template", text="Camera")
+    retarget_box.prop(scene, "witcher_cutscene_retarget_male_template", text="Male")
+    retarget_box.prop(scene, "witcher_cutscene_retarget_female_template", text="Female")
 
     # --- Selected actor detail panel ---
     if selected_obj is not None:
@@ -3290,6 +3527,7 @@ classes = [
     WITCH_OT_CutsceneSelectActor,
     WITCH_OT_CutsceneRemoveActor,
     WITCH_OT_CutsceneReplaceActor,
+    WITCH_OT_CutsceneRetargetW2ToW3,
     WITCH_OT_CutsceneRemoveAnimation,
     WITCH_OT_CutsceneAddEvent,
     ButtonOperatorImportW2cutscene,
@@ -3384,6 +3622,21 @@ def register():
         items=_CUTSCENE_ACTOR_REPLACE_SOURCE_ITEMS,
         default="W3",
     )
+    bpy.types.Scene.witcher_cutscene_retarget_camera_template = StringProperty(
+        name="W3 Camera",
+        description="Witcher 3 camera entity template used by W2 to W3 cutscene retarget",
+        default=import_cutscene.W3_CUTSCENE_CAMERA_TEMPLATE,
+    )
+    bpy.types.Scene.witcher_cutscene_retarget_male_template = StringProperty(
+        name="W3 Male",
+        description="Witcher 3 entity template used for W2 male skeleton actors",
+        default=import_cutscene.W3_CUTSCENE_GERALT_TEMPLATE,
+    )
+    bpy.types.Scene.witcher_cutscene_retarget_female_template = StringProperty(
+        name="W3 Female",
+        description="Witcher 3 entity template used for W2 female skeleton actors",
+        default=import_cutscene.W3_CUTSCENE_CIRI_TEMPLATE,
+    )
     bpy.types.Object.witcher_cutscene_actor_type = EnumProperty(
         name="type",
         description="ECutsceneActorType for the cutscene actor",
@@ -3434,6 +3687,9 @@ def unregister():
         "witcher_cs_event_view",
         "witcher_cutscene_selected_actor_obj",
         "witcher_cutscene_actor_replace_source",
+        "witcher_cutscene_retarget_camera_template",
+        "witcher_cutscene_retarget_male_template",
+        "witcher_cutscene_retarget_female_template",
         "witcher_cutscene_template_fields",
         "witcher_cutscene_effect_items",
         "witcher_cutscene_dialog_items",

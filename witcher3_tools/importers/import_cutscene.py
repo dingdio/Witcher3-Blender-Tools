@@ -42,6 +42,25 @@ CUTSCENE_DIALOG_SOUND_EVENT_PROP = "witcher_cutscene_dialog_sound_event"
 CUTSCENE_DIALOG_ITEM_PATH_PROP = "witcher_cutscene_dialog_item_path"
 CUTSCENE_DIALOG_SOURCE_PATH_PROP = "witcher_cutscene_dialog_source_path"
 CUTSCENE_DIALOG_SOURCE_GAME_PROP = "witcher_cutscene_dialog_source_game"
+W2W3_RETARGET_KIND_PROP = "witcher_cutscene_w2w3_retarget_kind"
+W2W3_RETARGET_SOURCE_RIG_PROP = "witcher_w2_retarget_source_rig"
+W2W3_RETARGET_ORIGINAL_TEMPLATE_PROP = "witcher_cutscene_w2_original_template"
+W3_CUTSCENE_CAMERA_TEMPLATE = "gameplay\\camera\\scene_camera.w2ent"
+W3_CUTSCENE_GERALT_TEMPLATE = "gameplay\\templates\\characters\\player\\player.w2ent"
+W3_CUTSCENE_CIRI_TEMPLATE = "quests\\main_npcs\\cirilla.w2ent"
+W2_MAN_SKELETON_MARKERS = (
+    "characters\\templates\\man\\model\\man_rig.w2rig",
+    "\\man\\model\\man_rig.w2rig",
+    "characters\\templates\\witcher\\model\\witcher_without_ponytail.w2rig",
+    "\\witcher\\model\\witcher_without_ponytail.w2rig",
+    "characters\\base_entities\\man_base\\man_base.w2rig",
+)
+W2_FEMALE_SKELETON_MARKERS = (
+    "characters\\templates\\woman\\model\\woman.w2rig",
+    "\\woman\\model\\woman.w2rig",
+    "noble_woman_base.w2rig",
+    "characters\\base_entities\\woman_base\\woman_base.w2rig",
+)
 
 def loadCutsceneFile(filename):
     ext = os.path.splitext(filename)[1]
@@ -214,6 +233,9 @@ def replace_cutscene_actor_template(
     use_mimic=False,
     anim_final_pos="",
     source_index=-1,
+    retarget_kind="",
+    retarget_source_rig="",
+    original_template_path="",
 ):
     template_path = _normalize_repo_path(template_path)
     if not template_path:
@@ -267,6 +289,15 @@ def replace_cutscene_actor_template(
     new_actor_obj[CUTSCENE_ACTOR_SOURCE_GAME_PROP] = source_key.lower()
     new_actor_obj["cutscene_actor_replacement_source_game"] = source_key
     new_actor_obj["cutscene_actor_resolved_template"] = resolved_template_path
+    retarget_kind = str(retarget_kind or "").strip().lower()
+    retarget_source_rig = _normalize_repo_path(retarget_source_rig)
+    original_template_path = _normalize_repo_path(original_template_path)
+    if retarget_kind:
+        new_actor_obj[W2W3_RETARGET_KIND_PROP] = retarget_kind
+    if retarget_source_rig:
+        new_actor_obj[W2W3_RETARGET_SOURCE_RIG_PROP] = retarget_source_rig
+    if original_template_path:
+        new_actor_obj[W2W3_RETARGET_ORIGINAL_TEMPLATE_PROP] = original_template_path
     try:
         new_actor_obj["witcher_source_game"] = "w2" if source_key == "W2" else "w3"
     except Exception:
@@ -290,6 +321,9 @@ def replace_cutscene_actor_template(
         "cutscene_guid": cutscene_guid,
         "source_index": _coerce_source_index(source_index),
         "removed_old": int(removed_old or 0),
+        "retarget_kind": retarget_kind,
+        "retarget_source_rig": retarget_source_rig,
+        "original_template_path": original_template_path,
     }
 
 import bpy
@@ -333,6 +367,184 @@ def _cutscene_progress_end(window_manager, workspace):
 
 def _normalize_repo_path(path):
     return str(path or "").replace("/", "\\").lstrip("\\")
+
+
+def default_cutscene_w2w3_retarget_options():
+    return {
+        "enabled": False,
+        "replace_camera": True,
+        "replace_actors": True,
+        "camera_template": W3_CUTSCENE_CAMERA_TEMPLATE,
+        "male_template": W3_CUTSCENE_GERALT_TEMPLATE,
+        "female_template": W3_CUTSCENE_CIRI_TEMPLATE,
+    }
+
+
+def normalize_cutscene_w2w3_retarget_options(options=None):
+    retarget = default_cutscene_w2w3_retarget_options()
+    if not options:
+        return retarget
+    for key in ("enabled", "replace_camera", "replace_actors"):
+        if key in options:
+            retarget[key] = bool(options.get(key))
+    for key in ("camera_template", "male_template", "female_template"):
+        if key in options:
+            value = _normalize_repo_path(options.get(key))
+            if value:
+                retarget[key] = value
+    return retarget
+
+
+def _is_cutscene_camera_actor_metadata(actor_name="", actor_type="", actor_obj=None):
+    actor_type = str(actor_type or "").strip()
+    actor_name = str(actor_name or "").strip().lower()
+    if actor_type == "CAT_Camera" or actor_name == "camera":
+        return True
+    if actor_obj is not None:
+        try:
+            if str(actor_obj.get("cutscene_actor_type", "") or "").strip() == "CAT_Camera":
+                return True
+            if str(actor_obj.get("cutscene_actor_name", "") or "").strip().lower() == "camera":
+                return True
+        except Exception:
+            pass
+        try:
+            pose_bones = getattr(getattr(actor_obj, "pose", None), "bones", None)
+            if pose_bones is not None and pose_bones.get("Camera_Node") is not None:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _actor_identity_text(actor_obj):
+    if actor_obj is None:
+        return ""
+    parts = [str(getattr(actor_obj, "name", "") or "")]
+    for prop_name in (
+        "cutscene_actor_name",
+        "cutscene_actor_template",
+        "cutscene_actor_resolved_template",
+        W2W3_RETARGET_ORIGINAL_TEMPLATE_PROP,
+        W2W3_RETARGET_SOURCE_RIG_PROP,
+        "witcher_path",
+        "witcher_source_game",
+    ):
+        try:
+            value = str(actor_obj.get(prop_name, "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            parts.append(value)
+    rig_settings = getattr(getattr(actor_obj, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is not None:
+        for attr_name in ("entity_name", "repo_path", "main_entity_skeleton", "main_face_skeleton"):
+            value = str(getattr(rig_settings, attr_name, "") or "").strip()
+            if value:
+                parts.append(value)
+    return " ".join(parts).lower().replace("/", "\\")
+
+
+def get_cutscene_actor_main_skeleton_path(actor_obj):
+    rig_settings = getattr(getattr(actor_obj, "data", None), "witcherui_RigSettings", None)
+    skeleton_path = str(getattr(rig_settings, "main_entity_skeleton", "") or "").strip() if rig_settings else ""
+    if skeleton_path:
+        return _normalize_repo_path(skeleton_path)
+    try:
+        armature_path = _normalize_repo_path(actor_obj.get("witcher_path", ""))
+    except Exception:
+        armature_path = ""
+    return armature_path if armature_path.lower().endswith(".w2rig") else ""
+
+
+def get_cutscene_actor_w2_retarget_source_rig(actor_obj, kind=""):
+    try:
+        stored_source_rig = _normalize_repo_path(actor_obj.get(W2W3_RETARGET_SOURCE_RIG_PROP, ""))
+    except Exception:
+        stored_source_rig = ""
+    if stored_source_rig:
+        return stored_source_rig
+
+    skeleton_path = get_cutscene_actor_main_skeleton_path(actor_obj)
+    if skeleton_path:
+        return skeleton_path
+
+    from ..CR2W.retarget_anims import (
+        DEFAULT_W2_MAN_RIG,
+        DEFAULT_W2_WITCHER_RIG,
+        DEFAULT_W2_WOMAN_RIG,
+    )
+
+    text = _actor_identity_text(actor_obj)
+    kind = str(kind or "").strip().lower()
+    if "witcher_without_ponytail.w2rig" in text or "\\witcher\\model\\" in text:
+        return DEFAULT_W2_WITCHER_RIG
+    if kind == "female":
+        return DEFAULT_W2_WOMAN_RIG
+    if kind == "male":
+        return DEFAULT_W2_MAN_RIG
+    return ""
+
+
+def infer_w2_cutscene_actor_retarget_kind(actor_obj):
+    if actor_obj is None:
+        return ""
+    if _is_cutscene_camera_actor_metadata(actor_obj=actor_obj):
+        return "camera"
+    actor_type = str(actor_obj.get("cutscene_actor_type", "") or "")
+    if actor_type not in {"", "CAT_Actor"}:
+        return ""
+    text = _actor_identity_text(actor_obj)
+    if any(marker in text for marker in W2_FEMALE_SKELETON_MARKERS):
+        return "female"
+    if any(marker in text for marker in W2_MAN_SKELETON_MARKERS):
+        return "male"
+    return ""
+
+
+def cutscene_w2w3_template_for_kind(kind, retarget_options=None):
+    retarget = normalize_cutscene_w2w3_retarget_options(retarget_options)
+    kind = str(kind or "").strip().lower()
+    if kind == "camera":
+        return retarget["camera_template"]
+    if kind == "male":
+        return retarget["male_template"]
+    if kind == "female":
+        return retarget["female_template"]
+    return ""
+
+
+def _existing_actor_matches_retarget_template(actor_obj, template_path, source_game=""):
+    if actor_obj is None:
+        return False
+    template_key = _normalize_repo_path(template_path).lower()
+    if not template_key:
+        return False
+    source_key = normalize_source_game(source_game).lower() if source_game else ""
+    if source_key:
+        try:
+            actor_source_value = str(actor_obj.get(CUTSCENE_ACTOR_SOURCE_GAME_PROP, "") or "").strip()
+            actor_source = normalize_source_game(actor_source_value).lower() if actor_source_value else ""
+        except Exception:
+            actor_source = ""
+        if not actor_source:
+            try:
+                actor_source_value = str(actor_obj.get("witcher_source_game", "") or "").strip()
+                actor_source = normalize_source_game(actor_source_value).lower() if actor_source_value else ""
+            except Exception:
+                actor_source = ""
+        if actor_source and actor_source != source_key:
+            return False
+
+    candidates = []
+    for prop_name in ("cutscene_actor_template", "cutscene_actor_resolved_template", "witcher_path"):
+        try:
+            value = _normalize_repo_path(actor_obj.get(prop_name, "")).lower()
+        except Exception:
+            value = ""
+        if value:
+            candidates.append(value)
+    return any(value == template_key or value.endswith(f"\\{template_key}") for value in candidates)
 
 
 def _normalize_filesystem_path(path):
@@ -933,6 +1145,9 @@ def _clear_cutscene_actor_tags(actor_obj):
         CUTSCENE_SOURCE_INDEX_PROP,
         CUTSCENE_ACTOR_IMPORTED_PROP,
         CUTSCENE_GUID_PROP,
+        W2W3_RETARGET_KIND_PROP,
+        W2W3_RETARGET_SOURCE_RIG_PROP,
+        W2W3_RETARGET_ORIGINAL_TEMPLATE_PROP,
     ):
         try:
             if prop_name in actor_obj:
@@ -1431,7 +1646,7 @@ def is_cutscene_animation_loaded(actor_obj, animation_name, source_path, source_
                     return True
     return False
 
-def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cache=None):
+def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cache=None, retarget_options=None):
     cutscene_template = cutscene_template if cutscene_template is not None else loadCutsceneFile(filename)
     if cutscene_template is None:
         return {}
@@ -1448,36 +1663,90 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
     template_counts = _actor_template_counts(actor_defs)
     actor_name = str(getattr(actor, "name", "") or "").strip()
     template_path = _normalize_repo_path(getattr(actor, "template", "") or "")
+    actor_type = _normalize_cutscene_actor_type(
+        _safe_actor_type_str(getattr(actor, "type", None)),
+        actor_name=actor_name,
+    )
     preferred_appearance_name = str(getattr(actor, "appearance", "") or "").strip()
     duplicate_count = template_counts.get(template_path, 0)
-    actor_source_game = "w2" if _is_w2_cutscene_file(filename) else "w3"
+    is_w2_cutscene = _is_w2_cutscene_file(filename)
+    actor_source_game = "w2" if is_w2_cutscene else "w3"
+    load_template_path = template_path
+    load_source_game = actor_source_game
+    retarget = normalize_cutscene_w2w3_retarget_options(retarget_options)
+    retargeted_kind = ""
+    retarget_source_rig = ""
+
+    if (
+        is_w2_cutscene
+        and retarget["enabled"]
+        and retarget["replace_camera"]
+        and _is_cutscene_camera_actor_metadata(actor_name=actor_name, actor_type=actor_type)
+    ):
+        retargeted_kind = "camera"
+        load_template_path = retarget["camera_template"]
+        load_source_game = "w3"
+        preferred_appearance_name = ""
 
     actor_obj = find_existing_cutscene_actor(
         actor_name=actor_name,
-        repo_path=template_path,
+        repo_path=load_template_path,
         duplicate_count=duplicate_count,
     )
+    if retargeted_kind == "camera" and actor_obj is not None and not _existing_actor_matches_retarget_template(
+        actor_obj,
+        load_template_path,
+        source_game=load_source_game,
+    ):
+        actor_obj = None
+    if (
+        actor_obj is not None
+        and is_w2_cutscene
+        and retarget["enabled"]
+        and retarget["replace_actors"]
+        and not retargeted_kind
+    ):
+        try:
+            existing_retarget_kind = str(actor_obj.get(W2W3_RETARGET_KIND_PROP, "") or "").strip().lower()
+        except Exception:
+            existing_retarget_kind = ""
+        if existing_retarget_kind in {"male", "female"}:
+            existing_retarget_template = cutscene_w2w3_template_for_kind(existing_retarget_kind, retarget)
+            if _existing_actor_matches_retarget_template(actor_obj, existing_retarget_template, source_game="w3"):
+                retargeted_kind = existing_retarget_kind
+                retarget_source_rig = _normalize_repo_path(actor_obj.get(W2W3_RETARGET_SOURCE_RIG_PROP, ""))
+                load_template_path = existing_retarget_template
+                load_source_game = "w3"
+                preferred_appearance_name = ""
     imported_new = bool(getattr(actor_obj, "get", lambda *_args, **_kwargs: False)(CUTSCENE_ACTOR_IMPORTED_PROP, False)) if actor_obj else False
     cutscene_guid = str(getattr(actor_obj, "get", lambda *_args, **_kwargs: "")(CUTSCENE_GUID_PROP, "") or "").strip() if actor_obj else ""
-    if not actor_obj and template_path and int(duplicate_count or 0) > 1 and actor_cache is not None:
-        cached_actor = actor_cache.get(template_path)
+    actor_cache_key = f"{load_source_game}:{load_template_path}".lower()
+    if not actor_obj and load_template_path and int(duplicate_count or 0) > 1 and actor_cache is not None:
+        cached_actor = actor_cache.get(actor_cache_key)
         if cached_actor is not None and getattr(cached_actor, "name", None) in bpy.data.objects:
             actor_obj, cutscene_guid = _duplicate_cutscene_actor_from_source(
                 cached_actor,
                 actor_name=actor_name,
-                repo_path=template_path,
+                repo_path=load_template_path,
                 appearance_name=preferred_appearance_name,
             )
             imported_new = actor_obj is not None
-    if not actor_obj and template_path:
+    if not actor_obj and load_template_path:
         try:
-            is_w2 = _is_w2_cutscene_file(filename)
-            resolved_template_path = _resolve_cutscene_actor_template_path(template_path, filename, is_w2)
+            if load_source_game == "w2":
+                resolved_template_path = _resolve_cutscene_actor_template_path(load_template_path, filename, True)
+            else:
+                resolved_template_path = resolve_cutscene_actor_replacement_template_path(
+                    load_template_path,
+                    cutscene_filename=filename,
+                    source_game=load_source_game,
+                    context=bpy.context,
+                )
             log.info(
                 "Cutscene actor '%s' template resolved (%s): %s -> %s",
                 actor_name or actor_index,
-                "w2" if is_w2 else "w3",
-                template_path,
+                load_source_game,
+                load_template_path,
                 resolved_template_path,
             )
             actor_obj = import_entity.import_ent_template(
@@ -1498,31 +1767,88 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
     if actor_obj is None:
         return {}
 
-    if actor_cache is not None and template_path and template_path not in actor_cache:
-        actor_cache[template_path] = actor_obj
+    if (
+        actor_obj is not None
+        and is_w2_cutscene
+        and retarget["enabled"]
+        and retarget["replace_actors"]
+        and not retargeted_kind
+    ):
+        inferred_kind = infer_w2_cutscene_actor_retarget_kind(actor_obj)
+        if inferred_kind in {"male", "female"}:
+            retarget_source_rig = get_cutscene_actor_w2_retarget_source_rig(actor_obj, inferred_kind)
+            replacement_template = cutscene_w2w3_template_for_kind(inferred_kind, retarget)
+            actor_info = replace_cutscene_actor_template(
+                actor_obj,
+                replacement_template,
+                source_game="W3",
+                cutscene_filename=filename,
+                actor_name=actor_name,
+                actor_type=actor_type,
+                appearance_name="",
+                tag="; ".join(str(t or "").strip() for t in (getattr(actor, "tag", None) or []) if str(t or "").strip()),
+                voice_tag=str(getattr(actor, "voiceTag", "") or "").strip(),
+                final_position="; ".join(str(t or "").strip() for t in (getattr(actor, "finalPosition", None) or []) if str(t or "").strip()),
+                kill_me=bool(getattr(actor, "killMe", False) or False),
+                use_mimic=bool(getattr(actor, "useMimic", False)),
+                anim_final_pos=str(getattr(actor, "animationAtFinalPosition", "") or "").strip(),
+                source_index=actor_index,
+                retarget_kind=inferred_kind,
+                retarget_source_rig=retarget_source_rig,
+                original_template_path=template_path,
+            )
+            actor_info["retargeted_w2_to_w3"] = True
+            return actor_info
+
+    if actor_cache is not None and load_template_path and actor_cache_key not in actor_cache and not retargeted_kind:
+        actor_cache[actor_cache_key] = actor_obj
 
     _ensure_cutscene_actor_appearance(actor_obj, preferred_appearance_name)
     _ensure_cutscene_face_setup(actor_obj)
     if imported_new and cutscene_guid:
         _tag_cutscene_object_hierarchy(actor_obj, cutscene_guid)
+    actor_proxy = _cutscene_actor_proxy_from_values(
+        actor_name=actor_name,
+        template_path=load_template_path,
+        actor_type=actor_type,
+        appearance_name=preferred_appearance_name,
+        tag=getattr(actor, "tag", None),
+        voice_tag=str(getattr(actor, "voiceTag", "") or "").strip(),
+        final_position=getattr(actor, "finalPosition", None),
+        kill_me=bool(getattr(actor, "killMe", False) or False),
+        use_mimic=bool(getattr(actor, "useMimic", False)),
+        anim_final_pos=str(getattr(actor, "animationAtFinalPosition", "") or "").strip(),
+    )
     _tag_cutscene_actor(
         actor_obj,
-        actor,
+        actor_proxy,
         source_index=actor_index,
         source_path=filename,
         imported_new=imported_new,
         cutscene_guid=cutscene_guid,
     )
-    actor_obj[CUTSCENE_ACTOR_SOURCE_GAME_PROP] = actor_source_game
+    actor_obj[CUTSCENE_ACTOR_SOURCE_GAME_PROP] = load_source_game
+    if retargeted_kind:
+        actor_obj[W2W3_RETARGET_KIND_PROP] = retargeted_kind
+        actor_obj[W2W3_RETARGET_ORIGINAL_TEMPLATE_PROP] = template_path
+        actor_obj["cutscene_actor_replacement_source_game"] = "W3"
+        try:
+            actor_obj["witcher_source_game"] = "w3"
+        except Exception:
+            pass
     return {
         "actor_obj": actor_obj,
         "actor_name": actor_name,
-        "template_path": template_path,
+        "template_path": load_template_path,
         "appearance_name": preferred_appearance_name,
-        "source_game": actor_source_game,
+        "source_game": load_source_game,
         "imported_new": bool(imported_new),
         "cutscene_guid": cutscene_guid,
         "source_index": actor_index,
+        "retargeted_w2_to_w3": bool(retargeted_kind),
+        "retarget_kind": retargeted_kind,
+        "retarget_source_rig": retarget_source_rig,
+        "original_template_path": template_path if retargeted_kind else "",
     }
 
 def apply_cutscene_animation_sequence(filename, animation_indices, actor_obj, actor_name="", track_name=CUTSCENE_TRACK_NAME,
@@ -2286,7 +2612,8 @@ def load_cutscene_dialog_items(cutscene_filepath):
 
 
 def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation_indices=None,
-                       auto_apply_selected_animations=False, import_burned_audio=True):
+                       auto_apply_selected_animations=False, import_burned_audio=True,
+                       retarget_options=None):
     context = bpy.context
     scene = context.scene
     window_manager = getattr(context, "window_manager", None)
@@ -2302,6 +2629,7 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
         CCutsceneTemplate = loadCutsceneFile(filename)
         if CCutsceneTemplate is None:
             return None
+        retarget = normalize_cutscene_w2w3_retarget_options(retarget_options)
 
         treeList = scene.witcher_w2cutscene_list
         treeList.clear()
@@ -2320,6 +2648,7 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
         loaded_actor_object_names_by_index = {}
         loaded_actor_imported_flags_by_index = {}
         loaded_actor_guid_by_index = {}
+        retarget_counts = Counter()
 
         for idx, node in enumerate(getattr(CCutsceneTemplate, "animations", None) or []):
             if selected_animation_indices is not None and idx not in selected_animation_indices:
@@ -2339,6 +2668,7 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
                 idx,
                 cutscene_template=CCutsceneTemplate,
                 actor_cache=actor_cache_by_template,
+                retarget_options=retarget,
             )
             actor_obj = actor_info.get("actor_obj")
             actor_name = str(actor_info.get("actor_name", "") or "").strip()
@@ -2348,6 +2678,8 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
                 loaded_actor_object_names_by_index[idx] = str(getattr(actor_obj, "name", "") or "")
                 loaded_actor_imported_flags_by_index[idx] = bool(actor_info.get("imported_new", False))
                 loaded_actor_guid_by_index[idx] = str(actor_info.get("cutscene_guid", "") or "")
+                if actor_info.get("retargeted_w2_to_w3"):
+                    retarget_counts[str(actor_info.get("retarget_kind", "") or "actor")] += 1
             if actor_total:
                 progress = 15 + int(round((actor_step_index / actor_total) * 45))
                 _set_progress(progress, f"Importing cutscene actors... {actor_step_index}/{actor_total}")
@@ -2406,6 +2738,7 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
             CCutsceneTemplate.loaded_actor_guid_by_index = dict(loaded_actor_guid_by_index)
             CCutsceneTemplate.applied_animation_indices = sorted(applied_animation_indices)
             CCutsceneTemplate.burned_audio_info = dict(burned_audio_info or {})
+            CCutsceneTemplate.w2w3_retarget_counts = dict(retarget_counts)
         except Exception:
             pass
         if hasattr(scene, "witcher_cutscene_last_import_seconds"):
