@@ -15,7 +15,7 @@ from ..CR2W.dc_w2_havok import W2_MIMIC_FLOATTRACKS_RIG
 from ..CR2W.CR2W_helpers import Enums
 log = logging.getLogger(__name__)
 
-from ..camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties
+from ..camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties, sanitize_camera_fov_sequence
 from ..importers.import_rig import get_ordered_bones
 from ..importers.motion_tools import MotionExtraction, apply_motion, apply_motion_to_bone, extract_motion_from_bone
 from .. import get_do_fix_tail, get_rig_rot90_enabled
@@ -760,6 +760,58 @@ def shouldIgnoreFrame(bone):
     x, y, z, _w = components
     return abs(x) < 0.5 and abs(y) < 0.5 and abs(z) < 0.5
 
+CAMERA_HARD_CUT_BONE = "Camera_ManipulationNode"
+CAMERA_HARD_CUT_POSITION_JUMP = 1.0
+CAMERA_HARD_CUT_ROTATION_JUMP_DEGREES = 45.0
+
+
+def _vector_distance(a, b):
+    try:
+        return math.sqrt(sum((float(b[i]) - float(a[i])) ** 2 for i in range(3)))
+    except Exception:
+        return 0.0
+
+
+def _quaternion_delta_degrees(a, b):
+    qa = _get_quaternion_components(a)
+    qb = _get_quaternion_components(b)
+    if qa is None or qb is None:
+        return 0.0
+    ax, ay, az, aw = qa
+    bx, by, bz, bw = qb
+    dot = abs((aw * bw) + (ax * bx) + (ay * by) + (az * bz))
+    dot = max(-1.0, min(1.0, dot))
+    return math.degrees(2.0 * math.acos(dot))
+
+
+def _detect_camera_hard_cut_frames(anim_buffer):
+    bone = _find_anim_bone(getattr(anim_buffer, "bones", []) or [], CAMERA_HARD_CUT_BONE)
+    if bone is None:
+        return []
+
+    total_frames = int(getattr(anim_buffer, "numFrames", 0) or 0)
+    pos_frames = list(getattr(bone, "positionFrames", []) or [])
+    rot_frames = list(getattr(bone, "rotationFramesQuat", []) or getattr(bone, "rotationFrames", []) or [])
+    frame_limits = []
+    if total_frames > 0:
+        frame_limits.append(total_frames)
+    if pos_frames:
+        frame_limits.append(len(pos_frames))
+    if rot_frames:
+        frame_limits.append(len(rot_frames))
+    frame_count = min(frame_limits) if frame_limits else 0
+    if frame_count <= 1:
+        return []
+
+    cuts = []
+    for frame_idx in range(1, frame_count):
+        pos_jump = _vector_distance(pos_frames[frame_idx - 1], pos_frames[frame_idx]) if pos_frames else 0.0
+        rot_jump = _quaternion_delta_degrees(rot_frames[frame_idx - 1], rot_frames[frame_idx]) if rot_frames else 0.0
+        if pos_jump >= CAMERA_HARD_CUT_POSITION_JUMP or rot_jump >= CAMERA_HARD_CUT_ROTATION_JUMP_DEGREES:
+            cuts.append(float(frame_idx))
+    return cuts
+
+
 def _split_component_animation_name(anim_name):
     parts = str(anim_name or "").split(":", 2)
     if len(parts) >= 3:
@@ -1078,6 +1130,63 @@ class AnimImporter:
             except Exception:
                 pass
 
+    def __split_nla_strip_at_action_frames(self, target, target_track, strip, action_frames):
+        action = getattr(strip, "action", None)
+        if action is None or target_track is None:
+            return []
+
+        action_start, action_end = self.__strip_action_range(strip)
+        split_frames = []
+        for frame in sorted({float(frame) for frame in (action_frames or [])}):
+            if action_start + 1e-4 < frame < action_end - 1e-4:
+                split_frames.append(frame)
+        if not split_frames:
+            return []
+
+        scene_start = float(getattr(strip, "frame_start", 0.0) or 0.0)
+        scale = float(getattr(strip, "scale", 1.0) or 1.0)
+        if abs(scale) <= 1e-6:
+            scale = 1.0
+
+        created = []
+        source_strip = strip
+        current_strip = strip
+        current_action_start = action_start
+        for idx, split_action_frame in enumerate(split_frames):
+            next_scene_start = scene_start + ((split_action_frame - action_start) * scale)
+            old_scene_end = float(getattr(current_strip, "frame_end", next_scene_start) or next_scene_start)
+
+            current_strip.frame_end = next_scene_start
+            self.__set_strip_action_range(
+                current_strip,
+                action_start=current_action_start,
+                action_end=split_action_frame,
+            )
+
+            strip_name = f"{getattr(strip, 'name', action.name)}_cut{idx + 2:02d}"
+            try:
+                new_strip = target_track.strips.new(strip_name, int(round(next_scene_start)), action)
+            except RuntimeError:
+                target_track = target.animation_data.nla_tracks.new()
+                target_track.name = str(self.__NLA_track or getattr(strip, "name", action.name) or "cutscene_anim")
+                new_strip = target_track.strips.new(strip_name, int(round(next_scene_start)), action)
+            self.__copy_nla_strip_settings(source_strip, new_strip)
+            new_strip.frame_start = next_scene_start
+            new_strip.frame_end = old_scene_end
+            self.__set_strip_action_range(
+                new_strip,
+                action_start=split_action_frame,
+                action_end=action_end,
+            )
+            try:
+                bind_strip_action_slot(new_strip, resolve_action_slot(action, target=target, ensure=True))
+            except Exception:
+                pass
+            created.append(new_strip)
+            current_strip = new_strip
+            current_action_start = split_action_frame
+        return created
+
     def __split_nla_strip_at_cursor(self, target, target_track, strip, cursor, insert_length):
         action = getattr(strip, "action", None)
         if action is None:
@@ -1124,7 +1233,7 @@ class AnimImporter:
             if strip_start < cursor < strip_end:
                 self.__split_nla_strip_at_cursor(target, target_track, strip, cursor, insert_length)
 
-    def __assign_action(self, target: Union[bpy.types.ID, HasAnimationData], action: bpy.types.Action):
+    def __assign_action(self, target: Union[bpy.types.ID, HasAnimationData], action: bpy.types.Action, camera_cut_frames=None):
         if target.animation_data is None:
             target.animation_data_create()
 
@@ -1203,6 +1312,10 @@ class AnimImporter:
                 track_name = str(self.__NLA_track or "")
                 if _nla_track_should_combine(track_name):
                     target_strip.blend_type = 'COMBINE'
+                if camera_cut_frames:
+                    created = self.__split_nla_strip_at_action_frames(target, target_track, target_strip, camera_cut_frames)
+                    if created:
+                        log.info("Split imported camera animation '%s' into %d cuts.", action.name, len(created) + 1)
 
     def __assignPartToArmature(self, armObj, SkeletalAnimation, SkeletalAnimationData, armature_namespace, SkeletalAnimationType, scale):
         
@@ -1290,6 +1403,10 @@ class AnimImporter:
                 root_bone.scaleFrames = [[1.0, 1.0, 1.0]]
                 root_bone.scale_dt = source_bone.scale_dt
                 root_bone.scale_numFrames = 1
+
+        camera_cut_frames = []
+        if camera_animation and _is_w2_cr2w_version(self.__animFile.filepath):
+            camera_cut_frames = _detect_camera_hard_cut_frames(anim_desc)
         
         #add detected namespace to aniamtion data
         if armature_namespace:
@@ -1307,6 +1424,8 @@ class AnimImporter:
                 action["w3_anim_buffer_source"] = source
             if detail:
                 action["w3_anim_buffer_detail"] = detail
+            if camera_cut_frames:
+                action["witcher_camera_cut_frames"] = json.dumps([float(frame) for frame in camera_cut_frames])
             if source:
                 log.debug(f"Animation buffer source: {source}{' (' + detail + ')' if detail else ''}")
             raw_motion_data = getattr(SkeletalAnimation, "motionExtraction", None)
@@ -1646,6 +1765,9 @@ class AnimImporter:
                     if len(keyFrames) == 0:
                         continue
                     name = str(track.trackName)
+                    sanitized_fov = False
+                    if camera_animation and name == "hctFOV":
+                        keyFrames, sanitized_fov = sanitize_camera_fov_sequence(keyFrames)
                     if name not in shapeKeyDict:
                         if not camera_animation and control_bone_name == W3_FACE_POSES_BONE and name in _MIMIC_HEAD_FLOAT_TRACKS:
                             shapeKeyDict[name] = _ensure_control_float_property(control_bone, name)
@@ -1655,7 +1777,7 @@ class AnimImporter:
                             continue
 
                     #Info
-                    track_frames = len(track.trackFrames)
+                    track_frames = len(keyFrames)
                     total_frames = SkeletalAnimationData.numFrames
                     if total_frames == 0:
                         # numFrames not set in chunk (e.g. WolvenKit-cooked files); distribute over actual track frames
@@ -1664,6 +1786,8 @@ class AnimImporter:
                     frame_skip = float(total_frames)/float(track_frames) if track_frames > 0 else 1.0
 
                     log.debug('(mesh) frames:%5d  name: %s', len(keyFrames), name)
+                    if sanitized_fov:
+                        log.warning("Camera FOV track '%s' contained invalid samples; held previous valid FOV.", name)
                     shapeKey = shapeKeyDict[name]
                     fcurve = new_action_fcurve(action, control_arm_obj, data_path='pose.bones["%s"]["%s"]'% (control_bone_name, name))#  (data_path='key_blocks["%s"].value'%shapeKey.name)
                     fcurve.keyframe_points.add(len(keyFrames))
@@ -1687,7 +1811,7 @@ class AnimImporter:
 
         
         
-        self.__assign_action(armObj, action)
+        self.__assign_action(armObj, action, camera_cut_frames=camera_cut_frames)
         if morph_action_target is not None and morph_action_target != armObj:
             self.__assign_action(morph_action_target, action)
         

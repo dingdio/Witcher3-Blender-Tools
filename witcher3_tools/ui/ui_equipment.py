@@ -51,7 +51,7 @@ from .equipment_item_picker import (
     inventory_preset_picker_width,
 )
 
-_UNCOOK_ITEM_ENT_INDEX = {}
+_UNCOOK_ITEM_TEMPLATE_INDEX = {}
 _LAST_EQUIPMENT_LOAD_FAILURES = {}
 _OPERATOR_ENUM_CACHE = {}
 _EQUIPMENT_ITEM_ICON_ID_CACHE = {}
@@ -813,14 +813,28 @@ def _get_last_equipment_load_failure(armature, slot_index):
     return _LAST_EQUIPMENT_LOAD_FAILURES.get(key, "")
 
 
-def _w2ent_basename_key(template_name):
+def _w2_item_basename_key(template_name, extension):
     rel_name = str(template_name or "").replace("/", "\\").lstrip("\\")
     if not rel_name:
         return ""
     base_name = rel_name.rsplit("\\", 1)[-1]
-    if not base_name.lower().endswith(".w2ent"):
-        base_name += ".w2ent"
+    base_root, base_ext = os.path.splitext(base_name)
+    if base_ext.lower() in {".w2ent", ".w2mesh"}:
+        base_name = base_root
+    extension = str(extension or "").lower()
+    if extension and not extension.startswith("."):
+        extension = "." + extension
+    if extension and not base_name.lower().endswith(extension):
+        base_name += extension
     return base_name.lower()
+
+
+def _w2ent_basename_key(template_name):
+    return _w2_item_basename_key(template_name, ".w2ent")
+
+
+def _w2mesh_basename_key(template_name):
+    return _w2_item_basename_key(template_name, ".w2mesh")
 
 
 def _normalize_unique_roots(roots):
@@ -1534,11 +1548,11 @@ def _get_armature_source_roots(armature):
     return _normalize_unique_roots(parsed)
 
 
-def _get_uncook_item_ent_index(uncook_root):
+def _get_uncook_item_template_index(uncook_root):
     norm_root = os.path.normcase(os.path.normpath(uncook_root)) if uncook_root else ""
     if not norm_root:
         return {}
-    cached = _UNCOOK_ITEM_ENT_INDEX.get(norm_root)
+    cached = _UNCOOK_ITEM_TEMPLATE_INDEX.get(norm_root)
     if cached is not None:
         return cached
 
@@ -1548,27 +1562,31 @@ def _get_uncook_item_ent_index(uncook_root):
             dirnames.sort()
             filenames.sort()
             for filename in filenames:
-                if not filename.lower().endswith(".w2ent"):
+                filename_lower = filename.lower()
+                if not (filename_lower.endswith(".w2ent") or filename_lower.endswith(".w2mesh")):
                     continue
                 full_path = os.path.join(dirpath, filename)
                 try:
                     rel_path = os.path.relpath(full_path, uncook_root).replace("/", "\\")
                 except Exception:
                     continue
-                key = filename.lower()
+                rel_lower = rel_path.lower()
+                if filename_lower.endswith(".w2mesh") and not rel_lower.startswith("items\\"):
+                    continue
+                key = filename_lower
                 existing = index.get(key)
                 if existing is None:
-                    # Prefer the first match; entity names are generally unique.
+                    # Prefer the first match; item template names are generally unique.
                     index[key] = rel_path
                     continue
                 # If there is a collision, prefer an items path for equipment.
                 existing_is_items = existing.lower().startswith("items\\")
-                rel_is_items = rel_path.lower().startswith("items\\")
+                rel_is_items = rel_lower.startswith("items\\")
                 if rel_is_items and not existing_is_items:
                     index[key] = rel_path
 
-    _UNCOOK_ITEM_ENT_INDEX[norm_root] = index
-    _clear_cache_if_oversized(_UNCOOK_ITEM_ENT_INDEX, max_entries=16)
+    _UNCOOK_ITEM_TEMPLATE_INDEX[norm_root] = index
+    _clear_cache_if_oversized(_UNCOOK_ITEM_TEMPLATE_INDEX, max_entries=16)
     # A new index means newly extracted files may now be findable via the index
     # path, so invalidate the template path resolve cache.
     _TEMPLATE_PATH_RESOLVE_CACHE.clear()
@@ -1579,11 +1597,14 @@ def _remember_uncook_item_relpath(uncook_root, rel_path):
     if not uncook_root or not rel_path:
         return
     norm_root = os.path.normcase(os.path.normpath(uncook_root))
-    root_index = _UNCOOK_ITEM_ENT_INDEX.get(norm_root)
+    root_index = _UNCOOK_ITEM_TEMPLATE_INDEX.get(norm_root)
     if root_index is None:
         return
     rel_name = str(rel_path).replace("/", "\\").lstrip("\\")
     key = _w2ent_basename_key(rel_name)
+    if key:
+        root_index.setdefault(key, rel_name)
+    key = _w2mesh_basename_key(rel_name)
     if key:
         root_index.setdefault(key, rel_name)
 
@@ -2692,6 +2713,7 @@ def _template_match_keys(template_name):
         keys.add(rel_root)
     else:
         keys.add(lower_rel + ".w2ent")
+        keys.add(lower_rel + ".w2mesh")
 
     base_name = lower_rel.rsplit("\\", 1)[-1]
     keys.add(base_name)
@@ -2700,25 +2722,27 @@ def _template_match_keys(template_name):
         keys.add(base_root)
     else:
         keys.add(base_name + ".w2ent")
+        keys.add(base_name + ".w2mesh")
     return {key for key in keys if key}
 
 
-def _resolve_bundle_item_by_template(template_name, search_roots=None):
+def _resolve_bundle_item_by_template(template_name, search_roots=None, source_game=""):
     if not template_name:
         return None, None, None
     rel_candidates = []
     rel_name = str(template_name).replace("/", "\\").lstrip("\\")
     is_short_template_id = bool(rel_name) and ("\\" not in rel_name)
     if rel_name:
-        if rel_name.lower().endswith(".w2ent"):
+        if rel_name.lower().endswith((".w2ent", ".w2mesh")):
             rel_candidates.append(rel_name)
         else:
             rel_candidates.append(rel_name + ".w2ent")
+            rel_candidates.append(rel_name + ".w2mesh")
         if not rel_candidates[0].lower().startswith("items\\"):
-            rel_candidates.append("items\\" + rel_candidates[0])
+            rel_candidates.extend(["items\\" + rel_path for rel_path in rel_candidates])
 
     search_roots = list(search_roots or [])
-    prefer_w2_repo = _is_w2_search(search_roots)
+    prefer_w2_repo = _is_w2_search(search_roots) or _normalize_source_game(source_game) == "w2"
     if prefer_w2_repo:
         roots_to_search = _normalize_unique_roots(search_roots + _get_w2_repo_roots())
         uncook_root = ""
@@ -2737,16 +2761,21 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None):
                 return SimpleNamespace(name=rel_path), export_path, "\\" + rel_path
 
     def _lookup_indexed_rel_path():
-        key = _w2ent_basename_key(rel_name)
-        if not key:
+        keys = [_w2ent_basename_key(rel_name)]
+        if prefer_w2_repo:
+            keys.append(_w2mesh_basename_key(rel_name))
+        keys = [key for key in keys if key]
+        if not keys:
             return None
         for root in roots_to_search:
-            indexed_rel_path = _get_uncook_item_ent_index(root).get(key)
-            if not indexed_rel_path:
-                continue
-            export_path = os.path.join(root, indexed_rel_path)
-            if os.path.exists(export_path):
-                return SimpleNamespace(name=indexed_rel_path), export_path, "\\" + indexed_rel_path
+            item_index = _get_uncook_item_template_index(root)
+            for key in keys:
+                indexed_rel_path = item_index.get(key)
+                if not indexed_rel_path:
+                    continue
+                export_path = os.path.join(root, indexed_rel_path)
+                if os.path.exists(export_path):
+                    return SimpleNamespace(name=indexed_rel_path), export_path, "\\" + indexed_rel_path
         return None
 
     if is_short_template_id:
@@ -2771,8 +2800,8 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None):
     if indexed_match:
         return indexed_match
 
-    search_pattern = "\\" + template_name
-    if not search_pattern.lower().endswith(".w2ent"):
+    search_pattern = "\\" + rel_name
+    if not search_pattern.lower().endswith((".w2ent", ".w2mesh")):
         search_pattern += ".w2ent"
     search_info = f"{search_pattern}; roots={roots_to_search}"
     if prefer_w2_repo:
@@ -2787,7 +2816,7 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None):
         # or \ as separators; os.path.basename() handles both, while endswith()
         # on a pattern that includes a backslash only matches backslash-keyed bundles.
         basename_end = rel_name
-        if not basename_end.lower().endswith(".w2ent"):
+        if not basename_end.lower().endswith((".w2ent", ".w2mesh")):
             basename_end += ".w2ent"
         item = bundle_manager.find_item_by_partial_hash(start="items", end=basename_end)
         if not item:
@@ -2799,7 +2828,7 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None):
             item = bundle_manager.find_item_by_partial_hash(start="", end=search_pattern)
         if not item and rel_name:
             basename_end = rel_name.rsplit("\\", 1)[-1]
-            if not basename_end.lower().endswith(".w2ent"):
+            if not basename_end.lower().endswith((".w2ent", ".w2mesh")):
                 basename_end += ".w2ent"
             item = bundle_manager.find_item_by_partial_hash(start="", end=basename_end)
     if not item:
@@ -2819,12 +2848,18 @@ def _resolve_bundle_item_by_template_cached(template_name, search_roots=None, pr
         return _resolve_bundle_item_by_template(template_name, search_roots=search_roots)
 
     cache = prepared_context.setdefault("bundle_item_cache", {})
+    source_game = _normalize_source_game(prepared_context.get("source_game", ""))
     cache_key = (
         _normalize_template_path(template_name).lower(),
         tuple(_norm_root_path(root) for root in (search_roots or [])),
+        source_game,
     )
     if cache_key not in cache:
-        cache[cache_key] = _resolve_bundle_item_by_template(template_name, search_roots=search_roots)
+        cache[cache_key] = _resolve_bundle_item_by_template(
+            template_name,
+            search_roots=search_roots,
+            source_game=source_game,
+        )
     return cache[cache_key]
 
 
@@ -2923,6 +2958,8 @@ def _update_entry_resolved_repo_path(entry, context=None, armature=None, rig_set
 def _get_cached_equipment_item_entity(export_path, prepared_context=None):
     if not export_path or not os.path.exists(export_path):
         return None
+    if os.path.splitext(str(export_path or ""))[1].lower() != ".w2ent":
+        return None
 
     try:
         cache_key = (
@@ -2954,6 +2991,22 @@ def _get_cached_equipment_item_entity(export_path, prepared_context=None):
     if local_cache is not None:
         local_cache[cache_key] = item_entity
     return item_entity
+
+
+def _direct_mesh_item_template_data(export_path, final_item_name):
+    source = str(final_item_name or export_path or "").replace("/", "\\").strip()
+    if not source.lower().endswith(".w2mesh"):
+        return None
+    component_name = os.path.splitext(source.rsplit("\\", 1)[-1])[0] or "mesh"
+    return {
+        "chunks": [{
+            "type": "CStaticMeshComponent",
+            "chunkIndex": 0,
+            "name": component_name,
+            "mesh": source,
+        }]
+    }
+
 
 def _update_slot_coloring_json(slot, item_entity):
     """Populate slot.item_coloring_json from item_entity.coloringEntries for the selected appearance."""
@@ -3153,11 +3206,11 @@ def _import_item_entity(export_path, final_item_name, entity, armature, appearan
         if selected_item_appearance is not None and hasattr(selected_item_appearance, 'includedTemplates') and selected_item_appearance.includedTemplates:
             included_templates = selected_item_appearance.includedTemplates
 
-    static_template_data = None
+    static_template_data = _direct_mesh_item_template_data(export_path, final_item_name)
     static_meshes = getattr(item_entity, 'staticMeshes', None) if item_entity else None
-    if isinstance(static_meshes, dict) and static_meshes.get('chunks'):
+    if static_template_data is None and isinstance(static_meshes, dict) and static_meshes.get('chunks'):
         static_template_data = static_meshes
-    elif hasattr(static_meshes, 'chunks') and getattr(static_meshes, 'chunks', None):
+    elif static_template_data is None and hasattr(static_meshes, 'chunks') and getattr(static_meshes, 'chunks', None):
         static_template_data = {'chunks': static_meshes.chunks}
 
     for template in included_templates:
@@ -3748,14 +3801,17 @@ def _resolve_visual_policy_from_slot_names(equip_slot_name, hold_slot_name, arma
     }
 
 
-def _slot_name_exists_on_rig(slot_name, armature, rig_settings):
-    """True if slot_name corresponds to a real EntitySlot (empty or entry) on this rig."""
+def _mount_target_exists_on_rig(slot_name, armature, rig_settings):
+    """True if slot_name can resolve to an entity slot or rig bone target."""
     if not slot_name or armature is None or rig_settings is None:
         return False
     entity_name = getattr(rig_settings, "entity_name", "") or ""
     if find_slot_empty(entity_name, slot_name, armature) is not None:
         return True
-    return _find_slot_entry_for_mount_slot(slot_name, rig_settings) is not None
+    if _find_slot_entry_for_mount_slot(slot_name, rig_settings) is not None:
+        return True
+    preferred_armature = _resolve_slot_target_armature_from_rig(slot_name, armature, rig_settings)
+    return _find_armature_with_bone(armature, slot_name, preferred_armature=preferred_armature) is not None
 
 
 def _resolve_slot_visual_policy(slot, armature, rig_settings, *, item_entity=None, attachment_profile=None):
@@ -3770,8 +3826,8 @@ def _resolve_slot_visual_policy(slot, armature, rig_settings, *, item_entity=Non
         )
     equip_slot_name = get_effective_equip_slot(slot)
     hold_slot_name = get_effective_hold_slot(slot)
-    # If hold_slot doesn't correspond to a real EntitySlot on this rig treat it as undefined
-    if hold_slot_name and not _slot_name_exists_on_rig(hold_slot_name, armature, rig_settings):
+    # If hold_slot cannot resolve to a real rig target, treat it as undefined.
+    if hold_slot_name and not _mount_target_exists_on_rig(hold_slot_name, armature, rig_settings):
         hold_slot_name = ""
     allow_unmounted_visual = _allow_unmounted_slotless_visual(
         slot,
@@ -8046,7 +8102,10 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
             resolved_repo_path = str(get_repo_from_abs_path(export_path) or "").replace("/", "\\").lstrip("\\")
         except Exception:
             resolved_repo_path = ""
-    slot.source_game = _normalize_source_game(get_equipment_source_game_for_search_roots(source_roots))
+    slot.source_game = _normalize_source_game(
+        prepared.get("source_game", "")
+        or get_equipment_source_game_for_search_roots(source_roots)
+    )
     slot.resolved_repo_path = resolved_repo_path
 
     # Populate item appearance list from entity (runs even if already loaded)
@@ -8445,6 +8504,11 @@ def load_equipment_items_batch(context, armature, slot_indices, rig_settings=Non
             if mount_mode_resolved not in {"equip", "hold"}:
                 mount_mode_resolved = requested_mount_mode
             if not _can_load_slot_for_mount_mode(slot_policy, mount_mode_resolved):
+                target_label = "hold" if mount_mode_resolved == "hold" else "equip"
+                reason = str(slot_policy.get("reason", "") or "").strip()
+                if not reason:
+                    reason = f"No valid {target_label} target on current rig for '{slot.item_name}'"
+                _set_last_equipment_load_failure(armature, idx, reason)
                 continue
             if _load_equipment_item_core(
                 context,

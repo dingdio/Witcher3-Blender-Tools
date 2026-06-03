@@ -45,9 +45,29 @@ CUTSCENE_DIALOG_SOURCE_GAME_PROP = "witcher_cutscene_dialog_source_game"
 W2W3_RETARGET_KIND_PROP = "witcher_cutscene_w2w3_retarget_kind"
 W2W3_RETARGET_SOURCE_RIG_PROP = "witcher_w2_retarget_source_rig"
 W2W3_RETARGET_ORIGINAL_TEMPLATE_PROP = "witcher_cutscene_w2_original_template"
+CUTSCENE_ITEM_EVENT_SLOT_PROP = "witcher_cutscene_item_event_slot"
+CUTSCENE_ITEM_EVENT_KEY_PROP = "witcher_cutscene_item_event_key"
 W3_CUTSCENE_CAMERA_TEMPLATE = "gameplay\\camera\\scene_camera.w2ent"
 W3_CUTSCENE_GERALT_TEMPLATE = "gameplay\\templates\\characters\\player\\player.w2ent"
 W3_CUTSCENE_CIRI_TEMPLATE = "quests\\main_npcs\\cirilla.w2ent"
+ITEM_EVENT_TYPE = "CExtAnimItemEvent"
+ITEM_EVENT_MOUNT_BY_ACTION = {
+    "IA_Mount": ("equip", ""),
+    "IA_MountToHand": ("hold", ""),
+    "IA_MountToLeftHand": ("hold", "l_weapon"),
+    "IA_MountToRightHand": ("hold", "r_weapon"),
+    "IA_MountToCustomSlot1": ("hold", "customCsSlot1"),
+    "IA_MountToCustomSlot2": ("hold", "customCsSlot2"),
+}
+ITEM_EVENT_UNMOUNT_ACTION = "IA_Unmount"
+ITEM_EVENT_MIRROR_CATEGORY = {
+    "steelsword": "silversword",
+    "silversword": "steelsword",
+}
+ITEM_EVENT_DEFAULT_ITEM = {
+    "steelsword": "SteelSword1",
+    "silversword": "SilverSword1",
+}
 W2_MAN_SKELETON_MARKERS = (
     "characters\\templates\\man\\model\\man_rig.w2rig",
     "\\man\\model\\man_rig.w2rig",
@@ -395,19 +415,47 @@ def normalize_cutscene_w2w3_retarget_options(options=None):
     return retarget
 
 
-def _is_cutscene_camera_actor_metadata(actor_name="", actor_type="", actor_obj=None):
+def _is_cutscene_camera_actor_name(actor_name):
+    text = str(actor_name or "").strip().lower()
+    return text == "camera" or (text.startswith("camera") and text[len("camera"):].isdigit())
+
+
+def _is_cutscene_camera_template_path(template_path):
+    text = _normalize_repo_path(template_path).lower()
+    if not text:
+        return False
+    return (
+        text == W3_CUTSCENE_CAMERA_TEMPLATE
+        or text.endswith("\\scene_camera.w2ent")
+        or "\\templates\\camera\\" in text
+        or text.startswith("characters\\templates\\camera\\")
+    )
+
+
+def _is_cutscene_camera_actor_metadata(actor_name="", actor_type="", template_path="", actor_obj=None):
     actor_type = str(actor_type or "").strip()
-    actor_name = str(actor_name or "").strip().lower()
-    if actor_type == "CAT_Camera" or actor_name == "camera":
+    if actor_type == "CAT_Camera" or _is_cutscene_camera_actor_name(actor_name):
+        return True
+    if _is_cutscene_camera_template_path(template_path):
         return True
     if actor_obj is not None:
         try:
             if str(actor_obj.get("cutscene_actor_type", "") or "").strip() == "CAT_Camera":
                 return True
-            if str(actor_obj.get("cutscene_actor_name", "") or "").strip().lower() == "camera":
+            if _is_cutscene_camera_actor_name(actor_obj.get("cutscene_actor_name", "")):
                 return True
         except Exception:
             pass
+        for prop_name in (
+            "cutscene_actor_template",
+            "cutscene_actor_resolved_template",
+            "witcher_path",
+        ):
+            try:
+                if _is_cutscene_camera_template_path(actor_obj.get(prop_name, "")):
+                    return True
+            except Exception:
+                pass
         try:
             pose_bones = getattr(getattr(actor_obj, "pose", None), "bones", None)
             if pose_bones is not None and pose_bones.get("Camera_Node") is not None:
@@ -578,6 +626,10 @@ def _is_face_cutscene_animation(anim_name):
     if _is_face_cutscene_component(component_name):
         return True
     return ":face" in str(anim_name or "").lower()
+
+def _is_cutscene_item_event_component(component_name):
+    component_name = str(component_name or "").strip().lower()
+    return not component_name or component_name == "root"
 
 def _cutscene_track_name_for_animation(anim_name, base_track=CUTSCENE_TRACK_NAME):
     if _is_face_cutscene_animation(anim_name):
@@ -1681,7 +1733,7 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
         is_w2_cutscene
         and retarget["enabled"]
         and retarget["replace_camera"]
-        and _is_cutscene_camera_actor_metadata(actor_name=actor_name, actor_type=actor_type)
+        and _is_cutscene_camera_actor_metadata(actor_name=actor_name, actor_type=actor_type, template_path=template_path)
     ):
         retargeted_kind = "camera"
         load_template_path = retarget["camera_template"]
@@ -1967,11 +2019,13 @@ def _safe_actor_type_str(type_value):
 
 def _normalize_cutscene_actor_type(type_value, actor_name=""):
     text = str(type_value or "").strip()
-    for candidate in ("CAT_None", "CAT_Actor", "CAT_Prop", "CAT_Camera"):
+    if text == "CAT_Camera" or "CAT_Camera" in text:
+        return "CAT_Camera"
+    if _is_cutscene_camera_actor_name(actor_name):
+        return "CAT_Camera"
+    for candidate in ("CAT_None", "CAT_Actor", "CAT_Prop"):
         if text == candidate or candidate in text:
             return candidate
-    if str(actor_name or "").strip().lower() == "camera":
-        return "CAT_Camera"
     return "CAT_Actor"
 
 
@@ -2344,6 +2398,591 @@ def _bake_cutscene_body_part_events(cutscene_template, animation_contexts, actor
                 pass
 
 
+def _cutscene_item_event_field(event, field_name, default=""):
+    value = getattr(event, field_name, None)
+    if value not in (None, ""):
+        return value
+    raw_fields = getattr(event, "raw_fields", None)
+    if isinstance(raw_fields, dict):
+        return raw_fields.get(field_name, default)
+    return default
+
+
+def _is_cutscene_item_event(event):
+    return str(_cutscene_event_value(event, "type_name", "") or "") == ITEM_EVENT_TYPE
+
+
+def _cutscene_item_event_action(event):
+    action = str(_cutscene_item_event_field(event, "action", "") or "").strip()
+    return action or "IA_Mount"
+
+
+def _cutscene_item_event_getting(event):
+    item_getting = str(_cutscene_item_event_field(event, "itemGetting", "") or "").strip()
+    return item_getting or "GI_ByName"
+
+
+def _cutscene_item_identity_key(category, item_name, template):
+    parts = [
+        import_entity._normalize_key(category),
+        import_entity._normalize_key(item_name),
+        import_entity._normalize_key(template),
+    ]
+    if not any(parts):
+        return ""
+    return "::".join(parts)
+
+
+def _cutscene_equipment_source_roots(actor_obj, filename):
+    roots = []
+    try:
+        roots.extend(import_entity._get_armature_source_roots(actor_obj))
+    except Exception:
+        pass
+
+    if not roots:
+        try:
+            rig_settings = getattr(getattr(actor_obj, "data", None), "witcherui_RigSettings", None)
+            repo_path = str(getattr(rig_settings, "repo_path", "") or "").strip()
+            if repo_path and os.path.isabs(repo_path):
+                roots.extend(import_entity._build_entity_source_roots(repo_path))
+        except Exception:
+            pass
+
+    if _is_w2_cutscene_file(filename):
+        try:
+            cutscene_root = w2_source_repo_root(filename)
+            if cutscene_root:
+                roots.append(cutscene_root)
+        except Exception:
+            pass
+        try:
+            from ..source_game_paths import w2_source_roots
+            roots.extend(w2_source_roots(bpy.context, existing_only=True))
+        except Exception:
+            pass
+    else:
+        try:
+            cutscene_root = import_entity._derive_repo_root_hint(filename)
+            if cutscene_root:
+                roots.append(cutscene_root)
+        except Exception:
+            pass
+
+    out = []
+    seen = set()
+    for root in roots:
+        if not root:
+            continue
+        try:
+            norm = os.path.normcase(os.path.normpath(str(root)))
+        except Exception:
+            norm = str(root).lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(str(root))
+    return out
+
+
+def _cutscene_item_catalog_context(actor_obj, filename):
+    from ..ui import ui_equipment
+
+    source_roots = _cutscene_equipment_source_roots(actor_obj, filename)
+    source_game = "w2" if _is_w2_cutscene_file(filename) else ui_equipment.get_equipment_source_game_for_search_roots(source_roots)
+    try:
+        ui_equipment.ensure_equipment_catalog_ready(source_game, search_roots=source_roots, context=bpy.context)
+    except Exception:
+        log.debug("Failed to ensure equipment catalog for cutscene item events", exc_info=True)
+    category_items, item_attributes = ui_equipment._get_equipment_catalog(source_game)
+    return ui_equipment, source_roots, source_game, category_items, item_attributes
+
+
+def _cutscene_lookup_item_attributes(ui_equipment, item_name, template, source_game, item_attributes):
+    for key in (item_name, template):
+        key = str(key or "").strip()
+        if not key:
+            continue
+        attrs = item_attributes.get(key, {})
+        if isinstance(attrs, dict) and attrs:
+            return dict(attrs)
+        attrs = ui_equipment.get_item_attributes_by_identifier(key, source_game=source_game)
+        if attrs:
+            return dict(attrs)
+    return {}
+
+
+def _cutscene_category_items(category, category_items):
+    category = str(category or "").strip()
+    if not category:
+        return []
+    items = category_items.get(category, [])
+    if items:
+        return list(items)
+    wanted = import_entity._normalize_key(category)
+    for cat_name, values in category_items.items():
+        if import_entity._normalize_key(cat_name) == wanted:
+            return list(values)
+    return []
+
+
+def _cutscene_template_for_category_item(category, item_name, category_items):
+    item_key = import_entity._normalize_key(item_name)
+    if not item_key:
+        return ""
+    for name, _display, template in _cutscene_category_items(category, category_items):
+        if import_entity._normalize_key(name) != item_key:
+            continue
+        template = str(template or "").strip()
+        if template and template.lower() != "none":
+            return template
+    return ""
+
+
+def _cutscene_inventory_item_for_category(actor_obj, category):
+    category_key = import_entity._normalize_key(category)
+    if not category_key:
+        return None
+
+    rig_settings = getattr(getattr(actor_obj, "data", None), "witcherui_RigSettings", None)
+    entity, entity_data = import_entity.get_rig_entity_state(rig_settings)
+    selected_appearance = None
+    try:
+        app_idx = int(getattr(rig_settings, "app_list_index", -1) or -1)
+        appearances = list(getattr(entity, "appearances", None) or [])
+        if 0 <= app_idx < len(appearances):
+            selected_appearance = appearances[app_idx]
+    except Exception:
+        selected_appearance = None
+    if selected_appearance is None and isinstance(entity_data, dict):
+        try:
+            app_idx = int(getattr(rig_settings, "app_list_index", -1) or -1)
+            appearances = list(entity_data.get("appearances", []) or [])
+            if 0 <= app_idx < len(appearances):
+                selected_appearance = appearances[app_idx]
+        except Exception:
+            selected_appearance = None
+
+    def _find_candidates(wanted_key):
+        candidates = []
+        for order, entry in enumerate(import_entity._iter_inventory_entries(selected_appearance, entity)):
+            entry_category = import_entity._get_inventory_category(entry)
+            if import_entity._normalize_key(entry_category) != wanted_key:
+                continue
+            item_name = str(import_entity._get_inventory_item_name(entry) or "").strip()
+            template = str(import_entity._get_inventory_equip_template(entry) or "").strip()
+            is_mount = bool(import_entity._inventory_entry_is_mount(entry))
+            if item_name or template:
+                candidates.append((not is_mount, order, entry_category, item_name, template))
+        return candidates
+
+    candidates = _find_candidates(category_key)
+    if not candidates:
+        mirror_key = ITEM_EVENT_MIRROR_CATEGORY.get(category_key, "")
+        if mirror_key:
+            candidates = _find_candidates(mirror_key)
+
+    if not candidates:
+        return None
+    _not_mounted, _order, entry_category, item_name, template = sorted(candidates)[0]
+    return {
+        "category": entry_category or category,
+        "item_name": item_name,
+        "template": template,
+    }
+
+
+def _cutscene_default_item_for_category(category):
+    return ITEM_EVENT_DEFAULT_ITEM.get(import_entity._normalize_key(category), "")
+
+
+def _resolve_cutscene_item_event(event, actor_obj, category_items, item_attributes, ui_equipment, source_game):
+    category = str(_cutscene_item_event_field(event, "category", "") or "").strip()
+    item_name = str(_cutscene_item_event_field(event, "itemName_optional", "") or "").strip()
+    prefer_category = _cutscene_item_event_getting(event) == "GI_ByCategory"
+    template = ""
+
+    if category and (prefer_category or not item_name):
+        inventory_item = _cutscene_inventory_item_for_category(actor_obj, category)
+        if inventory_item:
+            category = str(inventory_item.get("category", "") or category).strip()
+            item_name = str(inventory_item.get("item_name", "") or "").strip()
+            template = str(inventory_item.get("template", "") or "").strip()
+    if not item_name and category:
+        item_name = _cutscene_default_item_for_category(category) or category
+
+    attrs = _cutscene_lookup_item_attributes(ui_equipment, item_name, template, source_game, item_attributes)
+    if attrs:
+        category = str(attrs.get("category", "") or category).strip()
+        item_name = str(attrs.get("item_name", "") or item_name).strip()
+        template = str(
+            attrs.get("equip_template", "")
+            or attrs.get("template_name", "")
+            or attrs.get("hold_template", "")
+            or template
+        ).strip()
+
+    if not template and item_name:
+        template = _cutscene_template_for_category_item(category, item_name, category_items)
+    if not template:
+        template = import_entity._derive_template_from_item(item_name) or item_name
+
+    if not (category or item_name or template):
+        return None
+
+    return {
+        "category": category,
+        "item_name": item_name or template,
+        "template": template,
+        "attrs": attrs,
+    }
+
+
+def _cutscene_slot_prop(slot, key, default=None):
+    try:
+        value = slot.get(key, default)
+    except Exception:
+        value = default
+    return value
+
+
+def _cutscene_item_slot_key(resolved, mount_mode, hold_slot_override):
+    category = str(resolved.get("category", "") or "").strip()
+    item_name = str(resolved.get("item_name", "") or "").strip()
+    template = str(resolved.get("template", "") or "").strip()
+    return "::".join([
+        _cutscene_item_identity_key(category, item_name, template),
+        str(mount_mode or ""),
+        str(hold_slot_override or ""),
+    ])
+
+
+def _remove_cutscene_item_slot(ui_equipment, rig_settings, slot_idx, slot=None):
+    if slot is None:
+        try:
+            slot = rig_settings.equipment_slots[int(slot_idx)]
+        except Exception:
+            slot = None
+    if slot is not None:
+        try:
+            ui_equipment.unload_equipment_item(slot)
+        except Exception:
+            pass
+    try:
+        rig_settings.equipment_slots.remove(int(slot_idx))
+        return True
+    except Exception:
+        return False
+
+
+def _find_or_create_cutscene_item_slot(rig_settings, resolved, mount_mode, hold_slot_override):
+    slot_key = _cutscene_item_slot_key(resolved, mount_mode, hold_slot_override)
+    slots = rig_settings.equipment_slots
+    for idx, slot in enumerate(slots):
+        if str(_cutscene_slot_prop(slot, CUTSCENE_ITEM_EVENT_KEY_PROP, "") or "") == slot_key:
+            return idx, slot
+
+    slot = slots.add()
+    idx = len(slots) - 1
+    try:
+        slot[CUTSCENE_ITEM_EVENT_SLOT_PROP] = True
+        slot[CUTSCENE_ITEM_EVENT_KEY_PROP] = slot_key
+    except Exception:
+        pass
+    return idx, slot
+
+
+def _populate_cutscene_item_slot(slot, resolved, source_game, hold_slot_override):
+    attrs = dict(resolved.get("attrs", {}) or {})
+    template = str(resolved.get("template", "") or "").strip()
+    item_name = str(resolved.get("item_name", "") or "").strip()
+    category = str(resolved.get("category", "") or "").strip()
+
+    slot.source_game = source_game
+    slot.category = category
+    slot.item_name = item_name or template
+    slot.equip_template = template
+    slot.base_equip_template = template
+    slot.resolved_repo_path = ""
+    slot.is_inventory = True
+    slot.keep_across_appearances = True
+
+    if attrs:
+        slot.equip_slot = attrs.get("equip_slot", getattr(slot, "equip_slot", ""))
+        slot.hold_slot = attrs.get("hold_slot", getattr(slot, "hold_slot", ""))
+        slot.weapon = bool(attrs.get("weapon", getattr(slot, "weapon", False)))
+        slot.attachment_type = attrs.get("attachment_type", getattr(slot, "attachment_type", ""))
+        try:
+            import json
+            slot.variants_json = json.dumps(attrs.get("variants", []))
+            slot.bound_items_json = json.dumps(attrs.get("bound_items", []))
+        except Exception:
+            pass
+    if hold_slot_override:
+        slot.hold_slot = hold_slot_override
+
+
+def _clear_cutscene_item_event_slots(ui_equipment, rig_settings):
+    slots = getattr(rig_settings, "equipment_slots", None)
+    if slots is None:
+        return 0
+    removed = 0
+    for idx in range(len(slots) - 1, -1, -1):
+        slot = slots[idx]
+        if not bool(_cutscene_slot_prop(slot, CUTSCENE_ITEM_EVENT_SLOT_PROP, False)):
+            continue
+        if _remove_cutscene_item_slot(ui_equipment, rig_settings, idx, slot):
+            removed += 1
+    return removed
+
+
+def _set_cutscene_item_visibility_key(objects, frame, hidden):
+    frame = float(frame or 0.0)
+    for obj in objects or []:
+        if obj is None or obj.get("witcher_mount_anchor"):
+            continue
+        try:
+            obj.hide_viewport = bool(hidden)
+            obj.hide_render = bool(hidden)
+            obj.hide_set(bool(hidden))
+            obj.keyframe_insert(data_path="hide_viewport", frame=frame)
+            obj.keyframe_insert(data_path="hide_render", frame=frame)
+        except Exception:
+            log.debug("Failed to key cutscene item visibility on '%s'", getattr(obj, "name", "?"), exc_info=True)
+
+
+def _set_cutscene_item_visibility_interpolation(objects):
+    for obj in objects or []:
+        action = getattr(getattr(obj, "animation_data", None), "action", None)
+        if action is None:
+            continue
+        for fcurve in iter_action_fcurves(action, target=obj):
+            if str(getattr(fcurve, "data_path", "") or "") not in {"hide_viewport", "hide_render"}:
+                continue
+            for keyframe in fcurve.keyframe_points:
+                keyframe.interpolation = "CONSTANT"
+            try:
+                fcurve.update()
+            except Exception:
+                pass
+
+
+def _iter_cutscene_item_events(cutscene_template, animation_contexts, actor_name=""):
+    actor_name = str(actor_name or "").strip()
+    animation_contexts = list(animation_contexts or [])
+    if not animation_contexts:
+        return []
+
+    render = getattr(getattr(bpy, "context", None), "scene", None)
+    render = getattr(render, "render", None)
+    fallback_fps = next(
+        (float(ctx.get("frames_per_second", 0.0) or 0.0) for ctx in animation_contexts
+         if float(ctx.get("frames_per_second", 0.0) or 0.0) > 0.0),
+        float(render.fps if render else 30.0),
+    )
+
+    events = []
+    order = 0
+    for context in animation_contexts:
+        anim_name = str(context.get("anim_name", "") or "")
+        anim_actor_name, component_name, _display_name = split_cutscene_animation_name(anim_name)
+        if actor_name and anim_actor_name and anim_actor_name != actor_name:
+            continue
+        if not _is_cutscene_item_event_component(component_name):
+            continue
+        fps = float(context.get("frames_per_second", 0.0) or fallback_fps or 30.0)
+        for event in getattr(context.get("node"), "entries", None) or []:
+            if not _is_cutscene_item_event(event):
+                continue
+            start_time = float(_cutscene_event_value(event, "start_time", 0.0) or 0.0)
+            events.append({
+                "event": event,
+                "frame": float(context.get("at_frame", 0.0) or 0.0) + (start_time * fps),
+                "order": order,
+            })
+            order += 1
+
+    for event in getattr(cutscene_template, "animevents", None) or []:
+        if not _is_cutscene_item_event(event):
+            continue
+        animation_name = str(_cutscene_event_value(event, "animation_name", "") or "").strip()
+        event_actor_name, component_name, _display_name = split_cutscene_animation_name(animation_name)
+        if actor_name and event_actor_name and event_actor_name != actor_name:
+            continue
+        if actor_name and not event_actor_name:
+            continue
+        if not _is_cutscene_item_event_component(component_name):
+            continue
+        fps = _resolve_cutscene_event_fps(event, animation_contexts, fallback_fps)
+        start_time = float(_cutscene_event_value(event, "start_time", 0.0) or 0.0)
+        events.append({"event": event, "frame": start_time * fps, "order": order})
+        order += 1
+
+    return sorted(events, key=lambda item: (float(item.get("frame", 0.0) or 0.0), int(item.get("order", 0) or 0)))
+
+
+def _bake_cutscene_item_events(cutscene_template, filename, animation_contexts, actor_obj, actor_name=""):
+    if actor_obj is None or getattr(actor_obj, "type", None) != "ARMATURE":
+        return 0
+
+    rig_settings = getattr(getattr(actor_obj, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is None:
+        return 0
+
+    item_events = _iter_cutscene_item_events(cutscene_template, animation_contexts, actor_name=actor_name)
+    if not item_events:
+        try:
+            from ..ui import ui_equipment
+            _clear_cutscene_item_event_slots(ui_equipment, rig_settings)
+            ui_equipment.sync_equipment_slots_to_temp(bpy.context, rig_settings)
+        except Exception:
+            pass
+        return 0
+
+    try:
+        ui_equipment, source_roots, source_game, category_items, item_attributes = _cutscene_item_catalog_context(
+            actor_obj,
+            filename,
+        )
+    except Exception:
+        log.exception("Failed to prepare equipment catalog for cutscene item events")
+        return 0
+
+    _clear_cutscene_item_event_slots(ui_equipment, rig_settings)
+
+    prepared = {"source_roots": source_roots, "source_game": source_game}
+    loaded_by_slot_key = {}
+    failed_slot_keys = set()
+    keyed_objects = set()
+    loaded_count = 0
+
+    try:
+        ui_equipment.refresh_slot_constraints(actor_obj)
+    except Exception:
+        pass
+
+    scene = getattr(bpy.context, "scene", None)
+    scene_start = float(getattr(scene, "frame_start", 0) or 0)
+
+    for item in item_events:
+        event = item.get("event")
+        action = _cutscene_item_event_action(event)
+        frame = float(item.get("frame", 0.0) or 0.0)
+
+        resolved = _resolve_cutscene_item_event(
+            event,
+            actor_obj,
+            category_items,
+            item_attributes,
+            ui_equipment,
+            source_game,
+        )
+        if not resolved:
+            continue
+
+        identity_key = _cutscene_item_identity_key(
+            resolved.get("category", ""),
+            resolved.get("item_name", ""),
+            resolved.get("template", ""),
+        )
+        if not identity_key:
+            continue
+
+        if action == ITEM_EVENT_UNMOUNT_ACTION:
+            for state in loaded_by_slot_key.values():
+                if state.get("identity_key") != identity_key:
+                    continue
+                _set_cutscene_item_visibility_key(state.get("objects", []), frame, True)
+                keyed_objects.update(state.get("objects", []))
+            continue
+
+        mount_info = ITEM_EVENT_MOUNT_BY_ACTION.get(action)
+        if mount_info is None:
+            continue
+
+        mount_mode, hold_slot_override = mount_info
+        planned_slot_key = _cutscene_item_slot_key(resolved, mount_mode, hold_slot_override)
+        if planned_slot_key in failed_slot_keys:
+            continue
+
+        slot_idx, slot = _find_or_create_cutscene_item_slot(
+            rig_settings,
+            resolved,
+            mount_mode,
+            hold_slot_override,
+        )
+        _populate_cutscene_item_slot(slot, resolved, source_game, hold_slot_override)
+
+        slot_key = str(_cutscene_slot_prop(slot, CUTSCENE_ITEM_EVENT_KEY_PROP, "") or "")
+        if not slot_key:
+            slot_key = planned_slot_key
+        if slot_key in failed_slot_keys:
+            _remove_cutscene_item_slot(ui_equipment, rig_settings, slot_idx, slot)
+            continue
+
+        if slot_key not in loaded_by_slot_key:
+            loaded = ui_equipment.load_equipment_items_batch(
+                bpy.context,
+                actor_obj,
+                [slot_idx],
+                rig_settings=rig_settings,
+                prepared_context=prepared,
+                reload_loaded=True,
+                post_refresh_variants=False,
+                mount_mode=mount_mode,
+            )
+            if not loaded:
+                reason = ""
+                try:
+                    reason = ui_equipment._get_last_equipment_load_failure(actor_obj, slot_idx)
+                except Exception:
+                    reason = ""
+                log.warning(
+                    "Cutscene item event could not load '%s' (%s): %s",
+                    resolved.get("item_name", "") or resolved.get("template", ""),
+                    mount_mode,
+                    reason or "no visual item resolved",
+                )
+                failed_slot_keys.add(slot_key)
+                _remove_cutscene_item_slot(ui_equipment, rig_settings, slot_idx, slot)
+                continue
+
+            objects = [
+                obj for obj in ui_equipment.find_objects_by_guid(getattr(slot, "equip_guid", ""), "witcher_equip_guid")
+                if obj is not None
+            ]
+            loaded_by_slot_key[slot_key] = {
+                "identity_key": identity_key,
+                "objects": objects,
+            }
+            loaded_count += 1
+
+            if frame > scene_start:
+                _set_cutscene_item_visibility_key(objects, max(scene_start, frame - 1.0), True)
+
+        for existing_key, state in loaded_by_slot_key.items():
+            if existing_key == slot_key or state.get("identity_key") != identity_key:
+                continue
+            _set_cutscene_item_visibility_key(state.get("objects", []), frame, True)
+            keyed_objects.update(state.get("objects", []))
+
+        objects = loaded_by_slot_key.get(slot_key, {}).get("objects", [])
+        _set_cutscene_item_visibility_key(objects, frame, False)
+        keyed_objects.update(objects)
+
+    _set_cutscene_item_visibility_interpolation(keyed_objects)
+    try:
+        ui_equipment.sync_equipment_slots_to_temp(bpy.context, rig_settings)
+    except Exception:
+        pass
+    if scene is not None:
+        try:
+            scene.frame_set(scene.frame_current)
+        except Exception:
+            pass
+    return loaded_count
+
+
 def _apply_cutscene_animation_sequence_template(cutscene_template, filename, animation_indices, actor_obj, actor_name="",
                                                 track_name=CUTSCENE_TRACK_NAME, return_errors=False):
     if cutscene_template is None or actor_obj is None:
@@ -2411,12 +3050,19 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
             )
 
     if applied_indices:
+        loaded_contexts = [ctx for ctx in animation_contexts if int(ctx.get("source_index", -1)) in applied_indices]
         try:
-            loaded_contexts = [ctx for ctx in animation_contexts if int(ctx.get("source_index", -1)) in applied_indices]
             _bake_cutscene_body_part_events(cutscene_template, loaded_contexts, actor_obj, actor_name=actor_name)
         except Exception:
             log.exception(
                 "Failed to bake cutscene body-part appearance events on actor '%s'.",
+                getattr(actor_obj, "name", "<unknown>"),
+            )
+        try:
+            _bake_cutscene_item_events(cutscene_template, filename, loaded_contexts, actor_obj, actor_name=actor_name)
+        except Exception:
+            log.exception(
+                "Failed to bake cutscene item events on actor '%s'.",
                 getattr(actor_obj, "name", "<unknown>"),
             )
 

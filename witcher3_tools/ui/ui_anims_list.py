@@ -167,10 +167,14 @@ def _target_is_cutscene_camera(armature_obj) -> bool:
     try:
         if str(armature_obj.get("cutscene_actor_type", "") or "").strip() == "CAT_Camera":
             return True
-        if str(armature_obj.get("cutscene_actor_name", "") or "").strip().lower() == "camera":
+        actor_name = str(armature_obj.get("cutscene_actor_name", "") or "").strip().lower()
+        if actor_name == "camera" or (actor_name.startswith("camera") and actor_name[len("camera"):].isdigit()):
             return True
     except Exception:
         pass
+    text = _armature_identity_text(armature_obj)
+    if "characters\\templates\\camera\\" in text or "gameplay\\camera\\scene_camera.w2ent" in text:
+        return True
     try:
         pose_bones = getattr(getattr(armature_obj, "pose", None), "bones", None)
         return bool(pose_bones is not None and pose_bones.get("Camera_Node") is not None)

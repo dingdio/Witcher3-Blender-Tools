@@ -429,8 +429,7 @@ def _cs_find_camera_armature(context):
         return None
     for obj in scene.objects:
         if getattr(obj, "type", None) == 'ARMATURE':
-            actor_type = str(obj.get("cutscene_actor_type", "") or "")
-            if actor_type == "CAT_Camera" or str(obj.get("cutscene_actor_name", "") or "").lower() == "camera":
+            if import_cutscene._is_cutscene_camera_actor_metadata(actor_obj=obj):
                 return obj
     return None
 

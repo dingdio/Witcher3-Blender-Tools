@@ -27,6 +27,8 @@ CAMERA_DOF_TRACK_NAMES = (
 CAMERA_CONTROL_BONE = "Camera_Node"
 CAMERA_EDIT_BONE = "Camera_ManipulationNode"
 CAMERA_SENSOR_HEIGHT = 43.266615300557
+CAMERA_FOV_MIN = 1.0
+CAMERA_FOV_MAX = 179.0
 BLENDER_DOF_INTENSITY_FSTOP = 2.8
 BLENDER_DOF_INTENSITY_BIAS = 0.25
 BLENDER_DOF_FOCUS_RANGE_FSTOP = 2.0
@@ -36,6 +38,36 @@ BLENDER_DOF_NEAR_BLUR_FSTOP = 0.5
 
 def is_camera_track_name(track_name: str) -> bool:
     return str(track_name or "") in CAMERA_TRACK_DEFAULTS
+
+
+def is_valid_camera_fov(value) -> bool:
+    try:
+        fov = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(fov) and CAMERA_FOV_MIN < fov < CAMERA_FOV_MAX
+
+
+def sanitize_camera_fov(value, fallback=None) -> float:
+    if is_valid_camera_fov(value):
+        return float(value)
+    if is_valid_camera_fov(fallback):
+        return float(fallback)
+    return float(CAMERA_TRACK_DEFAULTS["hctFOV"])
+
+
+def sanitize_camera_fov_sequence(values, default=None):
+    previous = sanitize_camera_fov(default)
+    sanitized = []
+    changed = False
+    for value in values or []:
+        if is_valid_camera_fov(value):
+            previous = float(value)
+            sanitized.append(previous)
+        else:
+            sanitized.append(previous)
+            changed = True
+    return sanitized, changed
 
 
 def ensure_camera_track_properties(armature_obj, track_names=None):
@@ -52,10 +84,26 @@ def ensure_camera_track_properties(armature_obj, track_names=None):
         if not track_name:
             continue
         if track_name not in camera_bone:
-            camera_bone[track_name] = float(CAMERA_TRACK_DEFAULTS.get(track_name, 0.0))
+            try:
+                camera_bone[track_name] = float(CAMERA_TRACK_DEFAULTS.get(track_name, 0.0))
+            except Exception:
+                continue
+        elif track_name == "hctFOV":
+            sanitized_fov = sanitize_camera_fov(
+                camera_bone.get(track_name),
+                fallback=CAMERA_TRACK_DEFAULTS["hctFOV"],
+            )
+            if sanitized_fov != camera_bone.get(track_name):
+                try:
+                    camera_bone[track_name] = sanitized_fov
+                except Exception:
+                    pass
         try:
             ui = camera_bone.id_properties_ui(track_name)
-            ui.update(default=float(CAMERA_TRACK_DEFAULTS.get(track_name, 0.0)))
+            ui_args = {"default": float(CAMERA_TRACK_DEFAULTS.get(track_name, 0.0))}
+            if track_name == "hctFOV":
+                ui_args.update(min=CAMERA_FOV_MIN, max=CAMERA_FOV_MAX)
+            ui.update(**ui_args)
         except Exception:
             pass
     return camera_bone
@@ -119,7 +167,10 @@ def setup_camera_fov_driver(armature_obj, camera_obj, channel="hctFOV"):
         camera_data,
         "lens",
         armature_obj,
-        f"{CAMERA_SENSOR_HEIGHT} / ( 2 * tan( pi * {channel} / 360.0 ) )",
+        (
+            f"{CAMERA_SENSOR_HEIGHT} / ( 2 * tan( pi * "
+            f"max({CAMERA_FOV_MIN}, min({CAMERA_FOV_MAX}, {channel})) / 360.0 ) )"
+        ),
         [(channel, channel)],
     )
     armature_obj.update_tag()
@@ -295,7 +346,7 @@ def set_camera_dof_from_blender_camera(camera_bone, camera_obj, *,
 
 
 def fov_to_lens(fov: float) -> float:
-    fov = float(fov)
-    if fov <= 1.0 or fov >= 179.0:
+    if not is_valid_camera_fov(fov):
         return 50.0
+    fov = float(fov)
     return CAMERA_SENSOR_HEIGHT / (2.0 * math.tan(math.pi * fov / 360.0))

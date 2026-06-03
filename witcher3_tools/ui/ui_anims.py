@@ -967,7 +967,17 @@ def _find_camera_armature(context):
             continue
         actor_type = str(obj.get("cutscene_actor_type", "") or "")
         actor_name = str(obj.get("cutscene_actor_name", "") or "").lower()
-        if "CAT_Camera" in actor_type or actor_name == "camera":
+        identity = " ".join(
+            str(obj.get(prop_name, "") or "").replace("/", "\\").lower()
+            for prop_name in ("cutscene_actor_template", "cutscene_actor_resolved_template", "witcher_path")
+        )
+        if (
+            "CAT_Camera" in actor_type
+            or actor_name == "camera"
+            or (actor_name.startswith("camera") and actor_name[len("camera"):].isdigit())
+            or "characters\\templates\\camera\\" in identity
+            or "gameplay\\camera\\scene_camera.w2ent" in identity
+        ):
             return obj
     return None
 
