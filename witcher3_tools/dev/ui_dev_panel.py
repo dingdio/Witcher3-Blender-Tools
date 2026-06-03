@@ -301,16 +301,32 @@ def _get_entry_fs_path(path_obj):
     return str(path_obj.get("path", "") or "").strip()
 
 
-def _get_entry_repo_paths(path_obj):
-    """Return all depot/repo paths as a list. repo_path may be a string or list of strings."""
+_REPO_PATH_KEYS = ("repo_path", "w2_repo_path", "w2_redkit_path")
+
+
+def _get_entry_repo_path_key(path_obj):
     if not isinstance(path_obj, dict):
+        return ""
+    for key in _REPO_PATH_KEYS:
+        if path_obj.get(key):
+            return key
+    return ""
+
+
+def _get_entry_repo_paths(path_obj):
+    """Return all repo-like paths as a list. Values may be a string or list."""
+    key = _get_entry_repo_path_key(path_obj)
+    if not key:
         return []
-    raw = path_obj.get("repo_path", "")
-    if not raw:
-        return []
+    raw = path_obj.get(key, "")
     if isinstance(raw, list):
         return [str(p).strip().replace("/", "\\") for p in raw if str(p).strip()]
     return [str(raw).strip().replace("/", "\\")]
+
+
+def _get_entry_repo_path_label(path_obj):
+    key = _get_entry_repo_path_key(path_obj)
+    return key[:-5] if key.endswith("_path") else ""
 
 
 def _get_entry_repo_path(path_obj):
@@ -355,8 +371,9 @@ def _is_override_value_set(value) -> bool:
 
 def _resolve_entry_import_paths(path_obj):
     """Resolve an entry to a list of filesystem paths suitable for import operators."""
+    repo_key = _get_entry_repo_path_key(path_obj)
     repo_paths = _get_entry_repo_paths(path_obj)
-    if repo_paths:
+    if repo_paths and repo_key == "repo_path":
         source_game = _safe_text(path_obj.get("source_game", "")) if isinstance(path_obj, dict) else ""
         if source_game:
             from ..source_game_paths import normalize_source_game
@@ -374,6 +391,13 @@ def _resolve_entry_import_paths(path_obj):
             return [repo_file_for_source(rp, source_game) for rp in repo_paths]
         from ..CR2W.common_blender import repo_file
         return [repo_file(rp) for rp in repo_paths]
+    if repo_paths and repo_key == "w2_repo_path":
+        from .. import get_w2_unbundle_path
+        root = _safe_text(get_w2_unbundle_path(bpy.context))
+        return [os.path.normpath(os.path.join(root, rp)) if root else rp for rp in repo_paths]
+    if repo_paths and repo_key == "w2_redkit_path":
+        root = _safe_text(get_dev_panel_overrides(include_when_disabled=True).get("w2_redkit_path", ""))
+        return [os.path.normpath(os.path.join(root, rp)) if root else rp for rp in repo_paths]
     fs_path = _get_entry_fs_path(path_obj)
     return [fs_path] if fs_path else []
 
@@ -1012,6 +1036,7 @@ class VIEW3D_PT_witcher_dev(Panel):
             problem = path_obj.get("problem", "")
             is_selected = (selected_sec == sec_idx and selected_path == path_idx)
             is_repo_path = _is_repo_path_entry(path_obj)
+            path_label = _get_entry_repo_path_label(path_obj)
             exists = _entry_exists_ui(path_obj)
             has_problem = bool(problem)
 
@@ -1043,17 +1068,18 @@ class VIEW3D_PT_witcher_dev(Panel):
                 label = get_basename(display_path)
             else:
                 label = "(empty)"
-            if is_repo_path:
-                label = f"[repo] {label}"
+            if path_label:
+                label = f"[{path_label}] {label}"
             if note:
                 label = f"{label} - {note}"
             row.label(text=label)
 
             # Open in Explorer button
+            open_path = _resolve_entry_import_path(path_obj) if is_repo_path else display_path
             sub = row.row()
-            sub.enabled = bool(display_path)
+            sub.enabled = bool(open_path)
             op = sub.operator("witcher_dev.open_in_explorer", icon='FILE_FOLDER', text="")
-            op.filepath = display_path
+            op.filepath = open_path
 
             # Import button
             sub = row.row()
