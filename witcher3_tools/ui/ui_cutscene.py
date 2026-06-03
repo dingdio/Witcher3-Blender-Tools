@@ -53,6 +53,13 @@ def _scene_fps(scene):
     return fps / fps_base if fps_base else fps
 
 
+def _coerce_cutscene_index(value, default=-1):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
 def _strip_get(strip, prop_name, default=""):
     try:
         return strip.get(prop_name, default)
@@ -457,6 +464,7 @@ class CutsceneActorPreviewItem(PropertyGroup):
     label: StringProperty(default="")
     actor_name: StringProperty(default="")
     template_path: StringProperty(default="")
+    source_game: StringProperty(default="")
     appearance_name: StringProperty(default="")
     actor_type: StringProperty(default="")
     use_mimic: BoolProperty(default=False)
@@ -481,6 +489,7 @@ class CutsceneLoadedActorItem(PropertyGroup):
     tag: StringProperty(default="")
     voice_tag: StringProperty(default="")
     template_path: StringProperty(default="")
+    source_game: StringProperty(default="")
     appearance_name: StringProperty(default="")
     actor_type: StringProperty(default="")
     final_position: StringProperty(default="")
@@ -536,6 +545,7 @@ class CutsceneDialogItem(PropertyGroup):
     line_index: IntProperty(name="dialogLine Int32", default=0)
     line_text: StringProperty(name="LocalizedString.text", default="")
     scene_path: StringProperty(name="source .w2scene", default="")
+    source_game: StringProperty(name="source game", default="")
     start_frame: IntProperty(name="computed start frame", default=0)
     end_frame: IntProperty(name="computed end frame", default=0)
     imported_sound: BoolProperty(name="imported audio strip", default=False)
@@ -999,6 +1009,7 @@ def _cutscene_dialog_strip_props(filepath, dialog_data, item=None):
     line_id = str(getattr(item, "line_id", "") or _cutscene_dialog_line_id(dialog_data))
     line_text = str(getattr(item, "line_text", "") or dialog_data.get("line_text", "") or "")
     sound_event = str(getattr(item, "sound_event", "") or dialog_data.get("sound_event", "") or "")
+    source_game = str(getattr(item, "source_game", "") or dialog_data.get("source_game", "") or "")
     text_language = dialog_language.get_active_text_language()
     return {
         dialog_language.DIALOG_SUBTITLE_TEXT_PROP: line_text,
@@ -1011,16 +1022,14 @@ def _cutscene_dialog_strip_props(filepath, dialog_data, item=None):
         import_cutscene.CUTSCENE_DIALOG_TEXT_PROP: line_text,
         import_cutscene.CUTSCENE_DIALOG_SOUND_EVENT_PROP: sound_event,
         import_cutscene.CUTSCENE_DIALOG_SOURCE_PATH_PROP: str(filepath or ""),
+        import_cutscene.CUTSCENE_DIALOG_SOURCE_GAME_PROP: source_game,
     }
 
 
 def _find_cutscene_animation_strip_start(scene, animation_entry):
     if animation_entry is None:
         return None
-    try:
-        source_index = int(getattr(animation_entry, "source_index", -1))
-    except Exception:
-        source_index = -1
+    source_index = _coerce_cutscene_index(getattr(animation_entry, "source_index", -1))
     full_name = str(getattr(animation_entry, "full_name", "") or "").strip()
     filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
     track_names = {import_cutscene.CUTSCENE_TRACK_NAME, import_cutscene.CUTSCENE_FACE_TRACK_NAME}
@@ -1039,10 +1048,7 @@ def _find_cutscene_animation_strip_start(scene, animation_entry):
                 action = getattr(strip, "action", None)
                 if action is None:
                     continue
-                try:
-                    action_index = int(action.get(import_cutscene.CUTSCENE_SOURCE_INDEX_PROP, -1) or -1)
-                except Exception:
-                    action_index = -1
+                action_index = _coerce_cutscene_index(action.get(import_cutscene.CUTSCENE_SOURCE_INDEX_PROP, -1))
                 if action_index != source_index:
                     continue
                 action_name = str(action.get(import_cutscene.CUTSCENE_ANIMATION_NAME_PROP, "") or "").strip()
@@ -1066,7 +1072,7 @@ def _collect_cutscene_dialog_event_frames(scene):
         event_scope = str(getattr(event, "event_scope", "") or "").upper()
         event_fps = fps
         start_frame = float(getattr(event, "start_time", 0.0) or 0.0) * fps
-        source_index = int(getattr(event, "source_index", -1) or -1)
+        source_index = _coerce_cutscene_index(getattr(event, "source_index", -1))
         if event_scope == "ENTRY" and source_index >= 0:
             animation_entry = _find_loaded_cutscene_animation_entry(scene, source_index)
             if animation_entry is not None:
@@ -1085,6 +1091,13 @@ def _collect_cutscene_dialog_event_frames(scene):
         })
 
     dialog_events.sort(key=lambda item: (int(item["frame"]), int(item["source_index"])))
+    if not dialog_events:
+        filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+        if filepath:
+            try:
+                dialog_events = import_cutscene.collect_cutscene_dialog_event_frames(filepath)
+            except Exception:
+                log.debug("Could not collect dialog event frames directly from %s.", filepath, exc_info=True)
     return dialog_events
 
 
@@ -1128,6 +1141,7 @@ def _populate_cutscene_dialog_items(scene, dialog_items, dialog_events):
         item.line_index = _cutscene_dialog_int32(dialog_data.get("line_index", 0))
         item.line_text = line_text
         item.scene_path = str(dialog_data.get("scene_path", "") or "")
+        item.source_game = str(dialog_data.get("source_game", "") or "")
         item.start_frame = start_frame
         item.end_frame = start_frame + max(1, duration_frames)
         item.imported_sound = False
@@ -1148,7 +1162,12 @@ def _resolve_cutscene_dialog_item_text(scene, item, language=""):
             source_scene_path = import_cutscene.resolve_cutscene_linked_scene_file(linked_scene_path, cutscene_filepath)
         except Exception:
             log.debug("Could not resolve linked scene path for dialog text: %s", linked_scene_path, exc_info=True)
-    return dialog_language.resolve_localized_text(line_id, source_scene_path or cutscene_filepath, language=language)
+    return dialog_language.resolve_localized_text(
+        line_id,
+        source_scene_path or cutscene_filepath,
+        language=language,
+        source_game=str(getattr(item, "source_game", "") or ""),
+    )
 
 
 def refresh_cutscene_dialog_language(context, refresh_audio=False):
@@ -1189,7 +1208,7 @@ def refresh_cutscene_dialog_language(context, refresh_audio=False):
 
 
 def _load_cutscene_dialogs_into_scene(context):
-    from ..ui.ui_voice import load_voice_and_lipsync
+    from ..ui.ui_voice import load_voice_and_lipsync, load_w2_voice_and_lipsync
 
     scene = context.scene
     filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
@@ -1229,7 +1248,12 @@ def _load_cutscene_dialogs_into_scene(context):
 
         for voice_id in _cutscene_dialog_voice_id_candidates(dialog_data):
             try:
-                soundstrip = load_voice_and_lipsync(
+                load_voice = (
+                    load_w2_voice_and_lipsync
+                    if str(dialog_data.get("source_game", "") or "").upper() == "W2"
+                    else load_voice_and_lipsync
+                )
+                soundstrip = load_voice(
                     str(voice_id),
                     actor=actor_obj,
                     context=context,
@@ -1420,6 +1444,7 @@ def _update_cutscene_preview(operator):
         item.label = str(actor_data["label"])
         item.actor_name = str(actor_data["actor_name"])
         item.template_path = str(actor_data["template_path"])
+        item.source_game = str(actor_data.get("source_game", "") or "")
         item.appearance_name = str(actor_data["appearance_name"])
         item.actor_type = str(actor_data["actor_type"])
         item.use_mimic = bool(actor_data["use_mimic"])
@@ -1534,6 +1559,51 @@ def _get_loaded_cutscene_actor_object(actor_entry):
     return obj
 
 
+def _loaded_cutscene_actor_source_game(actor_obj, fallback=""):
+    if actor_obj is None:
+        return str(fallback or "")
+    for prop_name in (
+        import_cutscene.CUTSCENE_ACTOR_SOURCE_GAME_PROP,
+        "cutscene_actor_replacement_source_game",
+        "witcher_source_game",
+    ):
+        try:
+            value = str(actor_obj.get(prop_name, "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            value_l = value.lower()
+            if value_l == "w2":
+                return "w2"
+            if value_l == "redkit":
+                return "redkit"
+            return "w3"
+    rig_settings = getattr(getattr(actor_obj, "data", None), "witcherui_RigSettings", None)
+    value = str(getattr(rig_settings, "source_game", "") or "").strip() if rig_settings else ""
+    if value:
+        return "w2" if value.lower() == "w2" else "w3"
+    return str(fallback or "")
+
+
+def _find_loaded_cutscene_actor_entry_for_object(scene, actor_obj):
+    if scene is None or actor_obj is None:
+        return None
+    object_name = str(getattr(actor_obj, "name", "") or "")
+    try:
+        source_index = _coerce_cutscene_index(actor_obj.get(import_cutscene.CUTSCENE_SOURCE_INDEX_PROP, -1))
+    except Exception:
+        source_index = -1
+    actor_name = str(actor_obj.get("cutscene_actor_name", "") or "").strip()
+    for item in getattr(scene, "witcher_cutscene_actor_items", []):
+        if str(getattr(item, "object_name", "") or "") == object_name:
+            return item
+        if source_index >= 0 and _coerce_cutscene_index(getattr(item, "source_index", -2), default=-2) == source_index:
+            return item
+        if actor_name and str(getattr(item, "actor_name", "") or "").strip() == actor_name:
+            return item
+    return None
+
+
 def _same_filesystem_path(path_a, path_b):
     path_a = str(path_a or "").strip()
     path_b = str(path_b or "").strip()
@@ -1585,6 +1655,7 @@ def _validate_loaded_cutscene_state(scene):
             if not actor_entry.cutscene_guid:
                 actor_entry.cutscene_guid = str(actor_obj.get(import_cutscene.CUTSCENE_GUID_PROP, "") or "")
             actor_entry.imported_by_cutscene = bool(actor_obj.get(import_cutscene.CUTSCENE_ACTOR_IMPORTED_PROP, False))
+            actor_entry.source_game = _loaded_cutscene_actor_source_game(actor_obj, fallback=getattr(actor_entry, "source_game", ""))
 
     if not filepath:
         return
@@ -1661,6 +1732,7 @@ def _sync_loaded_cutscene_state(scene, filepath, cutscene_data=None):
                 "cutscene_guid": str(item.cutscene_guid or ""),
                 "is_loaded": bool(item.is_loaded),
                 "imported_by_cutscene": bool(item.imported_by_cutscene),
+                "source_game": str(getattr(item, "source_game", "") or ""),
             }
             for item in getattr(scene, "witcher_cutscene_actor_items", [])
         }
@@ -1713,6 +1785,7 @@ def _sync_loaded_cutscene_state(scene, filepath, cutscene_data=None):
         item.tag = str(actor_data.get("tag", "") or "")
         item.voice_tag = str(actor_data.get("voice_tag", "") or "")
         item.template_path = str(actor_data["template_path"])
+        item.source_game = str(state.get("source_game", "") or actor_data.get("source_game", "") or "")
         item.appearance_name = str(actor_data["appearance_name"])
         item.actor_type = str(actor_data["actor_type"])
         item.final_position = str(actor_data.get("final_position", "") or "")
@@ -1773,6 +1846,9 @@ def _update_loaded_actor_entry_from_result(actor_entry, actor_info):
     actor_entry.cutscene_guid = str(actor_info.get("cutscene_guid", "") or "")
     actor_entry.is_loaded = bool(actor_obj)
     actor_entry.imported_by_cutscene = bool(actor_info.get("imported_new", False))
+    actor_entry.template_path = str(actor_info.get("template_path", "") or getattr(actor_entry, "template_path", ""))
+    actor_entry.appearance_name = str(actor_info.get("appearance_name", "") or getattr(actor_entry, "appearance_name", ""))
+    actor_entry.source_game = str(actor_info.get("source_game", "") or _loaded_cutscene_actor_source_game(actor_obj, fallback=getattr(actor_entry, "source_game", "")))
 
 def _load_cutscene_actor_entry(scene, actor_entry):
     filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
@@ -2262,6 +2338,7 @@ _ACTOR_CUSTOM_PROPS_DEFAULTS = {
     "cutscene_actor_tag":          "",
     "cutscene_actor_voice_tag":    "",
     "cutscene_actor_template":     "",
+    import_cutscene.CUTSCENE_ACTOR_SOURCE_GAME_PROP: "",
     "cutscene_actor_appearance":   "",
     "cutscene_actor_type":         "CAT_Actor",
     "cutscene_actor_final_position":  "",
@@ -2298,6 +2375,12 @@ class WITCH_OT_CutsceneSelectActor(Operator):
             scene.witcher_cutscene_selected_actor_obj = self.object_name
             obj = bpy.data.objects.get(self.object_name)
             _ensure_actor_custom_props(obj)
+            if obj is not None and hasattr(scene, "witcher_cutscene_actor_replace_source"):
+                source_game = _loaded_cutscene_actor_source_game(obj, fallback="")
+                if source_game in {"w2", "w3"}:
+                    scene.witcher_cutscene_actor_replace_source = source_game.upper()
+                elif source_game == "redkit":
+                    scene.witcher_cutscene_actor_replace_source = "REDKIT"
             if hasattr(scene, "witcher_cs_actor_event_filter"):
                 actor_name = str(obj.get("cutscene_actor_name", "") or "").strip().lower() if obj else ""
                 scene.witcher_cs_actor_event_filter = actor_name
@@ -2327,6 +2410,91 @@ class WITCH_OT_CutsceneRemoveActor(Operator):
                 pass
         if str(getattr(scene, "witcher_cutscene_selected_actor_obj", "") or "") == self.object_name:
             scene.witcher_cutscene_selected_actor_obj = ""
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneReplaceActor(Operator):
+    bl_idname = "witcher.cutscene_replace_actor"
+    bl_label = "Replace Actor"
+    bl_description = "Import the selected actor's template path from the chosen source and reload active cutscene animations"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_name: StringProperty(default="")
+
+    def execute(self, context):
+        scene = context.scene
+        old_obj = bpy.data.objects.get(self.object_name)
+        if old_obj is None or getattr(old_obj, "type", None) != 'ARMATURE':
+            self.report({'ERROR'}, "Selected cutscene actor was not found.")
+            return {'CANCELLED'}
+
+        _ensure_actor_custom_props(old_obj)
+        actor_entry = _find_loaded_cutscene_actor_entry_for_object(scene, old_obj)
+        if actor_entry is None:
+            self.report({'ERROR'}, "Loaded cutscene actor entry was not found.")
+            return {'CANCELLED'}
+
+        template_path = str(old_obj.get("cutscene_actor_template", "") or "").strip()
+        if not template_path:
+            self.report({'ERROR'}, "Replacement template path is empty.")
+            return {'CANCELLED'}
+
+        filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+        source_game = str(getattr(scene, "witcher_cutscene_actor_replace_source", "W3") or "W3")
+        try:
+            source_index = _coerce_cutscene_index(
+                old_obj.get(import_cutscene.CUTSCENE_SOURCE_INDEX_PROP, actor_entry.source_index),
+                default=actor_entry.source_index,
+            )
+        except Exception:
+            source_index = _coerce_cutscene_index(getattr(actor_entry, "source_index", -1))
+
+        requested_animation_indices = [
+            int(animation_entry.source_index)
+            for animation_entry in getattr(scene, "witcher_cutscene_animation_items", [])
+            if bool(getattr(animation_entry, "is_loaded", False))
+            and _animation_matches_actor_entry(scene, animation_entry, actor_entry)
+        ]
+
+        try:
+            actor_info = import_cutscene.replace_cutscene_actor_template(
+                old_obj,
+                template_path,
+                source_game=source_game,
+                cutscene_filename=filepath,
+                actor_name=str(old_obj.get("cutscene_actor_name", "") or getattr(actor_entry, "actor_name", "")),
+                actor_type=str(old_obj.get("cutscene_actor_type", "") or getattr(actor_entry, "actor_type", "CAT_Actor")),
+                appearance_name=str(old_obj.get("cutscene_actor_appearance", "") or getattr(actor_entry, "appearance_name", "")),
+                tag=str(old_obj.get("cutscene_actor_tag", "") or getattr(actor_entry, "tag", "")),
+                voice_tag=str(old_obj.get("cutscene_actor_voice_tag", "") or getattr(actor_entry, "voice_tag", "")),
+                final_position=str(old_obj.get("cutscene_actor_final_position", "") or getattr(actor_entry, "final_position", "")),
+                kill_me=bool(old_obj.get("cutscene_actor_kill_me", getattr(actor_entry, "kill_me", False))),
+                use_mimic=bool(old_obj.get("cutscene_actor_use_mimic", getattr(actor_entry, "use_mimic", False))),
+                anim_final_pos=str(old_obj.get("cutscene_actor_anim_final_pos", "") or getattr(actor_entry, "anim_final_pos", "")),
+                source_index=source_index,
+            )
+        except Exception as exc:
+            log.exception("Failed to replace cutscene actor %s", getattr(old_obj, "name", "<unknown>"))
+            self.report({'ERROR'}, f"Actor replace failed: {exc}")
+            return {'CANCELLED'}
+
+        _update_loaded_actor_entry_from_result(actor_entry, actor_info)
+        actor_entry.template_path = template_path
+        actor_entry.source_game = str(actor_info.get("source_game", "") or "").lower()
+        new_obj = actor_info.get("actor_obj")
+        if new_obj is not None:
+            scene.witcher_cutscene_selected_actor_obj = str(getattr(new_obj, "name", "") or "")
+
+        applied_indices, error_messages = _rebuild_cutscene_actor_animations(scene, actor_entry)
+        failed_indices = [idx for idx in requested_animation_indices if idx not in applied_indices]
+        if failed_indices:
+            first_error = str(error_messages.get(failed_indices[0], "") or "").strip()
+            message = f"Replaced actor, but {len(failed_indices)} animation(s) failed to reload"
+            if first_error:
+                message = f"{message}: {first_error}"
+            self.report({'WARNING'}, message)
+        else:
+            self.report({'INFO'}, f"Replaced actor with {source_game} template.")
         return {'FINISHED'}
 
 
@@ -2486,6 +2654,11 @@ _ECutsceneActorType_ITEMS = [
 ]
 _ECutsceneActorType_VALUES = [item[0] for item in _ECutsceneActorType_ITEMS]
 _ECutsceneActorType_INDEX = {v: i for i, v in enumerate(_ECutsceneActorType_VALUES)}
+_CUTSCENE_ACTOR_REPLACE_SOURCE_ITEMS = [
+    ("W3", "W3", "Resolve replacement actor templates from the Witcher 3 repo"),
+    ("W2", "W2", "Resolve replacement actor templates from the Witcher 2 repo"),
+    ("REDKIT", "REDkit", "Resolve replacement actor templates from the active REDkit project/depot roots"),
+]
 
 
 def _actor_type_get(self):
@@ -2597,7 +2770,11 @@ def _draw_cutscene_actors_tab(layout, scene, context=None):
         col.prop(selected_obj, '["cutscene_actor_name"]', text="name")
         col.prop(selected_obj, '["cutscene_actor_tag"]', text="tag")
         col.prop(selected_obj, '["cutscene_actor_voice_tag"]', text="voiceTag")
-        col.prop(selected_obj, '["cutscene_actor_template"]', text="template")
+        template_row = col.row(align=True)
+        template_row.prop(selected_obj, '["cutscene_actor_template"]', text="template")
+        template_row.prop(scene, "witcher_cutscene_actor_replace_source", text="")
+        replace_op = template_row.operator("witcher.cutscene_replace_actor", text="", icon='FILE_REFRESH')
+        replace_op.object_name = selected_obj.name
         col.prop(selected_obj, '["cutscene_actor_appearance"]', text="appearance")
         col.prop(selected_obj, '["cutscene_actor_final_position"]', text="finalPosition")
         col.prop(selected_obj, '["cutscene_actor_anim_final_pos"]', text="animationAtFinalPosition")
@@ -3112,6 +3289,7 @@ classes = [
     WITCH_UL_ActorEntryEventList,
     WITCH_OT_CutsceneSelectActor,
     WITCH_OT_CutsceneRemoveActor,
+    WITCH_OT_CutsceneReplaceActor,
     WITCH_OT_CutsceneRemoveAnimation,
     WITCH_OT_CutsceneAddEvent,
     ButtonOperatorImportW2cutscene,
@@ -3200,6 +3378,12 @@ def register():
         default="",
         options={'SKIP_SAVE'},
     )
+    bpy.types.Scene.witcher_cutscene_actor_replace_source = EnumProperty(
+        name="Actor Template Source",
+        description="Repo source used when replacing the selected cutscene actor",
+        items=_CUTSCENE_ACTOR_REPLACE_SOURCE_ITEMS,
+        default="W3",
+    )
     bpy.types.Object.witcher_cutscene_actor_type = EnumProperty(
         name="type",
         description="ECutsceneActorType for the cutscene actor",
@@ -3249,6 +3433,7 @@ def unregister():
         "witcher_cs_events_anim_idx",
         "witcher_cs_event_view",
         "witcher_cutscene_selected_actor_obj",
+        "witcher_cutscene_actor_replace_source",
         "witcher_cutscene_template_fields",
         "witcher_cutscene_effect_items",
         "witcher_cutscene_dialog_items",

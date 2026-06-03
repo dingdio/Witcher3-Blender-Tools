@@ -289,6 +289,13 @@ def _frames_all_close(frames: Sequence[Sequence[float]], epsilon=1e-7) -> bool:
     return True
 
 
+def _position_frames_match_rest(frames: Sequence[Vec3], rest_pos: Vec3, epsilon=1e-7) -> bool:
+    if not frames or not _frames_all_close(frames, epsilon=epsilon):
+        return False
+    first = _vec3(frames[0], rest_pos)
+    return all(abs(float(a) - float(b)) <= epsilon for a, b in zip(first, rest_pos))
+
+
 def _quat_frames_all_close(frames: Sequence[Quat], epsilon=1e-7) -> bool:
     if len(frames) <= 1:
         return True
@@ -431,6 +438,90 @@ def _source_anim_bone_map(anim_buffer) -> Dict[str, object]:
     return out
 
 
+def _multipart_first_frames(parts: Sequence, first_frames: Sequence) -> List[int]:
+    if len(first_frames or []) == len(parts or []):
+        return [int(frame or 0) for frame in first_frames]
+
+    out = []
+    cursor = 0
+    for part in parts or []:
+        out.append(cursor)
+        part_frames = int(getattr(part, "numFrames", 0) or 0)
+        if part_frames <= 0:
+            part_frames = _animation_frame_count(part, list(_source_anim_bone_map(part).values()))
+        cursor += max(0, part_frames - 1)
+    return out
+
+
+def _multipart_num_frames(parts: Sequence, first_frames: Sequence) -> int:
+    parts = list(parts or [])
+    first_frames = _multipart_first_frames(parts, first_frames)
+    if not parts:
+        return 0
+    max_frame = 1
+    for idx, part in enumerate(parts):
+        start = int(first_frames[idx]) if idx < len(first_frames) else 0
+        part_frames = int(getattr(part, "numFrames", 0) or 0)
+        if part_frames <= 0:
+            part_frames = _animation_frame_count(part, list(_source_anim_bone_map(part).values()))
+        max_frame = max(max_frame, start + max(1, part_frames))
+    return max_frame
+
+
+def _retarget_w2_multipart_animation_entry(
+    animation_entry,
+    source_skeleton,
+    target_skeleton,
+    *,
+    in_place: bool = False,
+    hand_fit: str = "weapon_grip",
+    bone_map: Optional[Dict[str, str]] = None,
+):
+    animation = getattr(animation_entry, "animation", None)
+    old_buffer = getattr(animation, "animBuffer", None)
+    old_parts = list(getattr(old_buffer, "parts", None) or [])
+    if animation is None or not old_parts:
+        return animation_entry
+
+    retargeted_parts = []
+    for part in old_parts:
+        part_entry = copy.deepcopy(animation_entry)
+        part_anim = part_entry.animation
+        part_anim.animBuffer = part
+        part_duration = float(getattr(part, "duration", 0.0) or 0.0)
+        if part_duration > 0.0:
+            part_anim.duration = part_duration
+        part_entry = retarget_w2_animation_entry(
+            part_entry,
+            source_skeleton,
+            target_skeleton,
+            in_place=in_place,
+            hand_fit=hand_fit,
+            bone_map=bone_map,
+        )
+        retargeted_buffer = getattr(getattr(part_entry, "animation", None), "animBuffer", None)
+        if retargeted_buffer is not None:
+            retargeted_parts.append(retargeted_buffer)
+
+    if not retargeted_parts:
+        log.warning("W2 multipart retarget skipped: no decoded animation parts.")
+        return animation_entry
+
+    first_frames = _multipart_first_frames(retargeted_parts, getattr(old_buffer, "firstFrames", None) or [])
+    out_entry = copy.deepcopy(animation_entry)
+    out_anim = out_entry.animation
+    out_anim.animBuffer = w3_types.CAnimationBufferMultipart(
+        numFrames=_multipart_num_frames(retargeted_parts, first_frames),
+        numBones=max((len(getattr(part, "bones", None) or []) for part in retargeted_parts), default=0),
+        numTracks=0,
+        firstFrames=first_frames,
+        parts=retargeted_parts,
+    )
+    out_anim._w2_retargeted_to_w3 = True
+    out_anim._w2_retarget_in_place = bool(in_place)
+    return out_entry
+
+
 def _sample_source_local(
     anim_bone,
     rest_pos: Vec3,
@@ -483,7 +574,7 @@ def _apply_weapon_grip_hand_fit(
     target_world_pos: List[Vec3],
     target_world_rot: Sequence[Quat],
     target_local_pos: List[Vec3],
-    yaw_180: Quat,
+    source_to_target_rot: Quat,
 ) -> bool:
     """Move the secondary hand so its W2 hand-to-weapon offset is preserved."""
     source_hand_idx = source_by_name.get("l_hand")
@@ -496,7 +587,7 @@ def _apply_weapon_grip_hand_fit(
         return False
 
     source_rel_world = _vec_sub(source_world_pos[source_hand_idx], source_world_pos[source_weapon_idx])
-    desired_rel_world = _quat_rotate_vec(yaw_180, source_rel_world)
+    desired_rel_world = _quat_rotate_vec(source_to_target_rot, source_rel_world)
     desired_hand_world = _vec_add(target_world_pos[target_weapon_idx], desired_rel_world)
 
     parent_idx = _bone_parent_id(target_bones[target_hand_idx])
@@ -592,6 +683,28 @@ def _make_anim_bone(
     )
 
 
+def _body_facing_correction(
+    source_rest_world_rot: Sequence[Quat],
+    target_rest_world_rot: Sequence[Quat],
+    source_by_name: Dict[str, int],
+    target_by_name: Dict[str, int],
+) -> Optional[Quat]:
+    """World-space turn that re-faces the retargeted body to the W2 source facing.
+
+    The W2 and W3 humanoid rigs rest facing opposite directions; Use this to make the direction match on retarget.
+    """
+    src_idx = source_by_name.get("trajectory")
+    tgt_idx = target_by_name.get("trajectory")
+    if (
+        src_idx is None
+        or tgt_idx is None
+        or src_idx >= len(source_rest_world_rot)
+        or tgt_idx >= len(target_rest_world_rot)
+    ):
+        return None
+    return _quat_mul(source_rest_world_rot[src_idx], _quat_inv(target_rest_world_rot[tgt_idx]))
+
+
 def retarget_w2_animation_entry(
     animation_entry,
     source_skeleton,
@@ -617,6 +730,16 @@ def retarget_w2_animation_entry(
     if not source_bones or not target_bones:
         log.warning("W2 retarget skipped: missing source or target skeleton data.")
         return animation_entry
+
+    if getattr(anim_buffer, "parts", None):
+        return _retarget_w2_multipart_animation_entry(
+            animation_entry,
+            source_skeleton,
+            target_skeleton,
+            in_place=in_place,
+            hand_fit=hand_fit,
+            bone_map=bone_map,
+        )
 
     source_by_name = {_bone_name(bone).lower(): idx for idx, bone in enumerate(source_bones)}
     target_by_name = {_bone_name(bone).lower(): idx for idx, bone in enumerate(target_bones)}
@@ -645,8 +768,11 @@ def retarget_w2_animation_entry(
         and _anim_bone_is_animated(anim_bones_by_name.get("r_weapon"))
     )
 
-    yaw_180 = (0.0, 0.0, 1.0, 0.0)
-    yaw_180_inv = _quat_inv(yaw_180)
+    basis_rot = _body_facing_correction(
+        source_rest_world_rot, target_rest_world_rot, source_by_name, target_by_name
+    ) or (0.0, 0.0, 0.0, 1.0)
+    # Kept identity: only forwarded to the attachment-offset / weapon-grip helpers.
+    source_to_target_rot = (0.0, 0.0, 0.0, 1.0)
 
     pos_by_name: Dict[str, List[Vec3]] = {_bone_name(bone): [] for bone in target_bones}
     rot_by_name: Dict[str, List[Quat]] = {_bone_name(bone): [] for bone in target_bones}
@@ -693,7 +819,7 @@ def retarget_w2_animation_entry(
                 desired_world_rot = _quat_mul(parent_world_rot, local_rot)
             elif source_idx is not None:
                 src_delta_world = _quat_mul(source_world_rot[source_idx], _quat_inv(source_rest_world_rot[source_idx]))
-                rotated_delta = _quat_mul(_quat_mul(yaw_180, src_delta_world), yaw_180_inv)
+                rotated_delta = _quat_mul(_quat_mul(basis_rot, src_delta_world), _quat_inv(basis_rot))
                 desired_world_rot = _quat_mul(rotated_delta, target_rest_world_rot[tgt_idx])
                 local_rot = _quat_mul(_quat_inv(parent_world_rot), desired_world_rot)
             else:
@@ -722,7 +848,7 @@ def retarget_w2_animation_entry(
                     else (0.0, 0.0, 0.0, 1.0)
                 )
                 source_offset_world = _quat_rotate_vec(source_parent_world_rot, source_local_pos)
-                rotated_offset_world = _quat_rotate_vec(yaw_180, source_offset_world)
+                rotated_offset_world = _quat_rotate_vec(source_to_target_rot, source_offset_world)
                 local_pos = _quat_rotate_vec(_quat_inv(parent_world_rot), rotated_offset_world)
             elif target_key in _ROOT_POSITION_BONES and source_idx is not None:
                 anim_bone = anim_bones_by_name.get(str(source_name).lower())
@@ -756,7 +882,7 @@ def retarget_w2_animation_entry(
                 target_world_pos=target_world_pos,
                 target_world_rot=target_world_rot,
                 target_local_pos=target_local_pos,
-                yaw_180=yaw_180,
+                source_to_target_rot=source_to_target_rot,
             )
 
         for tgt_idx, target_bone in enumerate(target_bones):
@@ -767,17 +893,29 @@ def retarget_w2_animation_entry(
 
     rest_pos_by_name = {_bone_name(bone): target_rest_pos[idx] for idx, bone in enumerate(target_bones)}
     rest_rot_by_name = {_bone_name(bone): target_rest_rot[idx] for idx, bone in enumerate(target_bones)}
+
+    for target_bone in target_bones:
+        if _bone_name(target_bone).lower() == "root":
+            bake_name = _bone_name(target_bone)
+            rot_by_name[bake_name] = [
+                _quat_mul(basis_rot, q) for q in rot_by_name[bake_name]
+            ]
+            break
+
     if in_place:
         _apply_in_place_root_motion(pos_by_name, rot_by_name, rest_pos_by_name, rest_rot_by_name, num_frames)
 
     output_bones = []
     for idx, target_bone in enumerate(target_bones):
         name = _bone_name(target_bone, str(idx))
+        pos_frames = pos_by_name[name]
+        if _position_frames_match_rest(pos_frames, target_rest_pos[idx]):
+            pos_frames = []
         output_bones.append(
             _make_anim_bone(
                 idx,
                 name,
-                pos_by_name[name],
+                pos_frames,
                 rot_by_name[name],
                 scale_by_name[name],
                 base_dt,
@@ -809,6 +947,7 @@ def infer_w2_source_rig_path(target_rig_path: str, target_name_hint: str = "") -
     text = f"{target_rig_path or ''} {target_name_hint or ''}".lower().replace("/", "\\")
     if (
         "geralt" in text
+        or "witcher" in text
         or "\\player\\player.w2ent" in text
         or "gameplay\\templates\\characters\\player\\player.w2ent" in text
         or "witcher_without_ponytail" in text

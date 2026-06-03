@@ -120,7 +120,14 @@ def _armature_identity_text(armature_obj) -> str:
     if armature_obj is None:
         return ""
     parts = [str(getattr(armature_obj, "name", "") or "")]
-    for prop_name in ("witcher_path", "witcher_source_game"):
+    for prop_name in (
+        "witcher_path",
+        "witcher_source_game",
+        "cutscene_actor_name",
+        "cutscene_actor_template",
+        "cutscene_actor_resolved_template",
+        "cutscene_actor_replacement_source_game",
+    ):
         try:
             value = str(armature_obj.get(prop_name, "") or "").strip()
         except Exception:
@@ -679,6 +686,34 @@ def _unique_armatures(armatures):
         seen_names.add(armature_obj.name)
         unique.append(armature_obj)
     return unique
+
+
+_W2_FACE_BODY_BONE_NAMES = {
+    "root", "trajectory", "reference", "pelvis",
+    "torso", "torso2", "torso3", "neck", "neck2", "head",
+}
+
+#TODO look into animation and mimic poses working together
+def _strip_body_bones_from_w2_face_animation(animation):
+    """Drop body pose bones from a W2 face/mimic clip, keeping the morph tracks.
+    """
+    anim_data = getattr(animation, "animation", None)
+    if anim_data is None:
+        return
+    anim_buffer = getattr(anim_data, "animBuffer", None)
+    if anim_buffer is None:
+        return
+    parts = getattr(anim_buffer, "parts", None) or [anim_buffer]
+    removed = 0
+    for part in parts:
+        bones = getattr(part, "bones", None)
+        if not bones:
+            continue
+        kept = [b for b in bones if str(getattr(b, "BoneName", "") or "").lower() not in _W2_FACE_BODY_BONE_NAMES]
+        removed += len(bones) - len(kept)
+        part.bones = kept
+    if removed:
+        log.debug("Stripped %d body pose bone(s) from W2 face animation; keeping morph tracks only.", removed)
 
 
 def _resolve_face_animation_targets(main_arm_obj):
@@ -1778,6 +1813,8 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
             retarget_source_rig_path,
             rig_path,
         )
+    if face_animation and effective_source_game == "w2":
+        _strip_body_bones_from_w2_face_animation(animation)
 
     try:
         anim_data = getattr(animation, "animation", None)

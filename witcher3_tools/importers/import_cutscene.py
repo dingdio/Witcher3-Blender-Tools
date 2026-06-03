@@ -2,13 +2,14 @@ import logging
 import os
 import time
 from collections import Counter
+from types import SimpleNamespace
 from ..CR2W import w3_types
 from ..CR2W.prop_utils import read_enum_prop
 from ..importers import import_entity
 from ..action_compat import iter_action_fcurves, remove_action_fcurve
 from ..CR2W.dc_anims import load_bin_cutscene
 from ..CR2W.common_blender import repo_file, redkit_repo_context, win_path_isfile
-from ..source_game_paths import resolve_w2_repo_file_from_source, w2_source_repo_root
+from ..source_game_paths import normalize_source_game, repo_file_for_source, resolve_w2_repo_file_from_source, w2_source_repo_root
 from ..duplication import duplicate_character_hierarchy
 from .cutscene_appearance_events import (
     body_part_event_has_body_state,
@@ -26,6 +27,7 @@ CUTSCENE_SOURCE_PATH_PROP = "witcher_cutscene_source_path"
 CUTSCENE_SOURCE_INDEX_PROP = "witcher_cutscene_source_index"
 CUTSCENE_ANIMATION_NAME_PROP = "witcher_cutscene_animation_name"
 CUTSCENE_ACTOR_IMPORTED_PROP = "cutscene_actor_imported"
+CUTSCENE_ACTOR_SOURCE_GAME_PROP = "cutscene_actor_source_game"
 CUTSCENE_APPEARANCE_DATA_PATH = "witcherui_RigSettings.app_list_index"
 FACE_MORPHS_APPEARANCE_PROP = "witcher_face_morphs_loaded_for_appearance"
 CUTSCENE_BURNED_AUDIO_PROP = "witcher_cutscene_burned_audio"
@@ -39,6 +41,7 @@ CUTSCENE_DIALOG_TEXT_PROP = "witcher_cutscene_dialog_text"
 CUTSCENE_DIALOG_SOUND_EVENT_PROP = "witcher_cutscene_dialog_sound_event"
 CUTSCENE_DIALOG_ITEM_PATH_PROP = "witcher_cutscene_dialog_item_path"
 CUTSCENE_DIALOG_SOURCE_PATH_PROP = "witcher_cutscene_dialog_source_path"
+CUTSCENE_DIALOG_SOURCE_GAME_PROP = "witcher_cutscene_dialog_source_game"
 
 def loadCutsceneFile(filename):
     ext = os.path.splitext(filename)[1]
@@ -81,6 +84,213 @@ def _resolve_cutscene_actor_template_path(template_path, cutscene_filename, is_w
         with redkit_repo_context(cutscene_filename):
             return repo_file(template_path, version=115)
     return repo_file(template_path)
+
+
+def _normalize_actor_replacement_source(source_game):
+    source_text = str(source_game or "").strip().upper()
+    if source_text == "REDKIT":
+        return "REDKIT"
+    return normalize_source_game(source_text).upper()
+
+
+def _coerce_source_index(value, default=-1):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _append_unique_existing_root(roots, root):
+    root = str(root or "").strip()
+    if not root:
+        return
+    root = os.path.normpath(root)
+    if not os.path.isdir(root):
+        return
+    root_key = os.path.normcase(root)
+    if all(os.path.normcase(existing) != root_key for existing in roots):
+        roots.append(root)
+
+
+def _redkit_actor_replacement_roots(context=None):
+    roots = []
+    try:
+        from .. import get_all_addon_prefs
+
+        prefs = get_all_addon_prefs(context or bpy.context)
+    except Exception:
+        prefs = None
+    if prefs is None:
+        return roots
+
+    try:
+        projects = list(getattr(prefs, "redkit_projects", []) or [])
+        active_index = int(getattr(prefs, "redkit_projects_index", -1) or -1)
+    except Exception:
+        projects = []
+        active_index = -1
+    ordered_projects = []
+    if 0 <= active_index < len(projects):
+        ordered_projects.append(projects[active_index])
+    ordered_projects.extend(project for idx, project in enumerate(projects) if idx != active_index)
+    for project in ordered_projects:
+        project_path = str(getattr(project, "path", "") or "").strip()
+        if project_path:
+            _append_unique_existing_root(roots, os.path.join(bpy.path.abspath(project_path), "workspace"))
+
+    for attr_name in ("redkit_depot_path", "redkit_uncooked_path"):
+        try:
+            _append_unique_existing_root(roots, bpy.path.abspath(getattr(prefs, attr_name, "") or ""))
+        except Exception:
+            pass
+    return roots
+
+
+def resolve_cutscene_actor_replacement_template_path(template_path, cutscene_filename="", source_game="W3", context=None):
+    template_path = _normalize_repo_path(template_path)
+    if not template_path:
+        return ""
+    if os.path.isabs(template_path):
+        return template_path
+
+    source_key = _normalize_actor_replacement_source(source_game)
+    if source_key == "REDKIT":
+        rel_path = template_path.replace("/", "\\").lstrip("\\")
+        for root in _redkit_actor_replacement_roots(context):
+            candidate = os.path.normpath(os.path.join(root, rel_path))
+            if win_path_isfile(candidate):
+                return candidate
+        return ""
+    if source_key == "W2":
+        return _resolve_cutscene_actor_template_path(template_path, cutscene_filename, True)
+    return repo_file_for_source(template_path, "w3")
+
+
+def _split_tag_text(value):
+    if isinstance(value, (list, tuple)):
+        return [str(item or "").strip() for item in value if str(item or "").strip()]
+    return [part.strip() for part in str(value or "").split(";") if part.strip()]
+
+
+def _cutscene_actor_proxy_from_values(
+    actor_name="",
+    template_path="",
+    actor_type="CAT_Actor",
+    appearance_name="",
+    tag="",
+    voice_tag="",
+    final_position="",
+    kill_me=False,
+    use_mimic=False,
+    anim_final_pos="",
+):
+    return SimpleNamespace(
+        name=str(actor_name or "").strip(),
+        template=_normalize_repo_path(template_path),
+        type=_normalize_cutscene_actor_type(actor_type, actor_name=actor_name),
+        appearance=str(appearance_name or "").strip(),
+        useMimic=bool(use_mimic),
+        tag=_split_tag_text(tag),
+        voiceTag=str(voice_tag or "").strip(),
+        finalPosition=_split_tag_text(final_position),
+        killMe=bool(kill_me),
+        animationAtFinalPosition=str(anim_final_pos or "").strip(),
+    )
+
+
+def replace_cutscene_actor_template(
+    old_actor_obj,
+    template_path,
+    *,
+    source_game="W3",
+    cutscene_filename="",
+    actor_name="",
+    actor_type="CAT_Actor",
+    appearance_name="",
+    tag="",
+    voice_tag="",
+    final_position="",
+    kill_me=False,
+    use_mimic=False,
+    anim_final_pos="",
+    source_index=-1,
+):
+    template_path = _normalize_repo_path(template_path)
+    if not template_path:
+        raise RuntimeError("Replacement actor template path is empty.")
+
+    source_key = _normalize_actor_replacement_source(source_game)
+    resolved_template_path = resolve_cutscene_actor_replacement_template_path(
+        template_path,
+        cutscene_filename=cutscene_filename,
+        source_game=source_key,
+        context=bpy.context,
+    )
+    if not resolved_template_path or not win_path_isfile(resolved_template_path):
+        raise RuntimeError(f"Replacement actor template was not found for {source_key}: {template_path}")
+
+    actor_name = str(actor_name or "").strip()
+    appearance_name = str(appearance_name or "").strip()
+    old_actor_names = _collect_cutscene_actor_removal_names(old_actor_obj)
+    new_actor_obj = import_entity.import_ent_template(
+        resolved_template_path,
+        load_face_poses=True,
+        import_apperance=1,
+        selected_appearance_name=appearance_name,
+        entity_namespace=actor_name,
+    )
+    if new_actor_obj is None:
+        raise RuntimeError(f"Failed to import replacement actor: {resolved_template_path}")
+
+    cutscene_guid = _generate_cutscene_guid()
+    _tag_cutscene_object_hierarchy(new_actor_obj, cutscene_guid)
+    actor_proxy = _cutscene_actor_proxy_from_values(
+        actor_name=actor_name,
+        template_path=template_path,
+        actor_type=actor_type,
+        appearance_name=appearance_name,
+        tag=tag,
+        voice_tag=voice_tag,
+        final_position=final_position,
+        kill_me=kill_me,
+        use_mimic=use_mimic,
+        anim_final_pos=anim_final_pos,
+    )
+    _tag_cutscene_actor(
+        new_actor_obj,
+        actor_proxy,
+        source_index=source_index,
+        source_path=cutscene_filename,
+        imported_new=True,
+        cutscene_guid=cutscene_guid,
+    )
+    new_actor_obj[CUTSCENE_ACTOR_SOURCE_GAME_PROP] = source_key.lower()
+    new_actor_obj["cutscene_actor_replacement_source_game"] = source_key
+    new_actor_obj["cutscene_actor_resolved_template"] = resolved_template_path
+    try:
+        new_actor_obj["witcher_source_game"] = "w2" if source_key == "W2" else "w3"
+    except Exception:
+        pass
+
+    _ensure_cutscene_actor_appearance(new_actor_obj, appearance_name)
+    _ensure_cutscene_face_setup(new_actor_obj)
+
+    removed_old = 0
+    if old_actor_obj is not None and old_actor_obj is not new_actor_obj:
+        removed_old = remove_cutscene_actor_hierarchy(old_actor_obj, object_names=old_actor_names)
+
+    return {
+        "actor_obj": new_actor_obj,
+        "actor_name": actor_name,
+        "template_path": template_path,
+        "resolved_template_path": resolved_template_path,
+        "appearance_name": appearance_name,
+        "source_game": source_key.lower(),
+        "imported_new": True,
+        "cutscene_guid": cutscene_guid,
+        "source_index": _coerce_source_index(source_index),
+        "removed_old": int(removed_old or 0),
+    }
 
 import bpy
 from .import_anims import NewW2ANIMSListItem#, set_global_set #!USE NEW METHOD
@@ -696,8 +906,9 @@ def _tag_cutscene_actor(actor_obj, actor, source_index=-1, source_path="", impor
 
     if source_path:
         actor_obj[CUTSCENE_SOURCE_PATH_PROP] = str(source_path)
-    if int(source_index or -1) >= 0:
-        actor_obj[CUTSCENE_SOURCE_INDEX_PROP] = int(source_index)
+    source_index_int = _coerce_source_index(source_index)
+    if source_index_int >= 0:
+        actor_obj[CUTSCENE_SOURCE_INDEX_PROP] = source_index_int
     actor_obj[CUTSCENE_ACTOR_IMPORTED_PROP] = bool(imported_new)
     if cutscene_guid:
         actor_obj[CUTSCENE_GUID_PROP] = str(cutscene_guid)
@@ -717,6 +928,7 @@ def _clear_cutscene_actor_tags(actor_obj):
         "cutscene_actor_final_position",
         "cutscene_actor_kill_me",
         "cutscene_actor_anim_final_pos",
+        CUTSCENE_ACTOR_SOURCE_GAME_PROP,
         CUTSCENE_SOURCE_PATH_PROP,
         CUTSCENE_SOURCE_INDEX_PROP,
         CUTSCENE_ACTOR_IMPORTED_PROP,
@@ -894,6 +1106,68 @@ def clear_cutscene_actor_animation_tracks(actor_obj, track_name=None):
     if not track_name:
         clear_cutscene_actor_appearance_keys(actor_obj)
     return removed_tracks
+
+
+def _collect_cutscene_actor_removal_names(actor_obj):
+    names = set()
+    if actor_obj is None:
+        return names
+
+    def _add_obj(obj):
+        obj_name = getattr(obj, "name", "")
+        if obj_name:
+            names.add(obj_name)
+
+    _add_obj(actor_obj)
+    for obj in _iter_object_descendants(actor_obj):
+        _add_obj(obj)
+    for armature_obj in _iter_additional_cutscene_armatures(actor_obj):
+        _add_obj(armature_obj)
+        for obj in _iter_object_descendants(armature_obj):
+            _add_obj(obj)
+
+    guid = str(actor_obj.get(CUTSCENE_GUID_PROP, "") or "").strip()
+    if guid:
+        for obj in bpy.data.objects:
+            try:
+                if str(obj.get(CUTSCENE_GUID_PROP, "") or "").strip() == guid:
+                    _add_obj(obj)
+            except Exception:
+                continue
+    return names
+
+
+def remove_cutscene_actor_hierarchy(actor_obj, object_names=None):
+    if actor_obj is None and not object_names:
+        return 0
+
+    try:
+        clear_cutscene_actor_animation_tracks(actor_obj)
+    except Exception:
+        pass
+
+    names = set(object_names or _collect_cutscene_actor_removal_names(actor_obj))
+
+    def _object_depth(name):
+        depth = 0
+        obj = bpy.data.objects.get(name)
+        while obj is not None and getattr(obj, "parent", None) is not None:
+            depth += 1
+            obj = obj.parent
+        return depth
+
+    removed = 0
+    for name in sorted(names, key=_object_depth, reverse=True):
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            continue
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed += 1
+        except Exception:
+            log.exception("Failed to remove replaced cutscene actor object '%s'", name)
+    return removed
+
 
 def unload_cutscene_actor(actor_obj):
     if actor_obj is None:
@@ -1120,7 +1394,7 @@ def _tag_cutscene_animation_actions(target_armatures, track_name, anim_name, sou
             if action is None:
                 continue
             action[CUTSCENE_SOURCE_PATH_PROP] = str(source_path or "")
-            action[CUTSCENE_SOURCE_INDEX_PROP] = int(source_index)
+            action[CUTSCENE_SOURCE_INDEX_PROP] = _coerce_source_index(source_index)
             action[CUTSCENE_ANIMATION_NAME_PROP] = str(anim_name or "")
 
 def is_cutscene_animation_loaded(actor_obj, animation_name, source_path, source_index, track_name=None):
@@ -1148,7 +1422,7 @@ def is_cutscene_animation_loaded(actor_obj, animation_name, source_path, source_
                     continue
                 if (
                     str(action.get(CUTSCENE_SOURCE_PATH_PROP, "") or "") == source_path
-                    and int(action.get(CUTSCENE_SOURCE_INDEX_PROP, -1) or -1) == source_index
+                    and _coerce_source_index(action.get(CUTSCENE_SOURCE_INDEX_PROP, -1)) == source_index
                 ):
                     return True
                 action_name = str(getattr(action, "name", "") or "")
@@ -1176,6 +1450,7 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
     template_path = _normalize_repo_path(getattr(actor, "template", "") or "")
     preferred_appearance_name = str(getattr(actor, "appearance", "") or "").strip()
     duplicate_count = template_counts.get(template_path, 0)
+    actor_source_game = "w2" if _is_w2_cutscene_file(filename) else "w3"
 
     actor_obj = find_existing_cutscene_actor(
         actor_name=actor_name,
@@ -1238,11 +1513,13 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
         imported_new=imported_new,
         cutscene_guid=cutscene_guid,
     )
+    actor_obj[CUTSCENE_ACTOR_SOURCE_GAME_PROP] = actor_source_game
     return {
         "actor_obj": actor_obj,
         "actor_name": actor_name,
         "template_path": template_path,
         "appearance_name": preferred_appearance_name,
+        "source_game": actor_source_game,
         "imported_new": bool(imported_new),
         "cutscene_guid": cutscene_guid,
         "source_index": actor_index,
@@ -1759,6 +2036,7 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
 
     from ..ui.ui_anims_list import load_anim_into_scene
 
+    cutscene_source_game = "w2" if _is_w2_cutscene_file(filename) else ""
     applied_indices = set()
     error_messages = {}
     for context in animation_contexts:
@@ -1770,7 +2048,9 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
 
         try:
             face_target_mode = "owner"
-            if _is_face_cutscene_animation(anim_name):
+            is_face_animation = _is_face_cutscene_animation(anim_name)
+            target_component = component_name
+            if is_face_animation:
                 _ensure_cutscene_face_setup(actor_obj)
                 if _w2_mimic_armature_for_actor(actor_obj) is not None:
                     face_target_mode = "auto"
@@ -1782,7 +2062,8 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
                 NLA_track=animation_track_name,
                 at_frame=at_frame,
                 face_target_mode=face_target_mode,
-                target_component=component_name,
+                target_component=target_component,
+                source_game=cutscene_source_game,
             )
             _tag_cutscene_animation_actions(
                 target_armatures,
@@ -1825,6 +2106,7 @@ def collect_cutscene_preview(filename, cutscene_template=None):
 
     actor_defs = list(getattr(cutscene, "SCutsceneActorDefs", None) or [])
     template_counts = _actor_template_counts(actor_defs)
+    actor_source_game = "w2" if _is_w2_cutscene_file(filename) else "w3"
     actor_items = []
     for idx, actor in enumerate(actor_defs):
         actor_name = str(getattr(actor, "name", "") or "").strip()
@@ -1845,6 +2127,7 @@ def collect_cutscene_preview(filename, cutscene_template=None):
             "tag": "; ".join(str(t or "").strip() for t in (tag_list or []) if str(t or "").strip()),
             "voice_tag": str(getattr(actor, "voiceTag", "") or "").strip(),
             "template_path": template_path,
+            "source_game": actor_source_game,
             "appearance_name": appearance_name,
             "actor_type": _normalize_cutscene_actor_type(
                 _safe_actor_type_str(getattr(actor, "type", None)),
@@ -1882,6 +2165,62 @@ def collect_cutscene_preview(filename, cutscene_template=None):
             _append_cutscene_preview_event(event_items, ev, "ENTRY", source_index=idx)
 
     return cutscene, actor_items, animation_items, event_items
+
+
+def _cutscene_template_default_fps(cutscene_template):
+    for node in getattr(cutscene_template, "animations", None) or []:
+        fps = float(getattr(getattr(node, "animation", None), "framesPerSecond", 0.0) or 0.0)
+        if fps > 0.0:
+            return fps
+    return 30.0
+
+
+def _cutscene_animation_fps_by_name(cutscene_template):
+    by_name = {}
+    for node in getattr(cutscene_template, "animations", None) or []:
+        animation = getattr(node, "animation", None)
+        name = str(getattr(animation, "name", "") or "").strip()
+        fps = float(getattr(animation, "framesPerSecond", 0.0) or 0.0)
+        if name and fps > 0.0:
+            by_name[name] = fps
+    return by_name
+
+
+def _append_cutscene_dialog_event_frame(out, event, event_scope, fps, source_index=-1, frame_offset=0.0):
+    if "DialogEvent" not in str(_cutscene_event_value(event, "type_name", "") or ""):
+        return
+    start_time = float(_cutscene_event_value(event, "start_time", 0.0) or 0.0)
+    duration = float(_cutscene_event_value(event, "duration", 0.0) or 0.0)
+    out.append({
+        "frame": int(round(float(frame_offset or 0.0) + (start_time * fps))),
+        "duration_frames": max(0, int(round(duration * fps))),
+        "source_index": int(source_index),
+        "event_scope": event_scope,
+    })
+
+
+def collect_cutscene_dialog_event_frames(cutscene_filepath, cutscene_template=None):
+    cutscene = cutscene_template if cutscene_template is not None else loadCutsceneFile(cutscene_filepath)
+    if cutscene is None:
+        return []
+
+    fallback_fps = _cutscene_template_default_fps(cutscene)
+    animation_fps_by_name = _cutscene_animation_fps_by_name(cutscene)
+    dialog_events = []
+
+    for event in getattr(cutscene, "animevents", None) or []:
+        animation_name = str(_cutscene_event_value(event, "animation_name", "") or "").strip()
+        fps = animation_fps_by_name.get(animation_name, fallback_fps)
+        _append_cutscene_dialog_event_frame(dialog_events, event, "ROOT", fps)
+
+    for idx, node in enumerate(getattr(cutscene, "animations", None) or []):
+        animation = getattr(node, "animation", None)
+        fps = float(getattr(animation, "framesPerSecond", 0.0) or fallback_fps or 30.0)
+        for event in getattr(node, "entries", None) or []:
+            _append_cutscene_dialog_event_frame(dialog_events, event, "ENTRY", fps, source_index=idx)
+
+    dialog_events.sort(key=lambda item: (int(item["frame"]), int(item["source_index"])))
+    return dialog_events
 
 
 def load_cutscene_dialog_items(cutscene_filepath):
@@ -1937,6 +2276,7 @@ def load_cutscene_dialog_items(cutscene_filepath):
                 "line_index":  line_index,
                 "line_text":   str(line.get("line_text", "") or ""),
                 "scene_path":  depot_path,
+                "source_game": str(line.get("source_game", "") or ""),
             })
 
         if dialog_items and idx == 0:
