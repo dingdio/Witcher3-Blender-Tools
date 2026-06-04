@@ -24,6 +24,7 @@ DEFAULT_W2_MAN_RIG = r"characters\templates\man\model\man_rig.w2rig"
 DEFAULT_W2_WITCHER_RIG = r"characters\templates\witcher\model\witcher_without_ponytail.w2rig"
 
 _EPSILON = 1e-8
+_IDENTITY_QUAT: Quat = (0.0, 0.0, 0.0, 1.0)
 _ROOT_POSITION_BONES = {"trajectory", "pelvis"}
 _ATTACHMENT_TRANSFER_BONES = {"l_weapon", "r_weapon"}
 
@@ -564,6 +565,30 @@ def _hand_fit_mode_enabled(hand_fit: str, mode_name: str) -> bool:
     return False
 
 
+class _RetargetBasis:
+    """Shared source-to-target facing basis for rig rotations and offsets.
+
+    Trajectory/pelvis position tracks are locomotion data and intentionally do
+    not pass through this helper.
+    """
+
+    def __init__(self, source_to_target_rot: Quat = _IDENTITY_QUAT):
+        self.source_to_target_rot = _quat_normalize(source_to_target_rot)
+        self.target_to_source_rot = _quat_inv(self.source_to_target_rot)
+
+    def source_rotation_delta_to_target(self, source_delta_world: Quat) -> Quat:
+        return _quat_mul(
+            _quat_mul(self.source_to_target_rot, source_delta_world),
+            self.target_to_source_rot,
+        )
+
+    def source_offset_to_target(self, source_offset_world: Vec3) -> Vec3:
+        return _quat_rotate_vec(self.source_to_target_rot, source_offset_world)
+
+    def bake_root_facing(self, root_local_rot: Quat) -> Quat:
+        return _quat_mul(self.source_to_target_rot, root_local_rot)
+
+
 def _apply_weapon_grip_hand_fit(
     *,
     source_by_name: Dict[str, int],
@@ -574,7 +599,7 @@ def _apply_weapon_grip_hand_fit(
     target_world_pos: List[Vec3],
     target_world_rot: Sequence[Quat],
     target_local_pos: List[Vec3],
-    source_to_target_rot: Quat,
+    retarget_basis: _RetargetBasis,
 ) -> bool:
     """Move the secondary hand so its W2 hand-to-weapon offset is preserved."""
     source_hand_idx = source_by_name.get("l_hand")
@@ -587,7 +612,8 @@ def _apply_weapon_grip_hand_fit(
         return False
 
     source_rel_world = _vec_sub(source_world_pos[source_hand_idx], source_world_pos[source_weapon_idx])
-    desired_rel_world = _quat_rotate_vec(source_to_target_rot, source_rel_world)
+    # Hand Fit is a source-rig world offset; keep it in the same facing basis as the body.
+    desired_rel_world = retarget_basis.source_offset_to_target(source_rel_world)
     desired_hand_world = _vec_add(target_world_pos[target_weapon_idx], desired_rel_world)
 
     parent_idx = _bone_parent_id(target_bones[target_hand_idx])
@@ -768,11 +794,14 @@ def retarget_w2_animation_entry(
         and _anim_bone_is_animated(anim_bones_by_name.get("r_weapon"))
     )
 
-    basis_rot = _body_facing_correction(
-        source_rest_world_rot, target_rest_world_rot, source_by_name, target_by_name
-    ) or (0.0, 0.0, 0.0, 1.0)
-    # Kept identity: only forwarded to the attachment-offset / weapon-grip helpers.
-    source_to_target_rot = (0.0, 0.0, 0.0, 1.0)
+    retarget_basis = _RetargetBasis(
+        _body_facing_correction(
+            source_rest_world_rot,
+            target_rest_world_rot,
+            source_by_name,
+            target_by_name,
+        ) or _IDENTITY_QUAT
+    )
 
     pos_by_name: Dict[str, List[Vec3]] = {_bone_name(bone): [] for bone in target_bones}
     rot_by_name: Dict[str, List[Quat]] = {_bone_name(bone): [] for bone in target_bones}
@@ -819,7 +848,7 @@ def retarget_w2_animation_entry(
                 desired_world_rot = _quat_mul(parent_world_rot, local_rot)
             elif source_idx is not None:
                 src_delta_world = _quat_mul(source_world_rot[source_idx], _quat_inv(source_rest_world_rot[source_idx]))
-                rotated_delta = _quat_mul(_quat_mul(basis_rot, src_delta_world), _quat_inv(basis_rot))
+                rotated_delta = retarget_basis.source_rotation_delta_to_target(src_delta_world)
                 desired_world_rot = _quat_mul(rotated_delta, target_rest_world_rot[tgt_idx])
                 local_rot = _quat_mul(_quat_inv(parent_world_rot), desired_world_rot)
             else:
@@ -848,7 +877,8 @@ def retarget_w2_animation_entry(
                     else (0.0, 0.0, 0.0, 1.0)
                 )
                 source_offset_world = _quat_rotate_vec(source_parent_world_rot, source_local_pos)
-                rotated_offset_world = _quat_rotate_vec(source_to_target_rot, source_offset_world)
+                # Attachment offsets are source-rig world vectors, not root-motion positions.
+                rotated_offset_world = retarget_basis.source_offset_to_target(source_offset_world)
                 local_pos = _quat_rotate_vec(_quat_inv(parent_world_rot), rotated_offset_world)
             elif target_key in _ROOT_POSITION_BONES and source_idx is not None:
                 anim_bone = anim_bones_by_name.get(str(source_name).lower())
@@ -882,7 +912,7 @@ def retarget_w2_animation_entry(
                 target_world_pos=target_world_pos,
                 target_world_rot=target_world_rot,
                 target_local_pos=target_local_pos,
-                source_to_target_rot=source_to_target_rot,
+                retarget_basis=retarget_basis,
             )
 
         for tgt_idx, target_bone in enumerate(target_bones):
@@ -898,7 +928,7 @@ def retarget_w2_animation_entry(
         if _bone_name(target_bone).lower() == "root":
             bake_name = _bone_name(target_bone)
             rot_by_name[bake_name] = [
-                _quat_mul(basis_rot, q) for q in rot_by_name[bake_name]
+                retarget_basis.bake_root_facing(q) for q in rot_by_name[bake_name]
             ]
             break
 
