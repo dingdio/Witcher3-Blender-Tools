@@ -588,6 +588,15 @@ class _RetargetBasis:
     def bake_root_facing(self, root_local_rot: Quat) -> Quat:
         return _quat_mul(self.source_to_target_rot, root_local_rot)
 
+    def source_root_child_position_to_target(self, source_root_rot: Quat, source_local_pos: Vec3) -> Vec3:
+        # W2 normal imports zero Root position but keep Root rotation. Convert
+        # root-motion child positions into the corrected W3 Root space so the
+        # target world-space trajectory matches the W2 import.
+        return _quat_rotate_vec(
+            self.target_to_source_rot,
+            _quat_rotate_vec(source_root_rot, source_local_pos),
+        )
+
 
 def _apply_weapon_grip_hand_fit(
     *,
@@ -855,6 +864,13 @@ def retarget_w2_animation_entry(
                 local_rot = target_rest_rot[tgt_idx]
                 desired_world_rot = _quat_mul(parent_world_rot, local_rot)
 
+            source_root_idx = source_by_name.get("root")
+            source_root_rot = (
+                source_world_rot[source_root_idx]
+                if source_root_idx is not None and source_root_idx < len(source_world_rot)
+                else (0.0, 0.0, 0.0, 1.0)
+            )
+
             if target_key in _ATTACHMENT_TRANSFER_BONES and source_idx is not None:
                 anim_bone = anim_bones_by_name.get(str(source_name).lower())
                 source_local_pos, _source_local_rot = _sample_source_local(
@@ -889,7 +905,20 @@ def retarget_w2_animation_entry(
                     frame_idx,
                     base_dt,
                 )
-                local_pos = source_local_pos
+                source_parent_idx = _bone_parent_id(source_bones[source_idx])
+                target_root_idx = target_by_name.get("root")
+                if (
+                    source_root_idx is not None
+                    and source_parent_idx == source_root_idx
+                    and target_root_idx is not None
+                    and parent_idx == target_root_idx
+                ):
+                    local_pos = retarget_basis.source_root_child_position_to_target(
+                        source_root_rot,
+                        source_local_pos,
+                    )
+                else:
+                    local_pos = source_local_pos
             else:
                 local_pos = target_rest_pos[tgt_idx]
 
