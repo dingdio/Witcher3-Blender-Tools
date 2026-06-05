@@ -1988,6 +1988,8 @@ def _resolve_scene_template_path(template_path, scene_filepath="", source_game="
         resolved = resolve_w2_repo_file_from_source(template_path, scene_filepath, version=version)
         if resolved:
             return resolved
+        with redkit_repo_context(scene_filepath):
+            return repo_file(template_path, version=version)
 
     source_path = Path(str(scene_filepath or ""))
     if source_path:

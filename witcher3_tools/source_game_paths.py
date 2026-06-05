@@ -46,9 +46,11 @@ def coerce_w2_data_root(path_value) -> str:
     if not path_value:
         return ""
     norm_path = os.path.normpath(path_value)
-    if os.path.basename(norm_path).lower() == "data":
-        return norm_path
-    return os.path.normpath(os.path.join(norm_path, "data"))
+    data_root = norm_path if os.path.basename(norm_path).lower() == "data" else os.path.join(norm_path, "data")
+    data_root = os.path.normpath(data_root)
+    if os.path.basename(data_root).lower() != "data":
+        return ""
+    return data_root if os.path.isdir(data_root) else ""
 
 
 def normalize_roots(roots, *, existing_only=False):
@@ -71,6 +73,26 @@ def normalize_roots(roots, *, existing_only=False):
     return out
 
 
+def is_under_root(path_value, root) -> bool:
+    if not path_value or not root:
+        return False
+    try:
+        path_key = os.path.normcase(os.path.normpath(str(path_value)))
+        root_key = os.path.normcase(os.path.normpath(str(root)))
+        return os.path.commonpath([path_key, root_key]) == root_key
+    except Exception:
+        return False
+
+
+def same_path(path_a, path_b) -> bool:
+    if not path_a or not path_b:
+        return False
+    try:
+        return os.path.normcase(os.path.normpath(str(path_a))) == os.path.normcase(os.path.normpath(str(path_b)))
+    except Exception:
+        return False
+
+
 def w2_source_repo_root(source_filename) -> str:
     if not source_filename or not os.path.isabs(str(source_filename)):
         return ""
@@ -80,6 +102,49 @@ def w2_source_repo_root(source_filename) -> str:
     if not hits:
         return ""
     return norm_path[: min(hits)].rstrip("\\")
+
+
+def configured_w2_repo_roots(context=None, *, existing_only=False):
+    try:
+        if context is None:
+            import bpy
+
+            context = getattr(bpy, "context", None)
+    except Exception:
+        context = None
+    if context is None:
+        return []
+
+    try:
+        from . import get_w2_unbundle_path, get_witcher2_game_path
+    except Exception:
+        return []
+
+    roots = []
+    try:
+        w2_uncook = str(get_w2_unbundle_path(context) or "").strip()
+        if w2_uncook:
+            roots.append(w2_uncook)
+    except Exception:
+        pass
+    try:
+        w2_game = str(get_witcher2_game_path(context) or "").strip()
+        w2_data = coerce_w2_data_root(w2_game)
+        if w2_data:
+            roots.append(w2_data)
+    except Exception:
+        pass
+    return normalize_roots(roots, existing_only=existing_only)
+
+
+def w2_source_repo_root_if_configured(source_filename, context=None) -> str:
+    source_root = w2_source_repo_root(source_filename)
+    if not source_root:
+        return ""
+    for root in configured_w2_repo_roots(context):
+        if same_path(source_root, root) and is_under_root(source_filename, root):
+            return source_root
+    return ""
 
 
 def _existing_path(path_value) -> bool:
@@ -117,7 +182,7 @@ def resolve_w2_repo_file_from_root(filepath, root, *, extract_from_bundles=False
 def resolve_w2_repo_file_from_source(filepath, source_filename, *, version=None, extract_from_bundles=False) -> str:
     if version is not None and source_game_from_version(version) != "w2":
         return ""
-    source_root = w2_source_repo_root(source_filename)
+    source_root = w2_source_repo_root_if_configured(source_filename)
     if not source_root:
         return ""
     return resolve_w2_repo_file_from_root(
@@ -148,16 +213,11 @@ def repo_file_for_source(filepath, source_game="", *, version=None, is_abs_path=
 
 
 def source_roots(context, source_game, *, existing_only=False):
-    from . import get_uncook_path, get_w2_unbundle_path, get_witcher2_game_path
+    from . import get_uncook_path
 
     roots = []
     if normalize_source_game(source_game) == "w2":
-        w2_uncook = str(get_w2_unbundle_path(context) or "").strip()
-        if w2_uncook:
-            roots.append(w2_uncook)
-        w2_game = str(get_witcher2_game_path(context) or "").strip()
-        if w2_game:
-            roots.append(coerce_w2_data_root(w2_game))
+        return configured_w2_repo_roots(context, existing_only=existing_only)
     else:
         uncook = str(get_uncook_path(context) or "").strip()
         if uncook:

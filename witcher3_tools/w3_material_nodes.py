@@ -43,7 +43,7 @@ from . import get_all_addon_prefs, get_texture_path, get_uncook_path
 from .extension_paths import get_cache_root
 from .source_game_paths import (
     normalize_source_game as _normalize_material_source_game,
-    w2_source_repo_root,
+    w2_source_repo_root_if_configured,
     w2_source_roots,
 )
 import os
@@ -3312,7 +3312,7 @@ def get_repo_from_abs_path(texture_path_input, extension='.xbm'):
     if result:
         return result
 
-    source_root = w2_source_repo_root(texture_path)
+    source_root = w2_source_repo_root_if_configured(texture_path)
     result = _try_strip_root(texture_path, source_root)
     if result:
         return result

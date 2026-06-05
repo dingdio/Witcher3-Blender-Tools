@@ -46,7 +46,11 @@ from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
 from ..CR2W.common_blender import repo_file, redkit_repo_context, win_safe_path
 from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
-from ..source_game_paths import W2_REPO_ROOT_MARKERS, resolve_w2_repo_file_from_source, w2_source_repo_root
+from ..source_game_paths import (
+    W2_REPO_ROOT_MARKERS,
+    resolve_w2_repo_file_from_source,
+    w2_source_repo_root_if_configured,
+)
 from .dlc_mounters import (
     append_dlc_entity_template_params,
     append_dlc_external_appearances,
@@ -4127,6 +4131,10 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
         category_raw = _get_inventory_category(entry)
         item_raw = _get_inventory_item_name(entry)
         entry_template = _get_inventory_equip_template(entry)
+        if source_game == "w2":
+            entry_w2_path = str(_get_entry_attr(entry, "w2_entity_path", "") or "").strip()
+            if entry_w2_path:
+                entry_template = entry_w2_path
         override = _get_inventory_mount_override(rig_settings, category_raw, item_raw)
         if override is False:
             continue
@@ -4771,7 +4779,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 resolved_from_source = ""
             if resolved_from_source and os.path.exists(win_safe_path(resolved_from_source)):
                 return resolved_from_source
-            source_root = w2_source_repo_root(source_entity_path)
+            source_root = w2_source_repo_root_if_configured(source_entity_path)
             if source_root:
                 source_expected_path = os.path.join(source_root, repo_path.replace("/", "\\").lstrip("\\"))
         try:
@@ -6244,7 +6252,9 @@ def import_app(context,
                 source_roots = _build_entity_source_roots(repo_path_hint)
             except Exception:
                 source_roots = []
-    source_game = getattr(rig_settings, "source_game", "w3")
+    source_game = str(getattr(rig_settings, "source_game", "") or "").strip().lower()
+    if source_game not in {"w2", "w3"}:
+        source_game = _source_game_from_version(entity)
     item_lookup, template_lookup = _build_equipment_lookup(source_roots)
     try:
         from ..ui.ui_equipment import get_equipment_catalog_for_search_roots
@@ -6255,6 +6265,7 @@ def import_app(context,
         "entity": entity,
         "appearance": selectedAppearance,
         "source_roots": source_roots,
+        "source_game": source_game,
     }
     def _slot_has_persistent_override(slot):
         if slot is None or not getattr(slot, "keep_across_appearances", False):
@@ -6293,7 +6304,11 @@ def import_app(context,
 
         # Find the equip_template for this item
         equip_template = ''
-        if default_item and default_item != 'None':
+        if source_game == "w2":
+            entry_w2_path = str(_get_entry_attr(entry_data, "w2_entity_path", "") or "").strip()
+            if entry_w2_path:
+                equip_template = entry_w2_path
+        if not equip_template and default_item and default_item != 'None':
             resolved_item = _resolve_inventory_item(default_item, item_lookup, template_lookup)
             if resolved_item:
                 resolved_category, resolved_item_name, resolved_template = resolved_item

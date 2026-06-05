@@ -9,7 +9,12 @@ from ..importers import import_entity
 from ..action_compat import iter_action_fcurves, remove_action_fcurve
 from ..CR2W.dc_anims import load_bin_cutscene
 from ..CR2W.common_blender import repo_file, redkit_repo_context, win_path_isfile
-from ..source_game_paths import normalize_source_game, repo_file_for_source, resolve_w2_repo_file_from_source, w2_source_repo_root
+from ..source_game_paths import (
+    normalize_source_game,
+    repo_file_for_source,
+    resolve_w2_repo_file_from_source,
+    w2_source_repo_root_if_configured,
+)
 from ..duplication import duplicate_character_hierarchy
 from .cutscene_appearance_events import (
     body_part_event_has_body_state,
@@ -115,11 +120,6 @@ def _resolve_cutscene_actor_template_path(template_path, cutscene_filename, is_w
         resolved = resolve_w2_repo_file_from_source(template_path, cutscene_filename, version=115)
         if resolved:
             return resolved
-        source_root = w2_source_repo_root(cutscene_filename)
-        if source_root:
-            source_candidate = os.path.join(source_root, str(template_path or "").replace("/", "\\").lstrip("\\"))
-            if win_path_isfile(source_candidate):
-                return source_candidate
         with redkit_repo_context(cutscene_filename):
             return repo_file(template_path, version=115)
     return repo_file(template_path)
@@ -2451,7 +2451,7 @@ def _cutscene_equipment_source_roots(actor_obj, filename):
 
     if _is_w2_cutscene_file(filename):
         try:
-            cutscene_root = w2_source_repo_root(filename)
+            cutscene_root = w2_source_repo_root_if_configured(filename)
             if cutscene_root:
                 roots.append(cutscene_root)
         except Exception:

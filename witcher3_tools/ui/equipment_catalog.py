@@ -12,12 +12,14 @@ import bpy
 from .. import (
     get_all_addon_prefs,
     get_uncook_path,
-    get_w2_unbundle_path,
-    get_witcher2_game_path,
 )
 from ..CR2W.witcher_cache.Bundles import LoadBundleManager
 from ..extension_paths import get_cache_root, get_dev_override
-from ..source_game_paths import normalize_source_game as _normalize_source_game
+from ..source_game_paths import (
+    configured_w2_repo_roots,
+    is_under_root,
+    normalize_source_game as _normalize_source_game,
+)
 
 
 log = logging.getLogger(__name__)
@@ -415,31 +417,38 @@ def source_game_from_xml_path(path_value):
 
 
 def get_w2_repo_roots():
-    roots = []
+    return _normalize_unique_roots(configured_w2_repo_roots(bpy.context))
+
+
+def _is_under_any_root(path_value, roots):
+    if not path_value:
+        return False
     try:
-        w2_unbundle = (get_w2_unbundle_path(bpy.context) or "").strip()
+        path_key = os.path.normcase(os.path.normpath(str(path_value)))
     except Exception:
-        w2_unbundle = ""
-    if w2_unbundle:
-        roots.append(w2_unbundle)
-    try:
-        w2_game = (get_witcher2_game_path(bpy.context) or "").strip()
-    except Exception:
-        w2_game = ""
-    if w2_game:
-        roots.append(os.path.join(w2_game, "data"))
-        roots.append(w2_game)
-    return _normalize_unique_roots(roots)
+        return False
+    for root in roots or []:
+        if not root:
+            continue
+        try:
+            if is_under_root(path_key, root):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def candidate_w2_items_dirs(search_roots=None, *, include_configured_roots=True):
     candidates = []
     seen = set()
     roots = list(search_roots or [])
+    allowed_roots = get_w2_repo_roots()
     if include_configured_roots:
-        roots.extend(get_w2_repo_roots())
+        roots.extend(allowed_roots)
     roots = _normalize_unique_roots(roots)
     for root in roots:
+        if not _is_under_any_root(root, allowed_roots):
+            continue
         try:
             current = Path(root)
         except Exception:
@@ -458,6 +467,8 @@ def candidate_w2_items_dirs(search_roots=None, *, include_configured_roots=True)
                 if norm in seen:
                     continue
                 seen.add(norm)
+                if not _is_under_any_root(candidate_path, allowed_roots):
+                    continue
                 if os.path.basename(norm).lower() != "items":
                     continue
                 if os.path.isdir(candidate_path) and any(
@@ -479,11 +490,6 @@ def is_w2_search(search_roots):
         for candidate in norm_search_roots:
             if candidate == norm_root or candidate.startswith(prefix):
                 return True
-    # Do not let globally configured W2 roots classify an unrelated W3 entity
-    # import as W2. Catalog loading may include configured W2 roots later, but
-    # source-game detection must only consider the active search roots.
-    if candidate_w2_items_dirs(search_roots, include_configured_roots=False):
-        return True
     return False
 
 

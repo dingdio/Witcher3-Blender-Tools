@@ -22,7 +22,6 @@ from ..source_game_paths import (
     coerce_w2_data_root,
     iter_w2_repo_path_variants,
     normalize_roots,
-    w2_source_repo_root,
 )
 import logging
 log = logging.getLogger(__name__)
@@ -260,9 +259,6 @@ def _w2_repo_context_for_source(source_path=None, roots=None):
             return {"kind": "redkit_data", "root": game_data_root}
         if unbundle_root and _is_under_root(candidate, unbundle_root):
             return {"kind": "extracted", "root": unbundle_root}
-        source_root = w2_source_repo_root(candidate)
-        if source_root:
-            return {"kind": "extracted", "root": source_root}
     return None
 
 
@@ -659,8 +655,6 @@ def _get_repo_roots_from_prefs(version=999):
     if version <= 115:
         fbx_uncook_path = prefs.fbx_uncook_path
         uncook_path = str(getattr(prefs, "w2_unbundle_path", "") or "").strip()
-        if not uncook_path:
-            uncook_path = coerce_w2_data_root(getattr(prefs, "witcher2_game_path", ""))
         texture_path = uncook_path
 
     return fbx_uncook_path, uncook_path, texture_path, use_separate_texture_path
@@ -887,20 +881,6 @@ def _extract_w2_bundle_to_roots(filepath: str, roots, *, primary_root: str = "")
     return ""
 
 
-def _resolve_w2_cache_fallback(filepath: str, cache_extract_root: str) -> str:
-    if not cache_extract_root:
-        return ""
-    cache_candidate = _find_w2_existing_repo_file(cache_extract_root, filepath)
-    if cache_candidate:
-        _warn_w2_cache_fallback(filepath, cache_candidate)
-        return cache_candidate
-    cache_candidate = _extract_w2_bundle_repo_file(filepath, cache_extract_root)
-    if cache_candidate:
-        _warn_w2_cache_fallback(filepath, cache_candidate)
-        return cache_candidate
-    return ""
-
-
 def _warn_w2_redkit_fallback(filepath: str, resolved_path: str) -> None:
     log.debug(
         "WITCHER 2 REDKIT RESOLVE: loading '%s' from REDkit: %s",
@@ -909,58 +889,11 @@ def _warn_w2_redkit_fallback(filepath: str, resolved_path: str) -> None:
     )
 
 
-def _warn_w2_uncook_fallback(filepath: str, resolved_path: str) -> None:
-    log.warning(
-        "WITCHER 2 UNCOOK FALLBACK: loading '%s' from Uncook after REDkit lookup failed: %s",
-        filepath,
-        resolved_path,
-    )
-
-
-def _warn_w2_bundle_fallback(filepath: str, resolved_path: str) -> None:
-    log.warning(
-        "WITCHER 2 BUNDLE FALLBACK: extracted '%s' from Bundles after REDkit lookup failed: %s",
-        filepath,
-        resolved_path,
-    )
-
-
 def _resolve_w2_repo_file(filepath: str, extract_root: str, abs_filename: str) -> str:
     unbundle_root, game_data_root = _get_w2_repo_roots_from_prefs()
-    cache_extract_root = _w2_cache_extract_root()
     context = _active_w2_repo_context() or {}
     context_kind = context.get("kind", "")
     context_root = context.get("root", "")
-
-    if context_kind == "redkit_data":
-        redkit_roots = normalize_roots([context_root, game_data_root])
-        if not _overwrite_existing:
-            for root in redkit_roots:
-                redkit_candidate = _find_w2_existing_repo_file(root, filepath, skip_path=abs_filename)
-                if redkit_candidate:
-                    return redkit_candidate
-
-        fallback_roots = normalize_roots([extract_root, unbundle_root])
-        if not _overwrite_existing:
-            extracted_candidate = _find_w2_existing_in_roots(filepath, fallback_roots)
-            if extracted_candidate:
-                _warn_w2_uncook_fallback(filepath, extracted_candidate)
-                return extracted_candidate
-
-        extracted_candidate = _extract_w2_bundle_to_roots(
-            filepath,
-            [extract_root],
-            primary_root=extract_root,
-        )
-        if extracted_candidate:
-            _warn_w2_bundle_fallback(filepath, extracted_candidate)
-            return extracted_candidate
-
-        cache_candidate = _resolve_w2_cache_fallback(filepath, cache_extract_root)
-        if cache_candidate:
-            return cache_candidate
-
-        return abs_filename
 
     extracted_roots = [extract_root, unbundle_root]
     if context_kind == "extracted":
@@ -980,17 +913,6 @@ def _resolve_w2_repo_file(filepath: str, extract_root: str, abs_filename: str) -
     if extracted_candidate:
         return extracted_candidate
 
-    game_roots = []
-    if context_kind == "redkit_data":
-        game_roots.append(context_root)
-    game_roots.append(game_data_root)
-    game_roots = normalize_roots(game_roots)
-    for root in game_roots:
-        game_data_candidate = _find_w2_existing_repo_file(root, filepath, skip_path=abs_filename)
-        if game_data_candidate and not _overwrite_existing:
-            _warn_w2_redkit_fallback(filepath, game_data_candidate)
-            return game_data_candidate
-
     if _overwrite_existing:
         extracted_candidate = _extract_w2_bundle_to_roots(
             filepath,
@@ -1000,9 +922,16 @@ def _resolve_w2_repo_file(filepath: str, extract_root: str, abs_filename: str) -
         if extracted_candidate:
             return extracted_candidate
 
-    cache_candidate = _resolve_w2_cache_fallback(filepath, cache_extract_root)
-    if cache_candidate:
-        return cache_candidate
+    game_roots = []
+    if context_kind == "redkit_data":
+        game_roots.append(context_root)
+    game_roots.append(game_data_root)
+    game_roots = normalize_roots(game_roots, existing_only=True)
+    for root in game_roots:
+        game_data_candidate = _find_w2_existing_repo_file(root, filepath, skip_path=abs_filename)
+        if game_data_candidate and not _overwrite_existing:
+            _warn_w2_redkit_fallback(filepath, game_data_candidate)
+            return game_data_candidate
 
     return abs_filename
 

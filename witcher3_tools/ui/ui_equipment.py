@@ -16,7 +16,10 @@ log = logging.getLogger(__name__)
 from ..CR2W.witcher_cache.CacheController import CacheController
 from ..CR2W.witcher_cache.Bundles import LoadBundleManager
 from ..CR2W.witcher_cache.Bundles.BundleItem import BundleItem
-from ..CR2W.common_blender import repo_file, mod_loading_context
+from ..CR2W.common_blender import (
+    repo_file,
+    mod_loading_context,
+)
 from ..importers import import_entity
 from ..importers import import_isolation
 from ..importers.import_anims import load_idle_animation_for_armature as _load_idle_anim
@@ -32,7 +35,12 @@ from .. import get_rig_rot90_enabled
 from .armature_context import (
     get_main_armature_and_rig_settings,
 )
-from ..source_game_paths import normalize_source_game as _normalize_source_game
+from ..source_game_paths import W2_REPO_VERSION, normalize_source_game as _normalize_source_game
+from ..entity_path_resolver import (
+    EQUIPMENT_ENTITY_EXTENSIONS,
+    remember_entity_repo_path,
+    resolve_entity_repo_path,
+)
 from . import equipment_catalog
 from .equipment_item_picker import (
     EquipmentItemPickerRow,
@@ -940,6 +948,12 @@ def _infer_source_game_from_rig_settings(rig_settings, armature=None):
         sg = str(getattr(rig_settings, "source_game", "") or "").strip().lower()
         if sg in {"w2", "w3"}:
             return sg
+    if armature is not None:
+        try:
+            if _is_w2_search(_get_armature_source_roots(armature)):
+                return "w2"
+        except Exception:
+            pass
     return "w3"
 
 
@@ -1596,6 +1610,11 @@ def _get_uncook_item_template_index(uncook_root):
 def _remember_uncook_item_relpath(uncook_root, rel_path):
     if not uncook_root or not rel_path:
         return
+    try:
+        source_game = "w2" if _is_w2_search([uncook_root]) else "w3"
+        remember_entity_repo_path(uncook_root, rel_path, source_game=source_game)
+    except Exception:
+        pass
     norm_root = os.path.normcase(os.path.normpath(uncook_root))
     root_index = _UNCOOK_ITEM_TEMPLATE_INDEX.get(norm_root)
     if root_index is None:
@@ -2744,8 +2763,8 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
     search_roots = list(search_roots or [])
     prefer_w2_repo = _is_w2_search(search_roots) or _normalize_source_game(source_game) == "w2"
     if prefer_w2_repo:
-        roots_to_search = _normalize_unique_roots(search_roots + _get_w2_repo_roots())
-        uncook_root = ""
+        roots_to_search = _normalize_unique_roots(_get_w2_repo_roots())
+        uncook_root = roots_to_search[0] if roots_to_search else ""
     else:
         # Prefer already-exported assets from uncook/source roots. Bundles are fallback.
         try:
@@ -2754,11 +2773,69 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
             uncook_root = ""
         roots_to_search = _normalize_unique_roots([uncook_root] + search_roots)
 
-    for rel_path in rel_candidates:
-        for root in roots_to_search:
-            export_path = os.path.join(root, rel_path)
-            if os.path.exists(export_path):
-                return SimpleNamespace(name=rel_path), export_path, "\\" + rel_path
+    def _resolve_w2_repo_candidate(rel_path):
+        if not rel_path:
+            return None
+        try:
+            resolved_path = repo_file(rel_path, version=W2_REPO_VERSION)
+        except Exception:
+            resolved_path = ""
+        if resolved_path and os.path.exists(resolved_path):
+            repo_name = rel_path.replace("/", "\\").lstrip("\\")
+            return SimpleNamespace(name=repo_name), resolved_path, "\\" + repo_name
+        return None
+
+    def _materialize_resolved_repo_path(repo_path, source_root=""):
+        repo_name = str(repo_path or "").replace("/", "\\").lstrip("\\")
+        if not repo_name:
+            return None
+        try:
+            if prefer_w2_repo:
+                export_path = repo_file(repo_name, version=W2_REPO_VERSION)
+            else:
+                export_path = repo_file(repo_name)
+        except Exception:
+            export_path = ""
+        if export_path and os.path.exists(export_path):
+            _remember_uncook_item_relpath(uncook_root, repo_name)
+            return SimpleNamespace(name=repo_name), export_path, "\\" + repo_name
+        if source_root:
+            candidate = os.path.join(source_root, repo_name)
+            if os.path.exists(candidate):
+                _remember_uncook_item_relpath(source_root, repo_name)
+                return SimpleNamespace(name=repo_name), candidate, "\\" + repo_name
+        return None
+
+    try:
+        resolved_entity_path = resolve_entity_repo_path(
+            rel_name,
+            source_game="w2" if prefer_w2_repo else "w3",
+            search_roots=roots_to_search,
+            extensions=EQUIPMENT_ENTITY_EXTENSIONS,
+            load_bundle_manager=True,
+            include_non_items=True,
+        )
+    except Exception:
+        resolved_entity_path = None
+    if resolved_entity_path:
+        resolved = _materialize_resolved_repo_path(
+            resolved_entity_path.repo_path,
+            source_root=resolved_entity_path.source_root,
+        )
+        if resolved:
+            return resolved
+
+    if prefer_w2_repo:
+        for rel_path in rel_candidates:
+            resolved = _resolve_w2_repo_candidate(rel_path)
+            if resolved:
+                return resolved
+    else:
+        for rel_path in rel_candidates:
+            for root in roots_to_search:
+                export_path = os.path.join(root, rel_path)
+                if os.path.exists(export_path):
+                    return SimpleNamespace(name=rel_path), export_path, "\\" + rel_path
 
     def _lookup_indexed_rel_path():
         keys = [_w2ent_basename_key(rel_name)]
@@ -2774,6 +2851,11 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
                 if not indexed_rel_path:
                     continue
                 export_path = os.path.join(root, indexed_rel_path)
+                if prefer_w2_repo:
+                    resolved = _resolve_w2_repo_candidate(indexed_rel_path)
+                    if resolved:
+                        return resolved
+                    continue
                 if os.path.exists(export_path):
                     return SimpleNamespace(name=indexed_rel_path), export_path, "\\" + indexed_rel_path
         return None
@@ -2805,6 +2887,54 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
         search_pattern += ".w2ent"
     search_info = f"{search_pattern}; roots={roots_to_search}"
     if prefer_w2_repo:
+        try:
+            from ..CR2W.common_blender import _current_w2_bundle_manager
+
+            manager = _current_w2_bundle_manager()
+            items_by_path = getattr(manager, "Items", {}) if manager is not None else {}
+            if not items_by_path and rel_candidates:
+                # The exact repo_file probes above also initialize the DZIP manager.
+                _resolve_w2_repo_candidate(rel_candidates[0])
+                manager = _current_w2_bundle_manager()
+                items_by_path = getattr(manager, "Items", {}) if manager is not None else {}
+        except Exception:
+            items_by_path = {}
+
+        if items_by_path:
+            basename_ends = []
+            seen_ends = set()
+            for rel_path in rel_candidates:
+                basename_end = rel_path.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+                if basename_end and basename_end not in seen_ends:
+                    seen_ends.add(basename_end)
+                    basename_ends.append(basename_end)
+
+            matches = []
+            for item_key, item_list in items_by_path.items():
+                repo_name = str(item_key or "").replace("/", "\\").lstrip("\\")
+                lower_repo_name = repo_name.lower()
+                if not any(lower_repo_name == end or lower_repo_name.endswith("\\" + end) for end in basename_ends):
+                    continue
+                if not item_list:
+                    continue
+                preferred_equipment_path = lower_repo_name.startswith(("items\\geralt\\", "items\\weapons\\"))
+                score = (
+                    0 if preferred_equipment_path else (1 if lower_repo_name.startswith("items\\") else 2),
+                    0 if lower_repo_name.endswith(".w2ent") else 1,
+                    len(lower_repo_name),
+                    lower_repo_name,
+                )
+                matches.append((score, repo_name, item_list))
+
+            if matches:
+                matches.sort(key=lambda item: item[0])
+                _score, repo_name, item_list = matches[0]
+                final_item = item_list[-1] if isinstance(item_list, list) else item_list
+                resolved_repo_name = str(getattr(final_item, "name", "") or repo_name).replace("/", "\\").lstrip("\\")
+                resolved = _resolve_w2_repo_candidate(resolved_repo_name)
+                if resolved:
+                    _remember_uncook_item_relpath(uncook_root, resolved_repo_name)
+                    return resolved
         return None, None, search_info
     try:
         bundle_manager = LoadBundleManager()
@@ -2848,7 +2978,10 @@ def _resolve_bundle_item_by_template_cached(template_name, search_roots=None, pr
         return _resolve_bundle_item_by_template(template_name, search_roots=search_roots)
 
     cache = prepared_context.setdefault("bundle_item_cache", {})
-    source_game = _normalize_source_game(prepared_context.get("source_game", ""))
+    source_game = _normalize_source_game(
+        prepared_context.get("source_game", "")
+        or get_equipment_source_game_for_search_roots(search_roots)
+    )
     cache_key = (
         _normalize_template_path(template_name).lower(),
         tuple(_norm_root_path(root) for root in (search_roots or [])),
@@ -7035,6 +7168,7 @@ class EQUIPMENT_OT_ApplyInventoryPreset(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     preset_id: bpy.props.StringProperty(default="", options={'HIDDEN'})
+    source_game: bpy.props.StringProperty(default="", options={'HIDDEN'})
 
     def execute(self, context):
         armature, rig_settings = _get_armature_and_rig_settings(context)
@@ -7043,7 +7177,11 @@ class EQUIPMENT_OT_ApplyInventoryPreset(bpy.types.Operator):
             return {'CANCELLED'}
 
         temp_data = getattr(context.window_manager, "witcherui_temp_data", None)
-        source_game = _infer_source_game_from_rig_settings(rig_settings, armature)
+        source_game = (
+            _normalize_source_game(self.source_game)
+            if str(getattr(self, "source_game", "") or "").strip()
+            else _infer_source_game_from_rig_settings(rig_settings, armature)
+        )
         preset_id = str(self.preset_id or _get_inventory_preset_selection(context, target="INVENTORY") or "").strip()
         preset = _get_inventory_preset(preset_id, source_game=source_game)
         if not preset:
@@ -7056,7 +7194,7 @@ class EQUIPMENT_OT_ApplyInventoryPreset(bpy.types.Operator):
             return {'CANCELLED'}
 
         source_roots = _get_inventory_source_roots_for_rig(armature, rig_settings)
-        prepared_context = {"source_roots": source_roots} if source_roots else None
+        prepared_context = {"source_roots": source_roots, "source_game": source_game}
         with _preserve_selection(context):
             _remove_inventory_slots_for_preset_apply(rig_settings)
             try:
@@ -7961,6 +8099,12 @@ def _prepare_equipment_load_context(armature, rig_settings, prepared_context=Non
                 except Exception:
                     source_roots = []
         prepared["source_roots"] = source_roots
+
+    if not prepared.get("source_game"):
+        source_game = _infer_source_game_from_rig_settings(rig_settings, armature)
+        if source_game != "w2" and get_equipment_source_game_for_search_roots(source_roots) == "w2":
+            source_game = "w2"
+        prepared["source_game"] = source_game
 
     if "entity" not in prepared or "appearance" not in prepared:
         entity, appearance = _get_entity_and_appearance(rig_settings)

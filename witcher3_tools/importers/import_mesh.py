@@ -12,7 +12,13 @@ from ..CR2W.common_blender import repo_file, get_collision_for_mesh, get_collisi
 from ..importers.import_rig import rotate_and_connect_bones
 
 from ..cloth_util import setup_w3_material_CR2W
-from .. import get_texture_path, get_uncook_path, get_w2_unbundle_path, get_witcher2_game_path
+from .. import (
+    get_all_addon_prefs,
+    get_mod_directory,
+    get_modded_texture_path,
+    get_texture_path,
+    get_uncook_path,
+)
 from .. import file_helpers
 from ..CR2W import w3_types
 from ..CR2W import read_json_w3
@@ -26,7 +32,7 @@ from ..CR2W.Types.SBufferInfos import SMeshInfos, EMeshVertexType, VertexSkinnin
 from ..CR2W.dc_entity import CCollisionShapeConvex, CCollisionShapeTriMesh, CCollisionShapeBox, CCollisionShapeCapsule, CCollisionShapeSphere
 from ..importers.import_nxs import createCol, createTri, createBox, createCapsule, createSphere, create_from_nxs
 from .. import get_do_fix_tail, set_rig_rot90_enabled
-from ..source_game_paths import w2_source_repo_root
+from ..source_game_paths import configured_w2_repo_roots, w2_source_repo_root_if_configured
 
 log = logging.getLogger(__name__)
 
@@ -549,7 +555,6 @@ def import_mesh(filename:str,
         anim = None
     return anim
 
-from .. import get_mod_directory, get_texture_path, get_modded_texture_path, get_all_addon_prefs
 root_folders = [
     "animations",
     "characters",
@@ -583,8 +588,6 @@ def get_repo_from_abs_path(file_path):
     UNCOOK_DIR = get_uncook_path(bpy.context)
     MOD_DIR = get_mod_directory(bpy.context)
     MOD_TEX_PATH = get_modded_texture_path(bpy.context)
-    W2_UNCOOK_DIR = get_w2_unbundle_path(bpy.context)
-    W2_GAME_DIR = get_witcher2_game_path(bpy.context)
     addon_prefs = get_all_addon_prefs(bpy.context)
 
     def _try_strip(path, root):
@@ -615,14 +618,8 @@ def get_repo_from_abs_path(file_path):
 
     # Witcher 2 roots must be checked before the Witcher 3 uncook root so W2
     # imported meshes/items keep their source-game relative paths.
-    result = _try_strip(file_path, W2_UNCOOK_DIR)
-    if result:
-        return result
-    if W2_GAME_DIR:
-        w2_data_root = W2_GAME_DIR
-        if os.path.basename(os.path.normpath(w2_data_root)).lower() != "data":
-            w2_data_root = os.path.join(w2_data_root, "data")
-        result = _try_strip(file_path, w2_data_root)
+    for w2_root in configured_w2_repo_roots(bpy.context):
+        result = _try_strip(file_path, w2_root)
         if result:
             return result
 
@@ -1039,12 +1036,11 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
         
         
         if meshFile.HEADER.version <= 115:
-            uncook_path = w2_source_repo_root(getattr(meshFile, "fileName", "") or "")
+            uncook_path = w2_source_repo_root_if_configured(getattr(meshFile, "fileName", "") or "")
             if not uncook_path:
-                uncook_path = (get_w2_unbundle_path(bpy.context) or "").strip()
-            if not uncook_path:
-                uncook_path = get_witcher2_game_path(bpy.context)+"\\data"
-            uncook_path = uncook_path.rstrip("\\/") + "\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
+                roots = configured_w2_repo_roots(bpy.context)
+                uncook_path = roots[0] if roots else ""
+            uncook_path = (uncook_path.rstrip("\\/") + "\\") if uncook_path else "" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
             #uncook_path_modkit = get_witcher2_game_path(bpy.context)
         else:
             uncook_path = get_texture_path(bpy.context)+"\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES

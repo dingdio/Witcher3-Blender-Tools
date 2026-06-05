@@ -1396,6 +1396,7 @@ def _apply_geralt_inventory_preset(context, preset_id, operator=None, source_gam
         result = bpy.ops.witcher.equipment_apply_inventory_preset(
             'EXEC_DEFAULT',
             preset_id=preset_id,
+            source_game=source_game,
         )
         if isinstance(result, set) and 'FINISHED' in result and preset:
             return str(preset.get("name", "") or "")

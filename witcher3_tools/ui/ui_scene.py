@@ -12,7 +12,12 @@ log = logging.getLogger(__name__)
 from ..CR2W import w3_types
 from ..CR2W.prop_utils import prop_to_string
 from ..CR2W.common_blender import get_repo_override_state, repo_file, set_repo_override_roots
-from ..source_game_paths import normalize_source_game, source_roots, version_for_source_game, w2_source_repo_root
+from ..source_game_paths import (
+    normalize_source_game,
+    source_roots,
+    version_for_source_game,
+    w2_source_repo_root_if_configured,
+)
 from .. import dialog_language
 from ..importers import import_cutscene
 from ..importers import import_scene
@@ -1716,7 +1721,7 @@ def _w2scene_repo_root_from_filepath(filepath, repo_path="", source_game=""):
                 return root
 
     if source_game == "w2":
-        w2_root = w2_source_repo_root(normalized)
+        w2_root = w2_source_repo_root_if_configured(normalized)
         if w2_root:
             return w2_root
 
