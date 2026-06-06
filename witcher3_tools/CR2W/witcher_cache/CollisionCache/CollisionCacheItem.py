@@ -126,6 +126,29 @@ class CollisionCacheItemHeader:
         return size, consumed
 
 
+def _is_missing_collision_material_name(value: str) -> bool:
+    return not value or str(value).strip().lower() == "none"
+
+
+def _shape_material_value(item: CollisionCacheItemHeaderItem):
+    strings = [
+        str(value).strip()
+        for value in (getattr(item, "Strings", None) or [])
+        if not _is_missing_collision_material_name(value)
+    ]
+    name = str(getattr(item, "Name", "") or "").strip()
+
+    # Trimesh cache headers store their material table in Strings while Name is
+    # commonly the sentinel "None". Primitive shapes usually store it in Name.
+    if int(getattr(item, "Flag", -1)) == 5 and strings:
+        return strings
+    if not _is_missing_collision_material_name(name):
+        return name
+    if strings:
+        return strings[0]
+    return "nxs_material"
+
+
 class CollisionCacheItem:
     """
     Files packed into Collision.cache. Zlib compressed nxs/apb/bin files.
@@ -274,7 +297,7 @@ class CollisionCacheItem:
         return output
 
     def get_shapes_with_data(self):
-        """Return per-shape (pose_matrix, flag, payload_bytes, material_name) tuples.
+        """Return per-shape (pose_matrix, flag, payload_bytes, material_name_or_names) tuples.
 
         Re-decompresses the raw entry to extract both the RED header (poses, flags,
         material names) and each shape's raw payload bytes, so callers can create
@@ -286,7 +309,7 @@ class CollisionCacheItem:
             bytes 68-69 : asset ID (uint16)
 
         Returns:
-            list of (matrix_4x4_or_None, flag, payload_bytes, material_name) tuples.
+            list of (matrix_4x4_or_None, flag, payload_bytes, material_name_or_names) tuples.
             PxGeometryType: sphere=0, plane=1, capsule=2, box=3, convex=4, trimesh=5
             Returns empty list for Comtype 1/5 entries or on error.
         """
@@ -329,7 +352,7 @@ class CollisionCacheItem:
                 ]
             payload = decompressed_data[payload_offset:payload_offset + item.FileSize]
             payload_offset += item.FileSize
-            material_name = item.Name or "nxs_material"
+            material_name = _shape_material_value(item)
             result.append((pose, flag, payload, material_name))
 
         return result

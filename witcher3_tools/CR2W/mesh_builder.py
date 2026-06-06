@@ -44,6 +44,23 @@ from .Types.VariousTypes import (CUInt16,
 from .Types.SBufferInfos import (BoneData, EMeshVertexType)
 import base64
 
+MCR_SCENE = 1
+MCR_CASCADE1 = 2
+MCR_CASCADE2 = 4
+MCR_CASCADE3 = 8
+MCR_CASCADE4 = 16
+MCR_LOCAL_SHADOWS = 32
+DEFAULT_MESH_CHUNK_RENDER_MASK = MCR_SCENE | MCR_CASCADE1 | MCR_CASCADE2 | MCR_LOCAL_SHADOWS
+MESH_CHUNK_DIRECT_SHADOW_MASK = MCR_CASCADE1 | MCR_CASCADE2 | MCR_LOCAL_SHADOWS
+_RENDER_MASK_FLAG_NAMES = (
+    (MCR_SCENE, "MCR_Scene"),
+    (MCR_CASCADE1, "MCR_Cascade1"),
+    (MCR_CASCADE2, "MCR_Cascade2"),
+    (MCR_CASCADE3, "MCR_Cascade3"),
+    (MCR_CASCADE4, "MCR_Cascade4"),
+    (MCR_LOCAL_SHADOWS, "MCR_LocalShadows"),
+)
+
 
 def _float_to_u8(value):
     try:
@@ -57,6 +74,51 @@ def _linear_float_to_srgb_u8(value):
         return _float_to_u8(lin2srgb(float(value)))
     except Exception:
         return 0
+
+
+def _normalize_depot_path(path):
+    return str(path or "").replace("/", "\\").strip().lower()
+
+
+def _render_mask_to_strings(render_mask):
+    try:
+        mask = int(render_mask)
+    except (TypeError, ValueError):
+        mask = DEFAULT_MESH_CHUNK_RENDER_MASK
+    return [name for bit, name in _RENDER_MASK_FLAG_NAMES if mask & bit]
+
+
+def _is_shadowless_material(mat_data):
+    props = mat_data.get("witcher_props", {}) if isinstance(mat_data, dict) else {}
+
+    material_names = [
+        str(mat_data.get("name", "")) if isinstance(mat_data, dict) else "",
+        str(props.get("name", "")),
+    ]
+    if any(name.strip().lower() == "volume" for name in material_names):
+        return True
+
+    base_path = _normalize_depot_path(props.get("base_custom") or props.get("base"))
+    base_name = base_path.rsplit("\\", 1)[-1]
+    shader_name = base_name.rsplit(".", 1)[0]
+    if shader_name in {"volume", "invisible"}:
+        return True
+    if shader_name.startswith("transparent_") or "glass" in shader_name:
+        return True
+
+    return False
+
+
+def _derive_render_mask(common_info, mat_data):
+    mesh_settings = common_info.get("lod0_MeshSettings") if isinstance(common_info, dict) else None
+    if getattr(mesh_settings, "entityProxy", False):
+        render_mask = MCR_SCENE
+    else:
+        render_mask = DEFAULT_MESH_CHUNK_RENDER_MASK
+
+    if _is_shadowless_material(mat_data):
+        render_mask &= ~MESH_CHUNK_DIRECT_SHADOW_MASK
+    return render_mask
 
 
 def printProps(PROPS):
@@ -269,6 +331,14 @@ def Build_CMesh_Chunk(cr2w, ALL_LODS, bone_data:BoneData = None, common_info = N
             if firstIndex:
                 more_prop_SMeshChunkPacked.MoreProps.append(PROPERTY(Value = firstIndex, theName='firstIndex', theType='Uint32'))
 
+            if int(renderMask) != DEFAULT_MESH_CHUNK_RENDER_MASK:
+                more_prop_SMeshChunkPacked.MoreProps.append(PROPERTY(
+                    theName='renderMask',
+                    theType='EMeshChunkRenderMask',
+                    IsFlag=True,
+                    strings=_render_mask_to_strings(renderMask),
+                ))
+
             # Always write explicit shadow-mesh usage so the chunk data is unambiguous.
             more_prop_SMeshChunkPacked.MoreProps.append(PROPERTY(Value = bool(useForShadowmesh), theName='useForShadowmesh', theType='Bool'))
 
@@ -414,7 +484,7 @@ def Build_CMesh_Chunk(cr2w, ALL_LODS, bone_data:BoneData = None, common_info = N
             numIndices = bl_mesh_info.meshInfo.numIndices #Uint32
             firstVertex = bl_mesh_info.meshInfo.firstVertex # Uint32 0
             firstIndex = bl_mesh_info.meshInfo.firstIndex # Uint32 0
-            renderMask = 0 # EMeshChunkRenderMask
+            renderMask = _derive_render_mask(common_info, witcher_mat_info[0] if witcher_mat_info else {})
             useForShadowmesh = (lod_level == shadow_lod_level) # use lowest detail LOD for shadows
             
             chunks_to_make.append([
@@ -886,27 +956,60 @@ def _build_chunk_handle(chunk_index, handle_type):
     handle.Index = None
     return handle
 
-def _upsert_cmesh_handle_prop(cmesh_chunk, prop_name, prop_type, chunk_index):
-    insert_idx = len(cmesh_chunk.PROPS)
-    for i, prop in enumerate(cmesh_chunk.PROPS):
-        if getattr(prop, 'theName', None) == 'internalVersion':
-            insert_idx = i
-            break
+_CMESH_PROP_ORDER = (
+    'materialNames',
+    'materials',
+    'boundingBox',
+    'autoHideDistance',
+    'collisionMesh',
+    'useExtraStreams',
+    'generalizedMeshRadius',
+    'mergeInGlobalShadowMesh',
+    'isOccluder',
+    'smallestHoleOverride',
+    'chunks',
+    'rawVertices',
+    'rawIndices',
+    'isStatic',
+    'entityProxy',
+    'cookedData',
+    'soundInfo',
+    'internalVersion',
+    'chunksBuffer',
+)
+_CMESH_PROP_ORDER_INDEX = {name: idx for idx, name in enumerate(_CMESH_PROP_ORDER)}
 
+
+def _sort_cmesh_props(cmesh_chunk):
+    props = getattr(cmesh_chunk, 'PROPS', None)
+    if not props:
+        return
+
+    def sort_key(item):
+        original_index, prop = item
+        name = getattr(prop, 'theName', None)
+        rank = _CMESH_PROP_ORDER_INDEX.get(name)
+        if rank is None:
+            return (len(_CMESH_PROP_ORDER), original_index)
+        return (rank, original_index)
+
+    cmesh_chunk.PROPS[:] = [prop for _, prop in sorted(enumerate(props), key=sort_key)]
+
+
+def _upsert_cmesh_handle_prop(cmesh_chunk, prop_name, prop_type, chunk_index):
     for i, prop in enumerate(cmesh_chunk.PROPS):
         if getattr(prop, 'theName', None) == prop_name:
             cmesh_chunk.PROPS.pop(i)
-            if i < insert_idx:
-                insert_idx -= 1
             break
 
     handle = _build_chunk_handle(chunk_index, prop_type)
-    cmesh_chunk.PROPS.insert(insert_idx, PROPERTY(
+    cmesh_chunk.PROPS.append(PROPERTY(
         theName=prop_name,
         theType=prop_type,
         Value=chunk_index + 1,
         Handles=[handle],
     ))
+    _sort_cmesh_props(cmesh_chunk)
 
 def _validate_mesh_chunk_links(cr2w):
     chunks = getattr(getattr(cr2w, 'CHUNKS', None), 'CHUNKS', None) or []
@@ -1159,6 +1262,20 @@ def BuildMesh(ALL_LODS, bone_data, common_info, col_mesh, strip_material_names=F
                 MATERIAL_DICT[mat['name']] = mat
             else:
                 log.debug("MATERIAL_DICT entry skipped (no name)")
+
+    material_items = list(MATERIAL_DICT.items())
+    if any(mat_data.get('material_slot_index') is not None for _, mat_data in material_items):
+        def material_sort_key(item):
+            original_index, (mat_name, mat_data) = item
+            try:
+                return (0, int(mat_data.get('material_slot_index')), original_index)
+            except (TypeError, ValueError):
+                return (1, original_index, mat_name)
+
+        MATERIAL_DICT = {
+            mat_name: mat_data
+            for _, (mat_name, mat_data) in sorted(enumerate(material_items), key=material_sort_key)
+        }
 
     # Strip material names to Material0, Material1, etc.
     if strip_material_names:

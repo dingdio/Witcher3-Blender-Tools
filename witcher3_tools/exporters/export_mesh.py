@@ -6,6 +6,7 @@ import bpy
 import time
 import json
 from pathlib import Path
+from collections import defaultdict
 from mathutils import Matrix
 log = logging.getLogger(__name__)
 
@@ -242,7 +243,7 @@ def scan_principled_bsdf(mat, mesh_repo_dir=""):
     return found
 
 
-def get_mesh_material_info(mesh_bl, mesh_obj=None):
+def get_mesh_material_info(mesh_bl, mesh_obj=None, material_slot_indices=None):
     # Derive the mesh's repo directory for texture fallback paths
     mesh_repo_dir = ""
     if mesh_obj and hasattr(mesh_obj, 'witcherui_MeshSettings'):
@@ -250,8 +251,10 @@ def get_mesh_material_info(mesh_bl, mesh_obj=None):
         if repo:
             mesh_repo_dir = os.path.dirname(repo.replace('/', '\\'))
 
+    material_slot_indices = list(material_slot_indices or [])
+
     material_props = []
-    for mat in mesh_bl.materials:
+    for idx, mat in enumerate(mesh_bl.materials):
         if not mat:
             continue
         mat_props = getattr(mat, 'witcher_props', None)
@@ -269,6 +272,8 @@ def get_mesh_material_info(mesh_bl, mesh_obj=None):
                 'input_props':[] #[{'name':input_prop.name, 'is_enabled': input_prop.is_enabled} for input_prop in mat_props.input_props]
             }
         }
+        if idx < len(material_slot_indices):
+            mat_dict['material_slot_index'] = int(material_slot_indices[idx])
         if mat_props.local:
             validation_issues = validate_material_export_params(mat)
             if validation_issues:
@@ -385,14 +390,20 @@ import bmesh
 
 def split_mesh_by_material(mesh_obj):
     src_mesh = mesh_obj.data
-    used_material_indices = sorted({poly.material_index for poly in src_mesh.polygons})
+    used_material_indices = []
+    seen_material_indices = set()
+    for poly in src_mesh.polygons:
+        mat_idx = poly.material_index
+        if mat_idx not in seen_material_indices:
+            seen_material_indices.add(mat_idx)
+            used_material_indices.append(mat_idx)
 
     # Empty mesh or no polygon assignments: export a direct copy.
     if not used_material_indices:
         mesh_copy = mesh_obj.copy()
         mesh_copy.data = src_mesh.copy()
         bpy.context.collection.objects.link(mesh_copy)
-        return [mesh_copy]
+        return [(mesh_copy, list(range(len(src_mesh.materials))))]
 
     # Common case: one material slot in use, no split needed.
     if len(used_material_indices) == 1:
@@ -407,7 +418,7 @@ def split_mesh_by_material(mesh_obj):
             poly.material_index = 0
         mesh_copy.data = single_mesh
         bpy.context.collection.objects.link(mesh_copy)
-        return [mesh_copy]
+        return [(mesh_copy, [int(mat_idx)])]
 
     final_meshes = []
     for mat_idx in used_material_indices:
@@ -432,17 +443,16 @@ def split_mesh_by_material(mesh_obj):
             split_mesh.materials.append(target_material)
         for poly in split_mesh.polygons:
             poly.material_index = 0
-
         split_obj = mesh_obj.copy()
         split_obj.data = split_mesh
         bpy.context.collection.objects.link(split_obj)
-        final_meshes.append(split_obj)
+        final_meshes.append((split_obj, [int(mat_idx)]))
 
     if not final_meshes:
         mesh_copy = mesh_obj.copy()
         mesh_copy.data = src_mesh.copy()
         bpy.context.collection.objects.link(mesh_copy)
-        return [mesh_copy]
+        return [(mesh_copy, list(range(len(src_mesh.materials))))]
 
     return final_meshes
 
@@ -475,24 +485,136 @@ def split_mesh_by_material(mesh_obj):
 #     return new_meshes
 
 import mathutils
-def get_mesh_median(mesh):
-    median = mathutils.Vector()
-    if not mesh.vertices:
-        return median
-    for v in mesh.vertices:
-        median += v.co
-    median /= len(mesh.vertices)
-    return median
 
-def calculate_mesh_radius(obj):
-    mesh = obj.data
-    radius = 0.0
-    median = get_mesh_median(mesh)
-    for v in mesh.vertices:
-        distance = (obj.matrix_world @ v.co - median).length
-        if distance > radius:
-            radius = distance
-    return radius
+def _snap_generalized_radius_coord(value):
+    # Snap to the same two-decimal grid used when comparing shared vertices.
+    return int(float(value) * 100.0) / 100.0
+
+
+def _snap_generalized_radius_point(co):
+    return (
+        _snap_generalized_radius_coord(co.x),
+        _snap_generalized_radius_coord(co.y),
+        _snap_generalized_radius_coord(co.z),
+    )
+
+
+def _calculate_generalized_radius_from_triangles(points, triangles):
+    if not points or not triangles:
+        return 0.0
+
+    triangles_at_point = defaultdict(list)
+    for tri_index, triangle in enumerate(triangles):
+        for point_index in triangle:
+            triangles_at_point[point_index].append(tri_index)
+
+    processed = [False] * len(triangles)
+    largest_radius = 0.0
+
+    for start_index in range(len(triangles)):
+        if processed[start_index]:
+            continue
+
+        stack = [start_index]
+        processed[start_index] = True
+        cluster = []
+
+        while stack:
+            tri_index = stack.pop()
+            cluster.append(tri_index)
+            for point_index in triangles[tri_index]:
+                for linked_tri_index in triangles_at_point[point_index]:
+                    if not processed[linked_tri_index]:
+                        processed[linked_tri_index] = True
+                        stack.append(linked_tri_index)
+
+        center_x = center_y = center_z = 0.0
+        point_count = 0
+        for tri_index in cluster:
+            for point_index in triangles[tri_index]:
+                point = points[point_index]
+                center_x += point[0]
+                center_y += point[1]
+                center_z += point[2]
+                point_count += 1
+
+        if point_count == 0:
+            continue
+
+        center = (
+            center_x / point_count,
+            center_y / point_count,
+            center_z / point_count,
+        )
+
+        largest_distance_sq = 0.0
+        for tri_index in cluster:
+            for point_index in triangles[tri_index]:
+                point = points[point_index]
+                distance_sq = (
+                    (point[0] - center[0]) ** 2
+                    + (point[1] - center[1]) ** 2
+                    + (point[2] - center[2]) ** 2
+                )
+                if distance_sq > largest_distance_sq:
+                    largest_distance_sq = distance_sq
+
+        largest_radius = max(largest_radius, math.sqrt(largest_distance_sq))
+
+    return largest_radius
+
+
+def calculate_mesh_radius(mesh_objects):
+    point_indices = {}
+    points = []
+    triangles = []
+
+    def map_point(point):
+        point_index = point_indices.get(point)
+        if point_index is None:
+            point_index = len(points)
+            point_indices[point] = point_index
+            points.append(point)
+        return point_index
+
+    for obj in mesh_objects or []:
+        mesh = getattr(obj, "data", None)
+        if mesh is None:
+            continue
+
+        mesh.calc_loop_triangles()
+        for loop_tri in mesh.loop_triangles:
+            tri_indices = []
+            for vertex_index in loop_tri.vertices:
+                point = _snap_generalized_radius_point(mesh.vertices[vertex_index].co)
+                tri_indices.append(map_point(point))
+            if len(tri_indices) == 3:
+                triangles.append(tuple(tri_indices))
+
+    return _calculate_generalized_radius_from_triangles(points, triangles)
+
+
+def _mesh_lod_level(mesh_obj, fallback=0):
+    settings = getattr(mesh_obj, "witcherui_MeshSettings", None)
+    if settings is not None:
+        try:
+            return int(getattr(settings, "lod_level"))
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r'_lod(\d+)(?:\.\d{3})?$', getattr(mesh_obj, "name", ""), re.IGNORECASE)
+    return int(match.group(1)) if match else fallback
+
+
+def _shadow_lod_meshes(mesh_objects):
+    meshes = [mesh for mesh in (mesh_objects or []) if mesh is not None]
+    if not meshes:
+        return []
+    lod_levels = [_mesh_lod_level(mesh, idx) for idx, mesh in enumerate(meshes)]
+    shadow_lod_level = max(lod_levels)
+    return [
+        mesh for mesh, lod_level in zip(meshes, lod_levels)
+        if lod_level == shadow_lod_level
+    ]
 
 def get_mesh_radius_and_bounding_box(mesh_object):
     bounding_box = mesh_object.bound_box
@@ -501,8 +623,7 @@ def get_mesh_radius_and_bounding_box(mesh_object):
     z_coords = [v[2] for v in bounding_box]
     max_point = mathutils.Vector((max(x_coords), max(y_coords), max(z_coords)))
     min_point = mathutils.Vector((min(x_coords), min(y_coords), min(z_coords)))
-    generalizedMeshRadius = calculate_mesh_radius(mesh_object)
-    return generalizedMeshRadius, [list(min_point), list(max_point)]
+    return [list(min_point), list(max_point)]
 
 
 def mesh_to_CCollisionShapeConvex(mesh_obj):
@@ -564,25 +685,17 @@ def mesh_to_CCollisionShapeTriMesh(mesh_obj):
     if any(len(poly.vertices) != 3 for poly in mesh_data.polygons):
         raise ValueError("Mesh must be triangulated for CCollisionShapeTriMesh")
 
-    # Extract triangles as a flat list of vertex indices (3 per triangle)
+    # Extract triangles as a flat list of vertex indices (3 per triangle).
+    # Collision TRI data must keep Blender's vertex order intact; existing
+    # uncooked meshes may reference vertices in a non-first-use order.
     triangles = [v for poly in mesh_data.polygons for v in poly.vertices]
 
-    # REDkit serializes trimesh vertices in first-use order from the triangle
-    # stream (not Blender's raw mesh vertex index order). Reindex to match.
-    used_vertex_order = []
-    seen_vertex_indices = set()
-    for vert_idx in triangles:
-        if vert_idx not in seen_vertex_indices:
-            seen_vertex_indices.add(vert_idx)
-            used_vertex_order.append(vert_idx)
-
-    old_to_new_index = {old_idx: new_idx for new_idx, old_idx in enumerate(used_vertex_order)}
-    triangles = [old_to_new_index[vert_idx] for vert_idx in triangles]
-
-    # Transform only the used vertices to world space, in REDkit-compatible order
+    # Transform vertices to world space without dropping unused vertices. The
+    # source collision data can intentionally carry vertices outside first-use
+    # order, and exact roundtrip depends on preserving that array.
     vertices = []
-    for old_idx in used_vertex_order:
-        world_co = matrix @ mesh_data.vertices[old_idx].co
+    for vertex in mesh_data.vertices:
+        world_co = matrix @ vertex.co
         vertices.append([world_co[0], world_co[1], world_co[2], 1.0])
 
     # Extract material indices for each triangle
@@ -785,7 +898,7 @@ class MeshExporter(object):
         self.__armature = None
         self.__meshes = None
 
-    def __loadMeshData(self, meshObj, bone_map, original_mesh_obj=None):
+    def __loadMeshData(self, meshObj, bone_map, original_mesh_obj=None, material_slot_indices=None):
         bl_mesh = meshObj.data
 
         # Export from a temporary mesh copy so export-time calculations never
@@ -800,7 +913,11 @@ class MeshExporter(object):
                 )
 
             exportMeshdata = get_mesh_info(mesh_for_work, meshObj)
-            exportMaterialdata = get_mesh_material_info(mesh_for_work, mesh_obj=original_mesh_obj or meshObj)
+            exportMaterialdata = get_mesh_material_info(
+                mesh_for_work,
+                mesh_obj=original_mesh_obj or meshObj,
+                material_slot_indices=material_slot_indices,
+            )
             split_meshdata = exportMeshdata.split_data(MAX_W2MESH_CHUNK_VERTICES)
             if len(split_meshdata) > 1:
                 log.info(
@@ -905,14 +1022,17 @@ class MeshExporter(object):
         is_static = not requires_skinning
         nameMap = [] #self.__exportBones(meshes)
         
-        #Note the mesh radius on vanilla w2mesh is calculated for all lods together.
-        rad_box = get_mesh_radius_and_bounding_box(self.__meshes[0])
+        # Match the chunk set that export flags for shadow generation.
+        bounding_box = get_mesh_radius_and_bounding_box(self.__meshes[0])
+        generalized_mesh_radius = calculate_mesh_radius(_shadow_lod_meshes(self.__meshes))
         
         #class Common_Info
         lod0_settings = self.__meshes[0].witcherui_MeshSettings
+        if generalized_mesh_radius <= 0.0:
+            generalized_mesh_radius = calculate_mesh_radius(self.__meshes)
         common_info = {
-            'generalizedMeshRadius' : rad_box[0],
-            'boundingBox' : rad_box[1],
+            'generalizedMeshRadius' : generalized_mesh_radius,
+            'boundingBox' : bounding_box,
             'isStatic' : is_static,
             'lod0_MeshSettings' : lod0_settings
         }
@@ -925,20 +1045,23 @@ class MeshExporter(object):
                 'soundSizeIdentification': '' if size_id == 'default' else size_id,
                 'soundBoneMappingInfo': '' if bone_mapping == 'NONE' else bone_mapping,
             }
-        #generalizedMeshRadius
-        #boundingBox
-
-        # MESH STUFF
-        #todo chunks are stored in reversed sort order by faces
         ALL_LODS = []
         _temp_meshes = []  # Track all temporary mesh objects for cleanup
         try:
             for m in self.__meshes:
-                new_meshes = split_mesh_by_material(m)
+                split_entries = split_mesh_by_material(m)
+                new_meshes = [entry[0] for entry in split_entries]
                 _temp_meshes.extend(new_meshes)
                 mesh_data = []
-                for i in new_meshes:
-                    mesh_data.extend(self.__loadMeshData(i, nameMap, original_mesh_obj=m))
+                for i, material_slot_indices in split_entries:
+                    mesh_data.extend(
+                        self.__loadMeshData(
+                            i,
+                            nameMap,
+                            original_mesh_obj=m,
+                            material_slot_indices=material_slot_indices,
+                        )
+                    )
                 # Data extracted — remove temp meshes for this LOD
                 for mesh in new_meshes:
                     if mesh.name in bpy.data.objects:

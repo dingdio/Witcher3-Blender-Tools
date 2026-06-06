@@ -80,6 +80,22 @@ color_map = {
 }
 
 
+def _normalize_collision_material_names(material_value):
+    if isinstance(material_value, (list, tuple)):
+        names = [
+            str(value).strip()
+            for value in material_value
+            if value is not None and str(value).strip() and str(value).strip().lower() != "none"
+        ]
+        return names
+    if material_value is None:
+        return []
+    value = str(material_value).strip()
+    if not value or value.lower() == "none":
+        return []
+    return [value]
+
+
 class FileFormatException(Exception):
     pass
 
@@ -165,8 +181,9 @@ class CVXMCacheEntry:
         self.uk3 = []
 
 class CCollisionShapeConvexNXS(CCollisionShapeConvex):
-    def __init__(self, entry:CVXMCacheEntry):
-        self.physicalMaterialName = "nxs_material"
+    def __init__(self, entry:CVXMCacheEntry, material_name=None):
+        material_names = _normalize_collision_material_names(material_name)
+        self.physicalMaterialName = material_names[0] if material_names else "nxs_material"
         self.vertices = []
         self.polygons = []
         self.matrix_world = _identity_matrix_list()
@@ -181,7 +198,7 @@ class CCollisionShapeConvexNXS(CCollisionShapeConvex):
             log.error('Could not get CCollisionShapeConvex')
 
 class CCollisionShapeTriMeshNXS(CCollisionShapeTriMesh):
-    def __init__(self, entry:MeshCacheEntry):
+    def __init__(self, entry:MeshCacheEntry, material_name=None):
         self.physicalMaterialNames = []
         self.vertices = []
         self.triangles = []
@@ -189,7 +206,14 @@ class CCollisionShapeTriMeshNXS(CCollisionShapeTriMesh):
         self.matrix_world = _identity_matrix_list()
         try:
             max_material_index = max((int(num) for num in entry.materials), default=0)
-            self.physicalMaterialNames = [f"nxs_Material_{num}" for num in range(max_material_index + 1)]
+            self.physicalMaterialNames = _normalize_collision_material_names(material_name)
+            if not self.physicalMaterialNames:
+                self.physicalMaterialNames = ["nxs_Material_0"]
+            if len(self.physicalMaterialNames) <= max_material_index:
+                old_count = len(self.physicalMaterialNames)
+                self.physicalMaterialNames.extend(
+                    f"nxs_Material_{num}" for num in range(old_count, max_material_index + 1)
+                )
             for vert in entry.vertices:
                 self.vertices.append([vert.x,vert.y,vert.z,1.0])
             for face in entry.faces:
@@ -510,22 +534,36 @@ def createTri(shape_:CCollisionShapeTriMesh, mesh_name:str = "Custom"):
     bpy.context.view_layer.objects.active = obj
     #obj.select_set(True)
 
-    bm = bmesh.new()
+    mesh_vertices = []
     for v in vertices:
         if len(v) < 3:
             raise ValueError(f"TRI collision '{mesh_name}' has invalid vertex entry: {v!r}")
-        bm.verts.new(v[:3])
-    bm.verts.ensure_lookup_table()
-    for i in range(0, len(triangles), 3):
+        mesh_vertices.append((float(v[0]), float(v[1]), float(v[2])))
+
+    mesh_faces = []
+    face_material_indices = []
+    skipped_faces = 0
+    for face_index, i in enumerate(range(0, len(triangles), 3)):
         if i + 2 >= len(triangles):
             break
-        try:
-            bm.faces.new([bm.verts[triangles[i]], bm.verts[triangles[i+1]], bm.verts[triangles[i+2]]])
-        except (ValueError, IndexError):
-            # Skip invalid/duplicate faces in malformed collision meshes.
+        face = (triangles[i], triangles[i + 1], triangles[i + 2])
+        if any(idx < 0 or idx >= len(mesh_vertices) for idx in face):
+            skipped_faces += 1
             continue
-    bm.to_mesh(mesh)
-    bm.free()
+        mesh_faces.append(face)
+        face_material_indices.append(
+            physicalMaterialIndexes[face_index] if face_index < len(physicalMaterialIndexes) else 0
+        )
+
+    mesh.from_pydata(mesh_vertices, [], mesh_faces)
+    mesh.update()
+    if skipped_faces:
+        log.warning(
+            "TRI collision '%s' skipped %d face(s) with out-of-range vertex indices",
+            mesh_name,
+            skipped_faces,
+        )
+
     for material_name in physicalMaterialNames:
         material = bpy.data.materials.get(material_name)
         if material is None:
@@ -541,8 +579,7 @@ def createTri(shape_:CCollisionShapeTriMesh, mesh_name:str = "Custom"):
         mesh.materials.append(material)
 
     slot_count = len(mesh.materials)
-    for i, polygon in enumerate(mesh.polygons):
-        src_index = physicalMaterialIndexes[i] if i < len(physicalMaterialIndexes) else 0
+    for polygon, src_index in zip(mesh.polygons, face_material_indices):
         if src_index < 0:
             src_index = 0
         if slot_count:
@@ -721,8 +758,9 @@ def _read_mesh_entry(f: bStream) -> MeshCacheEntry:
             # 16-bit indices
             ra.extend([f.readUInt16(), f.readUInt16(), f.readUInt16()])
         else:
-            # 8-bit indices
-            ra.extend([f.readByte(), f.readByte(), f.readByte()])
+            # 8-bit vertex indices are unsigned. Signed reads turn 128..255
+            # into negative values and cause valid faces to be skipped.
+            ra.extend([f.readUByte(), f.readUByte(), f.readUByte()])
         entry.faces.append(ra)
 
     if (entry.flags & 0b1) > 0:
@@ -1106,21 +1144,22 @@ def _try_import_primitive_blob(filePath: str):
         return None
     return _try_import_primitive_blob_bytes(data, Path(filePath).stem, source_label=filePath)
 
-def _create_primitive_from_item(payload: bytes, flag: int, pose, material_name: str, name: str):
+def _create_primitive_from_item(payload: bytes, flag: int, pose, material_name, name: str):
     """Create one collision primitive from a RED header item's data and pose.
 
     Args:
         payload: Raw shape bytes (12=box, 4=sphere, 8=capsule)
         flag: PxGeometryType (0=sphere, 2=capsule, 3=box, 4/5=NXS handled elsewhere)
         pose: 4x4 row-major matrix list or None for identity
-        material_name: Physics material name
+        material_name: Physics material name or material-name list; primitives use the first valid name
         name: Blender object name base
 
     Returns:
         Created Blender object, or None on failure
     """
     pose_mat = pose if pose is not None else _identity_matrix_list()
-    mat_name = material_name or "nxs_material"
+    material_names = _normalize_collision_material_names(material_name)
+    mat_name = material_names[0] if material_names else "nxs_material"
 
     if flag == 3:  # box: 3 x float32 half-extents
         if len(payload) < 12:
@@ -1167,10 +1206,10 @@ def create_from_nxs(filePath, shape_items=None):
 
     Args:
         filePath: Path to the NXS file
-        shape_items: Optional list of (matrix_4x4_or_None, flag, payload_bytes, material_name)
+        shape_items: Optional list of (matrix_4x4_or_None, flag, payload_bytes, material_name_or_names)
                      tuples from CollisionCacheItem.get_shapes_with_data(). When provided:
-                     - NXS shapes (flag 4=convex, 5=trimesh): pose applied to the created object
-                     - Primitive shapes (flag 0-3): created individually with pose + material
+                     - NXS shapes (flag 4=convex, 5=trimesh): created with pose + material table
+                     - Primitive shapes (flag 0-3): created individually with pose + first material
 
     Returns:
         list: List of created Blender objects
@@ -1179,11 +1218,26 @@ def create_from_nxs(filePath, shape_items=None):
         FileFormatException: If no valid NXS entries are found and no shape_items
     """
     NXS_FLAGS = (4, 5)
-    nxs_poses = [pose for pose, flag, payload, mat in shape_items if flag in NXS_FLAGS] if shape_items else []
+    nxs_shape_items = [
+        (pose, mat) for pose, flag, payload, mat in shape_items if flag in NXS_FLAGS
+    ] if shape_items else []
 
     base_name = Path(filePath).stem
     nxs_file = bStream(path=filePath)
     objects = []
+
+    def _create_nxs_entry_object(entry, mesh_name, pose=None, material_name=None):
+        if isinstance(entry, CVXMCacheEntry):
+            shape = CCollisionShapeConvexNXS(entry, material_name)
+            if pose is not None:
+                shape.matrix_world = pose
+            return createCol(shape, mesh_name)
+        if isinstance(entry, MeshCacheEntry):
+            shape = CCollisionShapeTriMeshNXS(entry, material_name)
+            if pose is not None:
+                shape.matrix_world = pose
+            return createTri(shape, mesh_name)
+        return None
 
     with nxs_file:
         entries = read_all_nxs_entries(nxs_file)
@@ -1196,6 +1250,35 @@ def create_from_nxs(filePath, shape_items=None):
             except Exception:
                 header = b""
                 file_size = -1
+
+    if entries and shape_items:
+        nxs_index = 0
+        for pose, flag, payload, mat in shape_items:
+            if flag in NXS_FLAGS:
+                if nxs_index >= len(entries):
+                    log.warning(
+                        "Collision cache shape list has more NXS shapes than '%s' contains; skipping extra shape",
+                        filePath,
+                    )
+                    continue
+                mesh_name = f"{base_name}_{nxs_index:02d}" if len(entries) > 1 else base_name
+                obj = _create_nxs_entry_object(entries[nxs_index], mesh_name, pose, mat)
+                if obj:
+                    objects.append(obj)
+                nxs_index += 1
+            else:
+                obj = _create_primitive_from_item(payload, flag, pose, mat, base_name)
+                if obj:
+                    objects.append(obj)
+
+        for i in range(nxs_index, len(entries)):
+            mesh_name = f"{base_name}_{i:02d}" if len(entries) > 1 else base_name
+            obj = _create_nxs_entry_object(entries[i], mesh_name)
+            if obj:
+                objects.append(obj)
+
+        log.info(f"Imported {len(objects)} collision objects from {filePath}")
+        return objects
 
     if entries:
         primitive_objects = _try_import_mixed_file_primitives(filePath, entries)
@@ -1230,17 +1313,13 @@ def create_from_nxs(filePath, shape_items=None):
     for i, entry in enumerate(entries):
         mesh_name = f"{base_name}_{i:02d}" if len(entries) > 1 else base_name
 
-        if isinstance(entry, CVXMCacheEntry):
-            shape = CCollisionShapeConvexNXS(entry)
-            if i < len(nxs_poses) and nxs_poses[i] is not None:
-                shape.matrix_world = nxs_poses[i]
-            obj = createCol(shape, mesh_name)
-            objects.append(obj)
-        elif isinstance(entry, MeshCacheEntry):
-            shape = CCollisionShapeTriMeshNXS(entry)
-            if i < len(nxs_poses) and nxs_poses[i] is not None:
-                shape.matrix_world = nxs_poses[i]
-            obj = createTri(shape, mesh_name)
+        obj = _create_nxs_entry_object(
+            entry,
+            mesh_name,
+            nxs_shape_items[i][0] if i < len(nxs_shape_items) else None,
+            nxs_shape_items[i][1] if i < len(nxs_shape_items) else None,
+        )
+        if obj:
             objects.append(obj)
 
     log.info(f"Imported {len(objects)} collision objects from {filePath}")

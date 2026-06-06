@@ -14,6 +14,68 @@ from ..importers.import_nxs import material_colors, color_map
 log = logging.getLogger(__name__)
 
 _REDAPEX_PROFILE_WARN_THRESHOLD = 0.05
+COLLISION_SUFFIXES = ("_col", "_tri", "_box", "_sphere", "_capsule")
+
+
+def _strip_blender_copy_suffix(name):
+    return re.sub(r'\.\d{3}$', '', name or "")
+
+
+def _get_collision_type_from_name(obj_name):
+    base_name = _strip_blender_copy_suffix(obj_name)
+    for suffix in COLLISION_SUFFIXES:
+        if base_name.endswith(suffix):
+            return suffix
+    return None
+
+
+def _strip_lod_suffix(name):
+    return re.sub(r'_lod\d+$', '', _strip_blender_copy_suffix(name), flags=re.IGNORECASE)
+
+
+def _strip_collision_suffix(name):
+    base_name = _strip_blender_copy_suffix(name)
+    col_type = _get_collision_type_from_name(base_name)
+    if col_type:
+        return base_name[:-len(col_type)]
+    return base_name
+
+
+def _export_base_name_from_object(obj):
+    name = getattr(obj, "name", "")
+    return _strip_lod_suffix(_strip_collision_suffix(name))
+
+
+def _related_object_tail(obj_name, base_name):
+    stripped_name = _strip_blender_copy_suffix(obj_name)
+    if not stripped_name.startswith(base_name):
+        return None
+    return stripped_name[len(base_name):]
+
+
+def _is_related_lod_tail(tail):
+    return bool(re.fullmatch(r'_lod\d+', tail or "", re.IGNORECASE))
+
+
+def _is_related_collision_tail(tail):
+    tail = (tail or "").lower()
+    if tail in COLLISION_SUFFIXES:
+        return True
+    return any(re.fullmatch(rf'_lod\d+{re.escape(suffix)}', tail) for suffix in COLLISION_SUFFIXES)
+
+
+def _unique_objects(objects):
+    seen = set()
+    unique = []
+    for obj in objects:
+        if obj is None:
+            continue
+        key = getattr(obj, "name_full", getattr(obj, "name", id(obj)))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(obj)
+    return unique
 
 
 def _log_redapex_profile(message, *args):
@@ -949,10 +1011,18 @@ def _get_main_mesh(context):
     selected_armatures = [ob for ob in context.selected_objects if ob.type == 'ARMATURE']
     meshes = []
     for armature in selected_armatures:
-        armature_meshes = [child for child in armature.children if child.type == 'MESH']
+        armature_meshes = [
+            child for child in armature.children
+            if child.type == 'MESH' and not _get_collision_type_from_name(child.name)
+        ]
         meshes.extend(armature_meshes)
     if not selected_armatures:
-        meshes = [ob for ob in context.selected_objects if ob.type == 'MESH']
+        meshes = [
+            ob for ob in context.selected_objects
+            if ob.type == 'MESH' and not _get_collision_type_from_name(ob.name)
+        ]
+        if not meshes:
+            meshes = [ob for ob in context.selected_objects if ob.type == 'MESH']
     return meshes[0] if meshes else None
 
 
@@ -2925,9 +2995,6 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
     show_lod_tools: BoolProperty(name="Show LOD Tools", default=False, options={'HIDDEN'})
     show_advanced: BoolProperty(name="Show Advanced", default=False, options={'HIDDEN'})
 
-    # Collision suffixes to detect
-    COLLISION_SUFFIXES = ("_col", "_tri", "_box", "_sphere", "_capsule")
-
     def get_collision_type(self, obj_name):
         """
         Detect collision type from object name, handling Blender's .NNN suffix.
@@ -2938,27 +3005,24 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
             'mesh_box.001' -> '_box'
             'mesh_tri.003' -> '_tri'
         """
-        # Strip Blender's .NNN suffix if present
-        base_name = re.sub(r'\.\d{3}$', '', obj_name)
-        for suffix in self.COLLISION_SUFFIXES:
-            if base_name.endswith(suffix):
-                return suffix
-        return None
+        return _get_collision_type_from_name(obj_name)
 
     def find_related_meshes(self, base_name):
         lod_meshes = []
         col_tri_meshes = []
+        base_name = _strip_lod_suffix(_strip_collision_suffix(base_name))
+        if not base_name:
+            return lod_meshes, col_tri_meshes
         # Iterate through all objects in the scene
         for obj in bpy.context.scene.objects:
-            # Check for LOD meshes
-            if obj.name.startswith(base_name) and obj.name[len(base_name):].startswith("_lod"):
+            tail = _related_object_tail(obj.name, base_name)
+            if tail is None:
+                continue
+            col_type = self.get_collision_type(obj.name)
+            if col_type and _is_related_collision_tail(tail):
+                col_tri_meshes.append(obj)
+            elif _is_related_lod_tail(tail):
                 lod_meshes.append(obj)
-            # Check for collision meshes (_col, _tri, _box, _sphere, _capsule)
-            # Handles Blender's .NNN suffix (e.g., mesh_box.001)
-            elif obj.name.startswith(base_name):
-                col_type = self.get_collision_type(obj.name)
-                if col_type:
-                    col_tri_meshes.append(obj)
         return lod_meshes, col_tri_meshes
 
     def _classify_armature_children(self, armature):
@@ -2968,7 +3032,10 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         - lod_named: children whose names end with _lod0, _lod1, etc.
         - non_lod_named: all other mesh children
         """
-        children = [c for c in armature.children if c.type == 'MESH']
+        children = [
+            c for c in armature.children
+            if c.type == 'MESH' and not _get_collision_type_from_name(c.name)
+        ]
         lod_named = [c for c in children if re.search(r'_lod\d+$', c.name)]
         non_lod = [c for c in children if c not in lod_named]
         return lod_named, non_lod
@@ -3039,7 +3106,7 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         else:
             main_mesh_preview = _get_main_mesh(context)
             if main_mesh_preview:
-                base_name_preview = main_mesh_preview.name.rsplit('_lod0', 1)[0]
+                base_name_preview = _export_base_name_from_object(main_mesh_preview)
                 lod_preview, _ = self.find_related_meshes(base_name_preview)
                 n_lods = len(lod_preview) if lod_preview else 1
                 preview_meshes = lod_preview if lod_preview else [main_mesh_preview]
@@ -3147,10 +3214,13 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         if mesh_ob:
             selected_armatures = [ob for ob in context.selected_objects if ob.type == 'ARMATURE']
             if selected_armatures:
-                preview_meshes = [child for child in selected_armatures[0].children if child.type == 'MESH']
+                preview_meshes = [
+                    child for child in selected_armatures[0].children
+                    if child.type == 'MESH' and not self.get_collision_type(child.name)
+                ]
                 _get_effective_export_mesh_settings(preview_meshes, armature=selected_armatures[0])
             else:
-                preview_base_name = mesh_ob.name.rsplit('_lod0', 1)[0]
+                preview_base_name = _export_base_name_from_object(mesh_ob)
                 preview_meshes, _ = self.find_related_meshes(preview_base_name)
                 _get_effective_export_mesh_settings(preview_meshes if preview_meshes else [mesh_ob])
             mesh_settings = mesh_ob.witcherui_MeshSettings
@@ -3199,8 +3269,11 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                     # Non-LOD children: they'll be combined into one LOD0 at export time
                     lod_meshes = sorted(_arm_non_lod, key=lambda x: x.name)
                 col_tri_meshes = []
+                if lod_meshes:
+                    base_name = _export_base_name_from_object(lod_meshes[0])
+                    _, col_tri_meshes = self.find_related_meshes(base_name)
             else:
-                base_name = mesh_ob.name.rsplit('_lod0', 1)[0]
+                base_name = _export_base_name_from_object(mesh_ob)
                 lod_meshes, col_tri_meshes = self.find_related_meshes(base_name)
 
             # --- Material Export Order Preview ---
@@ -3381,7 +3454,15 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                 selected_armatures = [ob for ob in original_selection if ob.type == 'ARMATURE']
 
                 for armature in selected_armatures:
-                    armature_meshes = [child for child in armature.children if child.type == 'MESH']
+                    all_armature_meshes = [child for child in armature.children if child.type == 'MESH']
+                    armature_collision_meshes = [
+                        mesh for mesh in all_armature_meshes
+                        if self.get_collision_type(mesh.name)
+                    ]
+                    armature_meshes = [
+                        mesh for mesh in all_armature_meshes
+                        if not self.get_collision_type(mesh.name)
+                    ]
 
                     if not armature_meshes:
                         self.report({'ERROR'}, f"Armature '{armature.name}' has no mesh children to export.")
@@ -3408,6 +3489,12 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                     else:
                         meshes = armature_meshes
 
+                    col_tri_meshes = []
+                    if self.export_col_tri and meshes:
+                        base_name = _export_base_name_from_object(meshes[0])
+                        _, related_collision_meshes = self.find_related_meshes(base_name)
+                        col_tri_meshes = _unique_objects(related_collision_meshes + armature_collision_meshes)
+
                     effective_settings, ordered_meshes, _ = _get_effective_export_mesh_settings(meshes, armature=armature)
                     has_second_uv, has_vertex_color = _collect_extra_stream_requirements(ordered_meshes)
                     if effective_settings and not effective_settings.useExtraStreams and (has_second_uv or has_vertex_color):
@@ -3422,6 +3509,8 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                         mesh_back = do_export_mesh(context, fdir,
                                             armature = armature,
                                             meshes = meshes,
+                                            col_tri_meshes = col_tri_meshes,
+                                            export_col_tri = self.export_col_tri,
                                             keep_intermediate_json = self.keep_intermediate_json,
                                             use_native_writer = not self.use_wolvenkit_json,
                                             strip_material_names = self.strip_material_names)
@@ -3432,15 +3521,24 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                         if temp_joined and temp_joined.name in bpy.data.objects:
                             bpy.data.objects.remove(temp_joined, do_unlink=True)
                 if len(selected_armatures) == 0:
-                    meshes = [ob for ob in original_selection if ob.type == 'MESH']
-                    if not meshes:
+                    selected_meshes = [ob for ob in original_selection if ob.type == 'MESH']
+                    if not selected_meshes:
                         self.report({'ERROR'}, "No mesh objects selected for export.")
                         return {'CANCELLED'}
-                    base_name = meshes[0].name.rsplit('_lod0', 1)[0]
+                    render_meshes = [
+                        mesh for mesh in selected_meshes
+                        if not self.get_collision_type(mesh.name)
+                    ]
+                    target_mesh = _get_main_mesh(context) or selected_meshes[0]
+                    base_name = _export_base_name_from_object(target_mesh)
                     lod_meshes, col_tri_meshes = self.find_related_meshes(base_name)
                     # If no LOD meshes found, use the selected meshes directly
                     if not lod_meshes:
-                        lod_meshes = meshes
+                        lod_meshes = render_meshes
+                    if not lod_meshes:
+                        self.report({'ERROR'}, "Select a render mesh or an object with related LOD meshes to export.")
+                        return {'CANCELLED'}
+                    col_tri_meshes = _unique_objects(col_tri_meshes)
                     effective_settings, ordered_meshes, _ = _get_effective_export_mesh_settings(lod_meshes)
                     has_second_uv, has_vertex_color = _collect_extra_stream_requirements(ordered_meshes)
                     if effective_settings and not effective_settings.useExtraStreams and (has_second_uv or has_vertex_color):
