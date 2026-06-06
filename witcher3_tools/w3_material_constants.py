@@ -129,38 +129,6 @@ PARAM_ORDER = ['Diffuse', 'Diffusemap', 'DiffuseArray',
 	'DetailNormal2', 'DetailTile2', 'DetailRange2', 'DetailRotation2',
 	]
 
-# TODO: I should probably go about this in a better way. It should probably be a Pin:[Equivalents] dict, not an equivalent:pin dict.
-EQUIVALENT_PARAMS = {
-	'diffusemap' : 'Diffuse'
-	,'normalmap' : 'Normal'
-	,'Diffusemap' : 'Diffuse'
-	,'Normalmap' : 'Normal'
-	,'Ambientmap' : 'TintMask'
-
-	,'DiffuseArray' : 'Diffuse'
-	,'NormalArray' : 'Normal'
-
-	#w2hair
-	,'tex_Diffuse': 'Diffuse'
-	,'tex_Normalmap': 'Normal'
-	,'tex_Specular': 'SpecularTexture'
-	#,'tex_SpecShift': ''
-
-	,'diffuse' : 'Diffuse'
-	,'difuse' : 'Diffuse'
-	,'normal' : 'Normal'
-
-	,'diff' : 'Diffuse'
-	,'norm' : 'Normal'
-	,'Diff' : 'Diffuse'
-	,'Norm' : 'Normal'
-
-	,'Specular' : 'SpecularTexture'
-	,'specular' : 'SpecularTexture'
-	,'Spec' : 'SpecularTexture'
-	,'spec' : 'SpecularTexture'
-	}
-
 TODO_params = ['Pattern_Array', 'Pattern_Mixer', 'Pattern_Index', 'Pattern_Offset',
 	'Pattern_Size', 'Pattern_DistortionPower', 'Pattern_Rotation', 'handle:CTextureArray',
 	'Pattern_Roughness_Influence', 'Pattern_Color1', 'Pattern_Color2', 'Pattern_Color3'

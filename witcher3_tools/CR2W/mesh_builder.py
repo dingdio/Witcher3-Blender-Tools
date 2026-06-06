@@ -45,6 +45,20 @@ from .Types.SBufferInfos import (BoneData, EMeshVertexType)
 import base64
 
 
+def _float_to_u8(value):
+    try:
+        return max(0, min(255, int(round(float(value) * 255.0))))
+    except Exception:
+        return 0
+
+
+def _linear_float_to_srgb_u8(value):
+    try:
+        return _float_to_u8(lin2srgb(float(value)))
+    except Exception:
+        return 0
+
+
 def printProps(PROPS):
     """Debug utility: dump CR2W property tree to log. Only outputs at DEBUG level."""
     for prop in PROPS:
@@ -1054,14 +1068,14 @@ def BuildMesh(ALL_LODS, bone_data, common_info, col_mesh, strip_material_names=F
                 # byte layout regardless of useExtraStreams; that flag controls
                 # cooking behavior/semantics, not whether these bytes exist.
                 if do_lin2srgb:
-                    br.writeUInt8(max(0, min(255, int(lin2srgb(bl_mesh_info.vertexColor[i][0]) * 255))))    # r:np.ubyte = 0.0
-                    br.writeUInt8(max(0, min(255, int(lin2srgb(bl_mesh_info.vertexColor[i][1]) * 255))))    # g:np.ubyte = 0.0
-                    br.writeUInt8(max(0, min(255, int(lin2srgb(bl_mesh_info.vertexColor[i][2]) * 255))))    # b:np.ubyte = 0.0
+                    br.writeUInt8(_linear_float_to_srgb_u8(bl_mesh_info.vertexColor[i][0]))    # r:np.ubyte = 0.0
+                    br.writeUInt8(_linear_float_to_srgb_u8(bl_mesh_info.vertexColor[i][1]))    # g:np.ubyte = 0.0
+                    br.writeUInt8(_linear_float_to_srgb_u8(bl_mesh_info.vertexColor[i][2]))    # b:np.ubyte = 0.0
                 else:
-                    br.writeUInt8(max(0, min(255, int(bl_mesh_info.vertexColor[i][0] * 255))))    # r:np.ubyte = 0.0
-                    br.writeUInt8(max(0, min(255, int(bl_mesh_info.vertexColor[i][1] * 255))))    # g:np.ubyte = 0.0
-                    br.writeUInt8(max(0, min(255, int(bl_mesh_info.vertexColor[i][2] * 255))))    # b:np.ubyte = 0.0
-                br.writeUInt8(max(0, min(255, int(bl_mesh_info.vertexColor[i][3] * 255))))    # a:np.ubyte = 0.0
+                    br.writeUInt8(_float_to_u8(bl_mesh_info.vertexColor[i][0]))    # r:np.ubyte = 0.0
+                    br.writeUInt8(_float_to_u8(bl_mesh_info.vertexColor[i][1]))    # g:np.ubyte = 0.0
+                    br.writeUInt8(_float_to_u8(bl_mesh_info.vertexColor[i][2]))    # b:np.ubyte = 0.0
+                br.writeUInt8(_float_to_u8(bl_mesh_info.vertexColor[i][3]))    # a:np.ubyte = 0.0
                 br.writeFloat(bl_mesh_info.UV_vertex3DCoords[i][0])    # ux:float = 0.0
                 br.writeFloat(flip_v(bl_mesh_info.UV_vertex3DCoords[i][1]))    # uv:float = 0.0
                 br.writeFloat(bl_mesh_info.UV2_vertex3DCoords[i][0])    # ux2:float = 0.0

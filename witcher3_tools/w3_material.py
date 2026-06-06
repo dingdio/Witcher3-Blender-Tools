@@ -1425,16 +1425,7 @@ def _find_socket_by_name(sockets, name: str):
 
 
 def find_group_input_socket(node_ng: Node, par_name: str):
-    candidate_names = [par_name]
-    mapped_name = EQUIVALENT_PARAMS.get(par_name)
-    if mapped_name and mapped_name not in candidate_names:
-        candidate_names.append(mapped_name)
-
-    for candidate_name in candidate_names:
-        socket = _find_socket_by_name(node_ng.inputs, candidate_name)
-        if socket is not None:
-            return socket
-    return None
+    return _find_socket_by_name(node_ng.inputs, par_name)
 
 
 def get_active_witcher_group_node(material: Optional[Material]) -> Optional[Node]:
@@ -1613,7 +1604,7 @@ def build_shader_default_override_params(
         source_info = (inherited_param_sources or {}).get(par_name, {})
         shader_default_params.append(
             build_param_element(
-                input_pin.name,
+                par_name,
                 par_type,
                 par_value,
                 witcher_shader_default="true",
