@@ -10,7 +10,7 @@ from bpy.props import StringProperty, BoolProperty
 from mathutils import Vector
 
 from ..CR2W.common_blender import repo_file, mod_loading_context
-from ..source_game_paths import resolve_w2_repo_file_from_source
+from ..repo_paths import resolve_w2_repo_file_from_source
 from ..ui.ui_utils import WITCH_PT_Base
 from ..ui.armature_context import get_main_armature_and_rig_settings, set_main_armature
 from ..importers import import_anims

@@ -15,7 +15,7 @@ from .. import (
 )
 from ..CR2W.witcher_cache.Bundles import LoadBundleManager
 from ..extension_paths import get_cache_root, get_dev_override
-from ..source_game_paths import (
+from ..repo_paths import (
     configured_w2_repo_roots,
     is_under_root,
     normalize_source_game as _normalize_source_game,

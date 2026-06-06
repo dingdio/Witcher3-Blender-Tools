@@ -197,7 +197,7 @@ def _get_mimic_rig_path(armature_obj):
     def _resolve_for_armature(path):
         try:
             from .ui_anims_list import _source_game_for_armature_obj
-            from ..source_game_paths import repo_file_for_source
+            from ..repo_paths import repo_file_for_source
 
             return repo_file_for_source(path, _source_game_for_armature_obj(armature_obj))
         except Exception:
@@ -544,7 +544,7 @@ def _load_selected_mimic(context):
     file_rel, anim_name = item.mimicLineId.split(';', 1)
     try:
         from .ui_anims_list import _source_game_for_armature_obj
-        from ..source_game_paths import repo_file_for_source
+        from ..repo_paths import repo_file_for_source
 
         target_source_game = _source_game_for_armature_obj(target_armature)
         meta = MimicsResourceManager.Get().MetaByKey.get(item.mimicLineId, {})

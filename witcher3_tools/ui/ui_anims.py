@@ -17,8 +17,9 @@ from .. import dialog_language
 from . import ui_dialog_language
 from . import ui_scene
 from . import ui_rig
-from ..source_game_paths import (
+from ..repo_paths import (
     display_path_relative_to_source_roots,
+    materialize_entity_repo_path,
     normalize_source_game,
     source_roots,
 )
@@ -3305,7 +3306,11 @@ def _import_cutscene_camera_rig(context):
         return None
     before_names = {obj.name for obj in bpy.data.objects}
     try:
-        imported_obj = import_entity.import_ent_template(repo_file(repo_path), load_face_poses=False, import_apperance=0)
+        imported_obj = import_entity.import_ent_template(
+            materialize_entity_repo_path(repo_path, source_game="w3"),
+            load_face_poses=False,
+            import_apperance=0,
+        )
     except Exception:
         log.exception("Failed to auto-import cutscene camera '%s'.", repo_path)
         return None
@@ -3439,7 +3444,11 @@ class WITCH_OT_CutsceneScratchImportCamera(bpy.types.Operator):
 
         before_names = {obj.name for obj in bpy.data.objects}
         try:
-            imported_obj = import_entity.import_ent_template(repo_file(repo_path), load_face_poses=False, import_apperance=0)
+            imported_obj = import_entity.import_ent_template(
+                materialize_entity_repo_path(repo_path, source_game="w3"),
+                load_face_poses=False,
+                import_apperance=0,
+            )
         except Exception as exc:
             log.exception("Failed to import cutscene camera '%s'.", repo_path)
             self.report({'ERROR'}, f"Could not import camera entity: {exc}")
@@ -4212,9 +4221,8 @@ class TOOL_OT_List_LoadAnim(Operator):
             main_arm_obj = _find_character_armature(context)
             item, _safe_index = _get_selected_collection_item(scene, list_name, index_name)
             if item is not None:
-                anim_name = item.name 
-                fdir_abs = working_list_path  #repo_file(fdir) #!REMOVE !TODO link witcher_loaded_w2anims_path to an object? or keep for cutscene?
-                #!REMOVE TODO load anim on click or highlight instead of having to hit the load button
+                anim_name = item.name
+                fdir_abs = working_list_path
 
                 if not main_arm_obj:
                     self.report({'ERROR'}, "No armature found. Select or import a rig first.")

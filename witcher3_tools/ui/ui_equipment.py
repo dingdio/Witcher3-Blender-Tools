@@ -35,8 +35,12 @@ from .. import get_rig_rot90_enabled
 from .armature_context import (
     get_main_armature_and_rig_settings,
 )
-from ..source_game_paths import W2_REPO_VERSION, normalize_source_game as _normalize_source_game
-from ..entity_path_resolver import (
+from ..repo_paths import (
+    W2_REPO_VERSION,
+    materialize_entity_repo_path,
+    normalize_source_game as _normalize_source_game,
+)
+from ..repo_paths.entity_resolver import (
     EQUIPMENT_ENTITY_EXTENSIONS,
     remember_entity_repo_path,
     resolve_entity_repo_path,
@@ -2777,7 +2781,7 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
         if not rel_path:
             return None
         try:
-            resolved_path = repo_file(rel_path, version=W2_REPO_VERSION)
+            resolved_path = materialize_entity_repo_path(rel_path, source_game="w2")
         except Exception:
             resolved_path = ""
         if resolved_path and os.path.exists(resolved_path):
@@ -2790,10 +2794,10 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
         if not repo_name:
             return None
         try:
-            if prefer_w2_repo:
-                export_path = repo_file(repo_name, version=W2_REPO_VERSION)
-            else:
-                export_path = repo_file(repo_name)
+            export_path = materialize_entity_repo_path(
+                repo_name,
+                source_game="w2" if prefer_w2_repo else "w3",
+            )
         except Exception:
             export_path = ""
         if export_path and os.path.exists(export_path):
@@ -2866,11 +2870,11 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
             return indexed_match
 
     if not prefer_w2_repo:
-        # Try repo_file for candidate relative paths to benefit from bundle/mod
-        # extraction and repo override roots.
+        # Try source-aware materialization to benefit from bundle/mod extraction
+        # and repo override roots.
         for rel_path in rel_candidates:
             try:
-                repo_path = repo_file(rel_path)
+                repo_path = materialize_entity_repo_path(rel_path, source_game="w3")
             except Exception:
                 repo_path = ""
             if repo_path and os.path.exists(repo_path):
@@ -2966,7 +2970,7 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
     final_item = _select_bundle_item(item, search_pattern)
     if not hasattr(final_item, 'name'):
         return None, None, search_info
-    export_path = repo_file(final_item.name)
+    export_path = materialize_entity_repo_path(final_item.name, source_game="w3")
     if not os.path.exists(export_path):
         final_item.extract_to_file(export_path)
     _remember_uncook_item_relpath(uncook_root, final_item.name)

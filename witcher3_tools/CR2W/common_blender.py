@@ -18,7 +18,7 @@ import shutil
 import sys
 from contextlib import contextmanager
 from ..extension_paths import get_dev_override, get_w2_uncook_root
-from ..source_game_paths import (
+from ..repo_paths import (
     coerce_w2_data_root,
     iter_w2_repo_path_variants,
     normalize_roots,

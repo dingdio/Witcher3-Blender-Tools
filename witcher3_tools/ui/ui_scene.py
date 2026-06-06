@@ -11,11 +11,11 @@ log = logging.getLogger(__name__)
 
 from ..CR2W import w3_types
 from ..CR2W.prop_utils import prop_to_string
-from ..CR2W.common_blender import get_repo_override_state, repo_file, set_repo_override_roots
-from ..source_game_paths import (
+from ..CR2W.common_blender import get_repo_override_state, set_repo_override_roots
+from ..repo_paths import (
+    materialize_repo_path,
     normalize_source_game,
     source_roots,
-    version_for_source_game,
     w2_source_repo_root_if_configured,
 )
 from .. import dialog_language
@@ -1843,7 +1843,7 @@ def _w2scene_resolve_repo_file(context, repo_path, roots, source_game=""):
         if os.path.isfile(candidate):
             return candidate
     try:
-        resolved = repo_file(repo_path, version=version_for_source_game(source_game))
+        resolved = materialize_repo_path(repo_path, source_game=source_game)
         if os.path.isabs(resolved) and os.path.isfile(resolved):
             return resolved
     except Exception:

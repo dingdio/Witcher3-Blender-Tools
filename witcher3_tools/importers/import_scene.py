@@ -10,7 +10,7 @@ from .. import pose_key_tools
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.CR2W_types import EngineTransform
-from ..CR2W.common_blender import repo_file, redkit_repo_context, vanilla_only_repo_context
+from ..CR2W.common_blender import redkit_repo_context, vanilla_only_repo_context
 from ..CR2W.scene_csv_utils import (
     _lookup_dialogset_body_anim,
     _resolve_mimic_layer_anim_candidates,
@@ -21,7 +21,15 @@ from ..importers import import_scene_animation
 from ..importers import import_scene_motion
 import_scene_motion = importlib.reload(import_scene_motion)
 from ..importers.import_helpers import set_blender_object_transform#, set_blender_pose_bone_transform
-from ..source_game_paths import normalize_source_game, resolve_w2_repo_file_from_source, source_game_from_version, version_for_source_game
+from ..repo_paths import (
+    materialize_entity_repo_path,
+    normalize_source_game,
+    resolve_materialized_entity_path,
+    resolve_w2_repo_file_from_source,
+    source_game_from_version,
+    source_root_candidates_from_file,
+    version_for_source_game,
+)
 from ..action_compat import assign_action, bind_strip_action_slot, get_action_channelbag, iter_action_fcurves, new_action_fcurve, resolve_action_slot
 from .import_cutscene import (
     CUTSCENE_DIALOG_SOURCE_GAME_PROP,
@@ -122,6 +130,26 @@ def _scene_camera_entity_path(source_game):
 
 def _scene_camera_existing_object_paths(source_game):
     return (_scene_camera_entity_path(source_game),)
+
+
+def _resolve_materialized_scene_template(
+    template_path,
+    source_game,
+    scene_filepath="",
+    *,
+    search_roots=None,
+    version=None,
+):
+    if search_roots is None:
+        search_roots = source_root_candidates_from_file(scene_filepath, include_parents=True)
+    return resolve_materialized_entity_path(
+        template_path,
+        source_game,
+        search_roots=search_roots,
+        load_bundle_manager=True,
+        include_non_items=True,
+        version=version,
+    )
 
 W2SCENE_AUDIO_STRIP_PROP = "witcher_w2scene_section_audio"
 W2SCENE_AUDIO_SOURCE_PROP = "witcher_w2scene_source"
@@ -1982,14 +2010,35 @@ def _resolve_scene_template_path(template_path, scene_filepath="", source_game="
         # scene-adjacent directory walk (which would resolve to REDkit paths)
         # and resolve straight from vanilla bundles.
         with vanilla_only_repo_context():
-            return repo_file(template_path, version=version)
+            resolved = _resolve_materialized_scene_template(
+                template_path,
+                source_game,
+                scene_filepath,
+                search_roots=[],
+                version=version,
+            )
+            return resolved or materialize_entity_repo_path(
+                template_path,
+                source_game=source_game,
+                version=version,
+            )
 
     if source_game == "w2":
         resolved = resolve_w2_repo_file_from_source(template_path, scene_filepath, version=version)
         if resolved:
             return resolved
         with redkit_repo_context(scene_filepath):
-            return repo_file(template_path, version=version)
+            resolved = _resolve_materialized_scene_template(
+                template_path,
+                source_game,
+                scene_filepath,
+                version=version,
+            )
+            return resolved or materialize_entity_repo_path(
+                template_path,
+                source_game=source_game,
+                version=version,
+            )
 
     source_path = Path(str(scene_filepath or ""))
     if source_path:
@@ -1998,7 +2047,17 @@ def _resolve_scene_template_path(template_path, scene_filepath="", source_game="
             if candidate.exists():
                 return str(candidate)
     with redkit_repo_context(scene_filepath):
-        return repo_file(template_path, version=version)
+        resolved = _resolve_materialized_scene_template(
+            template_path,
+            source_game,
+            scene_filepath,
+            version=version,
+        )
+        return resolved or materialize_entity_repo_path(
+            template_path,
+            source_game=source_game,
+            version=version,
+        )
 
 
 def _resolve_w2scene_template_path(template_path, scene_filepath="", source_game=""):

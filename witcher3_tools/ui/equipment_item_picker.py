@@ -2,7 +2,7 @@ import json
 
 import bpy
 
-from ..source_game_paths import normalize_source_game as _normalize_source_game
+from ..repo_paths import normalize_source_game as _normalize_source_game
 
 
 _EQUIPMENT_ITEM_PICKER_RECENTS = {}

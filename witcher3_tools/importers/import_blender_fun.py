@@ -49,7 +49,7 @@ class lightObject:
         self.BlockDataObjectType = BlockDataObjectType
 
 from ..CR2W.common_blender import repo_file, win_safe_path
-from ..source_game_paths import resolve_w2_repo_file_from_root
+from ..repo_paths import resolve_w2_repo_file_from_root
 # def repo_file(filepath: str):
 #     if filepath.endswith('.fbx'):
 #         return os.path.join(bpy.context.preferences.addons['io_import_w2l'].preferences.fbx_uncook_path, filepath)

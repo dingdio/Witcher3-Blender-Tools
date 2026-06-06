@@ -6,6 +6,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .repo_paths import source_root_candidates_from_file
+
 log = logging.getLogger(__name__)
 
 DIALOG_LEGACY_LANGUAGE_PROP = "witcher_dialog_language"
@@ -586,23 +588,6 @@ def localized_string_id(prop):
     return str(getattr(string_obj, "val", "") or "").strip()
 
 
-def _source_root_candidates(source_filepath):
-    source_path = str(source_filepath or "").strip().replace("/", "\\")
-    if not source_path or not os.path.isabs(source_path):
-        return []
-
-    roots = []
-    normalized = os.path.normpath(source_path)
-    lowered = normalized.lower()
-    for marker in ("\\r4data\\", "\\workspace\\", "\\content\\content0\\"):
-        marker_idx = lowered.find(marker)
-        if marker_idx >= 0:
-            root = normalized[:marker_idx + len(marker) - 1]
-            if os.path.isdir(root):
-                roots.append(root)
-    return roots
-
-
 def _load_w3strings_map(strings_path):
     strings_path = os.path.normpath(str(strings_path or ""))
     if not strings_path:
@@ -636,7 +621,7 @@ def _load_w3strings_map(strings_path):
 
 
 def _resolve_from_source_table(line_key, source_filepath, language):
-    for root in _source_root_candidates(source_filepath):
+    for root in source_root_candidates_from_file(source_filepath):
         strings_path = os.path.join(root, f"{language}.w3strings")
         if os.path.isfile(strings_path):
             text = _load_w3strings_map(strings_path).get(line_key, "")
@@ -752,7 +737,7 @@ def _redkit_editor_db_roots(source_filepath=""):
         except Exception:
             log.debug("Could not inspect REDkit DB roots for %s", source_filepath, exc_info=True)
 
-    for root in _source_root_candidates(source_filepath):
+    for root in source_root_candidates_from_file(source_filepath):
         candidate = Path(root)
         if any((candidate / db_name).is_file() for db_name in _REDKIT_EDITOR_DB_NAMES):
             roots.append(candidate)

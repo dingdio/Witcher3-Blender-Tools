@@ -4,7 +4,7 @@ from .. import import_anims
 #from io_import_w2l.filter_list import memory
 log = logging.getLogger(__name__)
 from ..CR2W.dc_anims import load_bin_anims_single
-from ..source_game_paths import (
+from ..repo_paths import (
     normalize_source_game,
     repo_file_for_source,
     resolve_w2_repo_file_from_source,

@@ -32,7 +32,7 @@ from ..CR2W.Types.SBufferInfos import SMeshInfos, EMeshVertexType, VertexSkinnin
 from ..CR2W.dc_entity import CCollisionShapeConvex, CCollisionShapeTriMesh, CCollisionShapeBox, CCollisionShapeCapsule, CCollisionShapeSphere
 from ..importers.import_nxs import createCol, createTri, createBox, createCapsule, createSphere, create_from_nxs
 from .. import get_do_fix_tail, set_rig_rot90_enabled
-from ..source_game_paths import configured_w2_repo_roots, w2_source_repo_root_if_configured
+from ..repo_paths import configured_w2_repo_roots, w2_source_repo_root_if_configured
 
 log = logging.getLogger(__name__)
 

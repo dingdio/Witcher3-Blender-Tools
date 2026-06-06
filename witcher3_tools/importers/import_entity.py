@@ -46,7 +46,7 @@ from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
 from ..CR2W.common_blender import repo_file, redkit_repo_context, win_safe_path
 from ..CR2W.dc_beh import read_beh_info as _read_beh_info, guess_idle as _beh_guess_idle
-from ..source_game_paths import (
+from ..repo_paths import (
     W2_REPO_ROOT_MARKERS,
     resolve_w2_repo_file_from_source,
     w2_source_repo_root_if_configured,

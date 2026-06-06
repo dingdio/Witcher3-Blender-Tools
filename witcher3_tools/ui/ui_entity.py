@@ -37,14 +37,15 @@ from ..read_game_bin import (
     WITCHER3_EXE_REL,
 )
 from ..CR2W.common_blender import (
-    repo_file,
     mod_loading_context,
     win_safe_path,
 )
-from ..source_game_paths import (
+from ..repo_paths import (
     existing_repo_file_for_source,
+    materialize_entity_repo_path,
     normalize_source_game,
     repo_file_for_source,
+    resolve_entity_repo_path,
     source_game_for_animset_item,
     source_game_for_rig_settings,
     source_roots,
@@ -775,11 +776,28 @@ def _cache_imported_inventory_on_rig(rig_settings, inventory_entity, filepath, p
 def _import_standalone_item(context, category, item_name, template, result):
     """Import an equipment item without binding to a character."""
     from ..CR2W.witcher_cache.Bundles import LoadBundleManager
-    from ..CR2W.common_blender import repo_file
     import os
 
     try:
+        source_game = "w3"
         bundle_manager = LoadBundleManager()
+        resolved_entity = resolve_entity_repo_path(
+            template,
+            source_game=source_game,
+            bundle_manager=bundle_manager,
+            load_bundle_manager=False,
+            include_non_items=True,
+        )
+        if resolved_entity:
+            export_path = materialize_entity_repo_path(
+                resolved_entity.repo_path,
+                source_game=source_game,
+            )
+            if os.path.exists(export_path):
+                from ..importers import import_entity
+                import_entity.import_ent_template(export_path, False, 1, None)
+                return True
+
         search_pattern = "\\" + template + ".w2ent"
         items = bundle_manager.find_item_by_partial_hash(start="items", end=search_pattern)
 
@@ -795,7 +813,7 @@ def _import_standalone_item(context, category, item_name, template, result):
             result['messages'].append(f"Invalid bundle item for: {template}")
             return False
 
-        export_path = repo_file(final_item.name)
+        export_path = materialize_entity_repo_path(final_item.name, source_game="w3")
         if not os.path.exists(export_path):
             final_item.extract_to_file(export_path)
 
@@ -1448,7 +1466,7 @@ class WITCH_OT_ENTITY_import_geralt(bpy.types.Operator):
             bpy.ops.witcher.equipment_insert_default_categories()
 
             # 2. Import Geralt with slots and default equipment
-            path = uncook_path if use_uncook_file else repo_file(rel_path)
+            path = uncook_path if use_uncook_file else materialize_entity_repo_path(rel_path, source_game="w3")
             if not os.path.exists(path):
                 self.report({'ERROR'}, f"player.w2ent not found and could not be extracted at: {path}")
                 return {'CANCELLED'}
@@ -1502,7 +1520,7 @@ class WITCH_OT_ENTITY_import_ciri(bpy.types.Operator):
                     self.report({'WARNING'}, game_path_issue)
                     return {'CANCELLED'}
 
-            path = uncook_path if use_uncook_file else repo_file(rel_path)
+            path = uncook_path if use_uncook_file else materialize_entity_repo_path(rel_path, source_game="w3")
             if not os.path.exists(path):
                 self.report({'ERROR'}, f"ciri_player.w2ent not found and could not be extracted at: {path}")
                 return {'CANCELLED'}
@@ -1571,8 +1589,7 @@ class WITCH_OT_ENTITY_import_geralt_w2(bpy.types.Operator):
             return {'CANCELLED'}
 
         with mod_loading_context(context):
-            # version=115 routes resolution through the Witcher 2 repo/DZIP fallback.
-            path = repo_file_for_source(self.REL_PATH, "w2")
+            path = materialize_entity_repo_path(self.REL_PATH, source_game="w2")
             if not path or not os.path.exists(win_safe_path(path)):
                 self.report(
                     {'ERROR'},
@@ -1639,8 +1656,7 @@ class WITCH_OT_ENTITY_import_triss_w2(bpy.types.Operator):
             return {'CANCELLED'}
 
         with mod_loading_context(context):
-            # version=115 routes resolution through the Witcher 2 repo/DZIP fallback.
-            path = repo_file_for_source(self.REL_PATH, "w2")
+            path = materialize_entity_repo_path(self.REL_PATH, source_game="w2")
             if not path or not os.path.exists(win_safe_path(path)):
                 self.report(
                     {'ERROR'},

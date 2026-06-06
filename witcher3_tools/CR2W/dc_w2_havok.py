@@ -60,7 +60,7 @@ def _resolve_default_w2_floattrack_rig(source_file=None):
     candidates = []
     if source_file:
         try:
-            from ..source_game_paths import resolve_w2_repo_file_from_source
+            from ..repo_paths import resolve_w2_repo_file_from_source
 
             resolved = resolve_w2_repo_file_from_source(
                 W2_MIMIC_FLOATTRACKS_RIG,

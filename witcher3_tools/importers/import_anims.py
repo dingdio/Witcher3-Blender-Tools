@@ -19,7 +19,7 @@ from ..camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties, 
 from ..importers.import_rig import get_ordered_bones
 from ..importers.motion_tools import MotionExtraction, apply_motion, apply_motion_to_bone, extract_motion_from_bone
 from .. import get_do_fix_tail, get_rig_rot90_enabled
-from ..source_game_paths import repo_file_for_source, source_game_for_animset_item, source_game_for_rig_settings, source_roots
+from ..repo_paths import repo_file_for_source, source_game_for_animset_item, source_game_for_rig_settings, source_roots
 
 
 import json
@@ -630,7 +630,7 @@ def _resolve_w2_track_skeleton_path(path, source_file=None):
         return path
     if source_file:
         try:
-            from ..source_game_paths import resolve_w2_repo_file_from_source
+            from ..repo_paths import resolve_w2_repo_file_from_source
 
             resolved = resolve_w2_repo_file_from_source(path, source_file, version=115)
             if resolved:

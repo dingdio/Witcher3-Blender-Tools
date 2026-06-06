@@ -4,7 +4,7 @@ from .w3_types import CStoryScene
 from .CR2W_types import getCR2W, W_CLASS
 from .prop_utils import prop_to_string as _prop_to_str
 from ..dialog_language import resolve_localized_text
-from ..source_game_paths import source_game_from_version
+from ..repo_paths import source_game_from_version
 
 log = logging.getLogger(__name__)
 

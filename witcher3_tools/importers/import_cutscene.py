@@ -8,11 +8,14 @@ from ..CR2W.prop_utils import read_enum_prop
 from ..importers import import_entity
 from ..action_compat import iter_action_fcurves, remove_action_fcurve
 from ..CR2W.dc_anims import load_bin_cutscene
-from ..CR2W.common_blender import repo_file, redkit_repo_context, win_path_isfile
-from ..source_game_paths import (
+from ..CR2W.common_blender import redkit_repo_context, win_path_isfile
+from ..repo_paths import (
+    materialize_entity_repo_path,
+    materialize_repo_path,
     normalize_source_game,
-    repo_file_for_source,
+    resolve_materialized_entity_path,
     resolve_w2_repo_file_from_source,
+    source_root_candidates_from_file,
     w2_source_repo_root_if_configured,
 )
 from ..duplication import duplicate_character_hierarchy
@@ -116,13 +119,27 @@ def _resolve_cutscene_actor_template_path(template_path, cutscene_filename, is_w
     holds the cutscene is searched). import_ent_template then auto-detects W2
     from the file version and resolves nested dependencies the same way.
     """
+    source_game = "w2" if is_w2 else "w3"
+    try:
+        resolved = resolve_materialized_entity_path(
+            template_path,
+            source_game,
+            search_roots=source_root_candidates_from_file(cutscene_filename, include_parents=True),
+            load_bundle_manager=True,
+            include_non_items=True,
+        )
+        if resolved:
+            return resolved
+    except Exception:
+        log.debug("Entity resolver failed for cutscene actor template: %s", template_path, exc_info=True)
+
     if is_w2:
         resolved = resolve_w2_repo_file_from_source(template_path, cutscene_filename, version=115)
         if resolved:
             return resolved
         with redkit_repo_context(cutscene_filename):
-            return repo_file(template_path, version=115)
-    return repo_file(template_path)
+            return materialize_entity_repo_path(template_path, source_game="w2")
+    return materialize_entity_repo_path(template_path, source_game="w3")
 
 
 def _normalize_actor_replacement_source(source_game):
@@ -202,7 +219,7 @@ def resolve_cutscene_actor_replacement_template_path(template_path, cutscene_fil
         return ""
     if source_key == "W2":
         return _resolve_cutscene_actor_template_path(template_path, cutscene_filename, True)
-    return repo_file_for_source(template_path, "w3")
+    return materialize_entity_repo_path(template_path, "w3")
 
 
 def _split_tag_text(value):
@@ -2050,41 +2067,6 @@ def _append_cutscene_preview_event(event_items, ev, event_scope, source_index=-1
     })
 
 
-def _append_unique_existing_dir(roots, root):
-    root = str(root or "").strip()
-    if not root:
-        return
-    root = os.path.normpath(root)
-    if not os.path.isdir(root):
-        return
-    root_key = os.path.normcase(root)
-    if all(os.path.normcase(existing) != root_key for existing in roots):
-        roots.append(root)
-
-
-def _cutscene_source_root_candidates(cutscene_filepath):
-    roots = []
-    source_path = str(cutscene_filepath or "").strip().replace("/", "\\")
-    if not source_path or not os.path.isabs(source_path):
-        return roots
-
-    normalized = os.path.normpath(source_path)
-    lowered = normalized.lower()
-    for marker in ("\\r4data\\", "\\workspace\\", "\\content\\content0\\"):
-        marker_idx = lowered.find(marker)
-        if marker_idx >= 0:
-            _append_unique_existing_dir(roots, normalized[:marker_idx + len(marker) - 1])
-
-    parent = os.path.dirname(normalized)
-    previous = ""
-    while parent and parent != previous:
-        _append_unique_existing_dir(roots, parent)
-        previous = parent
-        parent = os.path.dirname(parent)
-
-    return roots
-
-
 def _resolve_cutscene_linked_scene_file(depot_path, cutscene_filepath):
     raw_path = str(depot_path or "").strip().replace("/", "\\")
     if not raw_path:
@@ -2093,14 +2075,14 @@ def _resolve_cutscene_linked_scene_file(depot_path, cutscene_filepath):
         return raw_path if win_path_isfile(raw_path) else ""
 
     rel_path = raw_path.lstrip("\\")
-    for root in _cutscene_source_root_candidates(cutscene_filepath):
+    for root in source_root_candidates_from_file(cutscene_filepath, include_parents=True):
         candidate = os.path.normpath(os.path.join(root, rel_path))
         if win_path_isfile(candidate):
             return candidate
 
     try:
         with redkit_repo_context(cutscene_filepath):
-            candidate = repo_file(rel_path)
+            candidate = materialize_repo_path(rel_path)
         if win_path_isfile(candidate):
             return candidate
     except Exception:
@@ -2457,7 +2439,7 @@ def _cutscene_equipment_source_roots(actor_obj, filename):
         except Exception:
             pass
         try:
-            from ..source_game_paths import w2_source_roots
+            from ..repo_paths import w2_source_roots
             roots.extend(w2_source_roots(bpy.context, existing_only=True))
         except Exception:
             pass

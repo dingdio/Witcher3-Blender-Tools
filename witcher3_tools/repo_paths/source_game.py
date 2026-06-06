@@ -73,6 +73,35 @@ def normalize_roots(roots, *, existing_only=False):
     return out
 
 
+def source_root_candidates_from_file(source_filepath, *, include_parents=False, markers=None):
+    """Return likely repo/project roots for an absolute source asset path."""
+    source_path = str(source_filepath or "").strip().replace("/", "\\")
+    if not source_path or not os.path.isabs(source_path):
+        return []
+
+    root_markers = markers or ("\\r4data\\", "\\workspace\\", "\\content\\content0\\")
+    roots = []
+    normalized = os.path.normpath(source_path)
+    lowered = normalized.lower()
+    for marker in root_markers:
+        marker_idx = lowered.find(marker)
+        if marker_idx >= 0:
+            root = normalized[:marker_idx + len(marker) - 1]
+            if os.path.isdir(root):
+                roots.append(root)
+
+    if include_parents:
+        parent = os.path.dirname(normalized)
+        previous = ""
+        while parent and parent != previous:
+            if os.path.isdir(parent):
+                roots.append(parent)
+            previous = parent
+            parent = os.path.dirname(parent)
+
+    return normalize_roots(roots)
+
+
 def is_under_root(path_value, root) -> bool:
     if not path_value or not root:
         return False
@@ -116,7 +145,7 @@ def configured_w2_repo_roots(context=None, *, existing_only=False):
         return []
 
     try:
-        from . import get_w2_unbundle_path, get_witcher2_game_path
+        from .. import get_w2_unbundle_path, get_witcher2_game_path
     except Exception:
         return []
 
@@ -151,7 +180,7 @@ def _existing_path(path_value) -> bool:
     if os.path.exists(path_value):
         return True
     try:
-        from .CR2W.common_blender import win_safe_path
+        from ..CR2W.common_blender import win_safe_path
 
         return os.path.exists(win_safe_path(path_value))
     except Exception:
@@ -172,7 +201,7 @@ def resolve_w2_repo_file_from_root(filepath, root, *, extract_from_bundles=False
         return ""
 
     try:
-        from .CR2W.common_blender import _extract_w2_bundle_repo_file
+        from ..CR2W.common_blender import _extract_w2_bundle_repo_file
 
         return _extract_w2_bundle_repo_file(rel_path, root)
     except Exception:
@@ -203,17 +232,8 @@ def source_game_for_animset_item(item, rig_settings=None, fallback="w3") -> str:
     return source_game_for_rig_settings(rig_settings, fallback=fallback)
 
 
-def repo_file_for_source(filepath, source_game="", *, version=None, is_abs_path=False):
-    if not filepath:
-        return ""
-    from .CR2W.common_blender import repo_file
-
-    effective_version = version if version is not None else version_for_source_game(source_game)
-    return repo_file(filepath, version=effective_version, is_abs_path=is_abs_path)
-
-
 def source_roots(context, source_game, *, existing_only=False):
-    from . import get_uncook_path
+    from .. import get_uncook_path
 
     roots = []
     if normalize_source_game(source_game) == "w2":
@@ -315,20 +335,6 @@ def iter_w2_repo_path_variants(filepath: str):
         yield from emit_with_template_variants(candidate)
     for candidate in iter_w2_known_alias_paths(filepath):
         yield from emit_with_template_variants(candidate)
-
-
-def existing_repo_file_for_source(filepath, source_game="", *, version=None, allow_json=True):
-    resolved = repo_file_for_source(filepath, source_game, version=version)
-    if not resolved:
-        return ""
-    from .CR2W.common_blender import win_safe_path
-
-    safe = win_safe_path(resolved)
-    if allow_json and os.path.isfile(safe + ".json"):
-        return resolved + ".json"
-    if os.path.exists(safe):
-        return resolved
-    return ""
 
 
 def display_path_relative_to_source_roots(path_value, context, source_game):

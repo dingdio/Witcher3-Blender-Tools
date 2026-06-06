@@ -5,10 +5,9 @@ from pathlib import Path
 import struct
 from types import SimpleNamespace
 from .third_party_libs import yaml
-from .common_blender import repo_file
 from .prop_utils import prop_to_string
 from ..extension_paths import get_dev_override
-from ..source_game_paths import resolve_w2_repo_file_from_source
+from ..repo_paths import materialize_repo_path, resolve_w2_repo_file_from_source
 log = logging.getLogger(__name__)
 import io
 
@@ -461,7 +460,7 @@ def _resolve_level_dependency_path(depot_path, version, dependency_resolver=None
     source_resolved = resolve_w2_repo_file_from_source(depot_path, source_filename, version=version)
     if source_resolved:
         return source_resolved
-    return repo_file(depot_path, version)
+    return materialize_repo_path(depot_path, version=version)
 
 
 _W2_SECTOR_FLAG_MESH_VISIBLE = 1 << 2

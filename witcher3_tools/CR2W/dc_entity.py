@@ -15,7 +15,7 @@ from .bStream import bStream
 from .prop_utils import prop_to_string
 from .read_json_w3 import readCSkeletonData
 from . import w3_types
-from ..source_game_paths import resolve_w2_repo_file_from_source
+from ..repo_paths import materialize_entity_repo_path, resolve_w2_repo_file_from_source
 
 # Session-scoped cache for LoadCEntityTemplateFile results.
 # Cleared between imports via clear_template_cache().
@@ -1366,7 +1366,7 @@ def read_entity_template_appearance_metadata(template_filename: str):
             return copy.deepcopy(empty_result)
         resolved_path = template_filename
     else:
-        resolved_path = repo_file(template_filename)
+        resolved_path = materialize_entity_repo_path(template_filename)
         if not resolved_path or not os.path.isabs(resolved_path) or not os.path.exists(resolved_path):
             return copy.deepcopy(empty_result)
 
@@ -2465,7 +2465,7 @@ def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:
     if os.path.isabs(templateFilename) and os.path.exists(templateFilename):
         fileNameFull = templateFilename
     else:
-        fileNameFull = repo_file(templateFilename)
+        fileNameFull = materialize_entity_repo_path(templateFilename)
     cache_key = _template_cache_key(fileNameFull)
     if cache_key in _template_file_cache:
         return copy.deepcopy(_template_file_cache[cache_key])
@@ -3027,7 +3027,10 @@ def create_CEntity(file, _inherit_visited=None):
             if not depot_path or not depot_path.lower().endswith(".w2ent"):
                 continue
             try:
-                include_full_path = repo_file(depot_path, file.HEADER.version)
+                include_full_path = materialize_entity_repo_path(
+                    depot_path,
+                    version=file.HEADER.version,
+                )
                 norm_include_path = os.path.normcase(os.path.normpath(include_full_path))
             except Exception as e:
                 log.debug(f"Failed to resolve included template path '{depot_path}': {e}")

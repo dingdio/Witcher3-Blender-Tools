@@ -41,7 +41,7 @@ from .w3_vector_param import (
 )
 from . import get_all_addon_prefs, get_texture_path, get_uncook_path
 from .extension_paths import get_cache_root
-from .source_game_paths import (
+from .repo_paths import (
     normalize_source_game as _normalize_material_source_game,
     w2_source_repo_root_if_configured,
     w2_source_roots,
