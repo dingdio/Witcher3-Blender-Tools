@@ -82,8 +82,11 @@ def _iter_reddlc_files_one_level(dlc_root: str):
 def _virtual_assets_mod_reddlc_path(path: str) -> str:
     path = str(path or "").replace("/", "\\").strip("\\")
     parts = [part for part in path.split("\\") if part]
-    if len(parts) == 4 and parts[1].lower() == "dlc" and parts[-1].lower().endswith(".reddlc"):
-        return "\\".join(parts[1:])
+    if not parts or not parts[-1].lower().endswith(".reddlc"):
+        return ""
+    for idx, part in enumerate(parts):
+        if part.lower() == "dlc" and len(parts) - idx >= 3:
+            return "\\".join(parts[idx:])
     return ""
 
 

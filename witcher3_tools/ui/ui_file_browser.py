@@ -4171,13 +4171,43 @@ def clear_search_cache():
     global _search_cache
     _search_cache = {'query': '', 'cache_type': '', 'loadmods': False, 'results': []}
 
-def refresh_mod_cache_managers():
+
+def _report_locked_bundle_cache(reporter, manager):
+    locked_files = list(getattr(manager, "locked_bundle_files", []) or [])
+    if not locked_files:
+        return
+    using_cache = bool(getattr(manager, "cache_fallback_due_locked", False))
+    if using_cache:
+        message = (
+            f"{len(locked_files)} mod bundle file(s) are locked; using the last bundle cache. "
+            "Close Witcher 3 to refresh."
+        )
+    else:
+        message = (
+            f"{len(locked_files)} mod bundle file(s) are locked and were skipped. "
+            "Close Witcher 3 and refresh Assets Mods."
+        )
+    log.warning("%s Locked files: %s", message, "; ".join(locked_files))
+    if reporter is not None and hasattr(reporter, "report"):
+        try:
+            reporter.report({'WARNING'}, message)
+        except Exception:
+            pass
+
+
+def refresh_mod_cache_managers(reporter=None):
     """Force rebuild of mod cache managers so removed mods disappear immediately."""
     clear_mod_index_cache()
     try:
-        LoadBundleManager(loadmods=True, reset_cache=True)
+        manager = LoadBundleManager(loadmods=True, reset_cache=True)
+        _report_locked_bundle_cache(reporter, manager)
     except Exception as e:
         log.error("Failed to refresh mod bundle cache: %s", e)
+        if isinstance(e, PermissionError) and reporter is not None and hasattr(reporter, "report"):
+            try:
+                reporter.report({'ERROR'}, "Mod bundle files are locked. Close Witcher 3 and refresh Assets Mods.")
+            except Exception:
+                pass
     try:
         LoadCollisionManager(loadmods=True, do_reload=True)
     except Exception as e:
@@ -5326,7 +5356,7 @@ class SimpleFileBrowser(Operator):
             pass
 
         if self.loadmods:
-            refresh_mod_cache_managers()
+            refresh_mod_cache_managers(self)
 
         startup_cache_type = str(getattr(self, "startup_cache_type", "") or "")
         startup_folder = str(getattr(self, "startup_folder", "") or "")
@@ -7541,7 +7571,8 @@ class SelectCacheTypeOperator(Operator):
         elif witcher_file_browser.use_mods_priority:
             clear_mod_index_cache()
             try:
-                LoadBundleManager(loadmods=True, reset_cache=True)
+                manager = LoadBundleManager(loadmods=True, reset_cache=True)
+                _report_locked_bundle_cache(self, manager)
             except Exception as e:
                 log.error("Failed to refresh mod override cache: %s", e)
 
@@ -7576,6 +7607,7 @@ class SelectCacheTypeOperator(Operator):
         try:
             if cache_type == "Bundle":
                 manager = LoadBundleManager(loadmods=loadmods, reset_cache=loadmods)
+                _report_locked_bundle_cache(self, manager)
             elif cache_type == WITCHER2_BUNDLE_CACHE_TYPE:
                 manager = LoadWitcher2BundleManager()
             elif cache_type == WITCHER2_SPEECH_CACHE_TYPE:

@@ -139,6 +139,37 @@ def get_mod_dirs(mods_root: str) -> List[str]:
     return dirs
 
 
+def _dedupe_paths(paths: Iterable[str]) -> List[str]:
+    out = []
+    seen = set()
+    for path in paths or []:
+        if not path:
+            continue
+        norm = os.path.normpath(path)
+        key = os.path.normcase(os.path.abspath(norm))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(norm)
+    return out
+
+
+def get_mod_roots(base_path: str) -> List[str]:
+    roots = []
+    for name in ("mods", "mod", "Mods", "MOD"):
+        root = os.path.join(base_path, name) if base_path else ""
+        if root and os.path.isdir(root):
+            roots.append(root)
+    return _dedupe_paths(roots)
+
+
+def get_all_mod_dirs(base_path: str) -> List[str]:
+    dirs = []
+    for mods_root in get_mod_roots(base_path):
+        dirs.extend(get_mod_dirs(mods_root))
+    return _dedupe_paths(dirs)
+
+
 def signature_w3strings(base_path: str, language: str) -> Tuple[Dict, Dict]:
     subdirs = ["content", "dlc", "mods", "mod", "DLC", "MOD"]
     roots = []
@@ -209,9 +240,7 @@ def signature_bundles_base(base_path: str, vanilla_dlc_list: List[str]) -> Tuple
 
 
 def signature_bundles_mods(base_path: str, vanilla_dlc_list: List[str]) -> Tuple[Dict, Dict]:
-    mods_root = os.path.join(base_path, "mods")
-
-    roots = get_mod_dirs(mods_root)
+    roots = get_all_mod_dirs(base_path)
 
     # Non-vanilla DLCs are considered modded DLCs
     dlc_dirs = get_dlc_dirs(base_path, vanilla_only=False, vanilla_list=vanilla_dlc_list)

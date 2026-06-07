@@ -82,7 +82,8 @@ class WitcherArchiveManager(ABC):
     
     @staticmethod
     def GetModFolder(path):
-        parts = path.split('\\')
-        if len(parts) > 3 and "content" in parts:
-            return parts[parts.index("content") - 1]
+        parts = str(path or "").replace("/", "\\").split("\\")
+        for idx, part in enumerate(parts):
+            if part.lower() == "content" and idx > 0:
+                return parts[idx - 1]
         return path

@@ -555,7 +555,7 @@ def _build_mod_order():
     try:
         from .witcher_cache.common_cache.WitcherArchiveManager import Configuration, WitcherArchiveManager
         from .witcher_cache import cache_meta
-        mods_dirs = cache_meta.get_mod_dirs(Configuration.GameModDir)
+        mods_dirs = cache_meta.get_all_mod_dirs(Configuration.ExecutablePath)
         for idx, d in enumerate(mods_dirs):
             order[os.path.basename(d)] = idx
         dlc_dirs = cache_meta.get_dlc_dirs(Configuration.ExecutablePath, vanilla_only=False, vanilla_list=WitcherArchiveManager.VanillaDLClist)

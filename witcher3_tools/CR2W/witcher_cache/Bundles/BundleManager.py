@@ -34,6 +34,9 @@ class BundleManager(WitcherArchiveManager):
         self.FileList = []
         self.Extensions = []
         self.AutocompleteSource = []
+        self.locked_bundle_files = []
+        self.failed_bundle_files = []
+        self.cache_fallback_due_locked = False
 
     @property
     def TypeName(self):
@@ -90,7 +93,16 @@ class BundleManager(WitcherArchiveManager):
         if filename in self.Bundles:
             return
 
-        bundle = Bundle(filename)
+        try:
+            bundle = Bundle(filename)
+        except PermissionError as exc:
+            self.locked_bundle_files.append(filename)
+            log.warning("Skipped locked mod bundle %s: %s", filename, exc)
+            return
+        except Exception as exc:
+            self.failed_bundle_files.append(filename)
+            log.warning("Failed to load mod bundle %s: %s", filename, exc)
+            return
 
         for key, value in bundle.Items.items():
             mod_folder = self.GetModFolder(filename) + "\\" + key
@@ -105,7 +117,16 @@ class BundleManager(WitcherArchiveManager):
         if filename in self.Bundles:
             return
 
-        bundle = Bundle(filename)  # Assuming Bundle is a class you've defined
+        try:
+            bundle = Bundle(filename)  # Assuming Bundle is a class you've defined
+        except PermissionError as exc:
+            self.locked_bundle_files.append(filename)
+            log.warning("Skipped locked bundle %s: %s", filename, exc)
+            return
+        except Exception as exc:
+            self.failed_bundle_files.append(filename)
+            log.warning("Failed to load bundle %s: %s", filename, exc)
+            return
 
         for key, value in bundle.Items.items():
             if key not in self.Items:
@@ -161,21 +182,38 @@ class BundleManager(WitcherArchiveManager):
         # Mods cache depends on a valid game root for mods/dlc locations.
         self.base_path = normalize_game_path(Configuration.ExecutablePath)
         self.cache_files = []
-        if not has_game_content_root(self.base_path):
+
+        mod_roots = cache_meta.get_mod_roots(self.base_path)
+        if mods and os.path.isdir(mods):
+            mods_norm = os.path.normpath(mods)
+            if os.path.normcase(os.path.abspath(mods_norm)) not in {
+                os.path.normcase(os.path.abspath(path)) for path in mod_roots
+            }:
+                mod_roots.append(mods_norm)
+
+        if not (
+            has_game_content_root(self.base_path)
+            or mod_roots
+            or (dlc and os.path.isdir(dlc))
+        ):
             log.info("Bundle cache skipped (mods): Witcher 3 path not set or invalid: %s", self.base_path or "<unset>")
             return
-        if not mods or not os.path.exists(mods):
-            return
-        modsdirs = sorted(glob.glob(os.path.join(mods, '*')))
-        modbundles = [file for dir in modsdirs for file in glob.glob(os.path.join(dir, '**', '*.bundle'), recursive=True)]
-        for file in modbundles:
-            self.LoadModBundle(file)
 
-        if os.path.exists(dlc):
+        for mods_root in mod_roots:
+            modsdirs = cache_meta.get_mod_dirs(mods_root)
+            modbundles = [
+                file
+                for dir_path in modsdirs
+                for file in glob.glob(os.path.join(dir_path, '**', '*.bundle'), recursive=True)
+            ]
+            for file in modbundles:
+                self.LoadModBundle(file)
+
+        if dlc and os.path.exists(dlc):
             dlcdirs = sorted(glob.glob(os.path.join(dlc, '*')))
             dlcfiles = [file
                         for dir in dlcdirs
-                        if os.path.basename(dir) not in self.VANILLA_DLC_LIST
+                        if os.path.basename(dir).lower() not in self.VANILLA_DLC_LIST
                         for file in glob.glob(os.path.join(dir, '**', '*.bundle'), recursive=True)
                         ]
             
@@ -196,7 +234,14 @@ class BundleManager(WitcherArchiveManager):
         ):
             reset_cache = True
 
-        if not has_game_content_root(current_base_path):
+        has_source_root = has_game_content_root(current_base_path)
+        if loadmods:
+            has_source_root = has_source_root or bool(
+                cache_meta.get_mod_roots(current_base_path)
+                or os.path.isdir(os.path.join(current_base_path, "dlc"))
+            )
+
+        if not has_source_root:
             bm = BundleManager()
             bm.base_path = current_base_path
             if loadmods:
@@ -212,6 +257,23 @@ class BundleManager(WitcherArchiveManager):
             filename = os.path.join(cache_dir, cache_name)
             
             start_time = time.time()
+
+            def load_cached_bm_if_valid():
+                if not os.path.exists(filename):
+                    return None
+                meta_path = cache_meta.get_meta_path(filename)
+                meta = cache_meta.load_meta(meta_path)
+                current_sig, _ = BundleManager.BuildSourceSignature(loadmods)
+                if not cache_meta.signatures_match(meta.get("signature", {}), current_sig):
+                    return None
+                try:
+                    with open(filename, 'rb') as f:
+                        cached_bm = pickle.load(f)
+                except Exception:
+                    return None
+                if getattr(cached_bm, "base_path", None) != current_base_path:
+                    return None
+                return cached_bm
             
             def load_bm(filename):
                 bm = BundleManager()
@@ -220,33 +282,36 @@ class BundleManager(WitcherArchiveManager):
                     bm.LoadModsBundles(Configuration.GameModDir, Configuration.GameDlcDir)
                 else:
                     bm.LoadAll(current_base_path)
-                with open(filename, 'wb') as f:
-                    pickle.dump(bm, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-                signature, source = BundleManager.BuildSourceSignature(loadmods)
-                meta_path = cache_meta.get_meta_path(filename)
-                meta = cache_meta.make_meta(cache_name, filename, signature, source)
-                cache_meta.save_meta(meta_path, meta)
+                if bm.locked_bundle_files:
+                    cached_bm = load_cached_bm_if_valid()
+                    if cached_bm is not None:
+                        cached_bm.locked_bundle_files = list(bm.locked_bundle_files)
+                        cached_bm.failed_bundle_files = list(getattr(bm, "failed_bundle_files", []) or [])
+                        cached_bm.cache_fallback_due_locked = True
+                        return cached_bm
+                    log.warning(
+                        "Bundle cache incomplete; %d bundle file(s) are locked.",
+                        len(bm.locked_bundle_files),
+                    )
+                else:
+                    with open(filename, 'wb') as f:
+                        pickle.dump(bm, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+                    signature, source = BundleManager.BuildSourceSignature(loadmods)
+                    meta_path = cache_meta.get_meta_path(filename)
+                    meta = cache_meta.make_meta(cache_name, filename, signature, source)
+                    cache_meta.save_meta(meta_path, meta)
                 return bm
             
             if not os.path.exists(filename) or reset_cache:
                 bm = load_bm(filename)
             else:
                 # Validate cache signature before loading from pickle
-                meta_path = cache_meta.get_meta_path(filename)
-                meta = cache_meta.load_meta(meta_path)
-                current_sig, _ = BundleManager.BuildSourceSignature(loadmods)
-                if not cache_meta.signatures_match(meta.get("signature", {}), current_sig):
+                bm = load_cached_bm_if_valid()
+                if bm is None:
                     log.info('Bundle cache stale, rebuilding %s...', "mods" if loadmods else "vanilla")
                     bm = load_bm(filename)
-                else:
-                    with open(filename, 'rb') as f:
-                        try:
-                            bm = pickle.load(f)
-                            if getattr(bm, "base_path", None) != current_base_path:
-                                bm = load_bm(filename)
-                        except Exception as e:
-                            bm = load_bm(filename)
             time_taken = time.time() - start_time
             log.info('Loaded Bundle Cache in %.2f seconds (%d items)', time_taken, len(bm.Items))
             instance_manager = bm
