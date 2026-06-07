@@ -258,17 +258,6 @@ def _fallback_tangent_basis(normal):
     return tangent, bitangent
 
 
-def _triangle_corner_angle(edge_a, edge_b):
-    len_a = math.sqrt(float(np.dot(edge_a, edge_a)))
-    len_b = math.sqrt(float(np.dot(edge_b, edge_b)))
-    if len_a < 1e-8 or len_b < 1e-8:
-        return 0.0
-
-    cos_angle = float(np.dot(edge_a, edge_b)) / (len_a * len_b)
-    cos_angle = max(-1.0, min(1.0, cos_angle))
-    return math.acos(cos_angle)
-
-
 def _solve_meshdata_tangent_basis(mesh_data: MeshData):
     vert_count = len(mesh_data.vertex3DCoords)
     if vert_count == 0:
@@ -286,8 +275,8 @@ def _solve_meshdata_tangent_basis(mesh_data: MeshData):
         uvs = np.zeros((vert_count, 2), dtype=np.float64)
         uvs[:, 1] = 1.0
 
-    tan1 = np.zeros((vert_count, 3), dtype=np.float64)
-    tan2 = np.zeros((vert_count, 3), dtype=np.float64)
+    tangent_accum = np.zeros((vert_count, 3), dtype=np.float64)
+    bitangent_accum = np.zeros((vert_count, 3), dtype=np.float64)
     degenerate_uv_faces = 0
 
     for face in mesh_data.faces:
@@ -316,43 +305,53 @@ def _solve_meshdata_tangent_basis(mesh_data: MeshData):
         delta_v1 = uv2[1] - uv1[1]
         delta_v2 = uv3[1] - uv1[1]
         denom = (delta_u1 * delta_v2) - (delta_u2 * delta_v1)
-        if not math.isfinite(float(denom)) or abs(float(denom)) < 1e-20:
+        if not math.isfinite(float(denom)) or abs(float(denom)) < 1e-7:
             degenerate_uv_faces += 1
             continue
 
         inv_denom = 1.0 / float(denom)
         sdir = ((delta_v2 * edge1) - (delta_v1 * edge2)) * inv_denom
         tdir = ((delta_u1 * edge2) - (delta_u2 * edge1)) * inv_denom
+        if not (np.all(np.isfinite(sdir)) and np.all(np.isfinite(tdir))):
+            degenerate_uv_faces += 1
+            continue
 
-        angle_1 = _triangle_corner_angle(p2 - p1, p3 - p1)
-        angle_2 = _triangle_corner_angle(p3 - p2, p1 - p2)
-        angle_3 = _triangle_corner_angle(p1 - p3, p2 - p3)
-        for vert_idx, weight in ((i1, angle_1), (i2, angle_2), (i3, angle_3)):
-            tan1[vert_idx] += sdir * weight
-            tan2[vert_idx] += tdir * weight
+        for vert_idx in (i1, i2, i3):
+            tangent_accum[vert_idx] += sdir
+            bitangent_accum[vert_idx] += tdir
 
     tangents = []
     bitangents = []
     fallback_count = 0
     for vert_idx in range(vert_count):
         normal = _normalize_vector3(normals[vert_idx], (0.0, 0.0, 1.0))
-        tangent_accum = tan1[vert_idx]
-        tangent_proj = tangent_accum - (np.dot(normal, tangent_accum) * np.asarray(normal, dtype=np.float64))
-        tangent = _normalize_vector3(tangent_proj, None)
+        fallback_tangent, fallback_bitangent = _fallback_tangent_basis(normal)
+
+        tangent = _normalize_vector3(tangent_accum[vert_idx], None)
         if tangent is None:
-            tangent, bitangent = _fallback_tangent_basis(normal)
+            source_bitangent = _normalize_vector3(bitangent_accum[vert_idx], None)
+            if source_bitangent is not None:
+                tangent = _normalize_vector3(np.cross(source_bitangent, normal), fallback_tangent)
+
+        if tangent is None:
+            tangent, bitangent = fallback_tangent, fallback_bitangent
             fallback_count += 1
         else:
-            handedness = -1.0 if float(np.dot(np.cross(normal, tangent), tan2[vert_idx])) < 0.0 else 1.0
-            bitangent = -np.cross(normal, tangent) * handedness
-            bitangent = _normalize_vector3(bitangent, _fallback_tangent_basis(normal)[1])
+            bitangent = _normalize_vector3(
+                (
+                    -(normal[1] * tangent[2] - normal[2] * tangent[1]),
+                    -(normal[2] * tangent[0] - normal[0] * tangent[2]),
+                    -(normal[0] * tangent[1] - normal[1] * tangent[0]),
+                ),
+                fallback_bitangent,
+            )
 
         tangents.append([tangent[0], tangent[1], tangent[2]])
         bitangents.append([bitangent[0], bitangent[1], bitangent[2]])
 
     if degenerate_uv_faces or fallback_count:
         log.debug(
-            "Solved tangent basis for %d verts with %d degenerate UV faces and %d fallback tangents.",
+            "Solved tangent/binormal basis for %d verts with %d degenerate UV faces and %d fallback vertices.",
             vert_count,
             degenerate_uv_faces,
             fallback_count,
@@ -1598,27 +1597,10 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
             return (0.0, 1.0)
         return (u, v)
 
-    def _triangle_uv_handedness(loop_indices):
-        if uv1_layer is None or len(loop_indices) != 3:
-            return 0
-
-        uv_a = _read_loop_uv(uv1_layer, loop_indices[0])
-        uv_b = _read_loop_uv(uv1_layer, loop_indices[1])
-        uv_c = _read_loop_uv(uv1_layer, loop_indices[2])
-        delta_u1 = uv_b[0] - uv_a[0]
-        delta_u2 = uv_c[0] - uv_a[0]
-        delta_v1 = uv_b[1] - uv_a[1]
-        delta_v2 = uv_c[1] - uv_a[1]
-        determinant = (delta_u1 * delta_v2) - (delta_u2 * delta_v1)
-        if not math.isfinite(determinant) or abs(determinant) < 1e-20:
-            return 0
-        return -1 if determinant < 0.0 else 1
-
     vertex_lookup = {}
     loops = me.loops
     for loop_tri in me.loop_triangles:
         tri_indices = []
-        triangle_handedness = _triangle_uv_handedness(loop_tri.loops)
         for loop_idx in loop_tri.loops:
             loop = loops[loop_idx]
             src_vert_idx = loop.vertex_index
@@ -1630,8 +1612,7 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
 
             color = _read_loop_color(loop_idx, src_vert_idx)
 
-            # tangent bases 
-            key = (src_vert_idx, normal, uv1, uv2, triangle_handedness, tuple(color))
+            key = (src_vert_idx, normal, uv1, uv2, tuple(color))
             export_vert_idx = vertex_lookup.get(key)
             if export_vert_idx is None:
                 export_vert_idx = len(exportMeshdata.vertex3DCoords)
