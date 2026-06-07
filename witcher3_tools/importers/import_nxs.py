@@ -96,6 +96,23 @@ def _normalize_collision_material_names(material_value):
     return [value]
 
 
+# Resource extensions that get embedded in an extracted collision filename as
+# '<resource>.<ext>.nxs' (the cache is keyed by the source path). Stripping them
+# keeps Blender collision objects named '<mesh>_tri' rather than
+# '<mesh>.w2mesh_tri'
+_COLLISION_SOURCE_EXTS = (".w2mesh", ".w2ter", ".reddest", ".redcloth", ".redapex", ".w2cube")
+
+
+def _collision_object_base_name(file_path):
+    """Object-name stem for a collision file, without any embedded source extension."""
+    stem = Path(file_path).stem
+    low = stem.lower()
+    for ext in _COLLISION_SOURCE_EXTS:
+        if low.endswith(ext):
+            return stem[:-len(ext)]
+    return stem
+
+
 class FileFormatException(Exception):
     pass
 
@@ -1103,7 +1120,8 @@ def _try_import_mixed_file_primitives(filePath: str, entries: list):
             gap = data[cursor:start]
             # Primitive blobs are tiny; ignore large non-NXS gaps/padding noise.
             if gap and len(gap) <= 32:
-                prim_name = Path(filePath).stem if gap_index == 0 else f"{Path(filePath).stem}_prim{gap_index:02d}"
+                stem = _collision_object_base_name(filePath)
+                prim_name = stem if gap_index == 0 else f"{stem}_prim{gap_index:02d}"
                 prim_objs = _try_import_primitive_blob_bytes(
                     gap,
                     prim_name,
@@ -1118,7 +1136,7 @@ def _try_import_mixed_file_primitives(filePath: str, entries: list):
     if cursor < len(data):
         gap = data[cursor:]
         if gap and len(gap) <= 32:
-            prim_name = f"{Path(filePath).stem}_prim{gap_index:02d}"
+            prim_name = f"{_collision_object_base_name(filePath)}_prim{gap_index:02d}"
             prim_objs = _try_import_primitive_blob_bytes(
                 gap,
                 prim_name,
@@ -1142,7 +1160,7 @@ def _try_import_primitive_blob(filePath: str):
         data = Path(filePath).read_bytes()
     except Exception:
         return None
-    return _try_import_primitive_blob_bytes(data, Path(filePath).stem, source_label=filePath)
+    return _try_import_primitive_blob_bytes(data, _collision_object_base_name(filePath), source_label=filePath)
 
 def _create_primitive_from_item(payload: bytes, flag: int, pose, material_name, name: str):
     """Create one collision primitive from a RED header item's data and pose.
@@ -1222,7 +1240,7 @@ def create_from_nxs(filePath, shape_items=None):
         (pose, mat) for pose, flag, payload, mat in shape_items if flag in NXS_FLAGS
     ] if shape_items else []
 
-    base_name = Path(filePath).stem
+    base_name = _collision_object_base_name(filePath)
     nxs_file = bStream(path=filePath)
     objects = []
 
