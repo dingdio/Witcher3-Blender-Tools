@@ -3654,7 +3654,12 @@ class WITCH_OT_nxs(bpy.types.Operator, ImportHelper):
         ext = file_helpers.getFilenameType(fdir)
         if ext == ".nxs":
             s = time.time()
-            import_nxs.create_from_nxs(fdir)
+            # The extracted .nxs has no per-shape transforms, they are in the collision cache header keyed ti .w2mesh path.
+            from ..CR2W.common_blender import get_collision_shape_items_for_file
+            shape_items = get_collision_shape_items_for_file(fdir)
+            if shape_items:
+                log.info("Found %d cached collision pose(s) for %s", len(shape_items), fdir)
+            import_nxs.create_from_nxs(fdir, shape_items=shape_items or None)
             message = f'Imported .nxs file in {time.time() - s} seconds.'
             log.info(message)
             self.report({'INFO'}, message)

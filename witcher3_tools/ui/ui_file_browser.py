@@ -8077,7 +8077,9 @@ class FileActionOperatorImportToScene(Operator):
                 # Import collision based on actual extracted file extension
                 if ext == ".nxs":
                     from ..importers import import_nxs
-                    import_nxs.create_from_nxs(abs_file_path)
+                    from ..CR2W.common_blender import get_collision_shape_items_for_file
+                    shape_items = get_collision_shape_items_for_file(abs_file_path)
+                    import_nxs.create_from_nxs(abs_file_path, shape_items=shape_items or None)
                 elif ext == ".apb":
                     from ..cloth_util import importCloth
 

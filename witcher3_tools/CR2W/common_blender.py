@@ -1219,6 +1219,46 @@ def get_game_path():
     return get_dev_override("fallback_game_path", "")
 
 
+def _find_collision_item(collision_manager, lookup_path: str):
+    """Find the CollisionCacheItem for a mesh/collision path.
+
+    Collision cache entries are keyed by the full source path, exact-match-first order
+    """
+    if not lookup_path:
+        return None
+
+    low = lookup_path.lower()
+    if low.endswith('.w2mesh'):
+        base = lookup_path[:-len('.w2mesh')]
+    elif low.endswith('.nxs'):
+        base = lookup_path[:-len('.nxs')]
+    else:
+        base = lookup_path
+
+    seen = set()
+    for cand in (lookup_path, base + '.w2mesh', base + '.nxs', base):
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        items = collision_manager.find_item_by_path_name(cand)
+        if items and len(items) > 0:
+            return items[0]
+
+    normalized = base.replace('/', '\\').lower()
+    if normalized:
+        for key in collision_manager.Items:
+            key_low = key.lower()
+            idx = key_low.find(normalized)
+            if idx == -1:
+                continue
+            rest = key_low[idx + len(normalized):]
+            if rest.startswith('.'):
+                items = collision_manager.Items[key]
+                if items and len(items) > 0:
+                    return items[0]
+    return None
+
+
 def repo_collision_file(mesh_filepath: str) -> str:
     """
     Find and extract the collision file (.nxs) associated with a mesh.
@@ -1239,39 +1279,10 @@ def repo_collision_file(mesh_filepath: str) -> str:
     if not uncook_path:
         return None
 
-    # Generate collision path from mesh path
-    # The collision file typically has the same path but with .nxs extension
-    if mesh_filepath.endswith('.w2mesh'):
-        collision_path = mesh_filepath[:-8]  # Remove .w2mesh
-    else:
-        collision_path = mesh_filepath
-
-    # Collision files in cache are stored without extension
-    # Try to find it in the collision manager
+    # Collision cache keys carry the full source path (.w2mesh). Let the shared
+    # resolver handle the .w2mesh/.nxs variants and sibling-safe fallback.
     collision_manager = CollisionManager.Get()
-
-    # Search for matching collision file
-    item = None
-
-    # Try exact match first (collision files may be stored with full path)
-    items = collision_manager.find_item_by_path_name(collision_path)
-    if items and len(items) > 0:
-        item = items[0]
-    else:
-        # Try with .nxs extension
-        items = collision_manager.find_item_by_path_name(collision_path + ".nxs")
-        if items and len(items) > 0:
-            item = items[0]
-
-    if item is None:
-        # Try to find by partial path match (in case of path format differences)
-        normalized_path = collision_path.replace('/', '\\').lower()
-        for key in collision_manager.Items:
-            if normalized_path in key.lower():
-                items = collision_manager.Items[key]
-                if items and len(items) > 0:
-                    item = items[0]
-                    break
+    item = _find_collision_item(collision_manager, mesh_filepath)
 
     if item is None:
         return None
@@ -1310,30 +1321,8 @@ def repo_collision_file_with_poses(mesh_filepath: str):
     if not uncook_path:
         return None, []
 
-    if mesh_filepath.endswith('.w2mesh'):
-        collision_path = mesh_filepath[:-8]
-    else:
-        collision_path = mesh_filepath
-
     collision_manager = CollisionManager.Get()
-    item = None
-
-    items = collision_manager.find_item_by_path_name(collision_path)
-    if items and len(items) > 0:
-        item = items[0]
-    else:
-        items = collision_manager.find_item_by_path_name(collision_path + ".nxs")
-        if items and len(items) > 0:
-            item = items[0]
-
-    if item is None:
-        normalized_path = collision_path.replace('/', '\\').lower()
-        for key in collision_manager.Items:
-            if normalized_path in key.lower():
-                items = collision_manager.Items[key]
-                if items and len(items) > 0:
-                    item = items[0]
-                    break
+    item = _find_collision_item(collision_manager, mesh_filepath)
 
     if item is None:
         return None, []
@@ -1398,3 +1387,26 @@ def get_collision_for_mesh_with_poses(mesh_filepath: str):
             mesh_filepath = mesh_filepath.replace(uncook_path + '/', '')
 
     return repo_collision_file_with_poses(mesh_filepath)
+
+
+def get_collision_shape_items_for_file(filepath: str):
+    """Return per-shape pose data for a standalone collision/mesh file.
+    """
+    from .witcher_cache.CollisionCache.CollisionManager import CollisionManager
+
+    _, uncook_path, _, _ = _get_repo_roots_from_prefs()
+
+    rel = filepath
+    if os.path.isabs(rel) and uncook_path and uncook_path in rel:
+        rel = rel.replace(uncook_path + '\\', '').replace(uncook_path + '/', '')
+
+    collision_manager = CollisionManager.Get()
+    item = _find_collision_item(collision_manager, rel)
+    if item is None:
+        return []
+
+    try:
+        return item.get_shapes_with_data()
+    except Exception as e:
+        log.warning("Failed to read collision shape poses for %s: %s", filepath, e)
+        return []

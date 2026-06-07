@@ -2125,7 +2125,11 @@ def _import_sector_collision_from_cache(mesh, errors, parent_transform, **kwargs
     if _is_missing_nxs(out_path):
         return None
     try:
-        nxs_objects = create_from_nxs(out_path)
+        try:
+            shape_items = item.get_shapes_with_data()
+        except Exception:
+            shape_items = []
+        nxs_objects = create_from_nxs(out_path, shape_items=shape_items or None)
     except Exception as exc:
         if _is_missing_file_error(exc):
             _note_missing_nxs_once(out_path, "Collision")
