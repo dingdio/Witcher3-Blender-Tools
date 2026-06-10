@@ -38,6 +38,11 @@ from .w3_material_reader import (
     read_material_params_from_path,
     resolve_w2mg,
 )
+from .w3_material_w2_compat import (
+    get_or_create_w2_bespoke_node_group,
+    is_w2_srgb_texture_param,
+    resolve_w2_bespoke_group_name,
+)
 from . import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext, get_texture_path
 from .extension_paths import get_texture_root
 from .CR2W.texture_converters import (
@@ -531,6 +536,9 @@ def get_recommended_node_group_for_base_path(material: Material, material_path: 
             fallback_ng_name,
             cached.get("resource_path") or resource_path,
         )
+        if cached.get("w2_bespoke_node_group_name"):
+            cached["w2_base_node_group_name"] = cached["node_group_name"]
+            cached["node_group_name"] = cached["w2_bespoke_node_group_name"]
         return cached
 
     result = {
@@ -539,6 +547,8 @@ def get_recommended_node_group_for_base_path(material: Material, material_path: 
         "resolved_path": normalized_path,
         "shader_type": "",
         "node_group_name": "",
+        "w2_base_node_group_name": "",
+        "w2_bespoke_node_group_name": "",
         "resource_path": resource_path,
     }
     if not normalized_path:
@@ -567,9 +577,33 @@ def get_recommended_node_group_for_base_path(material: Material, material_path: 
         fallback_ng_name,
         resource_path,
     )
+    if is_witcher2_material(material):
+        bespoke_ng_name = resolve_w2_bespoke_group_name(resolved_path, version=_material_repo_version(material))
+        if bespoke_ng_name:
+            result["w2_bespoke_node_group_name"] = bespoke_ng_name
+            result["w2_base_node_group_name"] = result["node_group_name"]
+            result["node_group_name"] = bespoke_ng_name
 
     _BASE_PATH_NODE_GROUP_CACHE[cache_key] = dict(result)
     return result
+
+
+def ensure_node_group_for_recommendation(recommendation):
+    """Materialize the recommended node group.
+
+    Bespoke W2 groups don't live in the resource .blend, so they are copied
+    from their base group on demand; everything else goes through
+    ensure_node_group directly.
+    """
+    recommendation = recommendation or {}
+    resource_path = recommendation.get("resource_path") or RES_PATH
+    base_ng_name = recommendation.get("w2_base_node_group_name") or recommendation.get("node_group_name", "")
+    ng = ensure_node_group(base_ng_name, resource_path=resource_path)
+    if recommendation.get("w2_bespoke_node_group_name"):
+        bespoke = get_or_create_w2_bespoke_node_group(ng, recommendation.get("resolved_path", ""))
+        if bespoke is not None:
+            return bespoke
+    return ng
 
 
 def load_w3_materials_XML(
@@ -1034,6 +1068,10 @@ def setup_w3_material(
         fallback_ng_name,
         resource_path,
     )
+    if is_witcher2_material(material):
+        bespoke_ng_name = resolve_w2_bespoke_group_name(resolved_mat_base, version=material_version)
+        if bespoke_ng_name:
+            expected_ng_name = bespoke_ng_name
 
     # Checking if this material was already imported by comparing some custom properties
     # that we create on imported materials.
@@ -1125,7 +1163,7 @@ def setup_w3_material(
                     log.warning("Material setup error: %s", e)
         
 
-        nodegroup_node_base_shader = init_material_nodes(material, shader_type, clear = False)
+        nodegroup_node_base_shader = init_material_nodes(material, shader_type, clear = False, base_path = resolved_mat_base)
         nodegroup_node_base_shader.name = mat_base[-60:]
         nodes_create_outputs(material, nodes, links, nodegroup_node_base_shader, xml_data, xml_path)
         for idx, p in enumerate(all_instances_params[0][0]):
@@ -1150,7 +1188,7 @@ def setup_w3_material(
         #log.warning(ElementTree.tostring(xml_data, encoding='utf8', method='xml'))
         #all_children2 = list(xml_data.iter())
         # Clean existing nodes and create core nodegroup.
-        nodegroup_node = init_material_nodes(material, shader_type)
+        nodegroup_node = init_material_nodes(material, shader_type, base_path = resolved_mat_base)
         nodegroup_node.name = mat_base[-60:]
 
         nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
@@ -1347,7 +1385,7 @@ def guess_shader_type(shader_type: str) -> str:
 
     return 'pbr_std'
 
-def init_material_nodes(material: Material, shader_type: str, clear:bool = True):
+def init_material_nodes(material: Material, shader_type: str, clear:bool = True, base_path: str = ""):
     """Wipe all nodes, then create a node group node and return it."""
     shader_mapping, fallback_ng_name, resource_path = get_shader_resources_for_material(material)
     ng_name = resolve_material_node_group_name(shader_type, shader_mapping, fallback_ng_name, resource_path)
@@ -1356,6 +1394,13 @@ def init_material_nodes(material: Material, shader_type: str, clear:bool = True)
     ng = ensure_node_group(ng_name, resource_path=resource_path)			# Nodegroup node tree  (bpy.types.ShaderNodeTree)
     node_ng = None							# Nodegroup group node (bpy.types.ShaderNodeGroup)
     assert ng, f"Node group {ng_name} not found. Resources didn't append correctly?"
+
+    if base_path and is_witcher2_material(material):
+        # W2 shader graphs get a bespoke copy of the base group with pins
+        # renamed to the parameters the .w2mg actually declares.
+        bespoke_ng = get_or_create_w2_bespoke_node_group(ng, base_path, version=_material_repo_version(material))
+        if bespoke_ng is not None:
+            ng = bespoke_ng
 
     nodes = material.node_tree.nodes
     if clear:
@@ -1814,16 +1859,26 @@ def reconcile_uv_mapping_vector_links(mat: Material) -> None:
         _apply_uv_mapping_vector_links(mat, param_name, node)
 
 
-def fix_texture_node(par_name, node):
+_SRGB_TEXTURE_PIN_NAMES = {'Diffuse', 'SpecularTexture', 'SnowDiffuse'}
+
+
+def _is_srgb_texture_param(pin_name: str, par_name: str, is_w2_material: bool = False) -> bool:
+    if pin_name in _SRGB_TEXTURE_PIN_NAMES or 'DiffuseArray' in (par_name or ""):
+        return True
+    # W2 graphs use their own parameter names (diffusemap, specular, ...).
+    return is_w2_material and is_w2_srgb_texture_param(pin_name)
+
+
+def fix_texture_node(par_name, node, is_w2_material: bool = False):
     if node and node.image:
-        if par_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse','diffuse','diffusemap','diff', 'tex_Diffuse'] or 'DiffuseArray' in par_name:
+        if _is_srgb_texture_param(par_name, par_name, is_w2_material):
             node.image.colorspace_settings.name = 'sRGB'
         else:
             node.image.colorspace_settings.name = 'Non-Color'
-            
+
     if node and node.image and len(node.outputs[0].links) > 0:
         pin_name = node.outputs[0].links[0].to_socket.name
-        if pin_name in ['Diffuse', 'SpecularTexture', 'SnowDiffuse','diffuse','diffusemap','diff', 'tex_Diffuse'] or 'DiffuseArray' in par_name:
+        if _is_srgb_texture_param(pin_name, par_name, is_w2_material):
             node.image.colorspace_settings.name = 'sRGB'
         else:
             node.image.colorspace_settings.name = 'Non-Color'
@@ -1917,7 +1972,7 @@ def create_node_for_param(
 
     if par_type in ['handle:ITexture']:
         node = create_node_texture(mat, param, node_ng, y_loc, uncook_path, texarray_index)
-        node = fix_texture_node(par_name, node)
+        node = fix_texture_node(par_name, node, is_w2_material=is_witcher2_material(mat))
 
     elif par_type == 'handle:CCubeTexture':
         node = create_node_cubemap(mat, param, node_ng, y_loc, uncook_path)
@@ -1945,7 +2000,7 @@ def create_node_for_param(
                 'value' :texarray_path
             }
             sub_node = create_node_texture(mat, sub_param, node_ng, y_loc, uncook_path, texarray_index)
-            sub_node = fix_texture_node(par_name, sub_node)
+            sub_node = fix_texture_node(par_name, sub_node, is_w2_material=is_witcher2_material(mat))
             sub_node.location = (-800, y_loc)
             texture_array.append(sub_node)
 

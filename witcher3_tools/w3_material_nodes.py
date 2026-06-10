@@ -5,7 +5,7 @@ import re
 import bpy
 from .CR2W.witcher_cache.Bundles import LoadBundleManager
 from .w3_material import (
-    ensure_node_group,
+    ensure_node_group_for_recommendation,
     find_group_input_socket,
     get_active_witcher_group_node,
     get_recommended_node_group_for_base_path,
@@ -316,7 +316,7 @@ def _ensure_material_chain_shader_group(material) -> tuple[object, bool, str]:
     created = False
     if node_group is None:
         try:
-            ng = ensure_node_group(recommended_name, resource_path=recommendation.get("resource_path"))
+            ng = ensure_node_group_for_recommendation(recommendation)
         except Exception as exc:
             return None, False, f"Could not load node group {recommended_name}: {exc}"
         node_group = nodes.new(type='ShaderNodeGroup')
@@ -3913,7 +3913,7 @@ class WITCH_OT_use_recommended_base_material_group(bpy.types.Operator):
             self.report({'INFO'}, f"Active group already matches {recommended_name}")
             return {'CANCELLED'}
 
-        ng = ensure_node_group(recommended_name, resource_path=recommendation.get("resource_path"))
+        ng = ensure_node_group_for_recommendation(recommendation)
         node_ng.node_tree = ng
         if recommendation.get("shader_type"):
             node_ng.label = recommendation["shader_type"]
