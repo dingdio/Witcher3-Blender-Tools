@@ -226,7 +226,7 @@ def _mesh_vertices_are_importable(mesh_data):
     return True
 
 
-def _normalize_vector3(value, fallback):
+def _normalize_vector3(value, fallback, min_length=1e-8):
     x = float(value[0])
     y = float(value[1])
     z = float(value[2])
@@ -234,49 +234,52 @@ def _normalize_vector3(value, fallback):
         return fallback
 
     length = math.sqrt((x * x) + (y * y) + (z * z))
-    if length < 1e-8:
+    if length < min_length:
         return fallback
     return (x / length, y / length, z / length)
 
 
-def _fallback_tangent_basis(normal):
-    nx, ny, nz = normal
-    if abs(nz) < 0.999:
-        ax, ay, az = 0.0, 0.0, 1.0
-    else:
-        ax, ay, az = 1.0, 0.0, 0.0
-
-    tx = ay * nz - az * ny
-    ty = az * nx - ax * nz
-    tz = ax * ny - ay * nx
-    tangent = _normalize_vector3((tx, ty, tz), (1.0, 0.0, 0.0))
-
-    bx = -(ny * tangent[2] - nz * tangent[1])
-    by = -(nz * tangent[0] - nx * tangent[2])
-    bz = -(nx * tangent[1] - ny * tangent[0])
-    bitangent = _normalize_vector3((bx, by, bz), (0.0, 1.0, 0.0))
-    return tangent, bitangent
+def _normalize_vector3_or_zero(value):
+    vector = _normalize_vector3(value, None)
+    if vector is None:
+        return (0.0, 0.0, 0.0)
+    return vector
 
 
-def _solve_meshdata_tangent_basis(mesh_data: MeshData):
+def _meshdata_position_key(mesh_data: MeshData, vert_idx: int):
+    position = mesh_data.vertex3DCoords[vert_idx]
+    return (float(position[0]), float(position[1]), float(position[2]))
+
+
+def _derive_meshdata_red_basis(mesh_data: MeshData):
+    """Derive RED-style normals/tangents/binormals from current mesh data."""
     vert_count = len(mesh_data.vertex3DCoords)
     if vert_count == 0:
+        mesh_data.normals = []
+        mesh_data.normalsAll = []
         return [], []
 
     positions = np.asarray(mesh_data.vertex3DCoords, dtype=np.float64)
-    normals = np.asarray(mesh_data.normals, dtype=np.float64)
-    if normals.shape != (vert_count, 3):
-        normals = np.zeros((vert_count, 3), dtype=np.float64)
-        if len(mesh_data.normalsAll) == vert_count * 3:
-            normals[:] = np.asarray(mesh_data.normalsAll, dtype=np.float64).reshape((-1, 3))
-
     uvs = np.asarray(mesh_data.UV_vertex3DCoords, dtype=np.float64)
     if uvs.shape != (vert_count, 2):
         uvs = np.zeros((vert_count, 2), dtype=np.float64)
         uvs[:, 1] = 1.0
 
-    tangent_accum = np.zeros((vert_count, 3), dtype=np.float64)
-    bitangent_accum = np.zeros((vert_count, 3), dtype=np.float64)
+    point_by_position = {}
+    vertex_points = []
+    for vert_idx in range(vert_count):
+        key = _meshdata_position_key(mesh_data, vert_idx)
+        point_idx = point_by_position.get(key)
+        if point_idx is None:
+            point_idx = len(point_by_position)
+            point_by_position[key] = point_idx
+        vertex_points.append(point_idx)
+
+    point_count = len(point_by_position)
+    normal_accum = np.zeros((point_count, 3), dtype=np.float64)
+    tangent_accum = np.zeros((point_count, 3), dtype=np.float64)
+    bitangent_accum = np.zeros((point_count, 3), dtype=np.float64)
+    skipped_degenerate = 0
     degenerate_uv_faces = 0
 
     for face in mesh_data.faces:
@@ -286,75 +289,72 @@ def _solve_meshdata_tangent_basis(mesh_data: MeshData):
         i1, i2, i3 = (int(face[0]), int(face[1]), int(face[2]))
         if (
             i1 < 0 or i2 < 0 or i3 < 0 or
-            i1 >= vert_count or i2 >= vert_count or i3 >= vert_count or
-            i1 == i2 or i2 == i3 or i1 == i3
+            i1 >= vert_count or i2 >= vert_count or i3 >= vert_count
         ):
+            continue
+
+        pidx1 = vertex_points[i1]
+        pidx2 = vertex_points[i2]
+        pidx3 = vertex_points[i3]
+        if pidx1 == pidx2 or pidx2 == pidx3 or pidx1 == pidx3:
+            skipped_degenerate += 1
             continue
 
         p1 = positions[i1]
         p2 = positions[i2]
         p3 = positions[i3]
+        edge1 = p2 - p1
+        edge2 = p3 - p1
+        face_normal = np.cross(edge1, edge2)
+        normal_accum[pidx1] += face_normal
+        normal_accum[pidx2] += face_normal
+        normal_accum[pidx3] += face_normal
+
         uv1 = uvs[i1]
         uv2 = uvs[i2]
         uv3 = uvs[i3]
-
-        edge1 = p2 - p1
-        edge2 = p3 - p1
         delta_u1 = uv2[0] - uv1[0]
         delta_u2 = uv3[0] - uv1[0]
         delta_v1 = uv2[1] - uv1[1]
         delta_v2 = uv3[1] - uv1[1]
         denom = (delta_u1 * delta_v2) - (delta_u2 * delta_v1)
-        if not math.isfinite(float(denom)) or abs(float(denom)) < 1e-7:
+        if abs(float(denom)) < 1e-7:
             degenerate_uv_faces += 1
             continue
 
         inv_denom = 1.0 / float(denom)
         sdir = ((delta_v2 * edge1) - (delta_v1 * edge2)) * inv_denom
         tdir = ((delta_u1 * edge2) - (delta_u2 * edge1)) * inv_denom
-        if not (np.all(np.isfinite(sdir)) and np.all(np.isfinite(tdir))):
-            degenerate_uv_faces += 1
-            continue
 
-        for vert_idx in (i1, i2, i3):
-            tangent_accum[vert_idx] += sdir
-            bitangent_accum[vert_idx] += tdir
+        tangent_accum[pidx1] += sdir
+        tangent_accum[pidx2] += sdir
+        tangent_accum[pidx3] += sdir
+        bitangent_accum[pidx1] += tdir
+        bitangent_accum[pidx2] += tdir
+        bitangent_accum[pidx3] += tdir
 
+    normals = []
     tangents = []
     bitangents = []
-    fallback_count = 0
     for vert_idx in range(vert_count):
-        normal = _normalize_vector3(normals[vert_idx], (0.0, 0.0, 1.0))
-        fallback_tangent, fallback_bitangent = _fallback_tangent_basis(normal)
+        point_idx = vertex_points[vert_idx]
+        normal = _normalize_vector3_or_zero(normal_accum[point_idx])
+        tangent = _normalize_vector3_or_zero(tangent_accum[point_idx])
+        bitangent = _normalize_vector3_or_zero(bitangent_accum[point_idx])
 
-        tangent = _normalize_vector3(tangent_accum[vert_idx], None)
-        if tangent is None:
-            source_bitangent = _normalize_vector3(bitangent_accum[vert_idx], None)
-            if source_bitangent is not None:
-                tangent = _normalize_vector3(np.cross(source_bitangent, normal), fallback_tangent)
-
-        if tangent is None:
-            tangent, bitangent = fallback_tangent, fallback_bitangent
-            fallback_count += 1
-        else:
-            bitangent = _normalize_vector3(
-                (
-                    -(normal[1] * tangent[2] - normal[2] * tangent[1]),
-                    -(normal[2] * tangent[0] - normal[0] * tangent[2]),
-                    -(normal[0] * tangent[1] - normal[1] * tangent[0]),
-                ),
-                fallback_bitangent,
-            )
-
+        normals.append([normal[0], normal[1], normal[2]])
         tangents.append([tangent[0], tangent[1], tangent[2]])
         bitangents.append([bitangent[0], bitangent[1], bitangent[2]])
 
-    if degenerate_uv_faces or fallback_count:
+    mesh_data.normals = normals
+    mesh_data.normalsAll = [component for normal in normals for component in normal]
+
+    if skipped_degenerate or degenerate_uv_faces:
         log.debug(
-            "Solved tangent/binormal basis for %d verts with %d degenerate UV faces and %d fallback vertices.",
+            "Derived RED mesh basis for %d verts with %d point-degenerate faces and %d UV-degenerate faces.",
             vert_count,
+            skipped_degenerate,
             degenerate_uv_faces,
-            fallback_count,
         )
 
     return tangents, bitangents
@@ -1532,12 +1532,6 @@ def get_vertex_weights(mesh_obj, vertex_group_name):
 def get_mesh_info(me, mesh_ob, meshDataBl = None):
     exportMeshdata:MeshData = MeshData()
 
-    if bpy.app.version < (4, 1, 0):
-        me.use_auto_smooth = True
-        me.calc_normals_split()
-
-    me.calc_loop_triangles()
-
     # Prefer explicit Witcher UV names when present; otherwise fall back to
     # index order. This keeps round-trips stable if Blender reorders layers.
     uv_layers = me.uv_layers
@@ -1564,11 +1558,11 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
     source_vertex_weights = {}
     for vert in me.vertices:
         weights = []
-        for group in vert.groups:
+        for group in sorted(vert.groups, key=lambda item: item.group):
             bone_name = vertex_group_names.get(group.group)
             if bone_name and group.weight != 0.0:
-                weights.append((bone_name, group.weight))
-        source_vertex_weights[vert.index] = weights
+                weights.append((bone_name, float(group.weight)))
+        source_vertex_weights[vert.index] = tuple(weights)
 
     def _read_loop_color(loop_idx: int, vert_idx: int):
         if not color_attribute:
@@ -1597,22 +1591,54 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
             return (0.0, 1.0)
         return (u, v)
 
+    def _iter_export_triangle_loop_indices():
+        for poly in me.polygons:
+            poly_loop_indices = tuple(poly.loop_indices)
+            if len(poly_loop_indices) < 3:
+                continue
+            for loop_offset in range(2, len(poly_loop_indices)):
+                yield (
+                    poly_loop_indices[0],
+                    poly_loop_indices[loop_offset - 1],
+                    poly_loop_indices[loop_offset],
+                )
+
+    def _loop_position_key(loop_idx: int):
+        src_vert_idx = loops[loop_idx].vertex_index
+        src_vert = me.vertices[src_vert_idx]
+        return (float(src_vert.co.x), float(src_vert.co.y), float(src_vert.co.z))
+
+    def _triangle_has_distinct_positions(loop_indices):
+        p1, p2, p3 = (_loop_position_key(loop_idx) for loop_idx in loop_indices)
+        return p1 != p2 and p2 != p3 and p1 != p3
+
     vertex_lookup = {}
     loops = me.loops
-    for loop_tri in me.loop_triangles:
+    dropped_degenerate_faces = 0
+    for triangle_loop_indices in _iter_export_triangle_loop_indices():
+        if not _triangle_has_distinct_positions(triangle_loop_indices):
+            dropped_degenerate_faces += 1
+            continue
+
         tri_indices = []
-        for loop_idx in loop_tri.loops:
+        for loop_idx in triangle_loop_indices:
             loop = loops[loop_idx]
             src_vert_idx = loop.vertex_index
             src_vert = me.vertices[src_vert_idx]
 
-            normal = (float(loop.normal[0]), float(loop.normal[1]), float(loop.normal[2]))
             uv1 = _read_loop_uv(uv1_layer, loop_idx)
             uv2 = _read_loop_uv(uv2_layer, loop_idx)
 
             color = _read_loop_color(loop_idx, src_vert_idx)
+            weights = source_vertex_weights.get(src_vert_idx, ())
 
-            key = (src_vert_idx, normal, uv1, uv2, tuple(color))
+            key = (
+                (float(src_vert.co.x), float(src_vert.co.y), float(src_vert.co.z)),
+                uv1,
+                uv2,
+                tuple(color),
+                weights,
+            )
             export_vert_idx = vertex_lookup.get(key)
             if export_vert_idx is None:
                 export_vert_idx = len(exportMeshdata.vertex3DCoords)
@@ -1623,13 +1649,13 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
                     float(src_vert.co.y),
                     float(src_vert.co.z),
                 ])
-                exportMeshdata.normals.append([normal[0], normal[1], normal[2]])
-                exportMeshdata.normalsAll.extend([normal[0], normal[1], normal[2]])
+                exportMeshdata.normals.append([0.0, 0.0, 0.0])
+                exportMeshdata.normalsAll.extend([0.0, 0.0, 0.0])
                 exportMeshdata.UV_vertex3DCoords.append([uv1[0], uv1[1]])
                 exportMeshdata.UV2_vertex3DCoords.append([uv2[0], uv2[1]])
                 exportMeshdata.vertexColor.append(color)
 
-                for bone_name, weight in source_vertex_weights.get(src_vert_idx, []):
+                for bone_name, weight in weights:
                     vse = VertexSkinningEntry()
                     vse.vertexId = export_vert_idx
                     vse.boneId = bone_name
@@ -1641,13 +1667,13 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
 
         exportMeshdata.faces.append(tri_indices)
 
+    if dropped_degenerate_faces:
+        log.debug("Dropped %d point-degenerate faces during RED mesh export.", dropped_degenerate_faces)
+
     exportMeshdata.meshInfo = SMeshInfos()
     exportMeshdata.meshInfo.numIndices = len(exportMeshdata.faces) * 3
     exportMeshdata.meshInfo.numVertices = len(exportMeshdata.vertex3DCoords)
-    exportMeshdata.tangent_vector, exportMeshdata.extra_vectors = _solve_meshdata_tangent_basis(exportMeshdata)
-
-    if bpy.app.version < (4, 1, 0):
-        me.free_normals_split()
+    exportMeshdata.tangent_vector, exportMeshdata.extra_vectors = _derive_meshdata_red_basis(exportMeshdata)
 
     return exportMeshdata
 

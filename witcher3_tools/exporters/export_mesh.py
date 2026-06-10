@@ -397,6 +397,7 @@ def split_mesh_by_material(mesh_obj):
         if mat_idx not in seen_material_indices:
             seen_material_indices.add(mat_idx)
             used_material_indices.append(mat_idx)
+    used_material_indices.sort()
 
     # Empty mesh or no polygon assignments: export a direct copy.
     if not used_material_indices:
