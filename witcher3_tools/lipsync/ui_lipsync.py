@@ -412,6 +412,19 @@ def _line_asset_status(line):
     return " ".join(parts) if parts else "missing"
 
 
+def _line_has_generated_project_asset(line):
+    if line is None:
+        return False
+    return bool(
+        getattr(line, "has_project_re", False)
+        or getattr(line, "has_project_wem", False)
+        or getattr(line, "has_project_wav", False)
+        or str(getattr(line, "project_re_path", "") or "").strip()
+        or str(getattr(line, "project_wem_path", "") or "").strip()
+        or str(getattr(line, "project_wav_path", "") or "").strip()
+    )
+
+
 def _project_line_audio_source(line):
     if bool(getattr(line, "project_wav_is_silent", False)):
         return "text_lipsync"
@@ -537,6 +550,23 @@ def _line_matches_lipsync_filters(scene, line):
             return False
 
     return True
+
+
+def _project_validation_log(result):
+    details = []
+    if result.duplicate_ids:
+        details.append("Duplicate IDs:")
+        details.extend(result.duplicate_ids)
+    if result.duplicate_voiceovers:
+        details.append("Duplicate VOICEOVER values:")
+        details.extend(result.duplicate_voiceovers)
+    if result.invalid_ids:
+        details.append("Invalid IDs:")
+        details.extend(result.invalid_ids)
+    if result.empty_voiceover_lines:
+        details.append("Rows without VOICEOVER:")
+        details.extend(result.empty_voiceover_lines)
+    return "\n".join(details)
 
 
 def _filtered_lipsync_lines(scene):
@@ -1382,6 +1412,17 @@ def _project_generation_missing_outputs(line, require_wem=False, require_re=Fals
     return missing
 
 
+def _project_line_generated_asset_path(line):
+    for path in (
+        _existing_or_expected_project_output(line, "project_re_path", "lipsync", ".re"),
+        _existing_or_expected_project_output(line, "project_wem_path", "audio", ".wem"),
+        _existing_path(getattr(line, "project_wav_path", "")),
+    ):
+        if path:
+            return path
+    return None
+
+
 def _resolve_project_output_path(line, path):
     project_path = Path(str(getattr(line, "project_path", "") or ""))
     try:
@@ -1863,7 +1904,8 @@ class WITCH_OT_import_wav_lipsync(bpy.types.Operator, ImportHelper):
 
 class WITCH_OT_generate_text_lipsync(bpy.types.Operator):
     bl_idname = "witcher.generate_text_lipsync"
-    bl_label = "Generate Lipsync From Text"
+    bl_label = "Generate Text Lipsync"
+    bl_description = "Generate lipsync from the line text and create silent placeholder audio instead of using a real WAV"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -2225,12 +2267,9 @@ class WITCH_OT_validate_redkit_project_lipsync_lines(bpy.types.Operator):
             return {"CANCELLED"}
 
         details = []
-        details.extend(result.duplicate_ids)
-        details.extend(result.duplicate_voiceovers)
-        details.extend(result.invalid_ids)
-        if result.empty_voiceover_lines:
-            details.append("Rows without VOICEOVER:")
-            details.extend(result.empty_voiceover_lines)
+        validation_log = _project_validation_log(result)
+        if validation_log:
+            details.append(validation_log)
         scene.witcher_lipsync_project_status = result.compact_message()
         scene.witcher_lipsync_project_log = "\n".join(details)
 
@@ -2340,14 +2379,24 @@ class WITCH_OT_generate_missing_project_lipsync_lines(bpy.types.Operator):
 
         projects = {str(getattr(line, "project_path", "") or "") for line in candidates}
         try:
+            validation_errors = []
             for project_path in projects:
                 validation = redkit_project.validate_project_voice_lines(project_path)
                 if not validation.is_valid:
-                    raise RuntimeError(f"{Path(project_path).name}: {validation.compact_message()}")
+                    validation_errors.append(f"{Path(project_path).name}: {validation.compact_message()}")
+                    validation_log = _project_validation_log(validation)
+                    if validation_log:
+                        validation_errors.append(validation_log)
         except Exception as exc:
             message = str(exc).strip() or exc.__class__.__name__
             scene.witcher_lipsync_project_status = "Project validation failed"
             scene.witcher_lipsync_project_log = message
+            self.report({"ERROR"}, message.splitlines()[0][:240])
+            return {"CANCELLED"}
+        if validation_errors:
+            message = validation_errors[0]
+            scene.witcher_lipsync_project_status = "Project validation failed"
+            scene.witcher_lipsync_project_log = "\n".join(validation_errors)
             self.report({"ERROR"}, message.splitlines()[0][:240])
             return {"CANCELLED"}
 
@@ -2449,6 +2498,7 @@ class WITCH_OT_lipsync_project_line_info(bpy.types.Operator):
     wav_path: StringProperty(default="", subtype="FILE_PATH", options={'SKIP_SAVE'})
     wem_path: StringProperty(default="", subtype="FILE_PATH", options={'SKIP_SAVE'})
     re_path: StringProperty(default="", subtype="FILE_PATH", options={'SKIP_SAVE'})
+    generated_location: StringProperty(default="", subtype="DIR_PATH", options={'SKIP_SAVE'})
     status_text: StringProperty(default="", options={'SKIP_SAVE'})
 
     def invoke(self, context, event):
@@ -2456,6 +2506,7 @@ class WITCH_OT_lipsync_project_line_info(bpy.types.Operator):
         if line is None:
             self.report({"WARNING"}, "No lipsync line selected.")
             return {"CANCELLED"}
+        _refresh_project_asset_status_for_line(line)
         self.project_path = str(getattr(line, "project_path", "") or "")
         self.csv_path = str(getattr(line, "project_csv_path", "") or "")
         self.resource = str(getattr(line, "resource", "") or "")
@@ -2465,6 +2516,8 @@ class WITCH_OT_lipsync_project_line_info(bpy.types.Operator):
         self.wav_path = str(getattr(line, "project_wav_path", "") or getattr(line, "wav_path", "") or "")
         self.wem_path = str(getattr(line, "project_wem_path", "") or "")
         self.re_path = str(getattr(line, "project_re_path", "") or getattr(line, "last_re", "") or "")
+        generated_path = _project_line_generated_asset_path(line)
+        self.generated_location = str(generated_path.parent) if generated_path else ""
         self.status_text = _line_asset_status(line)
         return context.window_manager.invoke_props_dialog(self, width=780)
 
@@ -2485,8 +2538,42 @@ class WITCH_OT_lipsync_project_line_info(bpy.types.Operator):
             col.prop(self, "wem_path", text="WEM")
         if self.re_path:
             col.prop(self, "re_path", text=".re")
+        if self.generated_location:
+            col.prop(self, "generated_location", text="Location")
 
     def execute(self, context):
+        return {"FINISHED"}
+
+
+class WITCH_OT_open_lipsync_project_line_location(bpy.types.Operator):
+    """Open the selected line's generated REDkit project asset folder."""
+
+    bl_idname = "witcher.open_lipsync_project_line_location"
+    bl_label = "Open Project Line Location"
+    bl_description = "Open the REDkit project folder containing the selected line's generated .re, WEM, or WAV asset"
+
+    def execute(self, context):
+        line = _active_editor_line(context.scene)
+        if line is None:
+            self.report({"WARNING"}, "No lipsync line selected.")
+            return {"CANCELLED"}
+        if not _line_has_project(line):
+            self.report({"WARNING"}, "The selected line is not linked to a REDkit project.")
+            return {"CANCELLED"}
+
+        _refresh_project_asset_status_for_line(line)
+        generated_path = _project_line_generated_asset_path(line)
+        if not generated_path:
+            self.report({"WARNING"}, "The selected project line has no generated .re, WEM, or WAV asset.")
+            return {"CANCELLED"}
+
+        folder = generated_path.parent if generated_path.is_file() else generated_path
+        try:
+            bpy.ops.wm.path_open(filepath=str(folder))
+        except Exception as exc:
+            self.report({"ERROR"}, f"Could not open folder: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Opened {folder}")
         return {"FINISHED"}
 
 
@@ -3305,6 +3392,9 @@ def draw_panel(layout, context):
             WITCH_OT_apply_redkit_project_lipsync_line.bl_idname,
             text="Save To Project", icon='FILE_TICK',
         )
+        open_project_location = project_actions.row(align=True)
+        open_project_location.enabled = _line_has_generated_project_asset(active_line)
+        open_project_location.operator(WITCH_OT_open_lipsync_project_line_location.bl_idname, text="", icon='FILE_FOLDER')
         project_actions.operator(WITCH_OT_lipsync_project_line_info.bl_idname, text="", icon='QUESTION')
     elif active_line is not None and _active_project_path(context):
         edit_box.operator(
@@ -3321,7 +3411,7 @@ def draw_panel(layout, context):
     )
     secondary = edit_box.row(align=True)
     secondary.operator(WITCH_OT_load_active_lipsync_editor_line.bl_idname, text="Load Result", icon='PLAY')
-    secondary.operator(WITCH_OT_generate_text_lipsync.bl_idname, text="Text Only", icon='TEXT')
+    secondary.operator(WITCH_OT_generate_text_lipsync.bl_idname, text="Generate Text", icon='TEXT')
 
     settings_body, _settings_header = _section_header(
         edit_box, scene, "witcher_lipsync_show_settings", "Settings", 'PREFERENCES', boxed=False,
@@ -3405,6 +3495,7 @@ classes = (
     WITCH_OT_validate_redkit_project_lipsync_lines,
     WITCH_OT_generate_missing_project_lipsync_lines,
     WITCH_OT_lipsync_project_line_info,
+    WITCH_OT_open_lipsync_project_line_location,
     WITCH_OT_lipsync_project_status_info,
     WITCH_OT_add_lipsync_line_to_redkit_project,
     WITCH_OT_apply_redkit_project_lipsync_line,
