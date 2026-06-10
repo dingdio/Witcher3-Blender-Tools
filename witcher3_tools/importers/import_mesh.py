@@ -1323,26 +1323,43 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
         # Weights #
         #=========#
         sorted_array = []
+        sorted_names = set()
+        duplicate_group_names = 0
 
-
+        def _append_unique_group_name(group_name):
+            nonlocal duplicate_group_names
+            if not group_name:
+                return
+            if group_name in sorted_names:
+                duplicate_group_names += 1
+                return
+            sorted_names.add(group_name)
+            sorted_array.append(group_name)
 
         # for Witcher 2
         for index in CData.boneData.BoneIndecesMappingBoneIndex:
-            if index < len(CData.boneData.jointNames):
-                sorted_array.append(CData.boneData.jointNames[index])
+            if 0 <= index < len(CData.boneData.jointNames):
+                _append_unique_group_name(CData.boneData.jointNames[index])
 
         if len(sorted_array) < len(CData.boneData.BoneIndecesMappingBoneIndex):
             for the_bone in CData.boneData.jointNames:
-                if the_bone not in sorted_array:
-                    sorted_array.append(the_bone)
+                _append_unique_group_name(the_bone)
                 if len(sorted_array) == len(CData.boneData.BoneIndecesMappingBoneIndex):
                     break
+
+        if duplicate_group_names:
+            log.debug(
+                "Skipped %d duplicate vertex group names while importing '%s'",
+                duplicate_group_names,
+                mesh_ob.name,
+            )
 
         #todo check skinning verts for any groups that are not created for some reason
         _diag(f"BEFORE vertex_groups create (sorted_array={len(sorted_array)})")
         for group_name in sorted_array:
             try:
-                mesh_ob.vertex_groups.new(name=group_name)
+                if mesh_ob.vertex_groups.get(group_name) is None:
+                    mesh_ob.vertex_groups.new(name=group_name)
             except Exception as e:
                 log.error("Error creating vertex group: %s", e)
         _diag(f"BEFORE assignVertexGroup loop (skinningVerts={len(meshDataBl.skinningVerts)})")

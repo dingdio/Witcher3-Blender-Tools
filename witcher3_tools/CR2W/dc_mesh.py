@@ -35,6 +35,27 @@ _W2_EMBEDDED_CMESH_FILE_CACHE = {}
 _W2_EMBEDDED_CMESH_FILE_CACHE_MAX = 4
 
 
+def _clear_w2_cmesh_runtime_buffers(chunk):
+    cmesh = getattr(chunk, "CMesh", None)
+    if cmesh is None:
+        return
+
+    # W2 cooked/uncooked parsing fills these arrays manually from raw payload
+    # data. Embedded CMesh imports may reuse a cached CR2W object, so clear the
+    # previous import's runtime parse results before appending fresh values.
+    for attr_name in (
+        "ChunkgroupIndeces",
+        "BoneNames",
+        "Bonematrices",
+        "Block3",
+        "BoneIndecesMappingBoneIndex",
+    ):
+        buffer = getattr(cmesh, attr_name, None)
+        elements = getattr(buffer, "elements", None)
+        if elements is not None:
+            elements.clear()
+
+
 def _w2_embedded_cmesh_cache_key(filename):
     try:
         safe_path = os.path.abspath(win_safe_path(filename))
@@ -912,6 +933,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                 if embedded_cmesh_chunk_index is not None and getattr(chunk, "ChunkIndex", None) != embedded_cmesh_chunk_index:
                     continue
                 selected_cmesh_found = True
+                _clear_w2_cmesh_runtime_buffers(chunk)
                 raw_props, payload_start = _read_w2_cmesh_header(meshFile, chunk, raw_data)
                 the_materials = chunk.GetVariableByName("materials") or raw_props.get("materials")
                 the_material_names_chunk = chunk.GetVariableByName("materialNames")
