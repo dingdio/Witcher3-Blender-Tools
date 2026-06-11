@@ -390,6 +390,9 @@ import bmesh
 
 def split_mesh_by_material(mesh_obj):
     src_mesh = mesh_obj.data
+    # First-seen polygon order, NOT sorted: imported meshes keep their polygons
+    # in original chunk order, so this preserves the source chunk order on
+    # round-trip (chunk order does not follow material index in game meshes).
     used_material_indices = []
     seen_material_indices = set()
     for poly in src_mesh.polygons:
@@ -397,7 +400,6 @@ def split_mesh_by_material(mesh_obj):
         if mat_idx not in seen_material_indices:
             seen_material_indices.add(mat_idx)
             used_material_indices.append(mat_idx)
-    used_material_indices.sort()
 
     # Empty mesh or no polygon assignments: export a direct copy.
     if not used_material_indices:
