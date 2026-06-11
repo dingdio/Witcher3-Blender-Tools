@@ -40,14 +40,27 @@ def _face_file_cache_key(filename):
         return (norm_path, None, None), norm_path
 
 
-def _cache_face_file(cache_key, norm_path, faceData):
-    if faceData is None:
+def _cache_face_file(cache_key, norm_path, source_entry):
+    # The cache stores the parsed *source* data (json dict / CR2W bin data),
+    # not the built CMimicFace: rebuilding via readFaceFileData on a hit is
+    # ~5x cheaper than deep-copying the built object tree, and every caller
+    # still gets its own freshly built faceData to mutate.
+    if source_entry is None:
         return
     for old_key in [key for key in _FACE_FILE_CACHE if key[0] == norm_path and key != cache_key]:
         _FACE_FILE_CACHE.pop(old_key, None)
-    _FACE_FILE_CACHE[cache_key] = copy.deepcopy(faceData)
+    _FACE_FILE_CACHE[cache_key] = source_entry
     while len(_FACE_FILE_CACHE) > _FACE_FILE_CACHE_MAX:
         _FACE_FILE_CACHE.pop(next(iter(_FACE_FILE_CACHE)))
+
+
+def _build_face_data(source_data, is_w2):
+    faceData = read_json_w3.readFaceFileData(source_data)
+    if is_w2:
+        faceData.source_game = "w2"
+        faceData.mimic_faces_chunk_index = getattr(source_data, "mimic_faces_chunk_index", None)
+        faceData.mimic_skeleton_chunk_index = getattr(source_data, "mimic_skeleton_chunk_index", None)
+    return faceData
 
 def load_json_skeleton(filename):
     dirpath, file = os.path.split(filename)
@@ -419,40 +432,37 @@ def loadFaceFile(filename, w2_chunk_index=None, w2_track_skeleton_file=None):
     cached = _FACE_FILE_CACHE.get(cache_key)
     if cached is not None:
         log.debug("Face file cache hit: %s", filename)
-        return copy.deepcopy(cached)
+        return _build_face_data(*cached)
 
     dirpath, file = os.path.split(filename)
     basename, ext = os.path.splitext(file)
+    source_data = None
+    is_w2 = False
     if ext.lower().endswith('.json'):
-        faceData = read_json_w3.readFaceFile(filename)
+        with open(filename) as f:
+            source_data = json.loads(f.read())
     elif ext.lower().endswith('.w3fac'):
-        bin_data = load_bin_face(filename)
-        faceData = read_json_w3.readFaceFileData(bin_data)
+        source_data = load_bin_face(filename)
     elif ext.lower().endswith('.w2faces'):
         # Witcher 2 mimic faces support. Keep this separate from the W3 .w3fac path.
-        bin_data = load_bin_w2_faces(
+        source_data = load_bin_w2_faces(
             filename,
             chunk_index=w2_chunk_index,
             track_skeleton_file=w2_track_skeleton_file,
         )
-        faceData = read_json_w3.readFaceFileData(bin_data)
-        faceData.source_game = "w2"
-        faceData.mimic_faces_chunk_index = getattr(bin_data, "mimic_faces_chunk_index", None)
-        faceData.mimic_skeleton_chunk_index = getattr(bin_data, "mimic_skeleton_chunk_index", None)
+        is_w2 = True
     elif w2_chunk_index is not None and ext.lower().endswith(('.w2ent', '.w2beard', '.w2mesh', '.cr2w')):
         # Witcher 2 cooked entities can embed CMimicFaces chunks directly.
-        bin_data = load_bin_w2_faces(
+        source_data = load_bin_w2_faces(
             filename,
             chunk_index=w2_chunk_index,
             track_skeleton_file=w2_track_skeleton_file,
         )
-        faceData = read_json_w3.readFaceFileData(bin_data)
-        faceData.source_game = "w2"
-        faceData.mimic_faces_chunk_index = getattr(bin_data, "mimic_faces_chunk_index", None)
-        faceData.mimic_skeleton_chunk_index = getattr(bin_data, "mimic_skeleton_chunk_index", None)
+        is_w2 = True
     else:
-        faceData = None
+        return None
 
-    _cache_face_file(cache_key, norm_path, faceData)
+    faceData = _build_face_data(source_data, is_w2)
+    _cache_face_file(cache_key, norm_path, (source_data, is_w2))
     return faceData
 

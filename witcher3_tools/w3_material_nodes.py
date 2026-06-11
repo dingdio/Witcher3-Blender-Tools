@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from contextlib import contextmanager
 
 import bpy
 from .CR2W.witcher_cache.Bundles import LoadBundleManager
@@ -850,8 +851,29 @@ def _material_for_node(context, node):
     return None
 
 
-def _update_node_witcher_include(self, context):
-    material = _material_for_node(context, self)
+_WITCHER_INCLUDE_UPDATE_SUSPENDED = False
+
+
+@contextmanager
+def suspend_witcher_include_updates():
+    """Suppress the witcher_include update callback during bulk node setup.
+
+    Importers set witcher_include on many nodes in a row; each set would
+    otherwise trigger a full material scan + override sync + chain re-layout.
+    Wrap the bulk writes in this context manager and call
+    refresh_witcher_include_state(material) once afterwards.
+    """
+    global _WITCHER_INCLUDE_UPDATE_SUSPENDED
+    previous = _WITCHER_INCLUDE_UPDATE_SUSPENDED
+    _WITCHER_INCLUDE_UPDATE_SUSPENDED = True
+    try:
+        yield
+    finally:
+        _WITCHER_INCLUDE_UPDATE_SUSPENDED = previous
+
+
+def refresh_witcher_include_state(material):
+    """Run the witcher_include sync/layout pass for a known material."""
     if material is None:
         return
     _sync_local_override_nodes(material)
@@ -861,6 +883,15 @@ def _update_node_witcher_include(self, context):
         _apply_chain_frames(material, create_missing=True)
     else:
         _remove_chain_frames(material)
+
+
+def _update_node_witcher_include(self, context):
+    if _WITCHER_INCLUDE_UPDATE_SUSPENDED:
+        return
+    material = _material_for_node(context, self)
+    if material is None:
+        return
+    refresh_witcher_include_state(material)
 
 
 def _apply_chain_color_to_nodes(material, source_path: str, source_index: int, color) -> int:
@@ -2727,6 +2758,7 @@ class WITCH_PT_materials(bpy.types.Panel):
         if not props.base_read_status:
             empty_row = layout.row()
             empty_row.label(text="Material Chain not loaded.", icon='INFO')
+            empty_row.operator("witcher.load_base_material_snapshot", text="Load Snapshot", icon='FILE_REFRESH')
             return
         try:
             stored_items = list(props.base_read_params)
@@ -3922,6 +3954,25 @@ class WITCH_OT_use_recommended_base_material_group(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WITCH_OT_load_base_material_snapshot(bpy.types.Operator):
+    """One-click Base Path snapshot load (same pass imports used to run automatically)."""
+    bl_idname = "witcher.load_base_material_snapshot"
+    bl_label = "Load Material Chain Snapshot"
+    bl_description = "Read the Base Path chain and load the Material Chain snapshot for this material"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        material = context.material
+        if material is None or getattr(material, "witcher_props", None) is None:
+            self.report({'ERROR'}, "No material selected")
+            return {'CANCELLED'}
+        inspection = auto_load_base_material_snapshot(context, material, create_missing=True)
+        if inspection.get("errors"):
+            self.report({'WARNING'}, str(inspection["errors"][0]))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 class WITCH_OT_read_base_material(bpy.types.Operator):
     bl_idname = "witcher.read_base_material"
     bl_label = "Load"
@@ -4768,6 +4819,7 @@ __classes = [
     WITCH_OT_autoresolve_texture_repo_path,
     WITCH_OT_search_base_material_path,
     WITCH_OT_use_recommended_base_material_group,
+    WITCH_OT_load_base_material_snapshot,
     WITCH_OT_read_base_material,
     WITCH_OT_create_missing_base_material_params,
     WITCH_OT_create_base_material_param,

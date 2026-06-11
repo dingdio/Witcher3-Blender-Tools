@@ -1001,6 +1001,7 @@ def setup_w3_material(
         ,xml_path: str
         ,force_update = False	# Set to True when re-importing stuff to test changes with the latest material set-up code.
         ,is_instance_file = False
+        ,defer_include_refresh = False	# Caller promises to run refresh_witcher_include_state itself (e.g. after the Base Path snapshot).
         ):
     material_started = time.perf_counter()
     resolve_seconds = 0.0
@@ -1185,40 +1186,47 @@ def setup_w3_material(
         #     xml_data = new_xml
 
         node_started = time.perf_counter()
+        from .w3_material_nodes import suspend_witcher_include_updates, refresh_witcher_include_state
         #log.warning(ElementTree.tostring(xml_data, encoding='utf8', method='xml'))
         #all_children2 = list(xml_data.iter())
-        # Clean existing nodes and create core nodegroup.
-        nodegroup_node = init_material_nodes(material, shader_type, base_path = resolved_mat_base)
-        nodegroup_node.name = mat_base[-60:]
+        # Bulk node setup: each witcher_include write would otherwise trigger a
+        # full override sync + chain re-layout, so suspend the update callback
+        # and run the sync once for this material at the end.
+        with suspend_witcher_include_updates():
+            # Clean existing nodes and create core nodegroup.
+            nodegroup_node = init_material_nodes(material, shader_type, base_path = resolved_mat_base)
+            nodegroup_node.name = mat_base[-60:]
 
-        nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
+            nodes_create_outputs(material, nodes, links, nodegroup_node, xml_data, xml_path)
 
-        # Order parameters so input nodes get created in a specified order, from top to bottom relative to the inputs of the nodegroup.
-        # Purely for neatness of the node noodles.
-        ordered_params = order_elements_by_attribute(xml_data, PARAM_ORDER, 'name')
-        
-        for name, attrs in params.items():
-            for param1 in ordered_params:
-                if param1.attrib['name'] == name:
-                    param1.set("witcher_include", True)
+            # Order parameters so input nodes get created in a specified order, from top to bottom relative to the inputs of the nodegroup.
+            # Purely for neatness of the node noodles.
+            ordered_params = order_elements_by_attribute(xml_data, PARAM_ORDER, 'name')
 
-        #links nodes to created output
-        #! Missing params will be created by this function
-        mat_load_params_into_nodes(material, ordered_params, nodegroup_node, uncook_path)
-        apply_shader_default_overrides(material, nodegroup_node, inherited_params, uncook_path, inherited_param_sources)
-        if shader_type == 'pbr_eye':
-            setup_eye_reflection_nodes(material, nodegroup_node, nodes, links)
-        hide_unused_sockets(nodegroup_node)
-    
-        if existing_mat and force_update:
-            existing_mat.user_remap(material)
+            for name, attrs in params.items():
+                for param1 in ordered_params:
+                    if param1.attrib['name'] == name:
+                        param1.set("witcher_include", True)
 
-        #if the material is a .w2mi file use the filename, otherwise use diffues name for materal
-        if not is_instance_file:
-            pass
-            #mat_set_name_by_diffuse(material, nodegroup_node, nodes)
-        mat_ensure_dummy_transparent_img_node(material, nodegroup_node, shader_type, nodes)
-        mat_apply_settings(material, shader_type)
+            #links nodes to created output
+            #! Missing params will be created by this function
+            mat_load_params_into_nodes(material, ordered_params, nodegroup_node, uncook_path)
+            apply_shader_default_overrides(material, nodegroup_node, inherited_params, uncook_path, inherited_param_sources)
+            if shader_type == 'pbr_eye':
+                setup_eye_reflection_nodes(material, nodegroup_node, nodes, links)
+            hide_unused_sockets(nodegroup_node)
+
+            if existing_mat and force_update:
+                existing_mat.user_remap(material)
+
+            #if the material is a .w2mi file use the filename, otherwise use diffues name for materal
+            if not is_instance_file:
+                pass
+                #mat_set_name_by_diffuse(material, nodegroup_node, nodes)
+            mat_ensure_dummy_transparent_img_node(material, nodegroup_node, shader_type, nodes)
+            mat_apply_settings(material, shader_type)
+        if not defer_include_refresh:
+            refresh_witcher_include_state(material)
         node_seconds = time.perf_counter() - node_started
     finalize_seconds = max(0.0, time.perf_counter() - material_started - resolve_seconds - duplicate_seconds - node_seconds)
     total_seconds = time.perf_counter() - material_started

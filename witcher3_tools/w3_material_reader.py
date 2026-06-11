@@ -52,6 +52,7 @@ _material_param_cache: Dict[tuple[int, str], Dict[str, tuple[str, str]]] = {}
 _resolved_w2mg_cache: Dict[tuple[int, str], Optional[str]] = {}
 _graph_buffer_meta_cache: Dict[str, Dict[str, object]] = {}
 _graph_declared_param_cache: Dict[tuple[int, str], Optional[Set[str]]] = {}
+_material_root_chunk_cache: Dict[tuple[int, str], Any] = {}
 
 GRAPH_DECLARED_INSTANCE_PARAMS: Set[str] = {"SpecularColor"}
 
@@ -85,6 +86,14 @@ def _apply_implicit_graph_param_default(
 
 
 def _load_material_root_chunk(material_path: str, version: int = 999):
+    # Chains share base materials heavily (e.g. pbr_skin.w2mg), and each entity
+    # import walks them several times per material slot, so cache the parsed
+    # root chunk for the session. Callers only read from it.
+    cache_key = (int(version), normalize_depot_path(material_path))
+    cached = _material_root_chunk_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     full_path = repo_file(material_path, version=version)
     if not os.path.exists(full_path):
         return None
@@ -99,6 +108,7 @@ def _load_material_root_chunk(material_path: str, version: int = 999):
                 ]
                 chunk._graph_material_path = material_path
                 chunk._graph_buffer_meta = _read_material_graph_buffer_meta(chunk, full_path)
+            _material_root_chunk_cache[cache_key] = chunk
             return chunk
     return None
 

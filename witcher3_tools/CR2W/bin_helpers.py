@@ -1,5 +1,6 @@
 import struct
 import math
+import weakref
 
 
 def _decode_cr2w_text(raw_bytes):
@@ -35,11 +36,24 @@ def findEndOfMot(f):
             f.seek(-4, 1); break;
         f.seek(1, 1);
 
+# Parsers call FileSize per property read (hundreds of thousands of times per
+# entity import) and every caller reads a file that is not growing, so cache
+# the size per stream object. WeakKey so closed/discarded streams drop out.
+_file_size_cache = weakref.WeakKeyDictionary()
+
+
 def FileSize(f):
+    size = _file_size_cache.get(f)
+    if size is not None:
+        return size
     old_file_position = f.tell()
     f.seek(0, 2)
     size = f.tell()
     f.seek(old_file_position, 0)
+    try:
+        _file_size_cache[f] = size
+    except TypeError:
+        pass
     return size
 
 def readString(inFile):
