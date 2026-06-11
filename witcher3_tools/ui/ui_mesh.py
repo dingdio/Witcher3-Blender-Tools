@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 
 _REDAPEX_PROFILE_WARN_THRESHOLD = 0.05
 COLLISION_SUFFIXES = ("_col", "_tri", "_box", "_sphere", "_capsule")
+_EXPORT_COLLIDER_PREVIEW_LIMIT = 80
 
 
 def _strip_blender_copy_suffix(name):
@@ -3039,7 +3040,171 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         lod_named = [c for c in children if re.search(r'_lod\d+$', c.name)]
         non_lod = [c for c in children if c not in lod_named]
         return lod_named, non_lod
-    
+
+    def _preview_context_signature(self, context):
+        selected = tuple(
+            (getattr(ob, "name_full", ob.name), ob.type)
+            for ob in getattr(context, "selected_objects", [])
+        )
+        active = getattr(getattr(context, "active_object", None), "name_full", "")
+        scene_object_count = len(getattr(context.scene, "objects", [])) if context.scene else 0
+        return active, selected, scene_object_count
+
+    def _get_preview_cache(self, context):
+        signature = self._preview_context_signature(context)
+        cache = getattr(self, "_preview_cache", None)
+        if cache and cache.get("signature") == signature:
+            return cache
+
+        cache = self._build_preview_cache(context, signature)
+        self._preview_cache = cache
+        return cache
+
+    def _build_preview_cache(self, context, signature):
+        selected_objects = list(getattr(context, "selected_objects", []))
+        selected_armatures = [ob for ob in selected_objects if ob.type == 'ARMATURE']
+        main_mesh = _get_main_mesh(context)
+        cache = {
+            "signature": signature,
+            "selected_armatures": selected_armatures,
+            "main_mesh": main_mesh,
+            "arm_lod_named": [],
+            "arm_non_lod": [],
+            "arm_has_children": True,
+            "effective_settings": None,
+            "preview_armature": None,
+            "lod_meshes": [],
+            "col_tri_meshes": [],
+            "n_lods": 0,
+            "has_uv2": False,
+            "has_vcol": False,
+            "has_detached_skinned_mesh": False,
+        }
+
+        if selected_armatures:
+            armature = selected_armatures[0]
+            arm_lod_named, arm_non_lod = self._classify_armature_children(armature)
+            arm_has_children = bool(arm_lod_named or arm_non_lod)
+            export_meshes_preview = arm_lod_named if arm_lod_named else (arm_non_lod or [])
+            effective_settings, checked_meshes, preview_armature = _get_effective_export_mesh_settings(
+                export_meshes_preview,
+                armature=armature,
+            )
+            lod_meshes = sorted(arm_lod_named if arm_lod_named else arm_non_lod, key=lambda x: x.name)
+            col_tri_meshes = []
+            if lod_meshes:
+                base_name = _export_base_name_from_object(lod_meshes[0])
+                _, related_collision_meshes = self.find_related_meshes(base_name)
+                armature_collision_meshes = [
+                    child for child in armature.children
+                    if child.type == 'MESH' and self.get_collision_type(child.name)
+                ]
+                col_tri_meshes = _unique_objects(related_collision_meshes + armature_collision_meshes)
+            has_uv2, has_vcol = _collect_extra_stream_requirements(checked_meshes)
+
+            cache.update({
+                "arm_lod_named": arm_lod_named,
+                "arm_non_lod": arm_non_lod,
+                "arm_has_children": arm_has_children,
+                "effective_settings": effective_settings,
+                "preview_armature": preview_armature,
+                "lod_meshes": lod_meshes,
+                "col_tri_meshes": col_tri_meshes,
+                "n_lods": len(lod_meshes),
+                "has_uv2": has_uv2,
+                "has_vcol": has_vcol,
+            })
+            return cache
+
+        if main_mesh:
+            base_name = _export_base_name_from_object(main_mesh)
+            lod_meshes, col_tri_meshes = self.find_related_meshes(base_name)
+            preview_meshes = lod_meshes if lod_meshes else [main_mesh]
+            effective_settings, checked_meshes, preview_armature = _get_effective_export_mesh_settings(
+                preview_meshes
+            )
+            has_uv2, has_vcol = _collect_extra_stream_requirements(checked_meshes)
+
+            cache.update({
+                "effective_settings": effective_settings,
+                "preview_armature": preview_armature,
+                "lod_meshes": lod_meshes,
+                "col_tri_meshes": _unique_objects(col_tri_meshes),
+                "n_lods": len(lod_meshes) if lod_meshes else 1,
+                "has_uv2": has_uv2,
+                "has_vcol": has_vcol,
+                "has_detached_skinned_mesh": (
+                    preview_armature is None and _has_detached_imported_skinned_meshes(preview_meshes)
+                ),
+            })
+
+        return cache
+
+    def _get_material_preview(self, cache, repo_path):
+        material_preview = cache.get("material_preview")
+        if material_preview is not None and cache.get("material_preview_repo_path") == repo_path:
+            return material_preview
+
+        preview_meshes = cache.get("lod_meshes") or (
+            [cache.get("main_mesh")] if cache.get("main_mesh") else []
+        )
+        material_preview = self._build_material_preview(preview_meshes, repo_path)
+        cache["material_preview"] = material_preview
+        cache["material_preview_repo_path"] = repo_path
+        return material_preview
+
+    def _build_material_preview(self, preview_meshes, repo_path):
+        from ..w3_material_nodes import get_group_inputs, get_socket_value
+        from ..exporters.export_mesh import scan_principled_bsdf
+
+        mesh_repo_dir = os.path.dirname(repo_path.replace('/', '\\')) if repo_path else ""
+        preview = []
+        for lod_mesh in sorted((mesh for mesh in preview_meshes if mesh), key=lambda x: x.name):
+            lod_label = lod_mesh.name.split('_')[-1] if '_lod' in lod_mesh.name else lod_mesh.name
+            materials = []
+            for mat_idx, mat in enumerate(lod_mesh.data.materials):
+                if not mat:
+                    materials.append({"index": mat_idx, "empty": True})
+                    continue
+
+                is_local = hasattr(mat, 'witcher_props') and mat.witcher_props.local
+                entry = {
+                    "index": mat_idx,
+                    "empty": False,
+                    "name": mat.name,
+                    "is_local": is_local,
+                    "group_textures": [],
+                    "bsdf_found": None,
+                    "base_custom": "",
+                }
+                if is_local:
+                    group_inputs = get_group_inputs(mat)
+                    if group_inputs:
+                        for inp in group_inputs:
+                            if not inp.is_linked:
+                                continue
+                            linked = inp.links[0].from_socket
+                            if linked.node.type == 'TEX_IMAGE' and linked.node.image:
+                                tex_path = get_socket_value(inp)
+                                if isinstance(tex_path, str):
+                                    entry["group_textures"].append({
+                                        "name": inp.name,
+                                        "value": tex_path,
+                                    })
+                    else:
+                        entry["bsdf_found"] = scan_principled_bsdf(mat, mesh_repo_dir)
+                elif hasattr(mat, 'witcher_props') and mat.witcher_props.base_custom:
+                    entry["base_custom"] = mat.witcher_props.base_custom
+
+                materials.append(entry)
+
+            preview.append({
+                "lod_label": lod_label,
+                "materials": materials,
+            })
+
+        return preview
+
     def _draw_section_header(self, layout, prop_name, label, icon):
         """Draw a collapsible section header. Returns the box to draw into, or None if collapsed."""
         box = layout.box()
@@ -3053,25 +3218,21 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
 
     def draw(self, context):
         layout = self.layout
-        obj = context.active_object
-
-        # --- Determine selection context (armature vs. standalone meshes) ---
-        selected_armatures = [ob for ob in context.selected_objects if ob.type == 'ARMATURE']
-        _arm_lod_named = []
-        _arm_non_lod = []
-        _arm_has_children = True
-        if selected_armatures:
-            _arm_lod_named, _arm_non_lod = self._classify_armature_children(selected_armatures[0])
-            _arm_has_children = bool(_arm_lod_named or _arm_non_lod)
+        cache = self._get_preview_cache(context)
+        selected_armatures = cache["selected_armatures"]
+        _arm_lod_named = cache["arm_lod_named"]
+        _arm_non_lod = cache["arm_non_lod"]
+        _arm_has_children = cache["arm_has_children"]
+        main_mesh = cache["main_mesh"]
+        effective_settings = cache["effective_settings"]
+        preview_armature = cache["preview_armature"]
+        has_uv2 = cache["has_uv2"]
+        has_vcol = cache["has_vcol"]
 
         # --- Export Summary ---
         summary_box = layout.box()
         if selected_armatures:
             arm = selected_armatures[0]
-            effective_settings, export_meshes_preview, _ = _get_effective_export_mesh_settings(
-                _arm_lod_named if _arm_lod_named else (_arm_non_lod or []),
-                armature=arm,
-            )
             if not _arm_has_children:
                 row = summary_box.row()
                 row.alert = True
@@ -3092,25 +3253,19 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                 row.label(text="Selected armature has no skinning data to export.", icon='ERROR')
 
             # UV2 / useExtraStreams tip
-            _has_uv2, _has_vcol = _collect_extra_stream_requirements(export_meshes_preview)
             _extra = bool(effective_settings and effective_settings.useExtraStreams)
-            if (_has_uv2 or _has_vcol) and not _extra:
+            if (has_uv2 or has_vcol) and not _extra:
                 parts = []
-                if _has_uv2:
+                if has_uv2:
                     parts.append("UV2")
-                if _has_vcol:
+                if has_vcol:
                     parts.append("vertex color")
                 row = summary_box.row()
                 row.alert = True
                 row.label(text=f"{', '.join(parts)} data found — enable 'Use Extra Streams'", icon='INFO')
         else:
-            main_mesh_preview = _get_main_mesh(context)
-            if main_mesh_preview:
-                base_name_preview = _export_base_name_from_object(main_mesh_preview)
-                lod_preview, _ = self.find_related_meshes(base_name_preview)
-                n_lods = len(lod_preview) if lod_preview else 1
-                preview_meshes = lod_preview if lod_preview else [main_mesh_preview]
-                effective_settings, _check_meshes, preview_armature = _get_effective_export_mesh_settings(preview_meshes)
+            if main_mesh:
+                n_lods = cache["n_lods"] or 1
                 if effective_settings and not effective_settings.isStatic:
                     rig_name = preview_armature.name if preview_armature else "Missing armature"
                     if preview_armature is None:
@@ -3122,21 +3277,17 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                 else:
                     summary_box.label(text=f"Static mesh — will export {n_lods} LOD(s)", icon='MESH_DATA')
 
-                    if preview_armature is None and _has_detached_imported_skinned_meshes(preview_meshes):
+                    if cache["has_detached_skinned_mesh"]:
                         row = summary_box.row()
                         row.label(text="Mesh was originally imported with a skeleton and is currently detached from any armature", icon='INFO')
 
                 # UV2 / useExtraStreams tip for standalone mesh exports
-                effective_settings, _check_meshes, _ = _get_effective_export_mesh_settings(
-                    preview_meshes
-                )
-                _has_uv2, _has_vcol = _collect_extra_stream_requirements(_check_meshes)
                 _extra = bool(effective_settings and effective_settings.useExtraStreams)
-                if (_has_uv2 or _has_vcol) and not _extra:
+                if (has_uv2 or has_vcol) and not _extra:
                     parts = []
-                    if _has_uv2:
+                    if has_uv2:
                         parts.append("UV2")
-                    if _has_vcol:
+                    if has_vcol:
                         parts.append("vertex color")
                     row = summary_box.row()
                     row.alert = True
@@ -3150,9 +3301,8 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         project_path = _get_active_redkit_project(context)
         workspace_root = _get_workspace_root(project_path) if project_path else None
 
-        main_mesh = _get_main_mesh(context)
         repo_path = ""
-        if main_mesh:
+        if main_mesh and hasattr(main_mesh, "witcherui_MeshSettings"):
             repo_path = main_mesh.witcherui_MeshSettings.item_repo_path
 
         box = self._draw_section_header(layout, 'show_redkit_project', "REDkit Project", 'FILE_FOLDER')
@@ -3210,19 +3360,8 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                              icon='ERROR')
 
         # --- Mesh Settings Section ---
-        mesh_ob = _get_main_mesh(context)
+        mesh_ob = main_mesh
         if mesh_ob:
-            selected_armatures = [ob for ob in context.selected_objects if ob.type == 'ARMATURE']
-            if selected_armatures:
-                preview_meshes = [
-                    child for child in selected_armatures[0].children
-                    if child.type == 'MESH' and not self.get_collision_type(child.name)
-                ]
-                _get_effective_export_mesh_settings(preview_meshes, armature=selected_armatures[0])
-            else:
-                preview_base_name = _export_base_name_from_object(mesh_ob)
-                preview_meshes, _ = self.find_related_meshes(preview_base_name)
-                _get_effective_export_mesh_settings(preview_meshes if preview_meshes else [mesh_ob])
             mesh_settings = mesh_ob.witcherui_MeshSettings
 
             box = self._draw_section_header(layout, 'show_mesh_settings', "Mesh Settings", 'MESH_DATA')
@@ -3262,45 +3401,29 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
             # Dynamically find the LOD mesh list.
             # For armature exports: use the actual armature children (what execute() will use).
             # For standalone mesh exports: search by _lod naming convention.
-            if selected_armatures:
-                if _arm_lod_named:
-                    lod_meshes = sorted(_arm_lod_named, key=lambda x: x.name)
-                else:
-                    # Non-LOD children: they'll be combined into one LOD0 at export time
-                    lod_meshes = sorted(_arm_non_lod, key=lambda x: x.name)
-                col_tri_meshes = []
-                if lod_meshes:
-                    base_name = _export_base_name_from_object(lod_meshes[0])
-                    _, col_tri_meshes = self.find_related_meshes(base_name)
-            else:
-                base_name = _export_base_name_from_object(mesh_ob)
-                lod_meshes, col_tri_meshes = self.find_related_meshes(base_name)
+            lod_meshes = cache["lod_meshes"]
+            col_tri_meshes = cache["col_tri_meshes"]
 
             # --- Material Export Order Preview ---
-            preview_meshes = lod_meshes if lod_meshes else [mesh_ob]
             box = self._draw_section_header(layout, 'show_materials', "Material Export Order", 'MATERIAL')
             if box:
                 box.prop(self, "strip_material_names")
-                from ..w3_material_nodes import get_group_inputs, get_socket_value
-                from ..exporters.export_mesh import scan_principled_bsdf
-                import re as _re
-                import os as _os
-                # repo_path is already computed from main_mesh.witcherui_MeshSettings.item_repo_path
-                _mesh_repo_dir = _os.path.dirname(repo_path.replace('/', '\\')) if repo_path else ""
-                for lod_mesh in sorted(preview_meshes, key=lambda x: x.name):
-                    lod_label = lod_mesh.name.split('_')[-1] if '_lod' in lod_mesh.name else lod_mesh.name
+                for lod_preview in self._get_material_preview(cache, repo_path):
+                    lod_label = lod_preview["lod_label"]
                     col = box.column(align=True)
                     col.label(text=f"{lod_label}:")
 
-                    if lod_mesh.data.materials:
-                        for mat_idx, mat in enumerate(lod_mesh.data.materials):
-                            if not mat:
+                    materials = lod_preview["materials"]
+                    if materials:
+                        for mat_preview in materials:
+                            mat_idx = mat_preview["index"]
+                            if mat_preview.get("empty"):
                                 col.label(text=f"  {mat_idx}: (empty)")
                                 continue
-                            mat_name = mat.name
-                            is_local = hasattr(mat, 'witcher_props') and mat.witcher_props.local
+                            mat_name = mat_preview["name"]
+                            is_local = mat_preview["is_local"]
                             if self.strip_material_names:
-                                match = _re.search(r'(Material\d+)', mat_name)
+                                match = re.search(r'(Material\d+)', mat_name)
                                 stripped = match.group(1) if match else f"Material{mat_idx}"
                                 row = col.row()
                                 row.label(text=f"  {mat_idx}: {mat_name}")
@@ -3308,40 +3431,29 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                             else:
                                 col.label(text=f"  {mat_idx}: {mat_name}")
                             if is_local:
-                                group_inputs = get_group_inputs(mat)
-                                if group_inputs:
-                                    # Witcher node group: show connected texture inputs
-                                    for inp in group_inputs:
-                                        if inp.is_linked:
-                                            linked = inp.links[0].from_socket
-                                            if linked.node.type == 'TEX_IMAGE' and linked.node.image:
-                                                tex_path = get_socket_value(inp)
-                                                if isinstance(tex_path, str):
-                                                    sub = col.row()
-                                                    sub.scale_y = 0.7
-                                                    sub.label(text=f"      {inp.name}: {tex_path}", icon='TEXTURE')
-                                else:
-                                    # No Witcher node group — check for Principled BSDF auto-convert
-                                    bsdf_found = scan_principled_bsdf(mat, _mesh_repo_dir)
-                                    if bsdf_found is not None:
-                                        sub = col.row()
-                                        sub.alert = True
-                                        sub.label(text="      Auto-convert from Principled BSDF → pbr_std:", icon='INFO')
-                                        if bsdf_found:
-                                            for p in bsdf_found:
-                                                sub2 = col.row()
-                                                sub2.scale_y = 0.7
-                                                sub2.label(text=f"      {p['name']}: {p['value']}", icon='TEXTURE')
-                                        else:
-                                            sub2 = col.row()
-                                            sub2.scale_y = 0.7
-                                            sub2.label(text="      (no textures found — pbr_std with defaults)", icon='DOT')
-                            else:
-                                # Non-local: show the w2mi/w2mg depot path
-                                if hasattr(mat, 'witcher_props') and mat.witcher_props.base_custom:
+                                for texture in mat_preview["group_textures"]:
                                     sub = col.row()
                                     sub.scale_y = 0.7
-                                    sub.label(text=f"      {mat.witcher_props.base_custom}", icon='LINKED')
+                                    sub.label(text=f"      {texture['name']}: {texture['value']}", icon='TEXTURE')
+
+                                bsdf_found = mat_preview["bsdf_found"]
+                                if bsdf_found is not None:
+                                    sub = col.row()
+                                    sub.alert = True
+                                    sub.label(text="      Auto-convert from Principled BSDF -> pbr_std:", icon='INFO')
+                                    if bsdf_found:
+                                        for p in bsdf_found:
+                                            sub2 = col.row()
+                                            sub2.scale_y = 0.7
+                                            sub2.label(text=f"      {p['name']}: {p['value']}", icon='TEXTURE')
+                                    else:
+                                        sub2 = col.row()
+                                        sub2.scale_y = 0.7
+                                        sub2.label(text="      (no textures found - pbr_std with defaults)", icon='DOT')
+                            elif mat_preview["base_custom"]:
+                                sub = col.row()
+                                sub.scale_y = 0.7
+                                sub.label(text=f"      {mat_preview['base_custom']}", icon='LINKED')
                     else:
                         col.label(text="  (no materials)")
                     box.separator()
@@ -3370,10 +3482,13 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
             if col_tri_meshes:
                 box = self._draw_section_header(layout, 'show_colliders', f"Collision Meshes ({len(col_tri_meshes)})", 'MOD_PHYSICS')
                 if box:
-                    for col_mesh in col_tri_meshes:
+                    for col_mesh in col_tri_meshes[:_EXPORT_COLLIDER_PREVIEW_LIMIT]:
                         row = box.row()
                         col_type = self.get_collision_type(col_mesh.name) or "collision"
                         row.label(text=f"{col_mesh.name} ({col_type})")
+                    hidden_count = len(col_tri_meshes) - _EXPORT_COLLIDER_PREVIEW_LIMIT
+                    if hidden_count > 0:
+                        box.label(text=f"{hidden_count} more hidden from preview", icon='INFO')
                     box.prop(self, "export_col_tri", text="Export All Collision Meshes")
 
             # --- LOD Tools ---
@@ -3586,6 +3701,7 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         return {'FINISHED'}
 
     def invoke(self, context, event):
+        self._preview_cache = None
         # Only set filepath on first use. On subsequent exports, Blender
         # restores the last used filepath before calling invoke(), so
         # we respect that to preserve the last export directory.
