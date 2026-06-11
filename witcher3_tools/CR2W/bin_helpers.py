@@ -65,11 +65,20 @@ def readString(inFile):
         chars.append(c)
 
 def getString(file):
+    # Read NUL-terminated string in blocks instead of byte-at-a-time
     raw = bytearray()
-    tmpChar = file.read(1)
-    while tmpChar not in (b"", b"\x00"):
-        raw.extend(tmpChar)
-        tmpChar = file.read(1)
+    while True:
+        block = file.read(64)
+        if not block:
+            break
+        idx = block.find(0)
+        if idx >= 0:
+            raw.extend(block[:idx])
+            overshoot = len(block) - (idx + 1)
+            if overshoot:
+                file.seek(-overshoot, 1)
+            break
+        raw.extend(block)
     return _decode_cr2w_text(raw)
 
 def getStringOfLen(file, len):

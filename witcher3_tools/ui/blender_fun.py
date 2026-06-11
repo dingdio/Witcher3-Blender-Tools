@@ -123,6 +123,7 @@ def _repair_dds_from_local_xbm(image_path: str, xbm_path: str = ""):
 
 def load_image_with_dds_repair(image_path: str, *, image=None, check_existing=True, allow_dds_repair=False):
     import os
+    import bpy
     from ..CR2W.common_blender import bpy_image_load_safe, win_unprefix_path
 
     image_path = win_unprefix_path(image_path or "")
@@ -155,11 +156,16 @@ def load_image_with_dds_repair(image_path: str, *, image=None, check_existing=Tr
     for attempt in range(2):
         loaded_image = None
         try:
+            pre_load_image_count = len(bpy.data.images)
             loaded_image = bpy_image_load_safe(image_path, check_existing=check_existing)
-            try:
-                loaded_image.reload()
-            except Exception as exc:
-                last_error = exc
+            # Only reload images that already existed (their pixel buffer may be
+            # stale, e.g. after an on-disk DDS repair). A freshly created image
+            # cannot be stale, and reload() forces a full second decode.
+            if len(bpy.data.images) == pre_load_image_count:
+                try:
+                    loaded_image.reload()
+                except Exception as exc:
+                    last_error = exc
             if _blender_image_has_data(loaded_image):
                 return loaded_image, None
             if last_error is None:

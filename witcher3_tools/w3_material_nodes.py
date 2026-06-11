@@ -51,7 +51,7 @@ import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Dict, Optional
 
 log = logging.getLogger(__name__)
 
@@ -1898,12 +1898,16 @@ def _set_base_read_snapshot(material, inspection: dict, *, status: str = "ok", m
         _set_chain_item_node_color(chain_item, color)
 
     _tag_existing_linked_chain_nodes(material, inspection)
-    _layout_chain_nodes_by_source(material)
-    _apply_chain_item_colors_to_nodes(material)
-    if bool(getattr(props, "base_read_chain_frames_enabled", True)):
-        _apply_chain_frames(material, create_missing=True)
-    else:
-        _remove_chain_frames(material)
+    # During bulk import the caller runs refresh_witcher_include_state once at
+    # the end, which repeats this exact layout/colors/frames pass — skip the
+    # redundant one here.
+    if not _WITCHER_INCLUDE_UPDATE_SUSPENDED:
+        _layout_chain_nodes_by_source(material)
+        _apply_chain_item_colors_to_nodes(material)
+        if bool(getattr(props, "base_read_chain_frames_enabled", True)):
+            _apply_chain_frames(material, create_missing=True)
+        else:
+            _remove_chain_frames(material)
     props.base_read_show_inspector = bool(props.base_read_params)
 
 
@@ -3251,6 +3255,50 @@ from . import get_mod_directory, get_modded_texture_path
 
 #     return texture_path
 
+# get_repo_from_abs_path probes ~a dozen candidate roots per call and runs for
+# every texture/param entry during import; realpath+isdir on each root per call
+# dominated its cost. Roots are stable for a session, so cache their resolution.
+# (A root directory created mid-session needs a Blender restart to be seen,
+# same as most other addon path settings.)
+_REPO_ROOT_PREP_CACHE: Dict[str, str] = {}
+
+
+def _prepare_repo_root(root) -> str:
+    """Resolve a candidate repo root to a validated real path ('' if unusable)."""
+    root = str(root or "").strip()
+    if not root:
+        return ""
+    cache_key = win_unprefix_path(bpy.path.abspath(root)).rstrip("\\/")
+    if not cache_key:
+        return ""
+    cached = _REPO_ROOT_PREP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    resolved = win_unprefix_path(os.path.realpath(cache_key)).rstrip("\\/")
+    if not resolved or not os.path.isdir(win_safe_path(resolved)):
+        resolved = ""
+    _REPO_ROOT_PREP_CACHE[cache_key] = resolved
+    return resolved
+
+
+def _try_strip_root(path, root):
+    """Strip a root directory from the path, returning game-relative path or None."""
+    root = _prepare_repo_root(root)
+    if not root:
+        return None
+    try:
+        root_key = os.path.normcase(os.path.normpath(root))
+        path_key = os.path.normcase(os.path.normpath(path))
+        if os.path.commonpath([root_key, path_key]) != root_key:
+            return None
+        rel_path = os.path.relpath(path, root)
+    except Exception:
+        return None
+    if not rel_path or rel_path == os.curdir or rel_path.startswith("..") or os.path.isabs(rel_path):
+        return None
+    return rel_path
+
+
 def get_repo_from_abs_path(texture_path_input, extension='.xbm'):
     texture_path_input = win_unprefix_path(texture_path_input)
     texture_path = os.path.realpath(bpy.path.abspath(texture_path_input))
@@ -3266,26 +3314,6 @@ def get_repo_from_abs_path(texture_path_input, extension='.xbm'):
     # Ensure the path ends with the specified extension
     texture_path_no_ext = os.path.splitext(texture_path)[0]
     texture_path = texture_path_no_ext + extension
-
-    def _try_strip_root(path, root):
-        """Strip a root directory from the path, returning game-relative path or None."""
-        root = str(root or "").strip()
-        if not root:
-            return None
-        root = win_unprefix_path(os.path.realpath(bpy.path.abspath(root))).rstrip("\\/")
-        if not root or not os.path.isdir(win_safe_path(root)):
-            return None
-        try:
-            root_key = os.path.normcase(os.path.normpath(root))
-            path_key = os.path.normcase(os.path.normpath(path))
-            if os.path.commonpath([root_key, path_key]) != root_key:
-                return None
-            rel_path = os.path.relpath(path, root)
-        except Exception:
-            return None
-        if not rel_path or rel_path == os.curdir or rel_path.startswith("..") or os.path.isabs(rel_path):
-            return None
-        return rel_path
 
     # Check paths in path_list first (user custom roots)
     for path_item in addon_prefs.path_list:

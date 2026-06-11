@@ -152,10 +152,16 @@ IREDPrimitive = [
 def detectedProp(f, CR2WFILE, offset ):
     gName = ""
     gType = ""
-    if (f.tell()+4 >= FileSize(f)):
+    # Hot path: called once per candidate property. Peek both u16 indices with
+    # a single read instead of two seek/read/seek round-trips.
+    pos = f.tell()
+    if (pos+4 >= FileSize(f)):
         return 0;
-    gNameIdx = readUShortCheck(f, f.tell())
-    gTypeIdx = readUShortCheck(f, f.tell()+2);
+    peek = f.read(4)
+    f.seek(pos, 0)
+    if len(peek) < 4:
+        return 0
+    gNameIdx, gTypeIdx = struct.unpack('<HH', peek)
 
     try:
         if (hasattr(CR2WFILE.CNAMES[gNameIdx], 'name')):
@@ -173,7 +179,7 @@ def detectedProp(f, CR2WFILE, offset ):
     return ((gName != gType and gName != "" and gType != "") and gType !="resourceVersion"
     and "Ref:" not in gName and gName != "PLATFORM_PC" and gType != "cookingPlatform"
     and gName != "ECookingPlatform" and "Uint" not in gName
-    and not (gNameIdx > 255 and gTypeIdx > 255 and readUByteCheck(f,f.tell()) == 0 and readUShortCheck(f, f.tell()+3) <= CR2WFILE.CR2WTable[1].itemCount));
+    and not (gNameIdx > 255 and gTypeIdx > 255 and readUByteCheck(f, pos) == 0 and readUShortCheck(f, pos+3) <= CR2WFILE.CR2WTable[1].itemCount));
 # }
 
 

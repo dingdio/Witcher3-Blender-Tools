@@ -139,87 +139,69 @@ def should_auto_align_armatures(arm_parent, arm_child):
     return False
 
 
+def _ensure_object_mode():
+    """Leave edit/pose mode if needed. No-op (and no operator call) when already in object mode."""
+    try:
+        if bpy.context.mode != 'OBJECT' and bpy.context.view_layer.objects.active is not None:
+            bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+    except Exception:
+        pass
+
+
 def align_armatures_for_constraints(arm_parent, arm_child):
-    """Snap the child armature into the parent's current pose before adding constraints."""
+    """Snap the child armature into the parent's current pose before adding constraints.
+
+    Pose-bone matrices are written through the data API; no mode switches or
+    selection changes are needed.
+    """
     if not should_auto_align_armatures(arm_parent, arm_child):
         return 0
 
     aligned = 0
-    saved_active = None
-    saved_selection = []
+    _ensure_object_mode()
+
+    # Single depsgraph evaluation shared by all pairs.
     try:
-        saved_active = bpy.context.view_layer.objects.active
-        saved_selection = list(bpy.context.selected_objects)
+        bpy.context.view_layer.update()
     except Exception:
-        saved_selection = []
+        pass
+
+    dg = None
+    try:
+        dg = bpy.context.evaluated_depsgraph_get()
+    except Exception:
+        pass
 
     try:
-        try:
-            bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
-        except Exception:
-            pass
+        parent_eval = arm_parent.evaluated_get(dg) if dg else arm_parent
+    except Exception:
+        parent_eval = arm_parent
+    parent_world = parent_eval.matrix_world.copy()
+    parent_eval_map = _build_pose_bone_map(parent_eval)
+    if not parent_eval_map:
+        return 0
 
-        # Single depsgraph evaluation shared by all pairs.
-        try:
-            bpy.context.view_layer.update()
-        except Exception:
-            pass
+    try:
+        arm_child.matrix_world = parent_world
+    except Exception:
+        pass
 
-        dg = None
+    inv_child_world = arm_child.matrix_world.inverted()
+    for child_bone in arm_child.pose.bones:
+        parent_bone = parent_eval_map.get(_normalized_bone_name(child_bone.name))
+        if parent_bone is None:
+            continue
+        target_world_matrix = parent_world @ parent_bone.matrix
         try:
-            dg = bpy.context.evaluated_depsgraph_get()
+            child_bone.matrix = inv_child_world @ target_world_matrix
+            aligned += 1
         except Exception:
-            pass
+            continue
 
-        try:
-            parent_eval = arm_parent.evaluated_get(dg) if dg else arm_parent
-        except Exception:
-            parent_eval = arm_parent
-        parent_world = parent_eval.matrix_world.copy()
-        parent_eval_map = _build_pose_bone_map(parent_eval)
-        if not parent_eval_map:
-            return 0
-
-        try:
-            arm_child.matrix_world = parent_world
-        except Exception:
-            pass
-
-        bpy.ops.object.select_all(action='DESELECT')
-        arm_child.select_set(True)
-        bpy.context.view_layer.objects.active = arm_child
-        bpy.ops.object.mode_set(mode='POSE', toggle=False)
-
-        inv_child_world = arm_child.matrix_world.inverted()
-        for child_bone in arm_child.pose.bones:
-            parent_bone = parent_eval_map.get(_normalized_bone_name(child_bone.name))
-            if parent_bone is None:
-                continue
-            target_world_matrix = parent_world @ parent_bone.matrix
-            try:
-                child_bone.matrix = inv_child_world @ target_world_matrix
-                aligned += 1
-            except Exception:
-                continue
-
-        bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
-        try:
-            bpy.context.view_layer.update()
-        except Exception:
-            pass
-    finally:
-        try:
-            bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
-        except Exception:
-            pass
-        try:
-            bpy.ops.object.select_all(action='DESELECT')
-            for obj in saved_selection:
-                if obj:
-                    obj.select_set(True)
-            bpy.context.view_layer.objects.active = saved_active
-        except Exception:
-            pass
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
 
     if aligned:
         log.info(
@@ -292,17 +274,10 @@ def CreateConstraints2(arm_parent: bpy.types.Object, arm_child:bpy.types.Object,
         except Exception as e:
             log.debug("Pre-constraint armature alignment failed for %s -> %s: %s", arm_parent.name, arm_child.name, e)
 
-    bpy.ops.object.select_all(action='DESELECT')
-    arm_parent.select_set(True)
-    arm_child.select_set(True)
-    bpy.context.view_layer.objects.active = arm_parent
-    objs = bpy.context.selected_objects[:]
-    obj = objs[0]
-    try:
-        bpy.ops.object.mode_set(mode='POSE', toggle=False)
-    except Exception as e:
-        raise e
-    
+    # Constraints are created through the data API; no selection or pose-mode
+    # switch is required (operator calls force scene-wide depsgraph syncs).
+    _ensure_object_mode()
+
     #flat_child_hierarchy = all(bone.parent is None for bone in arm_child.data.edit_bones)
     is_dyng = (sum(bone.name.startswith("dyng_") for bone in arm_child.data.bones) > len(arm_child.data.bones) / 2) or 'dyng' in arm_child.name.lower()
     force_root_copy = _should_copy_root_for_child_armature(arm_child)
@@ -418,7 +393,6 @@ def CreateConstraints2(arm_parent: bpy.types.Object, arm_child:bpy.types.Object,
             # bpy.ops.object.mode_set(mode='EDIT', toggle=False)
             # bpy.context.active_bone.parent = None
             # bpy.ops.object.mode_set(mode='POSE', toggle=False)
-    bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
     return {'FINISHED'}
 
 
