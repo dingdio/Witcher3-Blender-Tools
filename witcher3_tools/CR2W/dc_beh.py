@@ -14,6 +14,7 @@ import os
 import re
 from collections import namedtuple
 from .CR2W_types import getCR2W
+from .bStream import open_cr2w_read_stream
 
 log = logging.getLogger(__name__)
 _BEH_INFO_CACHE = {}
@@ -158,8 +159,7 @@ def read_beh_info(beh_path) -> BehInfo:
         return cached
 
     try:
-        with open(beh_path, "rb") as f:
-            cr2w = getCR2W(f)
+        cr2w = getCR2W(open_cr2w_read_stream(beh_path))
     except Exception as e:
         log.warning("dc_beh: could not open %s – %s", beh_path, e)
         return empty

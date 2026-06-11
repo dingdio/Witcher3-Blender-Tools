@@ -543,10 +543,8 @@ def create_Skeleton(file):
 
 def load_bin_face(fileName) -> w3_types.CMimicFace:
     face_fileName = fileName
-    with open(face_fileName,"rb") as f:
-        theFile = getCR2W(f)
-        f.close()
-        CMimicFace = create_CMimicFace(theFile)
+    theFile = getCR2W(open_cr2w_read_stream(face_fileName))
+    CMimicFace = create_CMimicFace(theFile)
     return CMimicFace
 
 def _load_w2_track_names(track_skeleton_file):
@@ -561,28 +559,25 @@ def _load_w2_track_names(track_skeleton_file):
 
 
 def load_bin_w2_faces(fileName, chunk_index=None, track_skeleton_file=None) -> w3_types.CMimicFace:
-    with open(fileName, "rb") as f:
-        file_data = f.read()
-        f.seek(0)
-        theFile = getCR2W(f)
+    f = open_cr2w_read_stream(fileName)
+    file_data = f.cr2w_buf
+    theFile = getCR2W(f)
     track_names = _load_w2_track_names(track_skeleton_file)
     return create_CMimicFaces_w2(theFile, file_data, chunk_index=chunk_index, track_names=track_names)
 
 def load_bin_skeleton(fileName):
-    with open(fileName,"rb") as f:
-        theFile = getCR2W(f)
+    f = open_cr2w_read_stream(fileName)
+    theFile = getCR2W(f)
 
-        if theFile.HEADER.version <= 115:
-            # W2 format: check if uncooked (embedded Havok) or cooked
-            f.seek(0)
-            file_data = f.read()
-            f.seek(0)
-            if HavokPackfile.find_magic(file_data) >= 0:
-                rig = create_Skeleton_w2_uncooked(file_data, theFile)
-            else:
-                rig = create_Skeleton_w2(f, theFile)
+    if theFile.HEADER.version <= 115:
+        # W2 format: check if uncooked (embedded Havok) or cooked
+        file_data = f.cr2w_buf
+        f.seek(0)
+        if HavokPackfile.find_magic(file_data) >= 0:
+            rig = create_Skeleton_w2_uncooked(file_data, theFile)
         else:
-            f.close()
-            rig = create_Skeleton(theFile)
+            rig = create_Skeleton_w2(f, theFile)
+    else:
+        rig = create_Skeleton(theFile)
     final = readCSkeletonData(rig)
     return final

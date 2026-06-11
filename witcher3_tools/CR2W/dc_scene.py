@@ -2,6 +2,7 @@ import os
 import logging
 from .w3_types import CStoryScene
 from .CR2W_types import getCR2W, W_CLASS
+from .bStream import open_cr2w_read_stream
 from .prop_utils import prop_to_string as _prop_to_str
 from ..dialog_language import resolve_localized_text
 from ..repo_paths import source_game_from_version
@@ -45,8 +46,7 @@ def create_scene(file):
 
 
 def load_bin_scene(fileName):
-    with open(fileName,"rb") as f:
-        theFile = getCR2W(f)
+    theFile = getCR2W(open_cr2w_read_stream(fileName))
     return create_scene(theFile)
 def get_cutscene_dialog_lines(scene_filepath, cutscene_path):
     """Load dialog lines from a .w2scene that belong to the given .w2cutscene.
@@ -59,8 +59,7 @@ def get_cutscene_dialog_lines(scene_filepath, cutscene_path):
     line_index, line_text.
     """
     try:
-        with open(scene_filepath, "rb") as f:
-            theFile = getCR2W(f)
+        theFile = getCR2W(open_cr2w_read_stream(scene_filepath))
     except Exception:
         log.exception("Failed to open .w2scene for dialog lookup: %s", scene_filepath)
         return []

@@ -3,6 +3,7 @@ import os
 import struct
 
 from .CR2W_types import getCR2W
+from .bStream import open_cr2w_read_stream
 from .common_blender import repo_file, win_safe_path
 from .dc_skeleton import create_CMimicFace, load_bin_skeleton
 
@@ -30,9 +31,8 @@ def is_w2_cutscene_file(file_name):
 def load_w2_base_skeleton(rig_path):
     if not rig_path:
         return None
-    with open(rig_path, "rb") as f:
-        the_file = getCR2W(f)
     if rig_path.endswith(".w3fac"):
+        the_file = getCR2W(open_cr2w_read_stream(rig_path))
         mimic_face = create_CMimicFace(the_file)
         return mimic_face.floatTrackSkeleton
     if rig_path.endswith(".w2rig"):

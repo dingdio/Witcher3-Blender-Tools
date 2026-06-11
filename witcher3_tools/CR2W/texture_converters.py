@@ -6,7 +6,7 @@ import logging
 import os
 import struct
 
-from .bStream import bStream
+from .bStream import bStream, bReadStream, open_cr2w_read_stream
 from .CR2W_helpers import Enums
 from .CR2W_types import getCR2W
 from .texture_dds import (
@@ -156,11 +156,10 @@ def _texture_cache_extract_path(texture_item, out_path):
 
 
 def convert_xbm_to_dds(fdir, force=False, out_path=None):
-    f = open(fdir, "rb")
+    f = open_cr2w_read_stream(fdir)
     xbmFile = getCR2W(f)
 
-    f.seek(0)
-    br = bStream(data=f.read())
+    br = bStream(data=f.cr2w_buf)
     f.close()
 
     ddsheader = b'\x44\x44\x53\x20\x7C\x00\x00\x00\x07\x10\x0A\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x20\x00\x00\x00\x05\x00\x00\x00\x44\x58\x54\x31\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08\x10\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
@@ -852,8 +851,7 @@ def _convert_w2cube_to_dds_impl(fdir, dds_path):
     if uncooked_dds:
         return uncooked_dds
 
-    with open(fdir, "rb") as f:
-        w2cubeFile = getCR2W(f)
+    w2cubeFile = getCR2W(bReadStream(file_bytes, name=fdir))
     br = bStream(data=file_bytes)
 
     for chunk in w2cubeFile.CHUNKS.CHUNKS:

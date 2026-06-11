@@ -847,8 +847,7 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                 if streaming_data_prop:
                     buffer_bytes = _extract_streaming_buffer_bytes(file, streaming_data_prop)
                     if buffer_bytes:
-                        f = bStream(data=bytearray(buffer_bytes))
-                        f.name = "DATA_BUFFER"
+                        f = bReadStream(buffer_bytes, name="DATA_BUFFER")
                         bufferedCR2W = getCR2W(f)
                         entity = create_level(
                             bufferedCR2W,
@@ -935,10 +934,5 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
     return level
 
 def read_CR2W(filename): #lipsync load face first
-    with open(filename,"rb") as f:
-        theFile = getCR2W(f)
-        f.close()
-    # f = bStream(path = filename)
-    # theFile = getCR2W(f)
-    # f.close()
+    theFile = getCR2W(open_cr2w_read_stream(filename))
     return theFile

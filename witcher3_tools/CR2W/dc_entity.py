@@ -11,7 +11,7 @@ from pathlib import Path
 from .common_blender import repo_file, redkit_repo_context
 from .CR2W_file import create_level, read_CR2W
 from .CR2W_types import Entity_Type_List, getCR2W
-from .bStream import bStream
+from .bStream import bStream, bReadStream
 from .prop_utils import prop_to_string
 from .read_json_w3 import readCSkeletonData
 from . import w3_types
@@ -3779,8 +3779,7 @@ def create_CEntity(file, _inherit_visited=None):
             sdb = entity_chunk.GetVariableByName('streamingDataBuffer')
             if sdb and hasattr(sdb, 'Bufferdata') and hasattr(sdb.Bufferdata, 'Bytes') and sdb.Bufferdata.Bytes:
                 try:
-                    buf_stream = bStream(data=bytearray(sdb.Bufferdata.Bytes))
-                    buf_stream.name = 'streamingDataBuffer'
+                    buf_stream = bReadStream(sdb.Bufferdata.Bytes, name='streamingDataBuffer')
                     buf_cr2w = getCR2W(buf_stream)
                     for buf_chunk in buf_cr2w.CHUNKS.CHUNKS:
                         if buf_chunk.Type == 'CStaticMeshComponent':
@@ -4135,8 +4134,7 @@ def create_CEntity(file, _inherit_visited=None):
                             )
                         if sdb_var and hasattr(sdb_var, "Bufferdata") and hasattr(sdb_var.Bufferdata, "Bytes"):
                             try:
-                                buf_stream = bStream(data=bytearray(sdb_var.Bufferdata.Bytes))
-                                buf_stream.name = "streamingDataBuffer"
+                                buf_stream = bReadStream(sdb_var.Bufferdata.Bytes, name="streamingDataBuffer")
                                 buf_cr2w = getCR2W(buf_stream)
                                 for buf_chunk in buf_cr2w.CHUNKS.CHUNKS:
                                     if buf_chunk.Type == "CStaticMeshComponent":

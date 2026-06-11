@@ -1348,11 +1348,9 @@ def load_lipsync_file(fileName_in = False) -> w3_types.CSkeletalAnimation:
     if fileName_in:
         fileName = fileName_in
     face_fileName = repo_file(r"characters\models\geralt\head\model\h_01_mg__geralt.w3fac")
-    with open(face_fileName,"rb") as f:
-        theFile = getCR2W(f)
-        f.close()
-        CMimicFace = create_CMimicFace(theFile)
-        
+    theFile = getCR2W(open_cr2w_read_stream(face_fileName))
+    CMimicFace = create_CMimicFace(theFile)
+
     def check_magic_number(filepath, magic_string):
         try:
             with open(filepath, 'rb') as file:
@@ -1360,8 +1358,7 @@ def load_lipsync_file(fileName_in = False) -> w3_types.CSkeletalAnimation:
         except IOError:
             return False
     if check_magic_number(fileName, "CR2W"):
-        with open(fileName,"rb") as f:
-            theFile = getCR2W(f, anim_name = False)
+        theFile = getCR2W(open_cr2w_read_stream(fileName), anim_name = False)
         anim = create_lipsync_anim(theFile, CMimicFace.floatTrackSkeleton)
     else:
         anim = read_lipsync_buffer_file(fileName, CMimicFace.floatTrackSkeleton)
@@ -1420,28 +1417,25 @@ def load_w2_lipsync_dat_file(fileName, rigPath=None) -> w3_types.CSkeletalAnimat
 
 
 def load_base_skeleton(rigPath):
-    with open(rigPath, "rb") as f:
-        theFile = getCR2W(f)
-        f.close()
-        if rigPath.endswith('.w3fac'):
-            CMimicFace = create_CMimicFace(theFile)
-            return CMimicFace.floatTrackSkeleton
-        elif rigPath.endswith('.w2rig'):
-            # Witcher 2 support: W2 .w2rig files can store skeleton/track names
-            # in embedded Havok data. The generic CSkeleton path can miss the
-            # float-track list, which shifts mimic animation channel names.
-            return load_bin_skeleton(rigPath)
-        else:
-            log.error('Error loading rig, check path and extension.')
-            return None
+    if rigPath.endswith('.w3fac'):
+        theFile = getCR2W(open_cr2w_read_stream(rigPath))
+        CMimicFace = create_CMimicFace(theFile)
+        return CMimicFace.floatTrackSkeleton
+    elif rigPath.endswith('.w2rig'):
+        # Witcher 2 support: W2 .w2rig files can store skeleton/track names
+        # in embedded Havok data. The generic CSkeleton path can miss the
+        # float-track list, which shifts mimic animation channel names.
+        return load_bin_skeleton(rigPath)
+    else:
+        log.error('Error loading rig, check path and extension.')
+        return None
 
 def load_bin_anims_info(fileName, anim_name = None, rigPath = None) -> w3_types.CSkeletalAnimationSet:
     """Load animation-set metadata without decoding per-clip animation buffers.
 
     This path is used for quick animset listing in the UI.
     """
-    with open(fileName, "rb") as f:
-        theFile = getCR2W(f, do_read_anim_buffer=True)
+    theFile = getCR2W(open_cr2w_read_stream(fileName), do_read_anim_buffer=True)
     return create_anim_set_info_only(theFile)
 
 
@@ -1457,9 +1451,7 @@ def load_bin_anims_single(fileName, anim_name = None, rigPath = None) -> w3_type
     rig = load_base_skeleton(rigPath)
     
     repo_file(fileName, is_abs_path = True) # Make sure anims file exists on disk
-    with open(fileName, "rb") as f:
-        theFile = getCR2W(f, anim_name)
-        f.close()
+    theFile = getCR2W(open_cr2w_read_stream(fileName), anim_name)
     anim_set = create_anim_set(theFile, rig)
     return anim_set
     
@@ -1474,9 +1466,7 @@ def load_bin_anims(fileName, rigPath = False) -> w3_types.CSkeletalAnimationSet:
         rig = load_base_skeleton(rigPath)
     #LOAD THE BASE SKELETON
 
-    with open(fileName, "rb") as f:
-        theFile = getCR2W(f)
-        f.close()
+    theFile = getCR2W(open_cr2w_read_stream(fileName))
     anim_set = create_anim_set(theFile, rig)
     return anim_set
 
@@ -1661,33 +1651,29 @@ def load_w2_anims_info(fileName) -> w3_types.CSkeletalAnimationSet:
     buffers. This function scans the embedded Havok blobs to extract
     duration and frame counts, and merges with CR2W animation names.
     """
-    # Read raw bytes for Havok blob scanning
-    with open(fileName, "rb") as f:
-        raw_data = f.read()
+    stream = open_cr2w_read_stream(fileName)
 
     # Scan all embedded Havok packfile blobs for animation metadata
-    havok_infos = HavokPackfile.scan_animation_blobs(raw_data)
+    havok_infos = HavokPackfile.scan_animation_blobs(stream.cr2w_buf)
     log.info("Scanned %d Havok animation blobs from %s",
              len(havok_infos), os.path.basename(fileName))
 
     # Parse CR2W structure for animation names
-    with open(fileName, "rb") as f:
-        theFile = getCR2W(f)
+    theFile = getCR2W(stream)
 
     return create_anim_set_info_only(theFile, havok_infos=havok_infos)
 
 
 def load_w2_anims_full(fileName, rigPath=None, anim_name=None) -> w3_types.CSkeletalAnimationSet:
     """Load a W2 .w2anims file with full Havok spline decompression."""
-    with open(fileName, "rb") as f:
-        raw_data = f.read()
+    stream = open_cr2w_read_stream(fileName)
+    raw_data = stream.cr2w_buf
 
     fallback_bone_names, fallback_track_names = _get_fallback_w2_skeleton_names(
         rigPath,
         source_file=fileName,
     )
-    with open(fileName, "rb") as f:
-        theFile = getCR2W(f)
+    theFile = getCR2W(stream)
 
     anim_set = create_anim_set_info_only(theFile, quiet=bool(anim_name))
 
@@ -2159,8 +2145,6 @@ def load_bin_cutscene(fileName) -> w3_types.CCutsceneTemplate:
     if _is_w2_cr2w_version_file(fileName):
         return load_w2_cutscene_template(fileName)
 
-    with open(fileName, "rb") as f:
-        theFile = getCR2W(f, do_read_anim_buffer=True)
-        f.close()
+    theFile = getCR2W(open_cr2w_read_stream(fileName), do_read_anim_buffer=True)
     anim_set = create_CCutscene(theFile)
     return anim_set

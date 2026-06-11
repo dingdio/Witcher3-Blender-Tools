@@ -3,30 +3,41 @@ import io
 import logging
 log = logging.getLogger(__name__)
 
-# This is free and unencumbered software released into the public domain.
-#
-# Anyone is free to copy, modify, publish, use, compile, sell, or
-# distribute this software, either in source code form or as a compiled
-# binary, for any purpose, commercial or non-commercial, and by any
-# means.
-#
-# In jurisdictions that recognize copyright laws, the author or authors
-# of this software dedicate any and all copyright interest in the
-# software to the public domain. We make this dedication for the benefit
-# of the public at large and to the detriment of our heirs and
-# successors. We intend this dedication to be an overt act of
-# relinquishment in perpetuity of all present and future rights to this
-# software under copyright law.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-# IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
-# OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
-# ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
-# OTHER DEALINGS IN THE SOFTWARE.
-#
-# For more information, please refer to <http://unlicense.org>
+class bReadStream(io.BytesIO):
+    """Read-only in-memory stream for CR2W parsing.
+
+    Subclasses BytesIO so read/seek/tell stay C-speed for the sequential
+    parser code, while `cr2w_buf` exposes the raw bytes so the bin_helpers
+    peek helpers (FileSize, readU32Check, detectedProp, ...) can
+    struct.unpack_from() at an absolute offset instead of doing a
+    tell/seek/read/seek round-trip per peek.
+
+    Writing is blocked: a write would desync cr2w_buf from the BytesIO
+    contents. Use bStream for streams that need to be written.
+    """
+
+    def __init__(self, data, name="<memory>"):
+        if not isinstance(data, bytes):
+            data = bytes(data)
+        super().__init__(data)
+        self.cr2w_buf = data
+        self.name = name
+
+    def write(self, *args, **kwargs):
+        raise io.UnsupportedOperation("bReadStream is read-only")
+
+    def writelines(self, *args, **kwargs):
+        raise io.UnsupportedOperation("bReadStream is read-only")
+
+    def truncate(self, *args, **kwargs):
+        raise io.UnsupportedOperation("bReadStream is read-only")
+
+
+def open_cr2w_read_stream(path):
+    with open(path, "rb") as fh:
+        data = fh.read()
+    return bReadStream(data, name=path)
+
 
 class bStream():
     def __enter__(self):

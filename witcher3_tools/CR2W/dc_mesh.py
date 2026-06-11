@@ -70,12 +70,11 @@ def _load_cached_w2_embedded_cmesh_file(filename):
     if cache_key and cache_key in _W2_EMBEDDED_CMESH_FILE_CACHE:
         return _W2_EMBEDDED_CMESH_FILE_CACHE[cache_key]
 
-    with open(win_safe_path(filename), "rb") as f:
-        mesh_file = getCR2W(f)
-        if getattr(getattr(mesh_file, "HEADER", None), "version", 999) > 115:
-            return mesh_file, None
-        f.seek(0)
-        raw_data = f.read()
+    f = open_cr2w_read_stream(win_safe_path(filename))
+    mesh_file = getCR2W(f)
+    if getattr(getattr(mesh_file, "HEADER", None), "version", 999) > 115:
+        return mesh_file, None
+    raw_data = f.cr2w_buf
 
     result = (mesh_file, raw_data)
     if cache_key:
@@ -887,18 +886,15 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
     _diag_label = f'{filename}{f" [embedded CMesh chunk {embedded_cmesh_chunk_index}]" if embedded_cmesh_chunk_index is not None else ""}'
     log.debug('FileLoading: %s', _diag_label)
 
-    # with open(filename,"rb") as meshFileReader:
-    #     meshFile = getCR2W(meshFileReader)
-    #     #f.close()
     f = None
     raw_data = None
     if embedded_cmesh_chunk_index is not None:
         meshFile, raw_data = _load_cached_w2_embedded_cmesh_file(filename)
     else:
-        f = open(win_safe_path(filename),"rb")
+        f = open_cr2w_read_stream(win_safe_path(filename))
         meshFile = getCR2W(f)
     if f is None and getattr(getattr(meshFile, "HEADER", None), "version", 999) > 115:
-        f = open(win_safe_path(filename),"rb")
+        f = open_cr2w_read_stream(win_safe_path(filename))
         meshFile = getCR2W(f)
     meshName = Path(meshFile.fileName).stem
     if "proxy" in meshName and keep_proxy_meshes:

@@ -46,7 +46,8 @@ from .bin_helpers import (
                         readU32Check,
                         FileSize,
                         readUShortCheck,
-                        skipPadding)
+                        skipPadding,
+                        _unpack_u16_from)
 
 Entity_Type_List = ["CEntity",
                     "CGameplayEntity",
@@ -149,37 +150,52 @@ IREDPrimitive = [
 ]
 
 
+_unpack_2u16_from = struct.Struct('<HH').unpack_from
+
+
 def detectedProp(f, CR2WFILE, offset ):
     gName = ""
     gType = ""
-    # Hot path: called once per candidate property. Peek both u16 indices with
-    # a single read instead of two seek/read/seek round-trips.
+    # Hot path: called once per candidate property byte. With a cr2w_buf-backed
+    # stream both u16 indices come straight out of the buffer; otherwise peek
+    # with a single read + seek-back instead of two seek/read/seek round-trips.
     pos = f.tell()
-    if (pos+4 >= FileSize(f)):
-        return 0;
-    peek = f.read(4)
-    f.seek(pos, 0)
-    if len(peek) < 4:
-        return 0
-    gNameIdx, gTypeIdx = struct.unpack('<HH', peek)
+    buf = getattr(f, 'cr2w_buf', None)
+    if buf is not None:
+        if (pos+4 >= len(buf)):
+            return 0;
+        gNameIdx, gTypeIdx = _unpack_2u16_from(buf, pos)
+    else:
+        if (pos+4 >= FileSize(f)):
+            return 0;
+        peek = f.read(4)
+        f.seek(pos, 0)
+        if len(peek) < 4:
+            return 0
+        gNameIdx, gTypeIdx = struct.unpack('<HH', peek)
 
-    try:
-        if (hasattr(CR2WFILE.CNAMES[gNameIdx], 'name')):
-            gName = CR2WFILE.CNAMES[gNameIdx].name.value;
-            CR2WFILE.gName = gName
-            if (hasattr(CR2WFILE.CNAMES[gTypeIdx], 'name')):
-                gType = CR2WFILE.CNAMES[gTypeIdx].name.value;
-                CR2WFILE.gType = gType
-    except IndexError:
-        pass
-        #log.debug('Not valid index')
-    #return 1
-    #CR2WFILE.CNAMES[THEINDEX].name.value
+    # Bounds checks instead of try/except IndexError: most candidate offsets are
+    # not real properties, and raising is far more expensive than comparing.
+    cnames = CR2WFILE.CNAMES
+    num_cnames = len(cnames)
+    if (gNameIdx < num_cnames and hasattr(cnames[gNameIdx], 'name')):
+        gName = cnames[gNameIdx].name.value;
+        CR2WFILE.gName = gName
+        if (gTypeIdx < num_cnames and hasattr(cnames[gTypeIdx], 'name')):
+            gType = cnames[gTypeIdx].name.value;
+            CR2WFILE.gType = gType
 
-    return ((gName != gType and gName != "" and gType != "") and gType !="resourceVersion"
-    and "Ref:" not in gName and gName != "PLATFORM_PC" and gType != "cookingPlatform"
-    and gName != "ECookingPlatform" and "Uint" not in gName
-    and not (gNameIdx > 255 and gTypeIdx > 255 and readUByteCheck(f, pos) == 0 and readUShortCheck(f, pos+3) <= CR2WFILE.CR2WTable[1].itemCount));
+    if not ((gName != gType and gName != "" and gType != "") and gType !="resourceVersion"
+            and "Ref:" not in gName and gName != "PLATFORM_PC" and gType != "cookingPlatform"
+            and gName != "ECookingPlatform" and "Uint" not in gName):
+        return False
+    if (gNameIdx > 255 and gTypeIdx > 255):
+        if buf is not None:
+            if (buf[pos] == 0 and _unpack_u16_from(buf, pos+3)[0] <= CR2WFILE.CR2WTable[1].itemCount):
+                return False
+        elif (readUByteCheck(f, pos) == 0 and readUShortCheck(f, pos+3) <= CR2WFILE.CR2WTable[1].itemCount):
+            return False
+    return True
 # }
 
 
@@ -313,18 +329,21 @@ class STRINGINDEX:
         if self.Index == 0:
             self.String = None
             return None
-        # local int lvl <hidden=true> = level;
-        try:
-            if (self.Index > 0 and CR2WFILE.CNAMES[self.Index].name.value):
-                self.String = CR2WFILE.CNAMES[self.Index].name.value
-        except IndexError:
-            pass #couldn't find name index
+        # Bounds checks instead of try/except IndexError: this runs for every
+        # name/type/CName read and out-of-range indices are the common case for
+        # the import-path lookup, so raising would dominate the parse time.
+        cnames = CR2WFILE.CNAMES
+        if self.Index < len(cnames):
+            value = cnames[self.Index].name.value
+            if value:
+                self.String = value
 
-        try:
-            if (self.Index > 0 and not hasattr(parent, 'dataType') and hasattr(CR2WFILE, 'CR2WImport') and CR2WFILE.CR2WImport[self.Index-1].path):
-                self.Path = CR2WFILE.CR2WImport[self.Index-1].path
-        except IndexError:
-            pass #couldn't fix path index
+        if not hasattr(parent, 'dataType'):
+            imports = getattr(CR2WFILE, 'CR2WImport', None)
+            if imports is not None and self.Index <= len(imports):
+                path = imports[self.Index-1].path
+                if path:
+                    self.Path = path
     def ToString(self):
         if hasattr(self, 'String'):
             return self.String
@@ -338,10 +357,6 @@ class FLOATVALUE:
     def __init__(self, f, CR2WFILE, parent):
         self.Type = PROPSTART(f, CR2WFILE, parent)
         self.Value = readFloat(f) # float
-
-class Data_Bytes:
-    def __init__(self, f, size):
-        f.seek(f.tell() + size - 4)
 
 class PROPSTART_BLANK:
     def __init__(self):
@@ -366,10 +381,11 @@ class PROPSTART:
                 self.name = CR2WFILE.CNAMES[self.strIdx.Index].name.value; #string
                 self.type = CR2WFILE.CNAMES[self.dataType.Index].name.value; #string
 
+                version = CR2WFILE.HEADER.version
                 if (
-                    CR2WFILE.HEADER.version <= 115
+                    version <= 115
                     or (
-                        is_old_version(CR2WFILE.HEADER.version)
+                        is_old_version(version)
                         and readUShortCheck(f, f.tell()) == 0xFFFF
                     )
                 ):
@@ -381,15 +397,13 @@ class PROPSTART:
 
                 if ("rRef:" in self.type and (readU32Check(f.tell()-8) == 10)):
                     self.size = 2; #local int
-                elif (f.tell() + 4 < FileSize(f) and readU32Check(f, f.tell()) < FileSize(f) - f.tell() + 2):
-                    self.size = readU32(f) #uint32
                 else:
-                    self.size = 4; # local ushort
-
-                if (self.size > 4):
-                    startofData_Bytes = f.tell()
-                    self.Data = Data_Bytes(f, self.size)
-                    f.seek(startofData_Bytes)
+                    pos = f.tell()
+                    file_size = FileSize(f)
+                    if (pos + 4 < file_size and readU32Check(f, pos) < file_size - pos + 2):
+                        self.size = readU32(f) #uint32
+                    else:
+                        self.size = 4; # local ushort
             else:
                 self.dataType = None
                 self.name = None
@@ -571,13 +585,20 @@ class ELEMENT:
         if exists(parent, "Count"):
             self.Count = parent.Count
         self.MoreProps = []
-        while(f.tell() < parent.dataEnd and f.tell() < parent.classEnd):
-            if (detectedProp(f, CR2WFILE,f.tell())):
+        parent_dataEnd = parent.dataEnd
+        parent_classEnd = parent.classEnd
+        while True:
+            pos = f.tell()
+            if not (pos < parent_dataEnd and pos < parent_classEnd):
+                break
+            # detectedProp is position-stable and idempotent, so one call per
+            # iteration serves both the outer and inner checks (was called twice).
+            if (detectedProp(f, CR2WFILE, pos)):
                 # if (doMesh == True)
                 #     parseMesh();
 
                 #parse elements:
-                if (prevProp != "metalLevelsOut" and detectedProp(f, CR2WFILE, f.tell()) and CR2WFILE.gName != firstProp and CR2WFILE.gName) : #multilayer_layers should end at metalLevelsOut
+                if (prevProp != "metalLevelsOut" and CR2WFILE.gName != firstProp and CR2WFILE.gName) : #multilayer_layers should end at metalLevelsOut
                     Sub_Element_Count += 1
                     if (firstProp == ""):
                         firstProp = CR2WFILE.gName
@@ -1043,6 +1064,23 @@ class EngineTransform:
         return vars(self).items()
 
     def Read(self, f):
+        buf = getattr(f, 'cr2w_buf', None)
+        if buf is not None and f.tell() < len(buf):
+            pos = f.tell()
+            flags = buf[pos]
+            pos += 1
+            if ((flags & 1) == 1):
+                self.X, self.Y, self.Z = _unpack_3f_from(buf, pos)
+                pos += 12
+            if ((flags & 2) == 2):
+                self.Pitch, self.Yaw, self.Roll = _unpack_3f_from(buf, pos)
+                pos += 12
+            if ((flags & 4) == 4):
+                self.Scale_x, self.Scale_y, self.Scale_z = _unpack_3f_from(buf, pos)
+                pos += 12
+            f.seek(pos)
+            return
+
         flags = readSByte(f)
 
         if ((flags & 1) == 1):
@@ -1095,8 +1133,46 @@ class EngineTransform:
                 setattr(t, name, val)
         return t
 
+_unpack_3f_from = struct.Struct('<fff').unpack_from
+_unpack_4f_from = struct.Struct('<ffff').unpack_from
+
+
 class CEngineQsTransform:
     def __init__(self, f):
+        # Hot path: W2 cooked entities embed huge array:EngineQsTransform pose
+        # buffers (hundreds of thousands of elements), so bulk-unpack each
+        # float group straight from the buffer instead of one read per float.
+        buf = getattr(f, 'cr2w_buf', None)
+        if buf is not None and f.tell() < len(buf):
+            pos = f.tell()
+            flags = buf[pos]
+            pos += 1
+            x = y = z = 0.0
+            pitch = yaw = roll = 0.0
+            w = 1.0
+            scale_x = scale_y = scale_z = 0.0
+            if ((flags & 1) == 1):
+                x, y, z = _unpack_3f_from(buf, pos)
+                pos += 12
+            if ((flags & 2) == 2):
+                pitch, yaw, roll, w = _unpack_4f_from(buf, pos)
+                pos += 16
+            if ((flags & 4) == 4):
+                scale_x, scale_y, scale_z = _unpack_3f_from(buf, pos)
+                pos += 12
+            f.seek(pos)
+            self.x = x
+            self.y = y
+            self.z = z
+            self.pitch = pitch
+            self.yaw = yaw
+            self.roll = roll
+            self.w = w
+            self.scale_x = scale_x
+            self.scale_y = scale_y
+            self.scale_z = scale_z
+            return
+
         flags = readUByte(f)
 
         self.x = 0.0
@@ -1341,14 +1417,15 @@ class PROPERTY:
                 arrayDataType = theType[delim+1:len(theType)]#SubStr( theType, delim+1, len(theType) - delim);
             arrayType = theType[delim+1:len(theType)]#SubStr( theType, delim+1, len(theType) - delim);
             theType = arrayType
-            if (f.tell()+2 < FileSize(f) and theType != "inkWidgetLibraryItem" and readU32Check(f, f.tell()) != 0 and (readU32Check(f, f.tell())) + f.tell() < dataEnd):
-                if (readUShortCheck(f, f.tell()) == 0):
+            pos = f.tell()
+            if (pos+2 < FileSize(f) and theType != "inkWidgetLibraryItem" and (peek32 := readU32Check(f, pos)) != 0 and peek32 + pos < dataEnd):
+                if (readUShortCheck(f, pos) == 0):
                     f.seek(2,1)
                     self.Count = readUShort(f)
                 else:
                     self.Count = readU32(f)
                 count = self.Count
-            elif (arrayDataType == "array" and f.tell() + 4 <= dataEnd and (dataEnd - f.tell()) == 4 and readU32Check(f, f.tell()) == 0):
+            elif (arrayDataType == "array" and pos + 4 <= dataEnd and (dataEnd - pos) == 4 and readU32Check(f, pos) == 0):
                 # Valid empty array payload: 4-byte count == 0 and no elements.
                 self.Count = 0
                 count = 0
@@ -1364,10 +1441,10 @@ class PROPERTY:
             arrayDataType == "array"
             and is_old_version(CR2WFILE.HEADER.version)
             and count > 0
-            and f.tell() + 4 <= dataEnd
+            and (pos := f.tell()) + 4 <= dataEnd
         ):
-            element_type_idx = readUShortCheck(f, f.tell())
-            element_type_end = readUShortCheck(f, f.tell() + 2)
+            element_type_idx = readUShortCheck(f, pos)
+            element_type_end = readUShortCheck(f, pos + 2)
             if (
                 0 < element_type_idx < len(CR2WFILE.CNAMES)
                 and element_type_end == 0xFFFF
@@ -1679,34 +1756,43 @@ class PROPERTY:
                 More.append(ELEMENT(f,CR2WFILE, self))
             self.More = More
             propCount+=1
-        if parent.classEnd == None:
+        parent_classEnd = parent.classEnd
+        if parent_classEnd == None:
             pass #print('WARNING: Attempting generic prop read without class size info')
-        while (parent.classEnd is not None and f.tell() < parent.classEnd and f.tell() < dataEnd and f.tell() < FileSize(f)-4 and readU32Check(f, f.tell()) != 1462915651):
-            if (detectedProp(f,CR2WFILE, f.tell()) and count > 1 and not hasattr(self, "Value") and not hasattr(self, "Index")): #!exists(this.Value) && !exists(this.Index)) :
-                #setColor();
-                #self.More = ELEMENT(f) #ELEMENT More;
-                More.append(ELEMENT(f,CR2WFILE, self))
-                self.More = More
-                propCount+=1
-            else:
-                if ( detectedProp(f, CR2WFILE, f.tell()) ):
-                    if (CR2WFILE.CNAMES[readUShortCheck(f, f.tell()+2)].name == "SharedDataBuffer" ):
-                        PackageHdr = PROPSTART(f, CR2WFILE, self); f.seek(4,1);#FSkip(4); #//start of new CR2W
-                        return
-                    else:
-                        if (f.tell() < dataEnd):
-                            # if (doMesh == True and count == 1):
-                            #     pass #parseMesh();
-                            #setColor();
-                            More.append(PROPERTY(f,CR2WFILE, self)) #struct PROPERTY More;  #//sub property
-                            self.More = More
-                            propCount+=1
-                            # if (not doesExist(gType, "loat") && not doesExist(gType, "Uint8"))
-                            #     SetBackColor(cNone);
-                        else:
-                            break
+        else:
+            file_limit = FileSize(f) - 4
+            while True:
+                pos = f.tell()
+                if not (pos < parent_classEnd and pos < dataEnd and pos < file_limit and readU32Check(f, pos) != 1462915651):
+                    break
+                # detectedProp is position-stable and idempotent, so one call per
+                # iteration serves both branches (was called twice).
+                dp = detectedProp(f, CR2WFILE, pos)
+                if (dp and count > 1 and not hasattr(self, "Value") and not hasattr(self, "Index")): #!exists(this.Value) && !exists(this.Index)) :
+                    #setColor();
+                    #self.More = ELEMENT(f) #ELEMENT More;
+                    More.append(ELEMENT(f,CR2WFILE, self))
+                    self.More = More
+                    propCount+=1
                 else:
-                    f.seek(1,1)
+                    if dp:
+                        if (CR2WFILE.CNAMES[readUShortCheck(f, pos+2)].name == "SharedDataBuffer" ):
+                            PackageHdr = PROPSTART(f, CR2WFILE, self); f.seek(4,1);#FSkip(4); #//start of new CR2W
+                            return
+                        else:
+                            if (pos < dataEnd):
+                                # if (doMesh == True and count == 1):
+                                #     pass #parseMesh();
+                                #setColor();
+                                More.append(PROPERTY(f,CR2WFILE, self)) #struct PROPERTY More;  #//sub property
+                                self.More = More
+                                propCount+=1
+                                # if (not doesExist(gType, "loat") && not doesExist(gType, "Uint8"))
+                                #     SetBackColor(cNone);
+                            else:
+                                break
+                    else:
+                        f.seek(1,1)
         #f.seek(dataEnd,1)
 
 import uuid
@@ -1790,7 +1876,7 @@ class CVariantSizeTypeName():
         varsize = readU32(f)#file.ReadUInt32();
         self.classEnd = varsize
         buffer = f.read(varsize - 4)#file.ReadBytes((int)varsize - 4);
-        br = bStream(data = bytearray(buffer))
+        br = bReadStream(buffer)
         typeId = readUShort(br)
         nameId = readUShort(br)
 
@@ -1901,7 +1987,7 @@ class CVariantSizeNameType():
         varsize = readU32(f)#file.ReadUInt32();
         self.classEnd = varsize
         buffer = f.read(varsize - 4)#file.ReadBytes((int)varsize - 4);
-        br = bStream(data = bytearray(buffer))
+        br = bReadStream(buffer)
         nameId = readUShort(br)
         typeId = readUShort(br)
 
@@ -1924,7 +2010,7 @@ class CVariantSizeType():
         varsize = readU32(f)#file.ReadUInt32();
         self.classEnd = varsize
         buffer = f.read(varsize - 4)#file.ReadBytes((int)varsize - 4);
-        br = bStream(data = bytearray(buffer))
+        br = bReadStream(buffer)
         typeId = readUShort(br)
 
 
@@ -2274,17 +2360,18 @@ class W_CLASS:
         elif (CR2WFILE.CR2WExport[idx].dataSize > 3):
             dataEnd = f.tell() + CR2WFILE.CR2WExport[idx].dataSize; #local uint64
             idxTotals = 0; #local int
-            while (f.tell() < self.classEnd-1 and f.tell() + 4 < FileSize(f) and readU32Check(f, f.tell()) != 1462915651):
-                if (detectedProp(f, CR2WFILE, f.tell()) and f.tell()+4 < self.classEnd):
-                    start_time = time.time()
-                    self.PROPS.append(PROPERTY(f, CR2WFILE, self))
-                    time_taken = time.time() - start_time
-                    log.debug(' Read PROP in %f seconds.', time.time() - start_time)
-                    if time_taken > 0.3:
-                        log.debug("time_taken > 0.3")
-                    if self.PROPS[-1].dataEnd != f.tell():
+            class_end_limit = self.classEnd - 1
+            file_size = FileSize(f)
+            while True:
+                pos = f.tell()
+                if not (pos < class_end_limit and pos + 4 < file_size and readU32Check(f, pos) != 1462915651):
+                    break
+                if (detectedProp(f, CR2WFILE, pos) and pos+4 < self.classEnd):
+                    prop = PROPERTY(f, CR2WFILE, self)
+                    self.PROPS.append(prop)
+                    if prop.dataEnd != f.tell():
                         log.debug('dataEnd was not correct %s', self.name)
-                        f.seek(self.PROPS[-1].dataEnd) # TODO NEEDS MORE TESTING
+                        f.seek(prop.dataEnd) # TODO NEEDS MORE TESTING
                     # if len(self.PROPS) == 16 and currentClass == "CClipMap":
                     #     log.critical("CClipMap")
                     self.propCount+=1
@@ -2469,7 +2556,7 @@ class W_CLASS:
                         if bytes_remaining > 4:
                             try:
                                 embedded_bytes = f.read(bytes_remaining)
-                                embedded_stream = bStream(data=bytearray(embedded_bytes))
+                                embedded_stream = bReadStream(embedded_bytes, name="<embedded>")
                                 self.flatCompiledData = getCR2W(embedded_stream)
                                 log.debug(f'CEntityTemplate: parsed flatCompiledData ({bytes_remaining} bytes, {len(self.flatCompiledData.CHUNKS.CHUNKS)} chunks)')
                             except Exception as e:

@@ -5,6 +5,7 @@ import re
 
 from . import w3_types
 from .CR2W_types import getCR2W
+from .bStream import open_cr2w_read_stream
 from .dc_cutscene_events_w2 import (
     read_w2_cutscene_entry_events,
     read_w2_cutscene_root_events,
@@ -527,19 +528,17 @@ def create_CCutscene_w2(file, raw_data):
 
 
 def load_w2_cutscene_template(file_name):
-    with open(file_name, "rb") as f:
-        raw_data = f.read()
-    with open(file_name, "rb") as f:
-        the_file = getCR2W(f)
+    stream = open_cr2w_read_stream(file_name)
+    raw_data = stream.cr2w_buf
+    the_file = getCR2W(stream)
     return create_CCutscene_w2(the_file, raw_data)
 
 
 def load_w2_cutscene_anim(file_name, rigPath=None, anim_name=None) -> w3_types.CSkeletalAnimationSet:
     """Decode one (or all) animation(s) from a W2 .w2cutscene via Havok."""
-    with open(file_name, "rb") as f:
-        raw_data = f.read()
-    with open(file_name, "rb") as f:
-        the_file = getCR2W(f)
+    stream = open_cr2w_read_stream(file_name)
+    raw_data = stream.cr2w_buf
+    the_file = getCR2W(stream)
 
     cutscene = create_CCutscene_w2(the_file, raw_data)
     anim_set = w3_types.CSkeletalAnimationSet(list(cutscene.animations))

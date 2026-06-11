@@ -39,10 +39,14 @@ def findEndOfMot(f):
 # Parsers call FileSize per property read (hundreds of thousands of times per
 # entity import) and every caller reads a file that is not growing, so cache
 # the size per stream object. WeakKey so closed/discarded streams drop out.
+# bReadStream exposes its bytes as cr2w_buf; len() is the cheapest answer.
 _file_size_cache = weakref.WeakKeyDictionary()
 
 
 def FileSize(f):
+    buf = getattr(f, "cr2w_buf", None)
+    if buf is not None:
+        return len(buf)
     size = _file_size_cache.get(f)
     if size is not None:
         return size
@@ -65,6 +69,15 @@ def readString(inFile):
         chars.append(c)
 
 def getString(file):
+    buf = getattr(file, "cr2w_buf", None)
+    if buf is not None:
+        pos = file.tell()
+        idx = buf.find(0, pos)
+        if idx < 0:
+            file.seek(0, 2)
+            return _decode_cr2w_text(buf[pos:])
+        file.seek(idx + 1)
+        return _decode_cr2w_text(buf[pos:idx])
     # Read NUL-terminated string in blocks instead of byte-at-a-time
     raw = bytearray()
     while True:
@@ -148,10 +161,21 @@ def read_wstring(inFile, chunk_len = 0x100, address = 0):
     inFile.seek(address+stringSize+offset)
     return wstring
 
+# Precompiled structs for the peek helpers below. The peek helpers are on the
+# hottest CR2W parse paths; with a cr2w_buf-backed stream they collapse to a
+# single unpack_from instead of a tell/seek/read/seek round-trip.
+_unpack_u32_from = struct.Struct("<I").unpack_from
+_unpack_u16_from = struct.Struct("<H").unpack_from
+_unpack_f32_from = struct.Struct("<f").unpack_from
+
+
 def readU32(inFile):
     return struct.unpack('I', inFile.read(4))[0]
 
 def readU32Check(f, pos):
+    buf = getattr(f, "cr2w_buf", None)
+    if buf is not None:
+        return _unpack_u32_from(buf, pos)[0]
     orignal_pos = f.tell()
     f.seek(pos,0)
     the_uint = struct.unpack('I', f.read(4))[0]
@@ -249,6 +273,9 @@ def ReadFloat16(file):
     # return (int(b2, 10) << 32) | (int(b1, 10) << 24) |(pad) |(pad);
 
 def readUShortCheck(f, pos):
+    buf = getattr(f, "cr2w_buf", None)
+    if buf is not None:
+        return _unpack_u16_from(buf, pos)[0]
     orignal_pos = f.tell()
     f.seek(pos,0)
     the_uint = struct.unpack(TypeFormat.UInt16, f.read(2))[0]
@@ -265,6 +292,11 @@ def readUChar(file):
     return struct.unpack(TypeFormat.Byte, file.read(1))[0]
 
 def readUByteCheck(f, pos):
+    buf = getattr(f, "cr2w_buf", None)
+    if buf is not None:
+        if pos >= len(buf):
+            raise struct.error("readUByteCheck past end of buffer")
+        return buf[pos]
     orignal_pos = f.tell()
     f.seek(pos,0)
     the_uint = struct.unpack(TypeFormat.Byte, f.read(1))[0]
@@ -284,6 +316,9 @@ def readFloat(inFile):
     return struct.unpack('f', inFile.read(4))[0]
 
 def readFloatCheck(f, pos):
+    buf = getattr(f, "cr2w_buf", None)
+    if buf is not None:
+        return _unpack_f32_from(buf, pos)[0]
     orignal_pos = f.tell()
     f.seek(pos,0)
     the_uint = struct.unpack('f', f.read(4))[0]
@@ -291,7 +326,8 @@ def readFloatCheck(f, pos):
     return the_uint
 
 def detectedFloat(f, offset):
-    return abs(readFloatCheck(f,offset)) == 0 or (abs(readFloatCheck(f,offset)) > 0.0000000000000001 and abs(readFloatCheck(f,offset)) < 100000000000000000);
+    value = abs(readFloatCheck(f, offset))
+    return value == 0 or (value > 0.0000000000000001 and value < 100000000000000000);
 
 
 # def readSingle(file):
