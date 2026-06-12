@@ -19,6 +19,12 @@ from ..CR2W.witcher_cache.Bundles.BundleItem import BundleItem
 from ..CR2W.common_blender import (
     repo_file,
     mod_loading_context,
+    win_safe_path,
+    win_extended_path,
+    win_path_isfile,
+    win_path_isdir,
+    win_unprefix_path,
+    win_explorer_path,
 )
 from ..importers import import_entity
 from ..importers import import_isolation
@@ -1576,14 +1582,16 @@ def _get_uncook_item_template_index(uncook_root):
 
     index = {}
     if uncook_root and os.path.isdir(uncook_root):
-        for dirpath, dirnames, filenames in os.walk(uncook_root):
+        # Walk a \\?\-prefixed root so deep subtrees aren't silently skipped,
+        # but keep unprefixed paths in the index (consumers wrap on use).
+        for dirpath, dirnames, filenames in os.walk(win_extended_path(uncook_root)):
             dirnames.sort()
             filenames.sort()
             for filename in filenames:
                 filename_lower = filename.lower()
                 if not (filename_lower.endswith(".w2ent") or filename_lower.endswith(".w2mesh")):
                     continue
-                full_path = os.path.join(dirpath, filename)
+                full_path = win_unprefix_path(os.path.join(dirpath, filename))
                 try:
                     rel_path = os.path.relpath(full_path, uncook_root).replace("/", "\\")
                 except Exception:
@@ -5946,17 +5954,20 @@ class EQUIPMENT_OT_OpenResolvedPathFolder(bpy.types.Operator):
             self.report({'WARNING'}, "Resolved absolute path not available")
             return {'CANCELLED'}
 
-        folder = os.path.dirname(abs_path) if os.path.isfile(abs_path) else abs_path
-        if not os.path.isdir(folder):
+        abs_path = win_unprefix_path(os.path.normpath(abs_path))
+        safe_abs_path = win_safe_path(abs_path)
+        folder = os.path.dirname(abs_path) if win_path_isfile(safe_abs_path) else abs_path
+        safe_folder = win_safe_path(folder)
+        if not folder or not os.path.isabs(folder) or not win_path_isdir(safe_folder):
             self.report({'WARNING'}, f"Folder not found: {folder}")
             return {'CANCELLED'}
 
         import subprocess
         try:
-            if os.path.isfile(abs_path):
-                subprocess.Popen(f'explorer /select,"{abs_path}"')
+            if win_path_isfile(safe_abs_path):
+                subprocess.Popen(f'explorer.exe /select,"{win_explorer_path(abs_path)}"')
             else:
-                subprocess.Popen(f'explorer "{folder}"')
+                subprocess.Popen(["explorer", win_explorer_path(folder)])
         except Exception as e:
             self.report({'ERROR'}, f"Could not open folder: {e}")
             return {'CANCELLED'}

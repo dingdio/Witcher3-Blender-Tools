@@ -9,11 +9,15 @@ from ..CR2W.witcher_cache.TextureCache.TextureCacheItem import TextureCacheItem
 from ..CR2W.common_blender import (
     repo_file,
     win_safe_path,
+    win_extended_path,
+    win_unprefix_path,
     win_path_exists,
+    win_path_isfile,
     win_path_isdir,
     win_path_getsize,
     win_path_getmtime,
     bpy_image_load_safe,
+    win_explorer_path,
     set_repo_override_roots,
     clear_repo_override_roots,
     mod_loading_context,
@@ -1581,8 +1585,11 @@ def _scan_disk_root(root_path, prefix="", source_kind="", project_root=None):
     if not root_path or not os.path.isdir(root_path):
         return
     root_path = os.path.normpath(root_path)
-    for dirpath, _, filenames in os.walk(root_path):
-        rel_dir = os.path.relpath(dirpath, root_path)
+    # Walk a \\?\-prefixed root so deep subtrees aren't silently skipped, but
+    # keep unprefixed paths in the source maps (consumers wrap on use).
+    for dirpath, _, filenames in os.walk(win_extended_path(root_path)):
+        bare_dirpath = win_unprefix_path(dirpath)
+        rel_dir = os.path.relpath(bare_dirpath, root_path)
         if rel_dir == ".":
             rel_dir = ""
         for fname in filenames:
@@ -1594,7 +1601,7 @@ def _scan_disk_root(root_path, prefix="", source_kind="", project_root=None):
             virtual_path = virtual_path.replace("/", "\\")
             if virtual_path in _file_source_map:
                 continue
-            abs_path = os.path.join(dirpath, fname)
+            abs_path = os.path.join(bare_dirpath, fname)
             _file_source_map[virtual_path] = abs_path
             _file_source_info[virtual_path] = {
                 "source": source_kind,
@@ -7296,21 +7303,30 @@ class OpenFileLocationOperator(Operator):
                 )
 
             abs_path = win_safe_path(abs_path or "")
-            if os.path.isfile(abs_path):
+            if not abs_path:
+                self.report({'WARNING'}, f"File not found: {self.file_path}")
+                return {'CANCELLED'}
+
+            explorer_path = win_explorer_path(abs_path)
+            if win_path_isfile(abs_path):
                 try:
                     import subprocess
 
-                    subprocess.Popen(["explorer", "/select,", abs_path])
+                    subprocess.Popen(f'explorer.exe /select,"{explorer_path}"')
                     return {'FINISHED'}
                 except Exception:
                     pass
 
-            parent_dir = abs_path if os.path.isdir(abs_path) else os.path.dirname(abs_path)
-            if os.path.isdir(parent_dir):
-                bpy.ops.wm.path_open(filepath=parent_dir)
+            parent_dir = abs_path if win_path_isdir(abs_path) else os.path.dirname(abs_path)
+            parent_dir_display = win_explorer_path(parent_dir)
+            if not parent_dir_display or not os.path.isabs(parent_dir_display):
+                self.report({'WARNING'}, f"File not found: {explorer_path}")
+                return {'CANCELLED'}
+            if win_path_isdir(parent_dir):
+                bpy.ops.wm.path_open(filepath=parent_dir_display)
                 return {'FINISHED'}
             else:
-                self.report({'WARNING'}, f"Directory not found: {parent_dir}")
+                self.report({'WARNING'}, f"Directory not found: {parent_dir_display}")
                 return {'CANCELLED'}
         except Exception as e:
             self.report({'ERROR'}, f"Failed to open location: {e}")

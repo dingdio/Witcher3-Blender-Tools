@@ -3140,7 +3140,7 @@ class MyVoiceList_OpenAssociatedPath(bpy.types.Operator):
         _set_associated_path_resolved(context, repo_path, game, disk_path)
 
         try:
-            from ..CR2W.common_blender import win_safe_path, win_unprefix_path
+            from ..CR2W.common_blender import win_safe_path, win_unprefix_path, win_explorer_path
 
             disk_path = win_unprefix_path(os.path.normpath(disk_path))
             safe_path = win_safe_path(disk_path)
@@ -3155,11 +3155,11 @@ class MyVoiceList_OpenAssociatedPath(bpy.types.Operator):
 
         try:
             if os.path.isfile(safe_path) and os.name == 'nt':
-                explorer_path = disk_path.replace('"', '\\"')
+                explorer_path = win_explorer_path(disk_path)
                 subprocess.Popen(f'explorer.exe /select,"{explorer_path}"')
                 selected_file = True
             else:
-                bpy.ops.wm.path_open(filepath=folder)
+                bpy.ops.wm.path_open(filepath=win_explorer_path(folder))
                 selected_file = False
         except Exception as exc:
             self.report({'ERROR'}, f"Failed to open location: {exc}")

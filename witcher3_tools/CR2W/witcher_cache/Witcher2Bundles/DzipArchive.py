@@ -184,7 +184,11 @@ class DzipItem:
     def extract_to_file(self, file_name: str):
         if not file_name:
             raise ValueError("file_name cannot be empty")
-        dir_name = os.path.dirname(file_name)
+
+        from ...common_blender import win_safe_path
+
+        safe_name = win_safe_path(file_name)
+        dir_name = os.path.dirname(safe_name)
         if dir_name:
             os.makedirs(dir_name, exist_ok=True)
 
@@ -192,7 +196,7 @@ class DzipItem:
         try:
             with os.fdopen(temp_fd, "wb") as temp_file:
                 self.extract(temp_file)
-            shutil.move(temp_path, file_name)
+            shutil.move(temp_path, safe_name)
         except Exception:
             try:
                 os.remove(temp_path)
@@ -203,7 +207,7 @@ class DzipItem:
         ts = _windows_filetime_to_timestamp(self.timestamp_filetime)
         if ts:
             try:
-                os.utime(file_name, (ts, ts))
+                os.utime(safe_name, (ts, ts))
             except OSError:
                 pass
         return file_name

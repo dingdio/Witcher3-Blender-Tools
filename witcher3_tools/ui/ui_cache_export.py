@@ -7,15 +7,16 @@ bar and a mandatory warning dialog.
 
 import bpy
 import os
-import re
 import logging
 import shutil
+import traceback
+from datetime import datetime
 
 from bpy.props import StringProperty
 from bpy.types import Operator
 
 from .. import get_all_addon_prefs, get_texture_path, get_uncook_path, get_W3_VOICE_PATH
-from ..CR2W.common_blender import win_path_exists, win_path_isdir
+from ..CR2W.common_blender import win_safe_path, win_extended_path, win_unprefix_path, win_path_exists, win_path_isdir
 from ..external_addon_tools import (
     APX_ADDON_URL,
     RE_ADDON_URL,
@@ -32,11 +33,11 @@ log = logging.getLogger(__name__)
 
 # Stats are –1 until Refresh Stats is pressed.
 _CACHE_STATS: dict = {
-    "Bundle":    {"cached": -1, "on_disk": -1, "output_path": ""},
-    "Texture":   {"cached": -1, "on_disk": -1, "output_path": ""},
-    "Collision": {"cached": -1, "on_disk": -1, "output_path": "", "apb_on_disk": -1, "apx_on_disk": -1},
-    "Sound":     {"cached": -1, "on_disk": -1, "output_path": ""},
-    "Speech":    {"cached": -1, "on_disk": -1, "on_disk_cr2w": -1, "on_disk_wem": -1, "output_path": ""},
+    "Bundle":    {"cached": -1, "on_disk": -1, "dir_files": -1, "output_path": ""},
+    "Texture":   {"cached": -1, "on_disk": -1, "dir_files": -1, "output_path": ""},
+    "Collision": {"cached": -1, "on_disk": -1, "dir_files": -1, "output_path": "", "apb_on_disk": -1, "apx_on_disk": -1},
+    "Sound":     {"cached": -1, "on_disk": -1, "dir_files": -1, "output_path": ""},
+    "Speech":    {"cached": -1, "on_disk": -1, "dir_files": -1, "on_disk_cr2w": -1, "on_disk_wem": -1, "output_path": ""},
 }
 
 _EXPORT_JOB: dict = {
@@ -54,10 +55,16 @@ _EXPORT_JOB: dict = {
     "apb_extracted": 0,
     "apx_converted": 0,
     "apx_failed":    0,
+    "error_log_path": "",
+    "error_log_created": False,
     "timer":      None,
     "wm":         None,
     "context":    None,  # stored for post-finish stat refresh
 }
+
+# Summary of the most recent Export All run. Stays visible in the panel after the
+# job ends until the user dismisses it. Session-scoped (not saved in the .blend).
+_LAST_EXPORT: dict = {}
 
 # Items to process per timer tick.
 _BATCH_SIZE = 150
@@ -104,12 +111,12 @@ def _first_existing_parent(path: str) -> str:
     if not path:
         return ""
     current = os.path.abspath(path)
-    while current and not os.path.exists(current):
+    while current and not win_path_exists(current):
         parent = os.path.dirname(current)
         if parent == current:
             break
         current = parent
-    return current if current and os.path.exists(current) else ""
+    return current if current and win_path_exists(current) else ""
 
 
 def _disk_free_bytes(path: str) -> int:
@@ -121,6 +128,109 @@ def _disk_free_bytes(path: str) -> int:
         return int(free)
     except Exception:
         return -1
+
+
+def _safe_cache_type_name(cache_type: str) -> str:
+    safe = "".join(ch.lower() if ch.isalnum() else "_" for ch in (cache_type or "cache"))
+    safe = "_".join(part for part in safe.split("_") if part)
+    return safe or "cache"
+
+
+def _export_error_log_path(context, cache_type: str) -> str:
+    output_root = _cache_output_root(context, cache_type)
+    if not output_root:
+        return ""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"witcher_export_all_{_safe_cache_type_name(cache_type)}_errors_{stamp}.log"
+    return os.path.join(output_root, name)
+
+
+def _format_export_target(out_path) -> str:
+    if isinstance(out_path, tuple):
+        return " | ".join(str(part) for part in out_path)
+    return str(out_path)
+
+
+def _export_item_name(item) -> str:
+    for attr in ("name", "Name", "FullName", "RawName", "id"):
+        try:
+            value = getattr(item, attr, "")
+        except Exception:
+            value = ""
+        if value:
+            return str(value)
+    return repr(item)
+
+
+def _export_item_source(item) -> str:
+    for attr in ("ParentFile", "filePath"):
+        value = getattr(item, attr, "")
+        if value:
+            return str(value)
+    for attr in ("bundle", "Bundle"):
+        bundle = getattr(item, attr, None)
+        value = getattr(bundle, "ArchiveAbsolutePath", "") if bundle is not None else ""
+        if value:
+            return str(value)
+    return ""
+
+
+def _record_export_error(job: dict, item, out_path, message: str, exc: Exception | None = None) -> None:
+    """Write an Export All failure to console and to the per-run error log."""
+    now = datetime.now().isoformat(timespec="seconds")
+    cache_type = job.get("cache_type", "")
+    item_name = _export_item_name(item)
+    target = _format_export_target(out_path)
+    source = _export_item_source(item)
+    index = job.get("index", 0)
+    total = job.get("total", 0)
+
+    lines = [
+        "=" * 80,
+        f"Time: {now}",
+        f"Cache: {cache_type}",
+        f"Item: {item_name}",
+        f"Target: {target}",
+    ]
+    if source:
+        lines.append(f"Source: {source}")
+    if index or total:
+        lines.append(f"Progress: {index}/{total}")
+    lines.append(f"Error: {message}")
+    if exc is not None:
+        lines.append("Traceback:")
+        lines.extend(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    text = "\n".join(str(line).rstrip("\n") for line in lines).rstrip() + "\n"
+
+    print(text, flush=True)
+
+    log_path = job.get("error_log_path", "")
+    if not log_path:
+        print("Witcher Export All error log path is not configured.", flush=True)
+        return
+
+    try:
+        safe_log_path = win_safe_path(log_path)
+        parent = os.path.dirname(safe_log_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        write_header = not job.get("error_log_created", False)
+        with open(safe_log_path, "a", encoding="utf-8") as handle:
+            if write_header:
+                handle.write("Witcher 3 Blender Tools Export All Error Log\n")
+                handle.write(f"Started: {now}\n")
+                handle.write(f"Cache: {cache_type}\n")
+                handle.write(f"Log path: {log_path}\n\n")
+                job["error_log_created"] = True
+            handle.write(text)
+            handle.write("\n")
+    except Exception as log_exc:
+        print(f"Failed to write Witcher Export All error log '{log_path}': {log_exc}", flush=True)
+
+
+def _assert_exported_file(path: str, label: str) -> None:
+    if not path or not win_path_exists(path):
+        raise FileNotFoundError(f"Expected exported {label} was not found: {path or '(empty path)'}")
 
 
 def _sum_item_sizes(items_dict: dict, size_attr: str, zsize_attr: str | None = None) -> tuple[int, int]:
@@ -164,7 +274,7 @@ def _count_dir_files(path: str, extensions=None) -> int:
         return 0
     count = 0
     try:
-        for _root, _dirs, files in os.walk(path):
+        for _root, _dirs, files in os.walk(win_extended_path(path)):
             for f in files:
                 if extensions is None or os.path.splitext(f)[1].lower() in extensions:
                     count += 1
@@ -173,45 +283,220 @@ def _count_dir_files(path: str, extensions=None) -> int:
     return count
 
 
+def _stats_path_key(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        path = win_unprefix_path(str(path))
+    except Exception:
+        path = str(path)
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+
+def _scan_output_files(path: str) -> tuple[set[str], int]:
+    """Return normalized file paths and total file count for an output tree."""
+    if not path or not win_path_isdir(path):
+        return set(), 0
+    keys = set()
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(win_extended_path(path)):
+            for filename in files:
+                total += 1
+                keys.add(_stats_path_key(os.path.join(root, filename)))
+    except Exception:
+        pass
+    return keys, total
+
+
+def _scan_output_files_cached(scan_cache: dict, path: str) -> tuple[set[str], int]:
+    key = _stats_path_key(path) if path else ""
+    if key not in scan_cache:
+        scan_cache[key] = _scan_output_files(path)
+    return scan_cache[key]
+
+
+def _output_path_for_name(output_root: str, name: str) -> str:
+    if not output_root or not name:
+        return ""
+    rel_name = str(name).replace("/", os.sep).lstrip("\\/")
+    return os.path.join(output_root, rel_name)
+
+
+def _final_cache_item(item_list):
+    return item_list[-1] if isinstance(item_list, list) else item_list
+
+
+def _stats_entry(
+    cached: int,
+    expected_paths,
+    output_root: str,
+    disk_files: set[str],
+    dir_files: int,
+    estimated_bytes: int = 0,
+    estimated_compressed_bytes: int = 0,
+    **extra,
+) -> dict:
+    expected_keys = {_stats_path_key(path) for path in expected_paths if path}
+    stats = {
+        "cached": cached,
+        "on_disk": sum(1 for key in expected_keys if key in disk_files),
+        "dir_files": dir_files,
+        "output_path": output_root,
+        "estimated_bytes": estimated_bytes,
+        "estimated_compressed_bytes": estimated_compressed_bytes,
+    }
+    stats.update(extra)
+    return stats
+
+
+def _bundle_cache_stats(bundle_manager, output_root: str, disk_files: set[str], dir_files: int) -> dict:
+    cached = 0
+    estimated_bytes = 0
+    estimated_zbytes = 0
+    expected_paths = []
+    for path, item_list in bundle_manager.Items.items():
+        item = _final_cache_item(item_list)
+        name = getattr(item, "name", "") or str(path)
+        if not name or _skip_bundle_item(name):
+            continue
+        cached += 1
+        estimated_bytes += int(getattr(item, "size", 0) or 0)
+        estimated_zbytes += int(getattr(item, "zsize", 0) or 0)
+        expected_paths.append(_output_path_for_name(output_root, name))
+    return _stats_entry(cached, expected_paths, output_root, disk_files, dir_files, estimated_bytes, estimated_zbytes)
+
+
+def _texture_cache_stats(texture_manager, output_root: str, disk_files: set[str], dir_files: int) -> dict:
+    cached = 0
+    expected_paths = []
+    for path, item_list in texture_manager.Items.items():
+        item = _final_cache_item(item_list)
+        name = getattr(item, "Name", "") or getattr(item, "name", "") or str(path)
+        if not name:
+            continue
+        cached += 1
+        expected_paths.append(_output_path_for_name(output_root, os.path.splitext(name)[0] + ".dds"))
+    estimated_bytes, estimated_zbytes = _sum_item_sizes(texture_manager.Items, "Size", "ZSize")
+    return _stats_entry(cached, expected_paths, output_root, disk_files, dir_files, estimated_bytes, estimated_zbytes)
+
+
+def _collision_cache_stats(collision_manager, output_root: str, disk_files: set[str], dir_files: int) -> dict:
+    cached = 0
+    expected_paths = []
+    expected_apb_paths = []
+    expected_apx_paths = []
+    for path, item_list in collision_manager.Items.items():
+        item = _final_cache_item(item_list)
+        name = getattr(item, "Name", "") or getattr(item, "name", "") or str(path)
+        if not name:
+            continue
+        cached += 1
+        ext = getattr(item, "Extension", "")
+        out_name = (os.path.splitext(name)[0] + ext) if ext else name
+        out_path = _output_path_for_name(output_root, out_name)
+        expected_paths.append(out_path)
+        if str(out_path).lower().endswith(".apb"):
+            expected_apb_paths.append(out_path)
+            expected_apx_paths.append(os.path.splitext(out_path)[0] + ".apx")
+    estimated_bytes, estimated_zbytes = _sum_item_sizes(collision_manager.Items, "Size", "ZSize")
+    apb_keys = {_stats_path_key(path) for path in expected_apb_paths if path}
+    apx_keys = {_stats_path_key(path) for path in expected_apx_paths if path}
+    return _stats_entry(
+        cached,
+        expected_paths,
+        output_root,
+        disk_files,
+        dir_files,
+        estimated_bytes,
+        estimated_zbytes,
+        apb_on_disk=sum(1 for key in apb_keys if key in disk_files),
+        apx_on_disk=sum(1 for key in apx_keys if key in disk_files),
+    )
+
+
+def _sound_cache_stats(sound_manager, output_root: str, disk_files: set[str], dir_files: int) -> dict:
+    cached = 0
+    expected_paths = []
+    for path, item_list in sound_manager.Items.items():
+        item = _final_cache_item(item_list)
+        name = getattr(item, "Name", "") or getattr(item, "name", "") or str(path)
+        if not name:
+            continue
+        cached += 1
+        expected_paths.append(_output_path_for_name(output_root, name))
+    estimated_bytes, estimated_zbytes = _sum_item_sizes(sound_manager.Items, "Size", "ZSize")
+    return _stats_entry(cached, expected_paths, output_root, disk_files, dir_files, estimated_bytes, estimated_zbytes)
+
+
+def _speech_cache_stats(speech_manager, output_root: str, disk_files: set[str], dir_files: int) -> dict:
+    from ..CR2W.witcher_cache.Speech.W3Speech import pad_filename
+
+    cached = 0
+    complete_pairs = 0
+    cr2w_on_disk = 0
+    wem_on_disk = 0
+    seen_pairs = set()
+    for key, item_list in speech_manager.Items.items():
+        item = _final_cache_item(item_list)
+        entry_id = str(getattr(item, "id", key))
+        base_name = pad_filename(os.path.splitext(os.path.basename(entry_id))[0])
+        cr2w_path = os.path.join(output_root, f"{base_name}.cr2w") if output_root else ""
+        wem_path = os.path.join(output_root, f"{base_name}.wem") if output_root else ""
+        pair_key = (_stats_path_key(cr2w_path), _stats_path_key(wem_path)) if output_root else (entry_id, "")
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        cached += 1
+        has_cr2w = bool(pair_key[0] and pair_key[0] in disk_files)
+        has_wem = bool(pair_key[1] and pair_key[1] in disk_files)
+        if has_cr2w:
+            cr2w_on_disk += 1
+        if has_wem:
+            wem_on_disk += 1
+        if has_cr2w and has_wem:
+            complete_pairs += 1
+    estimated_bytes, estimated_zbytes = _sum_item_sizes(speech_manager.Items, "size", "z_size")
+    return {
+        "cached": cached,
+        "on_disk": complete_pairs,
+        "dir_files": dir_files,
+        "on_disk_cr2w": cr2w_on_disk,
+        "on_disk_wem": wem_on_disk,
+        "output_path": output_root,
+        "estimated_bytes": estimated_bytes,
+        "estimated_compressed_bytes": estimated_zbytes,
+    }
+
+
 def _skip_bundle_item(name: str) -> bool:
     """Return True if a bundle item should be skipped during bulk export.
 
-    `.buffer` sidecar files are skipped – they are automatically paired with
-    their parent file during normal extraction.  The one exception is
-    `.w2ter.N.buffer` terrain tile buffers which must be present.
+    Bundle export is a raw logical bundle dump, so `.buffer` entries are exported
+    as files in their own right.
     """
-    lower = name.lower()
-    if ".buffer" not in lower:
-        return False
-    return not bool(re.search(r'\.w2ter\.\d+\.buffer$', lower))
+    return False
 
 
-def _refresh_ondisk_for(cache_type: str, output_root: str) -> None:
+def _refresh_ondisk_for(context, cache_type: str) -> None:
     """Update only the on-disk count for one cache type after export."""
-    if cache_type == "Speech":
-        cr2w_count = _count_dir_files(output_root, {".cr2w"})
-        wem_count = _count_dir_files(output_root, {".wem"})
-        _CACHE_STATS["Speech"]["on_disk"] = min(cr2w_count, wem_count)
-        _CACHE_STATS["Speech"]["on_disk_cr2w"] = cr2w_count
-        _CACHE_STATS["Speech"]["on_disk_wem"] = wem_count
-        _CACHE_STATS["Speech"]["output_path"] = output_root
-        return
-
-    ext_map = {
-        "Bundle":    None,
-        "Texture":   {".dds"},
-        "Collision": {".nxs", ".apb", ".apx", ".bin"},
-        "Sound":     {".wem", ".bnk"},
-    }
-    if cache_type not in ext_map:
-        return
-    on_disk = _count_dir_files(output_root, ext_map[cache_type])
-    if cache_type in _CACHE_STATS:
-        _CACHE_STATS[cache_type]["on_disk"] = on_disk
-        _CACHE_STATS[cache_type]["output_path"] = output_root
-        if cache_type == "Collision":
-            _CACHE_STATS[cache_type]["apb_on_disk"] = _count_dir_files(output_root, {".apb"})
-            _CACHE_STATS[cache_type]["apx_on_disk"] = _count_dir_files(output_root, {".apx"})
+    output_root = _cache_output_root(context, cache_type)
+    disk_files, dir_files = _scan_output_files(output_root)
+    if cache_type == "Bundle":
+        from ..CR2W.witcher_cache.Bundles import LoadBundleManager
+        _CACHE_STATS["Bundle"] = _bundle_cache_stats(LoadBundleManager(loadmods=False, reset_cache=False), output_root, disk_files, dir_files)
+    elif cache_type == "Texture":
+        from ..CR2W.witcher_cache.TextureCache import LoadTextureManager
+        _CACHE_STATS["Texture"] = _texture_cache_stats(LoadTextureManager(do_reload=False, loadmods=False), output_root, disk_files, dir_files)
+    elif cache_type == "Collision":
+        from ..CR2W.witcher_cache.CollisionCache import LoadCollisionManager
+        _CACHE_STATS["Collision"] = _collision_cache_stats(LoadCollisionManager(do_reload=False, loadmods=False), output_root, disk_files, dir_files)
+    elif cache_type == "Sound":
+        from ..CR2W.witcher_cache.SoundCache import LoadSoundManager
+        _CACHE_STATS["Sound"] = _sound_cache_stats(LoadSoundManager(do_reload=False, loadmods=False), output_root, disk_files, dir_files)
+    elif cache_type == "Speech":
+        from ..CR2W.witcher_cache.Speech import LoadSpeechManager
+        _CACHE_STATS["Speech"] = _speech_cache_stats(LoadSpeechManager(), output_root, disk_files, dir_files)
 
 
 def refresh_cache_stats(context) -> None:
@@ -224,100 +509,45 @@ def refresh_cache_stats(context) -> None:
 
     uncook = get_uncook_path(context) or ""
     texture_root = get_texture_path(context) or ""
+    voice_path = get_W3_VOICE_PATH(context) or ""
+
+    scan_cache = {}
+    uncook_files, uncook_dir_files = _scan_output_files_cached(scan_cache, uncook)
+    texture_files, texture_dir_files = _scan_output_files_cached(scan_cache, texture_root)
+    voice_files, voice_dir_files = _scan_output_files_cached(scan_cache, voice_path)
 
     # ── Bundle ──────────────────────────────────────────────────────────────
     try:
         bm = LoadBundleManager(loadmods=False, reset_cache=False)
-        cached = 0
-        estimated_bytes = 0
-        estimated_zbytes = 0
-        for path, item_list in bm.Items.items():
-            item = item_list[-1] if isinstance(item_list, list) else item_list
-            name = getattr(item, "name", "") or str(path)
-            if not name or _skip_bundle_item(name):
-                continue
-            cached += 1
-            estimated_bytes += int(getattr(item, "size", 0) or 0)
-            estimated_zbytes += int(getattr(item, "zsize", 0) or 0)
-        on_disk = _count_dir_files(uncook)
-        _CACHE_STATS["Bundle"] = {
-            "cached": cached,
-            "on_disk": on_disk,
-            "output_path": uncook,
-            "estimated_bytes": estimated_bytes,
-            "estimated_compressed_bytes": estimated_zbytes,
-        }
+        _CACHE_STATS["Bundle"] = _bundle_cache_stats(bm, uncook, uncook_files, uncook_dir_files)
     except Exception as e:
         log.warning("Bundle stats error: %s", e)
 
     # ── Texture ─────────────────────────────────────────────────────────────
     try:
         tm = LoadTextureManager(do_reload=False, loadmods=False)
-        cached = len(tm.Items)
-        estimated_bytes, estimated_zbytes = _sum_item_sizes(tm.Items, "Size", "ZSize")
-        on_disk = _count_dir_files(texture_root, {".dds"})
-        _CACHE_STATS["Texture"] = {
-            "cached": cached,
-            "on_disk": on_disk,
-            "output_path": texture_root,
-            "estimated_bytes": estimated_bytes,
-            "estimated_compressed_bytes": estimated_zbytes,
-        }
+        _CACHE_STATS["Texture"] = _texture_cache_stats(tm, texture_root, texture_files, texture_dir_files)
     except Exception as e:
         log.warning("Texture stats error: %s", e)
 
     # ── Collision ───────────────────────────────────────────────────────────
     try:
         cm = LoadCollisionManager(do_reload=False, loadmods=False)
-        cached = len(cm.FileList)
-        estimated_bytes, estimated_zbytes = _sum_item_sizes(cm.Items, "Size", "ZSize")
-        on_disk = _count_dir_files(uncook, {".nxs", ".apb", ".apx", ".bin"})
-        _CACHE_STATS["Collision"] = {
-            "cached": cached,
-            "on_disk": on_disk,
-            "output_path": uncook,
-            "apb_on_disk": _count_dir_files(uncook, {".apb"}),
-            "apx_on_disk": _count_dir_files(uncook, {".apx"}),
-            "estimated_bytes": estimated_bytes,
-            "estimated_compressed_bytes": estimated_zbytes,
-        }
+        _CACHE_STATS["Collision"] = _collision_cache_stats(cm, uncook, uncook_files, uncook_dir_files)
     except Exception as e:
         log.warning("Collision stats error: %s", e)
 
     # ── Sound (unbundle to uncook path) ──────────────────────────────────────
     try:
         som = LoadSoundManager(do_reload=False, loadmods=False)
-        cached = len(som.FileList)
-        estimated_bytes, estimated_zbytes = _sum_item_sizes(som.Items, "Size", "ZSize")
-        on_disk = _count_dir_files(uncook, {".wem", ".bnk"})
-        _CACHE_STATS["Sound"] = {
-            "cached": cached,
-            "on_disk": on_disk,
-            "output_path": uncook,
-            "estimated_bytes": estimated_bytes,
-            "estimated_compressed_bytes": estimated_zbytes,
-        }
+        _CACHE_STATS["Sound"] = _sound_cache_stats(som, uncook, uncook_files, uncook_dir_files)
     except Exception as e:
         log.warning("Sound stats error: %s", e)
 
     # ── Speech (unbundle to voice path) ─────────────────────────────────────
     try:
-        from ..CR2W.witcher_cache.Speech import LoadSpeechManager
         sm = LoadSpeechManager()
-        cached = len(sm.Items)
-        estimated_bytes, estimated_zbytes = _sum_item_sizes(sm.Items, "size", "z_size")
-        voice_path = get_W3_VOICE_PATH(context) or ""
-        cr2w_count = _count_dir_files(voice_path, {".cr2w"})
-        wem_count = _count_dir_files(voice_path, {".wem"})
-        _CACHE_STATS["Speech"] = {
-            "cached": cached,
-            "on_disk": min(cr2w_count, wem_count),
-            "on_disk_cr2w": cr2w_count,
-            "on_disk_wem": wem_count,
-            "output_path": voice_path,
-            "estimated_bytes": estimated_bytes,
-            "estimated_compressed_bytes": estimated_zbytes,
-        }
+        _CACHE_STATS["Speech"] = _speech_cache_stats(sm, voice_path, voice_files, voice_dir_files)
     except Exception as e:
         log.warning("Speech stats error: %s", e)
 
@@ -485,6 +715,7 @@ class WITCHER_OT_CacheStatsInfo(Operator):
 
         cached = stats.get("cached", -1)
         on_disk = stats.get("on_disk", -1)
+        dir_files = stats.get("dir_files", -1)
         output_path = stats.get("output_path", "") or "(not configured)"
         est_bytes = _cache_estimate_bytes(ctype)
         est_zbytes = _cache_estimate_compressed_bytes(ctype)
@@ -493,6 +724,8 @@ class WITCHER_OT_CacheStatsInfo(Operator):
         col = layout.column(align=True)
         col.label(text=f"Cache: {_format_count(cached)}")
         col.label(text=f"On disk: {_format_count(on_disk)}")
+        col.label(text=f"Directory files: {_format_count(dir_files)}")
+        col.label(text="On disk counts cache-matched outputs only.")
         col.label(text=f"Output path: {output_path}")
 
         if est_bytes > 0:
@@ -534,6 +767,36 @@ class WITCHER_OT_CancelCacheExport(Operator):
         if not _EXPORT_JOB.get("running"):
             return {'CANCELLED'}
         _EXPORT_JOB["cancel_requested"] = True
+        return {'FINISHED'}
+
+
+class WITCHER_OT_DismissCacheExportResult(Operator):
+    bl_idname = "witcher.dismiss_cache_export_result"
+    bl_label = "Dismiss Export Results"
+    bl_description = "Hide the last Export All results from the panel"
+
+    def execute(self, context):
+        _LAST_EXPORT.clear()
+        return {'FINISHED'}
+
+
+class WITCHER_OT_OpenCacheExportLog(Operator):
+    bl_idname = "witcher.open_cache_export_log"
+    bl_label = "Open Error Log"
+    bl_description = "Open the Export All error log in the system default application"
+
+    filepath: StringProperty(default="")
+
+    def execute(self, context):
+        path = self.filepath or _LAST_EXPORT.get("error_log_path", "")
+        if not path or not win_path_exists(path):
+            self.report({'WARNING'}, f"Error log not found: {path or '(none)'}")
+            return {'CANCELLED'}
+        try:
+            bpy.ops.wm.path_open(filepath=win_unprefix_path(path))
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not open error log: {e}")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
 
@@ -664,6 +927,8 @@ class WITCHER_OT_ExportAllCache(Operator):
         job["apb_extracted"] = 0
         job["apx_converted"] = 0
         job["apx_failed"]    = 0
+        job["error_log_path"] = _export_error_log_path(context, self.cache_type)
+        job["error_log_created"] = False
         job["context"]    = context
 
         wm = context.window_manager
@@ -703,8 +968,10 @@ class WITCHER_OT_ExportAllCache(Operator):
                     else:
                         parent = os.path.dirname(cr2w_out)
                         if parent:
-                            os.makedirs(parent, exist_ok=True)
+                            os.makedirs(win_safe_path(parent), exist_ok=True)
                         extracted_path = item.extract_to_file(entry_id) or wem_out
+                        _assert_exported_file(cr2w_out, ".cr2w speech file")
+                        _assert_exported_file(wem_out, ".wem speech file")
                         job["done"] += 1
                 else:
                     extracted_path = out_path
@@ -713,8 +980,9 @@ class WITCHER_OT_ExportAllCache(Operator):
                     else:
                         parent = os.path.dirname(out_path)
                         if parent:
-                            os.makedirs(parent, exist_ok=True)
+                            os.makedirs(win_safe_path(parent), exist_ok=True)
                         extracted_path = item.extract_to_file(out_path) or out_path
+                        _assert_exported_file(extracted_path, "cache file")
                         job["done"] += 1
                         if job["cache_type"] == "Collision" and str(extracted_path).lower().endswith(".apb"):
                             job["apb_extracted"] += 1
@@ -725,9 +993,15 @@ class WITCHER_OT_ExportAllCache(Operator):
                         job["apx_converted"] += 1
                     elif conv["status"] == "failed":
                         job["apx_failed"] += 1
+                        _record_export_error(
+                            job,
+                            item,
+                            out_path,
+                            f"APB to APX conversion failed for {extracted_path}: {conv.get('message', '')}",
+                        )
             except Exception as exc:
-                log.debug("Export error for %s: %s", out_path, exc)
                 job["errors"] += 1
+                _record_export_error(job, item, out_path, str(exc), exc)
 
         job["wm"].progress_update(job["index"])
 
@@ -779,16 +1053,34 @@ class WITCHER_OT_ExportAllCache(Operator):
         job["apb_extracted"] = 0
         job["apx_converted"] = 0
         job["apx_failed"]    = 0
+        error_log_path = job.get("error_log_path", "")
+        error_log_created = job.get("error_log_created", False)
+        job["error_log_path"] = ""
+        job["error_log_created"] = False
+
+        _LAST_EXPORT.clear()
+        _LAST_EXPORT.update({
+            "cache_type": ctype,
+            "cancelled": bool(cancelled),
+            "done": done,
+            "skipped": skipped,
+            "errors": errors,
+            "processed": processed,
+            "total": total,
+            "apb_extracted": apb_extracted,
+            "apx_converted": apx_converted,
+            "apx_failed": apx_failed,
+            "error_log_path": error_log_path if error_log_created else "",
+            "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        })
 
         # Auto-refresh the on-disk count so the UI is immediately up to date
         try:
-            output_root = _cache_output_root(ctx, ctype)
-            if output_root:
-                _refresh_ondisk_for(ctype, output_root)
+            _refresh_ondisk_for(ctx, ctype)
         except Exception:
             pass
 
-        level = 'INFO' if (errors == 0 and not cancelled) else 'WARNING'
+        level = 'INFO' if (errors == 0 and apx_failed == 0 and not cancelled) else 'WARNING'
         if cancelled:
             message = (
                 f"{ctype} export cancelled at {processed:,}/{total:,}: "
@@ -803,6 +1095,9 @@ class WITCHER_OT_ExportAllCache(Operator):
             message += f" APB extracted: {apb_extracted:,}. APX converted: {apx_converted:,}."
             if apx_failed:
                 message += f" APX conversion failures: {apx_failed:,}."
+        if error_log_created and error_log_path:
+            message += f" Error log: {error_log_path}"
+            print(f"Witcher Export All error log: {error_log_path}", flush=True)
         self.report({level}, message)
         return {'CANCELLED'} if cancelled else {'FINISHED'}
 
@@ -850,6 +1145,47 @@ def draw_export_stats_ui(layout, context) -> None:
             )
         detail_row.label(text=detail_text)
         return
+
+    if _LAST_EXPORT:
+        res = _LAST_EXPORT
+        had_problems = bool(res.get("errors") or res.get("apx_failed") or res.get("cancelled"))
+
+        result_box = box.box()
+        header_row = result_box.row(align=True)
+        header_row.alert = had_problems
+        if res.get("cancelled"):
+            title = (
+                f"Last export: {res.get('cache_type', '?')} cancelled at "
+                f"{res.get('processed', 0):,} / {res.get('total', 0):,}"
+            )
+        else:
+            title = f"Last export: {res.get('cache_type', '?')} complete"
+        header_row.label(
+            text=f"{title}  ({res.get('finished_at', '')})",
+            icon='ERROR' if had_problems else 'CHECKMARK',
+        )
+        header_row.operator("witcher.dismiss_cache_export_result", text="", icon='X')
+
+        detail_row = result_box.row(align=True)
+        detail_text = (
+            f"   Extracted: {res.get('done', 0):,}   "
+            f"Skipped: {res.get('skipped', 0):,}   "
+            f"Errors: {res.get('errors', 0):,}"
+        )
+        if res.get("cache_type") == "Collision":
+            detail_text += (
+                f"   APB: {res.get('apb_extracted', 0):,}   "
+                f"APX: {res.get('apx_converted', 0):,}"
+            )
+            if res.get("apx_failed"):
+                detail_text += f"   APX failed: {res.get('apx_failed', 0):,}"
+        detail_row.label(text=detail_text)
+
+        if res.get("error_log_path"):
+            log_row = result_box.row(align=True)
+            log_row.operator(
+                "witcher.open_cache_export_log", text="Open Error Log", icon='TEXT'
+            ).filepath = res["error_log_path"]
 
     col = box.column(align=True)
 
@@ -1068,6 +1404,8 @@ def register():
     bpy.utils.register_class(WITCHER_OT_OpenCacheExportFolder)
     bpy.utils.register_class(WITCHER_OT_CacheStatsInfo)
     bpy.utils.register_class(WITCHER_OT_CancelCacheExport)
+    bpy.utils.register_class(WITCHER_OT_DismissCacheExportResult)
+    bpy.utils.register_class(WITCHER_OT_OpenCacheExportLog)
     bpy.utils.register_class(WITCHER_OT_BrowseCacheInBrowser)
     bpy.utils.register_class(WITCHER_OT_ExportAllCache)
 
@@ -1075,6 +1413,8 @@ def register():
 def unregister():
     bpy.utils.unregister_class(WITCHER_OT_ExportAllCache)
     bpy.utils.unregister_class(WITCHER_OT_BrowseCacheInBrowser)
+    bpy.utils.unregister_class(WITCHER_OT_OpenCacheExportLog)
+    bpy.utils.unregister_class(WITCHER_OT_DismissCacheExportResult)
     bpy.utils.unregister_class(WITCHER_OT_CancelCacheExport)
     bpy.utils.unregister_class(WITCHER_OT_CacheStatsInfo)
     bpy.utils.unregister_class(WITCHER_OT_OpenCacheExportFolder)

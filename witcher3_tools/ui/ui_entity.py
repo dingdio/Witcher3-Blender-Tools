@@ -39,6 +39,10 @@ from ..read_game_bin import (
 from ..CR2W.common_blender import (
     mod_loading_context,
     win_safe_path,
+    win_path_isfile,
+    win_path_isdir,
+    win_unprefix_path,
+    win_explorer_path,
 )
 from ..repo_paths import (
     existing_repo_file_for_source,
@@ -1752,14 +1756,22 @@ class WITCH_OT_RevealAnimInExplorer(Operator):
         except Exception:
             # Fallback to the source-game root when bundle extraction is unavailable.
             pass
-        if not os.path.isfile(full_path) and os.path.isfile(full_path + ".json"):
+        full_path = win_unprefix_path(os.path.normpath(full_path))
+        safe_path = win_safe_path(full_path)
+        if not win_path_isfile(safe_path) and win_path_isfile(win_safe_path(full_path + ".json")):
             full_path = full_path + ".json"
-        folder = os.path.dirname(full_path)
-        if os.path.isdir(folder):
-            import subprocess
-            subprocess.Popen(f'explorer /select,"{full_path}"' if os.path.isfile(full_path) else f'explorer "{folder}"')
-        else:
+            safe_path = win_safe_path(full_path)
+        folder = full_path if win_path_isdir(safe_path) else os.path.dirname(full_path)
+        safe_folder = win_safe_path(folder)
+        if not folder or not os.path.isabs(folder) or not win_path_isdir(safe_folder):
             self.report({'WARNING'}, f"Folder not found: {folder}")
+            return {'CANCELLED'}
+
+        import subprocess
+        if win_path_isfile(safe_path):
+            subprocess.Popen(f'explorer.exe /select,"{win_explorer_path(full_path)}"')
+        else:
+            subprocess.Popen(["explorer", win_explorer_path(folder)])
         return {'FINISHED'}
 
 

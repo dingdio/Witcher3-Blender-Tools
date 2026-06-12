@@ -40,9 +40,18 @@ def _get_addon_prefs():
     return getattr(addon_entry, "preferences", None)
 
 
+# Win32 has no single 260-char MAX_PATH limit: CreateDirectoryW (os.makedirs) rejects
+# paths of 248+ chars (MAX_PATH minus room for an 8.3 filename) while CreateFileW allows
+# up to 259, so a 249-char directory fails even though a 259-char file is legal. Prefix
+# anything above 240 so every API is covered with margin. blender.exe is not
+# longPathAware, so the LongPathsEnabled registry switch does NOT help inside Blender;
+# the \\?\ prefix is the only mechanism that works.
+WIN_LONG_PATH_THRESHOLD = 240
+
+
 def win_safe_path(path: str) -> str:
-    """On Windows, apply \\?\\ prefix for paths > 250 chars to bypass MAX_PATH.
-    Safe on all Windows 10/11 machines - no registry changes needed.
+    """On Windows, apply \\?\\ prefix for paths > WIN_LONG_PATH_THRESHOLD chars to
+    bypass MAX_PATH. Safe on all Windows 10/11 machines - no registry changes needed.
     NOTE: never call os.path.normpath() on the result (it strips the prefix).
     Returns the original path unchanged on non-Windows or short paths."""
     if sys.platform != 'win32' or not path:
@@ -59,7 +68,7 @@ def win_safe_path(path: str) -> str:
     if not drive and not is_unc:
         return path
     abs_p = os.path.abspath(path)
-    if len(abs_p) > 250:
+    if len(abs_p) > WIN_LONG_PATH_THRESHOLD:
         if abs_p.startswith('\\\\'):
             return '\\\\?\\UNC\\' + abs_p.lstrip('\\')
         return '\\\\?\\' + abs_p
@@ -82,10 +91,29 @@ def win_bpy_image_path(path: str) -> str:
     if not drive and not is_unc:
         return path
     abs_p = os.path.abspath(path)
-    if len(abs_p) <= 250:
+    if len(abs_p) <= WIN_LONG_PATH_THRESHOLD:
         return path
     if abs_p.startswith('\\\\'):
         # UNC path -> \\?\UNC\server\share\...
+        return '\\\\?\\UNC\\' + abs_p.lstrip('\\')
+    return '\\\\?\\' + abs_p
+
+
+def win_extended_path(path: str) -> str:
+    """Always-prefixed \\?\\ absolute form, regardless of length. Use for os.walk /
+    os.scandir roots: os.walk derives every child path from the root string, so a
+    bare root makes scandir fail silently on subdirectories deeper than ~257 chars
+    in non-longPathAware processes (blender.exe) and entire subtrees vanish from
+    the scan. Returns depot/relative paths and non-Windows paths unchanged."""
+    if sys.platform != 'win32' or not path:
+        return path
+    p = win_unprefix_path(os.fspath(path))
+    drive, _ = os.path.splitdrive(p)
+    is_unc = p.startswith('\\\\')
+    if not drive and not is_unc:
+        return path
+    abs_p = os.path.abspath(p)
+    if abs_p.startswith('\\\\'):
         return '\\\\?\\UNC\\' + abs_p.lstrip('\\')
     return '\\\\?\\' + abs_p
 
@@ -102,6 +130,40 @@ def win_unprefix_path(path):
     if p.startswith('\\\\?\\'):
         return p[4:]
     return p
+
+
+def win_short_path(path: str) -> str:
+    """Return an existing path's 8.3 short form on Windows when available."""
+    if sys.platform != 'win32' or not path:
+        return path
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        source_path = win_safe_path(os.fspath(path))
+        get_short = ctypes.windll.kernel32.GetShortPathNameW
+        get_short.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        get_short.restype = wintypes.DWORD
+
+        size = get_short(source_path, None, 0)
+        if not size:
+            return win_unprefix_path(path)
+        buffer = ctypes.create_unicode_buffer(size + 1)
+        result = get_short(source_path, buffer, size + 1)
+        if not result:
+            return win_unprefix_path(path)
+        return win_unprefix_path(buffer.value)
+    except Exception:
+        return win_unprefix_path(path)
+
+
+def win_explorer_path(path: str) -> str:
+    """Return a path form suitable for Windows Explorer shell commands."""
+    if sys.platform != 'win32' or not path:
+        return path
+    path = win_unprefix_path(path)
+    short_path = win_short_path(path)
+    return short_path or path
 
 
 def win_path_key(path) -> str:
@@ -1129,7 +1191,7 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                         set_source_for_path(extract_root, filepath, "vanilla")
                 else:
                     if "." not in os.path.basename(abs_filename) and not _is_readonly_target(abs_filename):
-                        os.makedirs(abs_filename)
+                        os.makedirs(win_safe_path(abs_filename), exist_ok=True)
                     elif mod_entry and not _mod_priority_high:
                         # Fallback to mod if vanilla missing and mods are low priority
                         if not os.path.exists(win_safe_path(abs_filename)) or _overwrite_existing:
@@ -1178,16 +1240,19 @@ def extract_missing_buffers(abs_w2anims_path: str, required_index: int | None = 
     _, uncook_path, _, _ = _get_repo_roots_from_prefs()
     if not uncook_path:
         return extracted
-    norm_file = os.path.normcase(os.path.normpath(abs_w2anims_path))
-    norm_uncook = os.path.normcase(os.path.normpath(uncook_path))
-    if not norm_file.startswith(norm_uncook):
+
+    source_path = win_unprefix_path(abs_w2anims_path)
+    uncook_root = win_unprefix_path(uncook_path)
+    norm_file = os.path.normcase(os.path.normpath(source_path))
+    norm_uncook = os.path.normcase(os.path.normpath(uncook_root))
+    if norm_file != norm_uncook and not norm_file.startswith(norm_uncook + os.sep):
         return extracted
-    rel_path = os.path.relpath(abs_w2anims_path, uncook_path)
+    rel_path = os.path.relpath(source_path, uncook_root)
     bundle_manager = LoadBundleManager()
 
     if required_index is not None:
         buf_rel = f"{rel_path}.{required_index}.buffer"
-        buf_abs = f"{abs_w2anims_path}.{required_index}.buffer"
+        buf_abs = f"{source_path}.{required_index}.buffer"
         if os.path.exists(win_safe_path(buf_abs)):
             return extracted
         buf_item = bundle_manager.find_item_by_hash(buf_rel)
@@ -1201,7 +1266,7 @@ def extract_missing_buffers(abs_w2anims_path: str, required_index: int | None = 
         return extracted
 
     for buf_idx, buf_rel, buf_item in _collect_buffer_sidecar_entries(bundle_manager.Items.items(), rel_path):
-        buf_abs = f"{abs_w2anims_path}.{buf_idx}.buffer"
+        buf_abs = f"{source_path}.{buf_idx}.buffer"
         if os.path.exists(win_safe_path(buf_abs)):
             continue
         final_item: BundleItem = buf_item[-1]
