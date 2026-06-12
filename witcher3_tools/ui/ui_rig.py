@@ -1619,6 +1619,48 @@ class WITCH_OT_RigBakeIkToGame(bpy.types.Operator):
         return _report_ik_result(self, context, result)
 
 
+class WITCH_OT_RigLimbSwitch(bpy.types.Operator):
+    bl_idname = "witcher.rig_limb_switch"
+    bl_label = "Switch Limb FK/IK"
+    bl_description = "Snap this limb at the current frame, then switch it between FK and IK (keys controls and the IK switch when Key Snap is on)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    limb: EnumProperty(
+        items=[
+            ('l_arm', "Left Arm", ""),
+            ('r_arm', "Right Arm", ""),
+            ('l_leg', "Left Leg", ""),
+            ('r_leg', "Right Leg", ""),
+        ],
+        default='l_arm',
+    )
+    to_ik: BoolProperty(default=True)
+
+    def execute(self, context):
+        armature = _find_character_armature(context)
+        snap = ik_rig.snap_fk_to_ik if self.to_ik else ik_rig.snap_ik_to_fk
+        result = snap(
+            context,
+            armature,
+            (self.limb,),
+            context.scene.frame_current,
+            key=bool(getattr(context.scene, "witcher_rig_ik_key_current", False)),
+        )
+        return _report_ik_result(self, context, result)
+
+
+class WITCH_OT_RigRecalibratePoles(bpy.types.Operator):
+    bl_idname = "witcher.rig_recalibrate_poles"
+    bl_label = "Recalibrate Poles"
+    bl_description = "Re-tune the IK pole angles so enabling IK reproduces the current chain exactly (use after editing bones or on rigs from older versions)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        armature = _find_character_armature(context)
+        result = ik_rig.recalibrate_pole_angles(context, armature)
+        return _report_ik_result(self, context, result)
+
+
 class WITCH_OT_RigCreatePoseKey(bpy.types.Operator):
     bl_idname = "witcher.rig_create_pose_key"
     bl_label = "Create Pose Key"
@@ -2094,7 +2136,9 @@ def _draw_ik_rigging_tools(layout, context, armature):
     row.operator(WITCH_OT_RigCreateIkControls.bl_idname, text="Create Controls", icon='CONSTRAINT')
     rebuild = row.operator(WITCH_OT_RigCreateIkControls.bl_idname, text="Rebuild", icon='FILE_REFRESH')
     rebuild.rebuild = True
-    setup_box.operator(WITCH_OT_RigRemoveIkControls.bl_idname, text="Remove Controls", icon='TRASH')
+    row = setup_box.row(align=True)
+    row.operator(WITCH_OT_RigRecalibratePoles.bl_idname, text="Recalibrate Poles", icon='ORIENTATION_GIMBAL')
+    row.operator(WITCH_OT_RigRemoveIkControls.bl_idname, text="Remove", icon='TRASH')
     status = str(getattr(scene, "witcher_rig_ik_status", "") or "")
     if status:
         info = setup_box.row()
@@ -2108,11 +2152,18 @@ def _draw_ik_rigging_tools(layout, context, armature):
         row.enabled = False
         row.label(text="Create controls first.", icon='INFO')
     else:
-        grid = live_box.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=False, align=True)
-        grid.prop(armature, '["w3ik_l_arm"]', text="L Arm", slider=True)
-        grid.prop(armature, '["w3ik_r_arm"]', text="R Arm", slider=True)
-        grid.prop(armature, '["w3ik_l_leg"]', text="L Leg", slider=True)
-        grid.prop(armature, '["w3ik_r_leg"]', text="R Leg", slider=True)
+        for limb, label in (("l_arm", "L Arm"), ("r_arm", "R Arm"), ("l_leg", "L Leg"), ("r_leg", "R Leg")):
+            row = live_box.row(align=True)
+            row.prop(armature, f'["{ik_rig.IK_PROPS[limb]}"]', text=label, slider=True)
+            op = row.operator(WITCH_OT_RigLimbSwitch.bl_idname, text="", icon='CON_KINEMATIC')
+            op.limb = limb
+            op.to_ik = True
+            op = row.operator(WITCH_OT_RigLimbSwitch.bl_idname, text="", icon='BONE_DATA')
+            op.limb = limb
+            op.to_ik = False
+        hint = live_box.row()
+        hint.enabled = False
+        hint.label(text="Buttons snap & switch at the current frame (Key Snap keys it).", icon='INFO')
 
     snap_box = layout.box()
     snap_box.label(text="FK / IK Snap", icon='SNAP_ON')
@@ -2268,6 +2319,8 @@ classes = [
     WITCH_OT_RigSnapIkToFk,
     WITCH_OT_RigBakeFkToIk,
     WITCH_OT_RigBakeIkToGame,
+    WITCH_OT_RigLimbSwitch,
+    WITCH_OT_RigRecalibratePoles,
     WITCH_OT_RigCreatePoseKey,
     WITCH_OT_RigCopyPoseKeyXml,
     WITCH_OT_RigRefreshRedkitPresets,
