@@ -1,0 +1,20 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Witcher Tools Importer",
+  "Description": "Editor import bridge for Witcher 3 Blender Tools Unreal export bundles.",
+  "Category": "Importers",
+  "CreatedBy": "Witcher 3 Blender Tools",
+  "CanContainContent": true,
+  "IsBetaVersion": true,
+  "IsExperimentalVersion": true,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "WitcherToolsImporter",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ]
+}

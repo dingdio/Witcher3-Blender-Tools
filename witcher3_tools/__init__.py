@@ -429,6 +429,7 @@ from . import w3_material_nodes
 from . import w3_material_blender
 from . import w3_material_nodes_custom
 from . import w3_asset_browser
+from . import unreal_export
 
 # New unified panel system
 from .ui import panels as unified_panels
@@ -4432,6 +4433,7 @@ def register():
     w3_material_nodes.register()
     w3_material_nodes_custom.register()
     w3_asset_browser.register()
+    unreal_export.register()
     
     # Register new unified panel system
     unified_lists.register()
@@ -4477,6 +4479,7 @@ def unregister():
     bpy.utils.unregister_class(DlcMounterSourceItem)
     bpy.utils.unregister_class(PathItem)
 
+    unreal_export.unregister()
     w3_asset_browser.unregister()
     w3_material_nodes_custom.unregister()
     unregister_class(WITCH_PT_Quick)
