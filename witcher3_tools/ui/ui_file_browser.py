@@ -9238,7 +9238,18 @@ class FileActionOperator(Operator):
 
         # Auto-import for certain file types
         if export_path.endswith(".w2ent"):
-            if not import_entity.try_apply_inventory_file_to_selected_character(context, export_path):
+            metadata = import_entity.get_entity_appearance_metadata(export_path)
+            w2ent_mode = import_entity.classify_entity_import_metadata(metadata, context=context)
+            if w2ent_mode == "character":
+                default_appearance_name = str(metadata.get("default_name", "") or "").strip()
+                import_entity.import_direct_entity_file(
+                    export_path,
+                    False,
+                    0 if default_appearance_name else 1,
+                    None,
+                    selected_appearance_name=default_appearance_name,
+                )
+            elif not import_entity.try_apply_inventory_file_to_selected_character(context, export_path):
                 import_entity.import_direct_entity_file(export_path, False, 0, None)
 
         # For terrain tiles, emit per-tile images next to extracted buffers.

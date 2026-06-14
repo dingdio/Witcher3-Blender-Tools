@@ -925,12 +925,26 @@ class WITCH_OT_w2ent(bpy.types.Operator, ImportHelper):
                 return {'CANCELLED'}
             ext = file_helpers.getFilenameType(fdir)
             if ext == ".w2ent" or fdir.endswith(".json"):
-                arm_obj = import_entity.import_direct_entity_file(
-                    fdir,
-                    load_face_poses=False,
-                    import_apperance=0,
-                    parent_transform=None,
-                )
+                metadata = import_entity.get_entity_appearance_metadata(fdir)
+                w2ent_mode = import_entity.classify_entity_import_metadata(metadata, context=context)
+                if w2ent_mode == "character":
+                    default_appearance_name = str(metadata.get("default_name", "") or "").strip()
+                    arm_obj = import_entity.import_direct_entity_file(
+                        fdir,
+                        load_face_poses=False,
+                        import_apperance=0 if default_appearance_name else 1,
+                        parent_transform=None,
+                        selected_appearance_name=default_appearance_name,
+                    )
+                elif not import_entity.try_apply_inventory_file_to_selected_character(context, fdir):
+                    arm_obj = import_entity.import_direct_entity_file(
+                        fdir,
+                        load_face_poses=False,
+                        import_apperance=0,
+                        parent_transform=None,
+                    )
+                else:
+                    arm_obj = None
                 if arm_obj and get_all_addon_prefs(context).import_idle_animation:
                     import_anims.load_idle_animation_for_armature(context, arm_obj)
             else:
