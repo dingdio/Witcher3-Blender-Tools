@@ -25,6 +25,7 @@ from .manifest import (
     safe_asset_name,
 )
 from . import terrain_unreal
+from . import terrain_material
 from .bundle import _resolve_content_root_setting, default_export_folder
 
 
@@ -55,8 +56,18 @@ def _object_source_game(obj) -> str:
     return "w3"
 
 
-def _tint_dds_path(heightmap_png: str, hub: str) -> str:
+def _tint_source_path(heightmap_png: str, hub: str) -> str:
+    """Prefer the flipud'd tint PNG over the combined DDS.
+
+    The combine step applies np.flipud to the heightmap + control .data buffers
+    AND to ``{hub}.tint.png``, but writes ``combined.{hub}.dds`` un-flipped. Using
+    the DDS leaves the tint vertically mirrored relative to the terrain; the PNG
+    shares the heightmap/control orientation.
+    """
     folder = os.path.dirname(str(heightmap_png))
+    png = os.path.join(folder, f"{hub}.tint.png")
+    if os.path.isfile(png):
+        return png
     return os.path.join(folder, f"combined.{hub}.dds")
 
 
@@ -78,9 +89,82 @@ def _export_tint_texture(tint_dds: str, bundle_root: str, depot_rel: str,
     return {
         "depot_path": depot_rel,
         "file": relpath_for_manifest(png_path, bundle_root),
-        "srgb": True,
+        # import it linear.
+        "srgb": False,
         "compression": "default",
     }
+
+
+def _export_terrain_blend_layers(world, hub: str, heightmap_dir: str, height_res: int,
+                                 bundle_root: str, asset_rel: str,
+                                 warnings: list[str]) -> tuple[list[dict], str, list[dict]]:
+    """Extract the W3 terrain layer atlases + packed control map into the bundle.
+
+    Returns (layers_manifest, control_depot, texture_entries). Best-effort:
+    on any failure the caller falls back to the flat tint material.
+    """
+    from .texture_export import convert_texture_for_unreal
+
+    textures_dir = os.path.join(bundle_root, "Textures")
+    layers_manifest: list[dict] = []
+    control_depot: str = ""
+    texture_entries: list[dict] = []
+
+    mat_set = terrain_material.extract_terrain_material_set(world)
+    warnings.extend(mat_set.warnings)
+    if not mat_set.layers:
+        return [], "", []
+
+    def _add_texture(dds_path: str, depot_rel: str, srgb: bool, compression: str) -> str:
+        if not dds_path or not os.path.isfile(dds_path):
+            return ""
+        stem = depot_rel.rsplit("/", 1)[-1]
+        try:
+            png_path = convert_texture_for_unreal(dds_path, textures_dir, stem)
+        except Exception as exc:
+            warnings.append(f"terrain texture '{depot_rel}' conversion failed: {exc}")
+            return ""
+        texture_entries.append({
+            "depot_path": depot_rel,
+            "file": relpath_for_manifest(png_path, bundle_root),
+            "srgb": srgb,
+            "compression": compression,
+        })
+        return depot_rel
+
+    for layer in mat_set.layers:
+        diffuse_depot = _add_texture(
+            layer.diffuse_dds, f"{asset_rel}_layers/diffuse_{layer.index}", True, "default")
+        normal_depot = _add_texture(
+            layer.normal_dds, f"{asset_rel}_layers/normal_{layer.index}", False, "normalmap")
+        layers_manifest.append({
+            "index": layer.index,
+            "diffuse": diffuse_depot,
+            "normal": normal_depot,
+            "blend_sharpness": layer.blend_sharpness,
+            "slope_base_dampening": layer.slope_base_dampening,
+            "slope_normal_dampening": layer.slope_normal_dampening,
+            "falloff": layer.falloff,
+            "specularity": layer.specularity,
+            "specularity_base": layer.specularity_base,
+            "specularity_scale": layer.specularity_scale,
+        })
+
+    # Packed control map (RGBA8: overlay/bkgrnd/slope/uvScale) as one
+    # uncompressed, point-sampled texture.
+    control_dir = os.path.join(bundle_root, "Terrain")
+    control_path = terrain_material.write_control_map(
+        heightmap_dir, hub, (height_res, height_res), control_dir)
+    if control_path:
+        control_depot = f"{asset_rel}_control"
+        texture_entries.append({
+            "depot_path": control_depot,
+            "file": relpath_for_manifest(control_path, bundle_root),
+            "srgb": False,
+            "compression": "controlmap",
+        })
+
+    return layers_manifest, control_depot, texture_entries
 
 
 def build_unreal_world_bundle(context, settings) -> dict[str, Any]:
@@ -137,21 +221,52 @@ def build_unreal_world_bundle(context, settings) -> dict[str, Any]:
     layout = result.layout
     transform = result.transform
 
-    # Landscape asset mirrors the depot path of the world file.
-    asset_rel = depot_asset_rel(world_path) if world_path else f"levels/{safe_asset_name(hub)}/{safe_asset_name(hub)}"
+    # Landscape asset mirrors the DEPOT path of the world file. world_path is an
+    # absolute filesystem path, so convert it to depot-relative first (otherwise
+    # the whole C:\Users\... path becomes the Unreal asset path).
+    depot_world = ""
+    if world_path:
+        if os.path.isabs(world_path) or os.path.splitdrive(world_path)[0]:
+            try:
+                from ..importers.import_mesh import get_repo_from_abs_path
+
+                depot_world = get_repo_from_abs_path(os.path.normpath(world_path)) or ""
+            except Exception:
+                depot_world = ""
+        else:
+            depot_world = world_path
+    asset_rel = depot_asset_rel(depot_world) if depot_world else ""
     if not asset_rel:
         asset_rel = f"levels/{safe_asset_name(hub)}/{safe_asset_name(hub)}"
 
     textures: list[dict[str, Any]] = []
     base_color_depot = ""
     tint_entry = _export_tint_texture(
-        _tint_dds_path(heightmap_png, hub), bundle_root, f"{asset_rel}_tint", warnings
+        _tint_source_path(heightmap_png, hub), bundle_root, f"{asset_rel}_tint", warnings
     )
     if tint_entry is not None:
         textures.append(tint_entry)
         base_color_depot = tint_entry["depot_path"]
     else:
         warnings.append("No terrain tint texture; landscape will use a neutral base colour.")
+
+    # Faithful weight-blended terrain layers (Phase 4): diffuse/normal atlases +
+    # overlay/bkgrnd/blend control maps. Best-effort; falls back to tint.
+    terrain_layers: list[dict] = []
+    terrain_control: str = ""
+    heightmap_dir = os.path.dirname(heightmap_png)
+    try:
+        from ..CR2W import CR2W_reader
+
+        world = CR2W_reader.load_w2w(world_path) if world_path else None
+        if world is not None:
+            terrain_layers, terrain_control, layer_textures = _export_terrain_blend_layers(
+                world, hub, heightmap_dir, result.source_resolution,
+                bundle_root, asset_rel, warnings,
+            )
+            textures.extend(layer_textures)
+    except Exception as exc:
+        warnings.append(f"Terrain blend-layer export failed ({exc}); using flat tint.")
 
     terrain_section: dict[str, Any] = {
         "name": safe_asset_name(hub),
@@ -173,6 +288,10 @@ def build_unreal_world_bundle(context, settings) -> dict[str, Any]:
         "base_color_texture": base_color_depot,
         "world_path": world_path,
     }
+    if terrain_layers:
+        terrain_section["layers"] = terrain_layers
+        terrain_section["layer_count"] = len(terrain_layers)
+        terrain_section["control"] = terrain_control
 
     manifest = build_manifest(
         asset_name=asset_name,

@@ -36,6 +36,8 @@ private:
     void ImportAnimations();
     void ImportBlueprint();
     void ImportTerrain();
+    class UTexture2DArray* BuildTerrainTextureArray(const TArray<class UTexture2D*>& Slices, const FString& AssetRel, bool bNormal);
+    UMaterialInterface* BuildTerrainBlendMaterial(const TSharedPtr<FJsonObject>& Terrain, const FString& AssetRel);
 
     UTexture* ImportTexture(const TSharedPtr<FJsonObject>& TextureObject);
     UMaterialInterface* EnsureMasterMaterial(const TSharedPtr<FJsonObject>& MasterObject);

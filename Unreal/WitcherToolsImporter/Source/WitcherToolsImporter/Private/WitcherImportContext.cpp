@@ -16,15 +16,30 @@
 #include "Engine/StaticMeshActor.h"
 #include "Engine/Texture.h"
 #include "Engine/Texture2D.h"
+#include "Engine/Texture2DArray.h"
 #include "Editor.h"
 #include "Landscape.h"
 #include "LandscapeInfo.h"
 #include "LandscapeProxy.h"
 #include "LandscapeImportHelper.h"
+#include "Materials/MaterialExpressionAppendVector.h"
+#include "Materials/MaterialExpressionComponentMask.h"
+#include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionConstant2Vector.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialExpressionConstant4Vector.h"
+#include "Materials/MaterialExpressionDivide.h"
+#include "Materials/MaterialExpressionLinearInterpolate.h"
+#include "Materials/MaterialExpressionMax.h"
+#include "Materials/MaterialExpressionMultiply.h"
+#include "Materials/MaterialExpressionSaturate.h"
+#include "Materials/MaterialExpressionSquareRoot.h"
+#include "Materials/MaterialExpressionSubtract.h"
+#include "Materials/MaterialExpressionTextureObject.h"
 #include "Materials/MaterialExpressionTextureSample.h"
+#include "Materials/MaterialExpressionVertexNormalWS.h"
+#include "Materials/MaterialExpressionWorldPosition.h"
 #include "Factories/FbxAnimSequenceImportData.h"
 #include "Factories/FbxImportUI.h"
 #include "Factories/FbxSkeletalMeshImportData.h"
@@ -91,6 +106,30 @@ double JsonNumber(const TSharedPtr<FJsonObject>& Object, const FString& Field, d
         return DefaultValue;
     }
     return Object->HasTypedField<EJson::Number>(Field) ? Object->GetNumberField(Field) : DefaultValue;
+}
+
+FString HlslFloatLiteral(float Value)
+{
+    FString Literal = FString::SanitizeFloat(Value);
+    if (!Literal.Contains(TEXT(".")) && !Literal.Contains(TEXT("e")) && !Literal.Contains(TEXT("E")))
+    {
+        Literal += TEXT(".0");
+    }
+    return Literal;
+}
+
+FString HlslFloatArray(const TArray<float>& Values)
+{
+    FString Result;
+    for (int32 Index = 0; Index < Values.Num(); ++Index)
+    {
+        if (Index > 0)
+        {
+            Result += TEXT(",");
+        }
+        Result += HlslFloatLiteral(Values[Index]);
+    }
+    return Result;
 }
 
 FLinearColor JsonColor(const TSharedPtr<FJsonObject>& Object, const FString& Field)
@@ -301,6 +340,46 @@ EMaterialSamplerType SamplerTypeForParamName(const FString& ParamName)
     return SAMPLERTYPE_LinearColor;
 }
 
+void ApplyTextureImportSettings(UTexture* Texture, const TSharedPtr<FJsonObject>& TextureObject)
+{
+    if (!Texture)
+    {
+        return;
+    }
+    Texture->PreEditChange(nullptr);
+    Texture->SRGB = JsonBool(TextureObject, TEXT("srgb"), false);
+    const FString Compression = JsonString(TextureObject, TEXT("compression"));
+    if (UTexture2D* Texture2D = Cast<UTexture2D>(Texture))
+    {
+        if (Compression == TEXT("normalmap"))
+        {
+            Texture2D->CompressionSettings = TC_Normalmap;
+        }
+        else if (Compression == TEXT("masks"))
+        {
+            Texture2D->CompressionSettings = TC_Masks;
+        }
+        else if (Compression == TEXT("indexmap"))
+        {
+            Texture2D->CompressionSettings = TC_Grayscale;
+            Texture2D->MipGenSettings = TMGS_NoMipmaps;
+            Texture2D->Filter = TF_Nearest;
+        }
+        else if (Compression == TEXT("controlmap"))
+        {
+            Texture2D->CompressionSettings = TC_VectorDisplacementmap;
+            Texture2D->MipGenSettings = TMGS_NoMipmaps;
+            Texture2D->Filter = TF_Nearest;
+        }
+        else
+        {
+            Texture2D->CompressionSettings = TC_Default;
+        }
+    }
+    Texture->PostEditChange();
+    Texture->MarkPackageDirty();
+}
+
 template <typename T>
 T* LoadExistingAsset(const FString& ObjectPath)
 {
@@ -456,6 +535,7 @@ UTexture* FWitcherImportContext::ImportTexture(const TSharedPtr<FJsonObject>& Te
     // Reuse a texture that already exists at the mirrored depot path.
     if (UTexture* Existing = LoadExistingAsset<UTexture>(ObjectPathFor(AssetRel)))
     {
+        ApplyTextureImportSettings(Existing, TextureObject);
         TexturesByDepot.Add(DepotRel, Existing);
         return Existing;
     }
@@ -492,26 +572,7 @@ UTexture* FWitcherImportContext::ImportTexture(const TSharedPtr<FJsonObject>& Te
         return nullptr;
     }
 
-    Texture->PreEditChange(nullptr);
-    Texture->SRGB = JsonBool(TextureObject, TEXT("srgb"), false);
-    const FString Compression = JsonString(TextureObject, TEXT("compression"));
-    if (UTexture2D* Texture2D = Cast<UTexture2D>(Texture))
-    {
-        if (Compression == TEXT("normalmap"))
-        {
-            Texture2D->CompressionSettings = TC_Normalmap;
-        }
-        else if (Compression == TEXT("masks"))
-        {
-            Texture2D->CompressionSettings = TC_Masks;
-        }
-        else
-        {
-            Texture2D->CompressionSettings = TC_Default;
-        }
-    }
-    Texture->PostEditChange();
-    Texture->MarkPackageDirty();
+    ApplyTextureImportSettings(Texture, TextureObject);
     ImportedAssets.Add(Texture->GetPathName());
     TexturesByDepot.Add(DepotRel, Texture);
     return Texture;
@@ -1371,6 +1432,527 @@ void FWitcherImportContext::ImportBlueprint()
     ImportedAssets.Add(Blueprint->GetPathName());
 }
 
+UTexture2DArray* FWitcherImportContext::BuildTerrainTextureArray(
+    const TArray<UTexture2D*>& Slices, const FString& AssetRel, bool bNormal)
+{
+    if (Slices.Num() == 0)
+    {
+        return nullptr;
+    }
+    UTexture2DArray* Array = LoadExistingAsset<UTexture2DArray>(ObjectPathFor(AssetRel));
+    const bool bUpdatingExistingArray = Array != nullptr;
+    if (!Array)
+    {
+        const FString PackageName = FString::Printf(TEXT("%s/%s"), *ContentRoot, *AssetRel);
+        UPackage* Package = CreatePackage(*PackageName);
+        Array = NewObject<UTexture2DArray>(Package, *AssetRelName(AssetRel), RF_Public | RF_Standalone);
+    }
+    if (!Array)
+    {
+        return nullptr;
+    }
+    Array->PreEditChange(nullptr);
+    Array->SourceTextures.Reset();
+    for (UTexture2D* Slice : Slices)
+    {
+        if (Slice)
+        {
+            Array->SourceTextures.Add(Slice);
+        }
+    }
+    if (bNormal)
+    {
+        Array->SRGB = false;
+        Array->CompressionSettings = TC_Normalmap;
+    }
+    else
+    {
+        Array->SRGB = true;
+        Array->CompressionSettings = TC_Default;
+    }
+    // Build the array source from the per-slice 2D textures (all slices must
+    // share dimensions + format, which terrain atlas slices do).
+    Array->UpdateSourceFromSourceTextures(true);
+    Array->PostEditChange();
+    if (!bUpdatingExistingArray)
+    {
+        FAssetRegistryModule::AssetCreated(Array);
+    }
+    Array->MarkPackageDirty();
+    ImportedAssets.Add(Array->GetPathName());
+    return Array;
+}
+
+UMaterialInterface* FWitcherImportContext::BuildTerrainBlendMaterial(
+    const TSharedPtr<FJsonObject>& Terrain, const FString& AssetRel)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Layers = nullptr;
+    if (!Terrain->TryGetArrayField(TEXT("layers"), Layers) || Layers->Num() == 0)
+    {
+        return nullptr;
+    }
+
+    // Gather per-layer diffuse/normal textures in slice order.
+    TArray<UTexture2D*> DiffuseSlices;
+    TArray<UTexture2D*> NormalSlices;
+    DiffuseSlices.SetNumZeroed(Layers->Num());
+    NormalSlices.SetNumZeroed(Layers->Num());
+    const int32 ParamCount = FMath::Max(32, Layers->Num());
+    TArray<float> BlendSharpness;
+    TArray<float> SlopeBaseDampening;
+    TArray<float> SlopeNormalDampening;
+    TArray<float> Falloff;
+    TArray<float> Specularity;
+    TArray<float> SpecularityBase;
+    TArray<float> SpecularityScale;
+    BlendSharpness.Init(0.1f, ParamCount);
+    SlopeBaseDampening.Init(0.0f, ParamCount);
+    SlopeNormalDampening.Init(0.5f, ParamCount);
+    Falloff.Init(0.0f, ParamCount);
+    Specularity.Init(0.0f, ParamCount);
+    SpecularityBase.Init(0.5f, ParamCount);
+    SpecularityScale.Init(0.0f, ParamCount);
+    bool bAnyNormal = false;
+    for (const TSharedPtr<FJsonValue>& Value : *Layers)
+    {
+        const TSharedPtr<FJsonObject> Layer = Value->AsObject();
+        if (!Layer.IsValid())
+        {
+            continue;
+        }
+        const int32 Index = JsonInt(Layer, TEXT("index"), -1);
+        if (Index < 0 || Index >= DiffuseSlices.Num())
+        {
+            continue;
+        }
+        DiffuseSlices[Index] = Cast<UTexture2D>(FindTexture(JsonString(Layer, TEXT("diffuse"))));
+        UTexture2D* NormalTex = Cast<UTexture2D>(FindTexture(JsonString(Layer, TEXT("normal"))));
+        NormalSlices[Index] = NormalTex;
+        bAnyNormal = bAnyNormal || (NormalTex != nullptr);
+        if (Index < ParamCount)
+        {
+            BlendSharpness[Index] = static_cast<float>(
+                JsonNumber(Layer, TEXT("blend_sharpness"), BlendSharpness[Index]));
+            SlopeBaseDampening[Index] = static_cast<float>(
+                JsonNumber(Layer, TEXT("slope_base_dampening"), SlopeBaseDampening[Index]));
+            SlopeNormalDampening[Index] = static_cast<float>(
+                JsonNumber(Layer, TEXT("slope_normal_dampening"), SlopeNormalDampening[Index]));
+            Falloff[Index] = static_cast<float>(
+                JsonNumber(Layer, TEXT("falloff"), Falloff[Index]));
+            Specularity[Index] = static_cast<float>(
+                JsonNumber(Layer, TEXT("specularity"), Specularity[Index]));
+            SpecularityBase[Index] = static_cast<float>(
+                JsonNumber(Layer, TEXT("specularity_base"), SpecularityBase[Index]));
+            SpecularityScale[Index] = static_cast<float>(
+                JsonNumber(Layer, TEXT("specularity_scale"), SpecularityScale[Index]));
+        }
+    }
+    const FString BlendSharpnessCode = HlslFloatArray(BlendSharpness);
+    const FString SlopeBaseDampeningCode = HlslFloatArray(SlopeBaseDampening);
+    const FString SlopeNormalDampeningCode = HlslFloatArray(SlopeNormalDampening);
+    const FString FalloffCode = HlslFloatArray(Falloff);
+    const FString SpecularityCode = HlslFloatArray(Specularity);
+    const FString SpecularityBaseCode = HlslFloatArray(SpecularityBase);
+    const FString SpecularityScaleCode = HlslFloatArray(SpecularityScale);
+
+    // Texture arrays need every slice valid + uniform; fill gaps with the first
+    // good slice so a single missing layer can't abort the whole material.
+    UTexture2D* FallbackDiffuse = nullptr;
+    for (UTexture2D* Slice : DiffuseSlices) { if (Slice) { FallbackDiffuse = Slice; break; } }
+    if (!FallbackDiffuse)
+    {
+        AddWarning(TEXT("Terrain blend material: no diffuse layer textures resolved; using tint."));
+        return nullptr;
+    }
+    for (UTexture2D*& Slice : DiffuseSlices) { if (!Slice) { Slice = FallbackDiffuse; } }
+
+    UTexture2DArray* DiffuseArray = BuildTerrainTextureArray(DiffuseSlices, AssetRel + TEXT("_diffuse_array"), false);
+    if (!DiffuseArray)
+    {
+        return nullptr;
+    }
+    UTexture2DArray* NormalArray = nullptr;
+    if (bAnyNormal)
+    {
+        UTexture2D* FallbackNormal = nullptr;
+        for (UTexture2D* Slice : NormalSlices) { if (Slice) { FallbackNormal = Slice; break; } }
+        for (UTexture2D*& Slice : NormalSlices) { if (!Slice) { Slice = FallbackNormal; } }
+        NormalArray = BuildTerrainTextureArray(NormalSlices, AssetRel + TEXT("_normal_array"), true);
+    }
+    const bool bHasNormalArray = NormalArray != nullptr;
+
+    // Packed control map (RGBA8: overlay/bkgrnd/slope/uvScale indices) + tint.
+    const FString ControlDepot = JsonString(Terrain, TEXT("control"));
+    UTexture* ControlTex = ControlDepot.IsEmpty() ? nullptr : FindTexture(ControlDepot);
+    UTexture* TintTex = FindTexture(JsonString(Terrain, TEXT("base_color_texture")));
+    if (!ControlTex)
+    {
+        AddWarning(TEXT("Terrain blend material: control map missing; using tint."));
+        return nullptr;
+    }
+
+    // Landscape world AABB so the control + tint maps span the terrain once,
+    // locked to world space exactly like the heightmap.
+    const TSharedPtr<FJsonObject>* TransformPtr = nullptr;
+    Terrain->TryGetObjectField(TEXT("transform"), TransformPtr);
+    const TSharedPtr<FJsonObject> TransformObj = TransformPtr ? *TransformPtr : nullptr;
+    const FVector Location = JsonVector(TransformObj, TEXT("location"), FVector::ZeroVector);
+    const float SizeCm = static_cast<float>(JsonNumber(Terrain, TEXT("terrain_size"), 1.0) * 100.0);
+
+    UMaterial* Material = LoadExistingAsset<UMaterial>(ObjectPathFor(AssetRel));
+    const bool bUpdatingExistingMaterial = Material != nullptr;
+    if (!Material)
+    {
+        FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+        UMaterialFactoryNew* Factory = NewObject<UMaterialFactoryNew>();
+        Material = Cast<UMaterial>(AssetToolsModule.Get().CreateAsset(
+            AssetRelName(AssetRel), PackagePathFor(AssetRel), UMaterial::StaticClass(), Factory));
+    }
+    if (!Material)
+    {
+        return nullptr;
+    }
+    Material->PreEditChange(nullptr);
+    if (bUpdatingExistingMaterial)
+    {
+        UMaterialEditingLibrary::DeleteAllMaterialExpressions(Material);
+    }
+    Material->bTangentSpaceNormal = false;
+
+    auto NewExpr = [&](UClass* Cls, int32 X, int32 Y) -> UMaterialExpression*
+    {
+        return UMaterialEditingLibrary::CreateMaterialExpression(Material, Cls, X, Y);
+    };
+
+    // World XY -> uv01 = (worldXY - corner) / size, for the control + tint maps.
+    UMaterialExpression* WorldPos = NewExpr(UMaterialExpressionWorldPosition::StaticClass(), -1700, 0);
+    UMaterialExpressionComponentMask* WorldXY = Cast<UMaterialExpressionComponentMask>(
+        NewExpr(UMaterialExpressionComponentMask::StaticClass(), -1500, 0));
+    WorldXY->R = true; WorldXY->G = true; WorldXY->B = false; WorldXY->A = false;
+    WorldXY->Input.Connect(0, WorldPos);
+    UMaterialExpressionConstant2Vector* Corner = Cast<UMaterialExpressionConstant2Vector>(
+        NewExpr(UMaterialExpressionConstant2Vector::StaticClass(), -1500, 250));
+    Corner->R = static_cast<float>(Location.X);
+    Corner->G = static_cast<float>(Location.Y);
+    UMaterialExpressionSubtract* Centered = Cast<UMaterialExpressionSubtract>(
+        NewExpr(UMaterialExpressionSubtract::StaticClass(), -1300, 0));
+    Centered->A.Connect(0, WorldXY);
+    Centered->B.Connect(0, Corner);
+    UMaterialExpressionDivide* UV01 = Cast<UMaterialExpressionDivide>(
+        NewExpr(UMaterialExpressionDivide::StaticClass(), -1100, 0));
+    UV01->A.Connect(0, Centered);
+    UV01->ConstB = SizeCm;
+
+    UMaterialExpression* WorldPos2 = NewExpr(UMaterialExpressionWorldPosition::StaticClass(), -1100, 250);
+    UMaterialExpression* SurfaceNormal = NewExpr(UMaterialExpressionVertexNormalWS::StaticClass(), -1100, 450);
+
+    auto TexObj = [&](UTexture* Tex, int32 Y) -> UMaterialExpression*
+    {
+        UMaterialExpressionTextureObject* Obj = Cast<UMaterialExpressionTextureObject>(
+            NewExpr(UMaterialExpressionTextureObject::StaticClass(), -800, Y));
+        Obj->Texture = Tex;
+        return Obj;
+    };
+    UMaterialExpression* DiffuseObj = TexObj(DiffuseArray, 600);
+    UMaterialExpression* NormalObj = TexObj(bHasNormalArray ? (UTexture*)NormalArray : (UTexture*)DiffuseArray, 800);
+    UMaterialExpression* ControlObj = TexObj(ControlTex, 1000);
+    UMaterialExpression* TintObj = TexObj(TintTex ? TintTex : ControlTex, 1200);
+    auto ScalarParam = [&](const TCHAR* Name, float DefaultValue, int32 Y) -> UMaterialExpression*
+    {
+        UMaterialExpressionScalarParameter* Param = Cast<UMaterialExpressionScalarParameter>(
+            NewExpr(UMaterialExpressionScalarParameter::StaticClass(), -800, Y));
+        Param->ParameterName = FName(Name);
+        Param->DefaultValue = DefaultValue;
+        return Param;
+    };
+    UMaterialExpression* DebugMode = ScalarParam(TEXT("TerrainDebugMode"), 0.0f, 1400);
+    UMaterialExpression* NormalStrength = ScalarParam(TEXT("TerrainNormalStrength"), 1.0f, 1550);
+    UMaterialExpression* TextureOffsetCmX = ScalarParam(TEXT("TerrainTextureOffsetCmX"), 0.0f, 1700);
+    UMaterialExpression* TextureOffsetCmY = ScalarParam(TEXT("TerrainTextureOffsetCmY"), 0.0f, 1850);
+    UMaterialExpression* ControlOffsetCmX = ScalarParam(TEXT("TerrainControlOffsetCmX"), 0.0f, 2000);
+    UMaterialExpression* ControlOffsetCmY = ScalarParam(TEXT("TerrainControlOffsetCmY"), 0.0f, 2150);
+    UMaterialExpressionConstant* TerrainSizeCm = Cast<UMaterialExpressionConstant>(
+        NewExpr(UMaterialExpressionConstant::StaticClass(), -800, 2300));
+    TerrainSizeCm->R = SizeCm;
+
+    // Custom HLSL node implementing the W3 terrain material blend: decode the
+    // packed control texel, sample the OVERLAY (flat top-down, fixed scale) and
+    // BACKGROUND (triplanar, per-texel UV scale) atlas slices, blend by surface
+    // slope, then apply the tint as a per-channel overlay/screen blend.
+    UMaterialExpressionCustom* Custom = Cast<UMaterialExpressionCustom>(
+        NewExpr(UMaterialExpressionCustom::StaticClass(), 0, 300));
+    Custom->OutputType = CMOT_Float3;
+    FCustomOutput NormalOut;
+    NormalOut.OutputName = FName(TEXT("OutNormal"));
+    NormalOut.OutputType = CMOT_Float3;
+    Custom->AdditionalOutputs.Add(NormalOut);
+    FCustomOutput RoughnessOut;
+    RoughnessOut.OutputName = FName(TEXT("OutRoughness"));
+    RoughnessOut.OutputType = CMOT_Float1;
+    Custom->AdditionalOutputs.Add(RoughnessOut);
+    FCustomOutput SpecularOut;
+    SpecularOut.OutputName = FName(TEXT("OutSpecular"));
+    SpecularOut.OutputType = CMOT_Float1;
+    Custom->AdditionalOutputs.Add(SpecularOut);
+
+    Custom->Inputs.Empty();
+    auto AddInput = [&](const TCHAR* Name, UMaterialExpression* Src)
+    {
+        FCustomInput In;
+        In.InputName = FName(Name);
+        In.Input.Connect(0, Src);
+        Custom->Inputs.Add(In);
+    };
+    AddInput(TEXT("WorldPos"), WorldPos2);
+    AddInput(TEXT("VertexNormal"), SurfaceNormal);
+    AddInput(TEXT("UV01"), UV01);
+    AddInput(TEXT("DiffuseArray"), DiffuseObj);
+    AddInput(TEXT("NormalArray"), NormalObj);
+    AddInput(TEXT("ControlTex"), ControlObj);
+    AddInput(TEXT("TintTex"), TintObj);
+    AddInput(TEXT("DebugMode"), DebugMode);
+    AddInput(TEXT("NormalStrength"), NormalStrength);
+    AddInput(TEXT("TextureOffsetCmX"), TextureOffsetCmX);
+    AddInput(TEXT("TextureOffsetCmY"), TextureOffsetCmY);
+    AddInput(TEXT("ControlOffsetCmX"), ControlOffsetCmX);
+    AddInput(TEXT("ControlOffsetCmY"), ControlOffsetCmY);
+    AddInput(TEXT("TerrainSizeCm"), TerrainSizeCm);
+
+    FString TerrainShaderCode = FString(R"HLSL(
+// SampleLevel/Load only (no screen derivatives) so the node is valid in every
+// shader stage, including ray/path-tracing closest-hit.
+#define W3_NORMAL_X(RAW) ((RAW).r * 2.0 - 1.0)
+#define W3_NORMAL_Y(RAW) ((1.0 - (RAW).g) * 2.0 - 1.0)
+#define W3_DECODE_NORMAL(RAW) normalize(float3(W3_NORMAL_X(RAW), W3_NORMAL_Y(RAW), sqrt(saturate(1.0 - W3_NORMAL_X(RAW) * W3_NORMAL_X(RAW) - W3_NORMAL_Y(RAW) * W3_NORMAL_Y(RAW)))))
+
+float3 wpM = WorldPos / 100.0;
+float3 N = normalize(VertexNormal);
+float3 up = float3(0.0, 0.0, 1.0);
+float normalStrength = max(NormalStrength, 0.0);
+float2 controlUV = UV01 + float2(ControlOffsetCmX, ControlOffsetCmY) / max(TerrainSizeCm, 1.0);
+
+float scaleMap[8] = {0.333,0.166,0.05,0.025,0.0125,0.0075,0.00375,0.0};
+float thrMap[8]   = {0.0,0.125,0.25,0.375,0.5,0.625,0.75,0.98};
+float blendSharpMap[__LAYER_PARAM_COUNT__] = {__BLEND_SHARPNESS__};
+float slopeBaseDampMap[__LAYER_PARAM_COUNT__] = {__SLOPE_BASE_DAMPENING__};
+float slopeNormalDampMap[__LAYER_PARAM_COUNT__] = {__SLOPE_NORMAL_DAMPENING__};
+float falloffMap[__LAYER_PARAM_COUNT__] = {__FALLOFF__};
+float specularityMap[__LAYER_PARAM_COUNT__] = {__SPECULARITY__};
+float specularityBaseMap[__LAYER_PARAM_COUNT__] = {__SPECULARITY_BASE__};
+float specularityScaleMap[__LAYER_PARAM_COUNT__] = {__SPECULARITY_SCALE__};
+float hasNormals = __HAS_NORMALS__;
+
+// Atlas tiling is sampled in the W3 world frame. Keep the Y flip that matches
+// current REDkit orientation tests.
+float3 textureWorldM = wpM + float3(TextureOffsetCmX, TextureOffsetCmY, 0.0) / 100.0;
+float3 texPos = float3(textureWorldM.x, -textureWorldM.y, textureWorldM.z);
+float2 ovUV = texPos.xy * 0.333;   // OVERLAY: flat top-down, fixed scale.
+
+// Triplanar weights are derived from the landscape normal. The 0.576 threshold
+// comes from the reference terrain shader and tightens the blend around axes.
+float3 an = abs(N);
+float3 tw = max(an - 0.576, float3(0.0,0.0,0.0));
+tw /= max(tw.x + tw.y + tw.z, 1e-4);
+
+// 4-tap bilinear control interpolation. RED interpolates the chosen overlay,
+// background, threshold, and material params, then makes one slope decision.
+uint cw, ch;
+ControlTex.GetDimensions(cw, ch);
+float2 cdim = float2(cw, ch);
+// RED converts terrain-space position to texel space as UV * resolution and
+// floors it. Our packed map is flipped vertically to live in UE's Y-mirrored
+// frame, so the matching continuous texel coordinate is X: UV*N, Y: UV*N-1.
+float2 controlCpos = controlUV * cdim + float2(0.0, -1.0);
+float2 cpos = controlCpos;
+float2 cf = frac(cpos);
+int2 c0 = int2(floor(cpos));
+int2 cmax = int2((int)cw - 1, (int)ch - 1);
+
+float wts[4];
+wts[0] = (1.0-cf.x)*(1.0-cf.y);
+wts[1] = cf.x*(1.0-cf.y);
+wts[2] = (1.0-cf.x)*cf.y;
+wts[3] = cf.x*cf.y;
+int2 offs[4];
+offs[0]=int2(0,0); offs[1]=int2(1,0); offs[2]=int2(0,1); offs[3]=int2(1,1);
+
+float3 overlayDiff = float3(0,0,0);
+float3 backgroundDiff = float3(0,0,0);
+float3 overlayNorm = float3(0,0,0);
+float3 backgroundNorm = float3(0,0,0);
+float overlayRough = 0.0;
+float backgroundRough = 0.0;
+float overlaySpecularity = 0.0;
+float backgroundSpecularity = 0.0;
+float overlaySpecBase = 0.0;
+float backgroundSpecBase = 0.0;
+float overlaySpecScale = 0.0;
+float backgroundSpecScale = 0.0;
+float overlayFalloff = 0.0;
+float backgroundFalloff = 0.0;
+float slopeThreshold = 0.0;
+float blendSharpness = 0.0;
+float slopeBaseDampening = 0.0;
+float slopeNormalDampening = 0.0;
+float4 controlDebug = float4(0,0,0,0);
+
+[unroll]
+for (int i = 0; i < 4; i++)
+{
+    if (wts[i] < 1e-4) { continue; }
+    int2 coord = clamp(c0 + offs[i], int2(0,0), cmax);
+    float4 cc = ControlTex.Load(int3(coord, 0));
+    int ov = min(max((int)round(cc.r * 255.0) - 1, 0), __LAYER_COUNT__ - 1);
+    int bg = min(max((int)round(cc.g * 255.0) - 1, 0), __LAYER_COUNT__ - 1);
+    int sl = min(max((int)round(cc.b * 255.0), 0), 7);
+    int uvi = min(max((int)round(cc.a * 255.0), 0), 7);
+    float w = wts[i];
+    float bkScale = scaleMap[uvi];
+
+    float3 ovD = DiffuseArray.SampleLevel(DiffuseArraySampler, float3(ovUV, (float)ov), 0.0).rgb;
+
+    float2 uvTop = texPos.xy * bkScale;
+    float2 uvSY  = texPos.xz * bkScale;
+    float2 uvSX  = texPos.yz * bkScale;
+    float3 bgD = tw.z * DiffuseArray.SampleLevel(DiffuseArraySampler, float3(uvTop, (float)bg), 0.0).rgb
+               + tw.y * DiffuseArray.SampleLevel(DiffuseArraySampler, float3(uvSY,  (float)bg), 0.0).rgb
+               + tw.x * DiffuseArray.SampleLevel(DiffuseArraySampler, float3(uvSX,  (float)bg), 0.0).rgb;
+
+    float3 ovNw = up;
+    float3 bgNw = up;
+    float ovR = 0.9;
+    float bgR = 0.9;
+    if (hasNormals > 0.5)
+    {
+        float4 ovRaw = NormalArray.SampleLevel(NormalArraySampler, float3(ovUV, (float)ov), 0.0);
+        float3 ovNt = W3_DECODE_NORMAL(ovRaw);
+        ovNw = normalize(float3(ovNt.x, ovNt.y, max(ovNt.z, 1e-3)));
+        ovR = ovRaw.a;
+
+        float4 rawTop = NormalArray.SampleLevel(NormalArraySampler, float3(uvTop, (float)bg), 0.0);
+        float4 rawSY  = NormalArray.SampleLevel(NormalArraySampler, float3(uvSY,  (float)bg), 0.0);
+        float4 rawSX  = NormalArray.SampleLevel(NormalArraySampler, float3(uvSX,  (float)bg), 0.0);
+        float3 nTop = W3_DECODE_NORMAL(rawTop);
+        float3 nSY  = W3_DECODE_NORMAL(rawSY);
+        float3 nSX  = W3_DECODE_NORMAL(rawSX);
+        float3 bgTopN = normalize(float3(nTop.x, nTop.y, max(nTop.z, 1e-3)));
+        float3 bgSYN  = normalize(float3(nSY.x,  max(nSY.z, 1e-3), nSY.y));
+        float3 bgSXN  = normalize(float3(max(nSX.z, 1e-3), nSX.x,  nSX.y));
+        bgNw = normalize(tw.z * bgTopN + tw.y * bgSYN + tw.x * bgSXN);
+        bgR = tw.z * rawTop.a + tw.y * rawSY.a + tw.x * rawSX.a;
+    }
+
+    overlayDiff += w * ovD;
+    backgroundDiff += w * bgD;
+    overlayNorm += w * ovNw;
+    backgroundNorm += w * bgNw;
+    overlayRough += w * ovR;
+    backgroundRough += w * bgR;
+    overlaySpecularity += w * specularityMap[ov];
+    backgroundSpecularity += w * specularityMap[bg];
+    overlaySpecBase += w * specularityBaseMap[ov];
+    backgroundSpecBase += w * specularityBaseMap[bg];
+    overlaySpecScale += w * specularityScaleMap[ov];
+    backgroundSpecScale += w * specularityScaleMap[bg];
+    overlayFalloff += w * falloffMap[ov];
+    backgroundFalloff += w * falloffMap[bg];
+    slopeThreshold += w * thrMap[sl];
+    blendSharpness += w * blendSharpMap[ov];
+    slopeBaseDampening += w * slopeBaseDampMap[bg];
+    slopeNormalDampening += w * slopeNormalDampMap[bg];
+    controlDebug += w * float4(((float)ov + 1.0) / 31.0, ((float)bg + 1.0) / 31.0, (float)sl / 7.0, (float)uvi / 7.0);
+}
+
+overlayNorm = normalize(overlayNorm);
+backgroundNorm = normalize(backgroundNorm);
+float3 slopeBackgroundNorm = backgroundNorm;
+float3 overlayNormDebug = overlayNorm;
+float3 backgroundNormDebug = backgroundNorm;
+overlayNorm = normalize(float3(overlayNorm.xy * normalStrength, max(overlayNorm.z, 1e-3)));
+float3 finalBackgroundNorm = normalize(float3(backgroundNorm.xy * normalStrength, max(backgroundNorm.z, 1e-3)));
+finalBackgroundNorm = normalize(lerp(up, finalBackgroundNorm, saturate(slopeNormalDampening)));
+
+// Reference-style slope blend: bias the background normal toward up on flatter
+// terrain, then use tan(slope) against the bilinearly interpolated threshold.
+float vertexFlatness = saturate(dot(N, up));
+float3 flattenedBackground = lerp(slopeBackgroundNorm, up, vertexFlatness);
+float3 biasedBackground = normalize(lerp(slopeBackgroundNorm, flattenedBackground, saturate(slopeBaseDampening)));
+float slopeValue = saturate((abs(biasedBackground.x) + abs(biasedBackground.y)) / max(abs(biasedBackground.z), 1e-3));
+float surfaceSlopeBlend = saturate((slopeValue - slopeThreshold) / max(blendSharpness, 1e-3));
+
+float3 diff = lerp(overlayDiff, backgroundDiff, surfaceSlopeBlend);
+float3 worldNormal = normalize(lerp(overlayNorm, finalBackgroundNorm, surfaceSlopeBlend));
+float roughness = saturate(lerp(overlayRough, backgroundRough, surfaceSlopeBlend));
+float specularity = lerp(overlaySpecularity, backgroundSpecularity, surfaceSlopeBlend);
+float specBase = lerp(overlaySpecBase, backgroundSpecBase, surfaceSlopeBlend);
+float specScale = lerp(overlaySpecScale, backgroundSpecScale, surfaceSlopeBlend);
+float falloff = lerp(overlayFalloff, backgroundFalloff, surfaceSlopeBlend);
+float specular = saturate(specularity);
+if (hasNormals < 0.5)
+{
+    worldNormal = N;
+    roughness = saturate(specBase + specScale);
+}
+OutNormal = worldNormal;
+OutRoughness = roughness;
+OutSpecular = specular;
+
+// Tint: per-channel overlay/screen blend (gives the large-scale colour).
+float2 colorUV = saturate((controlCpos + 0.5) / max(cdim, float2(1.0, 1.0)));
+float3 tint = TintTex.SampleLevel(TintTexSampler, colorUV, 0.0).rgb;
+float3 darken = 2.0 * tint * diff;
+float3 screen = 1.0 - 2.0 * (1.0 - tint) * (1.0 - diff);
+float3 tinted = lerp(darken, screen, step(0.5, tint));
+
+int dbg = (int)floor(DebugMode + 0.5);
+if (dbg == 1) { return overlayDiff; }
+if (dbg == 2) { return backgroundDiff; }
+if (dbg == 3) { return float3(surfaceSlopeBlend, surfaceSlopeBlend, surfaceSlopeBlend); }
+if (dbg == 4) { return controlDebug.rgb; }
+if (dbg == 5) { return worldNormal * 0.5 + 0.5; }
+if (dbg == 6) { return tint; }
+if (dbg == 7) { return float3(slopeThreshold, blendSharpness, slopeBaseDampening); }
+if (dbg == 8) { return float3(frac(ovUV.x), frac(ovUV.y), 0.0); }
+if (dbg == 9) { return float3(frac(controlCpos.x), frac(controlCpos.y), 0.0); }
+if (dbg == 10) { return overlayNormDebug * 0.5 + 0.5; }
+if (dbg == 11) { return backgroundNormDebug * 0.5 + 0.5; }
+if (dbg == 12) { return float3(hasNormals, saturate(normalStrength / 4.0), slopeNormalDampening); }
+if (dbg == 13) { return float3(roughness, specular, saturate(falloff)); }
+return tinted;
+)HLSL");
+    TerrainShaderCode.ReplaceInline(TEXT("__LAYER_COUNT__"), *FString::FromInt(FMath::Max(1, Layers->Num())));
+    TerrainShaderCode.ReplaceInline(TEXT("__LAYER_PARAM_COUNT__"), *FString::FromInt(ParamCount));
+    TerrainShaderCode.ReplaceInline(TEXT("__BLEND_SHARPNESS__"), *BlendSharpnessCode);
+    TerrainShaderCode.ReplaceInline(TEXT("__SLOPE_BASE_DAMPENING__"), *SlopeBaseDampeningCode);
+    TerrainShaderCode.ReplaceInline(TEXT("__SLOPE_NORMAL_DAMPENING__"), *SlopeNormalDampeningCode);
+    TerrainShaderCode.ReplaceInline(TEXT("__FALLOFF__"), *FalloffCode);
+    TerrainShaderCode.ReplaceInline(TEXT("__SPECULARITY__"), *SpecularityCode);
+    TerrainShaderCode.ReplaceInline(TEXT("__SPECULARITY_BASE__"), *SpecularityBaseCode);
+    TerrainShaderCode.ReplaceInline(TEXT("__SPECULARITY_SCALE__"), *SpecularityScaleCode);
+    TerrainShaderCode.ReplaceInline(TEXT("__HAS_NORMALS__"), bHasNormalArray ? TEXT("1.0") : TEXT("0.0"));
+    Custom->Code = TerrainShaderCode;
+
+    // Rebuild explicitly so the named outputs exist before we connect them.
+    Custom->RebuildOutputs();
+
+    auto ConnectCustomOutput = [&](EMaterialProperty Property, int32 OutputIndex)
+    {
+        if (FExpressionInput* Input = Material->GetExpressionInputForProperty(Property))
+        {
+            Input->Connect(OutputIndex, Custom);
+        }
+    };
+    ConnectCustomOutput(MP_BaseColor, 0);
+    ConnectCustomOutput(MP_Normal, 1);
+    ConnectCustomOutput(MP_Roughness, 2);
+    ConnectCustomOutput(MP_Specular, 3);
+
+    Material->PostEditChange();
+    Material->MarkPackageDirty();
+    UMaterialEditingLibrary::RecompileMaterial(Material);
+    return Material;
+}
+
 void FWitcherImportContext::ImportTerrain()
 {
     const TSharedPtr<FJsonObject>* TerrainPtr = nullptr;
@@ -1426,17 +2008,25 @@ void FWitcherImportContext::ImportTerrain()
     UMaterialInterface* TerrainMaterial = nullptr;
     {
         const FString MaterialRel = TerrainAssetRel + TEXT("_terrain_m");
-        TerrainMaterial = LoadExistingAsset<UMaterialInterface>(ObjectPathFor(MaterialRel));
+        const TArray<TSharedPtr<FJsonValue>>* Layers = nullptr;
+        if (Terrain->TryGetArrayField(TEXT("layers"), Layers) && Layers->Num() > 0)
+        {
+            TerrainMaterial = BuildTerrainBlendMaterial(Terrain, MaterialRel);
+        }
+        if (!TerrainMaterial)
+        {
+            TerrainMaterial = LoadExistingAsset<UMaterialInterface>(ObjectPathFor(MaterialRel));
+        }
         if (!TerrainMaterial)
         {
             UTexture* TintTexture = FindTexture(JsonString(Terrain, TEXT("base_color_texture")));
             TerrainMaterial = CreateSimpleMaterial(
                 PackagePathFor(MaterialRel), AssetRelName(MaterialRel),
                 TintTexture, FLinearColor(0.18f, 0.22f, 0.12f), /*bTranslucent=*/false);
-            if (TerrainMaterial)
-            {
-                ImportedAssets.Add(TerrainMaterial->GetPathName());
-            }
+        }
+        if (TerrainMaterial)
+        {
+            ImportedAssets.Add(TerrainMaterial->GetPathName());
         }
     }
 
