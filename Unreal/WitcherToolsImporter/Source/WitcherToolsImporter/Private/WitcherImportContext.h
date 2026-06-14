@@ -35,6 +35,7 @@ private:
     void ImportMeshes();
     void ImportAnimations();
     void ImportBlueprint();
+    void ImportTerrain();
 
     UTexture* ImportTexture(const TSharedPtr<FJsonObject>& TextureObject);
     UMaterialInterface* EnsureMasterMaterial(const TSharedPtr<FJsonObject>& MasterObject);

@@ -10,6 +10,7 @@ from bpy.props import BoolProperty, EnumProperty, IntProperty, PointerProperty, 
 
 from ..ui.ui_utils import WITCH_PT_Base
 from . import bundle
+from . import world_bundle
 from . import plugin_install
 from . import unreal_project
 from .socket_client import send_import_request
@@ -137,6 +138,59 @@ class WITCHER_OT_export_unreal_item(bpy.types.Operator):
             return {"FINISHED"}
         except Exception as exc:
             settings.last_status = "Unreal export failed"
+            settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+
+class WITCHER_OT_export_unreal_world(bpy.types.Operator):
+    bl_idname = "witcher.export_unreal_world"
+    bl_label = "Export World Terrain to Unreal"
+    bl_description = (
+        "Export the selected full-map terrain as an Unreal Landscape bundle "
+        "(heightmap, transform, water). Import the world's .w2w terrain in Full "
+        "Map mode and select it first"
+    )
+    bl_options = {"REGISTER"}
+
+    action: EnumProperty(
+        name="Action",
+        items=[
+            ("BUNDLE", "Export Bundle", "Write the terrain R16, textures, and manifest"),
+            ("SEND", "Send to Unreal", "Write the bundle and send it to the running Unreal plugin"),
+        ],
+        default="BUNDLE",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context is not None and context.scene is not None
+
+    def execute(self, context):
+        settings = context.scene.witcher_unreal_export
+        if not settings.export_folder:
+            settings.export_folder = bundle.default_export_folder()
+
+        try:
+            result = world_bundle.build_unreal_world_bundle(context, settings)
+            settings.last_manifest_path = result["manifest_path"]
+            warning_count = len(result["manifest"].get("warnings", []))
+            settings.last_status = f"World bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
+            settings.last_details = _format_world_bundle_details(result)
+
+            if self.action == "SEND":
+                response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                success = bool(response.get("success"))
+                settings.last_status = "Unreal terrain import complete" if success else "Unreal terrain import failed"
+                settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
+                if not success:
+                    self.report({"ERROR"}, settings.last_status)
+                    return {"CANCELLED"}
+
+            self.report({"INFO"}, settings.last_status)
+            return {"FINISHED"}
+        except Exception as exc:
+            settings.last_status = "Unreal world export failed"
             settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -318,6 +372,18 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
         )
         send.action = "SEND"
 
+        box.separator()
+        box.label(text="World Terrain (Landscape)", icon="WORLD")
+        world_row = box.row(align=True)
+        w_bundle = world_row.operator(
+            WITCHER_OT_export_unreal_world.bl_idname, text="Export Terrain", icon="FILE_TICK"
+        )
+        w_bundle.action = "BUNDLE"
+        w_send = world_row.operator(
+            WITCHER_OT_export_unreal_world.bl_idname, text="Send Terrain", icon="URL"
+        )
+        w_send.action = "SEND"
+
         if _expander(box, settings, "show_connection", "Connection"):
             conn = box.column()
             conn.use_property_split = True
@@ -373,9 +439,43 @@ def _format_bundle_details(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_world_bundle_details(result: dict) -> str:
+    manifest = result.get("manifest", {})
+    terrain = manifest.get("terrain", {}) or {}
+    transform = terrain.get("transform", {}) or {}
+    elevation = terrain.get("elevation", {}) or {}
+    lines = [
+        f"Asset: {result.get('asset_name', '')}",
+        f"Bundle: {result.get('bundle_root', '')}",
+        f"Manifest: {result.get('manifest_path', '')}",
+        f"Content root: {manifest.get('content_root', '')}",
+        "",
+        "Terrain:",
+        f"- Landscape asset: {terrain.get('asset_path', '')}",
+        f"- Heightmap R16: {terrain.get('heightmap_r16', '')}",
+        f"- Resolution: {terrain.get('resolution', '')} (source {terrain.get('source_resolution', '')})",
+        f"- Components/axis: {terrain.get('component_count_per_axis', '')}"
+        f" @ {terrain.get('subsection_size_quads', '')} quads x {terrain.get('num_subsections', '')} sub",
+        f"- Terrain size: {terrain.get('terrain_size', '')} m",
+        f"- Elevation: {elevation.get('lowest', '')} .. {elevation.get('highest', '')} m",
+        f"- Location (cm): {transform.get('location', '')}",
+        f"- Scale (cm): {transform.get('scale', '')}",
+        f"- Base colour tex: {terrain.get('base_color_texture', '') or '(none)'}",
+        "",
+        "Warnings:",
+    ]
+    warnings = manifest.get("warnings", [])
+    if warnings:
+        lines.extend(f"- {warning}" for warning in warnings)
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
 classes = (
     WITCHER_PG_UnrealExportSettings,
     WITCHER_OT_export_unreal_item,
+    WITCHER_OT_export_unreal_world,
     WITCHER_OT_install_unreal_plugin,
     WITCHER_OT_unreal_export_details,
     WITCHER_OT_unreal_project_details,

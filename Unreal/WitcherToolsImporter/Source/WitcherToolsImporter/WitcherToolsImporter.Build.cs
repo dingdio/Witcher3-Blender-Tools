@@ -23,7 +23,9 @@ public class WitcherToolsImporter : ModuleRules
             "AssetTools",
             "MaterialEditor",
             "UnrealEd",
-            "WitcherToolsRuntime"
+            "WitcherToolsRuntime",
+            "Landscape",
+            "LandscapeEditor"
         });
     }
 }

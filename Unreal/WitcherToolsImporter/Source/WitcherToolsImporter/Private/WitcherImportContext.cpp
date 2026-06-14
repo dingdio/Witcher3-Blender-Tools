@@ -6,14 +6,25 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Components/StaticMeshComponent.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/StaticMeshActor.h"
 #include "Engine/Texture.h"
 #include "Engine/Texture2D.h"
+#include "Editor.h"
+#include "Landscape.h"
+#include "LandscapeInfo.h"
+#include "LandscapeProxy.h"
+#include "LandscapeImportHelper.h"
+#include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionConstant3Vector.h"
+#include "Materials/MaterialExpressionConstant4Vector.h"
+#include "Materials/MaterialExpressionTextureSample.h"
 #include "Factories/FbxAnimSequenceImportData.h"
 #include "Factories/FbxImportUI.h"
 #include "Factories/FbxSkeletalMeshImportData.h"
@@ -94,6 +105,97 @@ FLinearColor JsonColor(const TSharedPtr<FJsonObject>& Object, const FString& Fie
         Color.A = Values->Num() > 3 ? static_cast<float>((*Values)[3]->AsNumber()) : 1.0f;
     }
     return Color;
+}
+
+FVector JsonVector(const TSharedPtr<FJsonObject>& Object, const FString& Field, const FVector& DefaultValue)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+    if (Object.IsValid() && Object->TryGetArrayField(Field, Values) && Values->Num() >= 3)
+    {
+        return FVector(
+            (*Values)[0]->AsNumber(),
+            (*Values)[1]->AsNumber(),
+            (*Values)[2]->AsNumber());
+    }
+    return DefaultValue;
+}
+
+/** Minimal UMaterial: a texture or flat colour into BaseColor, with a fixed
+ *  roughness; optionally translucent (for the world water plane). */
+UMaterialInterface* CreateSimpleMaterial(
+    const FString& PackagePath,
+    const FString& Name,
+    UTexture* BaseColorTexture,
+    const FLinearColor& FallbackColor,
+    bool bTranslucent)
+{
+    FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+    UMaterialFactoryNew* Factory = NewObject<UMaterialFactoryNew>();
+    UMaterial* Material = Cast<UMaterial>(
+        AssetToolsModule.Get().CreateAsset(Name, PackagePath, UMaterial::StaticClass(), Factory));
+    if (!Material)
+    {
+        return nullptr;
+    }
+
+    Material->PreEditChange(nullptr);
+    if (bTranslucent)
+    {
+        Material->BlendMode = BLEND_Translucent;
+    }
+
+    UMaterialExpression* BaseColorSource = nullptr;
+    if (BaseColorTexture)
+    {
+        UMaterialExpressionTextureSample* TextureSample = Cast<UMaterialExpressionTextureSample>(
+            UMaterialEditingLibrary::CreateMaterialExpression(
+                Material, UMaterialExpressionTextureSample::StaticClass(), -400, 0));
+        if (TextureSample)
+        {
+            TextureSample->Texture = BaseColorTexture;
+            TextureSample->SamplerType = SAMPLERTYPE_Color;
+            BaseColorSource = TextureSample;
+        }
+    }
+    if (!BaseColorSource)
+    {
+        UMaterialExpressionConstant3Vector* ColorExpr = Cast<UMaterialExpressionConstant3Vector>(
+            UMaterialEditingLibrary::CreateMaterialExpression(
+                Material, UMaterialExpressionConstant3Vector::StaticClass(), -400, 0));
+        if (ColorExpr)
+        {
+            ColorExpr->Constant = FallbackColor;
+            BaseColorSource = ColorExpr;
+        }
+    }
+    if (BaseColorSource)
+    {
+        UMaterialEditingLibrary::ConnectMaterialProperty(BaseColorSource, TEXT(""), MP_BaseColor);
+    }
+
+    if (UMaterialExpressionConstant* Roughness = Cast<UMaterialExpressionConstant>(
+            UMaterialEditingLibrary::CreateMaterialExpression(
+                Material, UMaterialExpressionConstant::StaticClass(), -400, 250)))
+    {
+        Roughness->R = bTranslucent ? 0.06f : 0.92f;
+        UMaterialEditingLibrary::ConnectMaterialProperty(Roughness, TEXT(""), MP_Roughness);
+    }
+
+    if (bTranslucent)
+    {
+        if (UMaterialExpressionConstant* Opacity = Cast<UMaterialExpressionConstant>(
+                UMaterialEditingLibrary::CreateMaterialExpression(
+                    Material, UMaterialExpressionConstant::StaticClass(), -400, 400)))
+        {
+            Opacity->R = 0.55f;
+            UMaterialEditingLibrary::ConnectMaterialProperty(Opacity, TEXT(""), MP_Opacity);
+        }
+    }
+
+    Material->PostEditChange();
+    Material->MarkPackageDirty();
+    UMaterialEditingLibrary::RecompileMaterial(Material);
+    return Material;
 }
 
 void SetStringArray(TSharedPtr<FJsonObject> Object, const FString& Field, const TArray<FString>& Values)
@@ -315,6 +417,7 @@ FString FWitcherImportContext::ImportBundle()
     ImportMeshes();
     ImportAnimations();
     ImportBlueprint();
+    ImportTerrain();
 
     return BuildResponse(Errors.Num() == 0);
 }
@@ -1266,6 +1369,158 @@ void FWitcherImportContext::ImportBlueprint()
     FKismetEditorUtilities::CompileBlueprint(Blueprint);
     Blueprint->MarkPackageDirty();
     ImportedAssets.Add(Blueprint->GetPathName());
+}
+
+void FWitcherImportContext::ImportTerrain()
+{
+    const TSharedPtr<FJsonObject>* TerrainPtr = nullptr;
+    if (!Manifest->TryGetObjectField(TEXT("terrain"), TerrainPtr) || !TerrainPtr)
+    {
+        return;
+    }
+    const TSharedPtr<FJsonObject> Terrain = *TerrainPtr;
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        AddError(TEXT("Terrain import: no editor world available."));
+        return;
+    }
+
+    // --- heightmap (raw little-endian R16) ---
+    const FString R16Path = ResolveBundleFile(JsonString(Terrain, TEXT("heightmap_r16")));
+    TArray<uint8> RawBytes;
+    if (!FFileHelper::LoadFileToArray(RawBytes, *R16Path))
+    {
+        AddError(FString::Printf(TEXT("Terrain heightmap R16 not found: %s"), *R16Path));
+        return;
+    }
+    const int32 Resolution = JsonInt(Terrain, TEXT("resolution"));
+    const int32 ExpectedSamples = Resolution * Resolution;
+    if (Resolution <= 1 || RawBytes.Num() < ExpectedSamples * 2)
+    {
+        AddError(FString::Printf(TEXT("Terrain heightmap size mismatch: resolution=%d bytes=%d"),
+            Resolution, RawBytes.Num()));
+        return;
+    }
+    TArray<uint16> Heights;
+    Heights.SetNumUninitialized(ExpectedSamples);
+    FMemory::Memcpy(Heights.GetData(), RawBytes.GetData(), ExpectedSamples * sizeof(uint16));
+
+    const int32 MinX = JsonInt(Terrain, TEXT("min_x"), 0);
+    const int32 MinY = JsonInt(Terrain, TEXT("min_y"), 0);
+    const int32 MaxX = JsonInt(Terrain, TEXT("max_x"), Resolution - 1);
+    const int32 MaxY = JsonInt(Terrain, TEXT("max_y"), Resolution - 1);
+    const int32 NumSubsections = JsonInt(Terrain, TEXT("num_subsections"), 1);
+    const int32 SubsectionSizeQuads = JsonInt(Terrain, TEXT("subsection_size_quads"), 63);
+
+    // --- transform (centimetres, from the W3->UE convention in terrain_unreal.py) ---
+    const TSharedPtr<FJsonObject>* TransformPtr = nullptr;
+    Terrain->TryGetObjectField(TEXT("transform"), TransformPtr);
+    const TSharedPtr<FJsonObject> TransformObj = TransformPtr ? *TransformPtr : nullptr;
+    const FVector Location = JsonVector(TransformObj, TEXT("location"), FVector::ZeroVector);
+    const FVector Scale = JsonVector(TransformObj, TEXT("scale"), FVector(100.0, 100.0, 100.0));
+
+    // --- landscape material (tint base colour; Phase 4 swaps in weight blends) ---
+    const FString TerrainAssetRel = JsonString(Terrain, TEXT("asset_path"), TEXT("witcher_terrain"));
+    UMaterialInterface* TerrainMaterial = nullptr;
+    {
+        const FString MaterialRel = TerrainAssetRel + TEXT("_terrain_m");
+        TerrainMaterial = LoadExistingAsset<UMaterialInterface>(ObjectPathFor(MaterialRel));
+        if (!TerrainMaterial)
+        {
+            UTexture* TintTexture = FindTexture(JsonString(Terrain, TEXT("base_color_texture")));
+            TerrainMaterial = CreateSimpleMaterial(
+                PackagePathFor(MaterialRel), AssetRelName(MaterialRel),
+                TintTexture, FLinearColor(0.18f, 0.22f, 0.12f), /*bTranslucent=*/false);
+            if (TerrainMaterial)
+            {
+                ImportedAssets.Add(TerrainMaterial->GetPathName());
+            }
+        }
+    }
+
+    // --- spawn + import the landscape ---
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.ObjectFlags = RF_Transactional;
+    ALandscape* Landscape = World->SpawnActor<ALandscape>();
+    if (!Landscape)
+    {
+        AddError(TEXT("Terrain import: failed to spawn ALandscape."));
+        return;
+    }
+    Landscape->SetActorTransform(FTransform(FQuat::Identity, Location, Scale));
+    if (TerrainMaterial)
+    {
+        Landscape->LandscapeMaterial = TerrainMaterial;
+    }
+
+    TMap<FGuid, TArray<uint16>> HeightDataPerLayer;
+    HeightDataPerLayer.Add(FGuid(), MoveTemp(Heights));
+    TMap<FGuid, TArray<FLandscapeImportLayerInfo>> MaterialLayerDataPerLayer;
+    MaterialLayerDataPerLayer.Add(FGuid(), TArray<FLandscapeImportLayerInfo>());
+
+    Landscape->Import(
+        FGuid::NewGuid(), MinX, MinY, MaxX, MaxY,
+        NumSubsections, SubsectionSizeQuads,
+        HeightDataPerLayer, nullptr,
+        MaterialLayerDataPerLayer, ELandscapeImportAlphamapType::Additive,
+        MakeArrayView(static_cast<const FLandscapeLayer*>(nullptr), 0));
+
+    if (ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo())
+    {
+        LandscapeInfo->UpdateLayerInfoMap(Landscape);
+    }
+    Landscape->PostEditChange();
+    Landscape->SetActorLabel(JsonString(Terrain, TEXT("name"), TEXT("WitcherTerrain")));
+    ImportedAssets.Add(Landscape->GetPathName());
+
+    // --- world water plane (W3 water sits at world Z=0) ---
+    const TSharedPtr<FJsonObject>* WaterPtr = nullptr;
+    if (Terrain->TryGetObjectField(TEXT("water"), WaterPtr) && WaterPtr)
+    {
+        const TSharedPtr<FJsonObject> Water = *WaterPtr;
+        UStaticMesh* PlaneMesh = LoadExistingAsset<UStaticMesh>(TEXT("/Engine/BasicShapes/Plane.Plane"));
+        if (PlaneMesh)
+        {
+            const double WaterZ = JsonNumber(Water, TEXT("z"), 0.0);
+            const double SizeCm = JsonNumber(Water, TEXT("size_cm"), (MaxX - MinX) * Scale.X);
+            AStaticMeshActor* WaterActor = World->SpawnActor<AStaticMeshActor>(
+                FVector(0.0, 0.0, WaterZ), FRotator::ZeroRotator);
+            if (WaterActor && WaterActor->GetStaticMeshComponent())
+            {
+                UStaticMeshComponent* WaterComponent = WaterActor->GetStaticMeshComponent();
+                WaterComponent->SetMobility(EComponentMobility::Movable);
+                WaterComponent->SetStaticMesh(PlaneMesh);
+                // The engine plane is 100 uu (1 m) square, so scale = size in metres.
+                const double PlaneScale = SizeCm / 100.0;
+                WaterActor->SetActorScale3D(FVector(PlaneScale, PlaneScale, 1.0));
+
+                const FString WaterMaterialRel = TerrainAssetRel + TEXT("_water_m");
+                UMaterialInterface* WaterMaterial = LoadExistingAsset<UMaterialInterface>(ObjectPathFor(WaterMaterialRel));
+                if (!WaterMaterial)
+                {
+                    WaterMaterial = CreateSimpleMaterial(
+                        PackagePathFor(WaterMaterialRel), AssetRelName(WaterMaterialRel),
+                        nullptr, FLinearColor(0.02f, 0.16f, 0.24f), /*bTranslucent=*/true);
+                    if (WaterMaterial)
+                    {
+                        ImportedAssets.Add(WaterMaterial->GetPathName());
+                    }
+                }
+                if (WaterMaterial)
+                {
+                    WaterComponent->SetMaterial(0, WaterMaterial);
+                }
+                WaterActor->SetActorLabel(JsonString(Terrain, TEXT("name"), TEXT("WitcherTerrain")) + TEXT("_Water"));
+                ImportedAssets.Add(WaterActor->GetPathName());
+            }
+        }
+        else
+        {
+            AddWarning(TEXT("Water plane skipped: /Engine/BasicShapes/Plane not found."));
+        }
+    }
 }
 
 FString FWitcherImportContext::ResolveBundleFile(const FString& RelativePath) const

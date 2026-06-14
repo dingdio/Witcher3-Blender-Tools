@@ -217,6 +217,7 @@ def build_manifest(
     animations: Iterable[dict[str, Any]] = (),
     rig: dict[str, Any] | None = None,
     blueprint: dict[str, Any] | None = None,
+    terrain: dict[str, Any] | None = None,
     warnings: Iterable[str] = (),
 ) -> dict[str, Any]:
     game = normalize_source_game(source_game)
@@ -237,4 +238,6 @@ def build_manifest(
         manifest["rig"] = rig
     if blueprint:
         manifest["blueprint"] = blueprint
+    if terrain:
+        manifest["terrain"] = terrain
     return manifest
