@@ -914,6 +914,11 @@ def export_fbx(context, export_objects, fbx_path: str, *, object_types=None,
                 use_armature_deform_only=False,
                 # Unreal warns if Blender emits no FBX smoothing-group data.
                 mesh_smooth_type="FACE",
+                # Write per-loop tangents + binormals so UE imports the exact
+                # tangent basis (NormalImportMethod=ImportNormalsAndTangents) rather
+                # than recomputing it and seaming at vertex splits. Tangents are
+                # emitted for the active UV layer, so every exported mesh needs UVs.
+                use_tspace=True,
                 bake_anim=bake_anim,
                 bake_anim_use_all_bones=True,
                 bake_anim_use_nla_strips=False,

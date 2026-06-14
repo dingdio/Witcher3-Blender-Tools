@@ -913,10 +913,15 @@ UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, 
     if (Options->SkeletalMeshImportData)
     {
         Options->SkeletalMeshImportData->bImportMeshesInBoneHierarchy = true;
+        // Honor the custom split normals + tangent basis the Blender exporter
+        Options->SkeletalMeshImportData->NormalImportMethod = FBXNIM_ImportNormalsAndTangents;
+        Options->SkeletalMeshImportData->NormalGenerationMethod = EFBXNormalGenerationMethod::MikkTSpace;
     }
     if (Options->StaticMeshImportData)
     {
         Options->StaticMeshImportData->bCombineMeshes = true;
+        Options->StaticMeshImportData->NormalImportMethod = FBXNIM_ImportNormalsAndTangents;
+        Options->StaticMeshImportData->NormalGenerationMethod = EFBXNormalGenerationMethod::MikkTSpace;
     }
     Task->Options = Options;
 
