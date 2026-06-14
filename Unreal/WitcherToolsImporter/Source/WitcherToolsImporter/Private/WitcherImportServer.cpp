@@ -37,9 +37,13 @@ void FWitcherImportServer::Stop()
     }
     if (Thread)
     {
-        Thread->WaitForCompletion();
-        delete Thread;
+        // Clear the member first: ~FRunnableThread calls Kill(), which
+        // re-enters this Stop() - leaving the pointer set recursed until
+        // stack overflow on editor shutdown.
+        FRunnableThread* LocalThread = Thread;
         Thread = nullptr;
+        LocalThread->WaitForCompletion();
+        delete LocalThread;
     }
     if (ListenSocket)
     {

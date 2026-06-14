@@ -12,6 +12,11 @@
   "Installed": false,
   "Modules": [
     {
+      "Name": "WitcherToolsRuntime",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
       "Name": "WitcherToolsImporter",
       "Type": "Editor",
       "LoadingPhase": "Default"

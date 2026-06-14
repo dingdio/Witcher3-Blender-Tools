@@ -5,6 +5,7 @@
 class UMaterial;
 class UMaterialInterface;
 class UMaterialInstanceConstant;
+class UAnimSequence;
 class USkeleton;
 class UTexture;
 class UObject;
@@ -12,7 +13,7 @@ class FJsonObject;
 class FJsonValue;
 
 /**
- * Imports a witcher_unreal_export.v2 bundle: assets mirror the REDkit depot
+ * Imports a witcher_unreal_export.v2 bundle: assets mirror the Witcher depot
  * layout under the manifest's content root. Existing assets at the mirrored
  * paths (hand-authored master materials, textures, material instances) are
  * reused instead of being recreated.
@@ -32,6 +33,7 @@ private:
     void ImportMaterials();
     void ImportRig();
     void ImportMeshes();
+    void ImportAnimations();
     void ImportBlueprint();
 
     UTexture* ImportTexture(const TSharedPtr<FJsonObject>& TextureObject);
@@ -42,7 +44,9 @@ private:
     UTexture* FindTexture(const FString& DepotRel);
 
     UObject* ImportFbxMesh(const FString& BundleRelativeFbx, const FString& AssetRel, bool bSkeletal, USkeleton* Skeleton);
+    UAnimSequence* ImportAnimation(const TSharedPtr<FJsonObject>& AnimationObject);
     void AssignMaterialsToMesh(UObject* MeshObject, const TSharedPtr<FJsonObject>& MeshEntry);
+    UAnimSequence* FindAnimSequence(const FString& AssetRel);
 
     FString PackagePathFor(const FString& AssetRel) const;
     FString ObjectPathFor(const FString& AssetRel) const;

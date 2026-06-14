@@ -14,7 +14,7 @@ if "witcher3_tools" not in sys.modules:
     _pkg.__package__ = "witcher3_tools"
     sys.modules["witcher3_tools"] = _pkg
 
-from witcher3_tools.unreal_export import texture_export
+from witcher3_tools.unreal_export import bundle, texture_export, unreal_project
 from witcher3_tools.unreal_export.manifest import (
     SCHEMA,
     build_manifest,
@@ -37,6 +37,635 @@ for _name in [n for n in list(sys.modules) if n == "witcher3_tools" or n.startsw
 
 def _stub_register_texture(raw_value, param_name):
     return {"depot": depot_asset_rel(raw_value), "rough_depot": None}
+
+
+class TestFbxExportOptions(unittest.TestCase):
+    def test_export_fbx_emits_unreal_friendly_skeleton_and_smoothing_options(self):
+        captured = {}
+
+        class FakeMesh:
+            type = "MESH"
+            name = "t_01_mg__body_hires"
+
+            def select_set(self, value):
+                self.selected = value
+
+        def fake_fbx_export(**kwargs):
+            captured.update(kwargs)
+
+        previous_bpy = sys.modules.get("bpy")
+        fake_bpy = types.SimpleNamespace(
+            ops=types.SimpleNamespace(
+                object=types.SimpleNamespace(
+                    mode_set=lambda **kwargs: None,
+                    select_all=lambda **kwargs: None,
+                ),
+                export_scene=types.SimpleNamespace(fbx=fake_fbx_export),
+            ),
+            data=types.SimpleNamespace(objects={}),
+        )
+        sys.modules["bpy"] = fake_bpy
+        try:
+            mesh = FakeMesh()
+            context = types.SimpleNamespace(
+                selected_objects=[],
+                object=None,
+                view_layer=types.SimpleNamespace(objects=types.SimpleNamespace(active=None)),
+            )
+
+            bundle.export_fbx(context, [mesh], r"F:\tmp\t_01_mg__body_hires.fbx")
+        finally:
+            if previous_bpy is None:
+                sys.modules.pop("bpy", None)
+            else:
+                sys.modules["bpy"] = previous_bpy
+
+        self.assertEqual(captured["mesh_smooth_type"], "FACE")
+        self.assertFalse(captured["use_armature_deform_only"])
+        self.assertFalse(captured["add_leaf_bones"])
+        self.assertEqual(captured["armature_nodetype"], "NULL")
+        self.assertFalse(captured["bake_anim"])
+        # The m->cm factor rides the Armature root null; the UE plugin
+        # compensates on animation imports with ImportUniformScale=100.
+        self.assertEqual(captured["apply_scale_options"], "FBX_SCALE_NONE")
+        self.assertFalse(captured["bake_space_transform"])
+
+    def test_export_fbx_can_emit_animation_only_fbx_options(self):
+        captured = {}
+
+        class FakeArmature:
+            type = "ARMATURE"
+            name = "geralt_rig"
+
+            def select_set(self, value):
+                self.selected = value
+
+        def fake_fbx_export(**kwargs):
+            captured.update(kwargs)
+
+        previous_bpy = sys.modules.get("bpy")
+        fake_bpy = types.SimpleNamespace(
+            ops=types.SimpleNamespace(
+                object=types.SimpleNamespace(
+                    mode_set=lambda **kwargs: None,
+                    select_all=lambda **kwargs: None,
+                ),
+                export_scene=types.SimpleNamespace(fbx=fake_fbx_export),
+            ),
+            data=types.SimpleNamespace(objects={}),
+        )
+        sys.modules["bpy"] = fake_bpy
+        try:
+            armature = FakeArmature()
+            context = types.SimpleNamespace(
+                selected_objects=[],
+                object=None,
+                view_layer=types.SimpleNamespace(objects=types.SimpleNamespace(active=None)),
+            )
+
+            bundle.export_fbx(
+                context,
+                [armature],
+                r"F:\tmp\attack_fast_l_01.fbx",
+                object_types={"ARMATURE"},
+                bake_anim=True,
+            )
+        finally:
+            if previous_bpy is None:
+                sys.modules.pop("bpy", None)
+            else:
+                sys.modules["bpy"] = previous_bpy
+
+        self.assertEqual(captured["object_types"], {"ARMATURE"})
+        self.assertTrue(captured["bake_anim"])
+        self.assertFalse(captured["bake_anim_use_all_actions"])
+        self.assertFalse(captured["bake_anim_use_nla_strips"])
+        self.assertEqual(captured["bake_anim_simplify_factor"], 0.0)
+        self.assertEqual(captured["armature_nodetype"], "NULL")
+        self.assertEqual(captured["apply_scale_options"], "FBX_SCALE_NONE")
+
+    def test_export_fbx_temporarily_uses_unreal_armature_wrapper_name(self):
+        captured = {}
+
+        class FakeObject:
+            def __init__(self, name, obj_type):
+                self.name = name
+                self.type = obj_type
+                self.selected = False
+
+            def select_set(self, value):
+                self.selected = value
+
+        armature = FakeObject("geralt_player:CMovingPhysicalAgentComponent2_ARM", "ARMATURE")
+        existing_armature_name = FakeObject("Armature", "EMPTY")
+
+        def fake_fbx_export(**kwargs):
+            captured["export_armature_name"] = armature.name
+            captured["collision_name"] = existing_armature_name.name
+            captured.update(kwargs)
+
+        previous_bpy = sys.modules.get("bpy")
+        fake_bpy = types.SimpleNamespace(
+            ops=types.SimpleNamespace(
+                object=types.SimpleNamespace(
+                    mode_set=lambda **kwargs: None,
+                    select_all=lambda **kwargs: None,
+                ),
+                export_scene=types.SimpleNamespace(fbx=fake_fbx_export),
+            ),
+            data=types.SimpleNamespace(objects=[existing_armature_name, armature]),
+        )
+        sys.modules["bpy"] = fake_bpy
+        try:
+            context = types.SimpleNamespace(
+                selected_objects=[],
+                object=None,
+                view_layer=types.SimpleNamespace(objects=types.SimpleNamespace(active=None)),
+            )
+
+            bundle.export_fbx(
+                context,
+                [armature],
+                r"F:\tmp\attack_fast_l_01.fbx",
+                object_types={"ARMATURE"},
+                bake_anim=True,
+            )
+        finally:
+            if previous_bpy is None:
+                sys.modules.pop("bpy", None)
+            else:
+                sys.modules["bpy"] = previous_bpy
+
+        self.assertEqual(captured["export_armature_name"], "Armature")
+        self.assertNotEqual(captured["collision_name"], "Armature")
+        self.assertEqual(armature.name, "geralt_player:CMovingPhysicalAgentComponent2_ARM")
+        self.assertEqual(existing_armature_name.name, "Armature")
+
+
+class TestAnimationAssetPaths(unittest.TestCase):
+    def test_animation_asset_path_mirrors_w2anims_folder(self):
+        used = set()
+        self.assertEqual(
+            bundle._unique_animation_asset_rel(
+                r"animations\man\combat\man_geralt_sword.w2anims",
+                "attack fast l 01",
+                "geralt",
+                used,
+            ),
+            "animations/man/combat/man_geralt_sword/attack_fast_l_01",
+        )
+
+    def test_animation_asset_path_falls_back_to_custom_folder(self):
+        used = set()
+        self.assertEqual(
+            bundle._unique_animation_asset_rel("", "attack fast l 01", "geralt", used),
+            "custom/geralt/animations/attack_fast_l_01",
+        )
+
+    def test_w2anims_json_source_maps_to_w2anims_folder(self):
+        self.assertEqual(
+            bundle._normalize_animset_depot_path(r"animations\man\combat\man_geralt_sword.w2anims.json"),
+            r"animations\man\combat\man_geralt_sword.w2anims",
+        )
+
+
+class TestExportActionCollection(unittest.TestCase):
+    def _context_without_export_set(self):
+        return types.SimpleNamespace(scene=types.SimpleNamespace(witcher_anim_export_set=[]))
+
+    def test_falls_back_to_action_currently_applied_to_armature(self):
+        action = types.SimpleNamespace(name="nekker_idle")
+        armature = types.SimpleNamespace(
+            animation_data=types.SimpleNamespace(action=action)
+        )
+        warnings = []
+
+        actions = bundle._collect_export_actions(
+            self._context_without_export_set(), armature, warnings
+        )
+
+        self.assertEqual(actions, [action])
+        self.assertEqual(warnings, [])
+
+    def test_no_export_set_and_no_applied_action_exports_nothing(self):
+        armature = types.SimpleNamespace(animation_data=None)
+        warnings = []
+
+        actions = bundle._collect_export_actions(
+            self._context_without_export_set(), armature, warnings
+        )
+
+        self.assertEqual(actions, [])
+        self.assertEqual(warnings, [])
+
+    def test_falls_back_to_nla_strip_under_playhead(self):
+        # Clips loaded from the addon's anim list play from the 'anim_import'
+        # NLA track with animation_data.action left unset.
+        action = types.SimpleNamespace(name="c_idle.002")
+        strip = types.SimpleNamespace(action=action, mute=False, frame_start=0.0, frame_end=75.0)
+        track = types.SimpleNamespace(name="anim_import", mute=False, is_solo=False, strips=[strip])
+        armature = types.SimpleNamespace(
+            animation_data=types.SimpleNamespace(action=None, nla_tracks=[track])
+        )
+        context = types.SimpleNamespace(
+            scene=types.SimpleNamespace(witcher_anim_export_set=[], frame_current=10)
+        )
+
+        actions = bundle._collect_export_actions(context, armature, [])
+
+        self.assertEqual(actions, [action])
+
+    def test_nla_fallback_skips_muted_tracks_and_strips(self):
+        muted_action = types.SimpleNamespace(name="muted_clip")
+        playing_action = types.SimpleNamespace(name="playing_clip")
+        muted_track = types.SimpleNamespace(
+            name="anim_import", mute=True, is_solo=False,
+            strips=[types.SimpleNamespace(action=muted_action, mute=False, frame_start=0.0, frame_end=50.0)],
+        )
+        live_track = types.SimpleNamespace(
+            name="other", mute=False, is_solo=False,
+            strips=[types.SimpleNamespace(action=playing_action, mute=False, frame_start=0.0, frame_end=50.0)],
+        )
+        armature = types.SimpleNamespace(
+            animation_data=types.SimpleNamespace(action=None, nla_tracks=[muted_track, live_track])
+        )
+
+        self.assertEqual(bundle._current_armature_action(armature, 10), playing_action)
+
+    def test_export_set_entries_win_over_applied_action(self):
+        set_action = types.SimpleNamespace(name="attack_fast_l_01")
+        applied_action = types.SimpleNamespace(name="nekker_idle")
+        entry = types.SimpleNamespace(enabled=True, action_name="attack_fast_l_01")
+        context = types.SimpleNamespace(
+            scene=types.SimpleNamespace(witcher_anim_export_set=[entry])
+        )
+        armature = types.SimpleNamespace(
+            animation_data=types.SimpleNamespace(action=applied_action)
+        )
+
+        previous_bpy = sys.modules.get("bpy")
+        sys.modules["bpy"] = types.SimpleNamespace(
+            data=types.SimpleNamespace(actions={"attack_fast_l_01": set_action})
+        )
+        try:
+            warnings = []
+            actions = bundle._collect_export_actions(context, armature, warnings)
+        finally:
+            if previous_bpy is None:
+                sys.modules.pop("bpy", None)
+            else:
+                sys.modules["bpy"] = previous_bpy
+
+        self.assertEqual(actions, [set_action])
+        self.assertEqual(warnings, [])
+
+
+class TestExportObjectCollection(unittest.TestCase):
+    class FakeObject:
+        def __init__(self, name, obj_type, children=None, hidden=False, visible=True, depot="", source_game=""):
+            self.name = name
+            self.name_full = name
+            self.type = obj_type
+            self.children = list(children or [])
+            self.children_recursive = list(self.children)
+            self.hide_viewport = hidden
+            self.hide_render = hidden
+            self._hidden = hidden
+            self._visible = visible
+            self.modifiers = []
+            self.parent = None
+            self.witcherui_MeshSettings = types.SimpleNamespace(item_repo_path=depot)
+            self.selected = False
+            self._props = {}
+            if source_game:
+                self._props["witcher_source_game"] = source_game
+            for child in self.children:
+                child.parent = self
+
+        def get(self, key, default=None):
+            return self._props.get(key, default)
+
+        def select_set(self, value):
+            self.selected = bool(value)
+
+        def hide_get(self):
+            return self._hidden
+
+        def visible_get(self):
+            return self._visible
+
+    def test_selected_armature_exports_visible_character_template_slots(self):
+        neck_transition = self.FakeObject(
+            "h_wa__neck_transition",
+            "MESH",
+            depot=r"characters\models\common\woman_average\body\model\h_wa__neck_transition.w2mesh",
+        )
+        body = self.FakeObject(
+            "t_01_wa__body",
+            "MESH",
+            depot=r"dlc\ep1\data\characters\models\secondary_npc\shani\model\t_01_wa__body.w2mesh",
+        )
+        dress = self.FakeObject(
+            "shani_dress",
+            "MESH",
+            depot=r"dlc\ep1\data\characters\models\secondary_npc\shani\model\shani_dress.w2mesh",
+        )
+        old_body = self.FakeObject(
+            "h_wa__old_body",
+            "MESH",
+            hidden=True,
+            depot=r"characters\models\common\woman_average\body\model\h_wa__old_body.w2mesh",
+        )
+        unloaded_body = self.FakeObject(
+            "h_wa__unloaded_body",
+            "MESH",
+            depot=r"characters\models\common\woman_average\body\model\h_wa__unloaded_body.w2mesh",
+        )
+        collision_proxy = self.FakeObject("b_01_wa__shani_px:Collision Proxy", "MESH")
+
+        rig_settings = types.SimpleNamespace(
+            template_slots=[
+                types.SimpleNamespace(is_loaded=True, template_guid="template-visible"),
+                types.SimpleNamespace(is_loaded=True, template_guid="template-hidden"),
+                types.SimpleNamespace(is_loaded=False, template_guid="template-unloaded"),
+            ],
+            equipment_slots=[
+                types.SimpleNamespace(is_loaded=True, equip_guid="equip-visible"),
+            ],
+        )
+        armature = self.FakeObject(
+            "shani_CMovingPhysicalAgentComponent_ARM",
+            "ARMATURE",
+            children=[neck_transition, collision_proxy],
+        )
+        armature.data = types.SimpleNamespace(witcherui_RigSettings=rig_settings)
+
+        guid_map = {
+            ("template-visible", "witcher_template_guid"): [body, collision_proxy],
+            ("template-hidden", "witcher_template_guid"): [old_body],
+            ("template-unloaded", "witcher_template_guid"): [unloaded_body],
+            ("equip-visible", "witcher_equip_guid"): [dress],
+        }
+        fake_equipment = types.ModuleType("witcher3_tools.ui.ui_equipment")
+        fake_equipment.find_objects_by_guid = (
+            lambda guid, prop_name="witcher_equip_guid": guid_map.get((guid, prop_name), [])
+        )
+
+        previous_modules = {
+            name: sys.modules.get(name)
+            for name in (
+                "witcher3_tools",
+                "witcher3_tools.ui",
+                "witcher3_tools.ui.ui_equipment",
+            )
+        }
+        fake_pkg = types.ModuleType("witcher3_tools")
+        fake_pkg.__path__ = [str(REPO_ROOT / "witcher3_tools")]
+        fake_ui = types.ModuleType("witcher3_tools.ui")
+        fake_ui.__path__ = []
+        sys.modules["witcher3_tools"] = fake_pkg
+        sys.modules["witcher3_tools.ui"] = fake_ui
+        sys.modules["witcher3_tools.ui.ui_equipment"] = fake_equipment
+        try:
+            objects = bundle.collect_export_objects([armature])
+        finally:
+            for name, previous in previous_modules.items():
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
+
+        names = [obj.name for obj in objects]
+        self.assertIn("h_wa__neck_transition", names)
+        self.assertIn("t_01_wa__body", names)
+        self.assertIn("shani_dress", names)
+        self.assertNotIn("h_wa__old_body", names)
+        self.assertNotIn("h_wa__unloaded_body", names)
+        self.assertNotIn("b_01_wa__shani_px:Collision Proxy", names)
+
+    def test_unreal_export_preloads_current_appearance_when_slots_are_empty(self):
+        item = types.SimpleNamespace(name="shani")
+        rig_settings = types.SimpleNamespace(
+            app_list=[item],
+            app_list_index=0,
+            template_slots=[],
+            equipment_slots=[],
+        )
+        armature = self.FakeObject("shani_CMovingPhysicalAgentComponent_ARM", "ARMATURE")
+        armature.data = types.SimpleNamespace(witcherui_RigSettings=rig_settings)
+        old_active = self.FakeObject("old_active", "EMPTY")
+        context = types.SimpleNamespace(
+            selected_objects=[armature],
+            object=old_active,
+            view_layer=types.SimpleNamespace(objects=types.SimpleNamespace(active=old_active)),
+        )
+
+        calls = []
+        fake_import_entity = types.ModuleType("witcher3_tools.importers.import_entity")
+        fake_import_entity.import_from_list_item = lambda ctx, app_item: calls.append(app_item.name)
+
+        previous_modules = {
+            name: sys.modules.get(name)
+            for name in (
+                "witcher3_tools",
+                "witcher3_tools.importers",
+                "witcher3_tools.importers.import_entity",
+                "witcher3_tools.ui",
+                "witcher3_tools.ui.ui_equipment",
+            )
+        }
+        fake_pkg = types.ModuleType("witcher3_tools")
+        fake_pkg.__path__ = [str(REPO_ROOT / "witcher3_tools")]
+        fake_importers = types.ModuleType("witcher3_tools.importers")
+        fake_importers.__path__ = []
+        fake_ui = types.ModuleType("witcher3_tools.ui")
+        fake_ui.__path__ = []
+        fake_equipment = types.ModuleType("witcher3_tools.ui.ui_equipment")
+        fake_equipment.find_objects_by_guid = lambda guid, prop_name="witcher_equip_guid": []
+        sys.modules["witcher3_tools"] = fake_pkg
+        sys.modules["witcher3_tools.importers"] = fake_importers
+        sys.modules["witcher3_tools.importers.import_entity"] = fake_import_entity
+        sys.modules["witcher3_tools.ui"] = fake_ui
+        sys.modules["witcher3_tools.ui.ui_equipment"] = fake_equipment
+        try:
+            warnings = bundle._ensure_selected_character_appearances_loaded(context, [armature])
+        finally:
+            for name, previous in previous_modules.items():
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(calls, ["shani"])
+        self.assertIs(context.view_layer.objects.active, old_active)
+
+    def test_unreal_export_source_game_follows_selected_armature(self):
+        rig_settings = types.SimpleNamespace(source_game="w2")
+        armature = self.FakeObject("geralt_w2_ARM", "ARMATURE")
+        armature.data = types.SimpleNamespace(witcherui_RigSettings=rig_settings)
+
+        source_game, warnings = bundle._infer_export_source_game([armature], armature)
+
+        self.assertEqual(source_game, "w2")
+        self.assertEqual(warnings, [])
+        self.assertEqual(bundle._resolve_content_root_setting("/Game/Witcher3", source_game), "/Game/Witcher2")
+        self.assertEqual(bundle._resolve_content_root_setting("/Game/ImportedFbx", source_game), "/Game/Witcher2")
+        self.assertEqual(bundle._resolve_content_root_setting("/Game/CustomRED", source_game), "/Game/CustomRED")
+
+    def test_unreal_export_warns_on_mixed_source_games(self):
+        rig_settings = types.SimpleNamespace(source_game="w2")
+        armature = self.FakeObject("geralt_w2_ARM", "ARMATURE")
+        armature.data = types.SimpleNamespace(witcherui_RigSettings=rig_settings)
+        mesh = self.FakeObject("w3_sword", "MESH", source_game="w3")
+
+        source_game, warnings = bundle._infer_export_source_game([armature, mesh], armature)
+
+        self.assertEqual(source_game, "w2")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("Mixed W2/W3", warnings[0])
+
+
+class TestExportArmatureSelection(unittest.TestCase):
+    @staticmethod
+    def _armature(name, bone_names, parents=None):
+        parents = parents or {}
+        bones_by_name = {
+            bone_name: types.SimpleNamespace(name=bone_name, parent=None)
+            for bone_name in bone_names
+        }
+        for bone_name, parent_name in parents.items():
+            if bone_name in bones_by_name and parent_name in bones_by_name:
+                bones_by_name[bone_name].parent = bones_by_name[parent_name]
+        return types.SimpleNamespace(
+            name=name,
+            type="ARMATURE",
+            data=types.SimpleNamespace(bones=list(bones_by_name.values())),
+        )
+
+    def test_flat_mesh_armature_is_replaced_by_entity_rig(self):
+        # import_mesh builds per-mesh armatures from boneNames/boneMatrices
+        # (flat, no Root); the FBX must carry the entity rig instead or UE
+        # cannot merge the bone tree with the shared skeleton.
+        mesh_arm = self._armature("t_01__nekker_ARM", ["k_pelvis_g", "k_torso_g"])
+        main_arm = self._armature(
+            "nekker_lvl1_ARM", ["Root", "Trajectory", "k_pelvis_g", "k_torso_g"]
+        )
+        warnings = []
+
+        chosen = bundle._resolve_export_armature(mesh_arm, main_arm, "nekker/model/t_01__nekker", warnings)
+
+        self.assertIs(chosen, main_arm)
+        self.assertEqual(warnings, [])
+
+    def test_mesh_armature_with_extra_bones_is_kept_with_warning(self):
+        mesh_arm = self._armature("hair_ARM", ["k_pelvis_g", "hair_01"])
+        main_arm = self._armature("nekker_lvl1_ARM", ["Root", "k_pelvis_g"])
+        warnings = []
+
+        chosen = bundle._resolve_export_armature(mesh_arm, main_arm, "nekker/hair", warnings)
+
+        self.assertIs(chosen, mesh_arm)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("hair_01", warnings[0])
+
+    def test_missing_bone_export_uses_attachment_parent_chain(self):
+        source_arm = self._armature(
+            "shani:CAnimDangleBufferComponent03_ARM",
+            ["Root", "pelvis", "l_shin", "l_dyng_group_01", "l_01_01", "l_01_02"],
+            {
+                "pelvis": "Root",
+                "l_shin": "pelvis",
+                "l_dyng_group_01": "l_shin",
+                "l_01_01": "l_dyng_group_01",
+                "l_01_02": "l_01_01",
+            },
+        )
+
+        required = bundle._required_source_bone_names(
+            source_arm,
+            ["l_01_02"],
+            {"Root", "pelvis", "l_shin"},
+        )
+
+        self.assertEqual(required, ["l_dyng_group_01", "l_01_01", "l_01_02"])
+
+    def test_attachment_armature_is_preferred_over_flat_mesh_armature(self):
+        group_arm = self._armature("b_01_wa__shani_ARM", ["head", "l_01_02"])
+        attachment_arm = self._armature(
+            "shani:CAnimDangleBufferComponent03_ARM",
+            ["Root", "l_dyng_group_01", "l_01_01", "l_01_02"],
+            {
+                "l_dyng_group_01": "Root",
+                "l_01_01": "l_dyng_group_01",
+                "l_01_02": "l_01_01",
+            },
+        )
+        group_arm.parent = attachment_arm
+
+        source = bundle._find_attachment_armature_for_missing_bones(group_arm, ["l_01_02"])
+
+        self.assertIs(source, attachment_arm)
+
+    def test_retargeted_modifiers_restore_after_export(self):
+        mesh_arm = object()
+        main_arm = object()
+        modifier = types.SimpleNamespace(type="ARMATURE", object=mesh_arm)
+        mesh = types.SimpleNamespace(modifiers=[modifier])
+
+        with bundle._retargeted_armature_modifiers([mesh], main_arm):
+            self.assertIs(modifier.object, main_arm)
+        self.assertIs(modifier.object, mesh_arm)
+
+
+class TestBlueprintEntry(unittest.TestCase):
+    def test_blueprint_uses_rig_asset_as_base_mesh_driver(self):
+        rig_settings = types.SimpleNamespace(
+            repo_path=r"characters\npc_entities\main_npc\geralt.w2ent",
+            entity_name="geralt",
+        )
+        armature = types.SimpleNamespace(
+            data=types.SimpleNamespace(witcherui_RigSettings=rig_settings)
+        )
+
+        entry = bundle._build_blueprint_entry(
+            armature,
+            "geralt",
+            [{"kind": "skeletal", "asset_path": "characters/models/geralt/body/model/t_01_mg__body_hires"}],
+            {"asset_path": "characters/base_entities/man_base/man_base"},
+        )
+
+        self.assertEqual(entry["asset_path"], "characters/npc_entities/main_npc/geralt")
+        self.assertEqual(entry["base_mesh_asset_path"], "characters/base_entities/man_base/man_base")
+        self.assertEqual(
+            entry["mesh_asset_paths"],
+            ["characters/models/geralt/body/model/t_01_mg__body_hires"],
+        )
+        self.assertNotIn("animation_asset_path", entry)
+
+    def test_blueprint_carries_first_exported_animation(self):
+        rig_settings = types.SimpleNamespace(
+            repo_path=r"characters\npc_entities\monsters\nekker_lvl1.w2ent",
+            entity_name="nekker_lvl1",
+        )
+        armature = types.SimpleNamespace(
+            data=types.SimpleNamespace(witcherui_RigSettings=rig_settings)
+        )
+
+        entry = bundle._build_blueprint_entry(
+            armature,
+            "nekker_lvl1",
+            [{"kind": "skeletal", "asset_path": "characters/models/monsters/nekker/model/t_01__nekker"}],
+            {"asset_path": "characters/base_entities/nekker_base/nekker_base"},
+            [{"asset_path": "animations/monsters/monster_nekker/nekker_idle"},
+             {"asset_path": "animations/monsters/monster_nekker/nekker_walk"}],
+        )
+
+        self.assertEqual(entry["asset_path"], "characters/npc_entities/monsters/nekker_lvl1")
+        self.assertEqual(
+            entry["animation_asset_path"],
+            "animations/monsters/monster_nekker/nekker_idle",
+        )
 
 
 class TestDepotPaths(unittest.TestCase):
@@ -322,17 +951,36 @@ class TestManifest(unittest.TestCase):
         manifest = build_manifest(
             asset_name="geralt body",
             bundle_root=r"F:\exports\geralt",
-            content_root="ImportedFbx/",
             meshes=[{"name": "t_01_mg__body_hires", "fbx": "Meshes/t_01_mg__body_hires.fbx",
                      "asset_path": "characters/models/geralt/body/model/t_01_mg__body_hires",
                      "kind": "skeletal", "slots": []}],
         )
 
         self.assertEqual(manifest["schema"], SCHEMA)
-        self.assertEqual(manifest["content_root"], "/Game/ImportedFbx")
+        self.assertEqual(manifest["source_game"], "w3")
+        self.assertEqual(manifest["content_root"], "/Game/Witcher3")
         self.assertEqual(manifest["asset_name"], "geralt_body")
         self.assertNotIn("rig", manifest)
         self.assertNotIn("blueprint", manifest)
+
+    def test_manifest_w2_default_content_root(self):
+        manifest = build_manifest(
+            asset_name="geralt body",
+            bundle_root=r"F:\exports\geralt_w2",
+            source_game="witcher2",
+        )
+
+        self.assertEqual(manifest["source_game"], "w2")
+        self.assertEqual(manifest["content_root"], "/Game/Witcher2")
+
+    def test_manifest_explicit_content_root_is_preserved(self):
+        manifest = build_manifest(
+            asset_name="geralt body",
+            bundle_root=r"F:\exports\geralt",
+            content_root="REDImport/",
+        )
+
+        self.assertEqual(manifest["content_root"], "/Game/REDImport")
 
     def test_manifest_includes_rig_and_blueprint_when_present(self):
         manifest = build_manifest(
@@ -341,10 +989,31 @@ class TestManifest(unittest.TestCase):
             rig={"name": "geralt", "fbx": "Meshes/geralt.fbx",
                  "asset_path": "characters/base_entities/geralt/geralt"},
             blueprint={"name": "geralt", "asset_path": "characters/npc_entities/main_npc/geralt",
+                       "base_mesh_asset_path": "characters/base_entities/man_base/man_base",
                        "mesh_asset_paths": ["a", "b"]},
         )
         self.assertEqual(manifest["rig"]["asset_path"], "characters/base_entities/geralt/geralt")
         self.assertEqual(manifest["blueprint"]["name"], "geralt")
+        self.assertEqual(
+            manifest["blueprint"]["base_mesh_asset_path"],
+            "characters/base_entities/man_base/man_base",
+        )
+
+    def test_manifest_includes_animation_entries(self):
+        manifest = build_manifest(
+            asset_name="geralt",
+            bundle_root=r"F:\exports\geralt",
+            animations=[{
+                "name": "attack_fast_l_01",
+                "fbx": "Animations/attack_fast_l_01.fbx",
+                "asset_path": "animations/man/combat/man_geralt_sword/attack_fast_l_01",
+                "source_animset": r"animations\man\combat\man_geralt_sword.w2anims",
+            }],
+        )
+        self.assertEqual(
+            manifest["animations"][0]["asset_path"],
+            "animations/man/combat/man_geralt_sword/attack_fast_l_01",
+        )
 
 
 class TestSocketClient(unittest.TestCase):
@@ -407,6 +1076,43 @@ class TestPluginInstall(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 install_or_update_plugin(project_file, source_dir)
+
+
+class TestUnrealProjectInspection(unittest.TestCase):
+    def test_project_inspection_reads_engine_and_missing_plugin(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_file = Path(temp_dir) / "WitcherTest.uproject"
+            project_file.write_text(json.dumps({"EngineAssociation": "5.4"}), encoding="utf-8")
+
+            info = unreal_project.inspect_project(project_file)
+
+            self.assertTrue(info["exists"])
+            self.assertEqual(info["engine_association"], "5.4")
+            self.assertFalse(info["plugin_installed"])
+            self.assertEqual(unreal_project.plugin_status_label(info), "Not installed")
+            self.assertEqual(unreal_project.short_project_status(info), "UE 5.4; Plugin missing")
+            self.assertIn("EngineAssociation: 5.4", unreal_project.format_project_details(info))
+
+    def test_project_inspection_reads_installed_plugin_version(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project_file = root / "WitcherTest.uproject"
+            project_file.write_text(json.dumps({"EngineAssociation": "5.5"}), encoding="utf-8")
+
+            descriptor = root / "Plugins" / PLUGIN_NAME / f"{PLUGIN_NAME}.uplugin"
+            descriptor.parent.mkdir(parents=True)
+            descriptor.write_text(
+                json.dumps({"Version": 7, "VersionName": "0.2.0"}),
+                encoding="utf-8",
+            )
+
+            info = unreal_project.inspect_project(project_file)
+
+            self.assertTrue(info["plugin_installed"])
+            self.assertEqual(info["plugin_version"], "7")
+            self.assertEqual(info["plugin_version_name"], "0.2.0")
+            self.assertEqual(unreal_project.plugin_status_label(info), "Installed (0.2.0)")
+            self.assertEqual(unreal_project.short_project_status(info), "UE 5.5; Plugin installed")
 
 
 if __name__ == "__main__":

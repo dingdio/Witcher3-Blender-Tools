@@ -27,6 +27,7 @@
         "fallback_ogg_path": ""
     },
     "redkit_projects": [],
+    "unreal_projects": [],
     "test_paths": {
         "w2mesh": {
             "enabled": true,

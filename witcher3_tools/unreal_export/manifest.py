@@ -1,8 +1,8 @@
 """Manifest helpers for Witcher-to-Unreal export bundles.
 
-Schema v2: assets mirror the REDkit depot layout under a single Unreal
+Schema v2: assets mirror the Witcher depot layout under a single Unreal
 content root (e.g. ``characters\\models\\geralt\\body\\model\\t_01_mg__body_hires.w2mesh``
-imports as ``/Game/ImportedFbx/characters/models/geralt/body/model/t_01_mg__body_hires``).
+imports as ``/Game/Witcher3/characters/models/geralt/body/model/t_01_mg__body_hires``).
 Material instances are emitted per ``.w2mi`` chain level at their depot paths,
 parented up to a master material at the ``.w2mg`` graph's depot path.
 
@@ -16,7 +16,11 @@ import re
 from typing import Any, Iterable
 
 SCHEMA = "witcher_unreal_export.v2"
-DEFAULT_CONTENT_ROOT = "/Game/ImportedFbx"
+DEFAULT_CONTENT_ROOTS = {
+    "w2": "/Game/Witcher2",
+    "w3": "/Game/Witcher3",
+}
+DEFAULT_CONTENT_ROOT = DEFAULT_CONTENT_ROOTS["w3"]
 FALLBACK_MASTER_DEPOT = r"engine\materials\graphs\pbr_std.w2mg"
 
 # Witcher texture params that should import as sRGB color data.
@@ -31,6 +35,22 @@ _MASK_PARAM_TOKENS = ("rough", "mask", "pattern")
 
 def normalize_depot_path(path: str) -> str:
     return str(path or "").replace("/", "\\").strip().strip("\\").lower()
+
+
+def normalize_source_game(source_game: str | None) -> str:
+    value = str(source_game or "").strip().lower().replace(" ", "")
+    return "w2" if value in {"w2", "witcher2", "tw2"} else "w3"
+
+
+def default_content_root(source_game: str | None = "w3") -> str:
+    return DEFAULT_CONTENT_ROOTS[normalize_source_game(source_game)]
+
+
+def normalize_content_root(content_root: str | None, source_game: str | None = "w3") -> str:
+    root = str(content_root or default_content_root(source_game)).replace("\\", "/").rstrip("/")
+    if not root.startswith("/"):
+        root = "/Game/" + root.lstrip("/")
+    return root
 
 
 def is_w2mg_path(path: str) -> bool:
@@ -188,27 +208,29 @@ def build_manifest(
     *,
     asset_name: str,
     bundle_root: str,
+    source_game: str | None = "w3",
     content_root: str | None = None,
     meshes: Iterable[dict[str, Any]] = (),
     masters: Iterable[dict[str, Any]] = (),
     materials: Iterable[dict[str, Any]] = (),
     textures: Iterable[dict[str, Any]] = (),
+    animations: Iterable[dict[str, Any]] = (),
     rig: dict[str, Any] | None = None,
     blueprint: dict[str, Any] | None = None,
     warnings: Iterable[str] = (),
 ) -> dict[str, Any]:
-    root = str(content_root or DEFAULT_CONTENT_ROOT).replace("\\", "/").rstrip("/")
-    if not root.startswith("/"):
-        root = "/Game/" + root.lstrip("/")
+    game = normalize_source_game(source_game)
     manifest: dict[str, Any] = {
         "schema": SCHEMA,
         "asset_name": safe_asset_name(asset_name),
         "bundle_root": os.path.normpath(bundle_root),
-        "content_root": root,
+        "source_game": game,
+        "content_root": normalize_content_root(content_root, game),
         "meshes": list(meshes),
         "masters": list(masters),
         "materials": list(materials),
         "textures": list(textures),
+        "animations": list(animations),
         "warnings": list(warnings),
     }
     if rig:

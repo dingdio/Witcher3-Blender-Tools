@@ -4,7 +4,7 @@ Schema v2 no longer uses a bundled `M_W3_PBR_Std` asset.
 
 Master materials are created in the *project* at the depot path of each
 Witcher `.w2mg` shader graph, e.g.
-`/Game/ImportedFbx/engine/materials/graphs/pbr_std`. If an asset already
+`/Game/Witcher3/engine/materials/graphs/pbr_std`. If an asset already
 exists at that path (hand-authored or from a previous import) it is reused
 untouched; otherwise the importer generates one with the graph's declared
 parameters and a basic BaseColor/Normal/Roughness wiring.

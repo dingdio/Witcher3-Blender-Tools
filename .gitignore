@@ -10,3 +10,4 @@ TEMP/
 
 # Machine-specific dev config
 witcher3_tools/dev/dev_config.json
+WORKING_TEMP/

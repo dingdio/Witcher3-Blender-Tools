@@ -26,28 +26,50 @@ followed by UTF-8 JSON:
 
 ## Depot mirroring (schema v2)
 
-Imported assets mirror the REDkit depot layout under the manifest's content
-root (default `/Game/ImportedFbx`):
+Imported assets mirror the Witcher depot layout under the manifest's content
+root (default `/Game/Witcher3`, or `/Game/Witcher2` for W2 exports):
 
 - `characters\models\geralt\body\model\t_01_mg__body_hires.w2mesh`
-  -> `/Game/ImportedFbx/characters/models/geralt/body/model/t_01_mg__body_hires`
+  -> `/Game/Witcher3/characters/models/geralt/body/model/t_01_mg__body_hires`
 - Textures import at their `.xbm` depot paths and are shared between materials.
 - Each `.w2mi` in a material's baseMaterial chain becomes a Material Instance
   at its depot path; the terminal `.w2mg` becomes a master material at its
-  depot path (e.g. `/Game/ImportedFbx/engine/materials/graphs/pbr_std`).
+  depot path (e.g. `/Game/Witcher3/engine/materials/graphs/pbr_std`).
 - Local (in-mesh) materials become instances next to their mesh.
 - A `.w2rig` exports as a skeletal mesh at its depot path; its `_Skeleton`
   asset is shared by every skeletal mesh in the bundle.
-- Character bundles with multiple skeletal parts also get an actor blueprint
-  with one SkeletalMeshComponent per part.
+- Enabled Blender animation Export Set entries import as Animation Sequences
+  below their source `.w2anims` depot path, one asset per clip name. With an
+  empty Export Set, the action currently applied to the exported armature is
+  sent instead, so "Send to Unreal" ships whatever is playing in the viewport.
+- Character bundles can also get an actor blueprint; when a `.w2rig` is
+  exported, that rig mesh becomes the base SkeletalMeshComponent driver and
+  the part meshes follow it via leader pose (the Unreal equivalent of RED's
+  CAnimatedComponent + CMeshSkinningAttachment setup). The base component is
+  set to play the first exported animation as a looping single-node clip.
 
 Existing assets win: if a master material, texture, chain instance, or
 blueprint already exists at the mirrored path it is reused untouched, so
-hand-authored masters (pbr_std etc.) keep working across re-imports. Local
-mesh material instances are the exception: their parameter values refresh on
-every export. Delete an asset in Unreal to force regeneration.
+hand-authored masters (pbr_std etc.) keep working across re-imports. Two
+exceptions refresh on every export so Blender iteration flows through: local
+mesh material instances update their parameter values, and an existing
+blueprint updates its preview animation plus required skeletal component
+settings. Delete an asset in Unreal to force full blueprint regeneration.
 
 Masters that do not exist yet are generated with the graph's parameters
 (texture/scalar/vector) and a basic Diffuse->BaseColor, Normal->Normal,
 Rough->Roughness wiring; refine them in place and later imports will pick the
 refined version up automatically.
+
+## FBX scale and importer notes
+
+- All bundle imports force the legacy FBX importer (the Interchange pipeline,
+  default since UE 5.7, ignores parts of the legacy options and handles the
+  Blender armature root differently).
+- Blender FBXs carry the m->cm conversion on the armature root null. The
+  legacy importer folds that into the root bone for skeletal meshes (ref pose
+  root scale = 100) but divides it out of animation root tracks; the plugin
+  compensates with ImportUniformScale=100 on animation imports so animations
+  match the skeleton instead of collapsing 100x.
+- Placed actors only play their preview animation in PIE/Simulate; the level
+  editor viewport shows a static pose.

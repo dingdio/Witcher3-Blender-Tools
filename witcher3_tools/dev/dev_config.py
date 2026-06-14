@@ -58,3 +58,4 @@ DEV_PANEL_OVERRIDES = _config.get("dev_panel_overrides", _config.get("runtime_ov
 # Backward-compatible alias for legacy references.
 RUNTIME_OVERRIDES = DEV_PANEL_OVERRIDES
 ADDON_PREFS_REDKIT_PROJECTS = _config.get("redkit_projects", [])
+ADDON_PREFS_UNREAL_PROJECTS = _config.get("unreal_projects", [])

@@ -1,5 +1,6 @@
 #include "WitcherImportContext.h"
 
+#include "Animation/AnimSequence.h"
 #include "Animation/Skeleton.h"
 #include "AssetImportTask.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -13,13 +14,16 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture.h"
 #include "Engine/Texture2D.h"
+#include "Factories/FbxAnimSequenceImportData.h"
 #include "Factories/FbxImportUI.h"
 #include "Factories/FbxSkeletalMeshImportData.h"
 #include "Factories/FbxStaticMeshImportData.h"
 #include "Factories/MaterialFactoryNew.h"
 #include "Factories/TextureFactory.h"
 #include "GameFramework/Actor.h"
+#include "HAL/IConsoleManager.h"
 #include "IAssetTools.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "MaterialEditingLibrary.h"
 #include "Materials/Material.h"
@@ -33,6 +37,7 @@
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "WitcherImportedActor.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogWitcherImportContext, Log, All);
 
@@ -120,6 +125,60 @@ FString AssetRelName(const FString& AssetRel)
     return Name;
 }
 
+FString DefaultContentRootForSourceGame(const FString& SourceGame)
+{
+    const FString Lowered = SourceGame.ToLower();
+    return (Lowered == TEXT("w2") || Lowered == TEXT("witcher2") || Lowered == TEXT("tw2"))
+        ? TEXT("/Game/Witcher2")
+        : TEXT("/Game/Witcher3");
+}
+
+void ConfigureImportedBaseTemplate(USkeletalMeshComponent* Template, UAnimSequence* AnimSequence)
+{
+    // Seed the blueprint's driver-component template with the same bounds/tick
+    // setup the runtime actor applies (AWitcherImportedActor reconfigures every
+    // component on construction), then attach the preview clip. Mirrors RED's
+    // CAnimatedComponent: the base plays the clip; leader-pose followers copy
+    // its pose.
+    if (!Template)
+    {
+        return;
+    }
+    AWitcherImportedActor::ConfigureBaseComponent(Template, /*bUpdateAnimationInEditor=*/true);
+    if (AnimSequence)
+    {
+        Template->OverrideAnimationData(AnimSequence, true, true, 0.0f, 1.0f);
+    }
+}
+
+bool EnsureWitcherImportedActorParent(UBlueprint* Blueprint)
+{
+    if (!Blueprint || Blueprint->ParentClass == AWitcherImportedActor::StaticClass())
+    {
+        return false;
+    }
+    Blueprint->ParentClass = AWitcherImportedActor::StaticClass();
+    FBlueprintEditorUtils::RefreshAllNodes(Blueprint);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+    return true;
+}
+
+USCS_Node* CreateSkeletalMeshNode(USimpleConstructionScript* ConstructionScript, const FString& MeshRel, USkeletalMesh* Mesh)
+{
+    if (!ConstructionScript || !Mesh)
+    {
+        return nullptr;
+    }
+
+    USCS_Node* Node = ConstructionScript->CreateNode(
+        USkeletalMeshComponent::StaticClass(), FName(*AssetRelName(MeshRel)));
+    if (USkeletalMeshComponent* Template = Cast<USkeletalMeshComponent>(Node->ComponentTemplate))
+    {
+        Template->SetSkeletalMeshAsset(Mesh);
+    }
+    return Node;
+}
+
 EMaterialSamplerType SamplerTypeForParamName(const FString& ParamName)
 {
     const FString Lowered = ParamName.ToLower();
@@ -145,6 +204,37 @@ T* LoadExistingAsset(const FString& ObjectPath)
 {
     return Cast<T>(StaticLoadObject(T::StaticClass(), nullptr, *ObjectPath, nullptr, LOAD_NoWarn | LOAD_Quiet));
 }
+
+/**
+ * Forces the legacy FBX importer while alive. UE 5.7 routes FBX
+ * AssetImportTasks through Interchange by default, which does not honor all
+ * UFbxImportUI options and lacks the legacy importer's Blender "Armature"
+ * root-null strip - skeletal meshes and animations then disagree about the
+ * skeleton root and animations explode the bind pose.
+ */
+struct FScopedLegacyFbxImport
+{
+    FScopedLegacyFbxImport()
+    {
+        CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Interchange.FeatureFlags.Import.FBX"));
+        bWasEnabled = CVar && CVar->GetBool();
+        if (bWasEnabled)
+        {
+            CVar->Set(false, ECVF_SetByCode);
+        }
+    }
+
+    ~FScopedLegacyFbxImport()
+    {
+        if (bWasEnabled && CVar)
+        {
+            CVar->Set(true, ECVF_SetByCode);
+        }
+    }
+
+    IConsoleVariable* CVar = nullptr;
+    bool bWasEnabled = false;
+};
 }
 
 FString FWitcherImportContext::HandleRequest(const FString& RequestJson)
@@ -197,7 +287,10 @@ FWitcherImportContext::FWitcherImportContext(const TSharedPtr<FJsonObject>& InMa
     : Manifest(InManifest)
 {
     BundleRoot = JsonString(Manifest, TEXT("bundle_root"));
-    ContentRoot = JsonString(Manifest, TEXT("content_root"), TEXT("/Game/ImportedFbx"));
+    ContentRoot = JsonString(
+        Manifest,
+        TEXT("content_root"),
+        DefaultContentRootForSourceGame(JsonString(Manifest, TEXT("source_game"), TEXT("w3"))));
     while (ContentRoot.EndsWith(TEXT("/")))
     {
         ContentRoot.LeftChopInline(1);
@@ -213,11 +306,14 @@ FString FWitcherImportContext::ImportBundle()
         return BuildResponse(false);
     }
 
+    FScopedLegacyFbxImport LegacyFbxScope;
+
     ImportTextures();
     ImportMasters();
     ImportMaterials();
     ImportRig();
     ImportMeshes();
+    ImportAnimations();
     ImportBlueprint();
 
     return BuildResponse(Errors.Num() == 0);
@@ -774,6 +870,13 @@ void FWitcherImportContext::ImportMeshes()
             continue;
         }
         MeshesByAssetRel.Add(AssetRel, Imported);
+        if (bSkeletal && !SharedSkeleton.IsValid())
+        {
+            if (USkeletalMesh* SkeletalMesh = Cast<USkeletalMesh>(Imported))
+            {
+                SharedSkeleton = SkeletalMesh->GetSkeleton();
+            }
+        }
         AssignMaterialsToMesh(Imported, MeshEntry);
     }
 }
@@ -837,6 +940,123 @@ UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, 
         }
     }
     return MainAsset;
+}
+
+void FWitcherImportContext::ImportAnimations()
+{
+    const TArray<TSharedPtr<FJsonValue>>* Animations = nullptr;
+    if (!Manifest->TryGetArrayField(TEXT("animations"), Animations) || Animations->Num() == 0)
+    {
+        return;
+    }
+    if (!SharedSkeleton.IsValid())
+    {
+        AddWarning(TEXT("Animations skipped: no shared skeleton was imported."));
+        return;
+    }
+
+    for (const TSharedPtr<FJsonValue>& Value : *Animations)
+    {
+        const TSharedPtr<FJsonObject> AnimationObject = Value->AsObject();
+        if (!AnimationObject.IsValid())
+        {
+            continue;
+        }
+        UAnimSequence* Imported = ImportAnimation(AnimationObject);
+        if (!Imported)
+        {
+            AddError(FString::Printf(TEXT("Failed to import animation '%s'"),
+                *JsonString(AnimationObject, TEXT("asset_path"))));
+        }
+    }
+}
+
+UAnimSequence* FWitcherImportContext::ImportAnimation(const TSharedPtr<FJsonObject>& AnimationObject)
+{
+    if (!AnimationObject.IsValid() || !SharedSkeleton.IsValid())
+    {
+        return nullptr;
+    }
+
+    const FString RawAssetRel = JsonString(AnimationObject, TEXT("asset_path"));
+    if (RawAssetRel.IsEmpty())
+    {
+        return nullptr;
+    }
+    const FString AssetRel = ClassSafeAssetRel(RawAssetRel, UAnimSequence::StaticClass(), TEXT("_anim"));
+    const FString FbxPath = ResolveBundleFile(JsonString(AnimationObject, TEXT("fbx")));
+    if (!FPaths::FileExists(FbxPath))
+    {
+        AddWarning(FString::Printf(TEXT("Animation FBX file does not exist: %s"), *FbxPath));
+        return nullptr;
+    }
+
+    UAssetImportTask* Task = NewObject<UAssetImportTask>();
+    Task->Filename = FbxPath;
+    Task->DestinationPath = PackagePathFor(AssetRel);
+    Task->DestinationName = AssetRelName(AssetRel);
+    Task->bAutomated = true;
+    Task->bSave = false;
+    Task->bReplaceExisting = true;
+
+    UFbxImportUI* Options = NewObject<UFbxImportUI>();
+    Options->bImportMaterials = false;
+    Options->bImportTextures = false;
+    Options->bImportAnimations = true;
+    Options->bCreatePhysicsAsset = false;
+    Options->bAutomatedImportShouldDetectType = false;
+    Options->MeshTypeToImport = FBXIT_Animation;
+    Options->bImportAsSkeletal = true;
+    Options->Skeleton = SharedSkeleton.Get();
+    Options->bImportMesh = false;
+    if (Options->AnimSequenceImportData)
+    {
+        // Blender FBXs carry the m->cm factor on the Armature root null.
+        // Skeletal mesh import folds that into the root bone (ref pose root
+        // scale=100), but the anim importer divides the parent transform out
+        // of the root track (scale=1) -- the skeleton then collapses 100x
+        // when a clip plays. ImportUniformScale is multiplied onto the root
+        // track only (SkeletalMeshEdit.cpp), restoring the same structure
+        // the skeleton has.
+        Options->AnimSequenceImportData->ImportUniformScale = 100.0f;
+    }
+    Task->Options = Options;
+
+    FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+    TArray<UAssetImportTask*> Tasks;
+    Tasks.Add(Task);
+    AssetToolsModule.Get().ImportAssetTasks(Tasks);
+
+    UAnimSequence* AnimSequence = nullptr;
+    for (const FString& Path : Task->ImportedObjectPaths)
+    {
+        UObject* Imported = StaticLoadObject(UObject::StaticClass(), nullptr, *Path);
+        if (!Imported)
+        {
+            continue;
+        }
+        ImportedAssets.Add(Path);
+        if (!AnimSequence)
+        {
+            AnimSequence = Cast<UAnimSequence>(Imported);
+        }
+    }
+    return AnimSequence;
+}
+
+UAnimSequence* FWitcherImportContext::FindAnimSequence(const FString& AssetRel)
+{
+    if (AssetRel.IsEmpty())
+    {
+        return nullptr;
+    }
+    if (UAnimSequence* Existing = LoadExistingAsset<UAnimSequence>(ObjectPathFor(AssetRel)))
+    {
+        return Existing;
+    }
+    // Animations whose depot stem was occupied by another class import as an
+    // "_anim" sibling (see ClassSafeAssetRel in ImportAnimation).
+    return LoadExistingAsset<UAnimSequence>(ObjectPathFor(AssetRel + TEXT("_anim")));
 }
 
 void FWitcherImportContext::AssignMaterialsToMesh(UObject* MeshObject, const TSharedPtr<FJsonObject>& MeshEntry)
@@ -915,17 +1135,118 @@ void FWitcherImportContext::ImportBlueprint()
     {
         return;
     }
-    if (LoadExistingAsset<UBlueprint>(ObjectPathFor(AssetRel)))
+    const FString AnimationRel = JsonString(*BlueprintObject, TEXT("animation_asset_path"));
+    UAnimSequence* AnimSequence = AnimationRel.IsEmpty() ? nullptr : FindAnimSequence(AnimationRel);
+    if (!AnimationRel.IsEmpty() && !AnimSequence)
     {
-        AddWarning(FString::Printf(TEXT("Blueprint '%s' already exists; left untouched"), *AssetRel));
+        AddWarning(FString::Printf(TEXT("Blueprint '%s': animation '%s' not found"), *AssetRel, *AnimationRel));
+    }
+    const FString Name = AssetRelName(AssetRel);
+
+    auto RebuildBlueprintComponents = [&](UBlueprint* Blueprint) -> USkeletalMeshComponent*
+    {
+        if (!Blueprint || !Blueprint->SimpleConstructionScript)
+        {
+            return nullptr;
+        }
+
+        USimpleConstructionScript* ConstructionScript = Blueprint->SimpleConstructionScript;
+        const TArray<USCS_Node*> ExistingRootNodes = ConstructionScript->GetRootNodes();
+        for (USCS_Node* Node : ExistingRootNodes)
+        {
+            if (Node)
+            {
+                ConstructionScript->RemoveNode(Node, false);
+            }
+        }
+
+        USCS_Node* RootNode = nullptr;
+        USkeletalMeshComponent* BaseTemplate = nullptr;
+        const FString BaseMeshRel = JsonString(*BlueprintObject, TEXT("base_mesh_asset_path"));
+        if (!BaseMeshRel.IsEmpty())
+        {
+            USkeletalMesh* BaseMesh = LoadExistingAsset<USkeletalMesh>(ObjectPathFor(BaseMeshRel));
+            if (BaseMesh)
+            {
+                RootNode = CreateSkeletalMeshNode(ConstructionScript, BaseMeshRel, BaseMesh);
+                if (RootNode)
+                {
+                    BaseTemplate = Cast<USkeletalMeshComponent>(RootNode->ComponentTemplate);
+                    ConstructionScript->AddNode(RootNode);
+                }
+            }
+            else
+            {
+                AddWarning(FString::Printf(TEXT("Blueprint '%s': base mesh '%s' not found"), *Name, *BaseMeshRel));
+            }
+        }
+
+        const TArray<TSharedPtr<FJsonValue>>* Parts = nullptr;
+        if ((*BlueprintObject)->TryGetArrayField(TEXT("mesh_asset_paths"), Parts))
+        {
+            for (const TSharedPtr<FJsonValue>& Value : *Parts)
+            {
+                const FString PartRel = Value->AsString();
+                USkeletalMesh* PartMesh = LoadExistingAsset<USkeletalMesh>(ObjectPathFor(PartRel));
+                if (!PartMesh)
+                {
+                    AddWarning(FString::Printf(TEXT("Blueprint '%s': part mesh '%s' not found"), *Name, *PartRel));
+                    continue;
+                }
+
+                USCS_Node* Node = CreateSkeletalMeshNode(ConstructionScript, PartRel, PartMesh);
+                if (!Node)
+                {
+                    continue;
+                }
+                if (USkeletalMeshComponent* Template = Cast<USkeletalMeshComponent>(Node->ComponentTemplate))
+                {
+                    if (BaseTemplate)
+                    {
+                        AWitcherImportedActor::ConfigureFollowerComponent(
+                            Template, BaseTemplate, /*bUpdateAnimationInEditor=*/true);
+                    }
+                }
+                if (!RootNode)
+                {
+                    ConstructionScript->AddNode(Node);
+                    RootNode = Node;
+                    BaseTemplate = Cast<USkeletalMeshComponent>(Node->ComponentTemplate);
+                }
+                else
+                {
+                    RootNode->AddChildNode(Node);
+                }
+            }
+        }
+
+        ConstructionScript->ValidateSceneRootNodes();
+        return BaseTemplate;
+    };
+
+    if (UBlueprint* ExistingBlueprint = LoadExistingAsset<UBlueprint>(ObjectPathFor(AssetRel)))
+    {
+        const bool bReparented = EnsureWitcherImportedActorParent(ExistingBlueprint);
+        if (USkeletalMeshComponent* BaseTemplate = RebuildBlueprintComponents(ExistingBlueprint))
+        {
+            // RebuildBlueprintComponents already recreated and configured every
+            // follower; only the driver still needs its base/anim setup.
+            ConfigureImportedBaseTemplate(BaseTemplate, AnimSequence);
+            FKismetEditorUtilities::CompileBlueprint(ExistingBlueprint);
+            ExistingBlueprint->MarkPackageDirty();
+            ImportedAssets.AddUnique(ExistingBlueprint->GetPathName());
+            AddWarning(FString::Printf(TEXT("Blueprint '%s' already exists; rebuilt its skeletal components%s"),
+                *AssetRel, bReparented ? TEXT(" and runtime actor parent") : TEXT("")));
+            return;
+        }
+        AddWarning(FString::Printf(TEXT("Blueprint '%s' already exists; could not rebuild skeletal components"), *AssetRel));
         return;
     }
 
-    const FString Name = AssetRelName(AssetRel);
     const FString PackageName = FString::Printf(TEXT("%s/%s"), *ContentRoot, *AssetRel);
     UPackage* Package = CreatePackage(*PackageName);
     UBlueprint* Blueprint = FKismetEditorUtilities::CreateBlueprint(
-        AActor::StaticClass(), Package, FName(*Name), BPTYPE_Normal,
+        AWitcherImportedActor::StaticClass(), Package, FName(*Name), BPTYPE_Normal,
         UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass());
     if (!Blueprint)
     {
@@ -934,38 +1255,8 @@ void FWitcherImportContext::ImportBlueprint()
     }
     FAssetRegistryModule::AssetCreated(Blueprint);
 
-    USimpleConstructionScript* ConstructionScript = Blueprint->SimpleConstructionScript;
-    USCS_Node* RootNode = nullptr;
-    const TArray<TSharedPtr<FJsonValue>>* Parts = nullptr;
-    if (ConstructionScript && (*BlueprintObject)->TryGetArrayField(TEXT("mesh_asset_paths"), Parts))
-    {
-        for (const TSharedPtr<FJsonValue>& Value : *Parts)
-        {
-            const FString PartRel = Value->AsString();
-            USkeletalMesh* PartMesh = LoadExistingAsset<USkeletalMesh>(ObjectPathFor(PartRel));
-            if (!PartMesh)
-            {
-                AddWarning(FString::Printf(TEXT("Blueprint '%s': part mesh '%s' not found"), *Name, *PartRel));
-                continue;
-            }
-
-            USCS_Node* Node = ConstructionScript->CreateNode(
-                USkeletalMeshComponent::StaticClass(), FName(*AssetRelName(PartRel)));
-            if (USkeletalMeshComponent* Template = Cast<USkeletalMeshComponent>(Node->ComponentTemplate))
-            {
-                Template->SetSkeletalMeshAsset(PartMesh);
-            }
-            if (!RootNode)
-            {
-                ConstructionScript->AddNode(Node);
-                RootNode = Node;
-            }
-            else
-            {
-                RootNode->AddChildNode(Node);
-            }
-        }
-    }
+    USkeletalMeshComponent* BaseTemplate = RebuildBlueprintComponents(Blueprint);
+    ConfigureImportedBaseTemplate(BaseTemplate, AnimSequence);
 
     FKismetEditorUtilities::CompileBlueprint(Blueprint);
     Blueprint->MarkPackageDirty();

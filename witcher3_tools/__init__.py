@@ -40,10 +40,10 @@ def _load_dev_pref_overrides():
     try:
         from .dev import dev_config
     except Exception:
-        return {}, []
+        return {}, [], []
 
     if not getattr(dev_config, "DEV_MODE_ENABLED", False):
-        return {}, []
+        return {}, [], []
 
     defaults = getattr(dev_config, "ADDON_PREFS_DEFAULTS", {})
     if not isinstance(defaults, dict):
@@ -53,11 +53,15 @@ def _load_dev_pref_overrides():
     if not isinstance(redkit_projects, list):
         redkit_projects = []
 
-    return defaults, redkit_projects
+    unreal_projects = getattr(dev_config, "ADDON_PREFS_UNREAL_PROJECTS", [])
+    if not isinstance(unreal_projects, list):
+        unreal_projects = []
+
+    return defaults, redkit_projects, unreal_projects
 
 def _apply_dev_pref_overrides(prefs):
     """Apply dev-only defaults without overwriting existing user preferences."""
-    defaults, redkit_projects = _load_dev_pref_overrides()
+    defaults, redkit_projects, unreal_projects = _load_dev_pref_overrides()
 
     for key, value in defaults.items():
         if not value:
@@ -78,6 +82,13 @@ def _apply_dev_pref_overrides(prefs):
             if not path:
                 continue
             item = prefs.redkit_projects.add()
+            item.path = path
+
+    if unreal_projects and hasattr(prefs, "unreal_projects") and len(prefs.unreal_projects) == 0:
+        for path in unreal_projects:
+            if not path:
+                continue
+            item = prefs.unreal_projects.add()
             item.path = path
 
 from .setup_logging_bl import *
@@ -654,6 +665,14 @@ class PathItem(bpy.types.PropertyGroup):
     )
 
 
+class UnrealProjectItem(bpy.types.PropertyGroup):
+    path: StringProperty(
+        name="Project",
+        subtype='FILE_PATH',
+        description="Unreal .uproject file",
+    )
+
+
 class DlcMounterSourceItem(bpy.types.PropertyGroup):
     enabled: BoolProperty(
         name="Enabled",
@@ -910,6 +929,31 @@ class RemoveRedkitProjectOperator(bpy.types.Operator):
             addon_prefs.redkit_projects.remove(index)
             if index >= len(addon_prefs.redkit_projects):
                 addon_prefs.redkit_projects_index = len(addon_prefs.redkit_projects) - 1
+        return {'FINISHED'}
+
+
+class AddUnrealProjectOperator(bpy.types.Operator):
+    bl_idname = "witcher.add_unreal_project"
+    bl_label = "Add Unreal Project"
+
+    def execute(self, context):
+        addon_prefs = get_all_addon_prefs(context)
+        new_item = addon_prefs.unreal_projects.add()
+        new_item.path = ""
+        return {'FINISHED'}
+
+
+class RemoveUnrealProjectOperator(bpy.types.Operator):
+    bl_idname = "witcher.remove_unreal_project"
+    bl_label = "Remove Unreal Project"
+
+    def execute(self, context):
+        addon_prefs = get_all_addon_prefs(context)
+        index = addon_prefs.unreal_projects_index
+        if 0 <= index < len(addon_prefs.unreal_projects):
+            addon_prefs.unreal_projects.remove(index)
+            if index >= len(addon_prefs.unreal_projects):
+                addon_prefs.unreal_projects_index = len(addon_prefs.unreal_projects) - 1
         return {'FINISHED'}
 
 
@@ -1495,6 +1539,9 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
 
     redkit_projects: CollectionProperty(type=PathItem)
     redkit_projects_index: IntProperty(update=_reset_dlc_mounter_sources)
+
+    unreal_projects: CollectionProperty(type=UnrealProjectItem)
+    unreal_projects_index: IntProperty()
 
     dlc_mounter_sources: CollectionProperty(type=DlcMounterSourceItem)
     dlc_mounter_sources_index: IntProperty()
@@ -2177,6 +2224,13 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         col = row.column(align=True)
         col.operator("witcher.add_redkit_project", text="", icon="ADD")
         col.operator("witcher.remove_redkit_project", text="", icon="REMOVE")
+
+        unreal_box, _unreal_col = section("Unreal Projects", 'FILE_FOLDER')
+        unreal_row = unreal_box.row(align=True)
+        unreal_row.template_list("WITCHER_UL_path_list", "", self, "unreal_projects", self, "unreal_projects_index", rows=3)
+        unreal_buttons = unreal_row.column(align=True)
+        unreal_buttons.operator("witcher.add_unreal_project", text="", icon="ADD")
+        unreal_buttons.operator("witcher.remove_unreal_project", text="", icon="REMOVE")
 
         # Extra/legacy options
         extra_box, _extra_col = section("Witcher 3 Extra Settings", 'PREFERENCES')
@@ -4356,6 +4410,7 @@ _classes = [
 
 def register():
     bpy.utils.register_class(PathItem)
+    bpy.utils.register_class(UnrealProjectItem)
     bpy.utils.register_class(DlcMounterSourceItem)
     bpy.utils.register_class(WITCHER_UL_path_list)
     bpy.utils.register_class(WITCHER_UL_game_dlc_mounter_sources)
@@ -4365,6 +4420,8 @@ def register():
     bpy.utils.register_class(RemovePathOperator)
     bpy.utils.register_class(AddRedkitProjectOperator)
     bpy.utils.register_class(RemoveRedkitProjectOperator)
+    bpy.utils.register_class(AddUnrealProjectOperator)
+    bpy.utils.register_class(RemoveUnrealProjectOperator)
     bpy.utils.register_class(WITCHER_OT_refresh_dlc_mounter_sources)
     bpy.utils.register_class(WITCHER_OT_reset_browser_popup_width)
     bpy.utils.register_class(WITCHER_OT_autofind_w3_path)
@@ -4461,6 +4518,8 @@ def unregister():
     
     #PATH LIST
     bpy.utils.unregister_class(WITCHER_OT_refresh_dlc_mounter_sources)
+    bpy.utils.unregister_class(RemoveUnrealProjectOperator)
+    bpy.utils.unregister_class(AddUnrealProjectOperator)
     bpy.utils.unregister_class(RemoveRedkitProjectOperator)
     bpy.utils.unregister_class(AddRedkitProjectOperator)
     bpy.utils.unregister_class(RemovePathOperator)
@@ -4477,6 +4536,7 @@ def unregister():
     bpy.utils.unregister_class(WITCHER_UL_game_dlc_mounter_sources)
     bpy.utils.unregister_class(WITCHER_UL_path_list)
     bpy.utils.unregister_class(DlcMounterSourceItem)
+    bpy.utils.unregister_class(UnrealProjectItem)
     bpy.utils.unregister_class(PathItem)
 
     unreal_export.unregister()
