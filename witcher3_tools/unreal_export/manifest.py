@@ -23,6 +23,46 @@ DEFAULT_CONTENT_ROOTS = {
 DEFAULT_CONTENT_ROOT = DEFAULT_CONTENT_ROOTS["w3"]
 FALLBACK_MASTER_DEPOT = r"engine\materials\graphs\pbr_std.w2mg"
 
+# ---- overwrite policy ------------------------------------------------------
+# Which existing Unreal assets a re-import is allowed to replace, per asset
+
+OVERWRITE_CATEGORIES = (
+    "meshes",
+    "skeletons",
+    "animations",
+    "blueprints",
+    "material_instances",
+    "materials_base",
+    "textures",
+)
+
+OVERWRITE_PROTECTED_CATEGORIES = ("materials_base", "textures")
+OVERWRITE_PRESETS = ("reuse_all", "overwrite_all", "overwrite_except_base")
+
+
+def default_overwrite() -> dict[str, bool]:
+    """Reuse everything (never overwrite) -- the historical default."""
+    return {key: False for key in OVERWRITE_CATEGORIES}
+
+
+def normalize_overwrite(overwrite: Any = None) -> dict[str, bool]:
+    result = default_overwrite()
+    if isinstance(overwrite, dict):
+        for key in OVERWRITE_CATEGORIES:
+            if key in overwrite:
+                result[key] = bool(overwrite[key])
+    return result
+
+
+def overwrite_preset(preset: str) -> dict[str, bool]:
+    name = str(preset or "").strip().lower()
+    if name == "overwrite_all":
+        return {key: True for key in OVERWRITE_CATEGORIES}
+    if name == "overwrite_except_base":
+        return {key: key not in OVERWRITE_PROTECTED_CATEGORIES for key in OVERWRITE_CATEGORIES}
+    # "reuse_all" / anything unrecognised -> reuse everything.
+    return default_overwrite()
+
 # Witcher texture params that should import as sRGB color data.
 _SRGB_PARAM_TOKENS = ("diffuse",)
 # Witcher texture params that should import with normal-map compression.
@@ -210,6 +250,7 @@ def build_manifest(
     bundle_root: str,
     source_game: str | None = "w3",
     content_root: str | None = None,
+    overwrite: dict[str, Any] | None = None,
     meshes: Iterable[dict[str, Any]] = (),
     masters: Iterable[dict[str, Any]] = (),
     materials: Iterable[dict[str, Any]] = (),
@@ -218,6 +259,7 @@ def build_manifest(
     rig: dict[str, Any] | None = None,
     blueprint: dict[str, Any] | None = None,
     terrain: dict[str, Any] | None = None,
+    placements: dict[str, Any] | None = None,
     warnings: Iterable[str] = (),
 ) -> dict[str, Any]:
     game = normalize_source_game(source_game)
@@ -227,6 +269,7 @@ def build_manifest(
         "bundle_root": os.path.normpath(bundle_root),
         "source_game": game,
         "content_root": normalize_content_root(content_root, game),
+        "overwrite": normalize_overwrite(overwrite),
         "meshes": list(meshes),
         "masters": list(masters),
         "materials": list(materials),
@@ -240,4 +283,6 @@ def build_manifest(
         manifest["blueprint"] = blueprint
     if terrain:
         manifest["terrain"] = terrain
+    if placements:
+        manifest["placements"] = placements
     return manifest

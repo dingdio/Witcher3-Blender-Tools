@@ -26,7 +26,7 @@ from .manifest import (
 )
 from . import terrain_unreal
 from . import terrain_material
-from .bundle import _resolve_content_root_setting, default_export_folder
+from .bundle import _resolve_content_root_setting, default_export_folder, overwrite_policy_from_settings
 
 
 def _find_terrain_object(selected_objects, active_object=None):
@@ -298,6 +298,7 @@ def build_unreal_world_bundle(context, settings) -> dict[str, Any]:
         bundle_root=bundle_root,
         source_game=source_game,
         content_root=content_root,
+        overwrite=overwrite_policy_from_settings(settings),
         textures=textures,
         terrain=terrain_section,
         warnings=warnings,

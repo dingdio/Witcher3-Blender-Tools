@@ -34,6 +34,187 @@ def _group_armature(group_objects) -> Optional[Any]:
     return None
 
 
+def _object_prop(obj, name):
+    try:
+        return obj.get(name)
+    except Exception:
+        return None
+
+
+def _special_attachment_socket(armature) -> Optional[str]:
+    """Return the rig bone a separate-skeleton hard attachment hangs off, if any.
+
+    A CAnimatedComponent attachment (e.g. Ciri's scabbard) keeps its OWN
+    skeleton and is linked to the entity rig by anchoring its Root bone to a
+    main-skeleton bone -- ``import_entity.process_special_attachment`` records
+    that bone on the attachment armature as ``w2_special_parent_bone``. Such a
+    part must NOT have its bones grafted onto the shared skeleton; instead it
+    exports on its own skeleton and is attached to this bone in the Unreal
+    blueprint (no offset/scale -- the bones are co-located).
+    """
+    if armature is None:
+        return None
+    if not _object_prop(armature, "w2_special_attachment"):
+        return None
+    bone = str(_object_prop(armature, "w2_special_parent_bone") or "").strip()
+    return bone or None
+
+
+def _hard_attachment_socket(group_objects, main_armature) -> Optional[str]:
+    """Return the rig bone a bone-parented "hard attachment" hangs off, if any.
+
+    RED hangs rigid items (scabbards, sheathed weapons, quivers) off a skeleton
+    slot with ``CHardAttachment`` rather than skinning them. The entity importer
+    recreates that as a mesh parented to a "CHardAttachment" empty that is
+    bone-parented to the entity rig (see import_entity.process_regular_attachment).
+    These meshes have no armature modifier, so they would otherwise export as
+    loose static meshes that float at the origin in Unreal. Detect them by
+    walking up the parent chain for an ancestor bone-parented to ``main_armature``
+    and return that slot bone (only when the bone actually exists on the rig so a
+    follower can copy its pose).
+    """
+    if main_armature is None:
+        return None
+    main_bones = _armature_bones_by_name(main_armature)
+    for obj in group_objects:
+        node = obj
+        depth = 0
+        while node is not None and depth < 16:
+            if (
+                getattr(node, "parent_type", "") == "BONE"
+                and getattr(node, "parent", None) is main_armature
+            ):
+                bone = str(getattr(node, "parent_bone", "") or "")
+                if bone and bone in main_bones:
+                    return bone
+            node = getattr(node, "parent", None)
+            depth += 1
+    return None
+
+
+@contextmanager
+def _rigid_attachment_skinning(context, group_objects, main_armature, slot_bone: str,
+                               asset_rel: str, warnings: list[str]):
+    """Temporarily skin a hard-attachment mesh group rigidly to ``slot_bone``.
+
+    Re-binds each mesh so the FBX exporter writes it as a skeletal mesh weighted
+    100% to one rig bone, against the shared rig: the bone-parent (which the FBX
+    exporter cannot represent) is swapped for an object parent + full-weight
+    vertex group + armature modifier, with world position preserved. Unreal then
+    imports it on the shared skeleton and the blueprint drives it as an ordinary
+    leader-pose follower, so it tracks the slot bone exactly the way RED's hard
+    attachment does -- without grafting bones onto the base skeleton. Everything
+    is restored afterwards.
+    """
+    saved = []
+    bound = 0
+    try:
+        for obj in group_objects:
+            if getattr(obj, "type", "") != "MESH":
+                continue
+            mesh = getattr(obj, "data", None)
+            vertices = getattr(mesh, "vertices", None)
+            if vertices is None:
+                continue
+            world = obj.matrix_world.copy()
+            vertex_indices = list(range(len(vertices)))
+
+            vgroup = obj.vertex_groups.get(slot_bone)
+            vgroup_weights = None
+            if vgroup is not None:
+                vgroup_weights = []
+                vgroup_index = vgroup.index
+                for vertex in vertices:
+                    weight = None
+                    for group in getattr(vertex, "groups", []) or []:
+                        if getattr(group, "group", None) == vgroup_index:
+                            weight = float(getattr(group, "weight", 0.0))
+                            break
+                    vgroup_weights.append(weight)
+
+            modifier = next(
+                (m for m in obj.modifiers if getattr(m, "type", "") == "ARMATURE"), None
+            )
+            record = {
+                "obj": obj,
+                "parent": obj.parent,
+                "parent_type": obj.parent_type,
+                "parent_bone": obj.parent_bone,
+                "matrix_parent_inverse": obj.matrix_parent_inverse.copy(),
+                "world": world,
+                "created_vgroup": False,
+                "vgroup_weights": vgroup_weights,
+                "modifier": modifier,
+                "modifier_object": getattr(modifier, "object", None) if modifier is not None else None,
+                "created_modifier": None,
+            }
+            saved.append(record)
+
+            obj.parent = main_armature
+            obj.parent_type = "OBJECT"
+            obj.parent_bone = ""
+            try:
+                obj.matrix_parent_inverse = main_armature.matrix_world.inverted()
+            except Exception:
+                pass
+            obj.matrix_world = world
+
+            if vgroup is None:
+                vgroup = obj.vertex_groups.new(name=slot_bone)
+                record["created_vgroup"] = True
+            vgroup.add(vertex_indices, 1.0, "REPLACE")
+
+            if modifier is None:
+                modifier = obj.modifiers.new("Armature", "ARMATURE")
+                record["created_modifier"] = modifier
+            modifier.object = main_armature
+
+            bound += 1
+
+        if bound:
+            warnings.append(
+                f"{asset_rel}: exported as a rigid attachment skinned to bone "
+                f"'{slot_bone}' (Unreal leader-pose follower)"
+            )
+        yield bound > 0
+    finally:
+        for record in reversed(saved):
+            obj = record["obj"]
+            try:
+                if record["created_modifier"] is not None:
+                    obj.modifiers.remove(record["created_modifier"])
+                elif record["modifier"] is not None:
+                    record["modifier"].object = record["modifier_object"]
+            except Exception:
+                pass
+            try:
+                if record["created_vgroup"]:
+                    existing = obj.vertex_groups.get(slot_bone)
+                    if existing is not None:
+                        obj.vertex_groups.remove(existing)
+                elif record["vgroup_weights"] is not None:
+                    existing = obj.vertex_groups.get(slot_bone)
+                    if existing is not None:
+                        for index, weight in enumerate(record["vgroup_weights"]):
+                            try:
+                                if weight is None:
+                                    existing.remove([index])
+                                else:
+                                    existing.add([index], weight, "REPLACE")
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            try:
+                obj.parent = record["parent"]
+                obj.parent_type = record["parent_type"]
+                obj.parent_bone = record["parent_bone"]
+                obj.matrix_parent_inverse = record["matrix_parent_inverse"]
+                obj.matrix_world = record["world"]
+            except Exception:
+                pass
+
+
 def _resolve_export_armature(group_armature, main_armature, asset_rel: str,
                              warnings: list[str]):
     """Pick the armature a skeletal mesh FBX should carry.

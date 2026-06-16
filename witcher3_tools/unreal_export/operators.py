@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import traceback
 
 import bpy
@@ -10,7 +11,9 @@ from bpy.props import BoolProperty, EnumProperty, IntProperty, PointerProperty, 
 
 from ..ui.ui_utils import WITCH_PT_Base
 from . import bundle
+from . import manifest
 from . import world_bundle
+from . import placements_bundle
 from . import plugin_install
 from . import unreal_project
 from .socket_client import send_import_request
@@ -80,6 +83,70 @@ class WITCHER_PG_UnrealExportSettings(bpy.types.PropertyGroup):
         name="Connection",
         default=False,
         description="Show the Unreal live-link host and port",
+    )
+    show_placements_advanced: BoolProperty(
+        name="Placement Options",
+        default=False,
+        description="Show placement export performance options",
+    )
+    show_overwrite: BoolProperty(
+        name="Overwrite Policy",
+        default=False,
+        description="Show which existing Unreal assets a re-import is allowed to replace",
+    )
+    # Per-category overwrite policy. All default False (reuse every existing
+    # Unreal asset) -- the historical "existing UE assets win" behaviour. These
+    # serialize into the manifest's ``overwrite`` block; see manifest.py.
+    overwrite_meshes: BoolProperty(
+        name="Meshes",
+        default=False,
+        description="Re-export and reimport static/skeletal meshes, replacing the existing Unreal assets",
+    )
+    overwrite_skeletons: BoolProperty(
+        name="Skeletons",
+        default=False,
+        description="Reimport the rig skeleton, replacing the existing Unreal Skeleton asset",
+    )
+    overwrite_animations: BoolProperty(
+        name="Animations",
+        default=False,
+        description="Reimport animations, replacing existing Unreal AnimSequences",
+    )
+    overwrite_blueprints: BoolProperty(
+        name="Blueprints",
+        default=False,
+        description="Rebuild character/entity blueprints, replacing existing ones",
+    )
+    overwrite_material_instances: BoolProperty(
+        name="Material Instances",
+        default=False,
+        description="Refresh material-instance parameters and parents on existing Unreal MIs",
+    )
+    overwrite_materials_base: BoolProperty(
+        name="Base Materials",
+        default=False,
+        description=(
+            "Rebuild generated base UMaterial master materials. Off by default to "
+            "protect hand-authored masters at mirrored depot paths"
+        ),
+    )
+    overwrite_textures: BoolProperty(
+        name="Textures",
+        default=False,
+        description=(
+            "Reimport textures, replacing existing Unreal texture assets. Off by "
+            "default to protect hand-tweaked texture import settings"
+        ),
+    )
+    placement_export_collision: BoolProperty(
+        name="Collision",
+        default=False,
+        description="Export RED collision meshes as hidden Unreal collision actors. Slower",
+    )
+    placement_write_profile_log: BoolProperty(
+        name="Profile Log",
+        default=True,
+        description="Write a timing log for placement export phases",
     )
     export_folder: StringProperty(name="Export Folder", subtype="DIR_PATH", default="")
     content_root: StringProperty(
@@ -194,6 +261,94 @@ class WITCHER_OT_export_unreal_world(bpy.types.Operator):
             settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+
+
+class WITCHER_OT_export_unreal_placements(bpy.types.Operator):
+    bl_idname = "witcher.export_unreal_placements"
+    bl_label = "Export World Placements to Unreal"
+    bl_description = (
+        "Export the CSectorData placements in the selected layer(s) as Unreal "
+        "StaticMeshActors and instanced static meshes (HISM) positioned on the exported Landscape. "
+        "Load layers with 'Load Layers Around Camera', then select the layer "
+        "collection(s) and send; re-send more layers to fill the map in"
+    )
+    bl_options = {"REGISTER"}
+
+    action: EnumProperty(
+        name="Action",
+        items=[
+            ("BUNDLE", "Export Bundle", "Write the placement FBXs, textures, and manifest"),
+            ("SEND", "Send to Unreal", "Write the bundle and send it to the running Unreal plugin"),
+        ],
+        default="BUNDLE",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return bool(getattr(context, "selected_objects", None))
+
+    def execute(self, context):
+        settings = context.scene.witcher_unreal_export
+        if not settings.export_folder:
+            settings.export_folder = bundle.default_export_folder()
+
+        try:
+            result = placements_bundle.build_unreal_placements_bundle(context, settings)
+            settings.last_manifest_path = result["manifest_path"]
+            warning_count = len(result["manifest"].get("warnings", []))
+            settings.last_status = f"Placements bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
+            settings.last_details = _format_placements_bundle_details(result)
+
+            if self.action == "SEND":
+                send_started = time.perf_counter()
+                settings.last_status = "Sending placements to Unreal"
+                response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                send_seconds = time.perf_counter() - send_started
+                success = bool(response.get("success"))
+                settings.last_status = "Unreal placements import complete" if success else "Unreal placements import failed"
+                settings.last_details += (
+                    f"\n\nUnreal send/import time: {send_seconds:.3f}s"
+                    "\n\nUnreal response:\n"
+                    + json.dumps(response, indent=2)
+                )
+                if not success:
+                    self.report({"ERROR"}, settings.last_status)
+                    return {"CANCELLED"}
+
+            self.report({"INFO"}, settings.last_status)
+            return {"FINISHED"}
+        except Exception as exc:
+            settings.last_status = "Unreal placements export failed"
+            settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+
+class WITCHER_OT_unreal_overwrite_preset(bpy.types.Operator):
+    bl_idname = "witcher.unreal_overwrite_preset"
+    bl_label = "Overwrite Preset"
+    bl_description = "Apply an overwrite policy preset to the per-category options below"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset: EnumProperty(
+        name="Preset",
+        items=[
+            ("reuse_all", "Reuse All", "Never overwrite; reuse every existing Unreal asset"),
+            ("overwrite_all", "Overwrite All",
+             "Overwrite every category, including base materials and textures"),
+            ("overwrite_except_base", "Overwrite (keep base mats & textures)",
+             "Overwrite everything except base materials and textures; material instances are still refreshed"),
+        ],
+        default="reuse_all",
+    )
+
+    def execute(self, context):
+        settings = context.scene.witcher_unreal_export
+        for key, value in manifest.overwrite_preset(self.preset).items():
+            setattr(settings, f"overwrite_{key}", bool(value))
+        settings.show_overwrite = True
+        self.report({"INFO"}, f"Overwrite preset applied: {self.preset}")
+        return {"FINISHED"}
 
 
 class WITCHER_OT_install_unreal_plugin(bpy.types.Operator):
@@ -362,6 +517,8 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
         col.prop(settings, "asset_name")
         col.prop(settings, "export_folder")
 
+        self._draw_overwrite_policy(box, settings)
+
         row = box.row(align=True)
         op = row.operator(
             WITCHER_OT_export_unreal_item.bl_idname, text="Export Bundle", icon="FILE_TICK"
@@ -384,6 +541,26 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
         )
         w_send.action = "SEND"
 
+        box.separator()
+        box.label(text="World Placements (Buildings/Props)", icon="MESH_DATA")
+        placement_row = box.row(align=True)
+        p_bundle = placement_row.operator(
+            WITCHER_OT_export_unreal_placements.bl_idname, text="Export Placements", icon="FILE_TICK"
+        )
+        p_bundle.action = "BUNDLE"
+        p_send = placement_row.operator(
+            WITCHER_OT_export_unreal_placements.bl_idname, text="Send Placements", icon="URL"
+        )
+        p_send.action = "SEND"
+
+        if _expander(box, settings, "show_placements_advanced", "Placement Options"):
+            placement_options = box.column(align=True)
+            placement_options.use_property_split = True
+            placement_options.use_property_decorate = False
+            placement_options.prop(settings, "placement_export_collision", text="Collision")
+            placement_options.prop(settings, "placement_write_profile_log", text="Profile Log")
+            placement_options.label(text="FBX reuse follows Overwrite Policy > Meshes", icon="INFO")
+
         if _expander(box, settings, "show_connection", "Connection"):
             conn = box.column()
             conn.use_property_split = True
@@ -396,6 +573,31 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
         status_row.operator(
             WITCHER_OT_unreal_export_details.bl_idname, text="", icon="TEXT"
         )
+
+    def _draw_overwrite_policy(self, box, settings):
+        if not _expander(box, settings, "show_overwrite", "Overwrite Policy"):
+            return
+        ow = box.column(align=True)
+        ow.label(text="Replace existing Unreal assets on import:")
+        preset_row = ow.row(align=True)
+        for value, label in (
+            ("reuse_all", "Reuse All"),
+            ("overwrite_all", "Overwrite All"),
+            ("overwrite_except_base", "All but Base/Tex"),
+        ):
+            preset_row.operator(
+                WITCHER_OT_unreal_overwrite_preset.bl_idname, text=label
+            ).preset = value
+        cats = ow.column(align=True)
+        cats.use_property_split = True
+        cats.use_property_decorate = False
+        cats.prop(settings, "overwrite_meshes")
+        cats.prop(settings, "overwrite_skeletons")
+        cats.prop(settings, "overwrite_animations")
+        cats.prop(settings, "overwrite_blueprints")
+        cats.prop(settings, "overwrite_material_instances")
+        cats.prop(settings, "overwrite_materials_base")
+        cats.prop(settings, "overwrite_textures")
 
 
 def _format_bundle_details(result: dict) -> str:
@@ -431,6 +633,64 @@ def _format_bundle_details(result: dict) -> str:
         "",
         "Warnings:",
     ]
+    warnings = manifest.get("warnings", [])
+    if warnings:
+        lines.extend(f"- {warning}" for warning in warnings)
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
+def _format_placements_bundle_details(result: dict) -> str:
+    manifest = result.get("manifest", {})
+    placements = manifest.get("placements", {}) or {}
+    layers = placements.get("layers", []) or []
+    light_total = sum(len((group.get("lights", []) or [])) for group in layers)
+    meshes = manifest.get("meshes", []) or []
+    collision_meshes = [mesh for mesh in meshes if mesh.get("collision")]
+    visual_meshes = [mesh for mesh in meshes if not mesh.get("collision")]
+    profile = result.get("profile", {}) or {}
+    profile_counts = profile.get("counts", {}) or {}
+    profile_totals = profile.get("totals", {}) or {}
+    profile_path = result.get("profile_path", "")
+    lines = [
+        f"Asset: {result.get('asset_name', '')}",
+        f"Bundle: {result.get('bundle_root', '')}",
+        f"Manifest: {result.get('manifest_path', '')}",
+        f"Profile: {profile_path or '(not written)'}",
+        f"Content root: {manifest.get('content_root', '')}",
+        "",
+        f"Visual meshes: {len(visual_meshes)}"
+        f" | Collision meshes: {len(collision_meshes)}"
+        f" | Lights: {light_total}"
+        f" | Layers: {len(layers)}",
+        f"Total time: {profile.get('total_seconds', 0.0):.3f}s"
+        f" | FBX: {profile_totals.get('visual_fbx_export', 0.0):.3f}s"
+        f" | Materials: {profile_totals.get('material_scan', 0.0):.3f}s"
+        f" | Collision: {profile_totals.get('collision_fbx_export', 0.0):.3f}s",
+        f"FBX exported: {profile_counts.get('visual_fbx_exported', 0)}"
+        f" | reused: {profile_counts.get('visual_fbx_reused', 0)}"
+        f" | collision exported: {profile_counts.get('collision_fbx_exported', 0)}"
+        f" | collision reused: {profile_counts.get('collision_fbx_reused', 0)}",
+        "",
+        "Placements per layer:",
+    ]
+    if layers:
+        for group in layers:
+            actors = group.get("actors", []) or []
+            instancers = group.get("instancers", []) or []
+            lights = group.get("lights", []) or []
+            inst_total = sum(len(i.get("instances", [])) for i in instancers)
+            folder = group.get("folder", "")
+            lines.append(
+                f"- {folder + '/' if folder else ''}{group.get('label', '')}:"
+                f" {len(actors)} actor(s)"
+                + (f", {inst_total} instanced" if inst_total else "")
+                + (f", {len(lights)} light(s)" if lights else "")
+            )
+    else:
+        lines.append("- none")
+    lines += ["", "Warnings:"]
     warnings = manifest.get("warnings", [])
     if warnings:
         lines.extend(f"- {warning}" for warning in warnings)
@@ -476,6 +736,8 @@ classes = (
     WITCHER_PG_UnrealExportSettings,
     WITCHER_OT_export_unreal_item,
     WITCHER_OT_export_unreal_world,
+    WITCHER_OT_export_unreal_placements,
+    WITCHER_OT_unreal_overwrite_preset,
     WITCHER_OT_install_unreal_plugin,
     WITCHER_OT_unreal_export_details,
     WITCHER_OT_unreal_project_details,

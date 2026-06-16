@@ -62,6 +62,90 @@ def w3_world_to_unreal(x: float, y: float, z: float) -> tuple[float, float, floa
     )
 
 
+def _mat3_to_quat_xyzw(rot: np.ndarray) -> list[float]:
+    """Proper orthonormal 3x3 (rows) -> quaternion [x, y, z, w] (Shepperd)."""
+    m = np.asarray(rot, dtype=float)
+    trace = m[0, 0] + m[1, 1] + m[2, 2]
+    if trace > 0.0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (m[2, 1] - m[1, 2]) * s
+        y = (m[0, 2] - m[2, 0]) * s
+        z = (m[1, 0] - m[0, 1]) * s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([x, y, z, w], dtype=float)
+    norm = np.linalg.norm(q)
+    if norm > 0.0:
+        q = q / norm
+    if q[3] < 0.0:  # canonical: non-negative w
+        q = -q
+    return [float(v) for v in q]
+
+
+def w3_matrix_to_unreal(world_matrix) -> dict:
+    """Blender world 4x4 -> an Unreal placement transform.
+
+    ``world_matrix`` is a 4x4 (any nested sequence / numpy array, row-major).
+    The Blender->UE frame change is conjugation by ``P = diag(100, -100, 100, 1)``
+    (the same handedness flip + metre->centimetre scale as
+    :func:`w3_world_to_unreal` and the FBX export preset). A mesh asset exported
+    through that preset has local verts ``P . v``; placing an instance with
+    ``M_ue = P . W . P^-1`` therefore lands its geometry at ``P . (W . v)`` --
+    i.e. exactly where the Blender placement put it, in the shared UE frame.
+
+    The conjugation is a similarity transform (det preserved), so a proper
+    rotation stays proper and positive scale stays positive. If a placement
+    contains a negative/mirrored scale axis, the mirror is folded into a negative
+    scale component before extracting the quaternion. Returns
+    ``{location, rotation, scale}`` with location in centimetres, rotation as a
+    quaternion ``[x, y, z, w]``, and per-axis scale, ready for ``FTransform`` on
+    the Unreal side.
+
+    This is the ONE place placement orientation is decided; if a known building
+    lands mirrored/rotated, fix it here (mirrors the ``HEIGHTMAP_FLIP_V`` knob).
+    """
+    w = np.asarray(world_matrix, dtype=float).reshape(4, 4)
+    p = np.diag([UE_UNITS_PER_METER, UE_UNITS_PER_METER * UNREAL_Y_SIGN,
+                 UE_UNITS_PER_METER, 1.0])
+    p_inv = np.diag([1.0 / UE_UNITS_PER_METER, 1.0 / (UE_UNITS_PER_METER * UNREAL_Y_SIGN),
+                     1.0 / UE_UNITS_PER_METER, 1.0])
+    m = p @ w @ p_inv
+
+    location = [float(m[0, 3]), float(m[1, 3]), float(m[2, 3])]
+    linear = m[:3, :3]
+    scale = [float(np.linalg.norm(linear[:, i])) for i in range(3)]
+    rot = np.array(linear, dtype=float)
+    for i in range(3):
+        if scale[i] > 1e-12:
+            rot[:, i] = rot[:, i] / scale[i]
+    # Mirrored placements (a negative/flip scale axis in W3) give an improper
+    # rotation (det -1); quaternion extraction needs a proper rotation. Fold the
+    # mirror into a negative scale axis -- FTransform / HISM support negative
+    # scale -- so the geometry stays mirrored without garbling the rotation.
+    if np.linalg.det(rot) < 0.0:
+        rot[:, 0] = -rot[:, 0]
+        scale[0] = -scale[0]
+    rotation = _mat3_to_quat_xyzw(rot)
+    return {"location": location, "rotation": rotation, "scale": scale}
+
+
 # --- landscape resolution / component layout ---------------------------------
 
 @dataclass(frozen=True)

@@ -24,6 +24,11 @@ from .manifest import (
 log = logging.getLogger(__name__)
 
 TextureRegistrar = Callable[[str, str], Optional[dict]]
+VOLUME_MASTER_ASSET = "engine/materials/defaults/volume"
+
+
+def is_volume_master_path(path: str) -> bool:
+    return depot_asset_rel(path).lower() == VOLUME_MASTER_ASSET
 
 
 def _default_chain_reader(material_path: str, version: int) -> dict[str, Any]:
@@ -105,6 +110,8 @@ class ChainBuilder:
             "params": params,
         }
         entry.update(parent_ref)
+        if self._parent_ref_is_volume(parent_ref):
+            entry["volume"] = True
         self._append_material(entry)
         self._extend_master_params(parent_ref, params)
         return asset_path
@@ -113,10 +120,13 @@ class ChainBuilder:
         return [self.materials[mat_id] for mat_id in self.material_order]
 
     def ordered_masters(self) -> list[dict[str, Any]]:
-        return [
-            {"depot_path": rel, "params": list(master["params"].values())}
-            for rel, master in self.masters.items()
-        ]
+        entries = []
+        for rel, master in self.masters.items():
+            entry = {"depot_path": rel, "params": list(master["params"].values())}
+            if master.get("volume"):
+                entry["volume"] = True
+            entries.append(entry)
+        return entries
 
     # ---- chain handling ----
 
@@ -194,6 +204,8 @@ class ChainBuilder:
             "params": params,
         }
         entry.update(parent_ref)
+        if self._parent_ref_is_volume(parent_ref):
+            entry["volume"] = True
         self._append_material(entry)
         self._extend_master_params(parent_ref, params)
         return asset_path
@@ -202,8 +214,14 @@ class ChainBuilder:
         asset_path = depot_asset_rel(graph_depot_path or FALLBACK_MASTER_DEPOT)
         master = self.masters.get(asset_path)
         if master is None:
-            master = {"depot_path": graph_depot_path, "params": {}}
+            master = {
+                "depot_path": graph_depot_path,
+                "params": {},
+                "volume": is_volume_master_path(graph_depot_path or FALLBACK_MASTER_DEPOT),
+            }
             self.masters[asset_path] = master
+        elif is_volume_master_path(graph_depot_path or FALLBACK_MASTER_DEPOT):
+            master["volume"] = True
 
         if graph_bin is not None and not master.get("_defaults_read"):
             master["_defaults_read"] = True
@@ -238,6 +256,26 @@ class ChainBuilder:
             master["params"].setdefault(
                 param["name"], {"name": param["name"], "kind": param["kind"]}
             )
+
+    def _parent_ref_is_volume(self, parent_ref: dict[str, str]) -> bool:
+        master_rel = parent_ref.get("parent_master")
+        if master_rel:
+            return bool(self.masters.get(master_rel or "", {}).get("volume"))
+
+        parent_id = parent_ref.get("parent_material")
+        visited = set()
+        while parent_id and parent_id not in visited:
+            visited.add(parent_id)
+            parent = self.materials.get(parent_id)
+            if not parent:
+                return False
+            if parent.get("volume"):
+                return True
+            master_rel = parent.get("parent_master")
+            if master_rel:
+                return bool(self.masters.get(master_rel or "", {}).get("volume"))
+            parent_id = parent.get("parent_material")
+        return False
 
     # ---- helpers ----
 

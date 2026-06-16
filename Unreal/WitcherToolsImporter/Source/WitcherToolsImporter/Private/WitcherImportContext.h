@@ -36,6 +36,8 @@ private:
     void ImportAnimations();
     void ImportBlueprint();
     void ImportTerrain();
+    void ImportPlacements();
+    class UStaticMesh* FindPlacementMesh(const FString& AssetRel);
     class UTexture2DArray* BuildTerrainTextureArray(const TArray<class UTexture2D*>& Slices, const FString& AssetRel, bool bNormal);
     UMaterialInterface* BuildTerrainBlendMaterial(const TSharedPtr<FJsonObject>& Terrain, const FString& AssetRel);
 
@@ -56,11 +58,14 @@ private:
     UObject* LoadAnyAsset(const FString& AssetRel) const;
     FString ClassSafeAssetRel(const FString& AssetRel, UClass* DesiredClass, const FString& Suffix);
     FString ResolveBundleFile(const FString& RelativePath) const;
+    bool ShouldOverwrite(const FString& Category) const;
     void AddWarning(const FString& Warning);
     void AddError(const FString& Error);
+    void SaveImportedPackages();
     FString BuildResponse(bool bSuccess) const;
 
     TSharedPtr<FJsonObject> Manifest;
+    TSharedPtr<FJsonObject> OverwriteObject;
     FString BundleRoot;
     FString ContentRoot;
     FString AssetName;

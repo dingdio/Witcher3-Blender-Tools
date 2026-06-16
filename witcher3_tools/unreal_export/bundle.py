@@ -15,11 +15,13 @@ from contextlib import contextmanager, nullcontext
 from typing import Any, Optional
 
 from .manifest import (
+    OVERWRITE_CATEGORIES,
     build_manifest,
     default_content_root,
     depot_asset_dir,
     depot_asset_rel,
     normalize_content_root,
+    normalize_overwrite,
     normalize_source_game,
     relpath_for_manifest,
     safe_asset_name,
@@ -28,9 +30,12 @@ from .export_armature import (
     _export_armature_for_mesh_group,
     _find_attachment_armature_for_missing_bones,  # re-exported for tests
     _group_armature,
+    _hard_attachment_socket,
     _required_source_bone_names,  # re-exported for tests
     _resolve_export_armature,  # re-exported for tests
     _retargeted_armature_modifiers,
+    _rigid_attachment_skinning,
+    _special_attachment_socket,
 )
 from .material_chain import ChainBuilder
 from .scene_utils import (
@@ -58,6 +63,12 @@ def default_export_folder() -> str:
         return os.path.join(get_temp_root(), "unreal_exports")
     except Exception:
         return os.path.join(os.getcwd(), "witcher_unreal_exports")
+
+
+def overwrite_policy_from_settings(settings) -> dict[str, bool]:
+    return normalize_overwrite(
+        {key: bool(getattr(settings, f"overwrite_{key}", False)) for key in OVERWRITE_CATEGORIES}
+    )
 
 
 def _resolve_content_root_setting(content_root: str, source_game: str) -> str:
@@ -119,9 +130,19 @@ def _object_source_game(obj) -> str:
     return str(value or "").strip()
 
 
+def _refresh_view_layer(context) -> None:
+    try:
+        view_layer = getattr(context, "view_layer", None)
+        if view_layer is not None:
+            view_layer.update()
+    except Exception:
+        pass
+
+
 def build_unreal_export_bundle(context, settings) -> dict[str, Any]:
     selected_objects = list(getattr(context, "selected_objects", []) or [])
     preload_warnings = _ensure_selected_character_appearances_loaded(context, selected_objects)
+    _refresh_view_layer(context)
     export_objects = collect_export_objects(selected_objects)
     mesh_objects = [obj for obj in export_objects if getattr(obj, "type", "") == "MESH"]
     armatures = [obj for obj in export_objects if getattr(obj, "type", "") == "ARMATURE"]
@@ -164,6 +185,7 @@ def build_unreal_export_bundle(context, settings) -> dict[str, Any]:
         bundle_root=bundle_root,
         source_game=source_game,
         content_root=content_root,
+        overwrite=overwrite_policy_from_settings(settings),
         meshes=mesh_entries,
         masters=chain.ordered_masters(),
         materials=chain.ordered_materials(),
@@ -515,17 +537,47 @@ def _export_mesh_group(context, group, bundle_root: str, chain: ChainBuilder, wa
     fbx_path = _unique_fbx_path(bundle_root, asset_rel, used_fbx_stems)
 
     group_armature = _group_armature(group["objects"])
-    with _export_armature_for_mesh_group(
-        context, group_armature, main_armature, asset_rel, warnings
-    ) as armature:
-        fbx_objects = list(group["objects"]) + ([armature] if armature else [])
-        retarget = (
-            _retargeted_armature_modifiers(group["objects"], armature)
-            if armature is not None and armature is not group_armature
+
+    attach_to_bone = (
+        _special_attachment_socket(group_armature)
+        if group_armature is not None and group_armature is not main_armature
+        else None
+    )
+
+    if attach_to_bone:
+        armature = group_armature
+        export_fbx(context, list(group["objects"]) + [armature], fbx_path)
+        warnings.append(
+            f"{asset_rel}: exported on its own skeleton, attached to rig bone "
+            f"'{attach_to_bone}' in the blueprint"
+        )
+    else:
+        slot_bone = (
+            _hard_attachment_socket(group["objects"], main_armature)
+            if group_armature is None
+            else None
+        )
+        attachment_ctx = (
+            _rigid_attachment_skinning(
+                context, group["objects"], main_armature, slot_bone, asset_rel, warnings
+            )
+            if slot_bone
             else nullcontext()
         )
-        with retarget:
-            export_fbx(context, fbx_objects, fbx_path)
+        with attachment_ctx:
+            if slot_bone:
+                group_armature = _group_armature(group["objects"])
+            with _export_armature_for_mesh_group(
+                context, group_armature, main_armature, asset_rel, warnings
+            ) as armature:
+                fbx_objects = list(group["objects"]) + ([armature] if armature else [])
+                retarget = (
+                    _retargeted_armature_modifiers(group["objects"], armature)
+                    if armature is not None and armature is not group_armature
+                    else nullcontext()
+                )
+                with retarget:
+                    export_fbx(context, fbx_objects, fbx_path)
 
     slots: list[dict[str, Any]] = []
     seen_slots: set[tuple[int, str]] = set()
@@ -544,13 +596,17 @@ def _export_mesh_group(context, group, bundle_root: str, chain: ChainBuilder, wa
                 "material_id": material_id,
             })
 
-    return {
+    entry = {
         "name": mesh_name,
         "fbx": relpath_for_manifest(fbx_path, bundle_root),
         "asset_path": asset_rel,
         "kind": "skeletal" if armature else "static",
         "slots": slots,
     }
+    if attach_to_bone:
+        entry["own_skeleton"] = True
+        entry["attach_to_bone"] = attach_to_bone
+    return entry
 
 
 def _armature_rig_depot(armature) -> str:
@@ -618,11 +674,20 @@ def _create_rig_dummy_mesh(context, armature):
 
 def _build_blueprint_entry(armature, asset_name: str, mesh_entries,
                            rig_entry=None, animation_entries=None) -> Optional[dict[str, Any]]:
-    skeletal_paths = [entry["asset_path"] for entry in mesh_entries if entry.get("kind") == "skeletal"]
+    skeletal_entries = [entry for entry in mesh_entries if entry.get("kind") == "skeletal"]
+    follower_paths = [
+        entry["asset_path"] for entry in skeletal_entries if not entry.get("attach_to_bone")
+    ]
+    attachments = [
+        {"asset_path": entry["asset_path"], "attach_to_bone": entry["attach_to_bone"]}
+        for entry in skeletal_entries
+        if entry.get("attach_to_bone")
+    ]
+    skeletal_paths = follower_paths
     base_mesh_asset_path = str((rig_entry or {}).get("asset_path", "") or "")
-    if armature is None or not skeletal_paths:
+    if armature is None or (not skeletal_paths and not attachments):
         return None
-    if not base_mesh_asset_path and len(skeletal_paths) < 2:
+    if not base_mesh_asset_path and len(skeletal_paths) < 2 and not attachments:
         return None
 
     rig_settings = getattr(getattr(armature, "data", None), "witcherui_RigSettings", None)
@@ -641,6 +706,8 @@ def _build_blueprint_entry(armature, asset_name: str, mesh_entries,
         "asset_path": asset_rel,
         "mesh_asset_paths": skeletal_paths,
     }
+    if attachments:
+        entry["attachments"] = attachments
     if base_mesh_asset_path:
         entry["base_mesh_asset_path"] = base_mesh_asset_path
     if animation_entries:

@@ -5,8 +5,15 @@
 #include "AssetImportTask.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Components/LightComponent.h"
+#include "Components/PointLightComponent.h"
+#include "Components/PrimitiveComponent.h"
+#include "Components/SceneComponent.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Components/SpotLightComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "EngineUtils.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "Engine/SCS_Node.h"
@@ -17,6 +24,8 @@
 #include "Engine/Texture.h"
 #include "Engine/Texture2D.h"
 #include "Engine/Texture2DArray.h"
+#include "Engine/PointLight.h"
+#include "Engine/SpotLight.h"
 #include "Editor.h"
 #include "Landscape.h"
 #include "LandscapeInfo.h"
@@ -46,6 +55,7 @@
 #include "Factories/FbxStaticMeshImportData.h"
 #include "Factories/MaterialFactoryNew.h"
 #include "Factories/TextureFactory.h"
+#include "FileHelpers.h"
 #include "GameFramework/Actor.h"
 #include "HAL/IConsoleManager.h"
 #include "IAssetTools.h"
@@ -61,6 +71,7 @@
 #include "Materials/MaterialInterface.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "PhysicsEngine/BodySetup.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "WitcherImportedActor.h"
@@ -159,6 +170,22 @@ FVector JsonVector(const TSharedPtr<FJsonObject>& Object, const FString& Field, 
     return DefaultValue;
 }
 
+FQuat JsonQuat(const TSharedPtr<FJsonObject>& Object, const FString& Field)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+    if (Object.IsValid() && Object->TryGetArrayField(Field, Values) && Values->Num() >= 4)
+    {
+        FQuat Quat(
+            (*Values)[0]->AsNumber(),
+            (*Values)[1]->AsNumber(),
+            (*Values)[2]->AsNumber(),
+            (*Values)[3]->AsNumber());
+        Quat.Normalize();
+        return Quat;
+    }
+    return FQuat::Identity;
+}
+
 /** Minimal UMaterial: a texture or flat colour into BaseColor, with a fixed
  *  roughness; optionally translucent (for the world water plane). */
 UMaterialInterface* CreateSimpleMaterial(
@@ -235,6 +262,75 @@ UMaterialInterface* CreateSimpleMaterial(
     Material->MarkPackageDirty();
     UMaterialEditingLibrary::RecompileMaterial(Material);
     return Material;
+}
+
+bool IsVolumeMaterialRel(const FString& AssetRel)
+{
+    FString Normalized = AssetRel.Replace(TEXT("\\"), TEXT("/")).ToLower();
+    if (Normalized.EndsWith(TEXT(".w2mg")))
+    {
+        Normalized.LeftChopInline(5);
+    }
+    return Normalized == TEXT("engine/materials/defaults/volume");
+}
+
+void ApplyInvisibleVolumeMaterial(UMaterial* Material)
+{
+    if (!Material)
+    {
+        return;
+    }
+
+    Material->PreEditChange(nullptr);
+    UMaterialEditingLibrary::DeleteAllMaterialExpressions(Material);
+    Material->BlendMode = BLEND_Translucent;
+
+    if (UMaterialExpressionConstant3Vector* BaseColor = Cast<UMaterialExpressionConstant3Vector>(
+            UMaterialEditingLibrary::CreateMaterialExpression(
+                Material, UMaterialExpressionConstant3Vector::StaticClass(), -400, 0)))
+    {
+        BaseColor->Constant = FLinearColor::Black;
+        UMaterialEditingLibrary::ConnectMaterialProperty(BaseColor, TEXT(""), MP_BaseColor);
+    }
+
+    if (UMaterialExpressionConstant* Opacity = Cast<UMaterialExpressionConstant>(
+            UMaterialEditingLibrary::CreateMaterialExpression(
+                Material, UMaterialExpressionConstant::StaticClass(), -400, 220)))
+    {
+        Opacity->R = 0.0f;
+        UMaterialEditingLibrary::ConnectMaterialProperty(Opacity, TEXT(""), MP_Opacity);
+    }
+
+    Material->PostEditChange();
+    Material->MarkPackageDirty();
+    UMaterialEditingLibrary::RecompileMaterial(Material);
+}
+
+void ApplyInvisibleVolumeInstance(UMaterialInstanceConstant* Instance)
+{
+    if (!Instance)
+    {
+        return;
+    }
+    Instance->BasePropertyOverrides.bOverride_BlendMode = true;
+    Instance->BasePropertyOverrides.BlendMode = BLEND_Translucent;
+}
+
+void ConfigureStaticMeshAsCollisionMesh(UStaticMesh* Mesh)
+{
+    if (!Mesh)
+    {
+        return;
+    }
+    if (UBodySetup* BodySetup = Mesh->GetBodySetup())
+    {
+        Mesh->PreEditChange(nullptr);
+        BodySetup->CollisionTraceFlag = CTF_UseComplexAsSimple;
+        BodySetup->InvalidatePhysicsData();
+        BodySetup->CreatePhysicsMeshes();
+        Mesh->PostEditChange();
+        Mesh->MarkPackageDirty();
+    }
 }
 
 void SetStringArray(TSharedPtr<FJsonObject> Object, const FString& Field, const TArray<FString>& Values)
@@ -477,6 +573,17 @@ FWitcherImportContext::FWitcherImportContext(const TSharedPtr<FJsonObject>& InMa
         ContentRoot.LeftChopInline(1);
     }
     AssetName = JsonString(Manifest, TEXT("asset_name"), TEXT("WitcherAsset"));
+
+    const TSharedPtr<FJsonObject>* OverwritePtr = nullptr;
+    if (Manifest.IsValid() && Manifest->TryGetObjectField(TEXT("overwrite"), OverwritePtr) && OverwritePtr)
+    {
+        OverwriteObject = *OverwritePtr;
+    }
+}
+
+bool FWitcherImportContext::ShouldOverwrite(const FString& Category) const
+{
+    return JsonBool(OverwriteObject, Category, false);
 }
 
 FString FWitcherImportContext::ImportBundle()
@@ -497,6 +604,8 @@ FString FWitcherImportContext::ImportBundle()
     ImportAnimations();
     ImportBlueprint();
     ImportTerrain();
+    ImportPlacements();
+    SaveImportedPackages();
 
     return BuildResponse(Errors.Num() == 0);
 }
@@ -532,12 +641,15 @@ UTexture* FWitcherImportContext::ImportTexture(const TSharedPtr<FJsonObject>& Te
 
     const FString AssetRel = ClassSafeAssetRel(DepotRel, UTexture::StaticClass(), TEXT("_tex"));
 
-    // Reuse a texture that already exists at the mirrored depot path.
+    // Reuse a texture that already exists at the mirrored depot path, unless the
+    // overwrite policy says to re-import it (the import below replaces in place).
     if (UTexture* Existing = LoadExistingAsset<UTexture>(ObjectPathFor(AssetRel)))
     {
-        ApplyTextureImportSettings(Existing, TextureObject);
-        TexturesByDepot.Add(DepotRel, Existing);
-        return Existing;
+        if (!ShouldOverwrite(TEXT("textures")))
+        {
+            TexturesByDepot.Add(DepotRel, Existing);
+            return Existing;
+        }
     }
 
     const FString SourceFile = ResolveBundleFile(JsonString(TextureObject, TEXT("file")));
@@ -631,32 +743,75 @@ UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr
     {
         return nullptr;
     }
+    const bool bVolumeMaterial = JsonBool(MasterObject, TEXT("volume"), false) || IsVolumeMaterialRel(AssetRel);
     if (const TWeakObjectPtr<UMaterialInterface>* Cached = MastersByRel.Find(AssetRel))
     {
-        return Cached->Get();
+        UMaterialInterface* CachedMaterial = Cached->Get();
+        if (bVolumeMaterial)
+        {
+            ApplyInvisibleVolumeMaterial(Cast<UMaterial>(CachedMaterial));
+        }
+        return CachedMaterial;
     }
 
     const FString SafeRel = ClassSafeAssetRel(AssetRel, UMaterialInterface::StaticClass(), TEXT("_mi"));
 
-    // Hand-authored masters at the mirrored .w2mg path always win.
+    // Hand-authored / previously generated masters at the mirrored .w2mg path are
+    // reused as-is. With the "materials_base" overwrite policy on, the generated
+    // graph is instead rebuilt in place on the existing asset (hand-authored
+    // masters are only touched when the user explicitly opts into this).
+    UMaterial* Material = nullptr;
+    bool bRebuildExisting = false;
     if (UMaterialInterface* Existing = LoadExistingAsset<UMaterialInterface>(ObjectPathFor(SafeRel)))
     {
-        MastersByRel.Add(AssetRel, Existing);
-        return Existing;
+        if (!ShouldOverwrite(TEXT("materials_base")))
+        {
+            if (bVolumeMaterial)
+            {
+                ApplyInvisibleVolumeMaterial(Cast<UMaterial>(Existing));
+            }
+            MastersByRel.Add(AssetRel, Existing);
+            return Existing;
+        }
+        Material = Cast<UMaterial>(Existing);
+        if (!Material)
+        {
+            // Path is occupied by something other than a plain UMaterial (e.g. an
+            // MI); its graph can't be rebuilt in place, so reuse it as-is.
+            MastersByRel.Add(AssetRel, Existing);
+            return Existing;
+        }
+        bRebuildExisting = true;
     }
 
-    const FString Name = AssetRelName(SafeRel);
-    FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-    UMaterialFactoryNew* Factory = NewObject<UMaterialFactoryNew>();
-    UMaterial* Material = Cast<UMaterial>(
-        AssetToolsModule.Get().CreateAsset(Name, PackagePathFor(SafeRel), UMaterial::StaticClass(), Factory));
+    if (!Material)
+    {
+        const FString Name = AssetRelName(SafeRel);
+        FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+        UMaterialFactoryNew* Factory = NewObject<UMaterialFactoryNew>();
+        Material = Cast<UMaterial>(
+            AssetToolsModule.Get().CreateAsset(Name, PackagePathFor(SafeRel), UMaterial::StaticClass(), Factory));
+    }
     if (!Material)
     {
         AddWarning(FString::Printf(TEXT("Could not create master material '%s'"), *SafeRel));
         return nullptr;
     }
 
+    if (bVolumeMaterial)
+    {
+        ApplyInvisibleVolumeMaterial(Material);
+        ImportedAssets.AddUnique(Material->GetPathName());
+        MastersByRel.Add(AssetRel, Material);
+        return Material;
+    }
+
     Material->PreEditChange(nullptr);
+    if (bRebuildExisting)
+    {
+        // Clear the previously generated graph before rebuilding it in place.
+        UMaterialEditingLibrary::DeleteAllMaterialExpressions(Material);
+    }
 
     UMaterialExpression* BaseColorSource = nullptr;
     UMaterialExpression* NormalSource = nullptr;
@@ -816,7 +971,7 @@ UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr
     Material->PostEditChange();
     Material->MarkPackageDirty();
     UMaterialEditingLibrary::RecompileMaterial(Material);
-    ImportedAssets.Add(Material->GetPathName());
+    ImportedAssets.AddUnique(Material->GetPathName());
     MastersByRel.Add(AssetRel, Material);
     return Material;
 }
@@ -889,20 +1044,45 @@ UMaterialInterface* FWitcherImportContext::ImportMaterialInstance(const TSharedP
     }
 
     const FString SafeRel = ClassSafeAssetRel(AssetRel, UMaterialInterface::StaticClass(), TEXT("_mi"));
+    const bool bVolumeMaterial = JsonBool(MaterialObject, TEXT("volume"), false);
 
     // Existing chain instances at the mirrored path are reused untouched so
     // manual tweaks survive re-export. Local (mesh-owned) instances refresh
-    // their parameters each export, keeping Blender edits flowing through.
+    // their parameters each export, keeping Blender edits flowing through. With
+    // the "material_instances" overwrite policy on, every existing instance is
+    // fully refreshed (parent + blend overrides + params), not just local ones.
     if (UMaterialInterface* Existing = LoadExistingAsset<UMaterialInterface>(ObjectPathFor(SafeRel)))
     {
-        if (JsonBool(MaterialObject, TEXT("local"), false))
+        const bool bOverwrite = ShouldOverwrite(TEXT("material_instances"));
+        const bool bLocal = JsonBool(MaterialObject, TEXT("local"), false);
+        if (bOverwrite || bLocal || bVolumeMaterial)
         {
             if (UMaterialInstanceConstant* ExistingInstance = Cast<UMaterialInstanceConstant>(Existing))
             {
                 ExistingInstance->PreEditChange(nullptr);
-                ApplyInstanceParams(ExistingInstance, MaterialObject);
+                if (bOverwrite)
+                {
+                    if (UMaterialInterface* Parent = ResolveParent(MaterialObject))
+                    {
+                        ExistingInstance->SetParentEditorOnly(Parent);
+                    }
+                }
+                if (bVolumeMaterial)
+                {
+                    ApplyInvisibleVolumeInstance(ExistingInstance);
+                }
+                else if (bOverwrite && JsonBool(MaterialObject, TEXT("enable_mask"), false))
+                {
+                    ExistingInstance->BasePropertyOverrides.bOverride_BlendMode = true;
+                    ExistingInstance->BasePropertyOverrides.BlendMode = BLEND_Masked;
+                }
+                if (bOverwrite || bLocal)
+                {
+                    ApplyInstanceParams(ExistingInstance, MaterialObject);
+                }
                 ExistingInstance->PostEditChange();
                 ExistingInstance->MarkPackageDirty();
+                ImportedAssets.AddUnique(ExistingInstance->GetPathName());
             }
         }
         MaterialsById.Add(MaterialId, Existing);
@@ -929,7 +1109,11 @@ UMaterialInterface* FWitcherImportContext::ImportMaterialInstance(const TSharedP
 
     MaterialInstance->PreEditChange(nullptr);
     MaterialInstance->SetParentEditorOnly(ParentMaterial);
-    if (JsonBool(MaterialObject, TEXT("enable_mask"), false))
+    if (bVolumeMaterial)
+    {
+        ApplyInvisibleVolumeInstance(MaterialInstance);
+    }
+    else if (JsonBool(MaterialObject, TEXT("enable_mask"), false))
     {
         MaterialInstance->BasePropertyOverrides.bOverride_BlendMode = true;
         MaterialInstance->BasePropertyOverrides.BlendMode = BLEND_Masked;
@@ -995,8 +1179,11 @@ void FWitcherImportContext::ImportRig()
     const FString SkeletonPath = ObjectPathFor(AssetRel + TEXT("_Skeleton"));
     if (USkeleton* ExistingSkeleton = LoadExistingAsset<USkeleton>(SkeletonPath))
     {
-        SharedSkeleton = ExistingSkeleton;
-        return;
+        if (!ShouldOverwrite(TEXT("skeletons")))
+        {
+            SharedSkeleton = ExistingSkeleton;
+            return;
+        }
     }
 
     UObject* Imported = ImportFbxMesh(JsonString(*RigObject, TEXT("fbx")), AssetRel, true, nullptr);
@@ -1026,20 +1213,48 @@ void FWitcherImportContext::ImportMeshes()
         }
         const FString AssetRel = JsonString(MeshEntry, TEXT("asset_path"));
         const bool bSkeletal = JsonString(MeshEntry, TEXT("kind")) == TEXT("skeletal");
+        const bool bCollisionMesh = JsonBool(MeshEntry, TEXT("collision"), false);
+        const bool bOwnSkeleton = JsonBool(MeshEntry, TEXT("own_skeleton"), false);
+        USkeleton* MeshSkeleton = (bSkeletal && !bOwnSkeleton) ? SharedSkeleton.Get() : nullptr;
+
+        if (!ShouldOverwrite(TEXT("meshes")))
+        {
+            UObject* ExistingMesh = bSkeletal
+                ? static_cast<UObject*>(LoadExistingAsset<USkeletalMesh>(ObjectPathFor(AssetRel)))
+                : static_cast<UObject*>(LoadExistingAsset<UStaticMesh>(ObjectPathFor(AssetRel)));
+            if (ExistingMesh)
+            {
+                MeshesByAssetRel.Add(AssetRel, ExistingMesh);
+                if (bSkeletal && !bOwnSkeleton && !SharedSkeleton.IsValid())
+                {
+                    if (USkeletalMesh* SkeletalMesh = Cast<USkeletalMesh>(ExistingMesh))
+                    {
+                        SharedSkeleton = SkeletalMesh->GetSkeleton();
+                    }
+                }
+                continue;
+            }
+        }
+
         UObject* Imported = ImportFbxMesh(JsonString(MeshEntry, TEXT("fbx")), AssetRel, bSkeletal,
-            bSkeletal ? SharedSkeleton.Get() : nullptr);
+            MeshSkeleton);
         if (!Imported)
         {
             AddError(FString::Printf(TEXT("Failed to import mesh '%s'"), *AssetRel));
             continue;
         }
         MeshesByAssetRel.Add(AssetRel, Imported);
-        if (bSkeletal && !SharedSkeleton.IsValid())
+        if (bSkeletal && !bOwnSkeleton && !SharedSkeleton.IsValid())
         {
             if (USkeletalMesh* SkeletalMesh = Cast<USkeletalMesh>(Imported))
             {
                 SharedSkeleton = SkeletalMesh->GetSkeleton();
             }
+        }
+        if (bCollisionMesh)
+        {
+            ConfigureStaticMeshAsCollisionMesh(Cast<UStaticMesh>(Imported));
+            continue;
         }
         AssignMaterialsToMesh(Imported, MeshEntry);
     }
@@ -1084,6 +1299,7 @@ UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, 
     if (Options->StaticMeshImportData)
     {
         Options->StaticMeshImportData->bCombineMeshes = true;
+        Options->StaticMeshImportData->bAutoGenerateCollision = false;
         Options->StaticMeshImportData->NormalImportMethod = FBXNIM_ImportNormalsAndTangents;
         Options->StaticMeshImportData->NormalGenerationMethod = EFBXNormalGenerationMethod::MikkTSpace;
     }
@@ -1107,6 +1323,13 @@ UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, 
         {
             MainAsset = Imported;
         }
+    }
+
+    if (MainAsset && MainAsset->GetPathName() != ObjectPathFor(AssetRel))
+    {
+        AddWarning(FString::Printf(
+            TEXT("Mesh '%s' imported as '%s' instead of replacing the existing asset; the original may be open in an editor or locked."),
+            *AssetRel, *MainAsset->GetPathName()));
     }
     return MainAsset;
 }
@@ -1153,6 +1376,16 @@ UAnimSequence* FWitcherImportContext::ImportAnimation(const TSharedPtr<FJsonObje
         return nullptr;
     }
     const FString AssetRel = ClassSafeAssetRel(RawAssetRel, UAnimSequence::StaticClass(), TEXT("_anim"));
+
+    // Reuse an existing animation
+    if (!ShouldOverwrite(TEXT("animations")))
+    {
+        if (UAnimSequence* Existing = FindAnimSequence(RawAssetRel))
+        {
+            return Existing;
+        }
+    }
+
     const FString FbxPath = ResolveBundleFile(JsonString(AnimationObject, TEXT("fbx")));
     if (!FPaths::FileExists(FbxPath))
     {
@@ -1320,8 +1553,9 @@ void FWitcherImportContext::ImportBlueprint()
         }
 
         USimpleConstructionScript* ConstructionScript = Blueprint->SimpleConstructionScript;
-        const TArray<USCS_Node*> ExistingRootNodes = ConstructionScript->GetRootNodes();
-        for (USCS_Node* Node : ExistingRootNodes)
+        // Remove ALL existing nodes (not just roots) so a rebuild starts from a clean slate.
+        const TArray<USCS_Node*> ExistingNodes = ConstructionScript->GetAllNodes();
+        for (USCS_Node* Node : ExistingNodes)
         {
             if (Node)
             {
@@ -1389,18 +1623,62 @@ void FWitcherImportContext::ImportBlueprint()
             }
         }
 
+        const TArray<TSharedPtr<FJsonValue>>* Attachments = nullptr;
+        if ((*BlueprintObject)->TryGetArrayField(TEXT("attachments"), Attachments))
+        {
+            for (const TSharedPtr<FJsonValue>& Value : *Attachments)
+            {
+                const TSharedPtr<FJsonObject> AttachObj = Value->AsObject();
+                if (!AttachObj.IsValid())
+                {
+                    continue;
+                }
+                const FString AttachRel = JsonString(AttachObj, TEXT("asset_path"));
+                const FString AttachBone = JsonString(AttachObj, TEXT("attach_to_bone"));
+                USkeletalMesh* AttachMesh = LoadExistingAsset<USkeletalMesh>(ObjectPathFor(AttachRel));
+                if (!AttachMesh)
+                {
+                    AddWarning(FString::Printf(TEXT("Blueprint '%s': attachment mesh '%s' not found"), *Name, *AttachRel));
+                    continue;
+                }
+                if (!RootNode)
+                {
+                    AddWarning(FString::Printf(TEXT("Blueprint '%s': attachment '%s' has no base mesh to attach to"), *Name, *AttachRel));
+                    continue;
+                }
+                USCS_Node* Node = CreateSkeletalMeshNode(ConstructionScript, AttachRel, AttachMesh);
+                if (!Node)
+                {
+                    continue;
+                }
+                if (USkeletalMeshComponent* Template = Cast<USkeletalMeshComponent>(Node->ComponentTemplate))
+                {
+                    Template->SetRelativeTransform(FTransform::Identity);
+                    Template->SetAbsolute(false, false, true);
+                    Template->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+                }
+                Node->AttachToName = AttachBone.IsEmpty() ? NAME_None : FName(*AttachBone);
+                RootNode->AddChildNode(Node);
+            }
+        }
+
         ConstructionScript->ValidateSceneRootNodes();
         return BaseTemplate;
     };
 
     if (UBlueprint* ExistingBlueprint = LoadExistingAsset<UBlueprint>(ObjectPathFor(AssetRel)))
     {
+        if (!ShouldOverwrite(TEXT("blueprints")))
+        {
+            return;
+        }
         const bool bReparented = EnsureWitcherImportedActorParent(ExistingBlueprint);
         if (USkeletalMeshComponent* BaseTemplate = RebuildBlueprintComponents(ExistingBlueprint))
         {
             // RebuildBlueprintComponents already recreated and configured every
             // follower; only the driver still needs its base/anim setup.
             ConfigureImportedBaseTemplate(BaseTemplate, AnimSequence);
+            FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ExistingBlueprint);
             FKismetEditorUtilities::CompileBlueprint(ExistingBlueprint);
             ExistingBlueprint->MarkPackageDirty();
             ImportedAssets.AddUnique(ExistingBlueprint->GetPathName());
@@ -1441,6 +1719,10 @@ UTexture2DArray* FWitcherImportContext::BuildTerrainTextureArray(
     }
     UTexture2DArray* Array = LoadExistingAsset<UTexture2DArray>(ObjectPathFor(AssetRel));
     const bool bUpdatingExistingArray = Array != nullptr;
+    if (bUpdatingExistingArray && !ShouldOverwrite(TEXT("textures")))
+    {
+        return Array;
+    }
     if (!Array)
     {
         const FString PackageName = FString::Printf(TEXT("%s/%s"), *ContentRoot, *AssetRel);
@@ -1601,6 +1883,10 @@ UMaterialInterface* FWitcherImportContext::BuildTerrainBlendMaterial(
 
     UMaterial* Material = LoadExistingAsset<UMaterial>(ObjectPathFor(AssetRel));
     const bool bUpdatingExistingMaterial = Material != nullptr;
+    if (bUpdatingExistingMaterial && !ShouldOverwrite(TEXT("materials_base")))
+    {
+        return Material;
+    }
     if (!Material)
     {
         FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
@@ -2113,6 +2399,431 @@ void FWitcherImportContext::ImportTerrain()
     }
 }
 
+UStaticMesh* FWitcherImportContext::FindPlacementMesh(const FString& AssetRel)
+{
+    UStaticMesh* Mesh = Cast<UStaticMesh>(MeshesByAssetRel.FindRef(AssetRel).Get());
+    if (!Mesh)
+    {
+        Mesh = LoadExistingAsset<UStaticMesh>(ObjectPathFor(AssetRel));
+    }
+    return Mesh;
+}
+
+void FWitcherImportContext::ImportPlacements()
+{
+    const TSharedPtr<FJsonObject>* PlacementsPtr = nullptr;
+    if (!Manifest->TryGetObjectField(TEXT("placements"), PlacementsPtr) || !PlacementsPtr)
+    {
+        return;
+    }
+    const TArray<TSharedPtr<FJsonValue>>* Layers = nullptr;
+    if (!(*PlacementsPtr)->TryGetArrayField(TEXT("layers"), Layers))
+    {
+        return;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        AddError(TEXT("Placement import: no editor world available."));
+        return;
+    }
+
+    for (const TSharedPtr<FJsonValue>& LayerValue : *Layers)
+    {
+        const TSharedPtr<FJsonObject> Layer = LayerValue->AsObject();
+        if (!Layer.IsValid())
+        {
+            continue;
+        }
+        const FString LayerId = JsonString(Layer, TEXT("layer_id"), TEXT("placements"));
+        const FString Folder = JsonString(Layer, TEXT("folder"));
+
+        bool bLayerMeshesReady = true;
+        auto ValidateRequiredMesh = [&](const TSharedPtr<FJsonObject>& Entry, const TCHAR* Kind) -> bool
+        {
+            if (!Entry.IsValid())
+            {
+                return true;
+            }
+            const FString AssetRel = JsonString(Entry, TEXT("asset_path"));
+            const FString EntryName = JsonString(Entry, TEXT("name"), FString(Kind));
+            if (AssetRel.IsEmpty())
+            {
+                AddWarning(FString::Printf(
+                    TEXT("Placement %s '%s' has no mesh asset path (layer '%s'); layer left unchanged."),
+                    Kind,
+                    *EntryName,
+                    *LayerId));
+                return false;
+            }
+            if (!FindPlacementMesh(AssetRel))
+            {
+                AddWarning(FString::Printf(
+                    TEXT("Placement %s '%s' references missing mesh '%s' (layer '%s'); layer left unchanged."),
+                    Kind,
+                    *EntryName,
+                    *AssetRel,
+                    *LayerId));
+                return false;
+            }
+            return true;
+        };
+
+        const TArray<TSharedPtr<FJsonValue>>* PreflightActors = nullptr;
+        if (Layer->TryGetArrayField(TEXT("actors"), PreflightActors))
+        {
+            for (const TSharedPtr<FJsonValue>& ActorValue : *PreflightActors)
+            {
+                bLayerMeshesReady = ValidateRequiredMesh(ActorValue->AsObject(), TEXT("actor")) && bLayerMeshesReady;
+            }
+        }
+        const TArray<TSharedPtr<FJsonValue>>* PreflightInstancers = nullptr;
+        if (Layer->TryGetArrayField(TEXT("instancers"), PreflightInstancers))
+        {
+            for (const TSharedPtr<FJsonValue>& InstancerValue : *PreflightInstancers)
+            {
+                bLayerMeshesReady = ValidateRequiredMesh(InstancerValue->AsObject(), TEXT("instancer")) && bLayerMeshesReady;
+            }
+        }
+        if (!bLayerMeshesReady)
+        {
+            continue;
+        }
+
+        // Tag every actor from this layer so a re-send cleanly replaces them
+        // (incremental map fill: new layers add actors, re-sent layers never
+        // duplicate).
+        const FName LayerTag(*(FString(TEXT("WitcherLayer:")) + LayerId));
+        for (TActorIterator<AActor> It(World); It; ++It)
+        {
+            if (It->Tags.Contains(LayerTag))
+            {
+                World->DestroyActor(*It);
+            }
+        }
+
+        auto PlaceActorCommon = [&](AActor* Actor, const FString& ActorName)
+        {
+            if (!Actor)
+            {
+                return;
+            }
+            Actor->Tags.Add(LayerTag);
+            Actor->SetActorLabel(ActorName);
+            if (!Folder.IsEmpty())
+            {
+                Actor->SetFolderPath(FName(*Folder));
+            }
+            ImportedAssets.Add(Actor->GetPathName());
+        };
+
+        auto ConfigureVisualPlacement = [](UPrimitiveComponent* Component)
+        {
+            if (!Component)
+            {
+                return;
+            }
+            Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        };
+
+        auto ConfigureHiddenCollision = [](UPrimitiveComponent* Component)
+        {
+            if (!Component)
+            {
+                return;
+            }
+            Component->SetVisibility(false, true);
+            Component->SetHiddenInGame(true, true);
+            Component->SetCastShadow(false);
+            Component->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+            Component->SetCollisionProfileName(FName(TEXT("BlockAll")));
+        };
+
+        auto ConfigureLightCommon = [](ULightComponent* Component, const TSharedPtr<FJsonObject>& LightEntry)
+        {
+            if (!Component || !LightEntry.IsValid())
+            {
+                return;
+            }
+            Component->SetMobility(EComponentMobility::Movable);
+            Component->SetIntensity(static_cast<float>(JsonNumber(LightEntry, TEXT("intensity"), 0.0)));
+            Component->SetLightColor(JsonColor(LightEntry, TEXT("color")));
+        };
+
+        auto ConfigurePointLight = [&](UPointLightComponent* Component, const TSharedPtr<FJsonObject>& LightEntry)
+        {
+            ConfigureLightCommon(Component, LightEntry);
+            if (!Component || !LightEntry.IsValid())
+            {
+                return;
+            }
+            const float AttenuationRadius = static_cast<float>(JsonNumber(LightEntry, TEXT("attenuation_radius"), 0.0));
+            if (AttenuationRadius > 0.0f)
+            {
+                Component->SetAttenuationRadius(AttenuationRadius);
+            }
+            const float SourceRadius = static_cast<float>(JsonNumber(LightEntry, TEXT("source_radius"), 0.0));
+            if (SourceRadius > 0.0f)
+            {
+                Component->SetSourceRadius(SourceRadius);
+            }
+        };
+
+        int32 ActorCount = 0;
+        int32 CollisionActorCount = 0;
+        const TArray<TSharedPtr<FJsonValue>>* Actors = nullptr;
+        if (Layer->TryGetArrayField(TEXT("actors"), Actors))
+        {
+            for (const TSharedPtr<FJsonValue>& ActorValue : *Actors)
+            {
+                const TSharedPtr<FJsonObject> ActorEntry = ActorValue->AsObject();
+                if (!ActorEntry.IsValid())
+                {
+                    continue;
+                }
+                const FString AssetRel = JsonString(ActorEntry, TEXT("asset_path"));
+                UStaticMesh* Mesh = FindPlacementMesh(AssetRel);
+                if (!Mesh)
+                {
+                    AddWarning(FString::Printf(TEXT("Placement mesh not found for '%s' (layer '%s')."), *AssetRel, *LayerId));
+                    continue;
+                }
+                const TSharedPtr<FJsonObject>* TransformPtr = nullptr;
+                ActorEntry->TryGetObjectField(TEXT("transform"), TransformPtr);
+                const TSharedPtr<FJsonObject> Transform = TransformPtr ? *TransformPtr : nullptr;
+                const FVector Location = JsonVector(Transform, TEXT("location"), FVector::ZeroVector);
+                const FQuat Rotation = JsonQuat(Transform, TEXT("rotation"));
+                const FVector ScaleVec = JsonVector(Transform, TEXT("scale"), FVector::OneVector);
+
+                AStaticMeshActor* MeshActor = World->SpawnActor<AStaticMeshActor>();
+                if (!MeshActor)
+                {
+                    continue;
+                }
+                if (UStaticMeshComponent* Component = MeshActor->GetStaticMeshComponent())
+                {
+                    Component->SetMobility(EComponentMobility::Movable);
+                    Component->SetStaticMesh(Mesh);
+                    ConfigureVisualPlacement(Component);
+                }
+                MeshActor->SetActorTransform(FTransform(Rotation, Location, ScaleVec));
+                const FString ActorName = JsonString(ActorEntry, TEXT("name"), TEXT("Placement"));
+                PlaceActorCommon(MeshActor, ActorName);
+                ++ActorCount;
+
+                const FString CollisionAssetRel = JsonString(ActorEntry, TEXT("collision_asset_path"));
+                if (!CollisionAssetRel.IsEmpty())
+                {
+                    UStaticMesh* CollisionMesh = FindPlacementMesh(CollisionAssetRel);
+                    if (!CollisionMesh)
+                    {
+                        AddWarning(FString::Printf(
+                            TEXT("Placement collision mesh not found for '%s' (layer '%s')."),
+                            *CollisionAssetRel,
+                            *LayerId));
+                        continue;
+                    }
+                    AStaticMeshActor* CollisionActor = World->SpawnActor<AStaticMeshActor>();
+                    if (!CollisionActor)
+                    {
+                        continue;
+                    }
+                    if (UStaticMeshComponent* CollisionComponent = CollisionActor->GetStaticMeshComponent())
+                    {
+                        CollisionComponent->SetMobility(EComponentMobility::Movable);
+                        CollisionComponent->SetStaticMesh(CollisionMesh);
+                        ConfigureHiddenCollision(CollisionComponent);
+                    }
+                    CollisionActor->SetActorTransform(FTransform(Rotation, Location, ScaleVec));
+                    CollisionActor->SetActorHiddenInGame(true);
+                    PlaceActorCommon(CollisionActor, ActorName + TEXT("_Collision"));
+                    ++CollisionActorCount;
+                }
+            }
+        }
+
+        // Sector instancers (dense CSectorData layouts) -> one HISM actor each;
+        // their individual placements are not separate Blender objects.
+        int32 InstanceCount = 0;
+        const TArray<TSharedPtr<FJsonValue>>* Instancers = nullptr;
+        if (Layer->TryGetArrayField(TEXT("instancers"), Instancers))
+        {
+            for (const TSharedPtr<FJsonValue>& InstancerValue : *Instancers)
+            {
+                const TSharedPtr<FJsonObject> InstancerEntry = InstancerValue->AsObject();
+                if (!InstancerEntry.IsValid())
+                {
+                    continue;
+                }
+                const FString AssetRel = JsonString(InstancerEntry, TEXT("asset_path"));
+                UStaticMesh* Mesh = FindPlacementMesh(AssetRel);
+                if (!Mesh)
+                {
+                    AddWarning(FString::Printf(TEXT("Instancer mesh not found for '%s' (layer '%s')."), *AssetRel, *LayerId));
+                    continue;
+                }
+                const TArray<TSharedPtr<FJsonValue>>* Instances = nullptr;
+                if (!InstancerEntry->TryGetArrayField(TEXT("instances"), Instances) || Instances->Num() == 0)
+                {
+                    continue;
+                }
+                UStaticMesh* CollisionMesh = nullptr;
+                const FString CollisionAssetRel = JsonString(InstancerEntry, TEXT("collision_asset_path"));
+                if (!CollisionAssetRel.IsEmpty())
+                {
+                    CollisionMesh = FindPlacementMesh(CollisionAssetRel);
+                    if (!CollisionMesh)
+                    {
+                        AddWarning(FString::Printf(
+                            TEXT("Instancer collision mesh not found for '%s' (layer '%s')."),
+                            *CollisionAssetRel,
+                            *LayerId));
+                    }
+                }
+
+                AActor* Container = World->SpawnActor<AActor>();
+                if (!Container)
+                {
+                    continue;
+                }
+                USceneComponent* Root = NewObject<USceneComponent>(Container, TEXT("Root"));
+                Container->SetRootComponent(Root);
+                Root->SetMobility(EComponentMobility::Movable);
+                Container->AddInstanceComponent(Root);
+                Root->RegisterComponent();
+                UHierarchicalInstancedStaticMeshComponent* Hism =
+                    NewObject<UHierarchicalInstancedStaticMeshComponent>(Container);
+                Hism->SetupAttachment(Root);
+                Hism->SetMobility(EComponentMobility::Movable);
+                Hism->SetStaticMesh(Mesh);
+                ConfigureVisualPlacement(Hism);
+                Container->AddInstanceComponent(Hism);
+                Hism->RegisterComponent();
+
+                AActor* CollisionContainer = nullptr;
+                UHierarchicalInstancedStaticMeshComponent* CollisionHism = nullptr;
+                if (CollisionMesh)
+                {
+                    CollisionContainer = World->SpawnActor<AActor>();
+                    if (CollisionContainer)
+                    {
+                        USceneComponent* CollisionRoot = NewObject<USceneComponent>(CollisionContainer, TEXT("Root"));
+                        CollisionContainer->SetRootComponent(CollisionRoot);
+                        CollisionRoot->SetMobility(EComponentMobility::Movable);
+                        CollisionContainer->AddInstanceComponent(CollisionRoot);
+                        CollisionRoot->RegisterComponent();
+
+                        CollisionHism = NewObject<UHierarchicalInstancedStaticMeshComponent>(CollisionContainer);
+                        CollisionHism->SetupAttachment(CollisionRoot);
+                        CollisionHism->SetMobility(EComponentMobility::Movable);
+                        CollisionHism->SetStaticMesh(CollisionMesh);
+                        ConfigureHiddenCollision(CollisionHism);
+                        CollisionContainer->AddInstanceComponent(CollisionHism);
+                        CollisionHism->RegisterComponent();
+                        CollisionContainer->SetActorHiddenInGame(true);
+                    }
+                }
+
+                for (const TSharedPtr<FJsonValue>& InstanceValue : *Instances)
+                {
+                    const TSharedPtr<FJsonObject> Instance = InstanceValue->AsObject();
+                    if (!Instance.IsValid())
+                    {
+                        continue;
+                    }
+                    const FVector Location = JsonVector(Instance, TEXT("location"), FVector::ZeroVector);
+                    const FQuat Rotation = JsonQuat(Instance, TEXT("rotation"));
+                    const FVector ScaleVec = JsonVector(Instance, TEXT("scale"), FVector::OneVector);
+                    const FTransform InstanceTransform(Rotation, Location, ScaleVec);
+                    Hism->AddInstance(InstanceTransform, /*bWorldSpace=*/true);
+                    if (CollisionHism)
+                    {
+                        CollisionHism->AddInstance(InstanceTransform, /*bWorldSpace=*/true);
+                    }
+                    ++InstanceCount;
+                }
+                const FString InstancerName = JsonString(InstancerEntry, TEXT("name"), TEXT("Instancer"));
+                PlaceActorCommon(Container, InstancerName);
+                if (CollisionContainer)
+                {
+                    PlaceActorCommon(CollisionContainer, InstancerName + TEXT("_Collision"));
+                    ++CollisionActorCount;
+                }
+            }
+        }
+
+        int32 LightCount = 0;
+        const TArray<TSharedPtr<FJsonValue>>* Lights = nullptr;
+        if (Layer->TryGetArrayField(TEXT("lights"), Lights))
+        {
+            for (const TSharedPtr<FJsonValue>& LightValue : *Lights)
+            {
+                const TSharedPtr<FJsonObject> LightEntry = LightValue->AsObject();
+                if (!LightEntry.IsValid())
+                {
+                    continue;
+                }
+                const TSharedPtr<FJsonObject>* TransformPtr = nullptr;
+                LightEntry->TryGetObjectField(TEXT("transform"), TransformPtr);
+                const TSharedPtr<FJsonObject> Transform = TransformPtr ? *TransformPtr : nullptr;
+                const FVector Location = JsonVector(Transform, TEXT("location"), FVector::ZeroVector);
+                const FString LightType = JsonString(LightEntry, TEXT("type"), TEXT("point")).ToLower();
+                const FString LightName = JsonString(LightEntry, TEXT("name"), LightType == TEXT("spot") ? TEXT("SpotLight") : TEXT("PointLight"));
+
+                if (LightType == TEXT("spot"))
+                {
+                    ASpotLight* SpotActor = World->SpawnActor<ASpotLight>();
+                    if (!SpotActor)
+                    {
+                        continue;
+                    }
+                    FVector Direction = JsonVector(LightEntry, TEXT("direction"), FVector::ForwardVector);
+                    if (!Direction.Normalize())
+                    {
+                        Direction = FVector::ForwardVector;
+                    }
+                    SpotActor->SetActorLocation(Location);
+                    SpotActor->SetActorRotation(Direction.Rotation());
+                    if (USpotLightComponent* Component = SpotActor->FindComponentByClass<USpotLightComponent>())
+                    {
+                        ConfigurePointLight(Component, LightEntry);
+                        const float OuterCone = static_cast<float>(JsonNumber(LightEntry, TEXT("outer_cone_angle"), 44.0));
+                        const float InnerCone = static_cast<float>(JsonNumber(LightEntry, TEXT("inner_cone_angle"), 0.0));
+                        Component->SetOuterConeAngle(FMath::Max(0.0f, OuterCone));
+                        Component->SetInnerConeAngle(FMath::Clamp(InnerCone, 0.0f, FMath::Max(0.0f, OuterCone)));
+                    }
+                    PlaceActorCommon(SpotActor, LightName);
+                    ++LightCount;
+                }
+                else
+                {
+                    APointLight* PointActor = World->SpawnActor<APointLight>();
+                    if (!PointActor)
+                    {
+                        continue;
+                    }
+                    PointActor->SetActorLocation(Location);
+                    if (UPointLightComponent* Component = PointActor->FindComponentByClass<UPointLightComponent>())
+                    {
+                        ConfigurePointLight(Component, LightEntry);
+                    }
+                    PlaceActorCommon(PointActor, LightName);
+                    ++LightCount;
+                }
+            }
+        }
+
+        UE_LOG(LogWitcherImportContext, Log,
+            TEXT("Layer '%s': %d actor(s), %d collision actor(s), %d instanced placement(s), %d light(s)"),
+            *LayerId,
+            ActorCount,
+            CollisionActorCount,
+            InstanceCount,
+            LightCount);
+    }
+}
+
 FString FWitcherImportContext::ResolveBundleFile(const FString& RelativePath) const
 {
     return FPaths::ConvertRelativePathToFull(FPaths::Combine(BundleRoot, RelativePath));
@@ -2170,6 +2881,63 @@ void FWitcherImportContext::AddError(const FString& Error)
 {
     Errors.Add(Error);
     UE_LOG(LogWitcherImportContext, Error, TEXT("%s"), *Error);
+}
+
+void FWitcherImportContext::SaveImportedPackages()
+{
+    TSet<UPackage*> Packages;
+    const FString ContentRootPrefix = ContentRoot + TEXT("/");
+
+    auto ConsiderDirty = [&](UObject* Object)
+    {
+        if (!Object || Object->IsA<AActor>())
+        {
+            return;
+        }
+        UPackage* Package = Object->GetOutermost();
+        if (Package && Package->IsDirty() && Package->GetName().StartsWith(ContentRootPrefix))
+        {
+            Packages.Add(Package);
+        }
+    };
+
+    for (const FString& AssetPath : ImportedAssets)
+    {
+        if (AssetPath.StartsWith(ContentRootPrefix))
+        {
+            ConsiderDirty(StaticLoadObject(UObject::StaticClass(), nullptr, *AssetPath));
+        }
+    }
+
+    for (const TPair<FString, TWeakObjectPtr<UTexture>>& Pair : TexturesByDepot)
+    {
+        ConsiderDirty(Pair.Value.Get());
+    }
+    for (const TPair<FString, TWeakObjectPtr<UMaterialInterface>>& Pair : MastersByRel)
+    {
+        ConsiderDirty(Pair.Value.Get());
+    }
+    for (const TPair<FString, TWeakObjectPtr<UMaterialInterface>>& Pair : MaterialsById)
+    {
+        ConsiderDirty(Pair.Value.Get());
+    }
+    for (const TPair<FString, TWeakObjectPtr<UObject>>& Pair : MeshesByAssetRel)
+    {
+        ConsiderDirty(Pair.Value.Get());
+    }
+    ConsiderDirty(SharedSkeleton.Get());
+
+    if (Packages.IsEmpty())
+    {
+        return;
+    }
+
+    TArray<UPackage*> PackageArray = Packages.Array();
+    UE_LOG(LogWitcherImportContext, Display, TEXT("Saving %d imported asset package(s)"), PackageArray.Num());
+    if (!UEditorLoadingAndSavingUtils::SavePackages(PackageArray, false))
+    {
+        AddWarning(TEXT("One or more imported asset packages could not be saved."));
+    }
 }
 
 FString FWitcherImportContext::BuildResponse(bool bSuccess) const
