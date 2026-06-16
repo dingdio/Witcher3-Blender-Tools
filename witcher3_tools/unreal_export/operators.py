@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import traceback
+from contextlib import contextmanager
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, IntProperty, PointerProperty, StringProperty
@@ -14,11 +16,40 @@ from . import bundle
 from . import manifest
 from . import world_bundle
 from . import placements_bundle
+from . import w2l_placements
 from . import plugin_install
 from . import unreal_project
-from .socket_client import send_import_request
+from .socket_client import probe_import_server, send_import_request
 
 _UNREAL_PROJECT_ENUM_CACHE = []
+
+
+@contextmanager
+def _quiet_send_logging(settings, action: str):
+    if action != "SEND" or not bool(getattr(settings, "quiet_send_logging", True)):
+        yield
+        return
+
+    saved = []
+    seen = set()
+    package_root = __name__.split(".unreal_export", 1)[0]
+    loggers = [logging.getLogger(package_root), logging.getLogger("witcher3_tools")]
+    for name, logger in logging.Logger.manager.loggerDict.items():
+        if isinstance(logger, logging.Logger) and "witcher3_tools" in name:
+            loggers.append(logger)
+
+    for logger in loggers:
+        if id(logger) in seen:
+            continue
+        seen.add(id(logger))
+        saved.append((logger, logger.level))
+        if logger.getEffectiveLevel() < logging.WARNING:
+            logger.setLevel(logging.WARNING)
+    try:
+        yield
+    finally:
+        for logger, level in saved:
+            logger.setLevel(level)
 
 
 def _unreal_project_enum_items(self, context):
@@ -40,6 +71,17 @@ def _on_unreal_project_update(self, context):
     project_path = unreal_project.get_active_project_path(context)
     if project_path:
         self.unreal_project = str(project_path)
+
+
+def _preflight_send_connection(settings) -> str:
+    return probe_import_server(settings.host, settings.port, timeout=1.0)
+
+
+def _cancel_unreachable_unreal(operator, settings, message: str):
+    settings.last_status = "Unreal import server not reachable"
+    settings.last_details = message
+    operator.report({"ERROR"}, message)
+    return {"CANCELLED"}
 
 
 def _expander(layout, settings, prop_name: str, text: str):
@@ -138,6 +180,19 @@ class WITCHER_PG_UnrealExportSettings(bpy.types.PropertyGroup):
             "default to protect hand-tweaked texture import settings"
         ),
     )
+    prefer_source_buffers: BoolProperty(
+        name="Fast Mesh Buffers",
+        default=True,
+        description=(
+            "Send unedited meshes straight from the source .w2mesh as decoded buffers "
+            "(skips the FBX round-trip). Edited meshes still export through FBX"
+        ),
+    )
+    quiet_send_logging: BoolProperty(
+        name="Quiet SEND Logging",
+        default=True,
+        description="Reduce Blender console logging while building and sending live Unreal bundles",
+    )
     placement_export_collision: BoolProperty(
         name="Collision",
         default=False,
@@ -147,6 +202,15 @@ class WITCHER_PG_UnrealExportSettings(bpy.types.PropertyGroup):
         name="Profile Log",
         default=True,
         description="Write a timing log for placement export phases",
+    )
+    placement_skip_materials: BoolProperty(
+        name="Fast (geometry only)",
+        default=False,
+        description=(
+            "Send .w2l layer geometry + placement only, with Unreal's default material "
+            "(fastest, for placement iteration). Off by default; full material sends "
+            "stage cached PNG textures and use packed alpha in the Unreal shader"
+        ),
     )
     export_folder: StringProperty(name="Export Folder", subtype="DIR_PATH", default="")
     content_root: StringProperty(
@@ -184,22 +248,27 @@ class WITCHER_OT_export_unreal_item(bpy.types.Operator):
         settings = context.scene.witcher_unreal_export
         if not settings.export_folder:
             settings.export_folder = bundle.default_export_folder()
+        if self.action == "SEND":
+            connection_error = _preflight_send_connection(settings)
+            if connection_error:
+                return _cancel_unreachable_unreal(self, settings, connection_error)
 
         try:
-            result = bundle.build_unreal_export_bundle(context, settings)
-            settings.last_manifest_path = result["manifest_path"]
-            warning_count = len(result["manifest"].get("warnings", []))
-            settings.last_status = f"Bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
-            settings.last_details = _format_bundle_details(result)
+            with _quiet_send_logging(settings, self.action):
+                result = bundle.build_unreal_export_bundle(context, settings)
+                settings.last_manifest_path = result["manifest_path"]
+                warning_count = len(result["manifest"].get("warnings", []))
+                settings.last_status = f"Bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
+                settings.last_details = _format_bundle_details(result)
 
-            if self.action == "SEND":
-                response = send_import_request(settings.host, settings.port, result["manifest_path"])
-                success = bool(response.get("success"))
-                settings.last_status = "Unreal import complete" if success else "Unreal import failed"
-                settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
-                if not success:
-                    self.report({"ERROR"}, settings.last_status)
-                    return {"CANCELLED"}
+                if self.action == "SEND":
+                    response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                    success = bool(response.get("success"))
+                    settings.last_status = "Unreal import complete" if success else "Unreal import failed"
+                    settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
+                    if not success:
+                        self.report({"ERROR"}, settings.last_status)
+                        return {"CANCELLED"}
 
             self.report({"INFO"}, settings.last_status)
             return {"FINISHED"}
@@ -237,22 +306,27 @@ class WITCHER_OT_export_unreal_world(bpy.types.Operator):
         settings = context.scene.witcher_unreal_export
         if not settings.export_folder:
             settings.export_folder = bundle.default_export_folder()
+        if self.action == "SEND":
+            connection_error = _preflight_send_connection(settings)
+            if connection_error:
+                return _cancel_unreachable_unreal(self, settings, connection_error)
 
         try:
-            result = world_bundle.build_unreal_world_bundle(context, settings)
-            settings.last_manifest_path = result["manifest_path"]
-            warning_count = len(result["manifest"].get("warnings", []))
-            settings.last_status = f"World bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
-            settings.last_details = _format_world_bundle_details(result)
+            with _quiet_send_logging(settings, self.action):
+                result = world_bundle.build_unreal_world_bundle(context, settings)
+                settings.last_manifest_path = result["manifest_path"]
+                warning_count = len(result["manifest"].get("warnings", []))
+                settings.last_status = f"World bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
+                settings.last_details = _format_world_bundle_details(result)
 
-            if self.action == "SEND":
-                response = send_import_request(settings.host, settings.port, result["manifest_path"])
-                success = bool(response.get("success"))
-                settings.last_status = "Unreal terrain import complete" if success else "Unreal terrain import failed"
-                settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
-                if not success:
-                    self.report({"ERROR"}, settings.last_status)
-                    return {"CANCELLED"}
+                if self.action == "SEND":
+                    response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                    success = bool(response.get("success"))
+                    settings.last_status = "Unreal terrain import complete" if success else "Unreal terrain import failed"
+                    settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
+                    if not success:
+                        self.report({"ERROR"}, settings.last_status)
+                        return {"CANCELLED"}
 
             self.report({"INFO"}, settings.last_status)
             return {"FINISHED"}
@@ -291,34 +365,124 @@ class WITCHER_OT_export_unreal_placements(bpy.types.Operator):
         settings = context.scene.witcher_unreal_export
         if not settings.export_folder:
             settings.export_folder = bundle.default_export_folder()
+        if self.action == "SEND":
+            connection_error = _preflight_send_connection(settings)
+            if connection_error:
+                return _cancel_unreachable_unreal(self, settings, connection_error)
 
         try:
-            result = placements_bundle.build_unreal_placements_bundle(context, settings)
-            settings.last_manifest_path = result["manifest_path"]
-            warning_count = len(result["manifest"].get("warnings", []))
-            settings.last_status = f"Placements bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
-            settings.last_details = _format_placements_bundle_details(result)
+            with _quiet_send_logging(settings, self.action):
+                result = placements_bundle.build_unreal_placements_bundle(context, settings)
+                settings.last_manifest_path = result["manifest_path"]
+                warning_count = len(result["manifest"].get("warnings", []))
+                settings.last_status = f"Placements bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
+                settings.last_details = _format_placements_bundle_details(result)
 
-            if self.action == "SEND":
-                send_started = time.perf_counter()
-                settings.last_status = "Sending placements to Unreal"
-                response = send_import_request(settings.host, settings.port, result["manifest_path"])
-                send_seconds = time.perf_counter() - send_started
-                success = bool(response.get("success"))
-                settings.last_status = "Unreal placements import complete" if success else "Unreal placements import failed"
-                settings.last_details += (
-                    f"\n\nUnreal send/import time: {send_seconds:.3f}s"
-                    "\n\nUnreal response:\n"
-                    + json.dumps(response, indent=2)
-                )
-                if not success:
-                    self.report({"ERROR"}, settings.last_status)
-                    return {"CANCELLED"}
+                if self.action == "SEND":
+                    send_started = time.perf_counter()
+                    settings.last_status = "Sending placements to Unreal"
+                    response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                    send_seconds = time.perf_counter() - send_started
+                    success = bool(response.get("success"))
+                    settings.last_status = "Unreal placements import complete" if success else "Unreal placements import failed"
+                    settings.last_details += (
+                        f"\n\nUnreal send/import time: {send_seconds:.3f}s"
+                        "\n\nUnreal response:\n"
+                        + json.dumps(response, indent=2)
+                    )
+                    if not success:
+                        self.report({"ERROR"}, settings.last_status)
+                        return {"CANCELLED"}
 
             self.report({"INFO"}, settings.last_status)
             return {"FINISHED"}
         except Exception as exc:
             settings.last_status = "Unreal placements export failed"
+            settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+
+class WITCHER_OT_export_unreal_w2l(bpy.types.Operator):
+    bl_idname = "witcher.export_unreal_w2l"
+    bl_label = "Send .w2l Layer to Unreal"
+    bl_description = (
+        "Parse a Witcher .w2l layer file directly and send its placed meshes to "
+        "Unreal as positioned actors on the exported Landscape -- without importing "
+        "anything into Blender. Re-send more layers to fill the map in"
+    )
+    bl_options = {"REGISTER"}
+
+    w2l_path: StringProperty(
+        name=".w2l",
+        description="Depot or absolute path to the .w2l layer file",
+        subtype="FILE_PATH",
+        default="",
+    )
+    action: EnumProperty(
+        name="Action",
+        items=[
+            ("BUNDLE", "Export Bundle", "Write the layer buffers, textures, and manifest"),
+            ("SEND", "Send to Unreal", "Write the bundle and send it to the running Unreal plugin"),
+        ],
+        default="SEND",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context is not None and context.scene is not None
+
+    def execute(self, context):
+        button_started = time.perf_counter()
+        settings = context.scene.witcher_unreal_export
+        if not settings.export_folder:
+            settings.export_folder = bundle.default_export_folder()
+        if not str(getattr(self, "w2l_path", "") or "").strip():
+            settings.last_status = "No .w2l selected"
+            settings.last_details = "Select a .w2l layer file before sending to Unreal."
+            self.report({"ERROR"}, settings.last_details)
+            return {"CANCELLED"}
+        if self.action == "SEND":
+            connection_error = _preflight_send_connection(settings)
+            if connection_error:
+                return _cancel_unreachable_unreal(self, settings, connection_error)
+
+        try:
+            with _quiet_send_logging(settings, self.action):
+                result = w2l_placements.build_unreal_w2l_bundle(context, settings, self.w2l_path)
+                settings.last_manifest_path = result["manifest_path"]
+                warning_count = len(result["manifest"].get("warnings", []))
+                settings.last_status = f"Layer bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
+                settings.last_details = _format_w2l_bundle_details(result)
+
+                if self.action == "SEND":
+                    settings.last_status = "Sending layer to Unreal"
+                    send_started = time.perf_counter()
+                    response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                    send_seconds = time.perf_counter() - send_started
+                    total_seconds = time.perf_counter() - button_started
+                    success = bool(response.get("success"))
+                    settings.last_status = "Unreal layer import complete" if success else "Unreal layer import failed"
+                    timing_report = _format_send_timing_report(
+                        result.get("asset_name", "layer"),
+                        total_seconds,
+                        float(result.get("elapsed_seconds", 0.0) or 0.0),
+                        send_seconds,
+                        response,
+                        result.get("build_timings"),
+                    )
+                    print(timing_report)
+                    settings.last_details += "\n\n" + timing_report
+                    settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
+                    if not success:
+                        self.report({"ERROR"}, settings.last_status)
+                        return {"CANCELLED"}
+                    settings.last_status += f" ({total_seconds:.1f}s)"
+
+            self.report({"INFO"}, settings.last_status)
+            return {"FINISHED"}
+        except Exception as exc:
+            settings.last_status = "Unreal layer export failed"
             settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -557,6 +721,7 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
             placement_options = box.column(align=True)
             placement_options.use_property_split = True
             placement_options.use_property_decorate = False
+            placement_options.prop(settings, "placement_skip_materials", text="Fast .w2l (geometry only)")
             placement_options.prop(settings, "placement_export_collision", text="Collision")
             placement_options.prop(settings, "placement_write_profile_log", text="Profile Log")
             placement_options.label(text="FBX reuse follows Overwrite Policy > Meshes", icon="INFO")
@@ -567,6 +732,7 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
             conn.use_property_decorate = False
             conn.prop(settings, "host")
             conn.prop(settings, "port")
+            conn.prop(settings, "quiet_send_logging")
 
         status_row = box.row(align=True)
         status_row.label(text=settings.last_status or "Ready", icon="INFO")
@@ -699,6 +865,79 @@ def _format_placements_bundle_details(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_send_timing_report(
+    label: str,
+    total_seconds: float,
+    build_seconds: float,
+    send_seconds: float,
+    response: dict,
+    build_timings: dict | None = None,
+) -> str:
+    ue_total = float(response.get("total_seconds", 0.0) or 0.0)
+    timings = response.get("timings", {}) or {}
+    asset_count = int(response.get("imported_asset_count", 0) or 0)
+    bar = "=" * 58
+    lines = [
+        bar,
+        f"Send-to-Unreal timing: {label}",
+        f"  Button press -> loaded:  {total_seconds:7.2f} s",
+        f"    Blender build:         {build_seconds:7.2f} s",
+    ]
+    for name, secs in sorted((build_timings or {}).items(), key=lambda kv: float(kv[1] or 0.0), reverse=True):
+        secs = float(secs or 0.0)
+        if secs >= 0.0005:
+            lines.append(f"        {name:<12} {secs:7.2f} s")
+    lines.append(f"    Send + Unreal import:  {send_seconds:7.2f} s")
+    if ue_total > 0.0 or timings:
+        lines.append(f"      Unreal total:        {ue_total:7.2f} s")
+        for name, secs in sorted(timings.items(), key=lambda kv: float(kv[1] or 0.0), reverse=True):
+            secs = float(secs or 0.0)
+            if secs >= 0.0005:
+                lines.append(f"        {name:<12} {secs:7.2f} s")
+        lines.append(f"      network/overhead:    {max(0.0, send_seconds - ue_total):7.2f} s")
+    else:
+        lines.append("      (rebuild the Unreal plugin for the per-phase breakdown)")
+    lines.append(f"  Unreal assets imported: {asset_count}")
+    lines.append(bar)
+    return "\n".join(lines)
+
+
+def _format_w2l_bundle_details(result: dict) -> str:
+    manifest = result.get("manifest", {})
+    counts = result.get("counts", {}) or {}
+    skipped = counts.get("skipped", {}) or {}
+    lines = [
+        f"Layer: {result.get('layer_id', '')}",
+        f"Asset: {result.get('asset_name', '')}",
+        f"Bundle: {result.get('bundle_root', '')}",
+        f"Manifest: {result.get('manifest_path', '')}",
+        f"Content root: {manifest.get('content_root', '')}",
+        f"Source game: {str(manifest.get('source_game', 'w3')).upper()}",
+        f"Mode: {'FAST (geometry only, default material)' if result.get('skip_materials') else 'full materials + textures'}",
+        "",
+        f"Unique meshes: {counts.get('unique_meshes', 0)}"
+        f" | Actors: {counts.get('actors', 0)}"
+        f" | Instancers: {counts.get('instancers', 0)}"
+        f" ({counts.get('instances', 0)} instances)",
+        f"Build time: {result.get('elapsed_seconds', 0.0):.3f}s",
+    ]
+    if skipped:
+        lines.append("Skipped blocks: " + ", ".join(f"{key}={value}" for key, value in sorted(skipped.items())))
+    lines += [
+        f"Materials: {len(manifest.get('materials', []))}"
+        f" | Masters: {len(manifest.get('masters', []))}"
+        f" | Textures: {len(manifest.get('textures', []))}",
+        "",
+        "Warnings:",
+    ]
+    warnings = manifest.get("warnings", [])
+    if warnings:
+        lines.extend(f"- {warning}" for warning in warnings)
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
 def _format_world_bundle_details(result: dict) -> str:
     manifest = result.get("manifest", {})
     terrain = manifest.get("terrain", {}) or {}
@@ -737,6 +976,7 @@ classes = (
     WITCHER_OT_export_unreal_item,
     WITCHER_OT_export_unreal_world,
     WITCHER_OT_export_unreal_placements,
+    WITCHER_OT_export_unreal_w2l,
     WITCHER_OT_unreal_overwrite_preset,
     WITCHER_OT_install_unreal_plugin,
     WITCHER_OT_unreal_export_details,

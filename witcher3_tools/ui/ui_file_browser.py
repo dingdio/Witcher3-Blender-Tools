@@ -5612,8 +5612,11 @@ class SimpleFileBrowser(Operator):
         op_loc.cache_type = witcher_file_browser.active_cache_type
 
         if not witcher_file_browser.batch_select_mode and cache_supports_scene_import(witcher_file_browser.active_cache_type):
-            op_import = actions_row.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
+            import_row = actions_row.row(align=True)
+            import_row.operator_context = 'INVOKE_DEFAULT'
+            op_import = import_row.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
             op_import.file_path = item['name']
+            op_import.cache_type = witcher_file_browser.active_cache_type
 
         if cache_supports_sound_preview(witcher_file_browser.active_cache_type):
             is_playing = _sound_preview_matches(witcher_file_browser.active_cache_type, full_item_path)
@@ -5625,9 +5628,15 @@ class SimpleFileBrowser(Operator):
             op_sound.file_path = full_item_path
             op_sound.cache_type = witcher_file_browser.active_cache_type
 
-        if witcher_file_browser.active_cache_type != "Texture" and not is_disk_cache(witcher_file_browser.active_cache_type):
-            op_export = actions_row.operator("witcher.file_action", text="", icon='EXPORT')
-            op_export.file_path = item['name']
+        if (
+            not is_disk_cache(witcher_file_browser.active_cache_type)
+            or _browser_item_can_send_to_unreal(witcher_file_browser.active_cache_type, full_item_path)
+        ):
+            menu_row = actions_row.row(align=True)
+            menu_row.operator_context = 'INVOKE_DEFAULT'
+            op_menu = menu_row.operator("witcher.file_action_menu", text="", icon='THREE_DOTS')
+            op_menu.file_path = item['name']
+            op_menu.cache_type = witcher_file_browser.active_cache_type
 
         stats_op = actions_row.operator("witcher.file_item_stats", text="", icon='INFO')
         stats_op.file_path = full_item_path
@@ -5801,14 +5810,17 @@ class SimpleFileBrowser(Operator):
                 op = layout.operator("witcher.file_action_global_import", text="", icon='IMPORT')
                 op.cache_type = cache_type
             else:
-                op = layout.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
-        else:
-            if is_global:
-                op = layout.operator("witcher.file_action_global_export", text="", icon='EXPORT')
+                import_row = layout.row(align=True)
+                import_row.operator_context = 'INVOKE_DEFAULT'
+                op = import_row.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
                 op.cache_type = cache_type
-            else:
-                op = layout.operator("witcher.file_action", text="", icon='EXPORT')
-        op.file_path = item_path
+            op.file_path = item_path
+        if not is_disk_cache(cache_type) or _browser_item_can_send_to_unreal(cache_type, item_path):
+            menu_row = layout.row(align=True)
+            menu_row.operator_context = 'INVOKE_DEFAULT'
+            op = menu_row.operator("witcher.file_action_menu", text="", icon='THREE_DOTS')
+            op.file_path = item_path
+            op.cache_type = cache_type
 
         stats_op = layout.operator("witcher.file_item_stats", text="", icon='INFO')
         stats_op.file_path = item_path
@@ -6562,9 +6574,12 @@ class SimpleFileBrowser(Operator):
                     op_loc.cache_type = witcher_file_browser.active_cache_type
 
                     if not witcher_file_browser.batch_select_mode and cache_supports_scene_import(witcher_file_browser.active_cache_type):
-                        op1 = row.operator("witcher.file_action_import_to_scene",
-                                            text="", icon='IMPORT')
+                        import_row = row.row(align=True)
+                        import_row.operator_context = 'INVOKE_DEFAULT'
+                        op1 = import_row.operator("witcher.file_action_import_to_scene",
+                                                  text="", icon='IMPORT')
                         op1.file_path = item['name']
+                        op1.cache_type = witcher_file_browser.active_cache_type
 
                     _add_browser_preview_button_slot(
                         row,
@@ -6584,10 +6599,15 @@ class SimpleFileBrowser(Operator):
                         op_sound.file_path = full_item_path
                         op_sound.cache_type = witcher_file_browser.active_cache_type
 
-                    if witcher_file_browser.active_cache_type != "Texture" and not is_disk_cache(witcher_file_browser.active_cache_type):
-                        op2 = row.operator("witcher.file_action",
-                                            text="", icon='EXPORT')
+                    if (
+                        not is_disk_cache(witcher_file_browser.active_cache_type)
+                        or _browser_item_can_send_to_unreal(witcher_file_browser.active_cache_type, full_item_path)
+                    ):
+                        menu_row = row.row(align=True)
+                        menu_row.operator_context = 'INVOKE_DEFAULT'
+                        op2 = menu_row.operator("witcher.file_action_menu", text="", icon='THREE_DOTS')
                         op2.file_path = item['name']
+                        op2.cache_type = witcher_file_browser.active_cache_type
 
                     is_revealed = _is_revealed_browser_item(witcher_file_browser, full_item_path)
                     icon_info = _get_browser_item_icon_info(
@@ -7671,11 +7691,107 @@ class SelectCacheTypeOperator(Operator):
                     continue
                 folder_structure.add_path(key_str)
 
+_UNREAL_BROWSER_SEND_EXTS = {".w2ent", ".w3app", ".w2mesh", ".w2l"}
+_UNREAL_BROWSER_HEADLESS_EXTS = {".w2l"}
+
+
+def _browser_item_is_headless_unreal_send(item_path: str) -> bool:
+    return os.path.splitext(_normalize_virtual_path(item_path))[1].lower() in _UNREAL_BROWSER_HEADLESS_EXTS
+
+
+def _browser_operator_cache_type(context, cache_type: str = "") -> str:
+    if cache_type:
+        return cache_type
+    witcher_file_browser = getattr(context.scene, "witcher_file_browser", None)
+    return getattr(witcher_file_browser, "active_cache_type", "") if witcher_file_browser else ""
+
+
+def _browser_item_can_send_to_unreal(cache_type: str, item_path: str) -> bool:
+    if not cache_supports_scene_import(cache_type):
+        return False
+    return os.path.splitext(_normalize_virtual_path(item_path))[1].lower() in _UNREAL_BROWSER_SEND_EXTS
+
+
+def _browser_apply_unreal_send_profile(context):
+    changes = []
+
+    def set_attr(owner, name, value):
+        if owner is None or not hasattr(owner, name):
+            return
+        changes.append((owner, name, getattr(owner, name)))
+        setattr(owner, name, value)
+
+    prefs = get_all_addon_prefs(context)
+    for name in (
+        "do_import_redcloth",
+        "DO_WEAR_CLOTH",
+        "redcloth_simulation_enabled",
+        "import_idle_animation",
+        "mesh_import_keep_lod_meshes",
+        "mesh_import_do_import_collision",
+    ):
+        set_attr(prefs, name, False)
+
+    settings = getattr(context.scene, "witcher_unreal_export", None)
+    set_attr(settings, "prefer_source_buffers", True)
+    set_attr(settings, "asset_name", "")
+    return changes
+
+
+def _browser_restore_unreal_send_profile(changes):
+    for owner, name, value in reversed(changes):
+        try:
+            setattr(owner, name, value)
+        except Exception:
+            pass
+
+
+def _browser_select_send_objects(context, imported_objects):
+    scene_objects = set(context.scene.objects)
+    candidates = [
+        obj for obj in imported_objects
+        if obj in scene_objects and getattr(obj, "type", "") in {"ARMATURE", "MESH", "EMPTY"}
+    ]
+    if not candidates:
+        candidates = [
+            obj for obj in context.selected_objects
+            if obj in scene_objects and getattr(obj, "type", "") in {"ARMATURE", "MESH", "EMPTY"}
+        ]
+    if not candidates:
+        return []
+
+    candidate_set = set(candidates)
+    entity_armatures = []
+    for obj in candidates:
+        if getattr(obj, "type", "") != "ARMATURE":
+            continue
+        rig_settings = getattr(obj, "witcherui_RigSettings", None)
+        repo_path = str(getattr(rig_settings, "repo_path", "") or "").lower()
+        if repo_path.endswith((".w2ent", ".w3app")):
+            entity_armatures.append(obj)
+
+    roots = [obj for obj in candidates if getattr(obj, "parent", None) not in candidate_set]
+    selected = entity_armatures or roots or candidates
+    try:
+        if context.object and getattr(context.object, "mode", "OBJECT") != "OBJECT":
+            bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+    for obj in scene_objects:
+        obj.select_set(False)
+    for obj in selected:
+        obj.select_set(True)
+    context.view_layer.objects.active = selected[0]
+    return selected
+
+
 class FileActionOperatorImportToScene(Operator):
     """Import a file directly to the scene"""
     bl_idname = "witcher.file_action_import_to_scene"
     bl_label = "Import to Scene"
     file_path: StringProperty()
+    cache_type: StringProperty(default="")
+    unreal_send_profile: BoolProperty(default=False, options={'HIDDEN'})
 
     def invoke(self, context, event):
         witcher_file_browser = getattr(context.scene, "witcher_file_browser", None)
@@ -7716,7 +7832,7 @@ class FileActionOperatorImportToScene(Operator):
 
     def _build_import_state(self, context):
         witcher_file_browser = context.scene.witcher_file_browser
-        cache_type = witcher_file_browser.active_cache_type
+        cache_type = _browser_operator_cache_type(context, self.cache_type)
         overwrite_existing = witcher_file_browser.mods_overwrite
 
         # Build full path for lookup
@@ -7724,7 +7840,7 @@ class FileActionOperatorImportToScene(Operator):
                      if witcher_file_browser.current_folder else self.file_path)
 
         # For search results, file_path is already the full path
-        if "\\" in self.file_path:
+        if "\\" in self.file_path or "/" in self.file_path:
             full_path = self.file_path
 
         loadmods = witcher_file_browser.loadmods
@@ -8283,6 +8399,8 @@ class FileActionOperatorImportToScene(Operator):
             elif ext == ".w2mesh":
                 try:
                     mesh_import_settings = MeshImportSettings.from_addon_prefs(get_all_addon_prefs(context))
+                    if self.unreal_send_profile:
+                        mesh_import_settings.build_material_nodes = False
                     import_mesh.import_mesh(
                         abs_file_path,
                         do_merge_normals=False,
@@ -8309,9 +8427,34 @@ class FileActionOperatorImportToScene(Operator):
                             0 if default_appearance_name else 1,
                             None,
                             selected_appearance_name=default_appearance_name,
+                            mesh_import_settings={
+                                "build_material_nodes": not self.unreal_send_profile,
+                                "import_morphs": not self.unreal_send_profile,
+                            },
                         )
-                    elif not import_entity.try_apply_inventory_file_to_selected_character(context, abs_file_path):
-                        import_entity.import_direct_entity_file(abs_file_path, False, 0, None)
+                    elif w2ent_mode == "inventory":
+                        if not import_entity.try_apply_inventory_file_to_selected_character(context, abs_file_path):
+                            import_entity.import_direct_entity_file(
+                                abs_file_path,
+                                False,
+                                0,
+                                None,
+                                mesh_import_settings={
+                                    "build_material_nodes": not self.unreal_send_profile,
+                                    "import_morphs": not self.unreal_send_profile,
+                                },
+                            )
+                    else:
+                        import_entity.import_direct_entity_file(
+                            abs_file_path,
+                            False,
+                            0,
+                            None,
+                            mesh_import_settings={
+                                "build_material_nodes": not self.unreal_send_profile,
+                                "import_morphs": not self.unreal_send_profile,
+                            },
+                        )
                 except Exception as exc:
                     log.error("Entity import failed for %s", abs_file_path, exc_info=True)
                     self.report({'ERROR'}, f"Entity import failed: {exc}")
@@ -8373,6 +8516,128 @@ class FileActionOperatorImportToScene(Operator):
         elapsed_seconds = time.perf_counter() - import_started
         self.report({'INFO'}, f"Successfully imported: {filename} ({elapsed_seconds:.1f}s)")
         return {'FINISHED'}
+
+
+class FileActionMenuOperator(Operator):
+    bl_idname = "witcher.file_action_menu"
+    bl_label = "File Actions"
+
+    file_path: StringProperty()
+    cache_type: StringProperty(default="")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_popup(self, width=220)
+
+    def execute(self, context):
+        return context.window_manager.invoke_popup(self, width=220)
+
+    def draw(self, context):
+        layout = self.layout
+        cache_type = _browser_operator_cache_type(context, self.cache_type)
+
+        export_row = layout.row(align=True)
+        export_row.enabled = bool(cache_type) and not is_disk_cache(cache_type)
+        export_op = export_row.operator("witcher.file_action", text="Export", icon='EXPORT')
+        export_op.file_path = self.file_path
+        export_op.cache_type = cache_type
+
+        send_row = layout.row(align=True)
+        send_row.enabled = _browser_item_can_send_to_unreal(cache_type, self.file_path)
+        send_op = send_row.operator("witcher.file_action_send_to_unreal", text="Send to Unreal", icon='URL')
+        send_op.file_path = self.file_path
+        send_op.cache_type = cache_type
+
+
+class FileActionSendToUnrealOperator(Operator):
+    bl_idname = "witcher.file_action_send_to_unreal"
+    bl_label = "Send to Unreal"
+
+    file_path: StringProperty()
+    cache_type: StringProperty(default="")
+    unreal_send_profile: BoolProperty(default=True, options={'HIDDEN'})
+
+    def _build_import_state(self, context):
+        return FileActionOperatorImportToScene._build_import_state(self, context)
+
+    def _resolve_import_target(self, context):
+        return FileActionOperatorImportToScene._resolve_import_target(self, context)
+
+    def _execute_resolved_import(self, context, resolved):
+        return FileActionOperatorImportToScene._execute_resolved_import(self, context, resolved)
+
+    def execute(self, context):
+        cache_type = _browser_operator_cache_type(context, self.cache_type)
+        if not _browser_item_can_send_to_unreal(cache_type, self.file_path):
+            self.report({'WARNING'}, "Send to Unreal is available for entity, mesh, and .w2l layer browser items.")
+            return {'CANCELLED'}
+        if not hasattr(context.scene, "witcher_unreal_export"):
+            self.report({'ERROR'}, "Unreal export tools are not registered.")
+            return {'CANCELLED'}
+        settings = context.scene.witcher_unreal_export
+        try:
+            from ..unreal_export.socket_client import probe_import_server
+
+            connection_error = probe_import_server(settings.host, settings.port, timeout=1.0)
+        except Exception as exc:
+            connection_error = f"Could not check the Unreal import server: {exc}"
+        if connection_error:
+            settings.last_status = "Unreal import server not reachable"
+            settings.last_details = connection_error
+            self.report({'ERROR'}, connection_error)
+            return {'CANCELLED'}
+
+        if _browser_item_is_headless_unreal_send(self.file_path):
+            return self._send_w2l_headless(context, cache_type)
+
+        before_objects = set(bpy.data.objects)
+        self.unreal_send_profile = True
+        profile_changes = _browser_apply_unreal_send_profile(context)
+        try:
+            with mod_loading_context(context):
+                resolved = self._resolve_import_target(context)
+                if not resolved:
+                    return {'CANCELLED'}
+                import_result = self._execute_resolved_import(context, resolved)
+            if 'FINISHED' not in import_result:
+                return import_result
+
+            imported_objects = [obj for obj in bpy.data.objects if obj not in before_objects]
+            selected = _browser_select_send_objects(context, imported_objects)
+            if not selected:
+                self.report({'ERROR'}, "No imported mesh or armature was available to send.")
+                return {'CANCELLED'}
+
+            try:
+                result = bpy.ops.witcher.export_unreal_item(action='SEND')
+            except RuntimeError as exc:
+                message = str(exc).replace("Error: ", "").strip() or "Unreal send failed."
+                settings.last_status = "Unreal import failed"
+                settings.last_details = message
+                self.report({'ERROR'}, message)
+                return {'CANCELLED'}
+            return result
+        finally:
+            _browser_restore_unreal_send_profile(profile_changes)
+
+    def _send_w2l_headless(self, context, cache_type):
+        settings = context.scene.witcher_unreal_export
+        state = self._build_import_state(context)
+        w2l_arg = state["full_path"]
+        try:
+            if is_disk_cache(cache_type):
+                abs_path = get_disk_abs_path(cache_type, state["full_path"])
+                if abs_path:
+                    w2l_arg = abs_path
+        except Exception:
+            pass
+        try:
+            return bpy.ops.witcher.export_unreal_w2l(action='SEND', w2l_path=w2l_arg)
+        except RuntimeError as exc:
+            message = str(exc).replace("Error: ", "").strip() or "Unreal layer send failed."
+            settings.last_status = "Unreal layer import failed"
+            settings.last_details = message
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
 
 
 class SoundPreviewToggleOperator(Operator):
@@ -9048,10 +9313,11 @@ class FileActionOperator(Operator):
     bl_idname = "witcher.file_action"
     bl_label = "File Action"
     file_path: StringProperty()
+    cache_type: StringProperty(default="")
 
     def execute(self, context):
         witcher_file_browser = context.scene.witcher_file_browser
-        cache_type = witcher_file_browser.active_cache_type
+        cache_type = _browser_operator_cache_type(context, self.cache_type)
         effective_cache_type = get_effective_cache_type(cache_type)
 
         if is_disk_cache(cache_type):
@@ -9372,6 +9638,8 @@ def register():
     bpy.utils.register_class(AdjustTileMultiresOperator)
     bpy.utils.register_class(FileActionOperator)
     bpy.utils.register_class(FileActionOperatorImportToScene)
+    bpy.utils.register_class(FileActionMenuOperator)
+    bpy.utils.register_class(FileActionSendToUnrealOperator)
     bpy.utils.register_class(SoundPreviewToggleOperator)
     bpy.utils.register_class(GlobalImportOperator)
     bpy.utils.register_class(GlobalExportOperator)
@@ -9434,6 +9702,8 @@ def unregister():
     bpy.utils.unregister_class(ClearSearchOperator)
     bpy.utils.unregister_class(NavigateFolderOperator)
     bpy.utils.unregister_class(SelectCacheTypeOperator)
+    bpy.utils.unregister_class(FileActionSendToUnrealOperator)
+    bpy.utils.unregister_class(FileActionMenuOperator)
     bpy.utils.unregister_class(FileActionOperatorImportToScene)
     bpy.utils.unregister_class(FileActionOperator)
     bpy.utils.unregister_class(AdjustTileMultiresOperator)

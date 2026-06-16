@@ -378,6 +378,7 @@ def import_mesh(filename:str,
                 keep_proxy_meshes:bool = False,
                 do_import_collision:bool = False,
                 hide_zero_weight_faces:bool = True,
+                build_material_nodes:bool = True,
                 embedded_cmesh_chunk_index=None) -> w3_types.CSkeletalAnimationSet:
     mesh_started = time.perf_counter()
     parse_seconds = 0.0
@@ -421,7 +422,8 @@ def import_mesh(filename:str,
                     rotate_180,
                     keep_empty_lods,
                     keep_proxy_meshes,
-                    hide_zero_weight_faces)
+                    hide_zero_weight_faces,
+                    build_material_nodes)
                 prepare_seconds = time.perf_counter() - prepare_started
                 
                 if rotate_180:
@@ -661,7 +663,8 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                 rotate_180,
                 keep_empty_lods,
                 keep_proxy_meshes,
-                hide_zero_weight_faces):
+                hide_zero_weight_faces,
+                build_material_nodes=True):
     #TODO proxy meshes don't have lod0 they start at lod1, should import proxy anyway if requested
     #meshData = meshFile
     created_mesh_bl = []
@@ -1114,7 +1117,14 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                 len(materials),
                 len(final_bl_meshes),
             )
-            load_w3_materials_CR2W_Mesh(final_bl_meshes, uncook_path, materials, the_material_names, mat_filename=mat_filename)
+            load_w3_materials_CR2W_Mesh(
+                final_bl_meshes,
+                uncook_path,
+                materials,
+                the_material_names,
+                mat_filename=mat_filename,
+                build_material_nodes=build_material_nodes,
+            )
 
     #===========#
     #  Finish   #
@@ -1130,6 +1140,12 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
             bpy.context.view_layer.objects.active = final_bl_meshes[0]
     for mesh in final_bl_meshes:
         mesh.select_set(True)
+    try:
+        from ..unreal_export.mesh_signature import mesh_geometry_signature
+        for mesh_obj in final_bl_meshes:
+            mesh_obj.witcherui_MeshSettings['source_signature'] = mesh_geometry_signature(mesh_obj)
+    except Exception:
+        pass
     return (final_bl_meshes, armatures)
 
 #returns mesh object
@@ -1383,6 +1399,7 @@ def load_w3_materials_CR2W_Mesh(
         ,material_names: str
         ,force_mat_update = False
         ,mat_filename = str
+        ,build_material_nodes = True
     ):
     materials_started = time.perf_counter()
     objs = objs or []
@@ -1467,6 +1484,7 @@ def load_w3_materials_CR2W_Mesh(
                     mat,
                     force_update=force_mat_update,
                     mat_filename=mat_filename,
+                    build_nodes=build_material_nodes,
                 )
             except Exception:
                 log.exception(

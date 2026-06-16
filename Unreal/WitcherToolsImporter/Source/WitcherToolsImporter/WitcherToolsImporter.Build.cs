@@ -25,7 +25,14 @@ public class WitcherToolsImporter : ModuleRules
             "UnrealEd",
             "WitcherToolsRuntime",
             "Landscape",
-            "LandscapeEditor"
+            "LandscapeEditor",
+            "MeshDescription",
+            "StaticMeshDescription",
+            "SkeletalMeshDescription",
+            "SkeletalMeshUtilitiesCommon",
+            "AnimationCore",
+            "Slate",
+            "SlateCore"
         });
     }
 }

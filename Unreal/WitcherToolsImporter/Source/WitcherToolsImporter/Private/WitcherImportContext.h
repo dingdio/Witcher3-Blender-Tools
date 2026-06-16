@@ -49,6 +49,7 @@ private:
     UTexture* FindTexture(const FString& DepotRel);
 
     UObject* ImportFbxMesh(const FString& BundleRelativeFbx, const FString& AssetRel, bool bSkeletal, USkeleton* Skeleton);
+    UObject* ImportBufferMesh(const FString& BundleRelativeBuffer, const FString& AssetRel, bool bSkeletal, USkeleton* Skeleton);
     UAnimSequence* ImportAnimation(const TSharedPtr<FJsonObject>& AnimationObject);
     void AssignMaterialsToMesh(UObject* MeshObject, const TSharedPtr<FJsonObject>& MeshEntry);
     UAnimSequence* FindAnimSequence(const FString& AssetRel);
@@ -72,6 +73,9 @@ private:
     TArray<FString> ImportedAssets;
     TArray<FString> Warnings;
     TArray<FString> Errors;
+
+    TArray<TPair<FString, double>> PhaseTimings;
+    double TotalImportSeconds = 0.0;
 
     TMap<FString, TWeakObjectPtr<UTexture>> TexturesByDepot;
     TMap<FString, TWeakObjectPtr<UMaterialInterface>> MastersByRel;

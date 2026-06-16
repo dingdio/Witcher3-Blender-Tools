@@ -711,7 +711,7 @@ def build_unreal_placements_bundle(context, settings) -> dict[str, Any]:
     progress = _PlacementExportProgress(context, settings, progress_steps)
     profile_path = None
     try:
-        registry = TextureRegistry(bundle_root)
+        registry = TextureRegistry(bundle_root, parallel=True)
         chain = ChainBuilder(registry.register)
 
         mesh_entries: list[dict[str, Any]] = []

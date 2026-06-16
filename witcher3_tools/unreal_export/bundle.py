@@ -149,26 +149,27 @@ def build_unreal_export_bundle(context, settings) -> dict[str, Any]:
     if not mesh_objects and not armatures:
         raise ValueError("Select at least one mesh or armature.")
 
-    asset_name = safe_asset_name(getattr(settings, "asset_name", "") or _guess_asset_name(selected_objects, mesh_objects, armatures))
+    main_armature = _select_main_armature(armatures)
+    asset_name = safe_asset_name(getattr(settings, "asset_name", "") or _guess_asset_name(main_armature, selected_objects, mesh_objects, armatures))
     export_root = str(getattr(settings, "export_folder", "") or default_export_folder())
     bundle_root = os.path.join(export_root, asset_name)
     os.makedirs(bundle_root, exist_ok=True)
 
-    registry = TextureRegistry(bundle_root)
+    registry = TextureRegistry(bundle_root, parallel=True)
     chain = ChainBuilder(registry.register)
 
-    main_armature = armatures[0] if armatures else None
     source_game, source_warnings = _infer_export_source_game(export_objects, main_armature)
     content_root = _resolve_content_root_setting(getattr(settings, "content_root", ""), source_game)
     warnings: list[str] = list(preload_warnings) + source_warnings
 
     mesh_entries: list[dict[str, Any]] = []
     used_fbx_stems: dict[str, str] = {}
+    use_buffers = bool(getattr(settings, "prefer_source_buffers", True))
     groups = group_meshes_by_depot(mesh_objects, asset_name, warnings)
     for group in groups:
         mesh_entries.append(
             _export_mesh_group(context, group, bundle_root, chain, warnings, used_fbx_stems,
-                               main_armature=main_armature)
+                               main_armature=main_armature, use_buffers=use_buffers)
         )
 
     rig_entry = None
@@ -332,6 +333,8 @@ def collect_export_objects(selected_objects) -> list[Any]:
             return
         if getattr(obj, "type", "") not in {"MESH", "ARMATURE", "EMPTY"}:
             return
+        if getattr(obj, "type", "") == "MESH" and _is_character_proxy_mesh(obj):
+            return
         seen.add(name)
         objects.append(obj)
 
@@ -439,6 +442,8 @@ def _iter_visible_character_export_meshes(root):
 def _is_character_export_mesh(obj) -> bool:
     if getattr(obj, "type", "") != "MESH":
         return False
+    if _is_character_proxy_mesh(obj):
+        return False
     depot = mesh_depot_path(obj)
     if not depot:
         return False
@@ -446,6 +451,19 @@ def _is_character_export_mesh(obj) -> bool:
     if "shadowmesh" in lowered or "shadowmesh" in str(getattr(obj, "name", "")).lower():
         return False
     return True
+
+
+def _is_character_proxy_mesh(obj) -> bool:
+    name = str(getattr(obj, "name", "") or "").lower()
+    data_name = str(getattr(getattr(obj, "data", None), "name", "") or "").lower()
+    depot = depot_asset_rel(mesh_depot_path(obj)).lower()
+    text = " ".join((name, data_name, depot))
+    return (
+        "_px" in text
+        or ":collision" in text
+        or "collision proxy" in text
+        or "cloth" in text and "_px" in name
+    )
 
 
 def _is_character_armature(obj) -> bool:
@@ -510,11 +528,8 @@ def group_meshes_by_depot(mesh_objects, asset_name: str, warnings: list[str]) ->
 
 # ---- mesh / rig export ----
 
-def _unique_fbx_path(bundle_root: str, asset_rel: str, used_stems: dict[str, str],
-                     subdir: str = "Meshes") -> str:
-    """Flat FBX filenames: mirroring depot dirs on disk broke Windows MAX_PATH
-    inside Blender. The Unreal asset name/path comes from the manifest, not
-    from the FBX location."""
+def _unique_bundle_file(bundle_root: str, asset_rel: str, used_stems: dict[str, str],
+                        subdir: str, ext: str) -> str:
     base = asset_rel.rsplit("/", 1)[-1]
     stem = base
     counter = 2
@@ -523,18 +538,106 @@ def _unique_fbx_path(bundle_root: str, asset_rel: str, used_stems: dict[str, str
         counter += 1
     used_stems[stem] = asset_rel
 
-    fbx_dir = os.path.join(bundle_root, subdir)
-    _makedirs_safe(fbx_dir)
-    return os.path.join(fbx_dir, f"{stem}.fbx")
+    out_dir = os.path.join(bundle_root, subdir)
+    _makedirs_safe(out_dir)
+    return os.path.join(out_dir, f"{stem}{ext}")
+
+
+def _unique_fbx_path(bundle_root: str, asset_rel: str, used_stems: dict[str, str],
+                     subdir: str = "Meshes") -> str:
+    return _unique_bundle_file(bundle_root, asset_rel, used_stems, subdir, ".fbx")
+
+
+def _stored_mesh_signature(obj) -> str:
+    try:
+        return str(obj.witcherui_MeshSettings.get("source_signature", "") or "")
+    except Exception:
+        return ""
+
+
+def _object_has_morphs(obj) -> bool:
+    keys = getattr(getattr(obj, "data", None), "shape_keys", None)
+    blocks = getattr(keys, "key_blocks", None) if keys else None
+    return bool(blocks) and len(blocks) > 1
+
+
+def _group_is_unedited(objs) -> bool:
+    from .mesh_signature import mesh_geometry_signature
+
+    for obj in objs:
+        stored = _stored_mesh_signature(obj)
+        if not stored or stored != mesh_geometry_signature(obj):
+            return False
+    return True
+
+
+def _resolve_source_w2mesh(depot: str) -> str:
+    if not depot:
+        return ""
+    try:
+        from ..CR2W.common_blender import repo_file
+
+        abs_path = repo_file(depot)
+    except Exception:
+        return ""
+    return abs_path if abs_path and os.path.isfile(abs_path) else ""
+
+
+def _try_gather_group_buffer(context, group, main_armature, bundle_root: str,
+                             used_stems: dict[str, str], warnings: list[str]):
+    objs = group["objects"]
+    if not objs or _hard_attachment_socket(objs, main_armature):
+        return None
+    if any(_object_has_morphs(obj) for obj in objs):
+        return None
+    source = _resolve_source_w2mesh(mesh_depot_path(objs[0]))
+    if not source or not _group_is_unedited(objs):
+        return None
+
+    from . import gather as gather_mod
+    from .mesh_buffer import write_mesh_buffer
+
+    asset_rel = group["asset_path"]
+    group_armature = _group_armature(objs)
+
+    export_skeleton = None
+    try:
+        if group_armature is not None or main_armature is not None:
+            with _export_armature_for_mesh_group(
+                context, group_armature, main_armature, asset_rel, warnings
+            ) as export_arm:
+                if export_arm is not None:
+                    export_skeleton = gather_mod.extract_armature_skeleton(export_arm)
+    except Exception as exc:
+        warnings.append(f"{asset_rel}: skeleton extract failed ({exc}); using FBX")
+        return None
+
+    try:
+        mesh = gather_mod.gather_mesh(source, keep_lod_meshes=False, export_skeleton=export_skeleton)
+    except Exception as exc:
+        warnings.append(f"{asset_rel}: buffer gather failed ({exc}); using FBX")
+        return None
+    if not mesh.submeshes:
+        return None
+    if mesh.is_skinned and export_skeleton is None:
+        return None  # no armature to merge -> FBX is the safe path
+    if mesh.unresolved_bones:
+        warnings.append(
+            f"{asset_rel}: {len(mesh.unresolved_bones)} skin bone(s) not on the export "
+            f"skeleton, weighted to root (e.g. {mesh.unresolved_bones[0]})"
+        )
+
+    buf_path = _unique_bundle_file(bundle_root, asset_rel, used_stems, "Meshes", ".w3buf")
+    write_mesh_buffer(buf_path, mesh)
+    return relpath_for_manifest(buf_path, bundle_root), mesh.is_skinned
 
 
 def _export_mesh_group(context, group, bundle_root: str, chain: ChainBuilder, warnings: list[str],
-                       used_fbx_stems: dict[str, str], main_armature=None) -> dict[str, Any]:
+                       used_fbx_stems: dict[str, str], main_armature=None,
+                       use_buffers: bool = False) -> dict[str, Any]:
     asset_rel = group["asset_path"]
     asset_dir = depot_asset_dir(asset_rel)
     mesh_name = asset_rel.rsplit("/", 1)[-1]
-
-    fbx_path = _unique_fbx_path(bundle_root, asset_rel, used_fbx_stems)
 
     group_armature = _group_armature(group["objects"])
 
@@ -544,7 +647,16 @@ def _export_mesh_group(context, group, bundle_root: str, chain: ChainBuilder, wa
         else None
     )
 
-    if attach_to_bone:
+    buffer_rel = None
+    if use_buffers and not attach_to_bone:
+        gathered = _try_gather_group_buffer(context, group, main_armature, bundle_root, used_fbx_stems, warnings)
+        if gathered is not None:
+            buffer_rel, buffer_skinned = gathered
+
+    if buffer_rel is not None:
+        armature = None
+    elif attach_to_bone:
+        fbx_path = _unique_fbx_path(bundle_root, asset_rel, used_fbx_stems)
         armature = group_armature
         export_fbx(context, list(group["objects"]) + [armature], fbx_path)
         warnings.append(
@@ -552,6 +664,7 @@ def _export_mesh_group(context, group, bundle_root: str, chain: ChainBuilder, wa
             f"'{attach_to_bone}' in the blueprint"
         )
     else:
+        fbx_path = _unique_fbx_path(bundle_root, asset_rel, used_fbx_stems)
         slot_bone = (
             _hard_attachment_socket(group["objects"], main_armature)
             if group_armature is None
@@ -598,11 +711,14 @@ def _export_mesh_group(context, group, bundle_root: str, chain: ChainBuilder, wa
 
     entry = {
         "name": mesh_name,
-        "fbx": relpath_for_manifest(fbx_path, bundle_root),
         "asset_path": asset_rel,
-        "kind": "skeletal" if armature else "static",
+        "kind": "skeletal" if (buffer_skinned if buffer_rel is not None else armature) else "static",
         "slots": slots,
     }
+    if buffer_rel is not None:
+        entry["buffer"] = buffer_rel
+    else:
+        entry["fbx"] = relpath_for_manifest(fbx_path, bundle_root)
     if attach_to_bone:
         entry["own_skeleton"] = True
         entry["attach_to_bone"] = attach_to_bone
@@ -1078,7 +1194,33 @@ def _makedirs_safe(path: str) -> None:
         os.makedirs(path, exist_ok=True)
 
 
-def _guess_asset_name(selected_objects, mesh_objects, armatures) -> str:
+def _is_special_attachment_armature(obj) -> bool:
+    try:
+        return bool(obj.get("w2_special_attachment"))
+    except Exception:
+        return False
+
+
+def _armature_entity_depot(obj) -> str:
+    rig_settings = getattr(getattr(obj, "data", None), "witcherui_RigSettings", None)
+    return str(getattr(rig_settings, "repo_path", "") or "").strip()
+
+
+def _select_main_armature(armatures):
+    if not armatures:
+        return None
+    candidates = [a for a in armatures if not _is_special_attachment_armature(a)] or list(armatures)
+    for arm in candidates:
+        if _armature_entity_depot(arm).lower().endswith((".w2ent", ".w3ent")):
+            return arm
+    return candidates[0]
+
+
+def _guess_asset_name(main_armature, selected_objects, mesh_objects, armatures) -> str:
+    if main_armature is not None:
+        rig_settings = getattr(getattr(main_armature, "data", None), "witcherui_RigSettings", None)
+        entity_name = str(getattr(rig_settings, "entity_name", "") or "").strip()
+        return entity_name or main_armature.name
     for obj in selected_objects:
         if getattr(obj, "type", "") == "ARMATURE":
             return obj.name

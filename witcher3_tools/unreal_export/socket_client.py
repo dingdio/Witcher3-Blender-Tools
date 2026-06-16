@@ -32,6 +32,22 @@ def import_bundle_request(manifest_path: str) -> dict[str, Any]:
     }
 
 
+def probe_import_server(host: str, port: int, *, timeout: float = 1.0) -> str:
+    address = f"{host}:{int(port)}"
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return ""
+    except ConnectionRefusedError:
+        return (
+            f"No Unreal import server is listening at {address}. "
+            "Open the target Unreal project and make sure the Witcher Tools importer plugin is enabled."
+        )
+    except socket.timeout:
+        return f"Timed out connecting to the Unreal import server at {address}."
+    except OSError as exc:
+        return f"Could not connect to the Unreal import server at {address}: {exc}"
+
+
 def send_import_request(host: str, port: int, manifest_path: str, *, timeout: float = 600.0) -> dict[str, Any]:
     # Full character bundles (textures + masters + meshes) can take minutes in
     # the Unreal editor, so the response timeout is generous.

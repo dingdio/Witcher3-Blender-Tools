@@ -7,6 +7,7 @@ import time
 import json
 from pathlib import Path
 from collections import defaultdict
+from xml.etree import ElementTree
 from mathutils import Matrix
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,28 @@ COLLISION_SUFFIXES = ("_col", "_tri", "_box", "_sphere", "_capsule")
 DEFAULT_PHYSICAL_MATERIAL = "default"
 SKIN_WEIGHT_EPSILON = 1e-8
 MAX_W2MESH_CHUNK_VERTICES = 65535
+
+
+def _material_input_props_from_xml_text(xml_text):
+    text = str(xml_text or "").strip()
+    if not text:
+        return []
+    try:
+        root = ElementTree.fromstring(text)
+    except Exception:
+        return []
+    props = []
+    for param in root.iter("param"):
+        name = str(param.get("name") or "").strip()
+        value = str(param.get("value") or "").strip()
+        if not name or not value:
+            continue
+        props.append({
+            "name": name,
+            "type": str(param.get("type") or "Float").strip(),
+            "value": value,
+        })
+    return props
 
 
 def _get_collision_material_name(mesh_obj):
@@ -319,8 +342,11 @@ def get_mesh_material_info(mesh_bl, mesh_obj=None, material_slot_indices=None):
                         for p in bsdf_props
                     ]
                     log.info(f"Auto-converted Principled BSDF material '{mat.name}' → pbr_std with {[p['name'] for p in bsdf_props]}")
-        
-        
+            if not mat_dict['witcher_props']['input_props']:
+                mat_dict['witcher_props']['input_props'] = _material_input_props_from_xml_text(
+                    getattr(mat_props, "xml_text", "")
+                )
+
         material_props.append(mat_dict)
     return material_props
 

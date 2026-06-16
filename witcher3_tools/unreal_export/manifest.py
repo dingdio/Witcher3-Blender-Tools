@@ -65,11 +65,7 @@ def overwrite_preset(preset: str) -> dict[str, bool]:
 
 # Witcher texture params that should import as sRGB color data.
 _SRGB_PARAM_TOKENS = ("diffuse",)
-# Witcher texture params that should import with normal-map compression.
 _NORMAL_PARAM_TOKENS = ("normal", "bump")
-# Witcher texture params that should import as linear masks. "rough" is
-# included (and checked before the normal tokens) because the extracted
-# "<Name>Rough" alpha textures are masks even when <Name> is a normal map.
 _MASK_PARAM_TOKENS = ("rough", "mask", "pattern")
 
 
@@ -156,7 +152,7 @@ def texture_compression_for_param(param_name: str) -> str:
     if any(token in lowered for token in _MASK_PARAM_TOKENS):
         return "masks"
     if any(token in lowered for token in _NORMAL_PARAM_TOKENS):
-        return "normalmap"
+        return "normal_rgba"
     return "default"
 
 
@@ -203,9 +199,8 @@ def convert_witcher_param(
     """Convert one Witcher material parameter to manifest param entries.
 
     ``register_texture(raw_value, param_name)`` resolves/queues a texture for
-    export and returns ``{"depot": rel, "rough_depot": rel|None}`` or None.
-    Returns (param_entries, warnings); textures may add a follow-up
-    ``<name>Rough`` entry when a roughness sibling was extracted.
+    export and returns ``{"depot": rel}`` or None. Packed alpha channels are
+    handled by the generated Unreal master material, not sidecar textures.
     """
     name = str(param_name or "").strip()
     param_type = str(param_type or "").strip()
@@ -220,11 +215,7 @@ def convert_witcher_param(
         registered = register_texture(raw, name) if register_texture else None
         if not registered:
             return [], [f"{prefix}texture for '{name}' could not be resolved: '{raw}'"]
-        entries = [{"name": name, "kind": "texture", "depot": registered["depot"]}]
-        rough_depot = registered.get("rough_depot")
-        if rough_depot:
-            entries.append({"name": f"{name}Rough", "kind": "texture", "depot": rough_depot})
-        return entries, []
+        return [{"name": name, "kind": "texture", "depot": registered["depot"]}], []
 
     if param_type in _SCALAR_TYPES:
         return [{"name": name, "kind": "scalar", "value": _coerce_float(value)}], []

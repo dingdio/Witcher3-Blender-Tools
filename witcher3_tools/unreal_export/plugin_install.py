@@ -22,12 +22,12 @@ TRANSIENT_PATTERNS = (
 )
 
 
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def bundled_plugin_source() -> Path:
+    return Path(__file__).resolve().parent / PLUGIN_NAME
 
 
 def default_plugin_source() -> str:
-    return str(repo_root() / "Unreal" / PLUGIN_NAME)
+    return str(bundled_plugin_source())
 
 
 def plugin_target_dir(uproject_path: str | os.PathLike[str]) -> str:
@@ -40,7 +40,7 @@ def install_or_update_plugin(
     source_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     project_file = Path(uproject_path).expanduser()
-    source_path = Path(source_dir or default_plugin_source()).expanduser()
+    source_path = Path(source_dir).expanduser() if source_dir else bundled_plugin_source()
 
     if project_file.suffix.lower() != ".uproject":
         raise ValueError("Select the Unreal .uproject file.")

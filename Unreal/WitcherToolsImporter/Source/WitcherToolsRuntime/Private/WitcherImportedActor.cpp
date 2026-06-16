@@ -50,7 +50,7 @@ void AWitcherImportedActor::ConfigureFollowerComponent(
     // attach-parent bounds path, especially in the editor viewport.
     Component->bUseAttachParentBound = false;
     Component->bUseBoundsFromLeaderPoseComponent = false;
-    Component->bComponentUseFixedSkelBounds = true;
+    Component->bComponentUseFixedSkelBounds = false;
     Component->bSkipBoundsUpdateWhenInterpolating = false;
     Component->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
 #if WITH_EDITOR

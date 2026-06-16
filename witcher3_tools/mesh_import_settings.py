@@ -21,6 +21,7 @@ class MeshImportSettings:
     rotate_180: bool = False
     hide_zero_weight_faces: bool = True
     do_import_collision: bool = False
+    build_material_nodes: bool = True
 
     @classmethod
     def from_source(cls, source=None):
@@ -74,4 +75,5 @@ class MeshImportSettings:
             "rotate_180": self.rotate_180,
             "hide_zero_weight_faces": self.hide_zero_weight_faces,
             "do_import_collision": self.do_import_collision,
+            "build_material_nodes": self.build_material_nodes,
         }

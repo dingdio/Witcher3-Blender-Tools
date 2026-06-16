@@ -1,5 +1,11 @@
 #include "WitcherImportContext.h"
+#include "WitcherMeshBuffer.h"
 
+#include "Framework/Notifications/NotificationManager.h"
+#include "HAL/PlatformTime.h"
+#include "Misc/ScopeExit.h"
+#include "Misc/ScopedSlowTask.h"
+#include "Templates/Function.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/Skeleton.h"
 #include "AssetImportTask.h"
@@ -38,10 +44,13 @@
 #include "Materials/MaterialExpressionConstant2Vector.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialExpressionConstant4Vector.h"
+#include "Materials/MaterialExpressionDotProduct.h"
 #include "Materials/MaterialExpressionDivide.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionMax.h"
 #include "Materials/MaterialExpressionMultiply.h"
+#include "Materials/MaterialExpressionOneMinus.h"
+#include "Materials/MaterialExpressionPower.h"
 #include "Materials/MaterialExpressionSaturate.h"
 #include "Materials/MaterialExpressionSquareRoot.h"
 #include "Materials/MaterialExpressionSubtract.h"
@@ -186,6 +195,28 @@ FQuat JsonQuat(const TSharedPtr<FJsonObject>& Object, const FString& Field)
     return FQuat::Identity;
 }
 
+bool IsFiniteVector(const FVector& Value)
+{
+    return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) && FMath::IsFinite(Value.Z);
+}
+
+bool IsFiniteQuat(const FQuat& Value)
+{
+    return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) &&
+        FMath::IsFinite(Value.Z) && FMath::IsFinite(Value.W);
+}
+
+bool IsUsablePlacementTransform(const FVector& Location, const FQuat& Rotation, const FVector& ScaleVec)
+{
+    constexpr double MinScale = 1.0e-6;
+    return IsFiniteVector(Location) &&
+        IsFiniteQuat(Rotation) &&
+        IsFiniteVector(ScaleVec) &&
+        FMath::Abs(ScaleVec.X) > MinScale &&
+        FMath::Abs(ScaleVec.Y) > MinScale &&
+        FMath::Abs(ScaleVec.Z) > MinScale;
+}
+
 /** Minimal UMaterial: a texture or flat colour into BaseColor, with a fixed
  *  roughness; optionally translucent (for the world water plane). */
 UMaterialInterface* CreateSimpleMaterial(
@@ -274,6 +305,16 @@ bool IsVolumeMaterialRel(const FString& AssetRel)
     return Normalized == TEXT("engine/materials/defaults/volume");
 }
 
+bool IsEyeShadowMaterialRel(const FString& AssetRel)
+{
+    FString Normalized = AssetRel.Replace(TEXT("\\"), TEXT("/")).ToLower();
+    if (Normalized.EndsWith(TEXT(".w2mg")))
+    {
+        Normalized.LeftChopInline(5);
+    }
+    return Normalized == TEXT("engine/materials/graphs/eyeshadow/pbr_eye_shadow");
+}
+
 void ApplyInvisibleVolumeMaterial(UMaterial* Material)
 {
     if (!Material)
@@ -299,6 +340,112 @@ void ApplyInvisibleVolumeMaterial(UMaterial* Material)
     {
         Opacity->R = 0.0f;
         UMaterialEditingLibrary::ConnectMaterialProperty(Opacity, TEXT(""), MP_Opacity);
+    }
+
+    Material->PostEditChange();
+    Material->MarkPackageDirty();
+    UMaterialEditingLibrary::RecompileMaterial(Material);
+}
+
+void ApplyEyeShadowMaterial(UMaterial* Material)
+{
+    if (!Material)
+    {
+        return;
+    }
+
+    Material->PreEditChange(nullptr);
+    UMaterialEditingLibrary::DeleteAllMaterialExpressions(Material);
+    Material->BlendMode = BLEND_Translucent;
+
+    auto NewExpr = [&](UClass* Cls, int32 X, int32 Y) -> UMaterialExpression*
+    {
+        return UMaterialEditingLibrary::CreateMaterialExpression(Material, Cls, X, Y);
+    };
+
+    UMaterialExpressionVectorParameter* BaseColor = Cast<UMaterialExpressionVectorParameter>(
+        NewExpr(UMaterialExpressionVectorParameter::StaticClass(), -900, -220));
+    if (BaseColor)
+    {
+        BaseColor->ParameterName = FName(TEXT("Base Color"));
+        BaseColor->DefaultValue = FLinearColor(0.8f, 0.8f, 0.8f, 1.0f);
+        UMaterialEditingLibrary::ConnectMaterialProperty(BaseColor, TEXT(""), MP_BaseColor);
+    }
+
+    UMaterialExpressionVectorParameter* Color = Cast<UMaterialExpressionVectorParameter>(
+        NewExpr(UMaterialExpressionVectorParameter::StaticClass(), -900, 120));
+    UMaterialExpressionScalarParameter* Gamma = Cast<UMaterialExpressionScalarParameter>(
+        NewExpr(UMaterialExpressionScalarParameter::StaticClass(), -900, 340));
+    UMaterialExpressionConstant3Vector* Luminance = Cast<UMaterialExpressionConstant3Vector>(
+        NewExpr(UMaterialExpressionConstant3Vector::StaticClass(), -650, 500));
+    UMaterialExpressionPower* GammaCorrected = Cast<UMaterialExpressionPower>(
+        NewExpr(UMaterialExpressionPower::StaticClass(), -650, 120));
+    UMaterialExpressionOneMinus* Inverted = Cast<UMaterialExpressionOneMinus>(
+        NewExpr(UMaterialExpressionOneMinus::StaticClass(), -650, 310));
+    UMaterialExpressionSubtract* Difference = Cast<UMaterialExpressionSubtract>(
+        NewExpr(UMaterialExpressionSubtract::StaticClass(), -390, 180));
+    UMaterialExpressionDotProduct* AlphaValue = Cast<UMaterialExpressionDotProduct>(
+        NewExpr(UMaterialExpressionDotProduct::StaticClass(), -140, 180));
+    UMaterialExpressionDivide* AlphaScaled = Cast<UMaterialExpressionDivide>(
+        NewExpr(UMaterialExpressionDivide::StaticClass(), 100, 180));
+    UMaterialExpressionSaturate* AlphaClamped = Cast<UMaterialExpressionSaturate>(
+        NewExpr(UMaterialExpressionSaturate::StaticClass(), 330, 180));
+
+    if (Color)
+    {
+        Color->ParameterName = FName(TEXT("Color"));
+        Color->DefaultValue = FLinearColor::White;
+    }
+    if (Gamma)
+    {
+        Gamma->ParameterName = FName(TEXT("Gamma"));
+        Gamma->DefaultValue = 1.0f;
+    }
+    if (Luminance)
+    {
+        Luminance->Constant = FLinearColor(0.299f, 0.587f, 0.114f, 1.0f);
+    }
+    if (Color && Gamma && GammaCorrected)
+    {
+        GammaCorrected->Base.Connect(0, Color);
+        GammaCorrected->Exponent.Connect(0, Gamma);
+    }
+    if (Color && Inverted)
+    {
+        Inverted->Input.Connect(0, Color);
+    }
+    if (GammaCorrected && Inverted && Difference)
+    {
+        Difference->A.Connect(0, GammaCorrected);
+        Difference->B.Connect(0, Inverted);
+    }
+    if (Difference && Luminance && AlphaValue)
+    {
+        AlphaValue->A.Connect(0, Difference);
+        AlphaValue->B.Connect(0, Luminance);
+    }
+    if (AlphaValue && AlphaScaled)
+    {
+        AlphaScaled->A.Connect(0, AlphaValue);
+        AlphaScaled->ConstB = 11.0f;
+    }
+    if (AlphaScaled && AlphaClamped)
+    {
+        AlphaClamped->Input.Connect(0, AlphaScaled);
+        UMaterialEditingLibrary::ConnectMaterialProperty(AlphaClamped, TEXT(""), MP_Opacity);
+    }
+
+    if (UMaterialExpressionConstant* Metallic = Cast<UMaterialExpressionConstant>(
+            NewExpr(UMaterialExpressionConstant::StaticClass(), -150, -260)))
+    {
+        Metallic->R = 0.0f;
+        UMaterialEditingLibrary::ConnectMaterialProperty(Metallic, TEXT(""), MP_Metallic);
+    }
+    if (UMaterialExpressionConstant* Roughness = Cast<UMaterialExpressionConstant>(
+            NewExpr(UMaterialExpressionConstant::StaticClass(), -150, -80)))
+    {
+        Roughness->R = 1.0f;
+        UMaterialEditingLibrary::ConnectMaterialProperty(Roughness, TEXT(""), MP_Roughness);
     }
 
     Material->PostEditChange();
@@ -419,15 +566,13 @@ USCS_Node* CreateSkeletalMeshNode(USimpleConstructionScript* ConstructionScript,
 EMaterialSamplerType SamplerTypeForParamName(const FString& ParamName)
 {
     const FString Lowered = ParamName.ToLower();
-    // Rough/mask must outrank normal: extracted "<Name>Rough" textures come
-    // from a normal map's alpha channel but import as masks, not normal maps.
     if (Lowered.Contains(TEXT("rough")) || Lowered.Contains(TEXT("mask")) || Lowered.Contains(TEXT("pattern")))
     {
         return SAMPLERTYPE_Masks;
     }
     if (Lowered.Contains(TEXT("normal")) || Lowered.Contains(TEXT("bump")))
     {
-        return SAMPLERTYPE_Normal;
+        return SAMPLERTYPE_LinearColor;
     }
     if (Lowered.Contains(TEXT("diffuse")))
     {
@@ -450,6 +595,12 @@ void ApplyTextureImportSettings(UTexture* Texture, const TSharedPtr<FJsonObject>
         if (Compression == TEXT("normalmap"))
         {
             Texture2D->CompressionSettings = TC_Normalmap;
+        }
+        else if (Compression == TEXT("normal_rgba"))
+        {
+            Texture2D->CompressionSettings = TC_Default;
+            Texture2D->CompressionNoAlpha = false;
+            Texture2D->CompressionForceAlpha = true;
         }
         else if (Compression == TEXT("masks"))
         {
@@ -474,6 +625,46 @@ void ApplyTextureImportSettings(UTexture* Texture, const TSharedPtr<FJsonObject>
     }
     Texture->PostEditChange();
     Texture->MarkPackageDirty();
+}
+
+bool TextureMatchesImportSettings(UTexture* Texture, const TSharedPtr<FJsonObject>& TextureObject)
+{
+    if (!Texture)
+    {
+        return false;
+    }
+    if (Texture->SRGB != JsonBool(TextureObject, TEXT("srgb"), false))
+    {
+        return false;
+    }
+    const FString Compression = JsonString(TextureObject, TEXT("compression"));
+    if (UTexture2D* Texture2D = Cast<UTexture2D>(Texture))
+    {
+        if (Compression == TEXT("normalmap"))
+        {
+            return Texture2D->CompressionSettings == TC_Normalmap;
+        }
+        if (Compression == TEXT("normal_rgba"))
+        {
+            return Texture2D->CompressionSettings == TC_Default &&
+                !Texture2D->CompressionNoAlpha &&
+                Texture2D->CompressionForceAlpha;
+        }
+        if (Compression == TEXT("masks"))
+        {
+            return Texture2D->CompressionSettings == TC_Masks;
+        }
+        if (Compression == TEXT("indexmap"))
+        {
+            return Texture2D->CompressionSettings == TC_Grayscale;
+        }
+        if (Compression == TEXT("controlmap"))
+        {
+            return Texture2D->CompressionSettings == TC_VectorDisplacementmap;
+        }
+        return Texture2D->CompressionSettings == TC_Default;
+    }
+    return true;
 }
 
 template <typename T>
@@ -596,16 +787,37 @@ FString FWitcherImportContext::ImportBundle()
 
     FScopedLegacyFbxImport LegacyFbxScope;
 
-    ImportTextures();
-    ImportMasters();
-    ImportMaterials();
-    ImportRig();
-    ImportMeshes();
-    ImportAnimations();
-    ImportBlueprint();
-    ImportTerrain();
-    ImportPlacements();
-    SaveImportedPackages();
+    FSlateNotificationManager::Get().SetAllowNotifications(false);
+    ON_SCOPE_EXIT { FSlateNotificationManager::Get().SetAllowNotifications(true); };
+
+    FScopedSlowTask SlowTask(10.0f, FText::FromString(TEXT("Importing Witcher bundle")));
+    SlowTask.MakeDialog(false);
+
+    const double BundleStart = FPlatformTime::Seconds();
+    auto TimePhase = [&](const TCHAR* Name, float Weight, const TCHAR* Label, TFunctionRef<void()> Phase)
+    {
+        SlowTask.EnterProgressFrame(Weight, FText::FromString(Label));
+        const double PhaseStart = FPlatformTime::Seconds();
+        Phase();
+        const double Seconds = FPlatformTime::Seconds() - PhaseStart;
+        PhaseTimings.Emplace(FString(Name), Seconds);
+        UE_LOG(LogWitcherImportContext, Display, TEXT("Witcher import phase '%s': %.3fs"), Name, Seconds);
+    };
+
+    TimePhase(TEXT("textures"), 1.0f, TEXT("Importing textures"), [&] { ImportTextures(); });
+    TimePhase(TEXT("masters"), 1.0f, TEXT("Importing master materials"), [&] { ImportMasters(); });
+    TimePhase(TEXT("materials"), 1.0f, TEXT("Importing material instances"), [&] { ImportMaterials(); });
+    TimePhase(TEXT("rig"), 1.0f, TEXT("Importing rig"), [&] { ImportRig(); });
+    TimePhase(TEXT("meshes"), 2.0f, TEXT("Importing meshes"), [&] { ImportMeshes(); });
+    TimePhase(TEXT("animations"), 1.0f, TEXT("Importing animations"), [&] { ImportAnimations(); });
+    TimePhase(TEXT("blueprint"), 1.0f, TEXT("Building blueprint"), [&] { ImportBlueprint(); });
+    TimePhase(TEXT("terrain"), 0.5f, TEXT("Importing terrain"), [&] { ImportTerrain(); });
+    TimePhase(TEXT("placements"), 0.5f, TEXT("Placing layer actors"), [&] { ImportPlacements(); });
+    TimePhase(TEXT("save"), 1.0f, TEXT("Saving assets"), [&] { SaveImportedPackages(); });
+
+    TotalImportSeconds = FPlatformTime::Seconds() - BundleStart;
+    UE_LOG(LogWitcherImportContext, Display, TEXT("Witcher import total: %.3fs (%d assets)"),
+        TotalImportSeconds, ImportedAssets.Num());
 
     return BuildResponse(Errors.Num() == 0);
 }
@@ -645,7 +857,7 @@ UTexture* FWitcherImportContext::ImportTexture(const TSharedPtr<FJsonObject>& Te
     // overwrite policy says to re-import it (the import below replaces in place).
     if (UTexture* Existing = LoadExistingAsset<UTexture>(ObjectPathFor(AssetRel)))
     {
-        if (!ShouldOverwrite(TEXT("textures")))
+        if (!ShouldOverwrite(TEXT("textures")) && TextureMatchesImportSettings(Existing, TextureObject))
         {
             TexturesByDepot.Add(DepotRel, Existing);
             return Existing;
@@ -806,6 +1018,14 @@ UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr
         return Material;
     }
 
+    if (IsEyeShadowMaterialRel(AssetRel))
+    {
+        ApplyEyeShadowMaterial(Material);
+        ImportedAssets.AddUnique(Material->GetPathName());
+        MastersByRel.Add(AssetRel, Material);
+        return Material;
+    }
+
     Material->PreEditChange(nullptr);
     if (bRebuildExisting)
     {
@@ -817,6 +1037,8 @@ UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr
     UMaterialExpression* NormalSource = nullptr;
     UMaterialExpression* RoughTextureSource = nullptr;
     UMaterialExpression* RoughScalarSource = nullptr;
+    UMaterialExpressionTextureSampleParameter2D* BaseColorTextureSource = nullptr;
+    UMaterialExpressionTextureSampleParameter2D* NormalTextureSource = nullptr;
     bool BaseColorIsExact = false;
     bool NormalIsExact = false;
     bool RoughIsExact = false;
@@ -880,6 +1102,7 @@ UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr
                         if (bExactDiffuse || !BaseColorIsExact)
                         {
                             BaseColorSource = TextureExpression;
+                            BaseColorTextureSource = TextureExpression;
                             BaseColorIsExact = bExactDiffuse;
                         }
                     }
@@ -889,6 +1112,7 @@ UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr
                         if (bExactNormal || !NormalIsExact)
                         {
                             NormalSource = TextureExpression;
+                            NormalTextureSource = TextureExpression;
                             NormalIsExact = bExactNormal;
                         }
                     }
@@ -951,15 +1175,81 @@ UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr
         return TextureBase && TextureBase->Texture != nullptr;
     };
 
+    auto NewComponentMask = [&](UMaterialExpression* Source, int32 OutputIndex, bool bR, bool bG, bool bB, bool bA, int32 X, int32 Y)
+        -> UMaterialExpressionComponentMask*
+    {
+        if (!Source)
+        {
+            return nullptr;
+        }
+        UMaterialExpressionComponentMask* Mask = Cast<UMaterialExpressionComponentMask>(
+            UMaterialEditingLibrary::CreateMaterialExpression(
+                Material, UMaterialExpressionComponentMask::StaticClass(), X, Y));
+        if (!Mask)
+        {
+            return nullptr;
+        }
+        Mask->R = bR;
+        Mask->G = bG;
+        Mask->B = bB;
+        Mask->A = bA;
+        Mask->Input.Connect(OutputIndex, Source);
+        return Mask;
+    };
+
     if (BaseColorSource && NodeHasTexture(BaseColorSource))
     {
         UMaterialEditingLibrary::ConnectMaterialProperty(BaseColorSource, TEXT(""), MP_BaseColor);
     }
-    if (NormalSource && NodeHasTexture(NormalSource))
+
+    if (BaseColorTextureSource && NodeHasTexture(BaseColorTextureSource))
+    {
+        UMaterialExpressionComponentMask* AlphaMask = NewComponentMask(
+            BaseColorTextureSource, 5, false, false, false, true, -150, NodeY + 100);
+        if (AlphaMask)
+        {
+            Material->BlendMode = BLEND_Masked;
+            Material->OpacityMaskClipValue = 0.3333f;
+            UMaterialEditingLibrary::ConnectMaterialProperty(AlphaMask, TEXT(""), MP_OpacityMask);
+            UMaterialEditingLibrary::ConnectMaterialProperty(AlphaMask, TEXT(""), MP_Opacity);
+        }
+    }
+
+    UMaterialExpression* RoughFromNormalAlpha = nullptr;
+    if (NormalTextureSource && NodeHasTexture(NormalTextureSource))
+    {
+        UMaterialExpressionComponentMask* NormalRGB = NewComponentMask(
+            NormalTextureSource, 5, true, true, true, false, -150, NodeY + 350);
+        if (NormalRGB)
+        {
+            UMaterialExpressionMultiply* NormalScaled = Cast<UMaterialExpressionMultiply>(
+                UMaterialEditingLibrary::CreateMaterialExpression(
+                    Material, UMaterialExpressionMultiply::StaticClass(), 50, NodeY + 350));
+            UMaterialExpressionSubtract* NormalUnpacked = Cast<UMaterialExpressionSubtract>(
+                UMaterialEditingLibrary::CreateMaterialExpression(
+                    Material, UMaterialExpressionSubtract::StaticClass(), 250, NodeY + 350));
+            if (NormalScaled && NormalUnpacked)
+            {
+                NormalScaled->A.Connect(0, NormalRGB);
+                NormalScaled->ConstB = 2.0f;
+                NormalUnpacked->A.Connect(0, NormalScaled);
+                NormalUnpacked->ConstB = 1.0f;
+                UMaterialEditingLibrary::ConnectMaterialProperty(NormalUnpacked, TEXT(""), MP_Normal);
+            }
+        }
+        RoughFromNormalAlpha = NewComponentMask(
+            NormalTextureSource, 5, false, false, false, true, -150, NodeY + 650);
+    }
+    else if (NormalSource && NodeHasTexture(NormalSource))
     {
         UMaterialEditingLibrary::ConnectMaterialProperty(NormalSource, TEXT(""), MP_Normal);
     }
-    if (RoughTextureSource && NodeHasTexture(RoughTextureSource))
+
+    if (RoughFromNormalAlpha)
+    {
+        UMaterialEditingLibrary::ConnectMaterialProperty(RoughFromNormalAlpha, TEXT(""), MP_Roughness);
+    }
+    else if (RoughTextureSource && NodeHasTexture(RoughTextureSource))
     {
         UMaterialEditingLibrary::ConnectMaterialProperty(RoughTextureSource, TEXT(""), MP_Roughness);
     }
@@ -1236,8 +1526,9 @@ void FWitcherImportContext::ImportMeshes()
             }
         }
 
-        UObject* Imported = ImportFbxMesh(JsonString(MeshEntry, TEXT("fbx")), AssetRel, bSkeletal,
-            MeshSkeleton);
+        UObject* Imported = MeshEntry->HasField(TEXT("buffer"))
+            ? ImportBufferMesh(JsonString(MeshEntry, TEXT("buffer")), AssetRel, bSkeletal, MeshSkeleton)
+            : ImportFbxMesh(JsonString(MeshEntry, TEXT("fbx")), AssetRel, bSkeletal, MeshSkeleton);
         if (!Imported)
         {
             AddError(FString::Printf(TEXT("Failed to import mesh '%s'"), *AssetRel));
@@ -1332,6 +1623,53 @@ UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, 
             *AssetRel, *MainAsset->GetPathName()));
     }
     return MainAsset;
+}
+
+UObject* FWitcherImportContext::ImportBufferMesh(const FString& BundleRelativeBuffer, const FString& AssetRel,
+    bool bSkeletal, USkeleton* Skeleton)
+{
+    const FString BufPath = ResolveBundleFile(BundleRelativeBuffer);
+    FW3BufMesh Mesh;
+    FString Error;
+    if (!ReadW3Buf(BufPath, Mesh, Error))
+    {
+        AddWarning(FString::Printf(TEXT("Buffer mesh '%s' failed: %s"), *AssetRel, *Error));
+        return nullptr;
+    }
+
+    UPackage* Package = CreatePackage(*FString::Printf(TEXT("%s/%s"), *ContentRoot, *AssetRel));
+    const FName ObjectName(*AssetRelName(AssetRel));
+    if (UObject* Existing = LoadAnyAsset(AssetRel))
+    {
+        Existing->Rename(nullptr, GetTransientPackage(),
+            REN_DontCreateRedirectors | REN_ForceNoResetLoaders | REN_NonTransactional);
+        Existing->ClearFlags(RF_Public | RF_Standalone);
+        Existing->MarkAsGarbage();
+    }
+
+    UObject* Result = nullptr;
+    if (bSkeletal)
+    {
+        FString SkelError;
+        Result = BuildSkeletalMeshFromBuffer(Mesh, Package, ObjectName, Skeleton, SkelError);
+        if (!SkelError.IsEmpty())
+        {
+            AddWarning(FString::Printf(TEXT("%s: %s"), *AssetRel, *SkelError));
+        }
+    }
+    else
+    {
+        Result = BuildStaticMeshFromBuffer(Mesh, Package, ObjectName);
+    }
+
+    if (!Result)
+    {
+        return nullptr;
+    }
+    FAssetRegistryModule::AssetCreated(Result);
+    Result->MarkPackageDirty();
+    ImportedAssets.Add(ObjectPathFor(AssetRel));
+    return Result;
 }
 
 void FWitcherImportContext::ImportAnimations()
@@ -2589,12 +2927,21 @@ void FWitcherImportContext::ImportPlacements()
                     AddWarning(FString::Printf(TEXT("Placement mesh not found for '%s' (layer '%s')."), *AssetRel, *LayerId));
                     continue;
                 }
+                const FString ActorName = JsonString(ActorEntry, TEXT("name"), TEXT("Placement"));
                 const TSharedPtr<FJsonObject>* TransformPtr = nullptr;
                 ActorEntry->TryGetObjectField(TEXT("transform"), TransformPtr);
                 const TSharedPtr<FJsonObject> Transform = TransformPtr ? *TransformPtr : nullptr;
                 const FVector Location = JsonVector(Transform, TEXT("location"), FVector::ZeroVector);
                 const FQuat Rotation = JsonQuat(Transform, TEXT("rotation"));
                 const FVector ScaleVec = JsonVector(Transform, TEXT("scale"), FVector::OneVector);
+                if (!IsUsablePlacementTransform(Location, Rotation, ScaleVec))
+                {
+                    AddWarning(FString::Printf(
+                        TEXT("Placement actor '%s' has an invalid or zero-scale transform (layer '%s'); skipped."),
+                        *ActorName,
+                        *LayerId));
+                    continue;
+                }
 
                 AStaticMeshActor* MeshActor = World->SpawnActor<AStaticMeshActor>();
                 if (!MeshActor)
@@ -2608,7 +2955,6 @@ void FWitcherImportContext::ImportPlacements()
                     ConfigureVisualPlacement(Component);
                 }
                 MeshActor->SetActorTransform(FTransform(Rotation, Location, ScaleVec));
-                const FString ActorName = JsonString(ActorEntry, TEXT("name"), TEXT("Placement"));
                 PlaceActorCommon(MeshActor, ActorName);
                 ++ActorCount;
 
@@ -2668,6 +3014,7 @@ void FWitcherImportContext::ImportPlacements()
                 {
                     continue;
                 }
+                const FString InstancerName = JsonString(InstancerEntry, TEXT("name"), TEXT("Instancer"));
                 UStaticMesh* CollisionMesh = nullptr;
                 const FString CollisionAssetRel = JsonString(InstancerEntry, TEXT("collision_asset_path"));
                 if (!CollisionAssetRel.IsEmpty())
@@ -2735,6 +3082,14 @@ void FWitcherImportContext::ImportPlacements()
                     const FVector Location = JsonVector(Instance, TEXT("location"), FVector::ZeroVector);
                     const FQuat Rotation = JsonQuat(Instance, TEXT("rotation"));
                     const FVector ScaleVec = JsonVector(Instance, TEXT("scale"), FVector::OneVector);
+                    if (!IsUsablePlacementTransform(Location, Rotation, ScaleVec))
+                    {
+                        AddWarning(FString::Printf(
+                            TEXT("Placement instancer '%s' has an invalid or zero-scale instance transform (layer '%s'); instance skipped."),
+                            *InstancerName,
+                            *LayerId));
+                        continue;
+                    }
                     const FTransform InstanceTransform(Rotation, Location, ScaleVec);
                     Hism->AddInstance(InstanceTransform, /*bWorldSpace=*/true);
                     if (CollisionHism)
@@ -2743,7 +3098,6 @@ void FWitcherImportContext::ImportPlacements()
                     }
                     ++InstanceCount;
                 }
-                const FString InstancerName = JsonString(InstancerEntry, TEXT("name"), TEXT("Instancer"));
                 PlaceActorCommon(Container, InstancerName);
                 if (CollisionContainer)
                 {
@@ -2947,5 +3301,14 @@ FString FWitcherImportContext::BuildResponse(bool bSuccess) const
     SetStringArray(Response, TEXT("imported_assets"), ImportedAssets);
     SetStringArray(Response, TEXT("warnings"), Warnings);
     SetStringArray(Response, TEXT("errors"), Errors);
+
+    Response->SetNumberField(TEXT("imported_asset_count"), ImportedAssets.Num());
+    Response->SetNumberField(TEXT("total_seconds"), TotalImportSeconds);
+    TSharedPtr<FJsonObject> Timings = MakeShared<FJsonObject>();
+    for (const TPair<FString, double>& Phase : PhaseTimings)
+    {
+        Timings->SetNumberField(Phase.Key, Phase.Value);
+    }
+    Response->SetObjectField(TEXT("timings"), Timings);
     return SerializeJson(Response);
 }

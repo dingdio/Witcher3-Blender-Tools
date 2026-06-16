@@ -25,7 +25,9 @@ from witcher3_tools.unreal_export.manifest import (
 )
 from witcher3_tools.unreal_export.material_chain import ChainBuilder
 from witcher3_tools.unreal_export.plugin_install import (
+    PLUGIN_DESCRIPTOR,
     PLUGIN_NAME,
+    default_plugin_source,
     install_or_update_plugin,
     plugin_target_dir,
 )
@@ -36,7 +38,7 @@ for _name in [n for n in list(sys.modules) if n == "witcher3_tools" or n.startsw
 
 
 def _stub_register_texture(raw_value, param_name):
-    return {"depot": depot_asset_rel(raw_value), "rough_depot": None}
+    return {"depot": depot_asset_rel(raw_value)}
 
 
 class TestFbxExportOptions(unittest.TestCase):
@@ -443,6 +445,53 @@ class TestExportObjectCollection(unittest.TestCase):
         self.assertNotIn("h_wa__unloaded_body", names)
         self.assertNotIn("b_01_wa__shani_px:Collision Proxy", names)
 
+    def test_character_export_skips_px_proxy_meshes(self):
+        body = self.FakeObject(
+            "body_01_wa__ciri",
+            "MESH",
+            depot=r"characters\models\main_npc\ciri\model\body_01_wa__ciri.w2mesh",
+        )
+        redcloth_proxy = self.FakeObject("arm_01_wa__ciri_px:sphere_r_bicep_1", "MESH")
+        rig_settings = types.SimpleNamespace(
+            template_slots=[types.SimpleNamespace(is_loaded=True, template_guid="template-visible")],
+            equipment_slots=[],
+        )
+        armature = self.FakeObject("ciri_player_ARM", "ARMATURE")
+        armature.data = types.SimpleNamespace(witcherui_RigSettings=rig_settings)
+
+        fake_equipment = types.ModuleType("witcher3_tools.ui.ui_equipment")
+        fake_equipment.find_objects_by_guid = (
+            lambda guid, prop_name="witcher_equip_guid": [body, redcloth_proxy]
+        )
+
+        previous_modules = {
+            name: sys.modules.get(name)
+            for name in (
+                "witcher3_tools",
+                "witcher3_tools.ui",
+                "witcher3_tools.ui.ui_equipment",
+            )
+        }
+        fake_pkg = types.ModuleType("witcher3_tools")
+        fake_pkg.__path__ = [str(REPO_ROOT / "witcher3_tools")]
+        fake_ui = types.ModuleType("witcher3_tools.ui")
+        fake_ui.__path__ = []
+        sys.modules["witcher3_tools"] = fake_pkg
+        sys.modules["witcher3_tools.ui"] = fake_ui
+        sys.modules["witcher3_tools.ui.ui_equipment"] = fake_equipment
+        try:
+            objects = bundle.collect_export_objects([armature, redcloth_proxy])
+        finally:
+            for name, previous in previous_modules.items():
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
+
+        names = [obj.name for obj in objects]
+        self.assertIn("body_01_wa__ciri", names)
+        self.assertNotIn("arm_01_wa__ciri_px:sphere_r_bicep_1", names)
+
     def test_unreal_export_preloads_current_appearance_when_slots_are_empty(self):
         item = types.SimpleNamespace(name="shani")
         rig_settings = types.SimpleNamespace(
@@ -643,6 +692,36 @@ class TestBlueprintEntry(unittest.TestCase):
         )
         self.assertNotIn("animation_asset_path", entry)
 
+    def test_blueprint_keeps_ciri_body_as_visual_part(self):
+        rig_settings = types.SimpleNamespace(
+            repo_path=r"gameplay\templates\characters\player\ciri_player.w2ent",
+            entity_name="ciri_player",
+        )
+        armature = types.SimpleNamespace(
+            data=types.SimpleNamespace(witcherui_RigSettings=rig_settings)
+        )
+
+        entry = bundle._build_blueprint_entry(
+            armature,
+            "ciri_player",
+            [
+                {"kind": "skeletal", "asset_path": "characters/models/main_npc/ciri/model/item_07_wa__ciri"},
+                {"kind": "skeletal", "asset_path": "characters/models/common/woman_average/body/model/h_wa__neck_transition"},
+                {"kind": "skeletal", "asset_path": "characters/models/main_npc/ciri/model/body_01_wa__ciri"},
+            ],
+            {"asset_path": "characters/base_entities/woman_base/woman_base"},
+        )
+
+        self.assertEqual(entry["base_mesh_asset_path"], "characters/base_entities/woman_base/woman_base")
+        self.assertEqual(
+            entry["mesh_asset_paths"],
+            [
+                "characters/models/main_npc/ciri/model/item_07_wa__ciri",
+                "characters/models/common/woman_average/body/model/h_wa__neck_transition",
+                "characters/models/main_npc/ciri/model/body_01_wa__ciri",
+            ],
+        )
+
     def test_blueprint_carries_first_exported_animation(self):
         rig_settings = types.SimpleNamespace(
             repo_path=r"characters\npc_entities\monsters\nekker_lvl1.w2ent",
@@ -690,15 +769,12 @@ class TestDepotPaths(unittest.TestCase):
     def test_texture_color_space_heuristics(self):
         self.assertTrue(texture_srgb_for_param("Diffuse"))
         self.assertFalse(texture_srgb_for_param("Normal"))
-        self.assertEqual(texture_compression_for_param("Normal"), "normalmap")
-        self.assertEqual(texture_compression_for_param("DetailNormal"), "normalmap")
+        self.assertEqual(texture_compression_for_param("Normal"), "normal_rgba")
+        self.assertEqual(texture_compression_for_param("DetailNormal"), "normal_rgba")
         self.assertEqual(texture_compression_for_param("TintMask"), "masks")
         self.assertEqual(texture_compression_for_param("SpecularTexture"), "default")
 
-    def test_extracted_rough_params_are_masks_not_normalmaps(self):
-        # "<Name>Rough" textures come from a normal map's alpha; the rough/mask
-        # check must outrank the "normal" token or the master material gets a
-        # Normal sampler on a TC_Masks texture and fails to compile.
+    def test_explicit_rough_params_are_masks_not_normal_rgba(self):
         self.assertEqual(texture_compression_for_param("NormalRough"), "masks")
         self.assertEqual(texture_compression_for_param("DetailNormalRough"), "masks")
         self.assertEqual(texture_compression_for_param("RoughnessTexture"), "masks")
@@ -740,12 +816,9 @@ class TestParamConversion(unittest.TestCase):
         self.assertEqual(entries, [])
         self.assertTrue(any("deferred" in warning for warning in warnings))
 
-    def test_normal_with_rough_sibling_adds_roughness_param(self):
-        def register(raw_value, param_name):
-            return {"depot": depot_asset_rel(raw_value), "rough_depot": depot_asset_rel(raw_value) + "_rough"}
-
-        entries, _ = convert_witcher_param("Normal", "handle:ITexture", r"chars\n01.xbm", register)
-        self.assertEqual([e["name"] for e in entries], ["Normal", "NormalRough"])
+    def test_normal_param_does_not_create_roughness_sidecar(self):
+        entries, _ = convert_witcher_param("Normal", "handle:ITexture", r"chars\n01.xbm", _stub_register_texture)
+        self.assertEqual(entries, [{"name": "Normal", "kind": "texture", "depot": "chars/n01"}])
 
 
 class TestChainBuilder(unittest.TestCase):
@@ -900,11 +973,9 @@ class TestTextureRegistry(unittest.TestCase):
         self._original = (
             texture_export.resolve_texture_path,
             texture_export.convert_texture_for_unreal,
-            texture_export.extract_alpha_to_grayscale_png,
         )
         texture_export.resolve_texture_path = fake_resolve
         texture_export.convert_texture_for_unreal = fake_convert
-        texture_export.extract_alpha_to_grayscale_png = lambda src, dst: False
         return registry
 
     def tearDown(self):
@@ -912,7 +983,6 @@ class TestTextureRegistry(unittest.TestCase):
             (
                 texture_export.resolve_texture_path,
                 texture_export.convert_texture_for_unreal,
-                texture_export.extract_alpha_to_grayscale_png,
             ) = self._original
 
     def test_textures_export_once_with_flat_bundle_files(self):
@@ -944,6 +1014,46 @@ class TestTextureRegistry(unittest.TestCase):
             self.assertNotEqual(first["depot"], second["depot"])
             files = sorted(entry["file"] for entry in registry.manifest_entries())
             self.assertEqual(files, ["Textures/diffuse.png", "Textures/diffuse_2.png"])
+
+    def test_normal_textures_do_not_emit_roughness_sidecars(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = self._make_registry(temp_dir)
+            registry.parallel = True
+
+            registered = registry.register(r"items\wall\normal.xbm", "Normal")
+            entries = registry.manifest_entries()
+
+            self.assertEqual(registered["depot"], "items/wall/normal")
+            self.assertEqual(len(self._converted), 1)
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["compression"], "normal_rgba")
+            self.assertFalse(any(entry["depot_path"].endswith("_rough") for entry in entries))
+
+    def test_prefer_dds_ships_dds_without_transcode_or_rough(self):
+        original = (texture_export.resolve_texture_path, texture_export.stage_texture_as_dds)
+        staged = []
+
+        def fake_stage(source_path, textures_dir, base_name):
+            output = Path(textures_dir) / f"{base_name}.dds"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"dds")
+            staged.append(str(output))
+            return str(output)
+
+        texture_export.resolve_texture_path = lambda value: "C:\\fake\\" + Path(str(value)).name
+        texture_export.stage_texture_as_dds = fake_stage
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                registry = texture_export.TextureRegistry(temp_dir, prefer_dds=True)
+                registry.register(r"items\wall\diffuse.xbm", "Diffuse")
+                registry.register(r"items\wall\normal.xbm", "Normal")
+                entries = registry.manifest_entries()
+                files = sorted(entry["file"] for entry in entries)
+                self.assertEqual(files, ["Textures/diffuse.dds", "Textures/normal.dds"])
+                self.assertFalse(any(e["depot_path"].endswith("_rough") for e in entries))
+                self.assertEqual(len(staged), 2)
+        finally:
+            texture_export.resolve_texture_path, texture_export.stage_texture_as_dds = original
 
 
 class TestManifest(unittest.TestCase):
@@ -1030,6 +1140,13 @@ class TestSocketClient(unittest.TestCase):
 
 
 class TestPluginInstall(unittest.TestCase):
+    def test_default_plugin_source_is_bundled_inside_addon(self):
+        source = Path(default_plugin_source())
+        expected = REPO_ROOT / "witcher3_tools" / "unreal_export" / PLUGIN_NAME
+
+        self.assertEqual(source, expected)
+        self.assertTrue((source / PLUGIN_DESCRIPTOR).exists())
+
     def test_plugin_target_resolves_project_plugins_dir(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             project_file = Path(temp_dir) / "WitcherTest.uproject"

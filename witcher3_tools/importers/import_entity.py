@@ -211,6 +211,8 @@ def get_entity_mesh_import_settings(source=None) -> dict:
         "keep_empty_lods": False,
         "keep_proxy_meshes": False,
         "hide_zero_weight_faces": True,
+        "build_material_nodes": True,
+        "import_morphs": True,
     }
     if source is None:
         return settings
@@ -218,13 +220,24 @@ def get_entity_mesh_import_settings(source=None) -> dict:
     if isinstance(source, dict):
         getter = lambda name, default=None: source.get(name, default)
     else:
-        getter = lambda name, default=None: getattr(source, name, default)
+        def getter(name, default=None):
+            value = getattr(source, name, None)
+            if value is not None:
+                return value
+            if hasattr(source, "get"):
+                try:
+                    return source.get(name, default)
+                except Exception:
+                    return default
+            return default
 
     source_names = {
         "keep_lod_meshes": ("keep_lod_meshes", "do_import_lods"),
         "keep_empty_lods": ("keep_empty_lods",),
         "keep_proxy_meshes": ("keep_proxy_meshes",),
         "hide_zero_weight_faces": ("hide_zero_weight_faces",),
+        "build_material_nodes": ("build_material_nodes",),
+        "import_morphs": ("import_morphs", "load_morphs"),
     }
     for key, candidate_names in source_names.items():
         for candidate_name in candidate_names:
@@ -244,6 +257,17 @@ def apply_entity_mesh_import_settings(rig_settings, settings=None) -> dict:
     rig_settings.keep_empty_lods = normalized["keep_empty_lods"]
     rig_settings.keep_proxy_meshes = normalized["keep_proxy_meshes"]
     rig_settings.hide_zero_weight_faces = normalized["hide_zero_weight_faces"]
+    if hasattr(rig_settings, "build_material_nodes"):
+        rig_settings.build_material_nodes = normalized["build_material_nodes"]
+    else:
+        try:
+            rig_settings["build_material_nodes"] = normalized["build_material_nodes"]
+        except Exception:
+            pass
+    try:
+        rig_settings["import_morphs"] = normalized["import_morphs"]
+    except Exception:
+        pass
     return normalized
 
 
@@ -1305,7 +1329,8 @@ def _apply_chunk_transform_to_import_roots(chunk, *, armatures=None, meshes=None
 
 
 def import_direct_entity_file(filename, load_face_poses=False, import_apperance=0,
-                              parent_transform=None, selected_appearance_name=""):
+                              parent_transform=None, selected_appearance_name="",
+                              mesh_import_settings=None):
     _, ext = os.path.splitext(str(filename or ""))
     if ext.lower() == ".json":
         log.info("Importing entity via common importer (JSON): %s", filename)
@@ -1315,6 +1340,7 @@ def import_direct_entity_file(filename, load_face_poses=False, import_apperance=
             import_apperance,
             parent_transform,
             selected_appearance_name,
+            mesh_import_settings=mesh_import_settings,
         )
 
     before_objects = set(bpy.data.objects)
@@ -1326,6 +1352,7 @@ def import_direct_entity_file(filename, load_face_poses=False, import_apperance=
             import_apperance,
             parent_transform,
             selected_appearance_name,
+            mesh_import_settings=mesh_import_settings,
         )
     except Exception:
         if set(bpy.data.objects) != before_objects:
@@ -4956,6 +4983,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     keep_empty_lods=mesh_import_settings["keep_empty_lods"],
                     keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
                     hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
+                    build_material_nodes=mesh_import_settings["build_material_nodes"],
                     embedded_cmesh_chunk_index=selected_cmesh_chunk_index,
                 )
             except Exception:
@@ -5165,6 +5193,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                         keep_empty_lods=mesh_import_settings["keep_empty_lods"],
                         keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
                         hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
+                        build_material_nodes=mesh_import_settings["build_material_nodes"],
                         embedded_cmesh_chunk_index=selected_cmesh_chunk_index,
                     )
                 except Exception as mesh_err:
@@ -5289,7 +5318,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     _apply_coloring_lookup_to_objects(cloth_meshes, coloring_entry_lookup)
 
         # Handle morphs
-        if "morphComponentId" in chunk:
+        if mesh_import_settings.get("import_morphs", True) and "morphComponentId" in chunk:
             morph_source_path = repo_file(chunk['morphSource'], resource_version)
             morph_target_path = repo_file(chunk['morphTarget'], resource_version)
             if (
@@ -5316,6 +5345,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     keep_empty_lods=mesh_import_settings["keep_empty_lods"],
                     keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
                     hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
+                    build_material_nodes=mesh_import_settings["build_material_nodes"],
                 )
                 morph_target_meshes, morph_target_arms = fbx_util.import_model(
                     morph_target_path,
@@ -5325,6 +5355,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     keep_empty_lods=mesh_import_settings["keep_empty_lods"],
                     keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
                     hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
+                    build_material_nodes=mesh_import_settings["build_material_nodes"],
                 )
             except Exception as morph_err:
                 log.warning(

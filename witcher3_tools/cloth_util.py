@@ -159,9 +159,10 @@ def setup_w3_material_CR2W(
         ,force_update = False	# Set to True when re-importing stuff to test changes with the latest material set-up code.
         ,mat_filename = str
         ,is_instance_file = False
+        ,build_nodes = True
         ):
         new_xml = xml_data_from_CR2W(mat_bin, bl_material.name)
-        bl_material.use_nodes = True
+        bl_material.use_nodes = bool(build_nodes)
                     
         ##return base mat path and if it is local chunk handle
         bl_material.witcher_props.name = bl_material.name
@@ -182,6 +183,8 @@ def setup_w3_material_CR2W(
         enableMask = mat_bin.GetVariableByName('enableMask')
         if enableMask and enableMask.Value == 1:
             bl_material.witcher_props.enableMask = True
+        if not build_nodes:
+            return bl_material
         from .w3_material_nodes import (
             auto_load_base_material_snapshot,
             refresh_witcher_include_state,

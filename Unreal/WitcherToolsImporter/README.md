@@ -5,7 +5,7 @@ UE 5.4+ editor plugin for importing bundles produced by Witcher 3 Blender Tools.
 Install from Blender through **Unreal Export > Project Plugin**:
 
 - Project: select the target `.uproject`
-- Plugin Source: leave blank to use this repository's `Unreal/WitcherToolsImporter`
+- Plugin Source: leave blank to use the importer plugin bundled with the add-on
 - Install/Update: copies the plugin to `<Project>/Plugins/WitcherToolsImporter`
 
 If Unreal reports that modules are missing or cannot be built, regenerate project

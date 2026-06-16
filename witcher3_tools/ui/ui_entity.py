@@ -936,15 +936,23 @@ class WITCH_OT_w2ent(bpy.types.Operator, ImportHelper):
                         parent_transform=None,
                         selected_appearance_name=default_appearance_name,
                     )
-                elif not import_entity.try_apply_inventory_file_to_selected_character(context, fdir):
+                elif w2ent_mode == "inventory":
+                    if not import_entity.try_apply_inventory_file_to_selected_character(context, fdir):
+                        arm_obj = import_entity.import_direct_entity_file(
+                            fdir,
+                            load_face_poses=False,
+                            import_apperance=0,
+                            parent_transform=None,
+                        )
+                    else:
+                        arm_obj = None
+                else:
                     arm_obj = import_entity.import_direct_entity_file(
                         fdir,
                         load_face_poses=False,
                         import_apperance=0,
                         parent_transform=None,
                     )
-                else:
-                    arm_obj = None
                 if arm_obj and get_all_addon_prefs(context).import_idle_animation:
                     import_anims.load_idle_animation_for_armature(context, arm_obj)
             else:

@@ -146,6 +146,17 @@ def w3_matrix_to_unreal(world_matrix) -> dict:
     return {"location": location, "rotation": rotation, "scale": scale}
 
 
+def world_matrix_has_valid_basis(world_matrix, min_axis_scale: float = 1e-8) -> bool:
+    try:
+        w = np.asarray(world_matrix, dtype=float).reshape(4, 4)
+    except Exception:
+        return False
+    if not np.isfinite(w).all():
+        return False
+    linear = w[:3, :3]
+    return all(float(np.linalg.norm(linear[:, i])) > min_axis_scale for i in range(3))
+
+
 # --- landscape resolution / component layout ---------------------------------
 
 @dataclass(frozen=True)
