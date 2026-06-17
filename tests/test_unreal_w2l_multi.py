@@ -72,10 +72,26 @@ class _Rot:
         (self.ax, self.ay, self.az), (self.bx, self.by, self.bz), (self.cx, self.cy, self.cz) = rows
 
 
+class _Color:
+    def __init__(self, red=255, green=255, blue=255):
+        self.Red = red
+        self.Green = green
+        self.Blue = blue
+
+
+class _LightData:
+    def __init__(self, brightness=1.0, radius=255.0, color=None, inner=0.0, outer=1.0):
+        self.brightness = brightness
+        self.radius = radius
+        self.color = color or _Color()
+        self.innerAngle = inner
+        self.outerAngle = outer
+
+
 class _Block:
-    def __init__(self, block_type, mesh_index=0, pos=(0.0, 0.0, 0.0), rows=None):
+    def __init__(self, block_type, mesh_index=0, pos=(0.0, 0.0, 0.0), rows=None, packed_object=None):
         self.packedObjectType = block_type
-        self.packedObject = types.SimpleNamespace(meshIndex=mesh_index)
+        self.packedObject = packed_object or types.SimpleNamespace(meshIndex=mesh_index)
         self.position = _Vec(*pos)
         self.rotationMatrix = _Rot(rows or _IDENT_ROWS)
 
@@ -169,6 +185,7 @@ def _make_settings(export_folder):
         content_root="/Game/Witcher3",
         export_folder=export_folder,
         placement_skip_materials=False,
+        placement_export_collision=False,
     )
 
 
@@ -177,6 +194,8 @@ class TestMultiLayerBundle(unittest.TestCase):
         _install_pkg_stubs()
         self.tmp = tempfile.mkdtemp()
         self.gather_calls = []
+        self.collision_exports = []
+        self._orig_collision_exporter = w2l_placements._export_collision_mesh_for_asset
         self.depot_sources = {}
 
         # Map .w2l basenames -> parsed level. Two layers share "a\\wall.w2mesh".
@@ -198,6 +217,40 @@ class TestMultiLayerBundle(unittest.TestCase):
             self.w2l_paths.append(p)
 
         self._install_dep_stubs()
+
+    def tearDown(self):
+        w2l_placements._export_collision_mesh_for_asset = self._orig_collision_exporter
+
+    def _install_fake_collision_exporter(self):
+        test = self
+
+        def _fake_collision_exporter(
+            context,
+            asset_rel,
+            depot_path,
+            bundle_root,
+            warnings,
+            used_fbx_stems,
+            *,
+            reuse_existing_fbx=True,
+        ):
+            test.collision_exports.append((asset_rel, depot_path))
+            collision_rel = f"{asset_rel}_collision"
+            out_dir = os.path.join(bundle_root, "Collision")
+            os.makedirs(out_dir, exist_ok=True)
+            fbx_path = os.path.join(out_dir, collision_rel.rsplit("/", 1)[-1] + ".fbx")
+            with open(fbx_path, "wb") as fh:
+                fh.write(b"FBX")
+            return {
+                "name": collision_rel.rsplit("/", 1)[-1],
+                "fbx": w2l_placements.relpath_for_manifest(fbx_path, bundle_root),
+                "asset_path": collision_rel,
+                "kind": "static",
+                "collision": True,
+                "slots": [],
+            }
+
+        w2l_placements._export_collision_mesh_for_asset = _fake_collision_exporter
 
     def _install_dep_stubs(self):
         test = self
@@ -292,6 +345,72 @@ class TestMultiLayerBundle(unittest.TestCase):
             self.assertIn("buffer", mesh)
             self.assertEqual(mesh["kind"], "static")
         self.assertEqual(sorted(result["layer_ids"]), ["layer1.w2l", "layer2.w2l"])
+
+    def test_collision_blocks_export_as_hidden_collision_placements(self):
+        self._install_fake_collision_exporter()
+        collision_path = os.path.join(self.tmp, "collision.w2l")
+        with open(collision_path, "wb") as fh:
+            fh.write(b"w2l")
+        self.levels["collision.w2l"] = _Level(_Sector(
+            [_Block(_BlockDataObjectType.Collision, 0)],
+            ["a\\wall.w2mesh"],
+        ))
+
+        result = w2l_placements.build_unreal_w2l_bundle(
+            None,
+            _make_settings(self.tmp),
+            collision_path,
+            include_collision_blocks=True,
+        )
+
+        manifest = result["manifest"]
+        self.assertEqual(manifest["meshes"][0]["asset_path"], "a/wall_collision")
+        self.assertTrue(manifest["meshes"][0]["collision"])
+        actor = manifest["placements"]["layers"][0]["actors"][0]
+        self.assertEqual(actor["asset_path"], "a/wall_collision")
+        self.assertTrue(actor["collision_only"])
+        self.assertEqual(self.collision_exports, [("a/wall", "a\\wall.w2mesh")])
+
+    def test_visual_collision_option_adds_collision_companion_paths(self):
+        self._install_fake_collision_exporter()
+        settings = _make_settings(self.tmp)
+        settings.placement_export_collision = True
+
+        result = w2l_placements.build_unreal_w2l_bundle_multi(None, settings, self.w2l_paths)
+
+        manifest = result["manifest"]
+        self.assertEqual(len(manifest["meshes"]), 6)
+        collision_meshes = [m for m in manifest["meshes"] if m.get("collision")]
+        self.assertEqual(len(collision_meshes), 3)
+        for layer in manifest["placements"]["layers"]:
+            for actor in layer["actors"]:
+                self.assertIn("collision_asset_path", actor)
+                self.assertTrue(actor["collision_asset_path"].endswith("_collision"))
+
+    def test_light_only_layer_builds_placement_manifest(self):
+        light_path = os.path.join(self.tmp, "lights.w2l")
+        with open(light_path, "wb") as fh:
+            fh.write(b"w2l")
+        self.levels["lights.w2l"] = _Level(_Sector(
+            [_Block(
+                _BlockDataObjectType.PointLight,
+                pos=(1.0, 2.0, 3.0),
+                packed_object=_LightData(brightness=1.5, radius=255.0, color=_Color(255, 128, 0)),
+            )],
+            [],
+        ))
+
+        result = w2l_placements.build_unreal_w2l_bundle(None, _make_settings(self.tmp), light_path)
+
+        self.assertEqual(result["counts"]["unique_meshes"], 0)
+        self.assertEqual(result["counts"]["lights"], 1)
+        layer = result["manifest"]["placements"]["layers"][0]
+        self.assertEqual(layer["actors"], [])
+        self.assertEqual(layer["instancers"], [])
+        light = layer["lights"][0]
+        self.assertEqual(light["type"], "point")
+        self.assertEqual([round(v, 6) for v in light["transform"]["location"]], [100.0, -200.0, 300.0])
+        self.assertAlmostEqual(light["intensity"], 1500.0)
 
     def test_single_builder_preserves_layer_id(self):
         result = w2l_placements.build_unreal_w2l_bundle(None, _make_settings(self.tmp), self.w2l_paths[0])

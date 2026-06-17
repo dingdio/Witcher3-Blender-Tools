@@ -77,13 +77,29 @@ class _Rot:
         (self.ax, self.ay, self.az), (self.bx, self.by, self.bz), (self.cx, self.cy, self.cz) = rows
 
 
+class _Color:
+    def __init__(self, red=255, green=255, blue=255):
+        self.Red = red
+        self.Green = green
+        self.Blue = blue
+
+
+class _LightData:
+    def __init__(self, brightness=2.0, radius=255.0, color=None, inner=0.0, outer=1.0):
+        self.brightness = brightness
+        self.radius = radius
+        self.color = color or _Color()
+        self.innerAngle = inner
+        self.outerAngle = outer
+
+
 _IDENT_ROWS = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 
 
 class _Block:
-    def __init__(self, block_type, mesh_index=0, pos=(0.0, 0.0, 0.0), rows=None):
+    def __init__(self, block_type, mesh_index=0, pos=(0.0, 0.0, 0.0), rows=None, packed_object=None):
         self.packedObjectType = block_type
-        self.packedObject = types.SimpleNamespace(meshIndex=mesh_index)
+        self.packedObject = packed_object or types.SimpleNamespace(meshIndex=mesh_index)
         self.position = _Vec(*pos)
         self.rotationMatrix = _Rot(rows or _IDENT_ROWS)
 
@@ -226,8 +242,64 @@ class TestCollect(unittest.TestCase):
         )
         out = w2l_placements.collect_w2l_placements(level, [])
         self.assertEqual(len(out["actors"]), 2)
-        self.assertEqual(out["skipped"].get("point_light"), 1)
+        self.assertEqual(len(out["lights"]), 1)
+        self.assertIsNone(out["skipped"].get("point_light"))
         self.assertEqual(out["skipped"].get("collision"), 1)
+
+    def test_sector_point_light_exports_manifest_light_data(self):
+        level = self._level(
+            [_Block(
+                _BlockDataObjectType.PointLight,
+                pos=(1.0, 2.0, 3.0),
+                packed_object=_LightData(brightness=2.5, radius=510.0, color=_Color(128, 64, 255)),
+            )],
+            [],
+        )
+
+        out = w2l_placements.collect_w2l_placements(level, [])
+
+        self.assertEqual(out["assets"], {})
+        light = out["lights"][0]
+        self.assertEqual(light["type"], "point")
+        self.assertEqual(light["color"], [128 / 255, 64 / 255, 1.0])
+        self.assertAlmostEqual(light["intensity"], 2500.0)
+        self.assertAlmostEqual(light["attenuation_radius"], 200.0)
+        self.assertEqual(list(light["matrix"][:3, 3]), [1.0, 2.0, 3.0])
+
+    def test_sector_spot_light_exports_direction_and_cones(self):
+        level = self._level(
+            [_Block(
+                _BlockDataObjectType.SpotLight,
+                rows=_rot_z_rows(90.0),
+                packed_object=_LightData(brightness=2.0, radius=255.0, inner=0.25, outer=0.5),
+            )],
+            [],
+        )
+
+        out = w2l_placements.collect_w2l_placements(level, [])
+
+        light = out["lights"][0]
+        self.assertEqual(light["type"], "spot")
+        self.assertAlmostEqual(light["intensity"], 600.0)
+        self.assertAlmostEqual(light["inner_cone_angle"], 0.25 * 57.29577951308232)
+        self.assertAlmostEqual(light["outer_cone_angle"], 0.5 * 57.29577951308232)
+        self.assertEqual([round(v, 6) for v in light["direction"]], [0.0, -0.0, -1.0])
+
+    def test_collision_blocks_can_be_included_as_collision_only_placements(self):
+        level = self._level(
+            [_Block(_BlockDataObjectType.Collision, 0)],
+            ["a\\wall.w2mesh"],
+        )
+        out = w2l_placements.collect_w2l_placements(
+            level,
+            [],
+            include_collision_blocks=True,
+        )
+        self.assertEqual(list(out["assets"]), ["a/wall_collision"])
+        self.assertEqual(out["assets"]["a/wall_collision"]["kind"], "collision")
+        self.assertEqual(len(out["actors"]), 1)
+        self.assertTrue(out["actors"][0]["collision_only"])
+        self.assertIsNone(out["skipped"].get("collision"))
 
     def test_degenerate_transform_skipped(self):
         level = self._level(

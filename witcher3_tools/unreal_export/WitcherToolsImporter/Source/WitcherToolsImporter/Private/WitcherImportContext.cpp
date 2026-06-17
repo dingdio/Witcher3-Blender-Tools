@@ -37,7 +37,9 @@
 #include "LandscapeInfo.h"
 #include "LandscapeProxy.h"
 #include "LandscapeImportHelper.h"
+#include "LandscapeLayerInfoObject.h"
 #include "Materials/MaterialExpressionAppendVector.h"
+#include "Materials/MaterialExpressionLandscapeVisibilityMask.h"
 #include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionConstant.h"
@@ -293,6 +295,29 @@ UMaterialInterface* CreateSimpleMaterial(
     Material->MarkPackageDirty();
     UMaterialEditingLibrary::RecompileMaterial(Material);
     return Material;
+}
+
+/** Ensure imported visibility weights affect landscape rendering. */
+void EnsureLandscapeVisibilityMask(UMaterialInterface* MaterialInterface)
+{
+    UMaterial* Material = Cast<UMaterial>(MaterialInterface);
+    if (!Material)
+    {
+        return;
+    }
+    if (UMaterialExpressionLandscapeVisibilityMask* Mask =
+            Cast<UMaterialExpressionLandscapeVisibilityMask>(
+                UMaterialEditingLibrary::CreateMaterialExpression(
+                    Material, UMaterialExpressionLandscapeVisibilityMask::StaticClass(), -400, 550)))
+    {
+        Material->PreEditChange(nullptr);
+        Material->BlendMode = BLEND_Masked;
+        Material->OpacityMaskClipValue = 0.3333f;
+        UMaterialEditingLibrary::ConnectMaterialProperty(Mask, TEXT(""), MP_OpacityMask);
+        Material->PostEditChange();
+        Material->MarkPackageDirty();
+        UMaterialEditingLibrary::RecompileMaterial(Material);
+    }
 }
 
 bool IsVolumeMaterialRel(const FString& AssetRel)
@@ -2672,7 +2697,45 @@ void FWitcherImportContext::ImportTerrain()
     TMap<FGuid, TArray<uint16>> HeightDataPerLayer;
     HeightDataPerLayer.Add(FGuid(), MoveTemp(Heights));
     TMap<FGuid, TArray<FLandscapeImportLayerInfo>> MaterialLayerDataPerLayer;
-    MaterialLayerDataPerLayer.Add(FGuid(), TArray<FLandscapeImportLayerInfo>());
+    TArray<FLandscapeImportLayerInfo>& ImportLayers =
+        MaterialLayerDataPerLayer.Add(FGuid(), TArray<FLandscapeImportLayerInfo>());
+
+    bool bHasHoles = false;
+    const TSharedPtr<FJsonObject>* VisibilityPtr = nullptr;
+    if (Terrain->TryGetObjectField(TEXT("visibility"), VisibilityPtr) && VisibilityPtr)
+    {
+        const TSharedPtr<FJsonObject> Visibility = *VisibilityPtr;
+        const FString VisPath = ResolveBundleFile(JsonString(Visibility, TEXT("file")));
+        TArray<uint8> VisBytes;
+        if (FFileHelper::LoadFileToArray(VisBytes, *VisPath) && VisBytes.Num() == ExpectedSamples)
+        {
+            ULandscapeLayerInfoObject* VisLayerInfo = ALandscapeProxy::VisibilityLayer;
+            if (VisLayerInfo)
+            {
+                FLandscapeImportLayerInfo VisImport;
+                VisImport.LayerName = VisLayerInfo->LayerName;
+                VisImport.LayerInfo = VisLayerInfo;
+                VisImport.LayerData = MoveTemp(VisBytes);
+                ImportLayers.Add(MoveTemp(VisImport));
+                bHasHoles = true;
+            }
+            else
+            {
+                AddError(TEXT("Terrain holes: ALandscapeProxy::VisibilityLayer is unavailable; landscape will be solid."));
+            }
+        }
+        else
+        {
+            AddError(FString::Printf(
+                TEXT("Terrain holes: visibility map missing or wrong size (%s); landscape will be solid."),
+                *VisPath));
+        }
+    }
+
+    if (bHasHoles && TerrainMaterial)
+    {
+        EnsureLandscapeVisibilityMask(TerrainMaterial);
+    }
 
     Landscape->Import(
         FGuid::NewGuid(), MinX, MinY, MaxX, MaxY,
@@ -2921,6 +2984,7 @@ void FWitcherImportContext::ImportPlacements()
                     continue;
                 }
                 const FString AssetRel = JsonString(ActorEntry, TEXT("asset_path"));
+                const bool bCollisionOnly = JsonBool(ActorEntry, TEXT("collision_only"), false);
                 UStaticMesh* Mesh = FindPlacementMesh(AssetRel);
                 if (!Mesh)
                 {
@@ -2952,10 +3016,23 @@ void FWitcherImportContext::ImportPlacements()
                 {
                     Component->SetMobility(EComponentMobility::Movable);
                     Component->SetStaticMesh(Mesh);
-                    ConfigureVisualPlacement(Component);
+                    if (bCollisionOnly)
+                    {
+                        ConfigureHiddenCollision(Component);
+                    }
+                    else
+                    {
+                        ConfigureVisualPlacement(Component);
+                    }
                 }
                 MeshActor->SetActorTransform(FTransform(Rotation, Location, ScaleVec));
                 PlaceActorCommon(MeshActor, ActorName);
+                if (bCollisionOnly)
+                {
+                    MeshActor->SetActorHiddenInGame(true);
+                    ++CollisionActorCount;
+                    continue;
+                }
                 ++ActorCount;
 
                 const FString CollisionAssetRel = JsonString(ActorEntry, TEXT("collision_asset_path"));
@@ -3003,6 +3080,7 @@ void FWitcherImportContext::ImportPlacements()
                     continue;
                 }
                 const FString AssetRel = JsonString(InstancerEntry, TEXT("asset_path"));
+                const bool bCollisionOnly = JsonBool(InstancerEntry, TEXT("collision_only"), false);
                 UStaticMesh* Mesh = FindPlacementMesh(AssetRel);
                 if (!Mesh)
                 {
@@ -3016,7 +3094,9 @@ void FWitcherImportContext::ImportPlacements()
                 }
                 const FString InstancerName = JsonString(InstancerEntry, TEXT("name"), TEXT("Instancer"));
                 UStaticMesh* CollisionMesh = nullptr;
-                const FString CollisionAssetRel = JsonString(InstancerEntry, TEXT("collision_asset_path"));
+                const FString CollisionAssetRel = bCollisionOnly
+                    ? FString()
+                    : JsonString(InstancerEntry, TEXT("collision_asset_path"));
                 if (!CollisionAssetRel.IsEmpty())
                 {
                     CollisionMesh = FindPlacementMesh(CollisionAssetRel);
@@ -3044,7 +3124,14 @@ void FWitcherImportContext::ImportPlacements()
                 Hism->SetupAttachment(Root);
                 Hism->SetMobility(EComponentMobility::Movable);
                 Hism->SetStaticMesh(Mesh);
-                ConfigureVisualPlacement(Hism);
+                if (bCollisionOnly)
+                {
+                    ConfigureHiddenCollision(Hism);
+                }
+                else
+                {
+                    ConfigureVisualPlacement(Hism);
+                }
                 Container->AddInstanceComponent(Hism);
                 Hism->RegisterComponent();
 
@@ -3099,7 +3186,12 @@ void FWitcherImportContext::ImportPlacements()
                     ++InstanceCount;
                 }
                 PlaceActorCommon(Container, InstancerName);
-                if (CollisionContainer)
+                if (bCollisionOnly)
+                {
+                    Container->SetActorHiddenInGame(true);
+                    ++CollisionActorCount;
+                }
+                else if (CollisionContainer)
                 {
                     PlaceActorCommon(CollisionContainer, InstancerName + TEXT("_Collision"));
                     ++CollisionActorCount;

@@ -167,6 +167,54 @@ def _export_terrain_blend_layers(world, hub: str, heightmap_dir: str, height_res
     return layers_manifest, control_depot, texture_entries
 
 
+def _export_terrain_holes(heightmap_dir: str, hub: str, source_res: int,
+                          target_res: int, bundle_root: str,
+                          warnings: list[str]) -> Optional[dict[str, Any]]:
+    """Extract W3 terrain holes and emit an Unreal landscape visibility map.
+
+    W3 treats a terrain texel as a hole when all combined control channels are 0.
+    """
+    import numpy as np
+
+    overlay_src = os.path.join(heightmap_dir, f"combined.{hub}.overlay.data")
+    bkgrnd_src = os.path.join(heightmap_dir, f"combined.{hub}.bkgrnd.data")
+    blend_src = os.path.join(heightmap_dir, f"combined.{hub}.blendcontrol.data")
+    if not (os.path.isfile(overlay_src) and os.path.isfile(bkgrnd_src)
+            and os.path.isfile(blend_src)):
+        return None
+
+    overlay = np.fromfile(overlay_src, dtype=np.uint8)
+    bkgrnd = np.fromfile(bkgrnd_src, dtype=np.uint8)
+    blend = np.fromfile(blend_src, dtype=np.uint8)
+    n = source_res * source_res
+    if overlay.size != n or bkgrnd.size != n or blend.size != n:
+        warnings.append(
+            "Terrain hole export skipped: control map size does not match the "
+            "heightmap (non-square terrain not supported)."
+        )
+        return None
+
+    hole = (overlay == 0) & (bkgrnd == 0) & (blend == 0)
+    hole_count = int(hole.sum())
+    if hole_count == 0:
+        return None
+
+    hole = hole.reshape((source_res, source_res))
+    hole = terrain_unreal.resample_mask_nearest(hole, target_res)
+
+    os.makedirs(os.path.join(bundle_root, "Terrain"), exist_ok=True)
+    r8_path = os.path.join(bundle_root, "Terrain", f"{hub}.visibility.r8")
+    terrain_unreal.write_visibility_r8(r8_path, hole)
+
+    return {
+        "file": relpath_for_manifest(r8_path, bundle_root),
+        "resolution": int(target_res),
+        "layer_name": terrain_unreal.LANDSCAPE_VISIBILITY_LAYER,
+        "hole_value": terrain_unreal.LANDSCAPE_HOLE_VALUE,
+        "hole_count": hole_count,
+    }
+
+
 def build_unreal_world_bundle(context, settings) -> dict[str, Any]:
     selected_objects = list(getattr(context, "selected_objects", []) or [])
     active_object = getattr(getattr(context, "view_layer", None), "objects", None)
@@ -292,6 +340,16 @@ def build_unreal_world_bundle(context, settings) -> dict[str, Any]:
         terrain_section["layers"] = terrain_layers
         terrain_section["layer_count"] = len(terrain_layers)
         terrain_section["control"] = terrain_control
+
+    try:
+        visibility = _export_terrain_holes(
+            heightmap_dir, hub, result.source_resolution, layout.resolution,
+            bundle_root, warnings,
+        )
+        if visibility is not None:
+            terrain_section["visibility"] = visibility
+    except Exception as exc:
+        warnings.append(f"Terrain hole export failed ({exc}); landscape will be solid.")
 
     manifest = build_manifest(
         asset_name=asset_name,

@@ -312,6 +312,48 @@ def write_r16(path: str, height: np.ndarray) -> None:
         handle.write(heightmap_to_r16_bytes(height))
 
 
+LANDSCAPE_HOLE_VALUE = 255
+LANDSCAPE_VISIBLE_VALUE = 0
+LANDSCAPE_VISIBILITY_LAYER = "__LandscapeVisibility__"
+
+
+def resample_mask_nearest(mask: np.ndarray, target_res: int) -> np.ndarray:
+    """Nearest-neighbour resample a boolean/uint8 ``(H, W)`` mask to a square.
+
+    Uses the same corner-aligned sample positions as :func:`resample_height_u16`.
+    """
+    target = int(target_res)
+    src_h, src_w = mask.shape
+    if src_h == target and src_w == target:
+        return mask
+
+    def axis_index(src_n: int) -> np.ndarray:
+        if target == 1 or src_n == 1:
+            return np.zeros(target, dtype=np.int64)
+        pos = np.linspace(0.0, src_n - 1, target)
+        return np.rint(pos).astype(np.int64)
+
+    ry = axis_index(src_h)
+    rx = axis_index(src_w)
+    return mask[ry][:, rx]
+
+
+def holemap_to_r8_bytes(hole_mask: np.ndarray) -> bytes:
+    """Row-major uint8 visibility bytes (hole -> 255, visible -> 0).
+
+    Honours :data:`HEIGHTMAP_FLIP_V` like :func:`heightmap_to_r16_bytes`.
+    """
+    mask = np.flipud(hole_mask) if HEIGHTMAP_FLIP_V else hole_mask
+    out = np.where(np.asarray(mask) != 0, LANDSCAPE_HOLE_VALUE,
+                   LANDSCAPE_VISIBLE_VALUE).astype(np.uint8)
+    return np.ascontiguousarray(out, dtype=np.uint8).tobytes()
+
+
+def write_visibility_r8(path: str, hole_mask: np.ndarray) -> None:
+    with open(path, "wb") as handle:
+        handle.write(holemap_to_r8_bytes(hole_mask))
+
+
 # --- landscape transform -----------------------------------------------------
 
 @dataclass(frozen=True)

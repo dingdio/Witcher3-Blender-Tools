@@ -269,7 +269,69 @@ def _infer_colormap_mip(res: int, tile_blocks: int) -> Optional[int]:
     return mip
 
 
-def select_tintmap_buffer_index(tiles: Dict[int, Dict[Tuple[int, int], str]], res: int) -> Optional[int]:
+def _representative_buffer_size(tile_paths: Dict[Tuple[int, int], str]) -> Optional[int]:
+    counts: Dict[int, int] = {}
+    for path in tile_paths.values():
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        counts[size] = counts.get(size, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def _expected_buffer_sizes(res: int, num_mips: int, colormap_start_mip: int) -> List[int]:
+    seq: List[int] = []
+    for mip in range(num_mips):
+        r = res >> mip
+        u16 = r * r * 2
+        bc1 = (r * r) // 2
+        seq.append(u16)
+        seq.append(u16)
+        if mip >= colormap_start_mip:
+            seq.append(bc1)
+    return seq
+
+
+def detect_colormap_start_mip(
+    tiles: Dict[int, Dict[Tuple[int, int], str]],
+    res: int,
+) -> Optional[int]:
+    if not res or res <= 0:
+        return None
+    indices = sorted(tiles.keys())
+    if not indices:
+        return None
+    sizes: List[int] = []
+    for idx in indices:
+        size = _representative_buffer_size(tiles[idx])
+        if size is None:
+            return None
+        sizes.append(size)
+
+    total = len(indices)
+    for start_mip in range(0, res.bit_length()):
+        if (total + start_mip) % 3 != 0:
+            continue
+        num_mips = (total + start_mip) // 3
+        if not 0 <= start_mip < num_mips:
+            continue
+        if _expected_buffer_sizes(res, num_mips, start_mip) == sizes:
+            return start_mip
+    return None
+
+
+def select_tintmap_buffer_index(
+    tiles: Dict[int, Dict[Tuple[int, int], str]],
+    res: int,
+) -> Optional[int]:
+    start_mip = detect_colormap_start_mip(tiles, res)
+    if start_mip is not None:
+        idx = start_mip * 2 + 3
+        if idx in tiles and get_tintmap_tile_blocks(tiles[idx]):
+            return idx
     candidates = []
     for idx, tile_paths in tiles.items():
         if idx < 3:

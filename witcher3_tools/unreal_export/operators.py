@@ -545,7 +545,19 @@ class WITCHER_OT_send_unreal_layers_around_camera(bpy.types.Operator):
 
         try:
             with _quiet_send_logging(settings, self.action):
-                result = w2l_placements.build_unreal_w2l_bundle_multi(context, settings, w2l_paths)
+                scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+                include_collision_blocks = bool(
+                    getattr(settings, "placement_export_collision", False)
+                    or getattr(scene_settings, "terrain_layer_do_import_collision", False)
+                )
+                result = w2l_placements.build_unreal_w2l_bundle_multi(
+                    context,
+                    settings,
+                    w2l_paths,
+                    include_collision_blocks=include_collision_blocks,
+                    include_point_lights=bool(getattr(scene_settings, "terrain_layer_do_import_point_light", True)),
+                    include_spot_lights=bool(getattr(scene_settings, "terrain_layer_do_import_spot_light", True)),
+                )
                 settings.last_manifest_path = result["manifest_path"]
                 warning_count = len(result["manifest"].get("warnings", []))
                 settings.last_status = (

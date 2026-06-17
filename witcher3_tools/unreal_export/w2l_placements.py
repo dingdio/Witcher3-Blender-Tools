@@ -25,6 +25,10 @@ _PROXY_TOKENS = ("proxy",)
 DEFAULT_INSTANCER_THRESHOLD = 8
 
 
+def _collision_asset_rel(asset_rel: str) -> str:
+    return f"{asset_rel}_collision" if asset_rel else ""
+
+
 def _layer_id_for_w2l(w2l_path: str) -> str:
     from ..importers.import_mesh import get_repo_from_abs_path
 
@@ -84,6 +88,69 @@ def block_world_matrix(position, rotation_rows) -> np.ndarray:
     return m
 
 
+def _color_rgb(color) -> list[float]:
+    try:
+        return [
+            float(getattr(color, "Red")) / 255.0,
+            float(getattr(color, "Green")) / 255.0,
+            float(getattr(color, "Blue")) / 255.0,
+        ]
+    except Exception:
+        return [1.0, 1.0, 1.0]
+
+
+def _float_attr(obj, name: str, default: float = 0.0) -> float:
+    try:
+        value = getattr(obj, name, default)
+        if value is None:
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _w3_direction_to_unreal(direction) -> list[float]:
+    try:
+        return [float(direction[0]), -float(direction[1]), float(direction[2])]
+    except Exception:
+        return [1.0, 0.0, 0.0]
+
+
+def _spot_direction_from_world(world: np.ndarray) -> list[float]:
+    try:
+        return _w3_direction_to_unreal((-float(world[0, 2]), -float(world[1, 2]), -float(world[2, 2])))
+    except Exception:
+        return [1.0, 0.0, 0.0]
+
+
+def _light_entry_from_block(block, light_type: str) -> Optional[dict[str, Any]]:
+    light_data = getattr(block, "packedObject", None)
+    if light_data is None:
+        return None
+    world = block_world_matrix(_block_position(block), _block_rotation_rows(block))
+    brightness = _float_attr(light_data, "brightness", 0.0)
+    radius = _float_attr(light_data, "radius", 0.0)
+    is_spot = light_type == "spot"
+    entry: dict[str, Any] = {
+        "name": "SpotLight" if is_spot else "PointLight",
+        "type": light_type,
+        "matrix": world,
+        "color": _color_rgb(getattr(light_data, "color", None)),
+        "intensity": max(0.0, brightness * (300.0 if is_spot else 1000.0)),
+        "attenuation_radius": max(0.0, (radius / 255.0) * terrain_unreal.UE_UNITS_PER_METER),
+        "source_radius": max(0.0, (radius / 255.0) * terrain_unreal.UE_UNITS_PER_METER),
+    }
+    if is_spot:
+        outer_angle = _float_attr(light_data, "outerAngle", 0.0) * 57.29577951308232
+        inner_angle = _float_attr(light_data, "innerAngle", 0.0) * 57.29577951308232
+        if inner_angle <= 0.0:
+            inner_angle = outer_angle
+        entry["direction"] = _spot_direction_from_world(world)
+        entry["outer_cone_angle"] = max(0.0, outer_angle)
+        entry["inner_cone_angle"] = max(0.0, min(inner_angle, outer_angle))
+    return entry
+
+
 def _depot_has_token(depot: str, tokens) -> bool:
     lowered = str(depot or "").lower()
     return any(tok in lowered for tok in tokens)
@@ -102,31 +169,53 @@ def collect_w2l_placements(
     warnings: list[str],
     *,
     instancer_threshold: int = DEFAULT_INSTANCER_THRESHOLD,
+    include_collision_blocks: bool = False,
+    include_point_lights: bool = True,
+    include_spot_lights: bool = True,
 ) -> dict[str, Any]:
     from ..CR2W.CR2W_helpers import Enums
 
     sector = getattr(level, "CSectorData", None)
     assets: dict[str, dict[str, Any]] = {}
-    by_depot: dict[str, list[np.ndarray]] = {}
+    by_asset: dict[str, dict[str, Any]] = {}
+    lights: list[dict[str, Any]] = []
     skipped: dict[str, int] = {}
 
     def _skip(reason: str) -> None:
         skipped[reason] = skipped.get(reason, 0) + 1
 
     if not sector or not getattr(sector, "BlockData", None):
-        return {"assets": assets, "actors": [], "instancers": [], "skipped": skipped}
+        return {"assets": assets, "actors": [], "instancers": [], "lights": lights, "skipped": skipped}
 
     resources = getattr(sector, "Resources", None) or []
     mesh_types = {Enums.BlockDataObjectType.Mesh, Enums.BlockDataObjectType.RigidBody}
+    collision_type = Enums.BlockDataObjectType.Collision
 
     for block in sector.BlockData:
         block_type = getattr(block, "packedObjectType", None)
-        if block_type not in mesh_types:
-            if block_type == Enums.BlockDataObjectType.PointLight:
+        is_collision = block_type == collision_type
+        if block_type == Enums.BlockDataObjectType.PointLight:
+            if include_point_lights:
+                entry = _light_entry_from_block(block, "point")
+                if entry is not None:
+                    lights.append(entry)
+                else:
+                    _skip("point_light_invalid")
+            else:
                 _skip("point_light")
-            elif block_type == Enums.BlockDataObjectType.SpotLight:
+            continue
+        if block_type == Enums.BlockDataObjectType.SpotLight:
+            if include_spot_lights:
+                entry = _light_entry_from_block(block, "spot")
+                if entry is not None:
+                    lights.append(entry)
+                else:
+                    _skip("spot_light_invalid")
+            else:
                 _skip("spot_light")
-            elif block_type == Enums.BlockDataObjectType.Collision:
+            continue
+        if block_type not in mesh_types and not (include_collision_blocks and is_collision):
+            if is_collision:
                 _skip("collision")
             else:
                 _skip("other")
@@ -141,10 +230,10 @@ def collect_w2l_placements(
         if not depot:
             _skip("empty_depot")
             continue
-        if is_volume_depot(depot):
+        if not is_collision and is_volume_depot(depot):
             _skip("volume")
             continue
-        if is_proxy_depot(depot):
+        if not is_collision and is_proxy_depot(depot):
             _skip("proxy")
             continue
 
@@ -152,26 +241,46 @@ def collect_w2l_placements(
         if not terrain_unreal.world_matrix_has_valid_basis(world):
             _skip("degenerate_transform")
             continue
-        by_depot.setdefault(depot, []).append(world)
 
-    actors: list[dict[str, Any]] = []
-    instancers: list[dict[str, Any]] = []
-    for depot, matrices in by_depot.items():
-        asset_rel = depot_asset_rel(depot)
+        base_asset_rel = depot_asset_rel(depot)
+        asset_rel = _collision_asset_rel(base_asset_rel) if is_collision else base_asset_rel
         if not asset_rel:
             warnings.append(f"{depot}: could not derive an Unreal asset path; skipped.")
             continue
-        assets[asset_rel] = {"depot": depot}
+        entry = by_asset.setdefault(asset_rel, {
+            "depot": depot,
+            "kind": "collision" if is_collision else "mesh",
+            "base_asset_rel": base_asset_rel,
+            "matrices": [],
+        })
+        entry["matrices"].append(world)
+
+    actors: list[dict[str, Any]] = []
+    instancers: list[dict[str, Any]] = []
+    for asset_rel, entry in by_asset.items():
+        matrices = entry["matrices"]
+        is_collision = entry.get("kind") == "collision"
+        assets[asset_rel] = {
+            "depot": entry["depot"],
+            "kind": entry.get("kind", "mesh"),
+            "base_asset_rel": entry.get("base_asset_rel") or asset_rel,
+        }
         stem = asset_rel.rsplit("/", 1)[-1]
         if len(matrices) >= instancer_threshold:
-            instancers.append({"name": stem, "asset_rel": asset_rel, "matrices": matrices})
+            inst = {"name": stem, "asset_rel": asset_rel, "matrices": matrices}
+            if is_collision:
+                inst["collision_only"] = True
+            instancers.append(inst)
         else:
             single = len(matrices) == 1
             for index, world in enumerate(matrices):
                 name = stem if single else f"{stem}_{index + 1:03d}"
-                actors.append({"name": name, "asset_rel": asset_rel, "matrix": world})
+                actor = {"name": name, "asset_rel": asset_rel, "matrix": world}
+                if is_collision:
+                    actor["collision_only"] = True
+                actors.append(actor)
 
-    return {"assets": assets, "actors": actors, "instancers": instancers, "skipped": skipped}
+    return {"assets": assets, "actors": actors, "instancers": instancers, "lights": lights, "skipped": skipped}
 
 
 def _resolve_w2l_abspath(w2l_path: str) -> str:
@@ -191,16 +300,21 @@ def _resolve_w2l_abspath(w2l_path: str) -> str:
 def _gather_layer_assets(
     collected,
     *,
+    context,
     bundle_root,
     registry,
     chain,
     used_stems,
+    used_fbx_stems,
     gathered_assets,
     failed_assets,
+    collision_asset_paths,
     mesh_entries,
     warnings,
     phase,
     skip_materials,
+    export_visual_collision,
+    reuse_existing_collision_fbx,
 ) -> None:
     """Gather a single layer's unique placed meshes into the shared bundle.
 
@@ -216,6 +330,38 @@ def _gather_layer_assets(
         if asset_rel in gathered_assets or asset_rel in failed_assets:
             continue
         depot = entry["depot"]
+        asset_kind = str(entry.get("kind", "mesh") or "mesh").lower()
+        if asset_kind == "collision":
+            _g0 = time.perf_counter()
+            base_asset_rel = str(entry.get("base_asset_rel") or "").strip()
+            if not base_asset_rel:
+                warnings.append(f"{depot}: could not derive a collision asset path; skipped.")
+                failed_assets.add(asset_rel)
+                continue
+            collision_entry = _export_collision_mesh_for_asset(
+                context,
+                base_asset_rel,
+                depot,
+                bundle_root,
+                warnings,
+                used_fbx_stems,
+                reuse_existing_fbx=reuse_existing_collision_fbx,
+            )
+            phase["gather"] += time.perf_counter() - _g0
+            if not collision_entry:
+                failed_assets.add(asset_rel)
+                continue
+            exported_rel = str(collision_entry.get("asset_path", "") or "")
+            if exported_rel != asset_rel:
+                warnings.append(
+                    f"{depot}: collision asset path mismatch ({exported_rel or '<empty>'} != {asset_rel}); skipped."
+                )
+                failed_assets.add(asset_rel)
+                continue
+            mesh_entries.append(collision_entry)
+            gathered_assets.add(asset_rel)
+            continue
+
         source = repo_file(normalize_depot_path(depot))
         if not source or not os.path.isfile(source):
             warnings.append(f"{depot}: source .w2mesh not found on disk; placement skipped.")
@@ -263,32 +409,87 @@ def _gather_layer_assets(
         })
         gathered_assets.add(asset_rel)
 
+        if export_visual_collision:
+            _c0 = time.perf_counter()
+            collision_entry = _export_collision_mesh_for_asset(
+                context,
+                asset_rel,
+                depot,
+                bundle_root,
+                warnings,
+                used_fbx_stems,
+                reuse_existing_fbx=reuse_existing_collision_fbx,
+            )
+            phase["gather"] += time.perf_counter() - _c0
+            if collision_entry:
+                collision_rel = str(collision_entry.get("asset_path", "") or "")
+                if collision_rel and collision_rel not in gathered_assets:
+                    mesh_entries.append(collision_entry)
+                    gathered_assets.add(collision_rel)
+                if collision_rel:
+                    collision_asset_paths[asset_rel] = collision_rel
 
-def _layer_placement_group(layer_id, label, folder, collected, gathered_assets) -> Optional[dict]:
+
+def _layer_placement_group(layer_id, label, folder, collected, gathered_assets, collision_asset_paths=None) -> Optional[dict]:
     """Build the manifest placement group for one layer, keeping only meshes
     that were successfully gathered somewhere in the (possibly multi-layer)
     bundle."""
+    collision_asset_paths = collision_asset_paths or {}
     actors_out: list[dict[str, Any]] = []
     for actor in collected["actors"]:
         if actor["asset_rel"] not in gathered_assets:
             continue
-        actors_out.append({
+        actor_entry = {
             "name": actor["name"],
             "asset_path": actor["asset_rel"],
             "transform": terrain_unreal.w3_matrix_to_unreal(actor["matrix"]),
-        })
+        }
+        if actor.get("collision_only"):
+            actor_entry["collision_only"] = True
+        else:
+            collision_asset_path = collision_asset_paths.get(actor["asset_rel"])
+            if collision_asset_path:
+                actor_entry["collision_asset_path"] = collision_asset_path
+        actors_out.append(actor_entry)
 
     instancers_out: list[dict[str, Any]] = []
     for inst in collected["instancers"]:
         if inst["asset_rel"] not in gathered_assets or not inst["matrices"]:
             continue
-        instancers_out.append({
+        inst_entry = {
             "name": inst["name"],
             "asset_path": inst["asset_rel"],
             "instances": [terrain_unreal.w3_matrix_to_unreal(m) for m in inst["matrices"]],
-        })
+        }
+        if inst.get("collision_only"):
+            inst_entry["collision_only"] = True
+        else:
+            collision_asset_path = collision_asset_paths.get(inst["asset_rel"])
+            if collision_asset_path:
+                inst_entry["collision_asset_path"] = collision_asset_path
+        instancers_out.append(inst_entry)
 
-    if not actors_out and not instancers_out:
+    lights_out: list[dict[str, Any]] = []
+    for light in collected.get("lights", []) or []:
+        matrix = light.get("matrix")
+        if matrix is None:
+            continue
+        light_entry = {
+            "name": light.get("name", "Light"),
+            "type": light.get("type", "point"),
+            "transform": terrain_unreal.w3_matrix_to_unreal(matrix),
+            "color": light.get("color", [1.0, 1.0, 1.0]),
+            "intensity": light.get("intensity", 0.0),
+            "attenuation_radius": light.get("attenuation_radius", 0.0),
+            "source_radius": light.get("source_radius", 0.0),
+        }
+        if light_entry["type"] == "spot":
+            light_entry["direction"] = light.get("direction", [1.0, 0.0, 0.0])
+            light_entry["inner_cone_angle"] = light.get("inner_cone_angle", 0.0)
+            light_entry["outer_cone_angle"] = light.get("outer_cone_angle", 0.0)
+        lights_out.append(light_entry)
+
+    if not actors_out and not instancers_out and not lights_out:
         return None
     return {
         "layer_id": layer_id,
@@ -296,11 +497,19 @@ def _layer_placement_group(layer_id, label, folder, collected, gathered_assets) 
         "folder": folder,
         "actors": actors_out,
         "instancers": instancers_out,
-        "lights": [],
+        "lights": lights_out,
     }
 
 
-def _build_unreal_w2l_bundle_core(context, settings, w2l_paths) -> dict[str, Any]:
+def _build_unreal_w2l_bundle_core(
+    context,
+    settings,
+    w2l_paths,
+    *,
+    include_collision_blocks=None,
+    include_point_lights=True,
+    include_spot_lights=True,
+) -> dict[str, Any]:
     from ..CR2W.CR2W_reader import load_w2l
     from .bundle import (
         _resolve_content_root_setting,
@@ -316,6 +525,10 @@ def _build_unreal_w2l_bundle_core(context, settings, w2l_paths) -> dict[str, Any
     started = time.perf_counter()
     phase = {"parse": 0.0, "gather": 0.0, "materials": 0.0, "textures": 0.0, "manifest": 0.0}
     skip_materials = bool(getattr(settings, "placement_skip_materials", False))
+    export_visual_collision = bool(getattr(settings, "placement_export_collision", False))
+    if include_collision_blocks is None:
+        include_collision_blocks = export_visual_collision
+    include_collision_blocks = bool(include_collision_blocks)
 
     # First pass: parse every layer and gather its placements. We defer bundle
     # setup until the first parse so source_game is derived from real data.
@@ -340,16 +553,21 @@ def _build_unreal_w2l_bundle_core(context, settings, w2l_paths) -> dict[str, Any
         bundle_root = os.path.join(export_root, asset_name)
         os.makedirs(bundle_root, exist_ok=True)
         registry = TextureRegistry(bundle_root, parallel=True)
+        overwrite = overwrite_policy_from_settings(settings)
         bundle_state.update({
             "asset_name": asset_name,
             "content_root": content_root,
             "bundle_root": bundle_root,
             "registry": registry,
             "chain": ChainBuilder(registry.register),
+            "overwrite": overwrite,
             "used_stems": {},
+            "used_fbx_stems": {},
             "mesh_entries": [],
             "gathered_assets": set(),
             "failed_assets": set(),
+            "collision_asset_paths": {},
+            "reuse_existing_collision_fbx": not bool(overwrite.get("meshes", False)),
         })
 
     for raw_path in w2l_paths:
@@ -358,26 +576,38 @@ def _build_unreal_w2l_bundle_core(context, settings, w2l_paths) -> dict[str, Any
         label, folder = _layer_label_and_folder(layer_id)
         _parse0 = time.perf_counter()
         level = load_w2l(abs_w2l)
-        collected = collect_w2l_placements(level, warnings)
+        collected = collect_w2l_placements(
+            level,
+            warnings,
+            include_collision_blocks=include_collision_blocks,
+            include_point_lights=include_point_lights,
+            include_spot_lights=include_spot_lights,
+        )
         phase["parse"] += time.perf_counter() - _parse0
         for reason, count in (collected.get("skipped") or {}).items():
             skipped_totals[reason] = skipped_totals.get(reason, 0) + int(count or 0)
-        if not collected["assets"]:
+        if not collected["assets"] and not collected.get("lights"):
             continue
         _ensure_bundle(level)
-        _gather_layer_assets(
-            collected,
-            bundle_root=bundle_state["bundle_root"],
-            registry=bundle_state["registry"],
-            chain=bundle_state["chain"],
-            used_stems=bundle_state["used_stems"],
-            gathered_assets=bundle_state["gathered_assets"],
-            failed_assets=bundle_state["failed_assets"],
-            mesh_entries=bundle_state["mesh_entries"],
-            warnings=warnings,
-            phase=phase,
-            skip_materials=skip_materials,
-        )
+        if collected["assets"]:
+            _gather_layer_assets(
+                collected,
+                context=context,
+                bundle_root=bundle_state["bundle_root"],
+                registry=bundle_state["registry"],
+                chain=bundle_state["chain"],
+                used_stems=bundle_state["used_stems"],
+                used_fbx_stems=bundle_state["used_fbx_stems"],
+                gathered_assets=bundle_state["gathered_assets"],
+                failed_assets=bundle_state["failed_assets"],
+                collision_asset_paths=bundle_state["collision_asset_paths"],
+                mesh_entries=bundle_state["mesh_entries"],
+                warnings=warnings,
+                phase=phase,
+                skip_materials=skip_materials,
+                export_visual_collision=export_visual_collision,
+                reuse_existing_collision_fbx=bundle_state["reuse_existing_collision_fbx"],
+            )
         parsed.append({"layer_id": layer_id, "label": label, "folder": folder, "collected": collected})
 
     if not bundle_state:
@@ -391,7 +621,14 @@ def _build_unreal_w2l_bundle_core(context, settings, w2l_paths) -> dict[str, Any
     layers_out: list[dict[str, Any]] = []
     layer_ids: list[str] = []
     for item in parsed:
-        group = _layer_placement_group(item["layer_id"], item["label"], item["folder"], item["collected"], gathered_assets)
+        group = _layer_placement_group(
+            item["layer_id"],
+            item["label"],
+            item["folder"],
+            item["collected"],
+            gathered_assets,
+            bundle_state["collision_asset_paths"],
+        )
         if group is not None:
             layers_out.append(group)
             layer_ids.append(item["layer_id"])
@@ -413,7 +650,7 @@ def _build_unreal_w2l_bundle_core(context, settings, w2l_paths) -> dict[str, Any
         bundle_root=bundle_state["bundle_root"],
         source_game=source_game,
         content_root=bundle_state["content_root"],
-        overwrite=overwrite_policy_from_settings(settings),
+        overwrite=bundle_state["overwrite"],
         meshes=bundle_state["mesh_entries"],
         masters=masters,
         materials=materials,
@@ -430,6 +667,7 @@ def _build_unreal_w2l_bundle_core(context, settings, w2l_paths) -> dict[str, Any
     total_actors = sum(len(g["actors"]) for g in layers_out)
     total_instancers = sum(len(g["instancers"]) for g in layers_out)
     total_instances = sum(len(i["instances"]) for g in layers_out for i in g["instancers"])
+    total_lights = sum(len(g["lights"]) for g in layers_out)
 
     return {
         "asset_name": bundle_state["asset_name"],
@@ -443,6 +681,7 @@ def _build_unreal_w2l_bundle_core(context, settings, w2l_paths) -> dict[str, Any
             "actors": total_actors,
             "instancers": total_instancers,
             "instances": total_instances,
+            "lights": total_lights,
             "materials": len(materials),
             "textures": len(texture_entries),
             "layers": len(w2l_paths),
@@ -454,16 +693,52 @@ def _build_unreal_w2l_bundle_core(context, settings, w2l_paths) -> dict[str, Any
     }
 
 
-def build_unreal_w2l_bundle(context, settings, w2l_path: str) -> dict[str, Any]:
-    result = _build_unreal_w2l_bundle_core(context, settings, [w2l_path])
+def build_unreal_w2l_bundle(
+    context,
+    settings,
+    w2l_path: str,
+    *,
+    include_collision_blocks=None,
+    include_point_lights=True,
+    include_spot_lights=True,
+) -> dict[str, Any]:
+    result = _build_unreal_w2l_bundle_core(
+        context,
+        settings,
+        [w2l_path],
+        include_collision_blocks=include_collision_blocks,
+        include_point_lights=include_point_lights,
+        include_spot_lights=include_spot_lights,
+    )
     # Preserve the single-layer return contract used by the existing operator.
     layer_ids = result.get("layer_ids", [])
     result["layer_id"] = layer_ids[0] if layer_ids else _layer_id_for_w2l(_resolve_w2l_abspath(w2l_path))
     return result
 
 
-def build_unreal_w2l_bundle_multi(context, settings, w2l_paths: list[str]) -> dict[str, Any]:
-    return _build_unreal_w2l_bundle_core(context, settings, list(w2l_paths))
+def build_unreal_w2l_bundle_multi(
+    context,
+    settings,
+    w2l_paths: list[str],
+    *,
+    include_collision_blocks=None,
+    include_point_lights=True,
+    include_spot_lights=True,
+) -> dict[str, Any]:
+    return _build_unreal_w2l_bundle_core(
+        context,
+        settings,
+        list(w2l_paths),
+        include_collision_blocks=include_collision_blocks,
+        include_point_lights=include_point_lights,
+        include_spot_lights=include_spot_lights,
+    )
+
+
+def _export_collision_mesh_for_asset(*args, **kwargs):
+    from .placements_bundle import _export_collision_mesh_for_asset as export_collision
+
+    return export_collision(*args, **kwargs)
 
 
 def _unique_buffer_path(bundle_root: str, asset_rel: str, used_stems: dict[str, str]) -> str:
