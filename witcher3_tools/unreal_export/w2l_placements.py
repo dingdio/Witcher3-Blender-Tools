@@ -188,60 +188,38 @@ def _resolve_w2l_abspath(w2l_path: str) -> str:
     return resolved
 
 
-def build_unreal_w2l_bundle(context, settings, w2l_path: str) -> dict[str, Any]:
-    from ..CR2W.CR2W_reader import load_w2l
+def _gather_layer_assets(
+    collected,
+    *,
+    bundle_root,
+    registry,
+    chain,
+    used_stems,
+    gathered_assets,
+    failed_assets,
+    mesh_entries,
+    warnings,
+    phase,
+    skip_materials,
+) -> None:
+    """Gather a single layer's unique placed meshes into the shared bundle.
+
+    ``gathered_assets``/``failed_assets``/``mesh_entries``/``used_stems`` are
+    shared across every layer in a multi-layer bundle so a mesh referenced by
+    several layers is decoded, materialised, and emitted exactly once.
+    """
     from ..CR2W.common_blender import repo_file
-    from .bundle import (
-        _resolve_content_root_setting,
-        default_export_folder,
-        overwrite_policy_from_settings,
-    )
     from .gather import gather_placement_mesh
-    from .material_chain import ChainBuilder
     from .mesh_buffer import write_mesh_buffer
-    from .texture_export import TextureRegistry
 
-    started = time.perf_counter()
-    phase = {"parse": 0.0, "gather": 0.0, "materials": 0.0, "textures": 0.0, "manifest": 0.0}
-    abs_w2l = _resolve_w2l_abspath(w2l_path)
-    layer_id = _layer_id_for_w2l(abs_w2l)
-    label, folder = _layer_label_and_folder(layer_id)
-
-    warnings: list[str] = []
-    _parse0 = time.perf_counter()
-    level = load_w2l(abs_w2l)
-    collected = collect_w2l_placements(level, warnings)
-    phase["parse"] = time.perf_counter() - _parse0
-    assets = collected["assets"]
-    if not assets:
-        raise ValueError(
-            f"No placed meshes found in '{label}'. (Skipped: {collected['skipped'] or 'nothing'}.)"
-        )
-
-    level_version = getattr(level, "version", None)
-    source_game = "w2" if (level_version is not None and int(level_version) <= 115) else "w3"
-    asset_name = safe_asset_name(getattr(settings, "asset_name", "") or label or "WitcherLayer")
-    content_root = _resolve_content_root_setting(getattr(settings, "content_root", ""), source_game)
-
-    export_root = str(getattr(settings, "export_folder", "") or default_export_folder())
-    bundle_root = os.path.join(export_root, asset_name)
-    os.makedirs(bundle_root, exist_ok=True)
-
-    overwrite = overwrite_policy_from_settings(settings)
-    skip_materials = bool(getattr(settings, "placement_skip_materials", False))
-
-    registry = TextureRegistry(bundle_root, parallel=True)
-    chain = ChainBuilder(registry.register)
-
-    mesh_entries: list[dict[str, Any]] = []
-    used_stems: dict[str, str] = {}
-    gathered_assets: set[str] = set()
-
-    for asset_rel, entry in assets.items():
+    for asset_rel, entry in collected["assets"].items():
+        if asset_rel in gathered_assets or asset_rel in failed_assets:
+            continue
         depot = entry["depot"]
         source = repo_file(normalize_depot_path(depot))
         if not source or not os.path.isfile(source):
             warnings.append(f"{depot}: source .w2mesh not found on disk; placement skipped.")
+            failed_assets.add(asset_rel)
             continue
         buffer_path = _unique_buffer_path(bundle_root, asset_rel, used_stems)
         _g0 = time.perf_counter()
@@ -254,9 +232,11 @@ def build_unreal_w2l_bundle(context, settings, w2l_path: str) -> dict[str, Any]:
             except Exception as exc:
                 warnings.append(f"{depot}: mesh gather failed ({exc}); placement skipped.")
                 log.warning("Placement gather failed for %s", depot, exc_info=True)
+                failed_assets.add(asset_rel)
                 continue
             if not mesh.submeshes:
                 warnings.append(f"{depot}: mesh has no geometry; placement skipped.")
+                failed_assets.add(asset_rel)
                 continue
             write_mesh_buffer(buffer_path, mesh)
         phase["gather"] += time.perf_counter() - _g0
@@ -283,6 +263,11 @@ def build_unreal_w2l_bundle(context, settings, w2l_path: str) -> dict[str, Any]:
         })
         gathered_assets.add(asset_rel)
 
+
+def _layer_placement_group(layer_id, label, folder, collected, gathered_assets) -> Optional[dict]:
+    """Build the manifest placement group for one layer, keeping only meshes
+    that were successfully gathered somewhere in the (possibly multi-layer)
+    bundle."""
     actors_out: list[dict[str, Any]] = []
     for actor in collected["actors"]:
         if actor["asset_rel"] not in gathered_assets:
@@ -303,19 +288,118 @@ def build_unreal_w2l_bundle(context, settings, w2l_path: str) -> dict[str, Any]:
             "instances": [terrain_unreal.w3_matrix_to_unreal(m) for m in inst["matrices"]],
         })
 
-    placements = None
-    if actors_out or instancers_out:
-        placements = {
-            "layers": [{
-                "layer_id": layer_id,
-                "label": label,
-                "folder": folder,
-                "actors": actors_out,
-                "instancers": instancers_out,
-                "lights": [],
-            }]
-        }
+    if not actors_out and not instancers_out:
+        return None
+    return {
+        "layer_id": layer_id,
+        "label": label,
+        "folder": folder,
+        "actors": actors_out,
+        "instancers": instancers_out,
+        "lights": [],
+    }
 
+
+def _build_unreal_w2l_bundle_core(context, settings, w2l_paths) -> dict[str, Any]:
+    from ..CR2W.CR2W_reader import load_w2l
+    from .bundle import (
+        _resolve_content_root_setting,
+        default_export_folder,
+        overwrite_policy_from_settings,
+    )
+    from .material_chain import ChainBuilder
+    from .texture_export import TextureRegistry
+
+    if not w2l_paths:
+        raise ValueError("No .w2l layers given.")
+
+    started = time.perf_counter()
+    phase = {"parse": 0.0, "gather": 0.0, "materials": 0.0, "textures": 0.0, "manifest": 0.0}
+    skip_materials = bool(getattr(settings, "placement_skip_materials", False))
+
+    # First pass: parse every layer and gather its placements. We defer bundle
+    # setup until the first parse so source_game is derived from real data.
+    parsed: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    source_game: Optional[str] = None
+    skipped_totals: dict[str, int] = {}
+
+    bundle_state: dict[str, Any] = {}
+
+    def _ensure_bundle(level) -> None:
+        nonlocal source_game
+        if bundle_state:
+            return
+        level_version = getattr(level, "version", None)
+        source_game = "w2" if (level_version is not None and int(level_version) <= 115) else "w3"
+        first_label = _layer_label_and_folder(_layer_id_for_w2l(w2l_paths[0]))[0]
+        default_name = first_label if len(w2l_paths) == 1 else "WitcherLayers"
+        asset_name = safe_asset_name(getattr(settings, "asset_name", "") or default_name or "WitcherLayer")
+        content_root = _resolve_content_root_setting(getattr(settings, "content_root", ""), source_game)
+        export_root = str(getattr(settings, "export_folder", "") or default_export_folder())
+        bundle_root = os.path.join(export_root, asset_name)
+        os.makedirs(bundle_root, exist_ok=True)
+        registry = TextureRegistry(bundle_root, parallel=True)
+        bundle_state.update({
+            "asset_name": asset_name,
+            "content_root": content_root,
+            "bundle_root": bundle_root,
+            "registry": registry,
+            "chain": ChainBuilder(registry.register),
+            "used_stems": {},
+            "mesh_entries": [],
+            "gathered_assets": set(),
+            "failed_assets": set(),
+        })
+
+    for raw_path in w2l_paths:
+        abs_w2l = _resolve_w2l_abspath(raw_path)
+        layer_id = _layer_id_for_w2l(abs_w2l)
+        label, folder = _layer_label_and_folder(layer_id)
+        _parse0 = time.perf_counter()
+        level = load_w2l(abs_w2l)
+        collected = collect_w2l_placements(level, warnings)
+        phase["parse"] += time.perf_counter() - _parse0
+        for reason, count in (collected.get("skipped") or {}).items():
+            skipped_totals[reason] = skipped_totals.get(reason, 0) + int(count or 0)
+        if not collected["assets"]:
+            continue
+        _ensure_bundle(level)
+        _gather_layer_assets(
+            collected,
+            bundle_root=bundle_state["bundle_root"],
+            registry=bundle_state["registry"],
+            chain=bundle_state["chain"],
+            used_stems=bundle_state["used_stems"],
+            gathered_assets=bundle_state["gathered_assets"],
+            failed_assets=bundle_state["failed_assets"],
+            mesh_entries=bundle_state["mesh_entries"],
+            warnings=warnings,
+            phase=phase,
+            skip_materials=skip_materials,
+        )
+        parsed.append({"layer_id": layer_id, "label": label, "folder": folder, "collected": collected})
+
+    if not bundle_state:
+        labels = ", ".join(sorted({_layer_label_and_folder(_layer_id_for_w2l(_resolve_w2l_abspath(p)))[0] for p in w2l_paths}))
+        raise ValueError(
+            f"No placed meshes found in {labels or 'the selected layers'}. "
+            f"(Skipped: {skipped_totals or 'nothing'}.)"
+        )
+
+    gathered_assets = bundle_state["gathered_assets"]
+    layers_out: list[dict[str, Any]] = []
+    layer_ids: list[str] = []
+    for item in parsed:
+        group = _layer_placement_group(item["layer_id"], item["label"], item["folder"], item["collected"], gathered_assets)
+        if group is not None:
+            layers_out.append(group)
+            layer_ids.append(item["layer_id"])
+
+    placements = {"layers": layers_out} if layers_out else None
+
+    registry = bundle_state["registry"]
+    chain = bundle_state["chain"]
     _tex0 = time.perf_counter()
     texture_entries = [] if skip_materials else registry.manifest_entries()
     masters = [] if skip_materials else chain.ordered_masters()
@@ -325,12 +409,12 @@ def build_unreal_w2l_bundle(context, settings, w2l_path: str) -> dict[str, Any]:
 
     _man0 = time.perf_counter()
     manifest = build_manifest(
-        asset_name=asset_name,
-        bundle_root=bundle_root,
+        asset_name=bundle_state["asset_name"],
+        bundle_root=bundle_state["bundle_root"],
         source_game=source_game,
-        content_root=content_root,
-        overwrite=overwrite,
-        meshes=mesh_entries,
+        content_root=bundle_state["content_root"],
+        overwrite=overwrite_policy_from_settings(settings),
+        meshes=bundle_state["mesh_entries"],
         masters=masters,
         materials=materials,
         textures=texture_entries,
@@ -338,30 +422,48 @@ def build_unreal_w2l_bundle(context, settings, w2l_path: str) -> dict[str, Any]:
         warnings=warnings + chain_warnings,
     )
 
-    manifest_path = os.path.join(bundle_root, "witcher_unreal_export.json")
+    manifest_path = os.path.join(bundle_state["bundle_root"], "witcher_unreal_export.json")
     with open(manifest_path, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
     phase["manifest"] = time.perf_counter() - _man0
 
+    total_actors = sum(len(g["actors"]) for g in layers_out)
+    total_instancers = sum(len(g["instancers"]) for g in layers_out)
+    total_instances = sum(len(i["instances"]) for g in layers_out for i in g["instancers"])
+
     return {
-        "asset_name": asset_name,
-        "bundle_root": bundle_root,
+        "asset_name": bundle_state["asset_name"],
+        "bundle_root": bundle_state["bundle_root"],
         "manifest_path": manifest_path,
-        "layer_id": layer_id,
+        "layer_ids": layer_ids,
         "skip_materials": skip_materials,
         "build_timings": phase,
         "counts": {
             "unique_meshes": len(gathered_assets),
-            "actors": len(actors_out),
-            "instancers": len(instancers_out),
-            "instances": sum(len(i["instances"]) for i in instancers_out),
+            "actors": total_actors,
+            "instancers": total_instancers,
+            "instances": total_instances,
             "materials": len(materials),
             "textures": len(texture_entries),
-            "skipped": collected["skipped"],
+            "layers": len(w2l_paths),
+            "layers_with_placements": len(layers_out),
+            "skipped": skipped_totals,
         },
         "elapsed_seconds": time.perf_counter() - started,
         "manifest": manifest,
     }
+
+
+def build_unreal_w2l_bundle(context, settings, w2l_path: str) -> dict[str, Any]:
+    result = _build_unreal_w2l_bundle_core(context, settings, [w2l_path])
+    # Preserve the single-layer return contract used by the existing operator.
+    layer_ids = result.get("layer_ids", [])
+    result["layer_id"] = layer_ids[0] if layer_ids else _layer_id_for_w2l(_resolve_w2l_abspath(w2l_path))
+    return result
+
+
+def build_unreal_w2l_bundle_multi(context, settings, w2l_paths: list[str]) -> dict[str, Any]:
+    return _build_unreal_w2l_bundle_core(context, settings, list(w2l_paths))
 
 
 def _unique_buffer_path(bundle_root: str, asset_rel: str, used_stems: dict[str, str]) -> str:

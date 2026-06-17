@@ -3680,6 +3680,10 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 row = controls.row(align=True)
                 row.operator("witcher.load_layers_around_camera", text="Load Layers Around Camera", icon='VIEW_CAMERA')
                 row.operator("witcher.rebuild_layer_scan_cache", text="", icon='FILE_REFRESH')
+                controls.operator(
+                    "witcher.send_unreal_layers_around_camera",
+                    text="Send Nearby Layers to Unreal", icon='URL',
+                ).action = "SEND"
 
         body = section("witcher_terrain_foliage", "Foliage", 'PARTICLE_DATA', default_closed=True)
         if body:

@@ -4714,6 +4714,87 @@ def get_camera_position_label(context):
     return f"Camera Position: {position[0]:.1f}, {position[1]:.1f}, {position[2]:.1f}"
 
 
+def select_nearby_w2l_paths(
+    context,
+    *,
+    camera_position=None,
+    radius=None,
+    load_limit=None,
+    root_collection=None,
+):
+    if root_collection is None:
+        root_collection = _find_world_root_collection(context)
+    if root_collection is None:
+        raise ValueError("Select imported terrain or a world layer collection first.")
+
+    if camera_position is None:
+        camera_position = _get_camera_position(context)
+    if camera_position is None:
+        raise ValueError("Could not determine a viewport or scene camera position.")
+
+    scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+    if radius is None:
+        radius = float(getattr(scene_settings, "terrain_layer_load_radius", 100.0) or 100.0)
+    radius = max(1.0, float(radius))
+    if load_limit is None:
+        load_limit = int(getattr(scene_settings, "terrain_layer_max_load_count", 0) or 0)
+    load_limit = max(0, int(load_limit))
+
+    cache_key = _world_layer_cache_key(context, root_collection)
+    index = _WORLD_LAYER_INDEX_CACHE.get(cache_key)
+    if index is None:
+        index = _hydrate_world_layer_index_from_disk(context, root_collection)
+    if index is None:
+        raise ValueError(
+            "World layer scan cache is not built. Run a layer scan (or "
+            "'Load Layers Around Camera') once for this world first."
+        )
+
+    radius_sq = radius * radius
+    if str(index.get("cache_backend", "") or "").strip().lower() == "sqlite":
+        candidates, _skipped = _query_world_layer_cache_nearby_candidates(
+            index, camera_position, radius, False, context=context
+        )
+    else:
+        candidates = []
+        for entry in index.get("entries", []):
+            if "min_x" not in entry:
+                continue
+            distance_sq = _distance_sq_to_bounds_xy(camera_position[0], camera_position[1], entry)
+            if distance_sq > radius_sq:
+                continue
+            candidates.append((distance_sq, entry.get("collection_name", ""), entry, 0))
+
+    candidates.sort(key=lambda item: (item[0], str(item[2].get("level_path", "")).lower()))
+    selected = candidates if load_limit <= 0 else candidates[:load_limit]
+
+    paths: list[str] = []
+    unresolved: list[str] = []
+    seen: set[str] = set()
+    for _dist, _name, entry, _count in selected:
+        resolved = str(entry.get("resolved_path", "") or "").strip()
+        if not resolved or not os.path.isfile(resolved):
+            resolved = _resolve_level_file(context, entry.get("level_path", ""), root_collection)
+        if not resolved or not os.path.isfile(resolved):
+            unresolved.append(str(entry.get("level_path", "") or ""))
+            continue
+        key = os.path.normcase(os.path.normpath(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(resolved)
+
+    return {
+        "paths": paths,
+        "camera_position": camera_position,
+        "radius": radius,
+        "candidate_count": len(candidates),
+        "selected_count": len(selected),
+        "unresolved": unresolved,
+        "root_collection_name": root_collection.name,
+    }
+
+
 _nearby_scan_label = "Scan Cache Nearby: click Scan to update"
 
 

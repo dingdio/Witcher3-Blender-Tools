@@ -488,6 +488,107 @@ class WITCHER_OT_export_unreal_w2l(bpy.types.Operator):
             return {"CANCELLED"}
 
 
+class WITCHER_OT_send_unreal_layers_around_camera(bpy.types.Operator):
+    bl_idname = "witcher.send_unreal_layers_around_camera"
+    bl_label = "Send Layers Around Camera to Unreal"
+    bl_description = (
+        "Parse every .w2l layer near the viewport camera (using the world layer "
+        "scan cache) and send their placed meshes to Unreal as positioned actors "
+    )
+    bl_options = {"REGISTER"}
+
+    action: EnumProperty(
+        name="Action",
+        items=[
+            ("BUNDLE", "Export Bundle", "Write the layer buffers, textures, and manifest"),
+            ("SEND", "Send to Unreal", "Write the bundle and send it to the running Unreal plugin"),
+        ],
+        default="SEND",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context is not None and context.scene is not None
+
+    def execute(self, context):
+        button_started = time.perf_counter()
+        from ..ui.ui_map import select_nearby_w2l_paths
+
+        settings = context.scene.witcher_unreal_export
+        if not settings.export_folder:
+            settings.export_folder = bundle.default_export_folder()
+
+        try:
+            selection = select_nearby_w2l_paths(context)
+        except ValueError as exc:
+            settings.last_status = "No nearby layers"
+            settings.last_details = str(exc)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        w2l_paths = selection.get("paths", [])
+        if not w2l_paths:
+            radius = selection.get("radius", 0.0)
+            msg = (
+                f"No .w2l layers found within {radius:.0f} world units of the camera "
+                f"(checked {selection.get('candidate_count', 0)} cached layers)."
+            )
+            settings.last_status = "No nearby layers"
+            settings.last_details = msg
+            self.report({"WARNING"}, msg)
+            return {"CANCELLED"}
+
+        if self.action == "SEND":
+            connection_error = _preflight_send_connection(settings)
+            if connection_error:
+                return _cancel_unreachable_unreal(self, settings, connection_error)
+
+        try:
+            with _quiet_send_logging(settings, self.action):
+                result = w2l_placements.build_unreal_w2l_bundle_multi(context, settings, w2l_paths)
+                settings.last_manifest_path = result["manifest_path"]
+                warning_count = len(result["manifest"].get("warnings", []))
+                settings.last_status = (
+                    f"Layers bundle ready ({len(w2l_paths)} layers, "
+                    f"{warning_count} warning{'s' if warning_count != 1 else ''})"
+                )
+                settings.last_details = _format_w2l_multi_bundle_details(result, selection)
+
+                if self.action == "SEND":
+                    settings.last_status = f"Sending {len(w2l_paths)} layers to Unreal"
+                    send_started = time.perf_counter()
+                    response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                    send_seconds = time.perf_counter() - send_started
+                    total_seconds = time.perf_counter() - button_started
+                    success = bool(response.get("success"))
+                    settings.last_status = (
+                        "Unreal layers import complete" if success else "Unreal layers import failed"
+                    )
+                    timing_report = _format_send_timing_report(
+                        f"{len(w2l_paths)} layers around camera",
+                        total_seconds,
+                        float(result.get("elapsed_seconds", 0.0) or 0.0),
+                        send_seconds,
+                        response,
+                        result.get("build_timings"),
+                    )
+                    print(timing_report)
+                    settings.last_details += "\n\n" + timing_report
+                    settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
+                    if not success:
+                        self.report({"ERROR"}, settings.last_status)
+                        return {"CANCELLED"}
+                    settings.last_status += f" ({total_seconds:.1f}s)"
+
+            self.report({"INFO"}, settings.last_status)
+            return {"FINISHED"}
+        except Exception as exc:
+            settings.last_status = "Unreal layers export failed"
+            settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+
 class WITCHER_OT_unreal_overwrite_preset(bpy.types.Operator):
     bl_idname = "witcher.unreal_overwrite_preset"
     bl_label = "Overwrite Preset"
@@ -716,6 +817,10 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
             WITCHER_OT_export_unreal_placements.bl_idname, text="Send Placements", icon="URL"
         )
         p_send.action = "SEND"
+        box.label(
+            text="'Send Nearby Layers to Unreal' is under World > Load Layers",
+            icon="INFO",
+        )
 
         if _expander(box, settings, "show_placements_advanced", "Placement Options"):
             placement_options = box.column(align=True)
@@ -938,6 +1043,53 @@ def _format_w2l_bundle_details(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_w2l_multi_bundle_details(result: dict, selection: dict | None = None) -> str:
+    manifest = result.get("manifest", {})
+    counts = result.get("counts", {}) or {}
+    skipped = counts.get("skipped", {}) or {}
+    selection = selection or {}
+    lines = [
+        f"Asset: {result.get('asset_name', '')}",
+        f"Bundle: {result.get('bundle_root', '')}",
+        f"Manifest: {result.get('manifest_path', '')}",
+        f"Content root: {manifest.get('content_root', '')}",
+        f"Source game: {str(manifest.get('source_game', 'w3')).upper()}",
+        f"Mode: {'FAST (geometry only, default material)' if result.get('skip_materials') else 'full materials + textures'}",
+        "",
+    ]
+    if selection:
+        cam = selection.get("camera_position") or (0.0, 0.0, 0.0)
+        lines.append(
+            f"Camera: ({cam[0]:.1f}, {cam[1]:.1f}, {cam[2]:.1f})"
+            f" | Radius: {selection.get('radius', 0.0):.0f}"
+            f" | Cached layers in range: {selection.get('candidate_count', 0)}"
+        )
+    lines += [
+        f"Layers sent: {counts.get('layers', 0)}"
+        f" (with placements: {counts.get('layers_with_placements', 0)})",
+        f"Unique meshes: {counts.get('unique_meshes', 0)}"
+        f" | Actors: {counts.get('actors', 0)}"
+        f" | Instancers: {counts.get('instancers', 0)}"
+        f" ({counts.get('instances', 0)} instances)",
+        f"Materials: {len(manifest.get('materials', []))}"
+        f" | Masters: {len(manifest.get('masters', []))}"
+        f" | Textures: {len(manifest.get('textures', []))}",
+        f"Build time: {result.get('elapsed_seconds', 0.0):.3f}s",
+    ]
+    if skipped:
+        lines.append("Skipped blocks: " + ", ".join(f"{key}={value}" for key, value in sorted(skipped.items())))
+    unresolved = selection.get("unresolved") or []
+    if unresolved:
+        lines.append(f"Unresolved layer files: {len(unresolved)}")
+    lines += ["", "Warnings:"]
+    warnings = manifest.get("warnings", [])
+    if warnings:
+        lines.extend(f"- {warning}" for warning in warnings)
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
 def _format_world_bundle_details(result: dict) -> str:
     manifest = result.get("manifest", {})
     terrain = manifest.get("terrain", {}) or {}
@@ -977,6 +1129,7 @@ classes = (
     WITCHER_OT_export_unreal_world,
     WITCHER_OT_export_unreal_placements,
     WITCHER_OT_export_unreal_w2l,
+    WITCHER_OT_send_unreal_layers_around_camera,
     WITCHER_OT_unreal_overwrite_preset,
     WITCHER_OT_install_unreal_plugin,
     WITCHER_OT_unreal_export_details,
