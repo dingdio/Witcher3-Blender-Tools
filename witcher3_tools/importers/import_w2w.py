@@ -911,6 +911,122 @@ def import_combined_terrain_full_map(
     return obj
 
 
+FULLMAP_BAKE_RES_DEFAULT = 8192
+
+
+def _get_scene_terrain_bake_res():
+    try:
+        return int(getattr(bpy.context.scene.witcher_file_browser, "terrain_bake_res", FULLMAP_BAKE_RES_DEFAULT))
+    except Exception:
+        return FULLMAP_BAKE_RES_DEFAULT
+
+
+def _terrain_bake_enabled():
+    try:
+        return bool(getattr(bpy.context.scene.witcher_file_browser, "terrain_bake_diffuse", True))
+    except Exception:
+        return True
+
+
+def _avg_dds_color(dds_path):
+    if not dds_path or not os.path.isfile(dds_path):
+        return None
+    img = None
+    try:
+        img = bpy_image_load_safe(dds_path, check_existing=False)
+        if img is None or img.size[0] == 0 or img.size[1] == 0:
+            return None
+        try:
+            img.colorspace_settings.name = 'Non-Color'
+        except Exception:
+            pass
+        try:
+            img.scale(4, 4)
+        except Exception:
+            pass
+        px = np.array(img.pixels[:], dtype=np.float32)
+        if px.size < 4:
+            return None
+        rgb = px.reshape(-1, 4)[:, :3].mean(axis=0)
+        return (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+    except Exception:
+        log.debug("avg color failed for %s", dds_path, exc_info=True)
+        return None
+    finally:
+        if img is not None:
+            try:
+                bpy.data.images.remove(img)
+            except Exception:
+                pass
+
+
+def _compute_terrain_layer_colors(worldFile, output_dir, hub_name):
+    import json
+    cache_path = os.path.join(output_dir, f"{hub_name}.layercolors.json")
+    try:
+        from ..unreal_export.terrain_material import extract_terrain_material_set
+        mset = extract_terrain_material_set(worldFile)
+    except Exception:
+        log.debug("terrain material set extraction failed", exc_info=True)
+        mset = None
+
+    texarray = getattr(mset, "diffuse_texarray", "") if mset else ""
+
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cached = json.load(f)
+            if cached.get("texarray") == texarray and cached.get("colors"):
+                return np.array(cached["colors"], dtype=np.float32)
+        except Exception:
+            pass
+
+    if not mset or not getattr(mset, "layers", None):
+        if mset and getattr(mset, "warnings", None):
+            log.info("Terrain bake: %s", "; ".join(mset.warnings))
+        return None
+
+    colors = []
+    for layer in mset.layers:
+        c = _avg_dds_color(getattr(layer, "diffuse_dds", ""))
+        colors.append(list(c) if c else [0.3, 0.3, 0.3])
+
+    try:
+        with open(cache_path, "w") as f:
+            json.dump({"texarray": texarray, "colors": colors}, f)
+    except Exception:
+        pass
+    return np.array(colors, dtype=np.float32)
+
+
+def _bake_fullmap_diffuse(worldFile, output_dir, hub_name, tiles, tile_res, n_tiles, buffer_paths):
+    if not _terrain_bake_enabled() or not tiles:
+        return None
+    try:
+        baked_path = os.path.join(output_dir, f"{hub_name}.terrain_baked.png")
+        src_mtime = terrain_w2ter._max_source_mtime(buffer_paths)
+        if terrain_w2ter._is_fresh(baked_path, src_mtime):
+            return baked_path
+
+        layer_colors = _compute_terrain_layer_colors(worldFile, output_dir, hub_name)
+        if layer_colors is None or not len(layer_colors):
+            log.info("Terrain bake skipped (no layer colors); using overlay palette")
+            return None
+        return terrain_w2ter.bake_terrain_fullmap_from_tiles(
+            tiles, tile_res, n_tiles, n_tiles, layer_colors, baked_path,
+            out_res=_get_scene_terrain_bake_res(),
+            use_slope=True,
+            terrain_size=worldFile.terrainSize,
+            lowest_elevation=worldFile.lowestElevation,
+            highest_elevation=worldFile.highestElevation,
+            skip_existing=True,
+            src_mtime=src_mtime,
+        )
+    except Exception:
+        log.warning("Terrain diffuse bake failed; using overlay palette", exc_info=True)
+        return None
+
+
 def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=None):
     ctx = _resolve_terrain_context(worldFile, filePath)
     hub_name = ctx["hub_name"]
@@ -935,23 +1051,44 @@ def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=N
         return None
 
     output_dir = str(ctx["w2w_dir"])
-    terrain_w2ter.combine_w2ter_tiles(
+    combined = terrain_w2ter.combine_w2ter_tiles(
         buffer_paths,
         output_dir,
         hub_name,
         res_override=tile_res,
         x_tiles_override=n_tiles,
         y_tiles_override=n_tiles,
+        targets=("heightmap",),
+        skip_existing=True,
     )
 
     heightmap_path = os.path.join(output_dir, f"{hub_name}.heightmap.png")
-    colormap_path = os.path.join(output_dir, f"{hub_name}.overlay.png")
     if not os.path.isfile(heightmap_path):
         log.warning("Missing combined heightmap PNG: %s", heightmap_path)
         return None
-    if not os.path.isfile(colormap_path):
-        log.warning("Missing combined overlay PNG: %s", colormap_path)
-        return None
+
+    tiles = (combined or {}).get("info", {}).get("tiles", {}) or {}
+    baked_path = _bake_fullmap_diffuse(
+        worldFile, output_dir, hub_name, tiles, tile_res, n_tiles, buffer_paths
+    )
+    if baked_path and os.path.isfile(baked_path):
+        colormap_path = baked_path
+        log.info("Using baked terrain diffuse: %s", os.path.basename(baked_path))
+    else:
+        terrain_w2ter.combine_w2ter_tiles(
+            buffer_paths,
+            output_dir,
+            hub_name,
+            res_override=tile_res,
+            x_tiles_override=n_tiles,
+            y_tiles_override=n_tiles,
+            targets=("overlay",),
+            skip_existing=True,
+        )
+        colormap_path = os.path.join(output_dir, f"{hub_name}.overlay.png")
+        if not os.path.isfile(colormap_path):
+            log.warning("Missing combined overlay PNG: %s", colormap_path)
+            return None
 
     obj = import_combined_terrain_full_map(
         hub_name=hub_name,
@@ -1004,9 +1141,10 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
             if buf2_path:
                 info = terrain_w2ter.TileInfo(x=x, y=y, res=tile_res, buffer_index=2)
                 overlay_path = buf2_path + ".overlay.png"
-                # Always regenerate to avoid stale cached overlays from older orientation logic.
                 try:
-                    terrain_w2ter._tile_texture_pngs(buf2_path, info)
+                    terrain_w2ter._tile_texture_pngs(
+                        buf2_path, info, which=("overlay",), skip_existing=True
+                    )
                 except Exception:
                     pass
                 if os.path.exists(overlay_path):

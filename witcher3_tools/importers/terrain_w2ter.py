@@ -21,6 +21,32 @@ BUFFER_LABELS = {
     2: "texturemap",
 }
 
+
+def _safe_mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _generator_mtime() -> float:
+    return _safe_mtime(__file__)
+
+
+def _max_source_mtime(paths) -> float:
+    newest = _generator_mtime()
+    for p in paths:
+        m = _safe_mtime(p)
+        if m > newest:
+            newest = m
+    return newest
+
+
+def _is_fresh(out_path: str, src_mtime: float) -> bool:
+    if not out_path or not os.path.isfile(out_path):
+        return False
+    return _safe_mtime(out_path) >= src_mtime
+
 # palette from bevy plugin (32 colors, RGB)
 TEXTURING_PALETTE = [
     0, 0, 0,        75, 87, 66,     68, 82, 61,
@@ -78,13 +104,12 @@ def write_png(
     if len(data) < row_bytes * height:
         raise ValueError("PNG data too small")
 
-    raw = bytearray()
-    for row in range(height):
-        start = row * row_bytes
-        raw.append(0)
-        raw.extend(data[start:start + row_bytes])
+    pixels = np.frombuffer(data, dtype=np.uint8, count=row_bytes * height).reshape(height, row_bytes)
+    raw = np.empty((height, row_bytes + 1), dtype=np.uint8)
+    raw[:, 0] = 0
+    raw[:, 1:] = pixels
 
-    compressed = zlib.compress(bytes(raw))
+    compressed = zlib.compress(raw.tobytes())
 
     ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, color_type, 0, 0, 0)
     chunks = [_png_chunk(b"IHDR", ihdr)]
@@ -391,58 +416,49 @@ def decode_bc1_to_rgba(data: bytes, width: int, height: int) -> Optional[np.ndar
         return None
     blocks_x = width // 4
     blocks_y = height // 4
-    expected = blocks_x * blocks_y * 8
+    n_blocks = blocks_x * blocks_y
+    expected = n_blocks * 8
     if len(data) < expected:
         return None
 
-    rgba = np.zeros((height, width, 4), dtype=np.uint8)
-    offset = 0
-    for by in range(blocks_y):
-        for bx in range(blocks_x):
-            c0, c1 = struct.unpack_from("<HH", data, offset)
-            bits = struct.unpack_from("<I", data, offset + 4)[0]
-            offset += 8
+    raw = np.frombuffer(data, dtype=np.uint8, count=expected).reshape(n_blocks, 8)
+    c0 = raw[:, 0].astype(np.uint16) | (raw[:, 1].astype(np.uint16) << 8)
+    c1 = raw[:, 2].astype(np.uint16) | (raw[:, 3].astype(np.uint16) << 8)
+    bits = (raw[:, 4].astype(np.uint32) | (raw[:, 5].astype(np.uint32) << 8)
+            | (raw[:, 6].astype(np.uint32) << 16) | (raw[:, 7].astype(np.uint32) << 24))
 
-            c0_rgb = _decode_rgb565(c0)
-            c1_rgb = _decode_rgb565(c1)
-            if c0 > c1:
-                colors = [
-                    (c0_rgb[0], c0_rgb[1], c0_rgb[2], 255),
-                    (c1_rgb[0], c1_rgb[1], c1_rgb[2], 255),
-                    (
-                        (2 * c0_rgb[0] + c1_rgb[0]) // 3,
-                        (2 * c0_rgb[1] + c1_rgb[1]) // 3,
-                        (2 * c0_rgb[2] + c1_rgb[2]) // 3,
-                        255,
-                    ),
-                    (
-                        (c0_rgb[0] + 2 * c1_rgb[0]) // 3,
-                        (c0_rgb[1] + 2 * c1_rgb[1]) // 3,
-                        (c0_rgb[2] + 2 * c1_rgb[2]) // 3,
-                        255,
-                    ),
-                ]
-            else:
-                colors = [
-                    (c0_rgb[0], c0_rgb[1], c0_rgb[2], 255),
-                    (c1_rgb[0], c1_rgb[1], c1_rgb[2], 255),
-                    (
-                        (c0_rgb[0] + c1_rgb[0]) // 2,
-                        (c0_rgb[1] + c1_rgb[1]) // 2,
-                        (c0_rgb[2] + c1_rgb[2]) // 2,
-                        255,
-                    ),
-                    (0, 0, 0, 0),
-                ]
+    def _rgb565(v):
+        r = (((v >> 11) & 0x1F).astype(np.uint16) * 255 // 31).astype(np.uint8)
+        g = (((v >> 5) & 0x3F).astype(np.uint16) * 255 // 63).astype(np.uint8)
+        b = ((v & 0x1F).astype(np.uint16) * 255 // 31).astype(np.uint8)
+        return r, g, b
 
-            block_x = bx * 4
-            block_y = by * 4
-            for py in range(4):
-                for px in range(4):
-                    idx = (bits >> (2 * (py * 4 + px))) & 0x03
-                    rgba[block_y + py, block_x + px] = colors[idx]
+    r0, g0, b0 = _rgb565(c0)
+    r1, g1, b1 = _rgb565(c1)
+    R0, G0, B0 = r0.astype(np.int32), g0.astype(np.int32), b0.astype(np.int32)
+    R1, G1, B1 = r1.astype(np.int32), g1.astype(np.int32), b1.astype(np.int32)
+    full = np.full(n_blocks, 255, np.int32)
 
-    return rgba
+    pal = np.zeros((n_blocks, 4, 4), dtype=np.uint8)
+    pal[:, 0] = np.stack([r0, g0, b0, np.full_like(r0, 255)], axis=1)
+    pal[:, 1] = np.stack([r1, g1, b1, np.full_like(r1, 255)], axis=1)
+
+    opaque = (c0 > c1)[:, None]
+    c2_op = np.stack([(2 * R0 + R1) // 3, (2 * G0 + G1) // 3, (2 * B0 + B1) // 3, full], axis=1).astype(np.uint8)
+    c3_op = np.stack([(R0 + 2 * R1) // 3, (G0 + 2 * G1) // 3, (B0 + 2 * B1) // 3, full], axis=1).astype(np.uint8)
+    c2_tr = np.stack([(R0 + R1) // 2, (G0 + G1) // 2, (B0 + B1) // 2, full], axis=1).astype(np.uint8)
+    c3_tr = np.zeros((n_blocks, 4), dtype=np.uint8)
+    pal[:, 2] = np.where(opaque, c2_op, c2_tr)
+    pal[:, 3] = np.where(opaque, c3_op, c3_tr)
+
+    shifts = (2 * np.arange(16, dtype=np.uint32)).reshape(1, 16)
+    idx = ((bits[:, None] >> shifts) & 0x03).astype(np.intp)
+    block_pixels = np.take_along_axis(pal, idx[:, :, None], axis=1)
+
+    rgba = (block_pixels.reshape(blocks_y, blocks_x, 4, 4, 4)
+            .transpose(0, 2, 1, 3, 4)
+            .reshape(blocks_y * 4, blocks_x * 4, 4))
+    return np.ascontiguousarray(rgba)
 
 
 def decode_tintmap_buffer_to_rgba(
@@ -473,6 +489,161 @@ def decode_tintmap_file_to_rgba(path: str, target_res_px: Optional[int] = None) 
     return decode_tintmap_buffer_to_rgba(data[:expected], tile_res_px, target_res_px)
 
 
+# Full-map diffuse bake: resolve the RED terrain blend to one EEVEE-safe texture.
+TERRAIN_SLOPE_LIMITS = tuple(i / 8.0 for i in range(7)) + (0.98,)
+
+
+def _assemble_height_u16(tile_paths: Dict[Tuple[int, int], str], res: int, x_tiles: int, y_tiles: int) -> np.ndarray:
+    """Raw uint16 heightmap matching assemble_texture_maps orientation."""
+    result = np.zeros((y_tiles * res, x_tiles * res), dtype=np.uint16)
+    for (x, y), path in tile_paths.items():
+        data = np.fromfile(path, dtype="<u2")
+        if data.size != res * res:
+            continue
+        result[y * res:(y + 1) * res, x * res:(x + 1) * res] = data.reshape((res, res))
+    return np.flipud(result)
+
+
+def _decimate_nearest(arr: np.ndarray, out: int) -> np.ndarray:
+    h, w = arr.shape[:2]
+    th, tw = min(h, out), min(w, out)
+    if th == h and tw == w:
+        return arr
+    ys = np.linspace(0, h - 1, th).astype(np.intp)
+    xs = np.linspace(0, w - 1, tw).astype(np.intp)
+    return arr[ys][:, xs]
+
+
+def _resample_avg(arr: np.ndarray, out: int) -> np.ndarray:
+    h, w = arr.shape[:2]
+    th, tw = min(h, out), min(w, out)
+    if th == h and tw == w:
+        return arr.astype(np.float32)
+    if h % th == 0 and w % tw == 0:
+        fy, fx = h // th, w // tw
+        a = arr.astype(np.float32)
+        if arr.ndim == 2:
+            return a.reshape(th, fy, tw, fx).mean(axis=(1, 3))
+        return a.reshape(th, fy, tw, fx, arr.shape[2]).mean(axis=(1, 3))
+    return _decimate_nearest(arr, out).astype(np.float32)
+
+
+def bake_terrain_fullmap_diffuse(
+    overlay_idx: np.ndarray,
+    bkgrnd_idx: np.ndarray,
+    slope_band_idx: Optional[np.ndarray],
+    height_u16: Optional[np.ndarray],
+    tint_rgb: Optional[np.ndarray],
+    layer_colors,
+    terrain_size: float,
+    elev_range: float,
+    out_res: int = 8192,
+    use_slope: bool = True,
+    slope_sharpness: float = 0.5,
+    hole_color: Tuple[float, float, float] = (0.25, 0.22, 0.18),
+) -> Optional[np.ndarray]:
+    """Resolve terrain layer indices, slope, and tint into one uint8 RGB image."""
+    lut = np.asarray(layer_colors, dtype=np.float32)
+    if lut.ndim != 2 or lut.shape[1] != 3 or lut.shape[0] == 0:
+        return None
+    n = lut.shape[0]
+
+    work = max(overlay_idx.shape[0], overlay_idx.shape[1]) if out_res <= 0 else out_res
+    overlay_idx = _decimate_nearest(overlay_idx, work)
+    bkgrnd_idx = _decimate_nearest(bkgrnd_idx, work)
+
+    def lookup(idx_map: np.ndarray) -> np.ndarray:
+        idx = idx_map.astype(np.intp)
+        col = lut[np.clip(idx - 1, 0, n - 1)]
+        hole = idx <= 0
+        if hole.any():
+            col = col.copy()
+            col[hole] = np.asarray(hole_color, np.float32)
+        return col
+
+    base = lookup(overlay_idx)
+
+    if use_slope and height_u16 is not None and slope_band_idx is not None:
+        bk = lookup(bkgrnd_idx)
+        h_m = _resample_avg(height_u16, work) * (float(elev_range) / 65535.0)
+        spacing = float(terrain_size) / max(h_m.shape[1], 1)
+        gy, gx = np.gradient(h_m, spacing if spacing > 0 else 1.0)
+        slope = np.sqrt(gx * gx + gy * gy)
+        del gx, gy, h_m
+        limits = np.asarray(TERRAIN_SLOPE_LIMITS, np.float32)[
+            np.clip(_decimate_nearest(slope_band_idx, work).astype(np.intp), 0, 7)
+        ]
+        sb = np.clip((slope - limits) / max(slope_sharpness, 1e-4), 0.0, 1.0)[..., None]
+        base = base * (1.0 - sb) + bk * sb
+        del bk, sb, slope, limits
+
+    if tint_rgb is not None:
+        t = np.clip(_resample_avg(tint_rgb, work), 0.0, 1.0)
+        if t.shape[:2] == base.shape[:2] and t.shape[2] >= 3:
+            t = t[..., :3]
+            base = np.where(t < 0.5, 2.0 * t * base, 1.0 - 2.0 * (1.0 - t) * (1.0 - base))
+            del t
+
+    return (np.clip(base, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+
+def bake_terrain_fullmap_from_tiles(
+    tiles: Dict[int, Dict[Tuple[int, int], str]],
+    res: int,
+    x_tiles: int,
+    y_tiles: int,
+    layer_colors,
+    output_path: str,
+    out_res: int = 8192,
+    use_slope: bool = True,
+    terrain_size: float = 0.0,
+    lowest_elevation: float = 0.0,
+    highest_elevation: float = 0.0,
+    skip_existing: bool = False,
+    src_mtime: float = 0.0,
+) -> Optional[str]:
+    if 2 not in tiles:
+        return None
+    if skip_existing and _is_fresh(output_path, src_mtime):
+        return output_path
+
+    bkgrnd, overlay, blend = assemble_texture_maps(tiles[2], res, x_tiles, y_tiles)
+    slope_band = (blend & 0x07).astype(np.uint8)
+
+    height = None
+    if use_slope and 1 in tiles:
+        height = _assemble_height_u16(tiles[1], res, x_tiles, y_tiles)
+
+    tint = None
+    tint_idx = select_tintmap_buffer_index(tiles, res)
+    if tint_idx is not None:
+        tile_blocks = get_tintmap_tile_blocks(tiles[tint_idx])
+        if tile_blocks:
+            tintmap = assemble_tintmap(tiles[tint_idx], tile_blocks, x_tiles, y_tiles)
+            tw, th = tile_blocks * 4 * x_tiles, tile_blocks * 4 * y_tiles
+            rgba = decode_bc1_to_rgba(tintmap, tw, th)
+            if rgba is not None:
+                rgba = np.flipud(rgba)
+                if res > tile_blocks * 4 and res % (tile_blocks * 4) == 0:
+                    s = res // (tile_blocks * 4)
+                    rgba = np.repeat(np.repeat(rgba, s, axis=0), s, axis=1)
+                tint = rgba[..., :3].astype(np.float32) / 255.0
+
+    elev_range = abs(float(lowest_elevation)) + abs(float(highest_elevation))
+    rgb = bake_terrain_fullmap_diffuse(
+        overlay, bkgrnd, slope_band, height, tint, layer_colors,
+        terrain_size, elev_range, out_res=out_res, use_slope=use_slope,
+    )
+    if rgb is None:
+        return None
+
+    rgba_out = np.empty((rgb.shape[0], rgb.shape[1], 4), dtype=np.uint8)
+    rgba_out[..., :3] = rgb
+    rgba_out[..., 3] = 255
+    write_png(output_path, rgb.shape[1], rgb.shape[0], 6, 8, rgba_out.tobytes())
+    return output_path
+
+
 def _tile_heightmap_png(path: str, info: TileInfo) -> Optional[str]:
     data = np.fromfile(path, dtype="<u2")
     if data.size != info.res * info.res:
@@ -485,27 +656,49 @@ def _tile_heightmap_png(path: str, info: TileInfo) -> Optional[str]:
     return out_path
 
 
-def _tile_texture_pngs(path: str, info: TileInfo) -> List[str]:
+def _tile_texture_pngs(
+    path: str,
+    info: TileInfo,
+    which: Optional[Tuple[str, ...]] = None,
+    skip_existing: bool = False,
+) -> List[str]:
+    if which is None:
+        which = ("bkgrnd", "overlay", "blendcontrol")
+    wanted = set(which)
     outputs: List[str] = []
+    base = path
+    channels = (
+        ("bkgrnd", ".bkgrnd.png", 5, 0x1F, None),
+        ("overlay", ".overlay.png", 0, 0x1F, None),
+        ("blendcontrol", ".blendcontrol.png", 10, 0x3F, None),
+    )
+
+    src_mtime = _max_source_mtime([path])
+    todo = []
+    for name, suffix, shift, mask, _pal in channels:
+        if name not in wanted:
+            continue
+        out_path = base + suffix
+        if skip_existing and _is_fresh(out_path, src_mtime):
+            outputs.append(out_path)
+            continue
+        todo.append((name, out_path, shift, mask))
+
+    if not todo:
+        return outputs
+
     data = np.fromfile(path, dtype="<u2")
     if data.size != info.res * info.res:
         return outputs
-    tile = data.reshape((info.res, info.res))
-    tile = np.flipud(tile)
+    tile = np.flipud(data.reshape((info.res, info.res)))
 
-    overlay = (tile & 0x1F).astype(np.uint8)
-    bkgrnd = ((tile >> 5) & 0x1F).astype(np.uint8)
-    blend = ((tile >> 10) & 0x3F).astype(np.uint8)
-
-    base = path
-    palette = bytes(TEXTURING_PALETTE)
-    bk_path = base + ".bkgrnd.png"
-    ov_path = base + ".overlay.png"
-    bl_path = base + ".blendcontrol.png"
-    write_png(bk_path, info.res, info.res, 3, 8, bkgrnd.tobytes(), palette)
-    write_png(ov_path, info.res, info.res, 3, 8, overlay.tobytes(), palette)
-    write_png(bl_path, info.res, info.res, 3, 8, blend.tobytes(), blendcontrol_palette())
-    outputs.extend([bk_path, ov_path, bl_path])
+    texturing_palette = bytes(TEXTURING_PALETTE)
+    blend_palette = blendcontrol_palette()
+    for name, out_path, shift, mask in todo:
+        channel = ((tile >> shift) & mask).astype(np.uint8)
+        palette = blend_palette if name == "blendcontrol" else texturing_palette
+        write_png(out_path, info.res, info.res, 3, 8, channel.tobytes(), palette)
+        outputs.append(out_path)
     return outputs
 
 
@@ -565,6 +758,9 @@ def _select_override_tiles(override: Optional[int], detected: int) -> int:
     return detected
 
 
+COMBINE_TARGETS_ALL = ("per_tile", "heightmap", "overlay", "bkgrnd", "blend", "tint")
+
+
 def combine_w2ter_tiles(
     buffer_paths: List[str],
     output_dir: str,
@@ -572,7 +768,11 @@ def combine_w2ter_tiles(
     res_override: Optional[int] = None,
     x_tiles_override: Optional[int] = None,
     y_tiles_override: Optional[int] = None,
+    targets: Optional[Tuple[str, ...]] = None,
+    skip_existing: bool = False,
 ) -> Dict[str, object]:
+    """Assemble selected per-tile .w2ter buffers into combined terrain maps."""
+    want = set(COMBINE_TARGETS_ALL if targets is None else targets)
     info = collect_tile_buffers(buffer_paths)
     res_detected = info.get("res")
     res = res_override or res_detected
@@ -589,66 +789,89 @@ def combine_w2ter_tiles(
 
     os.makedirs(output_dir, exist_ok=True)
     outputs: List[str] = []
+    src_mtime = _max_source_mtime(buffer_paths) if skip_existing else 0.0
 
-    # Individual per-tile images are exported next to source .w2ter buffers.
-    tile_image_outputs = export_tile_images(buffer_paths)
-    outputs.extend(tile_image_outputs)
+    def _needs(out_path: str) -> bool:
+        return not (skip_existing and _is_fresh(out_path, src_mtime))
 
-    if 1 in tiles:
-        heightmap = assemble_heightmap(tiles[1], res, x_tiles, y_tiles)
-        out_path = os.path.join(output_dir, f"combined.{hub_name}.data")
-        with open(out_path, "wb") as target:
-            target.write(heightmap)
-        outputs.append(out_path)
-        try:
-            png_path = os.path.join(output_dir, f"{hub_name}.heightmap.png")
-            write_png(png_path, res * x_tiles, res * y_tiles, 0, 16, heightmap)
-            outputs.append(png_path)
-        except Exception:
-            pass
+    if "per_tile" in want:
+        outputs.extend(export_tile_images(buffer_paths))
 
-    if 2 in tiles:
-        bkgrnd, overlay, blend = assemble_texture_maps(tiles[2], res, x_tiles, y_tiles)
-        out_bk = os.path.join(output_dir, f"combined.{hub_name}.bkgrnd.data")
-        out_ov = os.path.join(output_dir, f"combined.{hub_name}.overlay.data")
-        out_bl = os.path.join(output_dir, f"combined.{hub_name}.blendcontrol.data")
-        bkgrnd.tofile(out_bk)
-        overlay.tofile(out_ov)
-        blend.tofile(out_bl)
-        outputs.extend([out_bk, out_ov, out_bl])
-        try:
-            palette = bytes(TEXTURING_PALETTE)
-            bk_png = os.path.join(output_dir, f"{hub_name}.bkgrnd.png")
-            ov_png = os.path.join(output_dir, f"{hub_name}.overlay.png")
-            bl_png = os.path.join(output_dir, f"{hub_name}.blendcontrol.png")
-            write_png(bk_png, res * x_tiles, res * y_tiles, 3, 8, bkgrnd.tobytes(), palette)
-            write_png(ov_png, res * x_tiles, res * y_tiles, 3, 8, overlay.tobytes(), palette)
-            write_png(bl_png, res * x_tiles, res * y_tiles, 3, 8, blend.tobytes(), blendcontrol_palette())
-            outputs.extend([bk_png, ov_png, bl_png])
-        except Exception:
-            pass
+    if "heightmap" in want and 1 in tiles:
+        data_path = os.path.join(output_dir, f"combined.{hub_name}.data")
+        png_path = os.path.join(output_dir, f"{hub_name}.heightmap.png")
+        if _needs(data_path) or _needs(png_path):
+            heightmap = assemble_heightmap(tiles[1], res, x_tiles, y_tiles)
+            if _needs(data_path):
+                with open(data_path, "wb") as target:
+                    target.write(heightmap)
+            if _needs(png_path):
+                try:
+                    write_png(png_path, res * x_tiles, res * y_tiles, 0, 16, heightmap)
+                except Exception:
+                    pass
+        for p in (data_path, png_path):
+            if os.path.isfile(p):
+                outputs.append(p)
 
-    tint_idx = select_tintmap_buffer_index(tiles, res)
-    if tint_idx is not None:
-        tile_blocks = get_tintmap_tile_blocks(tiles[tint_idx])
-        if tile_blocks:
-            tintmap = assemble_tintmap(tiles[tint_idx], tile_blocks, x_tiles, y_tiles)
-            width = tile_blocks * 4 * x_tiles
-            height = tile_blocks * 4 * y_tiles
-            out_dds = os.path.join(output_dir, f"combined.{hub_name}.dds")
-            write_dds_dxt1(out_dds, width, height, tintmap)
-            outputs.append(out_dds)
-            try:
-                rgba = decode_bc1_to_rgba(tintmap, width, height)
-                if rgba is not None:
-                    rgba = np.flipud(rgba)
-                    if res > tile_blocks * 4 and res % (tile_blocks * 4) == 0:
-                        scale = res // (tile_blocks * 4)
-                        rgba = np.repeat(np.repeat(rgba, scale, axis=0), scale, axis=1)
-                    out_png = os.path.join(output_dir, f"{hub_name}.tint.png")
-                    write_png(out_png, rgba.shape[1], rgba.shape[0], 6, 8, rgba.tobytes())
-                    outputs.append(out_png)
-            except Exception:
-                pass
+    texture_channels = {"overlay", "bkgrnd", "blend"} & want
+    if texture_channels and 2 in tiles:
+        palette = bytes(TEXTURING_PALETTE)
+        specs = {
+            "bkgrnd": (f"combined.{hub_name}.bkgrnd.data", f"{hub_name}.bkgrnd.png", palette),
+            "overlay": (f"combined.{hub_name}.overlay.data", f"{hub_name}.overlay.png", palette),
+            "blend": (f"combined.{hub_name}.blendcontrol.data", f"{hub_name}.blendcontrol.png", blendcontrol_palette()),
+        }
+        plan = []
+        for name in ("bkgrnd", "overlay", "blend"):
+            if name not in texture_channels:
+                continue
+            data_name, png_name, pal = specs[name]
+            plan.append((name, os.path.join(output_dir, data_name), os.path.join(output_dir, png_name), pal))
+
+        if any(_needs(d) or _needs(p) for (_n, d, p, _pal) in plan):
+            bkgrnd, overlay, blend = assemble_texture_maps(tiles[2], res, x_tiles, y_tiles)
+            channel_arrays = {"bkgrnd": bkgrnd, "overlay": overlay, "blend": blend}
+            for name, data_path, png_path, pal in plan:
+                arr = channel_arrays[name]
+                if _needs(data_path):
+                    arr.tofile(data_path)
+                if _needs(png_path):
+                    try:
+                        write_png(png_path, res * x_tiles, res * y_tiles, 3, 8, arr.tobytes(), pal)
+                    except Exception:
+                        pass
+        for _name, data_path, png_path, _pal in plan:
+            for p in (data_path, png_path):
+                if os.path.isfile(p):
+                    outputs.append(p)
+
+    if "tint" in want:
+        tint_idx = select_tintmap_buffer_index(tiles, res)
+        if tint_idx is not None:
+            tile_blocks = get_tintmap_tile_blocks(tiles[tint_idx])
+            if tile_blocks:
+                width = tile_blocks * 4 * x_tiles
+                height = tile_blocks * 4 * y_tiles
+                out_dds = os.path.join(output_dir, f"combined.{hub_name}.dds")
+                out_png = os.path.join(output_dir, f"{hub_name}.tint.png")
+                if _needs(out_dds) or _needs(out_png):
+                    tintmap = assemble_tintmap(tiles[tint_idx], tile_blocks, x_tiles, y_tiles)
+                    if _needs(out_dds):
+                        write_dds_dxt1(out_dds, width, height, tintmap)
+                    if _needs(out_png):
+                        try:
+                            rgba = decode_bc1_to_rgba(tintmap, width, height)
+                            if rgba is not None:
+                                rgba = np.flipud(rgba)
+                                if res > tile_blocks * 4 and res % (tile_blocks * 4) == 0:
+                                    scale = res // (tile_blocks * 4)
+                                    rgba = np.repeat(np.repeat(rgba, scale, axis=0), scale, axis=1)
+                                write_png(out_png, rgba.shape[1], rgba.shape[0], 6, 8, rgba.tobytes())
+                        except Exception:
+                            pass
+                for p in (out_dds, out_png):
+                    if os.path.isfile(p):
+                        outputs.append(p)
 
     return {"outputs": outputs, "info": info}
