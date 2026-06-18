@@ -84,6 +84,9 @@ _PLAN_ITEM_EXTRA_KEYS = frozenset(
         "sector_flags",
         "drawable_flags",
         "engine_visible",
+        "component_type",
+        "component_name",
+        "action_name",
     }
 )
 _SECTOR_FLAG_MESH_PART_OF_ENTITY_PROXY = 1 << 10
@@ -117,6 +120,20 @@ def _path_indicates_proxy_mesh(repo_path, name=""):
             continue
         tokens.extend(token for token in re.split(r"[_\-\s]+", stem) if token)
     return any(token == "proxy" for token in tokens)
+
+
+def _mesh_label_from_repo_path(repo_path):
+    repo_path = str(repo_path or "").replace("\\", "/").strip()
+    return Path(repo_path).stem if repo_path else ""
+
+
+def _component_plan_label(component_type, component_name="", repo_path=""):
+    component_type = str(component_type or "Component").strip() or "Component"
+    component_name = str(component_name or "").strip()
+    label = _mesh_label_from_repo_path(repo_path) or component_name
+    if label and label != component_type:
+        return f"{label} ({component_type})"
+    return component_type
 
 
 def _path_extension(repo_path):
@@ -271,6 +288,7 @@ def _scan_cr2w_structure(
     result = _new_scan_result()
     pending_entities = []
     component_map = {}
+    component_parent_map = {}
 
     exports = list(getattr(cr2w_file, "CR2WExport", []) or [])
     for export_index, export in enumerate(exports):
@@ -333,6 +351,7 @@ def _scan_cr2w_structure(
                 )
             if entity_scan.get("template") is not None:
                 _merge_scan_completeness(result, entity_scan.get("template"))
+            entity_scan["_export_index"] = export_index
             pending_entities.append(entity_scan)
             marker = _bounds_marker_from_transform(
                 entity_scan.get("transform"),
@@ -367,6 +386,12 @@ def _scan_cr2w_structure(
             if component_desc is None:
                 continue
             component_map[export_index] = component_desc
+            try:
+                parent_id = int(getattr(export, "parentID", 0) or 0)
+            except Exception:
+                parent_id = 0
+            if parent_id > 0:
+                component_parent_map.setdefault(parent_id - 1, []).append(component_desc)
             marker = _bounds_marker_from_transform(
                 component_desc.get("transform"),
                 component_desc.get("streaming_distance", 0.0),
@@ -376,15 +401,22 @@ def _scan_cr2w_structure(
 
     for entity in pending_entities:
         components = []
+        seen_components = set()
         for component_index in list(entity.get("component_indices", []) or []):
             actual_index = int(component_index or 0) - 1
             if actual_index < 0:
                 continue
             component_desc = component_map.get(actual_index)
-            if component_desc is not None:
+            if component_desc is not None and id(component_desc) not in seen_components:
                 components.append(component_desc)
+                seen_components.add(id(component_desc))
+        for component_desc in component_parent_map.get(int(entity.get("_export_index", -1)), []) or []:
+            if component_desc is not None and id(component_desc) not in seen_components:
+                components.append(component_desc)
+                seen_components.add(id(component_desc))
         entity["components"] = components
         entity.pop("component_indices", None)
+        entity.pop("_export_index", None)
         result["entities"].append(entity)
 
     return result
@@ -885,6 +917,7 @@ def _scan_entity_export(
         "stream_items": list(stream_items or []),
         "component_indices": component_indices,
         "components": [],
+        "action_name": str(props.get("actionName", "") or "").strip(),
         "streaming_distance": float(props.get("streamingDistance", 0.0) or 0.0),
         "unresolved_dependencies": unresolved_dependencies,
     }
@@ -901,9 +934,10 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
             if not repo_path:
                 return None
             drawable_flags = props.get("drawableFlags")
+            component_name = str(props.get("name", "") or "").strip()
             return {
-                "kind": "mesh",
-                "name": Path(repo_path).stem or export_name,
+                "kind": "component_mesh",
+                "name": _component_plan_label(export_name, component_name, repo_path),
                 "repo_path": repo_path,
                 "transform": transform,
                 "matrix": None,
@@ -912,6 +946,9 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
                 "is_proxy_mesh": _path_indicates_proxy_mesh(repo_path, export_name),
                 "drawable_flags": drawable_flags,
                 "engine_visible": _drawable_flags_visible_from_value(drawable_flags, default=True),
+                "component_type": export_name,
+                "component_name": component_name,
+                "action_name": str(props.get("actionName", "") or "").strip(),
             }
         if export_name == "CClothComponent":
             repo_path = str(props.get("resource", "") or "").strip()
@@ -947,11 +984,11 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
         repo_path = str(props.get("mesh", "") or props.get("resource", "") or "").strip()
         if not repo_path:
             return None
-        component_label = str(props.get("name", "") or "").strip() or Path(repo_path).stem or export_name
+        component_label = str(props.get("name", "") or "").strip()
         drawable_flags = props.get("drawableFlags")
         return {
             "kind": "component_mesh",
-            "name": f"{export_name} {component_label}",
+            "name": _component_plan_label(export_name, component_label, repo_path),
             "repo_path": repo_path,
             "transform": transform,
             "matrix": None,
@@ -961,6 +998,9 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
             "is_proxy_mesh": _path_indicates_proxy_mesh(repo_path, export_name),
             "drawable_flags": drawable_flags,
             "engine_visible": _drawable_flags_visible_from_value(drawable_flags, default=True),
+            "component_type": export_name,
+            "component_name": component_label,
+            "action_name": str(props.get("actionName", "") or "").strip(),
         }
 
     if export_name == "CPointLightComponent":
@@ -1155,6 +1195,8 @@ def _append_entity(state, entity, *, parent_id, parent_position):
         translation=None,
         world_position=entity_position,
     )
+    if entity_id and state.get("items") and entity.get("action_name"):
+        state["items"][-1]["action_name"] = str(entity.get("action_name") or "")
     item_count_before_children = len(state["items"])
 
     for item_desc in list(entity.get("stream_items", []) or []):
@@ -1168,7 +1210,11 @@ def _append_entity(state, entity, *, parent_id, parent_position):
         _append_scan_entities(state, template_scan, parent_id=entity_id, parent_position=entity_position)
 
     if len(state["items"]) == item_count_before_children:
-        _remove_plan_item(state, entity_id)
+        for item in reversed(state.get("items", [])):
+            if str(item.get("id", "") or "") == str(entity_id):
+                item["kind"] = "entity_empty"
+                item["repo_path"] = ""
+                break
 
 
 def _append_item_from_desc(state, item_desc, *, parent_id, parent_position):

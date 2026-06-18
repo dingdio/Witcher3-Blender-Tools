@@ -7,8 +7,8 @@ log = logging.getLogger(__name__)
 import numpy as np
 from ..importers.import_texarray import insert_color, get_texture_node, insert_heightmap_to_disp
 from ..importers import terrain_w2ter
-from ..CR2W.CR2W_file import WORLD
-from ..CR2W.common_blender import repo_file, bpy_image_load_safe
+from ..CR2W.CR2W_file import WORLD, read_CR2W
+from ..CR2W.common_blender import repo_file, bpy_image_load_safe, redkit_repo_context, win_safe_path
 from .. import CR2W
 from ..importers import import_w2l
 from ..CR2W.third_party_libs import yaml
@@ -24,7 +24,8 @@ from bpy.props import (
 )
 from .. import get_uncook_path
 from .. import get_fbx_uncook_path
-from ..extension_paths import get_dev_override
+from .. import get_all_addon_prefs
+from ..extension_paths import get_dev_override, get_redkit_working_root
 
 W2W_NODES_PROP = "witcher_w2w_nodes"
 W2W_LIST_PROP = "witcher_w2w_list_tree"
@@ -361,6 +362,7 @@ def AddCLayerGroup(groups, parent_collection, world_path=""):
     if groups.ChildrenInfos:
         for ChildInfo in groups.ChildrenInfos:
             child_collection = bpy.data.collections.new(os.path.basename(ChildInfo.depotFilePath))
+            child_collection['w2layer_path'] = ChildInfo.depotFilePath
             child_collection['level_path'] = ChildInfo.depotFilePath
             child_collection['layerBuildTag'] = ChildInfo.layerBuildTag
             child_collection['group_type'] = "LayerInfo"
@@ -395,7 +397,8 @@ def btn_import_w2w(worldFile: WORLD, filePath):
     layer_collection = bpy.context.view_layer.layer_collection.children[collection.name]
     bpy.context.view_layer.active_layer_collection = layer_collection
 
-    do_import_map_terrain(worldFile, filePath, world_root_collection=collection)
+    with redkit_repo_context(filePath):
+        do_import_map_terrain(worldFile, filePath, world_root_collection=collection)
 
 
 from pathlib import Path
@@ -414,27 +417,173 @@ def btn_import_radish(filename):
         worldFile.tileRes = data['terrain']['tileRes']
         do_import_map_terrain(worldFile, filePath)
 
-def _resolve_tile_buffer(terrain_tiles_dir, terrain_tiles_rel, buf_name):
+_MATERIALIZED_W2TER_BUFFER_CACHE = {}
+
+
+def _path_is_under_root(path, root):
+    if not path or not root:
+        return False
+    try:
+        norm_path = os.path.normcase(os.path.normpath(os.path.abspath(str(path))))
+        norm_root = os.path.normcase(os.path.normpath(os.path.abspath(str(root))))
+        return os.path.commonpath([norm_path, norm_root]) == norm_root
+    except Exception:
+        return False
+
+
+def _relpath_under_root(path, root):
+    if not _path_is_under_root(path, root):
+        return None
+    try:
+        return os.path.relpath(str(path), str(root))
+    except Exception:
+        return None
+
+
+def _configured_redkit_roots():
+    roots = []
+    try:
+        prefs = get_all_addon_prefs(bpy.context)
+    except Exception:
+        prefs = None
+    if not prefs:
+        return roots
+    for attr in ("redkit_depot_path", "redkit_uncooked_path"):
+        value = str(getattr(prefs, attr, "") or "").strip()
+        if value:
+            roots.append(os.path.normpath(value))
+    return roots
+
+
+def _first_containing_root(path, roots):
+    for root in roots or []:
+        if _path_is_under_root(path, root):
+            return root
+    return ""
+
+
+def _materialize_w2ter_embedded_buffers(tile_path, working_tiles_dir):
+    """Write REDkit/source .w2ter embedded buffers as sidecars in working storage."""
+    if not tile_path or not working_tiles_dir:
+        return []
+    try:
+        source_path = os.path.abspath(str(tile_path))
+    except Exception:
+        source_path = str(tile_path)
+    if not os.path.isfile(win_safe_path(source_path)):
+        return []
+
+    try:
+        source_mtime = os.path.getmtime(win_safe_path(source_path))
+    except Exception:
+        source_mtime = 0.0
+    cache_key = (
+        os.path.normcase(os.path.normpath(source_path)),
+        os.path.normcase(os.path.normpath(str(working_tiles_dir))),
+        source_mtime,
+    )
+    cached = _MATERIALIZED_W2TER_BUFFER_CACHE.get(cache_key)
+    if cached:
+        return [p for p in cached if os.path.isfile(win_safe_path(p))]
+
+    try:
+        cr2w_file = read_CR2W(source_path)
+    except Exception:
+        log.debug("Failed to read REDkit terrain tile buffers: %s", source_path, exc_info=True)
+        return []
+
+    buffers = list(getattr(cr2w_file, "BufferData", None) or [])
+    buffer_infos = list(getattr(cr2w_file, "CR2WBuffer", None) or [])
+    if not buffers:
+        return []
+
+    try:
+        os.makedirs(win_safe_path(str(working_tiles_dir)), exist_ok=True)
+    except Exception:
+        log.warning("Could not create REDkit terrain working directory: %s", working_tiles_dir, exc_info=True)
+        return []
+
+    base_name = os.path.basename(source_path)
+    outputs = []
+    for idx, data in enumerate(buffers):
+        if data is None:
+            continue
+        info = buffer_infos[idx] if idx < len(buffer_infos) else None
+        buffer_index = int(getattr(info, "index", idx + 1) or (idx + 1))
+        out_path = os.path.join(str(working_tiles_dir), f"{base_name}.{buffer_index}.buffer")
+        safe_out = win_safe_path(out_path)
+        expected_size = len(data)
+        write_needed = True
+        if os.path.isfile(safe_out):
+            try:
+                write_needed = (
+                    os.path.getsize(safe_out) != expected_size
+                    or os.path.getmtime(safe_out) < source_mtime
+                )
+            except Exception:
+                write_needed = True
+        if write_needed:
+            try:
+                with open(safe_out, "wb") as handle:
+                    handle.write(data)
+                if source_mtime:
+                    os.utime(safe_out, (source_mtime, source_mtime))
+            except Exception:
+                log.warning("Could not materialize REDkit terrain buffer: %s", out_path, exc_info=True)
+                continue
+        outputs.append(out_path)
+
+    _MATERIALIZED_W2TER_BUFFER_CACHE[cache_key] = outputs
+    return outputs
+
+
+def _embedded_tile_source_path(terrain_tiles_dir, terrain_tiles_rel, tile_name):
+    disk_path = os.path.join(str(terrain_tiles_dir), tile_name)
+    if os.path.isfile(win_safe_path(disk_path)):
+        return disk_path
+    if terrain_tiles_rel:
+        try:
+            rel_path = os.path.join(terrain_tiles_rel, tile_name)
+            abs_path = repo_file(rel_path)
+            if abs_path and os.path.isfile(win_safe_path(abs_path)):
+                return abs_path
+        except Exception:
+            pass
+    return ""
+
+
+def _resolve_tile_buffer(terrain_tiles_dir, terrain_tiles_rel, buf_name, working_tiles_dir=None):
     """Find a tile buffer file on disk or extract from bundle via repo_file."""
     # Check disk first
     disk_path = os.path.join(str(terrain_tiles_dir), buf_name)
-    if os.path.isfile(disk_path):
+    if os.path.isfile(win_safe_path(disk_path)):
         return disk_path
+    if working_tiles_dir:
+        working_path = os.path.join(str(working_tiles_dir), buf_name)
+        if os.path.isfile(win_safe_path(working_path)):
+            return working_path
     # Try bundle extraction via repo_file
     if terrain_tiles_rel:
         rel_path = os.path.join(terrain_tiles_rel, buf_name)
         abs_path = repo_file(rel_path)
-        if abs_path and os.path.exists(abs_path):
+        if abs_path and os.path.exists(win_safe_path(abs_path)):
             return abs_path
+    if working_tiles_dir:
+        tile_name = terrain_w2ter.W2TER_BUFFER_RE.sub("", buf_name)
+        source_tile = _embedded_tile_source_path(terrain_tiles_dir, terrain_tiles_rel, tile_name)
+        if source_tile:
+            for path in _materialize_w2ter_embedded_buffers(source_tile, working_tiles_dir):
+                if os.path.basename(path).lower() == buf_name.lower():
+                    return path
     return None
 
 
 def _discover_tile_count(terrain_tiles_dir):
     """Discover max tile count by scanning files on disk."""
     max_coord = -1
-    if os.path.isdir(str(terrain_tiles_dir)):
+    if os.path.isdir(win_safe_path(str(terrain_tiles_dir))):
         try:
-            for entry in os.scandir(str(terrain_tiles_dir)):
+            for entry in os.scandir(win_safe_path(str(terrain_tiles_dir))):
                 info = terrain_w2ter.parse_tile_filename(entry.name)
                 if info:
                     max_coord = max(max_coord, info.x, info.y)
@@ -462,13 +611,23 @@ def _resolve_terrain_context(worldFile, filePath):
 
     # Compute relative path for bundle extraction
     terrain_tiles_rel = None
+    output_dir = w2w_dir
+    working_tiles_dir = None
     try:
         uncook_path = get_uncook_path(bpy.context)
-        if uncook_path:
-            rel_dir = os.path.relpath(str(w2w_dir), uncook_path)
+        rel_dir = _relpath_under_root(str(w2w_dir), uncook_path) if uncook_path else None
+        if rel_dir:
             terrain_tiles_rel = os.path.join(rel_dir, "terrain_tiles")
     except Exception:
         pass
+
+    redkit_root = _first_containing_root(str(w2w_dir), _configured_redkit_roots())
+    if redkit_root:
+        rel_dir = _relpath_under_root(str(w2w_dir), redkit_root)
+        if rel_dir:
+            terrain_tiles_rel = os.path.join(rel_dir, "terrain_tiles")
+            output_dir = Path(get_redkit_working_root(create=True)) / rel_dir
+            working_tiles_dir = output_dir / "terrain_tiles"
 
     # Compute tile grid from WORLD params
     tile_res = worldFile.tileRes or 256
@@ -484,8 +643,10 @@ def _resolve_terrain_context(worldFile, filePath):
     return {
         "hub_name": hub_name,
         "w2w_dir": w2w_dir,
+        "output_dir": output_dir,
         "terrain_tiles_dir": terrain_tiles_dir,
         "terrain_tiles_rel": terrain_tiles_rel,
+        "working_tiles_dir": working_tiles_dir,
         "tile_res": tile_res,
         "n_tiles": n_tiles,
     }
@@ -508,7 +669,7 @@ def _get_scene_terrain_import_mode():
     return TERRAIN_IMPORT_FULL_MAP
 
 
-def _collect_tile_buffer_paths_for_combine(terrain_tiles_dir, terrain_tiles_rel, n_tiles, tile_res):
+def _collect_tile_buffer_paths_for_combine(terrain_tiles_dir, terrain_tiles_rel, n_tiles, tile_res, working_tiles_dir=None):
     """Collect tile buffer paths for combine workflow.
 
     Includes existing on-disk buffers and tries to resolve key buffers from bundle.
@@ -516,9 +677,9 @@ def _collect_tile_buffer_paths_for_combine(terrain_tiles_dir, terrain_tiles_rel,
     buffer_paths = []
     seen = set()
 
-    if os.path.isdir(str(terrain_tiles_dir)):
+    if os.path.isdir(win_safe_path(str(terrain_tiles_dir))):
         try:
-            for entry in os.scandir(str(terrain_tiles_dir)):
+            for entry in os.scandir(win_safe_path(str(terrain_tiles_dir))):
                 if not entry.is_file():
                     continue
                 if not terrain_w2ter.is_w2ter_buffer_name(entry.name):
@@ -530,13 +691,37 @@ def _collect_tile_buffer_paths_for_combine(terrain_tiles_dir, terrain_tiles_rel,
         except Exception:
             pass
 
+    if working_tiles_dir and os.path.isdir(win_safe_path(str(terrain_tiles_dir))):
+        try:
+            for entry in os.scandir(win_safe_path(str(terrain_tiles_dir))):
+                if not entry.is_file():
+                    continue
+                if not terrain_w2ter.is_w2ter_tile_name(entry.name):
+                    continue
+                if terrain_w2ter.is_w2ter_buffer_name(entry.name):
+                    continue
+                for path in _materialize_w2ter_embedded_buffers(entry.path, working_tiles_dir):
+                    if not terrain_w2ter.is_w2ter_buffer_name(os.path.basename(path)):
+                        continue
+                    apath = os.path.abspath(path)
+                    if apath not in seen:
+                        buffer_paths.append(apath)
+                        seen.add(apath)
+        except Exception:
+            log.debug("Failed to materialize REDkit terrain tiles from %s", terrain_tiles_dir, exc_info=True)
+
     # Ensure required height/texture buffers can be resolved from bundle paths too.
     for y in range(max(0, int(n_tiles))):
         for x in range(max(0, int(n_tiles))):
             tile_name = f"tile_{y}_x_{x}_res{tile_res}"
             for idx in (1, 2):
                 buf_name = f"{tile_name}.w2ter.{idx}.buffer"
-                buf_path = _resolve_tile_buffer(terrain_tiles_dir, terrain_tiles_rel, buf_name)
+                buf_path = _resolve_tile_buffer(
+                    terrain_tiles_dir,
+                    terrain_tiles_rel,
+                    buf_name,
+                    working_tiles_dir=working_tiles_dir,
+                )
                 if not buf_path:
                     continue
                 apath = os.path.abspath(buf_path)
@@ -1045,12 +1230,14 @@ def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=N
         ctx["terrain_tiles_rel"],
         n_tiles,
         tile_res,
+        working_tiles_dir=ctx["working_tiles_dir"],
     )
     if not buffer_paths:
         log.warning("No terrain buffers found for %s", hub_name)
         return None
 
-    output_dir = str(ctx["w2w_dir"])
+    output_dir = str(ctx["output_dir"])
+    combine_targets = ("heightmap", "tint") if ctx["working_tiles_dir"] else ("heightmap",)
     combined = terrain_w2ter.combine_w2ter_tiles(
         buffer_paths,
         output_dir,
@@ -1058,7 +1245,7 @@ def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=N
         res_override=tile_res,
         x_tiles_override=n_tiles,
         y_tiles_override=n_tiles,
-        targets=("heightmap",),
+        targets=combine_targets,
         skip_existing=True,
     )
 
@@ -1131,13 +1318,23 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
 
             # Buffer 1 = heightmap (raw uint16 data)
             buf1_name = f"{tile_name}.w2ter.1.buffer"
-            buf1_path = _resolve_tile_buffer(ctx["terrain_tiles_dir"], ctx["terrain_tiles_rel"], buf1_name)
+            buf1_path = _resolve_tile_buffer(
+                ctx["terrain_tiles_dir"],
+                ctx["terrain_tiles_rel"],
+                buf1_name,
+                working_tiles_dir=ctx["working_tiles_dir"],
+            )
             if buf1_path:
                 tile_heightmap_buffers[(x, y)] = buf1_path
 
             # Buffer 2 = texturemap (overlay PNG for material)
             buf2_name = f"{tile_name}.w2ter.2.buffer"
-            buf2_path = _resolve_tile_buffer(ctx["terrain_tiles_dir"], ctx["terrain_tiles_rel"], buf2_name)
+            buf2_path = _resolve_tile_buffer(
+                ctx["terrain_tiles_dir"],
+                ctx["terrain_tiles_rel"],
+                buf2_name,
+                working_tiles_dir=ctx["working_tiles_dir"],
+            )
             if buf2_path:
                 info = terrain_w2ter.TileInfo(x=x, y=y, res=tile_res, buffer_index=2)
                 overlay_path = buf2_path + ".overlay.png"

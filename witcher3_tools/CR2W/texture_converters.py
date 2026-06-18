@@ -452,7 +452,7 @@ def convert_texarray_to_dds(fdir: str, force: bool = False) -> list[str]:
 
         seen_starts = set()
         for candidate_start in candidate_starts:
-            if candidate_start in seen_starts or candidate_start < 0 or candidate_start + 20 > file_size:
+            if candidate_start in seen_starts or candidate_start < 0 or candidate_start + 24 > file_size:
                 continue
             seen_starts.add(candidate_start)
 

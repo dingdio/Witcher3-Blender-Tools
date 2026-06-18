@@ -26,7 +26,7 @@ from ..importers import import_w2w
 from ..importers import import_isolation
 from ..importers import import_blender_fun
 from ..CR2W import fast_cache_scan
-from ..CR2W.common_blender import repo_file
+from ..CR2W.common_blender import repo_file, redkit_repo_context
 
 from ..exporters import export_radish
 
@@ -35,7 +35,7 @@ _WORLD_LAYER_INDEX_CACHE = {}
 _WORLD_LAYER_RUNTIME_CACHE = {}
 _LAYER_VISIBILITY_CACHE = {}
 _DEFAULT_HIDDEN_GROUP_CACHE = {}
-_WORLD_LAYER_SCAN_CACHE_VERSION = 7
+_WORLD_LAYER_SCAN_CACHE_VERSION = 9
 _WORLD_LAYER_SPATIAL_CELL_SIZE = 10.0
 _LAYER_SCAN_BATCH_SIZE = 16
 _LAYER_LOAD_BATCH_SIZE = 8
@@ -70,8 +70,37 @@ _LAYER_QUERY_FILTER_KINDS = frozenset({
     "component_spot_light",
     "cloth",
     "entity",
+    "entity_empty",
     "entity_template",
 })
+W2LAYER_PATH_PROP = "w2layer_path"
+LEGACY_LEVEL_PATH_PROP = "level_path"
+
+
+def collection_w2layer_path(collection) -> str:
+    if collection is None or not hasattr(collection, "get"):
+        return ""
+    return (
+        str(collection.get(W2LAYER_PATH_PROP, "") or "").strip()
+        or str(collection.get(LEGACY_LEVEL_PATH_PROP, "") or "").strip()
+    )
+
+
+def set_collection_w2layer_path(collection, path_value) -> str:
+    path_text = str(path_value or "").strip()
+    if collection is not None and hasattr(collection, "__setitem__"):
+        collection[W2LAYER_PATH_PROP] = path_text
+        # Legacy mirror for older cache/import code and existing user scenes.
+        collection[LEGACY_LEVEL_PATH_PROP] = path_text
+    return path_text
+
+
+def ensure_collection_w2layer_path(collection) -> str:
+    path_text = collection_w2layer_path(collection)
+    if path_text and collection is not None and hasattr(collection, "__setitem__"):
+        if not str(collection.get(W2LAYER_PATH_PROP, "") or "").strip():
+            collection[W2LAYER_PATH_PROP] = path_text
+    return path_text
 _LAYER_VIS_REASON_BITS = {
     "volume": 1 << 0,
     "shadow": 1 << 1,
@@ -139,6 +168,7 @@ def _layer_load_mode_signature_for_scene(scene_settings):
     regex = settings.get("do_name_filter_regex", "") if settings.get("do_enable_name_filter") else ""
     return (
         f"dev_empty={int(dev_empty_only)}"
+        f";transform={int(getattr(import_blender_fun, 'CACHED_LAYER_TRANSFORM_MODE_VERSION', 4))}"
         f";mesh={int(settings.get('do_import_Mesh', True))}"
         f";proxy_mesh={int(settings.get('do_import_ProxyMesh', False))}"
         f";collision={int(settings.get('do_import_Collision', True))}"
@@ -775,6 +805,31 @@ def _world_source_prefers_uncook(context, root_collection=None) -> bool:
     return False
 
 
+def _world_source_is_redkit(context, root_collection=None) -> bool:
+    if root_collection is None:
+        return False
+    world_path = str(root_collection.get("world_path", "")).strip()
+    if not world_path:
+        return False
+    try:
+        prefs = get_all_addon_prefs(context)
+    except Exception:
+        prefs = None
+    for attr in ("redkit_depot_path", "redkit_uncooked_path"):
+        root = str(getattr(prefs, attr, "") or "").strip() if prefs is not None else ""
+        if root and _path_is_within_root(world_path, root):
+            return True
+    try:
+        parts = {
+            part.lower()
+            for part in os.path.normpath(world_path).split(os.sep)
+            if part
+        }
+    except Exception:
+        parts = set()
+    return "r4data" in parts
+
+
 def _level_search_roots(context, root_collection=None):
     uncook_roots = _uncook_level_search_roots(context)
     extra_roots = _extra_level_search_roots(context)
@@ -915,7 +970,7 @@ def _collection_has_imported_layer_objects(collection):
     if collection is None:
         return False
     try:
-        if str(collection.get("level_path", "") or "").strip():
+        if collection_w2layer_path(collection):
             return True
         if str(collection.get("group_type", "") or "").strip() in {"LayerInfo", "LayerGroup"}:
             return True
@@ -1011,6 +1066,7 @@ def _build_scan_resolve_config(context, root_collection):
         "primary_roots": _normalize_roots(primary_roots),
         "secondary_roots": _normalize_roots(secondary_roots),
         "prefer_repo_extract": bool(prefer_repo_extract),
+        "force_full_parse": _world_source_is_redkit(context, root_collection),
     }
 
 
@@ -1554,7 +1610,7 @@ def _world_layer_entry_map(index):
 def _collection_level_key(collection):
     if collection is None:
         return ""
-    level_path = str(collection.get("level_path", "") or "").strip()
+    level_path = collection_w2layer_path(collection)
     if not level_path:
         return ""
     return _normalize_level_rel_path(level_path).lower()
@@ -2464,6 +2520,8 @@ def _scan_level_cache_entry(
     mesh_uncook_path=None,
     force_full_parse=False,
 ):
+    if resolve_config is not None and bool(resolve_config.get("force_full_parse")):
+        force_full_parse = True
     layer_started = time.perf_counter()
     parse_started = time.perf_counter()
     export_summary = _summarize_level_exports_for_fast_scan(
@@ -2570,7 +2628,7 @@ def _get_world_layer_index(context, root_collection, rebuild=False, show_progres
     layer_collections = [
         collection
         for collection in _iter_layer_info_collections(root_collection)
-        if str(collection.get("level_path", "")).strip()
+        if collection_w2layer_path(collection)
     ]
 
     entries = []
@@ -2608,7 +2666,7 @@ def _get_world_layer_index(context, root_collection, rebuild=False, show_progres
 
         with progress_context as progress:
             for layer_index, collection in enumerate(layer_collections, start=1):
-                level_path = str(collection.get("level_path", "")).strip()
+                level_path = ensure_collection_w2layer_path(collection)
                 level_name = Path(level_path).name or collection.name
                 if progress:
                     progress.update(
@@ -2739,7 +2797,7 @@ def _hydrate_world_layer_index_from_disk(context, root_collection):
             "incomplete_manifests": 0,
         }
         for collection in _iter_layer_info_collections(root_collection):
-            level_path = str(collection.get("level_path", "")).strip()
+            level_path = ensure_collection_w2layer_path(collection)
             if not level_path:
                 continue
             stats["layers_total"] += 1
@@ -2971,7 +3029,7 @@ def _start_layer_scan_phase(job, context, root_collection, rebuild=False, title=
     missing_count = 0
 
     for collection in _iter_layer_info_collections(root_collection):
-        level_path = str(collection.get("level_path", "")).strip()
+        level_path = ensure_collection_w2layer_path(collection)
         if not level_path:
             continue
         level_name = Path(level_path).name or collection.name
@@ -3954,7 +4012,7 @@ def _process_layer_load_batch(job, context):
 
         load["failed"] += 1
         _update_world_layer_complete_state(job.get("index_data") or {}, entry, collection)
-        msg = f"Can't load level {collection_name} ({entry['level_path']})"
+        msg = f"Can't load layer {collection_name} ({entry['level_path']})"
         if resolved:
             msg += f" from {resolved}"
         if err:
@@ -4333,10 +4391,25 @@ def _layer_visibility_cache_key(root_collection):
 
 def _layer_visibility_cache_signature(root_collection):
     try:
-        object_count = len(root_collection.all_objects)
+        objects = list(root_collection.all_objects)
     except Exception:
-        object_count = 0
-    return (object_count, str(getattr(root_collection, "name_full", "") or getattr(root_collection, "name", "")))
+        objects = []
+    object_count = len(objects)
+    object_sum = 0
+    object_xor = 0
+    for obj in objects:
+        try:
+            obj_id = int(obj.as_pointer())
+        except Exception:
+            obj_id = id(obj)
+        object_sum = (object_sum + obj_id) & 0xFFFFFFFFFFFFFFFF
+        object_xor ^= obj_id
+    return (
+        object_count,
+        object_sum,
+        object_xor,
+        str(getattr(root_collection, "name_full", "") or getattr(root_collection, "name", "")),
+    )
 
 
 def invalidate_layer_visibility_cache(root_collection=None):
@@ -4483,6 +4556,7 @@ def _apply_layer_object_visibility_rules(
 
 def _apply_layer_post_import_visibility(job, context):
     root_collection = bpy.data.collections.get(str((job or {}).get("root_collection_name", "") or ""))
+    invalidate_layer_visibility_cache(root_collection)
     return _apply_layer_object_visibility_rules(
         context,
         hide_volume=bool((job or {}).get("hide_volume_meshes")),
@@ -4501,7 +4575,7 @@ def _apply_layer_post_import_visibility(job, context):
     )
 
 
-def apply_layer_visibility_settings(context, scene_settings=None):
+def apply_layer_visibility_settings(context, scene_settings=None, root_collection=None):
     scene = getattr(context, "scene", None) or getattr(bpy.context, "scene", None)
     if scene_settings is None and scene is not None:
         scene_settings = getattr(scene, "witcher_file_browser", None)
@@ -4521,6 +4595,7 @@ def apply_layer_visibility_settings(context, scene_settings=None):
         solo_engine_hidden=bool(getattr(scene_settings, "terrain_layer_solo_engine_hidden_meshes", False)),
         solo_proxy=bool(getattr(scene_settings, "terrain_layer_solo_proxy_meshes", False)),
         solo_redapex=bool(getattr(scene_settings, "terrain_layer_solo_redapex", False)),
+        root_collection=root_collection,
     )
 
 
@@ -4728,7 +4803,7 @@ def _default_hidden_level_paths(root_collection):
                 child_hidden = chain_hidden or int(child.get("witcher_visible_on_start", 1)) == 0
                 visit(child, child_hidden)
             elif gtype == "LayerInfo" and chain_hidden:
-                level_path = _normalize_level_path(child.get("level_path", ""))
+                level_path = _normalize_level_path(collection_w2layer_path(child))
                 if level_path:
                     hidden.add(level_path)
 
@@ -4895,13 +4970,13 @@ def _import_level_from_collection(
     mode_signature=None,
     plan_hash=None,
 ):
-    level_path = str(coll.get("level_path", "")).strip()
+    level_path = ensure_collection_w2layer_path(coll)
     if not level_path:
-        return False, "", "Collection has no level_path", False
+        return False, "", "Collection has no w2layer_path", False
     root_collection = _find_world_root_collection_for_collection(coll)
     resolved = _resolve_level_file(context, level_path, root_collection)
     if not resolved:
-        return False, "", f"Could not resolve level path: {level_path}", False
+        return False, "", f"Could not resolve w2layer_path: {level_path}", False
 
     scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
     dev_empty_only = False
@@ -4942,55 +5017,63 @@ def _import_level_from_collection(
             and getattr(isolation_batch_session, "isolated", False)
         )
 
-        if use_fast_path:
-            if use_isolation_scope:
-                with import_isolation.isolated_batch_import_target(
-                    isolation_batch_session,
-                    coll,
-                    label=scope_label,
-                ) as scope:
+        with redkit_repo_context(resolved):
+            if use_fast_path:
+                if use_isolation_scope:
+                    with import_isolation.isolated_batch_import_target(
+                        isolation_batch_session,
+                        coll,
+                        label=scope_label,
+                    ) as scope:
+                        import_blender_fun.loadLevelFromCachedPlan(
+                            resolved,
+                            cached_plan_items,
+                            context=scope.context,
+                            **import_kwargs,
+                        )
+                else:
                     import_blender_fun.loadLevelFromCachedPlan(
                         resolved,
                         cached_plan_items,
-                        context=scope.context,
+                        context=context,
                         **import_kwargs,
                     )
             else:
-                import_blender_fun.loadLevelFromCachedPlan(
-                    resolved,
-                    cached_plan_items,
-                    context=context,
-                    **import_kwargs,
-                )
-        else:
-            level_file = CR2W.CR2W_reader.load_w2l(resolved)
-            if use_isolation_scope:
-                with import_isolation.isolated_batch_import_target(
-                    isolation_batch_session,
-                    coll,
-                    label=scope_label,
-                ) as scope:
-                    import_w2l.btn_import_W2L(level_file, context=scope.context, **import_kwargs)
-            else:
-                import_w2l.btn_import_W2L(level_file, context=context, **import_kwargs)
+                level_file = CR2W.CR2W_reader.load_w2l(resolved)
+                if use_isolation_scope:
+                    with import_isolation.isolated_batch_import_target(
+                        isolation_batch_session,
+                        coll,
+                        label=scope_label,
+                    ) as scope:
+                        import_w2l.btn_import_W2L(level_file, context=scope.context, **import_kwargs)
+                else:
+                    import_w2l.btn_import_W2L(level_file, context=context, **import_kwargs)
     except import_blender_fun.LayerImportCancelled as e:
         return False, resolved, str(e) or "Cancelled by user", True
     except Exception as e:
         return False, resolved, str(e), False
+    finally:
+        invalidate_layer_visibility_cache(root_collection or coll)
     return True, resolved, "", False
 
 
-def import_group(context, coll, stats):
+def import_group(context, coll, stats, isolation_batch_session=None):
     for child in coll.children:
         child_group_type = str(child.get("group_type", "")).strip()
         if child_group_type == "LayerInfo":
-            log.info("LOADING LEVEL %s", child.name)
-            ok, resolved, err, _cancelled = _import_level_from_collection(context, child)
+            log.info("LOADING LAYER %s", child.name)
+            ok, resolved, err, _cancelled = _import_level_from_collection(
+                context,
+                child,
+                isolation_batch_session=isolation_batch_session,
+            )
             if ok:
                 stats["imported"] += 1
             else:
                 stats["failed"] += 1
-                msg = f"Can't load level {child.name} ({str(child.get('level_path', ''))})"
+                child_path = collection_w2layer_path(child)
+                msg = f"Can't load layer {child.name} ({child_path})"
                 if resolved:
                     msg += f" from {resolved}"
                 if err:
@@ -4999,7 +5082,99 @@ def import_group(context, coll, stats):
                 stats["messages"].append(msg)
         elif child_group_type == "LayerGroup":
             log.info("LAYER_GROUP %s", child.name)
-            import_group(context, child, stats)
+            import_group(context, child, stats, isolation_batch_session=isolation_batch_session)
+
+
+def _count_layer_info_children(collection):
+    if collection is None:
+        return 0
+    total = 0
+    for child in getattr(collection, "children", []) or []:
+        child_group_type = str(child.get("group_type", "") or "").strip()
+        if child_group_type == "LayerInfo":
+            total += 1
+        elif child_group_type == "LayerGroup":
+            total += _count_layer_info_children(child)
+    return total
+
+
+def _w2l_collection_details_text(context, collection, resolved_path=""):
+    if collection is None:
+        return "No active collection."
+    group_type = str(collection.get("group_type", "") or "").strip()
+    root_collection = _find_world_root_collection_for_collection(collection)
+    world_path = str((root_collection or collection).get("world_path", "") or "").strip()
+    lines = [
+        f"collection: {collection.name}",
+        f"group_type: {group_type or 'Unset'}",
+    ]
+    w2layer_path = collection_w2layer_path(collection)
+    if w2layer_path:
+        lines.append(f"w2layer_path: {w2layer_path}")
+    if resolved_path:
+        lines.append(f"resolved_path: {resolved_path}")
+    if world_path:
+        lines.append(f"world_path: {world_path}")
+    layer_build_tag = str(collection.get("layerBuildTag", "") or "").strip()
+    if layer_build_tag:
+        lines.append(f"layerBuildTag: {layer_build_tag}")
+    if group_type == "LayerGroup":
+        lines.append(f"child_layers: {_count_layer_info_children(collection)}")
+        lines.append(f"visible_on_start: {int(collection.get('witcher_visible_on_start', 1) or 0)}")
+    state = str(collection.get("witcher_layer_import_state", "") or "").strip()
+    if state:
+        lines.append(f"import_state: {state}")
+        lines.append(f"import_count: {int(collection.get('witcher_layer_import_count', 0) or 0)}")
+        lines.append(f"import_errors: {int(collection.get('witcher_layer_import_errors', 0) or 0)}")
+        lines.append(f"import_filtered: {int(collection.get('witcher_layer_import_filtered', 0) or 0)}")
+    return "\n".join(lines)
+
+
+class WITCH_OT_w2l_collection_details(bpy.types.Operator):
+    bl_idname = "witcher.w2l_collection_details"
+    bl_label = "W2L Collection Details"
+    bl_description = "Show copyable W2L layer or LayerGroup collection details"
+
+    collection_name: StringProperty(name="Collection", default="")
+    group_type: StringProperty(name="group_type", default="")
+    w2layer_path: StringProperty(name="w2layer_path", subtype="FILE_PATH", default="")
+    resolved_path: StringProperty(name="Resolved", subtype="FILE_PATH", default="")
+    world_path: StringProperty(name="world_path", subtype="FILE_PATH", default="")
+    details: StringProperty(name="Details", default="")
+
+    def invoke(self, context, event):
+        coll = context.collection
+        if coll is not None:
+            self.collection_name = str(getattr(coll, "name", "") or "")
+            self.group_type = str(coll.get("group_type", "") or "").strip()
+            self.w2layer_path = ensure_collection_w2layer_path(coll)
+            root_collection = _find_world_root_collection_for_collection(coll)
+            self.world_path = str((root_collection or coll).get("world_path", "") or "").strip()
+            self.resolved_path = ""
+            if self.w2layer_path:
+                try:
+                    resolved = _resolve_level_file(context, self.w2layer_path, root_collection)
+                except Exception:
+                    resolved = ""
+                self.resolved_path = resolved or ""
+            self.details = _w2l_collection_details_text(context, coll, self.resolved_path)
+        return context.window_manager.invoke_props_dialog(self, width=720)
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
+        col.prop(self, "collection_name", text="Collection")
+        col.prop(self, "group_type", text="group_type")
+        if self.w2layer_path:
+            col.prop(self, "w2layer_path", text="w2layer_path")
+        if self.resolved_path:
+            col.prop(self, "resolved_path", text="Resolved")
+        if self.world_path:
+            col.prop(self, "world_path", text="world_path")
+        col.prop(self, "details", text="Details")
+
+    def execute(self, context):
+        return {'FINISHED'}
+
 
 class WITCH_OT_load_layer_group(bpy.types.Operator):
     """IMPORT_LAYER_ButtonOperator"""
@@ -5009,21 +5184,24 @@ class WITCH_OT_load_layer_group(bpy.types.Operator):
     def execute(self, context):
         coll = context.collection
         if coll:
+            root_collection = _find_world_root_collection_for_collection(coll)
             _unhide_default_hidden_layer_groups(context)
             try:
                 start_time = time.time()
                 stats = {"imported": 0, "failed": 0, "messages": []}
-                import_group(context, coll, stats)
+                label = Path(getattr(coll, "name", "") or "LayerGroup").stem or "LayerGroup"
+                with import_isolation.isolated_import_batch_session(context, label=label) as session:
+                    import_group(context, coll, stats, isolation_batch_session=session)
                 log.info(' Finished importing LayerGroup in %f seconds.', time.time() - start_time)
                 if stats["failed"] > 0:
-                    self.report({'WARNING'}, f"Imported {stats['imported']} levels, failed {stats['failed']}")
+                    self.report({'WARNING'}, f"Imported {stats['imported']} layers, failed {stats['failed']}")
                     if stats["messages"]:
                         log.warning(stats["messages"][0])
                 else:
-                    self.report({'INFO'}, f"Imported {stats['imported']} levels")
+                    self.report({'INFO'}, f"Imported {stats['imported']} layers")
             finally:
                 _restore_default_hidden_layer_groups(context)
-                apply_layer_visibility_settings(context)
+                apply_layer_visibility_settings(context, root_collection=root_collection)
         else:
             self.report({'WARNING'}, "No active collection")
         return {'FINISHED'}
@@ -5042,16 +5220,23 @@ class WITCH_OT_load_layer(bpy.types.Operator):
         if not coll:
             self.report({'WARNING'}, "No active collection")
             return {'CANCELLED'}
+        root_collection = _find_world_root_collection_for_collection(coll)
         _unhide_default_hidden_layer_groups(context)
         try:
-            ok, resolved, err, _cancelled = _import_level_from_collection(context, coll)
+            label = Path(getattr(coll, "name", "") or "Layer").stem or "Layer"
+            with import_isolation.isolated_import_batch_session(context, label=label) as session:
+                ok, resolved, err, _cancelled = _import_level_from_collection(
+                    context,
+                    coll,
+                    isolation_batch_session=session,
+                )
         finally:
             _restore_default_hidden_layer_groups(context)
-            apply_layer_visibility_settings(context)
+            apply_layer_visibility_settings(context, root_collection=root_collection)
         if not ok:
-            self.report({'ERROR'}, err or "Failed to load level")
+            self.report({'ERROR'}, err or "Failed to load layer")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Loaded level: {Path(resolved).name}")
+        self.report({'INFO'}, f"Loaded layer: {Path(resolved).name}")
         return {'FINISHED'}
 
 

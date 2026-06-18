@@ -281,6 +281,36 @@ def get_tintmap_tile_blocks(tile_paths: Dict[Tuple[int, int], str]) -> Optional[
     return None
 
 
+def _raw_colormap_res_from_size(byte_size: int) -> Optional[int]:
+    if byte_size <= 0 or byte_size % 4 != 0:
+        return None
+    res = int(math.isqrt(byte_size // 4))
+    if res * res * 4 != byte_size:
+        return None
+    return res
+
+
+def get_raw_colormap_res_from_file(path: str) -> Optional[int]:
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        return None
+    return _raw_colormap_res_from_size(size)
+
+
+def get_raw_colormap_tile_res(tile_paths: Dict[Tuple[int, int], str]) -> Optional[int]:
+    for path in tile_paths.values():
+        res = get_raw_colormap_res_from_file(path)
+        if res:
+            return res
+    return None
+
+
+def _is_editor_colormap_buffer_index(idx: int) -> bool:
+    # Editor/source terrain keeps height, control, and color buffers per mip.
+    return idx >= 3 and idx % 3 == 0
+
+
 def _infer_colormap_mip(res: int, tile_blocks: int) -> Optional[int]:
     tile_res_px = tile_blocks * 4
     if tile_res_px <= 0 or res % tile_res_px != 0:
@@ -352,6 +382,21 @@ def select_tintmap_buffer_index(
     tiles: Dict[int, Dict[Tuple[int, int], str]],
     res: int,
 ) -> Optional[int]:
+    raw_candidates = []
+    for idx, tile_paths in tiles.items():
+        if not _is_editor_colormap_buffer_index(idx):
+            continue
+        raw_res = get_raw_colormap_tile_res(tile_paths)
+        if not raw_res:
+            continue
+        if raw_res == res:
+            return idx
+        raw_candidates.append((idx, raw_res))
+    if raw_candidates:
+        # REDkit/editor tiles store uncompressed RGBA colormaps per mip. Prefer
+        # the largest available mip so it matches the full terrain resolution.
+        return sorted(raw_candidates, key=lambda it: (-it[1], it[0]))[0][0]
+
     start_mip = detect_colormap_start_mip(tiles, res)
     if start_mip is not None:
         idx = start_mip * 2 + 3
@@ -397,6 +442,29 @@ def assemble_tintmap(tile_paths: Dict[Tuple[int, int], str], tile_blocks: int, x
             result[dest_start:dest_start + row_bytes] = data[src_start:src_end]
 
     return bytes(result)
+
+
+def assemble_raw_colormap(
+    tile_paths: Dict[Tuple[int, int], str],
+    tile_res_px: int,
+    x_tiles: int,
+    y_tiles: int,
+) -> Optional[np.ndarray]:
+    if tile_res_px <= 0:
+        return None
+    result = np.zeros((y_tiles * tile_res_px, x_tiles * tile_res_px, 4), dtype=np.uint8)
+    expected = tile_res_px * tile_res_px * 4
+    for (x, y), path in tile_paths.items():
+        try:
+            data = np.fromfile(path, dtype=np.uint8, count=expected)
+        except Exception:
+            continue
+        if data.size != expected:
+            continue
+        tile = data.reshape((tile_res_px, tile_res_px, 4))
+        dest_y = y * tile_res_px
+        result[dest_y:dest_y + tile_res_px, x * tile_res_px:(x + 1) * tile_res_px] = tile
+    return np.ascontiguousarray(np.flipud(result))
 
 
 def write_dds_dxt1(output_path: str, width: int, height: int, data: bytes) -> None:
@@ -477,6 +545,17 @@ def decode_tintmap_buffer_to_rgba(
 
 
 def decode_tintmap_file_to_rgba(path: str, target_res_px: Optional[int] = None) -> Optional[np.ndarray]:
+    raw_res = get_raw_colormap_res_from_file(path)
+    if raw_res:
+        expected = raw_res * raw_res * 4
+        data = np.fromfile(path, dtype=np.uint8, count=expected)
+        if data.size != expected:
+            return None
+        rgba = np.ascontiguousarray(np.flipud(data.reshape((raw_res, raw_res, 4))))
+        if target_res_px and target_res_px > raw_res and target_res_px % raw_res == 0:
+            scale = target_res_px // raw_res
+            rgba = np.repeat(np.repeat(rgba, scale, axis=0), scale, axis=1)
+        return rgba
     blocks = get_tintmap_blocks_from_file(path)
     if not blocks:
         return None
@@ -617,17 +696,26 @@ def bake_terrain_fullmap_from_tiles(
     tint = None
     tint_idx = select_tintmap_buffer_index(tiles, res)
     if tint_idx is not None:
-        tile_blocks = get_tintmap_tile_blocks(tiles[tint_idx])
-        if tile_blocks:
-            tintmap = assemble_tintmap(tiles[tint_idx], tile_blocks, x_tiles, y_tiles)
-            tw, th = tile_blocks * 4 * x_tiles, tile_blocks * 4 * y_tiles
-            rgba = decode_bc1_to_rgba(tintmap, tw, th)
+        raw_res = get_raw_colormap_tile_res(tiles[tint_idx])
+        if raw_res:
+            rgba = assemble_raw_colormap(tiles[tint_idx], raw_res, x_tiles, y_tiles)
             if rgba is not None:
-                rgba = np.flipud(rgba)
-                if res > tile_blocks * 4 and res % (tile_blocks * 4) == 0:
-                    s = res // (tile_blocks * 4)
+                if res > raw_res and res % raw_res == 0:
+                    s = res // raw_res
                     rgba = np.repeat(np.repeat(rgba, s, axis=0), s, axis=1)
                 tint = rgba[..., :3].astype(np.float32) / 255.0
+        else:
+            tile_blocks = get_tintmap_tile_blocks(tiles[tint_idx])
+            if tile_blocks:
+                tintmap = assemble_tintmap(tiles[tint_idx], tile_blocks, x_tiles, y_tiles)
+                tw, th = tile_blocks * 4 * x_tiles, tile_blocks * 4 * y_tiles
+                rgba = decode_bc1_to_rgba(tintmap, tw, th)
+                if rgba is not None:
+                    rgba = np.flipud(rgba)
+                    if res > tile_blocks * 4 and res % (tile_blocks * 4) == 0:
+                        s = res // (tile_blocks * 4)
+                        rgba = np.repeat(np.repeat(rgba, s, axis=0), s, axis=1)
+                    tint = rgba[..., :3].astype(np.float32) / 255.0
 
     elev_range = abs(float(lowest_elevation)) + abs(float(highest_elevation))
     rgb = bake_terrain_fullmap_diffuse(
@@ -849,29 +937,49 @@ def combine_w2ter_tiles(
     if "tint" in want:
         tint_idx = select_tintmap_buffer_index(tiles, res)
         if tint_idx is not None:
-            tile_blocks = get_tintmap_tile_blocks(tiles[tint_idx])
-            if tile_blocks:
-                width = tile_blocks * 4 * x_tiles
-                height = tile_blocks * 4 * y_tiles
-                out_dds = os.path.join(output_dir, f"combined.{hub_name}.dds")
+            raw_res = get_raw_colormap_tile_res(tiles[tint_idx])
+            if raw_res:
+                width = raw_res * x_tiles
+                height = raw_res * y_tiles
                 out_png = os.path.join(output_dir, f"{hub_name}.tint.png")
-                if _needs(out_dds) or _needs(out_png):
-                    tintmap = assemble_tintmap(tiles[tint_idx], tile_blocks, x_tiles, y_tiles)
-                    if _needs(out_dds):
-                        write_dds_dxt1(out_dds, width, height, tintmap)
-                    if _needs(out_png):
+                if _needs(out_png):
+                    rgba = assemble_raw_colormap(tiles[tint_idx], raw_res, x_tiles, y_tiles)
+                    if rgba is not None:
+                        if res > raw_res and res % raw_res == 0:
+                            scale = res // raw_res
+                            rgba = np.repeat(np.repeat(rgba, scale, axis=0), scale, axis=1)
+                            width = rgba.shape[1]
+                            height = rgba.shape[0]
                         try:
-                            rgba = decode_bc1_to_rgba(tintmap, width, height)
-                            if rgba is not None:
-                                rgba = np.flipud(rgba)
-                                if res > tile_blocks * 4 and res % (tile_blocks * 4) == 0:
-                                    scale = res // (tile_blocks * 4)
-                                    rgba = np.repeat(np.repeat(rgba, scale, axis=0), scale, axis=1)
-                                write_png(out_png, rgba.shape[1], rgba.shape[0], 6, 8, rgba.tobytes())
+                            write_png(out_png, width, height, 6, 8, rgba.tobytes())
                         except Exception:
                             pass
-                for p in (out_dds, out_png):
-                    if os.path.isfile(p):
-                        outputs.append(p)
+                if os.path.isfile(out_png):
+                    outputs.append(out_png)
+            else:
+                tile_blocks = get_tintmap_tile_blocks(tiles[tint_idx])
+                if tile_blocks:
+                    width = tile_blocks * 4 * x_tiles
+                    height = tile_blocks * 4 * y_tiles
+                    out_dds = os.path.join(output_dir, f"combined.{hub_name}.dds")
+                    out_png = os.path.join(output_dir, f"{hub_name}.tint.png")
+                    if _needs(out_dds) or _needs(out_png):
+                        tintmap = assemble_tintmap(tiles[tint_idx], tile_blocks, x_tiles, y_tiles)
+                        if _needs(out_dds):
+                            write_dds_dxt1(out_dds, width, height, tintmap)
+                        if _needs(out_png):
+                            try:
+                                rgba = decode_bc1_to_rgba(tintmap, width, height)
+                                if rgba is not None:
+                                    rgba = np.flipud(rgba)
+                                    if res > tile_blocks * 4 and res % (tile_blocks * 4) == 0:
+                                        scale = res // (tile_blocks * 4)
+                                        rgba = np.repeat(np.repeat(rgba, scale, axis=0), scale, axis=1)
+                                    write_png(out_png, rgba.shape[1], rgba.shape[0], 6, 8, rgba.tobytes())
+                            except Exception:
+                                pass
+                    for p in (out_dds, out_png):
+                        if os.path.isfile(p):
+                            outputs.append(p)
 
     return {"outputs": outputs, "info": info}

@@ -398,12 +398,17 @@ def isolated_import_session(context, target_collection, *, label="Import", visib
         # called during the import now see the isolated environment.
         window.view_layer = temp_view_layer
 
-        yield ImportIsolationSession(
-            context=bpy.context,
-            isolated=True,
-            target_collection=temp_collection,
-            final_target_collection=target_collection,
-        )
+        with bpy.context.temp_override(
+            view_layer=temp_view_layer,
+            active_layer_collection=target_layer_collection,
+            collection=temp_collection,
+        ):
+            yield ImportIsolationSession(
+                context=bpy.context,
+                isolated=True,
+                target_collection=temp_collection,
+                final_target_collection=target_collection,
+            )
     finally:
         # Capture hide state before we move objects out of the temp collection.
         if temp_collection is not None and temp_view_layer is not None:
@@ -574,12 +579,17 @@ def isolated_batch_import_target(batch_session, target_collection, *, label="Imp
             raise RuntimeError(f"Could not find isolated import layer for '{temp_collection.name}'")
         session.view_layer.active_layer_collection = target_layer_collection
 
-        yield ImportIsolationSession(
-            context=bpy.context,
-            isolated=True,
-            target_collection=temp_collection,
-            final_target_collection=target_collection,
-        )
+        with bpy.context.temp_override(
+            view_layer=session.view_layer,
+            active_layer_collection=target_layer_collection,
+            collection=temp_collection,
+        ):
+            yield ImportIsolationSession(
+                context=bpy.context,
+                isolated=True,
+                target_collection=temp_collection,
+                final_target_collection=target_collection,
+            )
     finally:
         if temp_collection is not None and session.view_layer is not None:
             hidden_state_by_id = _capture_hidden_state_for_collection(temp_collection, session.view_layer)

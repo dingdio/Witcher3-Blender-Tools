@@ -7,7 +7,11 @@ from types import SimpleNamespace
 from .third_party_libs import yaml
 from .prop_utils import prop_to_string
 from ..extension_paths import get_dev_override
-from ..repo_paths import materialize_repo_path, resolve_w2_repo_file_from_source
+from ..repo_paths import (
+    materialize_repo_path,
+    resolve_w2_repo_file_from_source,
+    source_root_candidates_from_file,
+)
 log = logging.getLogger(__name__)
 import io
 
@@ -20,6 +24,84 @@ from .CR2W_helpers import Enums
 from .CR2W_types import ( Entity_Type_List, getCR2W, W_CLASS )
 
 from .bStream import *
+
+_ENTITY_DIRECT_COMPONENT_TYPES = {
+    "CPointLightComponent",
+    "CSpotLightComponent",
+    "CMeshComponent",
+    "CStaticMeshComponent",
+    "CAreaComponent",
+    "CWaterComponent",
+}
+
+
+def _entity_component_parent_map(file, chunks):
+    by_parent = {}
+    exports = list(getattr(file, "CR2WExport", []) or [])
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        if getattr(chunk, "name", "") not in _ENTITY_DIRECT_COMPONENT_TYPES:
+            continue
+        export_index = chunk_index - 1
+        if export_index < 0 or export_index >= len(exports):
+            continue
+        try:
+            parent_id = int(getattr(exports[export_index], "parentID", 0) or 0)
+        except Exception:
+            parent_id = 0
+        if parent_id <= 0 or parent_id == chunk_index:
+            continue
+        by_parent.setdefault(parent_id, []).append(chunk)
+    return by_parent
+
+
+def _append_unique_entity_component(entity, component, seen_ids):
+    if component is None or getattr(component, "name", "") not in _ENTITY_DIRECT_COMPONENT_TYPES:
+        return False
+    identity = id(component)
+    if identity in seen_ids:
+        return False
+    entity.Components.append(component)
+    seen_ids.add(identity)
+    return True
+
+
+def _append_entity_components(entity, entity_chunk, chunks, parent_component_map, filename, chunk_index):
+    seen_ids = set()
+    malformed_refs = 0
+    unsupported_refs = []
+    for chunk_id in list(getattr(entity_chunk, "Components", []) or []):
+        try:
+            component_index = int(chunk_id)
+        except Exception:
+            malformed_refs += 1
+            continue
+        if component_index <= 0 or component_index > len(chunks):
+            malformed_refs += 1
+            continue
+        sub_chunk = chunks[component_index - 1]
+        if not _append_unique_entity_component(entity, sub_chunk, seen_ids):
+            unsupported_refs.append((component_index, getattr(sub_chunk, "name", "<unknown>")))
+
+    for sub_chunk in parent_component_map.get(int(chunk_index), []) or []:
+        _append_unique_entity_component(entity, sub_chunk, seen_ids)
+
+    if malformed_refs:
+        log.warning(
+            "Ignoring %d malformed component reference(s) on %s in %s; using export parent links where available.",
+            malformed_refs,
+            getattr(entity, "name", getattr(entity_chunk, "name", "<entity>")),
+            filename,
+        )
+    if unsupported_refs:
+        preview = ", ".join(f"#{idx}:{name}" for idx, name in unsupported_refs[:6])
+        if len(unsupported_refs) > 6:
+            preview += f", ... (+{len(unsupported_refs) - 6} more)"
+        log.warning(
+            "Skipping unsupported component reference(s) on %s in %s: %s",
+            getattr(entity, "name", getattr(entity_chunk, "name", "<entity>")),
+            filename,
+            preview,
+        )
 
 
 def _stream_chunk_props_summary(chunk, limit=8):
@@ -191,15 +273,46 @@ def getChildrenGroups(group, CHUNKS):
             group_obj.ChildrenInfos.append(getChildrenInfos(ChildInfo.GetRef(CHUNKS), CHUNKS))
     return group_obj
 
-def create_world(file):
+def _build_world_groups_from_disk(world_name, file_path):
+    """REDkit/editor .w2w files don't embed the layer-group tree (no
+    hasEmbeddedLayerInfos); the hierarchy is the on-disk folder structure of
+    .w2l files next to the .w2w. Reconstruct the LayerGroup tree from it."""
+    level_dir = os.path.dirname(os.path.abspath(file_path))
+    root = LayerGroup(world_name)
+    for dirpath, _dirnames, filenames in os.walk(level_dir):
+        w2ls = sorted(f for f in filenames if f.lower().endswith('.w2l'))
+        if not w2ls:
+            continue
+        rel = os.path.relpath(dirpath, level_dir)
+        group = root
+        if rel != os.curdir:
+            for part in rel.split(os.sep):
+                child = next((g for g in group.ChildrenGroups if g.name == part), None)
+                if child is None:
+                    child = LayerGroup(part)
+                    group.ChildrenGroups.append(child)
+                group = child
+        for name in w2ls:
+            depot = os.path.normpath(os.path.join(dirpath, name))
+            group.ChildrenInfos.append(CLayerInfo(os.path.splitext(name)[0], depot, None))
+    return root
+
+
+def create_world(file, file_path=None):
 
     world = WORLD()
     CHUNKS = file.CHUNKS.CHUNKS
+    CGameWorld = None
     for chunk in CHUNKS:
         if chunk.name == "CGameWorld":
             CGameWorld:W_CLASS = chunk
-    firstLayer = CHUNKS[CGameWorld.Firstlayer.Reference]
-    
+
+    fl = getattr(CGameWorld, 'Firstlayer', None)
+    fl_ref = getattr(fl, 'Reference', None) if fl is not None else None
+    embedded = (fl_ref is not None and 0 <= fl_ref < len(CHUNKS)
+                and CHUNKS[fl_ref].name == "CLayerGroup")
+    firstLayer = CHUNKS[fl_ref] if embedded else None
+
     world.terrainClipMap = CHUNKS[CGameWorld.GetVariableByName('terrainClipMap').Value-1]
     clip_size = world.terrainClipMap.GetVariableByName('clipSize')
     if clip_size:
@@ -214,7 +327,15 @@ def create_world(file):
     world.lowestElevation:float = world.terrainClipMap.GetVariableByName('lowestElevation').Value
     world.highestElevation:float = world.terrainClipMap.GetVariableByName('highestElevation').Value
     
-    world.groups = getChildrenGroups(firstLayer, CHUNKS)
+    if embedded:
+        world.groups = getChildrenGroups(firstLayer, CHUNKS)
+    else:
+        world_name = os.path.splitext(os.path.basename(file_path))[0] if file_path else "WORLD"
+        if not file_path:
+            log.warning("CGameWorld has no embedded layer infos and no file path; layer tree unavailable.")
+            world.groups = LayerGroup(world_name)
+        else:
+            world.groups = _build_world_groups_from_disk(world_name, file_path)
     world.worldName = world.groups.name
     # for ChildGroup in firstLayer.ChildrenGroups:
     #     groupName = ChildGroup.GetRef(CHUNKS).GetVariableByName('name').String.String
@@ -232,6 +353,8 @@ class LEVEL():
         self.Foliage = False
         self.type = "Clayer"
         self.version = 999
+        self.expectedEntityCount = 0
+        self.parsedEntityCount = 0
 
 class CLayerInfo(object):
     def __init__(self, name = "", depotFilePath = "", layerBuildTag = ""):
@@ -457,6 +580,20 @@ def _resolve_level_dependency_path(depot_path, version, dependency_resolver=None
             resolved = dependency_resolver(depot_path)
         if resolved:
             return resolved
+    try:
+        is_w3 = bool(version) and int(version) > 115
+    except Exception:
+        is_w3 = True
+    if is_w3:
+        rel_path = str(depot_path or "").replace("/", "\\").lstrip("\\")
+        if os.path.isabs(rel_path):
+            if os.path.exists(rel_path):
+                return os.path.normpath(rel_path)
+        elif source_filename:
+            for root in source_root_candidates_from_file(source_filename):
+                candidate = os.path.normpath(os.path.join(root, rel_path))
+                if os.path.exists(candidate):
+                    return candidate
     source_resolved = resolve_w2_repo_file_from_source(depot_path, source_filename, version=version)
     if source_resolved:
         return source_resolved
@@ -758,13 +895,16 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
     Entities = []
     level.name = CHUNKS[0].name
     level.type = CHUNKS[0].name
+    expected_entities = sum(1 for chunk in CHUNKS if getattr(chunk, "name", "") in Entity_Type_List)
+    template_static_mesh_chunks = []
+    parent_component_map = _entity_component_parent_map(file, CHUNKS)
 
     #only create a LEVEL for these types otherwise return entire file
     top_level_list = [ "CLayer", "CEntityTemplate", "CFoliageResource" ]
     if level.type not in top_level_list:
         return file
         
-    for chunk in CHUNKS:
+    for chunk_index, chunk in enumerate(CHUNKS, start=1):
         if chunk.name == "CFoliageResource":
             level.Foliage = chunk
             
@@ -794,6 +934,14 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                         log.exception("Problem Importing an include")
         if chunk.name == "CSectorData":
             CSectorData = chunk
+        if level.type == "CEntityTemplate" and chunk.name in {"CMeshComponent", "CStaticMeshComponent"}:
+            try:
+                mesh_prop = chunk.GetVariableByName("mesh") or chunk.GetVariableByName("resource")
+            except Exception:
+                mesh_prop = None
+            mesh_path = _first_handle_depot_path(mesh_prop) or str(prop_to_string(mesh_prop) or "").strip()
+            if mesh_path:
+                template_static_mesh_chunks.append(chunk)
         if chunk.name in Entity_Type_List:
             try:
                 class_ = getattr(CR2W_file, chunk.name)
@@ -814,6 +962,7 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                     chunk.Template.Handles[0].DepotPath = r"environment\decorations\containers\dressers\simple_dresser\simple_dresser_table.w2ent"
                 template_path = getattr(chunk.Template.Handles[0], "DepotPath", None)
                 if not template_path:
+                    log.warning("Skipping template entity %s in %s: empty template path", Entity.name, filename)
                     continue
                 try:
                     fileName = _resolve_level_dependency_path(
@@ -899,24 +1048,14 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                             Entity.name,
                             getattr(file, "fileName", "<memory>"),
                         )
-                try:
-                    if hasattr(chunk, 'Components'):
-                        for chunk_id in chunk.Components:
-                            sub_chunk  = CHUNKS[chunk_id-1]
-                            if sub_chunk.name == "CPointLightComponent":
-                                Entity.Components.append(sub_chunk)
-                            elif sub_chunk.name == "CSpotLightComponent":
-                                Entity.Components.append(sub_chunk)
-                            elif sub_chunk.name == "CMeshComponent":
-                                Entity.Components.append(sub_chunk)
-                            elif sub_chunk.name == "CStaticMeshComponent":
-                                Entity.Components.append(sub_chunk)
-                            elif sub_chunk.name == "CAreaComponent":
-                                Entity.Components.append(sub_chunk)
-                            elif sub_chunk.name == "CWaterComponent":
-                                Entity.Components.append(sub_chunk)
-                except Exception as e:
-                    pass#raise e
+                _append_entity_components(
+                    Entity,
+                    chunk,
+                    CHUNKS,
+                    parent_component_map,
+                    filename,
+                    chunk_index,
+                )
                 Entities.append(Entity)
     if level.type == "CLayer":
         try:
@@ -929,7 +1068,20 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
             level.W2CookedLayerSectorData = w2_cooked_sector_data
 
     level.CSectorData = CSectorData
+    if level.type == "CEntityTemplate" and template_static_mesh_chunks:
+        level.staticMeshes = {"chunks": template_static_mesh_chunks}
     level.Entities = Entities
+    level.expectedEntityCount = expected_entities
+    level.parsedEntityCount = len(Entities)
+    if level.type == "CLayer" and expected_entities != len(Entities):
+        log.warning(
+            "Layer entity parse mismatch for %s: parsed %d/%d supported entity chunks; skipped %d. "
+            "See previous warnings for unresolved templates or malformed entity data.",
+            filename,
+            len(Entities),
+            expected_entities,
+            expected_entities - len(Entities),
+        )
 
     return level
 

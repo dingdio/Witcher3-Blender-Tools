@@ -17,7 +17,7 @@ def load_w2w(fileName_in = False):
     if fileName_in:
         fileName = fileName_in
     CR2WFile = CR2W_file.read_CR2W(fileName)
-    world = CR2W_file.create_world(CR2WFile)
+    world = CR2W_file.create_world(CR2WFile, fileName)
     #write_yml(world)
     return world
 

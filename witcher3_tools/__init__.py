@@ -8,6 +8,7 @@ from .extension_paths import (
     get_audio_root,
     get_cache_root,
     get_extension_user_dir,
+    get_redkit_working_root,
     get_temp_root,
     get_texture_root,
     get_uncook_root,
@@ -305,6 +306,21 @@ def get_vgmstream_path(context) -> str:
 def get_all_addon_prefs(context):
     return context.preferences.addons[ADDON_NAME].preferences
 
+
+def _get_registered_addon_prefs(context=None):
+    ctx = context or bpy.context
+    addons = getattr(getattr(ctx, "preferences", None), "addons", None)
+    if addons is None:
+        return None
+    for name in (ADDON_NAME, LEGACY_ADDON_NAME):
+        try:
+            addon = addons.get(name)
+        except Exception:
+            addon = None
+        if addon is not None:
+            return addon.preferences
+    return None
+
 def get_do_import_redcloth(context) -> bool:
     addon_prefs = context.preferences.addons[ADDON_NAME].preferences
     return bool(getattr(addon_prefs, "do_import_redcloth", True))
@@ -388,6 +404,7 @@ from .ui import ui_custom_icons
 from .ui import ui_map
 from .ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_w2w,
+                                     WITCH_OT_w2l_collection_details,
                                      WITCH_OT_load_layer,
                                      WITCH_OT_load_layer_group,
                                      WITCH_OT_cancel_layer_stream_job,
@@ -3576,25 +3593,26 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 col.prop(coll, "name")
                 group_type = str(coll.get("group_type", "")).strip()
                 world_path = str(coll.get("world_path", "")).strip()
-                level_path = str(coll.get("level_path", "")).strip()
+                level_path = ui_map.ensure_collection_w2layer_path(coll)
                 layer_build_tag = str(coll.get("layerBuildTag", "")).strip()
 
                 if group_type:
-                    col.label(text=f"group_type: {group_type}")
+                    col.prop(coll, '["group_type"]', text="group_type")
                 if world_path:
-                    col.label(text=f"world_path: {world_path}")
+                    col.prop(coll, '["world_path"]', text="world_path")
                 if level_path:
-                    col.label(text=f"level_path: {level_path}")
+                    col.prop(coll, '["w2layer_path"]', text="w2layer_path")
                 if layer_build_tag:
-                    col.label(text=f"layerBuildTag: {layer_build_tag}")
+                    col.prop(coll, '["layerBuildTag"]', text="layerBuildTag")
 
                 has_level_button = bool(level_path)
                 has_group_button = group_type == "LayerGroup"
-                if has_level_button or has_group_button:
+                if has_level_button or has_group_button or group_type:
                     col.separator()
                     col_load = col.column(align=True)
+                    col_load.operator("witcher.w2l_collection_details", text="Details", icon='INFO')
                     if has_level_button:
-                        col_load.operator("witcher.load_layer", text="Load This Level", icon='CUBE')
+                        col_load.operator("witcher.load_layer", text="Load This Layer", icon='CUBE')
                     if has_group_button:
                         col_load.operator("witcher.load_layer_group", text="Load This LayerGroup", icon='OUTLINER_COLLECTION')
             else:
@@ -3868,7 +3886,7 @@ class WITCH_PT_Utils(WITCH_PT_Base, bpy.types.Panel):
         if coll:
             has_witcher_data = any(
                 str(coll.get(k, "")).strip()
-                for k in ("group_type", "world_path", "level_path", "layerBuildTag")
+                for k in ("group_type", "world_path", "w2layer_path", "level_path", "layerBuildTag")
             )
             if has_witcher_data:
                 box = layout.box()
@@ -4082,7 +4100,7 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
             if coll:
                 has_witcher_data = any(
                     str(coll.get(k, "")).strip()
-                    for k in ("group_type", "world_path", "level_path", "layerBuildTag")
+                    for k in ("group_type", "world_path", "w2layer_path", "level_path", "layerBuildTag")
                 )
                 if has_witcher_data:
                     box = layout.box()
@@ -4382,6 +4400,7 @@ _classes = [
     # WITCH_OT_ExportW2AnimJson,
     WITCH_OT_ViewportNormals,
     WITCH_OT_ToggleClothSimulation,
+    WITCH_OT_w2l_collection_details,
     WITCH_OT_load_layer,
     WITCH_OT_load_layer_group,
     WITCH_OT_cancel_layer_stream_job,
@@ -4436,15 +4455,16 @@ def register():
     bpy.utils.register_class(WITCHER_OT_pref_help_popup)
 
     bpy.utils.register_class(Witcher3AddonPrefs)
-    prefs = bpy.context.preferences.addons[ADDON_NAME].preferences
-    _apply_dev_pref_overrides(prefs)
-    # Apply logging levels after programmatic dev overrides because property
-    # update callbacks do not fire when set via setattr().
-    try:
-        _update_verbose_logging(prefs, bpy.context)
-    except Exception:
-        pass
-    _auto_initialize_game_and_audio_paths(prefs, bpy.context)
+    prefs = _get_registered_addon_prefs(bpy.context)
+    if prefs is not None:
+        _apply_dev_pref_overrides(prefs)
+        # Apply logging levels after programmatic dev overrides because property
+        # update callbacks do not fire when set via setattr().
+        try:
+            _update_verbose_logging(prefs, bpy.context)
+        except Exception:
+            pass
+        _auto_initialize_game_and_audio_paths(prefs, bpy.context)
     try:
         from .importers import dlc_mounters
 

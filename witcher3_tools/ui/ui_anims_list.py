@@ -1290,6 +1290,7 @@ def AddCLayerGroupExample(groups, parent_collection):
     if groups.ChildrenInfos:
         for ChildInfo in groups.ChildrenInfos:
             child_collection = bpy.data.collections.new(os.path.basename(ChildInfo.depotFilePath))
+            child_collection['w2layer_path'] = ChildInfo.depotFilePath
             child_collection['level_path'] = ChildInfo.depotFilePath
             child_collection['layerBuildTag'] = ChildInfo.layerBuildTag
             child_collection['group_type'] = "LayerInfo"

@@ -1868,6 +1868,102 @@ class SEntityBufferType2():
         self.componentName = self.CR2WFILE.CNAMES[readUShort(f)].name
         self.variables.Read(f, size)
 
+
+def _entity_component_tail_positions(tail_start, class_end, prefer_direct=False):
+    positions = []
+    if prefer_direct:
+        positions.append(tail_start)
+        legacy_pos = tail_start + 10
+        if legacy_pos < class_end:
+            positions.append(legacy_pos)
+    else:
+        legacy_pos = tail_start + 10
+        if legacy_pos < class_end:
+            positions.append(legacy_pos)
+        positions.append(tail_start)
+    seen = set()
+    for pos in positions:
+        if pos in seen or pos >= class_end:
+            continue
+        seen.add(pos)
+        yield pos
+
+
+def _try_read_entity_components_at(f, CR2WFILE, class_end, pos):
+    f.seek(pos)
+    try:
+        elementcount, _count_len = ReadBit6(f, returnLen=True)
+    except Exception:
+        return None
+    if elementcount < 0:
+        return None
+    remaining = int(class_end) - int(f.tell())
+    if elementcount * 4 > remaining:
+        return None
+    components = []
+    try:
+        for _item in range(0, elementcount):
+            if f.tell() + 4 > class_end:
+                return None
+            components.append(readInt32(f))
+    except Exception:
+        return None
+    return components
+
+
+def _read_entity_components_safe(f, CR2WFILE, entity_chunk, tail_start, class_end, prefer_direct=False):
+    for pos in _entity_component_tail_positions(tail_start, class_end, prefer_direct=prefer_direct):
+        components = _try_read_entity_components_at(f, CR2WFILE, class_end, pos)
+        if components is not None:
+            return components
+    log.warning(
+        "Skipping malformed CEntity component array in %s export #%s at 0x%X (%d byte tail)",
+        getattr(CR2WFILE, "fileName", "<memory>"),
+        getattr(entity_chunk, "ChunkIndex", "?"),
+        int(tail_start),
+        max(0, int(class_end) - int(tail_start)),
+    )
+    f.seek(tail_start)
+    return []
+
+
+def _read_entity_buffer_v2_safe(f, CR2WFILE, entity_chunk, class_end):
+    start = f.tell()
+    try:
+        if start + 4 > class_end:
+            return []
+        elementcount = readU32Check(f, start)
+        remaining_after_count = max(0, int(class_end) - int(start) - 4)
+        # A BufferV2 element starts with sizeofdata + component CName, so it
+        # cannot be smaller than six bytes even when it has no variables.
+        max_possible = remaining_after_count // 6
+        if elementcount > max_possible:
+            log.debug(
+                "Skipping malformed CEntity BufferV2 in %s export #%s at 0x%X "
+                "(count %d cannot fit in %d byte tail)",
+                getattr(CR2WFILE, "fileName", "<memory>"),
+                getattr(entity_chunk, "ChunkIndex", "?"),
+                int(start),
+                int(elementcount),
+                int(class_end) - int(start),
+            )
+            f.seek(class_end)
+            return []
+        buffer_v2 = CBufferUInt32(CR2WFILE, SEntityBufferType2)
+        buffer_v2.Read(f, 0)
+        return buffer_v2.elements
+    except Exception as exc:
+        log.debug(
+            "Skipping malformed CEntity BufferV2 in %s export #%s at 0x%X: %s",
+            getattr(CR2WFILE, "fileName", "<memory>"),
+            getattr(entity_chunk, "ChunkIndex", "?"),
+            int(start),
+            exc,
+        )
+        f.seek(class_end)
+        return []
+
+
 class CVariantSizeTypeName():
     def __init__(self, CR2WFILE):
         self.CR2WFILE = CR2WFILE
@@ -2205,10 +2301,8 @@ class W_CLASS:
                 self.BufferV2 = False
                 if (self.isCreatedFromTemplate):
                     f.seek(-10,1)
-                    self.BufferV2 = CBufferUInt32(CR2WFILE, SEntityBufferType2)
                     if (bytesleft > 0):
-                        self.BufferV2.Read(f, 0)
-                        self.BufferV2 = self.BufferV2.elements
+                        self.BufferV2 = _read_entity_buffer_v2_safe(f, CR2WFILE, self, self.classEnd)
                     else:
                         _log_optional_centity_buffer_skip(
                             CR2WFILE,
@@ -2383,16 +2477,24 @@ class W_CLASS:
                         if self.Template and self.Template.Handles and self.Template.Handles[0].DepotPath:
                             self.isCreatedFromTemplate = True
                         self.Components = []
-                        f.seek(10,1)
+                        entity_tail_start = f.tell()
+                        if self.isCreatedFromTemplate:
+                            f.seek(min(entity_tail_start + 10, self.classEnd))
                         size = self.classEnd - startofthis
                         endPos = f.tell()
                         bytesleft = size - (endPos - startofthis)
                         log.debug(self.name)
                         if (not self.isCreatedFromTemplate):
                             if bytesleft > 0:
-                                elementcount = ReadBit6(f)
-                                for item in range(0,elementcount):
-                                    self.Components.append(readInt32(f))
+                                prefer_direct_components = self.GetVariableByName('streamingDataBuffer') is not None
+                                self.Components = _read_entity_components_safe(
+                                    f,
+                                    CR2WFILE,
+                                    self,
+                                    entity_tail_start,
+                                    self.classEnd,
+                                    prefer_direct=prefer_direct_components,
+                                )
 
 
                         endPos = f.tell()
@@ -2422,10 +2524,8 @@ class W_CLASS:
                         bytesleft = size - (endPos - startofthis)
                         self.BufferV2 = False
                         if (self.isCreatedFromTemplate):
-                            self.BufferV2 = CBufferUInt32(CR2WFILE, SEntityBufferType2)
                             if (bytesleft > 0):
-                                self.BufferV2.Read(f, 0)
-                                self.BufferV2 = self.BufferV2.elements
+                                self.BufferV2 = _read_entity_buffer_v2_safe(f, CR2WFILE, self, self.classEnd)
                             else:
                                 _log_optional_centity_buffer_skip(
                                     CR2WFILE,
