@@ -62,6 +62,15 @@ def w3_world_to_unreal(x: float, y: float, z: float) -> tuple[float, float, floa
     )
 
 
+def unreal_to_w3_world(x: float, y: float, z: float) -> tuple[float, float, float]:
+    """Inverse of w3_world_to_unreal: Unreal world (cm) -> W3/Blender world (m)."""
+    return (
+        float(x) / UE_UNITS_PER_METER,
+        float(y) / UE_UNITS_PER_METER * UNREAL_Y_SIGN,
+        float(z) / UE_UNITS_PER_METER,
+    )
+
+
 def _mat3_to_quat_xyzw(rot: np.ndarray) -> list[float]:
     """Proper orthonormal 3x3 (rows) -> quaternion [x, y, z, w] (Shepperd)."""
     m = np.asarray(rot, dtype=float)

@@ -11,5 +11,8 @@ public:
     virtual void ShutdownModule() override;
 
 private:
+    void RegisterMenus();
+    void OnLoadW2LAroundCamera();
+
     TUniquePtr<FWitcherImportServer> Server;
 };

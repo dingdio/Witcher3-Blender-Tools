@@ -32,7 +32,10 @@ public class WitcherToolsImporter : ModuleRules
             "SkeletalMeshUtilitiesCommon",
             "AnimationCore",
             "Slate",
-            "SlateCore"
+            "SlateCore",
+            "ToolMenus",
+            "LevelEditor",
+            "EditorFramework"
         });
     }
 }

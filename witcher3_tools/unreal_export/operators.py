@@ -488,6 +488,93 @@ class WITCHER_OT_export_unreal_w2l(bpy.types.Operator):
             return {"CANCELLED"}
 
 
+def run_send_layers_around_camera(context, *, camera_position=None, radius=None, action="SEND"):
+    button_started = time.perf_counter()
+    from ..ui.ui_map import select_nearby_w2l_paths
+
+    settings = context.scene.witcher_unreal_export
+    if not settings.export_folder:
+        settings.export_folder = bundle.default_export_folder()
+
+    try:
+        selection = select_nearby_w2l_paths(context, camera_position=camera_position, radius=radius)
+    except ValueError as exc:
+        settings.last_status = "No nearby layers"
+        settings.last_details = str(exc)
+        return {"status": "CANCELLED", "level": "ERROR", "message": str(exc)}
+
+    w2l_paths = selection.get("paths", [])
+    if not w2l_paths:
+        msg = (
+            f"No .w2l layers found within {selection.get('radius', 0.0):.0f} world units of the camera "
+            f"(checked {selection.get('candidate_count', 0)} cached layers)."
+        )
+        settings.last_status = "No nearby layers"
+        settings.last_details = msg
+        return {"status": "CANCELLED", "level": "WARNING", "message": msg}
+
+    if action == "SEND":
+        connection_error = _preflight_send_connection(settings)
+        if connection_error:
+            settings.last_status = "Unreal import server not reachable"
+            settings.last_details = connection_error
+            return {"status": "CANCELLED", "level": "ERROR", "message": connection_error}
+
+    try:
+        with _quiet_send_logging(settings, action):
+            scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+            include_collision_blocks = bool(
+                getattr(settings, "placement_export_collision", False)
+                or getattr(scene_settings, "terrain_layer_do_import_collision", False)
+            )
+            result = w2l_placements.build_unreal_w2l_bundle_multi(
+                context,
+                settings,
+                w2l_paths,
+                include_collision_blocks=include_collision_blocks,
+                include_point_lights=bool(getattr(scene_settings, "terrain_layer_do_import_point_light", True)),
+                include_spot_lights=bool(getattr(scene_settings, "terrain_layer_do_import_spot_light", True)),
+            )
+            settings.last_manifest_path = result["manifest_path"]
+            warning_count = len(result["manifest"].get("warnings", []))
+            settings.last_status = (
+                f"Layers bundle ready ({len(w2l_paths)} layers, "
+                f"{warning_count} warning{'s' if warning_count != 1 else ''})"
+            )
+            settings.last_details = _format_w2l_multi_bundle_details(result, selection)
+
+            if action == "SEND":
+                settings.last_status = f"Sending {len(w2l_paths)} layers to Unreal"
+                send_started = time.perf_counter()
+                response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                send_seconds = time.perf_counter() - send_started
+                total_seconds = time.perf_counter() - button_started
+                success = bool(response.get("success"))
+                settings.last_status = (
+                    "Unreal layers import complete" if success else "Unreal layers import failed"
+                )
+                timing_report = _format_send_timing_report(
+                    f"{len(w2l_paths)} layers around camera",
+                    total_seconds,
+                    float(result.get("elapsed_seconds", 0.0) or 0.0),
+                    send_seconds,
+                    response,
+                    result.get("build_timings"),
+                )
+                print(timing_report)
+                settings.last_details += "\n\n" + timing_report
+                settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
+                if not success:
+                    return {"status": "CANCELLED", "level": "ERROR", "message": settings.last_status}
+                settings.last_status += f" ({total_seconds:.1f}s)"
+
+        return {"status": "FINISHED", "level": "INFO", "message": settings.last_status}
+    except Exception as exc:
+        settings.last_status = "Unreal layers export failed"
+        settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
+        return {"status": "CANCELLED", "level": "ERROR", "message": str(exc)}
+
+
 class WITCHER_OT_send_unreal_layers_around_camera(bpy.types.Operator):
     bl_idname = "witcher.send_unreal_layers_around_camera"
     bl_label = "Send Layers Around Camera to Unreal"
@@ -511,94 +598,9 @@ class WITCHER_OT_send_unreal_layers_around_camera(bpy.types.Operator):
         return context is not None and context.scene is not None
 
     def execute(self, context):
-        button_started = time.perf_counter()
-        from ..ui.ui_map import select_nearby_w2l_paths
-
-        settings = context.scene.witcher_unreal_export
-        if not settings.export_folder:
-            settings.export_folder = bundle.default_export_folder()
-
-        try:
-            selection = select_nearby_w2l_paths(context)
-        except ValueError as exc:
-            settings.last_status = "No nearby layers"
-            settings.last_details = str(exc)
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-
-        w2l_paths = selection.get("paths", [])
-        if not w2l_paths:
-            radius = selection.get("radius", 0.0)
-            msg = (
-                f"No .w2l layers found within {radius:.0f} world units of the camera "
-                f"(checked {selection.get('candidate_count', 0)} cached layers)."
-            )
-            settings.last_status = "No nearby layers"
-            settings.last_details = msg
-            self.report({"WARNING"}, msg)
-            return {"CANCELLED"}
-
-        if self.action == "SEND":
-            connection_error = _preflight_send_connection(settings)
-            if connection_error:
-                return _cancel_unreachable_unreal(self, settings, connection_error)
-
-        try:
-            with _quiet_send_logging(settings, self.action):
-                scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
-                include_collision_blocks = bool(
-                    getattr(settings, "placement_export_collision", False)
-                    or getattr(scene_settings, "terrain_layer_do_import_collision", False)
-                )
-                result = w2l_placements.build_unreal_w2l_bundle_multi(
-                    context,
-                    settings,
-                    w2l_paths,
-                    include_collision_blocks=include_collision_blocks,
-                    include_point_lights=bool(getattr(scene_settings, "terrain_layer_do_import_point_light", True)),
-                    include_spot_lights=bool(getattr(scene_settings, "terrain_layer_do_import_spot_light", True)),
-                )
-                settings.last_manifest_path = result["manifest_path"]
-                warning_count = len(result["manifest"].get("warnings", []))
-                settings.last_status = (
-                    f"Layers bundle ready ({len(w2l_paths)} layers, "
-                    f"{warning_count} warning{'s' if warning_count != 1 else ''})"
-                )
-                settings.last_details = _format_w2l_multi_bundle_details(result, selection)
-
-                if self.action == "SEND":
-                    settings.last_status = f"Sending {len(w2l_paths)} layers to Unreal"
-                    send_started = time.perf_counter()
-                    response = send_import_request(settings.host, settings.port, result["manifest_path"])
-                    send_seconds = time.perf_counter() - send_started
-                    total_seconds = time.perf_counter() - button_started
-                    success = bool(response.get("success"))
-                    settings.last_status = (
-                        "Unreal layers import complete" if success else "Unreal layers import failed"
-                    )
-                    timing_report = _format_send_timing_report(
-                        f"{len(w2l_paths)} layers around camera",
-                        total_seconds,
-                        float(result.get("elapsed_seconds", 0.0) or 0.0),
-                        send_seconds,
-                        response,
-                        result.get("build_timings"),
-                    )
-                    print(timing_report)
-                    settings.last_details += "\n\n" + timing_report
-                    settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
-                    if not success:
-                        self.report({"ERROR"}, settings.last_status)
-                        return {"CANCELLED"}
-                    settings.last_status += f" ({total_seconds:.1f}s)"
-
-            self.report({"INFO"}, settings.last_status)
-            return {"FINISHED"}
-        except Exception as exc:
-            settings.last_status = "Unreal layers export failed"
-            settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
+        result = run_send_layers_around_camera(context, action=self.action)
+        self.report({result["level"]}, result["message"])
+        return {result["status"]}
 
 
 class WITCHER_OT_unreal_overwrite_preset(bpy.types.Operator):
@@ -713,6 +715,26 @@ class WITCHER_OT_unreal_project_details(bpy.types.Operator):
         col.prop(self, "project_details", text="Details")
 
     def execute(self, context):
+        return {"FINISHED"}
+
+
+class WITCHER_OT_unreal_listener_toggle(bpy.types.Operator):
+    bl_idname = "witcher.unreal_listener_toggle"
+    bl_label = "Toggle Unreal Listener"
+    bl_description = "Start or stop the local server that lets Unreal trigger Blender (e.g. Load W2L Around Camera)"
+
+    def execute(self, context):
+        from . import blender_server
+        if blender_server.is_running():
+            blender_server.stop()
+            self.report({"INFO"}, "Unreal listener stopped")
+        else:
+            error = blender_server.start()
+            if error:
+                self.report({"ERROR"}, f"Listener failed to start: {error}")
+                return {"CANCELLED"}
+            host, port = blender_server.endpoint()
+            self.report({"INFO"}, f"Unreal listener active on {host}:{port}")
         return {"FINISHED"}
 
 
@@ -850,6 +872,19 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
             conn.prop(settings, "host")
             conn.prop(settings, "port")
             conn.prop(settings, "quiet_send_logging")
+
+            from . import blender_server
+            running = blender_server.is_running()
+            lhost, lport = blender_server.endpoint()
+            listen_row = box.row(align=True)
+            listen_row.label(
+                text=f"Listening for Unreal: {lhost}:{lport}" if running else "Not listening for Unreal",
+                icon="CHECKMARK" if running else "RADIOBUT_OFF",
+            )
+            listen_row.operator(
+                WITCHER_OT_unreal_listener_toggle.bl_idname,
+                text="Stop" if running else "Start",
+            )
 
         status_row = box.row(align=True)
         status_row.label(text=settings.last_status or "Ready", icon="INFO")
@@ -1146,6 +1181,7 @@ classes = (
     WITCHER_OT_install_unreal_plugin,
     WITCHER_OT_unreal_export_details,
     WITCHER_OT_unreal_project_details,
+    WITCHER_OT_unreal_listener_toggle,
     WITCH_PT_UnrealExport,
 )
 
@@ -1154,9 +1190,13 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.witcher_unreal_export = PointerProperty(type=WITCHER_PG_UnrealExportSettings)
+    from . import blender_server
+    blender_server.start()
 
 
 def unregister():
+    from . import blender_server
+    blender_server.stop()
     if hasattr(bpy.types.Scene, "witcher_unreal_export"):
         del bpy.types.Scene.witcher_unreal_export
     for cls in reversed(classes):
