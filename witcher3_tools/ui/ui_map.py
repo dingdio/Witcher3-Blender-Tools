@@ -4714,6 +4714,29 @@ def get_camera_position_label(context):
     return f"Camera Position: {position[0]:.1f}, {position[1]:.1f}, {position[2]:.1f}"
 
 
+def _normalize_level_path(path):
+    return str(path or "").replace("/", "\\").strip().strip("\\").lower()
+
+
+def _default_hidden_level_paths(root_collection):
+    hidden = set()
+
+    def visit(collection, chain_hidden):
+        for child in getattr(collection, "children", []):
+            gtype = str(child.get("group_type", "")).strip()
+            if gtype == "LayerGroup":
+                child_hidden = chain_hidden or int(child.get("witcher_visible_on_start", 1)) == 0
+                visit(child, child_hidden)
+            elif gtype == "LayerInfo" and chain_hidden:
+                level_path = _normalize_level_path(child.get("level_path", ""))
+                if level_path:
+                    hidden.add(level_path)
+
+    if root_collection is not None:
+        visit(root_collection, False)
+    return hidden
+
+
 def select_nearby_w2l_paths(
     context,
     *,
@@ -4768,8 +4791,11 @@ def select_nearby_w2l_paths(
     candidates.sort(key=lambda item: (item[0], str(item[2].get("level_path", "")).lower()))
     selected = candidates if load_limit <= 0 else candidates[:load_limit]
 
+    default_hidden_level_paths = _default_hidden_level_paths(root_collection)
+
     paths: list[str] = []
     unresolved: list[str] = []
+    default_hidden_paths: list[str] = []
     seen: set[str] = set()
     for _dist, _name, entry, _count in selected:
         resolved = str(entry.get("resolved_path", "") or "").strip()
@@ -4783,6 +4809,8 @@ def select_nearby_w2l_paths(
             continue
         seen.add(key)
         paths.append(resolved)
+        if _normalize_level_path(entry.get("level_path", "")) in default_hidden_level_paths:
+            default_hidden_paths.append(resolved)
 
     return {
         "paths": paths,
@@ -4791,6 +4819,7 @@ def select_nearby_w2l_paths(
         "candidate_count": len(candidates),
         "selected_count": len(selected),
         "unresolved": unresolved,
+        "default_hidden_paths": default_hidden_paths,
         "root_collection_name": root_collection.name,
     }
 

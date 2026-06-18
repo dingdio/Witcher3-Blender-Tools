@@ -97,11 +97,13 @@ _IDENT_ROWS = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 
 
 class _Block:
-    def __init__(self, block_type, mesh_index=0, pos=(0.0, 0.0, 0.0), rows=None, packed_object=None):
+    def __init__(self, block_type, mesh_index=0, pos=(0.0, 0.0, 0.0), rows=None, packed_object=None, flags=None):
         self.packedObjectType = block_type
         self.packedObject = packed_object or types.SimpleNamespace(meshIndex=mesh_index)
         self.position = _Vec(*pos)
         self.rotationMatrix = _Rot(rows or _IDENT_ROWS)
+        if flags is not None:
+            self.flags = flags
 
 
 class _Sector:
@@ -214,6 +216,41 @@ class TestCollect(unittest.TestCase):
         level = self._level(blocks, ["a\\crate.w2mesh"])
         out = w2l_placements.collect_w2l_placements(level, [], instancer_threshold=8)
         self.assertEqual([a["name"] for a in out["actors"]], ["crate_001", "crate_002", "crate_003"])
+
+    def test_missing_sector_flags_default_to_visible(self):
+        level = self._level([_Block(_BlockDataObjectType.Mesh, 0)], ["a\\wall.w2mesh"])
+        out = w2l_placements.collect_w2l_placements(level, [])
+        self.assertFalse(out["actors"][0].get("engine_hidden", False))
+
+    def test_engine_hidden_is_per_sector_placement(self):
+        visible = _Block(_BlockDataObjectType.Mesh, 0, flags=1 << 2)
+        hidden = _Block(_BlockDataObjectType.Mesh, 0, flags=0)
+        level = self._level([visible, hidden], ["a\\wall.w2mesh"])
+
+        out = w2l_placements.collect_w2l_placements(level, [], instancer_threshold=8)
+
+        self.assertEqual(len(out["assets"]), 1)
+        visible_actors = [actor for actor in out["actors"] if not actor.get("engine_hidden")]
+        hidden_actors = [actor for actor in out["actors"] if actor.get("engine_hidden")]
+        self.assertEqual([actor["name"] for actor in visible_actors], ["wall"])
+        self.assertEqual([actor["name"] for actor in hidden_actors], ["wall_EngineHidden"])
+
+    def test_engine_hidden_instancers_split_from_visible_instancers(self):
+        blocks = (
+            [_Block(_BlockDataObjectType.Mesh, 0, flags=1 << 2) for _ in range(8)]
+            + [_Block(_BlockDataObjectType.Mesh, 0, flags=0) for _ in range(8)]
+        )
+        level = self._level(blocks, ["a\\barrel.w2mesh"])
+
+        out = w2l_placements.collect_w2l_placements(level, [], instancer_threshold=8)
+
+        self.assertEqual(out["actors"], [])
+        self.assertEqual(len(out["instancers"]), 2)
+        by_name = {inst["name"]: inst for inst in out["instancers"]}
+        self.assertEqual(len(by_name["barrel"]["matrices"]), 8)
+        self.assertFalse(by_name["barrel"].get("engine_hidden", False))
+        self.assertEqual(len(by_name["barrel_EngineHidden"]["matrices"]), 8)
+        self.assertTrue(by_name["barrel_EngineHidden"].get("engine_hidden", False))
 
     def test_volume_and_proxy_filtered(self):
         level = self._level(

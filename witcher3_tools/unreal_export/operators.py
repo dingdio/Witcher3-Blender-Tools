@@ -385,6 +385,8 @@ class WITCHER_OT_export_unreal_placements(bpy.types.Operator):
                     send_seconds = time.perf_counter() - send_started
                     success = bool(response.get("success"))
                     settings.last_status = "Unreal placements import complete" if success else "Unreal placements import failed"
+                    if success:
+                        settings.last_status += _ue_status_suffix(response, result["manifest"].get("warnings", []))
                     settings.last_details += (
                         f"\n\nUnreal send/import time: {send_seconds:.3f}s"
                         "\n\nUnreal response:\n"
@@ -463,6 +465,8 @@ class WITCHER_OT_export_unreal_w2l(bpy.types.Operator):
                     total_seconds = time.perf_counter() - button_started
                     success = bool(response.get("success"))
                     settings.last_status = "Unreal layer import complete" if success else "Unreal layer import failed"
+                    if success:
+                        settings.last_status += _ue_status_suffix(response, result["manifest"].get("warnings", []))
                     timing_report = _format_send_timing_report(
                         result.get("asset_name", "layer"),
                         total_seconds,
@@ -534,6 +538,7 @@ def run_send_layers_around_camera(context, *, camera_position=None, radius=None,
                 include_collision_blocks=include_collision_blocks,
                 include_point_lights=bool(getattr(scene_settings, "terrain_layer_do_import_point_light", True)),
                 include_spot_lights=bool(getattr(scene_settings, "terrain_layer_do_import_spot_light", True)),
+                default_hidden_paths=selection.get("default_hidden_paths", []),
             )
             settings.last_manifest_path = result["manifest_path"]
             warning_count = len(result["manifest"].get("warnings", []))
@@ -553,6 +558,8 @@ def run_send_layers_around_camera(context, *, camera_position=None, radius=None,
                 settings.last_status = (
                     "Unreal layers import complete" if success else "Unreal layers import failed"
                 )
+                if success:
+                    settings.last_status += _ue_status_suffix(response, result["manifest"].get("warnings", []))
                 timing_report = _format_send_timing_report(
                     f"{len(w2l_paths)} layers around camera",
                     total_seconds,
@@ -562,6 +569,7 @@ def run_send_layers_around_camera(context, *, camera_position=None, radius=None,
                     result.get("build_timings"),
                 )
                 print(timing_report)
+                _print_dropped_placements(response, result["manifest"].get("warnings", []))
                 settings.last_details += "\n\n" + timing_report
                 settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
                 if not success:
@@ -916,6 +924,49 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
         cats.prop(settings, "overwrite_material_instances")
         cats.prop(settings, "overwrite_materials_base")
         cats.prop(settings, "overwrite_textures")
+
+
+_DROP_WARNING_TOKENS = (
+    "not found", "missing mesh", "placement skipped", "left unchanged",
+    "has no geometry", "could not derive", "could not resolve", "skipped.",
+)
+
+
+def _ue_status_suffix(response: dict, build_warnings) -> str:
+    ue = response or {}
+    warning_lists = (build_warnings or [], ue.get("warnings", []) or [])
+    total = sum(len(lst) for lst in warning_lists)
+    dropped = sum(
+        1
+        for lst in warning_lists
+        for w in lst
+        if any(tok in str(w).lower() for tok in _DROP_WARNING_TOKENS)
+    )
+    errors = ue.get("errors", []) or []
+    parts = []
+    if dropped:
+        parts.append(f"{dropped} placement{'s' if dropped != 1 else ''} dropped")
+    if total:
+        parts.append(f"{total} warning{'s' if total != 1 else ''}")
+    if errors:
+        parts.append(f"{len(errors)} error{'s' if len(errors) != 1 else ''}")
+    return f" — {', '.join(parts)}" if parts else ""
+
+
+def _print_dropped_placements(response: dict, build_warnings) -> None:
+    """Echo any dropped-placement warnings to the system console so the user
+    doesn't have to dig into the Details dialog to see what went missing."""
+    ue = response or {}
+    lines = [
+        str(w)
+        for lst in (build_warnings or [], ue.get("warnings", []) or [])
+        for w in lst
+        if any(tok in str(w).lower() for tok in _DROP_WARNING_TOKENS)
+    ]
+    if lines:
+        print("Witcher->Unreal: %d placement warning(s):" % len(lines))
+        for line in lines:
+            print("  - " + line)
 
 
 def _format_bundle_details(result: dict) -> str:

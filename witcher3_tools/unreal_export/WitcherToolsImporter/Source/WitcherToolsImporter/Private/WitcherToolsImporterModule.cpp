@@ -9,6 +9,7 @@
 #include "Widgets/Notifications/SNotificationList.h"
 #include "WitcherBlenderClient.h"
 #include "WitcherImportServer.h"
+#include "WitcherVisibilityPanel.h"
 
 #define LOCTEXT_NAMESPACE "FWitcherToolsImporterModule"
 
@@ -25,6 +26,8 @@ void FWitcherToolsImporterModule::StartupModule()
     Server = MakeUnique<FWitcherImportServer>();
     Server->Start();
 
+    WitcherVisibilityPanel::Register();
+
     UToolMenus::RegisterStartupCallback(
         FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FWitcherToolsImporterModule::RegisterMenus));
 }
@@ -33,6 +36,8 @@ void FWitcherToolsImporterModule::ShutdownModule()
 {
     UToolMenus::UnRegisterStartupCallback(this);
     UToolMenus::UnregisterOwner(this);
+
+    WitcherVisibilityPanel::Unregister();
 
     if (Server)
     {
@@ -53,6 +58,12 @@ void FWitcherToolsImporterModule::RegisterMenus()
         LOCTEXT("LoadW2LAroundCameraTip", "Ask Blender to export and import the .w2l layers near the viewport camera"),
         FSlateIcon(),
         FUIAction(FExecuteAction::CreateRaw(this, &FWitcherToolsImporterModule::OnLoadW2LAroundCamera)));
+    Section.AddMenuEntry(
+        TEXT("LayerVisibility"),
+        LOCTEXT("LayerVisibility", "Layer Visibility"),
+        LOCTEXT("LayerVisibilityTip", "Open the panel to show/hide imported layer groups (collision, meshes, lights)"),
+        FSlateIcon(),
+        FUIAction(FExecuteAction::CreateStatic(&WitcherVisibilityPanel::OpenTab)));
 }
 
 void FWitcherToolsImporterModule::OnLoadW2LAroundCamera()

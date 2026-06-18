@@ -1,5 +1,6 @@
 #include "WitcherImportContext.h"
 #include "WitcherMeshBuffer.h"
+#include "WitcherPlacementTags.h"
 
 #include "Framework/Notifications/NotificationManager.h"
 #include "HAL/PlatformTime.h"
@@ -11,7 +12,7 @@
 #include "AssetImportTask.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
-#include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LightComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/PrimitiveComponent.h"
@@ -2840,6 +2841,18 @@ void FWitcherImportContext::ImportPlacements()
         const FString LayerId = JsonString(Layer, TEXT("layer_id"), TEXT("placements"));
         const FString Folder = JsonString(Layer, TEXT("folder"));
 
+        // Mirror the Blender layer hierarchy in the outliner:
+        FString LayerRoot = JsonString(Layer, TEXT("label"), LayerId);
+        LayerRoot.ReplaceInline(TEXT("\\"), TEXT("/"));
+        if (!Folder.IsEmpty())
+        {
+            LayerRoot = Folder + TEXT("/") + LayerRoot;
+        }
+        const FString SectorRoot = LayerRoot + TEXT("/CSectorData");
+        const FString MeshFolder = SectorRoot + TEXT("/Mesh");
+        const FString CollisionFolder = SectorRoot + TEXT("/Collision");
+        const FString LightFolder = SectorRoot + TEXT("/Lights");
+
         bool bLayerMeshesReady = true;
         auto ValidateRequiredMesh = [&](const TSharedPtr<FJsonObject>& Entry, const TCHAR* Kind) -> bool
         {
@@ -2904,19 +2917,59 @@ void FWitcherImportContext::ImportPlacements()
             }
         }
 
-        auto PlaceActorCommon = [&](AActor* Actor, const FString& ActorName)
+        auto PlaceActorCommon = [&](AActor* Actor, const FString& ActorName, const FString& ActorFolder)
         {
             if (!Actor)
             {
                 return;
             }
             Actor->Tags.Add(LayerTag);
-            Actor->SetActorLabel(ActorName);
-            if (!Folder.IsEmpty())
+            if (ActorFolder.EndsWith(TEXT("/Collision")))
             {
-                Actor->SetFolderPath(FName(*Folder));
+                Actor->Tags.Add(WitcherPlacementTags::Collision());
+            }
+            else if (ActorFolder.EndsWith(TEXT("/Lights")))
+            {
+                Actor->Tags.Add(WitcherPlacementTags::Light());
+            }
+            else
+            {
+                Actor->Tags.Add(WitcherPlacementTags::Mesh());
+            }
+            Actor->SetActorLabel(ActorName);
+            if (!ActorFolder.IsEmpty())
+            {
+                Actor->SetFolderPath(FName(*ActorFolder));
             }
             ImportedAssets.Add(Actor->GetPathName());
+        };
+
+        auto HideEngineActorInEditor = [&](AActor* Actor)
+        {
+            if (Actor)
+            {
+                Actor->SetIsTemporarilyHiddenInEditor(true);
+            }
+        };
+
+        auto MarkEngineHidden = [&](AActor* Actor)
+        {
+            if (Actor)
+            {
+                Actor->Tags.Add(WitcherPlacementTags::EngineHidden());
+                Actor->SetActorHiddenInGame(true);
+                Actor->SetIsTemporarilyHiddenInEditor(true);
+            }
+        };
+
+        auto MarkDefaultHidden = [&](AActor* Actor)
+        {
+            if (Actor)
+            {
+                Actor->Tags.Add(WitcherPlacementTags::DefaultHidden());
+                Actor->SetActorHiddenInGame(true);
+                Actor->SetIsTemporarilyHiddenInEditor(true);
+            }
         };
 
         auto ConfigureVisualPlacement = [](UPrimitiveComponent* Component)
@@ -2985,6 +3038,8 @@ void FWitcherImportContext::ImportPlacements()
                 }
                 const FString AssetRel = JsonString(ActorEntry, TEXT("asset_path"));
                 const bool bCollisionOnly = JsonBool(ActorEntry, TEXT("collision_only"), false);
+                const bool bEngineHidden = JsonBool(ActorEntry, TEXT("engine_hidden"), false);
+                const bool bDefaultHidden = JsonBool(ActorEntry, TEXT("default_hidden"), false);
                 UStaticMesh* Mesh = FindPlacementMesh(AssetRel);
                 if (!Mesh)
                 {
@@ -3026,12 +3081,25 @@ void FWitcherImportContext::ImportPlacements()
                     }
                 }
                 MeshActor->SetActorTransform(FTransform(Rotation, Location, ScaleVec));
-                PlaceActorCommon(MeshActor, ActorName);
+                PlaceActorCommon(MeshActor, ActorName, bCollisionOnly ? CollisionFolder : MeshFolder);
                 if (bCollisionOnly)
                 {
                     MeshActor->SetActorHiddenInGame(true);
+                    HideEngineActorInEditor(MeshActor);
+                    if (bDefaultHidden)
+                    {
+                        MarkDefaultHidden(MeshActor);
+                    }
                     ++CollisionActorCount;
                     continue;
+                }
+                if (bEngineHidden)
+                {
+                    MarkEngineHidden(MeshActor);
+                }
+                if (bDefaultHidden)
+                {
+                    MarkDefaultHidden(MeshActor);
                 }
                 ++ActorCount;
 
@@ -3060,7 +3128,12 @@ void FWitcherImportContext::ImportPlacements()
                     }
                     CollisionActor->SetActorTransform(FTransform(Rotation, Location, ScaleVec));
                     CollisionActor->SetActorHiddenInGame(true);
-                    PlaceActorCommon(CollisionActor, ActorName + TEXT("_Collision"));
+                    PlaceActorCommon(CollisionActor, ActorName + TEXT("_Collision"), CollisionFolder);
+                    HideEngineActorInEditor(CollisionActor);
+                    if (bDefaultHidden)
+                    {
+                        MarkDefaultHidden(CollisionActor);
+                    }
                     ++CollisionActorCount;
                 }
             }
@@ -3081,6 +3154,8 @@ void FWitcherImportContext::ImportPlacements()
                 }
                 const FString AssetRel = JsonString(InstancerEntry, TEXT("asset_path"));
                 const bool bCollisionOnly = JsonBool(InstancerEntry, TEXT("collision_only"), false);
+                const bool bEngineHidden = JsonBool(InstancerEntry, TEXT("engine_hidden"), false);
+                const bool bDefaultHidden = JsonBool(InstancerEntry, TEXT("default_hidden"), false);
                 UStaticMesh* Mesh = FindPlacementMesh(AssetRel);
                 if (!Mesh)
                 {
@@ -3119,8 +3194,12 @@ void FWitcherImportContext::ImportPlacements()
                 Root->SetMobility(EComponentMobility::Movable);
                 Container->AddInstanceComponent(Root);
                 Root->RegisterComponent();
-                UHierarchicalInstancedStaticMeshComponent* Hism =
-                    NewObject<UHierarchicalInstancedStaticMeshComponent>(Container);
+                // Plain ISM, not HISM: HISM's per-cluster frustum/occlusion
+                // culling is what made distant rock instances pop in only up
+                // close. ISM culls per whole component, so a placed cluster
+                // renders together. Fine for the dozens-to-hundreds counts here.
+                UInstancedStaticMeshComponent* Hism =
+                    NewObject<UInstancedStaticMeshComponent>(Container);
                 Hism->SetupAttachment(Root);
                 Hism->SetMobility(EComponentMobility::Movable);
                 Hism->SetStaticMesh(Mesh);
@@ -3136,7 +3215,7 @@ void FWitcherImportContext::ImportPlacements()
                 Hism->RegisterComponent();
 
                 AActor* CollisionContainer = nullptr;
-                UHierarchicalInstancedStaticMeshComponent* CollisionHism = nullptr;
+                UInstancedStaticMeshComponent* CollisionHism = nullptr;
                 if (CollisionMesh)
                 {
                     CollisionContainer = World->SpawnActor<AActor>();
@@ -3148,7 +3227,7 @@ void FWitcherImportContext::ImportPlacements()
                         CollisionContainer->AddInstanceComponent(CollisionRoot);
                         CollisionRoot->RegisterComponent();
 
-                        CollisionHism = NewObject<UHierarchicalInstancedStaticMeshComponent>(CollisionContainer);
+                        CollisionHism = NewObject<UInstancedStaticMeshComponent>(CollisionContainer);
                         CollisionHism->SetupAttachment(CollisionRoot);
                         CollisionHism->SetMobility(EComponentMobility::Movable);
                         CollisionHism->SetStaticMesh(CollisionMesh);
@@ -3185,16 +3264,37 @@ void FWitcherImportContext::ImportPlacements()
                     }
                     ++InstanceCount;
                 }
-                PlaceActorCommon(Container, InstancerName);
+                PlaceActorCommon(Container, InstancerName, bCollisionOnly ? CollisionFolder : MeshFolder);
                 if (bCollisionOnly)
                 {
                     Container->SetActorHiddenInGame(true);
+                    HideEngineActorInEditor(Container);
+                    if (bDefaultHidden)
+                    {
+                        MarkDefaultHidden(Container);
+                    }
                     ++CollisionActorCount;
                 }
-                else if (CollisionContainer)
+                else
                 {
-                    PlaceActorCommon(CollisionContainer, InstancerName + TEXT("_Collision"));
-                    ++CollisionActorCount;
+                    if (bEngineHidden)
+                    {
+                        MarkEngineHidden(Container);
+                    }
+                    if (bDefaultHidden)
+                    {
+                        MarkDefaultHidden(Container);
+                    }
+                    if (CollisionContainer)
+                    {
+                        PlaceActorCommon(CollisionContainer, InstancerName + TEXT("_Collision"), CollisionFolder);
+                        HideEngineActorInEditor(CollisionContainer);
+                        if (bDefaultHidden)
+                        {
+                            MarkDefaultHidden(CollisionContainer);
+                        }
+                        ++CollisionActorCount;
+                    }
                 }
             }
         }
@@ -3216,6 +3316,7 @@ void FWitcherImportContext::ImportPlacements()
                 const FVector Location = JsonVector(Transform, TEXT("location"), FVector::ZeroVector);
                 const FString LightType = JsonString(LightEntry, TEXT("type"), TEXT("point")).ToLower();
                 const FString LightName = JsonString(LightEntry, TEXT("name"), LightType == TEXT("spot") ? TEXT("SpotLight") : TEXT("PointLight"));
+                const bool bDefaultHidden = JsonBool(LightEntry, TEXT("default_hidden"), false);
 
                 if (LightType == TEXT("spot"))
                 {
@@ -3239,7 +3340,11 @@ void FWitcherImportContext::ImportPlacements()
                         Component->SetOuterConeAngle(FMath::Max(0.0f, OuterCone));
                         Component->SetInnerConeAngle(FMath::Clamp(InnerCone, 0.0f, FMath::Max(0.0f, OuterCone)));
                     }
-                    PlaceActorCommon(SpotActor, LightName);
+                    PlaceActorCommon(SpotActor, LightName, LightFolder);
+                    if (bDefaultHidden)
+                    {
+                        MarkDefaultHidden(SpotActor);
+                    }
                     ++LightCount;
                 }
                 else
@@ -3254,7 +3359,11 @@ void FWitcherImportContext::ImportPlacements()
                     {
                         ConfigurePointLight(Component, LightEntry);
                     }
-                    PlaceActorCommon(PointActor, LightName);
+                    PlaceActorCommon(PointActor, LightName, LightFolder);
+                    if (bDefaultHidden)
+                    {
+                        MarkDefaultHidden(PointActor);
+                    }
                     ++LightCount;
                 }
             }

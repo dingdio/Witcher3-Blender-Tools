@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 _VOLUME_TOKENS = ("volume", "trigger", "dimmer", "occlusion", "_occ", "blocker", "nointer")
 _PROXY_TOKENS = ("proxy",)
 DEFAULT_INSTANCER_THRESHOLD = 8
+# SBlockData.flags bit 2 = mesh visible in engine. Cleared = "engine hidden"
+_SECTOR_FLAG_MESH_VISIBLE = 1 << 2
 
 
 def _collision_asset_rel(asset_rel: str) -> str:
@@ -114,6 +116,19 @@ def _w3_direction_to_unreal(direction) -> list[float]:
         return [float(direction[0]), -float(direction[1]), float(direction[2])]
     except Exception:
         return [1.0, 0.0, 0.0]
+
+
+def _block_engine_hidden(block, is_collision: bool) -> bool:
+    if is_collision:
+        return False
+    try:
+        flags = getattr(block, "flags")
+    except Exception:
+        return False
+    try:
+        return not bool(int(flags) & _SECTOR_FLAG_MESH_VISIBLE)
+    except Exception:
+        return False
 
 
 def _spot_direction_from_world(world: np.ndarray) -> list[float]:
@@ -247,37 +262,46 @@ def collect_w2l_placements(
         if not asset_rel:
             warnings.append(f"{depot}: could not derive an Unreal asset path; skipped.")
             continue
-        entry = by_asset.setdefault(asset_rel, {
+        engine_hidden = _block_engine_hidden(block, is_collision)
+        group_key = (asset_rel, "collision" if is_collision else "mesh", bool(engine_hidden))
+        entry = by_asset.setdefault(group_key, {
             "depot": depot,
             "kind": "collision" if is_collision else "mesh",
             "base_asset_rel": base_asset_rel,
             "matrices": [],
+            "engine_hidden": engine_hidden,
         })
         entry["matrices"].append(world)
 
     actors: list[dict[str, Any]] = []
     instancers: list[dict[str, Any]] = []
-    for asset_rel, entry in by_asset.items():
+    for (asset_rel, _kind, _hidden), entry in by_asset.items():
         matrices = entry["matrices"]
         is_collision = entry.get("kind") == "collision"
+        engine_hidden = bool(entry.get("engine_hidden", False))
         assets[asset_rel] = {
             "depot": entry["depot"],
             "kind": entry.get("kind", "mesh"),
             "base_asset_rel": entry.get("base_asset_rel") or asset_rel,
         }
         stem = asset_rel.rsplit("/", 1)[-1]
+        group_stem = f"{stem}_EngineHidden" if engine_hidden else stem
         if len(matrices) >= instancer_threshold:
-            inst = {"name": stem, "asset_rel": asset_rel, "matrices": matrices}
+            inst = {"name": group_stem, "asset_rel": asset_rel, "matrices": matrices}
             if is_collision:
                 inst["collision_only"] = True
+            if engine_hidden:
+                inst["engine_hidden"] = True
             instancers.append(inst)
         else:
             single = len(matrices) == 1
             for index, world in enumerate(matrices):
-                name = stem if single else f"{stem}_{index + 1:03d}"
+                name = group_stem if single else f"{group_stem}_{index + 1:03d}"
                 actor = {"name": name, "asset_rel": asset_rel, "matrix": world}
                 if is_collision:
                     actor["collision_only"] = True
+                if engine_hidden:
+                    actor["engine_hidden"] = True
                 actors.append(actor)
 
     return {"assets": assets, "actors": actors, "instancers": instancers, "lights": lights, "skipped": skipped}
@@ -322,7 +346,7 @@ def _gather_layer_assets(
     shared across every layer in a multi-layer bundle so a mesh referenced by
     several layers is decoded, materialised, and emitted exactly once.
     """
-    from ..CR2W.common_blender import repo_file
+    from ..CR2W.common_blender import repo_file, win_safe_path
     from .gather import gather_placement_mesh
     from .mesh_buffer import write_mesh_buffer
 
@@ -363,7 +387,7 @@ def _gather_layer_assets(
             continue
 
         source = repo_file(normalize_depot_path(depot))
-        if not source or not os.path.isfile(source):
+        if not source or not os.path.isfile(win_safe_path(source)):
             warnings.append(f"{depot}: source .w2mesh not found on disk; placement skipped.")
             failed_assets.add(asset_rel)
             continue
@@ -430,10 +454,11 @@ def _gather_layer_assets(
                     collision_asset_paths[asset_rel] = collision_rel
 
 
-def _layer_placement_group(layer_id, label, folder, collected, gathered_assets, collision_asset_paths=None) -> Optional[dict]:
+def _layer_placement_group(layer_id, label, folder, collected, gathered_assets, collision_asset_paths=None, default_hidden=False) -> Optional[dict]:
     """Build the manifest placement group for one layer, keeping only meshes
     that were successfully gathered somewhere in the (possibly multi-layer)
-    bundle."""
+    bundle. ``default_hidden`` marks the whole layer as a RED "Default Hidden"
+    group (its parent LayerGroup has visible_on_start == 0)."""
     collision_asset_paths = collision_asset_paths or {}
     actors_out: list[dict[str, Any]] = []
     for actor in collected["actors"]:
@@ -450,6 +475,10 @@ def _layer_placement_group(layer_id, label, folder, collected, gathered_assets, 
             collision_asset_path = collision_asset_paths.get(actor["asset_rel"])
             if collision_asset_path:
                 actor_entry["collision_asset_path"] = collision_asset_path
+        if actor.get("engine_hidden"):
+            actor_entry["engine_hidden"] = True
+        if default_hidden:
+            actor_entry["default_hidden"] = True
         actors_out.append(actor_entry)
 
     instancers_out: list[dict[str, Any]] = []
@@ -467,6 +496,10 @@ def _layer_placement_group(layer_id, label, folder, collected, gathered_assets, 
             collision_asset_path = collision_asset_paths.get(inst["asset_rel"])
             if collision_asset_path:
                 inst_entry["collision_asset_path"] = collision_asset_path
+        if inst.get("engine_hidden"):
+            inst_entry["engine_hidden"] = True
+        if default_hidden:
+            inst_entry["default_hidden"] = True
         instancers_out.append(inst_entry)
 
     lights_out: list[dict[str, Any]] = []
@@ -487,6 +520,8 @@ def _layer_placement_group(layer_id, label, folder, collected, gathered_assets, 
             light_entry["direction"] = light.get("direction", [1.0, 0.0, 0.0])
             light_entry["inner_cone_angle"] = light.get("inner_cone_angle", 0.0)
             light_entry["outer_cone_angle"] = light.get("outer_cone_angle", 0.0)
+        if default_hidden:
+            light_entry["default_hidden"] = True
         lights_out.append(light_entry)
 
     if not actors_out and not instancers_out and not lights_out:
@@ -509,8 +544,14 @@ def _build_unreal_w2l_bundle_core(
     include_collision_blocks=None,
     include_point_lights=True,
     include_spot_lights=True,
+    default_hidden_paths=None,
 ) -> dict[str, Any]:
     from ..CR2W.CR2W_reader import load_w2l
+
+    def _norm_abs(path):
+        return os.path.normcase(os.path.normpath(str(path or "")))
+
+    default_hidden_set = {_norm_abs(p) for p in (default_hidden_paths or [])}
     from .bundle import (
         _resolve_content_root_setting,
         default_export_folder,
@@ -608,7 +649,13 @@ def _build_unreal_w2l_bundle_core(
                 export_visual_collision=export_visual_collision,
                 reuse_existing_collision_fbx=bundle_state["reuse_existing_collision_fbx"],
             )
-        parsed.append({"layer_id": layer_id, "label": label, "folder": folder, "collected": collected})
+        parsed.append({
+            "layer_id": layer_id,
+            "label": label,
+            "folder": folder,
+            "collected": collected,
+            "default_hidden": _norm_abs(abs_w2l) in default_hidden_set,
+        })
 
     if not bundle_state:
         labels = ", ".join(sorted({_layer_label_and_folder(_layer_id_for_w2l(_resolve_w2l_abspath(p)))[0] for p in w2l_paths}))
@@ -628,6 +675,7 @@ def _build_unreal_w2l_bundle_core(
             item["collected"],
             gathered_assets,
             bundle_state["collision_asset_paths"],
+            default_hidden=item.get("default_hidden", False),
         )
         if group is not None:
             layers_out.append(group)
@@ -724,6 +772,7 @@ def build_unreal_w2l_bundle_multi(
     include_collision_blocks=None,
     include_point_lights=True,
     include_spot_lights=True,
+    default_hidden_paths=None,
 ) -> dict[str, Any]:
     return _build_unreal_w2l_bundle_core(
         context,
@@ -732,6 +781,7 @@ def build_unreal_w2l_bundle_multi(
         include_collision_blocks=include_collision_blocks,
         include_point_lights=include_point_lights,
         include_spot_lights=include_spot_lights,
+        default_hidden_paths=default_hidden_paths,
     )
 
 
@@ -748,10 +798,13 @@ def _unique_buffer_path(bundle_root: str, asset_rel: str, used_stems: dict[str, 
 
 
 def _buffer_cache_is_fresh(buffer_path: str, source_path: str) -> bool:
+    from ..CR2W.common_blender import win_safe_path
+
     try:
         if not os.path.isfile(buffer_path) or os.path.getsize(buffer_path) <= 0:
             return False
-        if os.path.isfile(source_path) and os.path.getmtime(buffer_path) < os.path.getmtime(source_path):
+        safe_source = win_safe_path(source_path)
+        if os.path.isfile(safe_source) and os.path.getmtime(buffer_path) < os.path.getmtime(safe_source):
             return False
         return True
     except OSError:

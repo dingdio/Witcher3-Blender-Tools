@@ -271,6 +271,7 @@ class TestMultiLayerBundle(unittest.TestCase):
             return src
 
         common.repo_file = _repo_file
+        common.win_safe_path = lambda path: path
         sys.modules["witcher3_tools.CR2W.common_blender"] = common
 
         gather = types.ModuleType("witcher3_tools.unreal_export.gather")
@@ -346,6 +347,18 @@ class TestMultiLayerBundle(unittest.TestCase):
             self.assertEqual(mesh["kind"], "static")
         self.assertEqual(sorted(result["layer_ids"]), ["layer1.w2l", "layer2.w2l"])
 
+    def test_default_hidden_paths_mark_only_that_layer(self):
+        result = w2l_placements.build_unreal_w2l_bundle_multi(
+            None,
+            _make_settings(self.tmp),
+            self.w2l_paths,
+            default_hidden_paths=[self.w2l_paths[0]],
+        )
+
+        layers = {layer["layer_id"]: layer for layer in result["manifest"]["placements"]["layers"]}
+        self.assertTrue(all(actor.get("default_hidden") for actor in layers["layer1.w2l"]["actors"]))
+        self.assertTrue(all(not actor.get("default_hidden") for actor in layers["layer2.w2l"]["actors"]))
+
     def test_collision_blocks_export_as_hidden_collision_placements(self):
         self._install_fake_collision_exporter()
         collision_path = os.path.join(self.tmp, "collision.w2l")
@@ -411,6 +424,15 @@ class TestMultiLayerBundle(unittest.TestCase):
         self.assertEqual(light["type"], "point")
         self.assertEqual([round(v, 6) for v in light["transform"]["location"]], [100.0, -200.0, 300.0])
         self.assertAlmostEqual(light["intensity"], 1500.0)
+
+        hidden_result = w2l_placements.build_unreal_w2l_bundle_multi(
+            None,
+            _make_settings(self.tmp),
+            [light_path],
+            default_hidden_paths=[light_path],
+        )
+        hidden_light = hidden_result["manifest"]["placements"]["layers"][0]["lights"][0]
+        self.assertTrue(hidden_light["default_hidden"])
 
     def test_single_builder_preserves_layer_id(self):
         result = w2l_placements.build_unreal_w2l_bundle(None, _make_settings(self.tmp), self.w2l_paths[0])
