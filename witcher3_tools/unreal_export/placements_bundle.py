@@ -523,11 +523,90 @@ def _ensure_collision_export_uv(objects) -> None:
             pass
 
 
+_EMBEDDED_COLLISION_BUILDERS = {
+    "CCollisionShapeConvex": ("CCollisionShapeConvex", "createCol"),
+    "CCollisionShapeTriMesh": ("CCollisionShapeTriMesh", "createTri"),
+    "CCollisionShapeBox": ("CCollisionShapeBox", "createBox"),
+    "CCollisionShapeSphere": ("CCollisionShapeSphere", "createSphere"),
+    "CCollisionShapeCapsule": ("CCollisionShapeCapsule", "createCapsule"),
+}
+
+
+def _create_embedded_collision_objects(
+    depot_path: str,
+    warnings: list[str],
+    profile: Optional[_PlacementExportProfile] = None,
+):
+    """Read collision from an UNCOOKED .w2mesh's embedded ``CCollisionMesh`` chunk
+    (the REDkit custom format), mirroring the importer's path
+    [import_mesh.py:466-535]. Returns ``(found, objects)``: ``found`` is True when
+    the mesh carried a ``CCollisionMesh`` chunk, in which case the caller must NOT
+    fall back to the cooked ``.nxs`` cache. Relies on the active
+    ``redkit_repo_context`` so ``repo_file`` resolves the uncooked mesh."""
+    try:
+        from ..CR2W.common_blender import repo_file, win_safe_path
+        from ..CR2W.dc_mesh import load_bin_mesh
+        from ..CR2W import dc_entity
+        from ..importers import import_nxs
+    except Exception as exc:
+        warnings.append(f"{depot_path}: embedded collision importer unavailable ({exc}).")
+        return False, []
+
+    source = repo_file(normalize_depot_path(depot_path))
+    if not source or not os.path.isfile(win_safe_path(source)):
+        return False, []
+
+    try:
+        section = profile.section("collision_resolve_embedded", depot_path) if profile else nullcontext()
+        with section:
+            *_, meshFile = load_bin_mesh(source, keep_lod_meshes=False)
+    except Exception as exc:
+        warnings.append(f"{depot_path}: could not parse mesh for embedded collision ({exc}).")
+        return False, []
+
+    chunks = getattr(getattr(meshFile, "CHUNKS", None), "CHUNKS", None) or []
+    collision_chunk = next((c for c in chunks if getattr(c, "name", "") == "CCollisionMesh"), None)
+    if collision_chunk is None:
+        return False, []  # cooked mesh -> caller uses the .nxs cache
+
+    mesh_stem = os.path.splitext(os.path.basename(source))[0] or "collision"
+    objects = []
+    try:
+        section = profile.section("collision_create_embedded", depot_path) if profile else nullcontext()
+        with section:
+            shapes = collision_chunk.GetVariableByName("shapes")
+            for shape_id in (getattr(shapes, "value", None) or []):
+                shape = chunks[shape_id - 1]
+                entry = _EMBEDDED_COLLISION_BUILDERS.get(getattr(shape, "Type", ""))
+                if entry is None:
+                    continue
+                wrap = getattr(dc_entity, entry[0])
+                build = getattr(import_nxs, entry[1])
+                try:
+                    obj = build(wrap(shape), mesh_stem)
+                except Exception as exc:
+                    warnings.append(f"{depot_path}: {getattr(shape, 'Type', 'shape')} collision failed ({exc}).")
+                    continue
+                if obj is not None:
+                    objects.append(obj)
+    except Exception as exc:
+        warnings.append(f"{depot_path}: could not read embedded collision ({exc}).")
+    return True, objects
+
+
 def _create_collision_objects(
     depot_path: str,
     warnings: list[str],
     profile: Optional[_PlacementExportProfile] = None,
 ):
+    # Uncooked REDkit mesh: build from the embedded CCollisionMesh shapes.
+    found_embedded, embedded_objects = _create_embedded_collision_objects(depot_path, warnings, profile=profile)
+    if found_embedded:
+        if not embedded_objects and profile:
+            profile.count("collision_embedded_empty")
+        return embedded_objects
+
+    # Cooked mesh: no embedded chunk -> the collision cache .nxs.
     try:
         from ..CR2W.common_blender import get_collision_for_mesh_with_poses
         from ..importers.import_nxs import create_from_nxs

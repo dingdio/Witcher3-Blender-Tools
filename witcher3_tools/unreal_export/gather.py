@@ -194,7 +194,8 @@ def gather_mesh(filename: str, *, keep_lod_meshes: bool = False,
 
 
 def gather_placement_mesh(filename: str, *, version: Optional[int] = None,
-                          warnings: Optional[list] = None):
+                          warnings: Optional[list] = None,
+                          embedded_cmesh_chunk_index: Optional[int] = None):
     from ..CR2W import dc_mesh
     from ..importers.import_mesh import _sanitize_mesh_faces_for_import
     try:
@@ -206,7 +207,7 @@ def gather_placement_mesh(filename: str, *, version: Optional[int] = None,
     warnings = warnings if warnings is not None else []
 
     CData, _bufferInfos, material_names, materials, meshName, meshFile = dc_mesh.load_bin_mesh(
-        filename, keep_lod_meshes=False
+        filename, keep_lod_meshes=False, embedded_cmesh_chunk_index=embedded_cmesh_chunk_index
     )
     if version is None:
         version = getattr(getattr(meshFile, "HEADER", None), "version", 999)

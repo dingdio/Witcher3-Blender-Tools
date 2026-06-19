@@ -1,5 +1,7 @@
 import logging
 import addon_utils
+import hashlib
+import shutil
 
 from ..importers import import_mesh
 
@@ -1818,25 +1820,40 @@ def _ensure_redcloth_apx_for_asset_import(context, redcloth_abs_path: str, redcl
     return ""
 
 
-def _srt_json_from_file(abs_file_path: str) -> str:
+def _srt_json_from_file(abs_file_path: str, output_dir: str = "") -> str:
     """Ensure a JSON sidecar exists for an SRT file and return its path."""
-    abs_file_path = win_safe_path(abs_file_path or "")
+    abs_file_path = win_unprefix_path(abs_file_path or "")
+    safe_file_path = win_safe_path(abs_file_path)
     lower = abs_file_path.lower()
     if lower.endswith(".json"):
-        return abs_file_path if win_path_exists(abs_file_path) else ""
-    if not lower.endswith(".srt") or not win_path_exists(abs_file_path):
+        return safe_file_path if win_path_exists(safe_file_path) else ""
+    if not lower.endswith(".srt") or not win_path_exists(safe_file_path):
         return ""
 
-    json_path = abs_file_path + ".json"
+    if output_dir:
+        os.makedirs(win_safe_path(output_dir), exist_ok=True)
+        json_path = os.path.join(output_dir, os.path.basename(abs_file_path) + ".json")
+    else:
+        json_path = abs_file_path + ".json"
+    original_json_path = abs_file_path + ".json"
     try:
-        src_mtime = os.path.getmtime(abs_file_path)
-        json_mtime = os.path.getmtime(json_path) if os.path.exists(json_path) else -1
+        src_mtime = os.path.getmtime(safe_file_path)
+        json_mtime = os.path.getmtime(win_safe_path(json_path)) if win_path_exists(json_path) else -1
     except Exception:
         src_mtime = -1
         json_mtime = -1
 
     if json_mtime >= src_mtime and win_path_exists(json_path):
         return json_path
+
+    def copy_existing_json_to_output():
+        if not output_dir or not win_path_exists(original_json_path):
+            return ""
+        try:
+            shutil.copy2(win_safe_path(original_json_path), win_safe_path(json_path))
+            return json_path if win_path_exists(json_path) else ""
+        except Exception:
+            return ""
 
     try:
         import importlib
@@ -1845,10 +1862,16 @@ def _srt_json_from_file(abs_file_path: str) -> str:
         srt_mod = importlib.import_module("io_mesh_srt")
         converter = os.path.join(os.path.dirname(srt_mod.__file__), "converter", "srt_json_converter.exe")
         if not os.path.isfile(converter):
+            copied = copy_existing_json_to_output()
+            if copied:
+                return copied
             return json_path if win_path_exists(json_path) else ""
-        command = [converter, "-d", abs_file_path, "-o", os.path.dirname(abs_file_path)]
+        command = [converter, "-d", safe_file_path, "-o", win_safe_path(output_dir or os.path.dirname(abs_file_path))]
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
         if completed.returncode != 0 and not win_path_exists(json_path):
+            copied = copy_existing_json_to_output()
+            if copied:
+                return copied
             log.warning(
                 "SRT converter failed for %s (code=%s): %s",
                 abs_file_path,
@@ -1857,6 +1880,9 @@ def _srt_json_from_file(abs_file_path: str) -> str:
             )
             return ""
     except Exception as exc:
+        copied = copy_existing_json_to_output()
+        if copied:
+            return copied
         log.warning("Could not generate SRT JSON sidecar for %s: %s", abs_file_path, exc)
         return json_path if win_path_exists(json_path) else ""
 
@@ -1958,6 +1984,128 @@ def _collect_srt_texture_names(json_path: str) -> list[str]:
     return names
 
 
+def _srt_working_import_dir(abs_srt_path: str) -> str:
+    from ..extension_paths import get_redkit_working_root
+
+    source_path = win_unprefix_path(abs_srt_path or "")
+    try:
+        stat = os.stat(win_safe_path(source_path))
+        key = f"{os.path.normcase(os.path.normpath(source_path))}|{stat.st_mtime_ns}|{stat.st_size}"
+    except Exception:
+        key = os.path.normcase(os.path.normpath(source_path))
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(source_path))[0] or "srt")
+    stem = stem.strip("._")[:80] or "srt"
+    work_dir = os.path.join(get_redkit_working_root(True), "_srt_import", f"{stem}_{digest[:16]}")
+    os.makedirs(win_safe_path(work_dir), exist_ok=True)
+    return work_dir
+
+
+def _srt_is_redkit_source_path(path_value: str) -> bool:
+    try:
+        from ..w3_material import _is_redkit_source_path
+
+        if _is_redkit_source_path(path_value):
+            return True
+    except Exception:
+        pass
+
+    lowered = win_unprefix_path(path_value or "").replace("/", "\\").lower()
+    return "redkit" in lowered and "\\r4data\\" in lowered
+
+
+def _srt_dds_has_dx10_header(path_value: str) -> bool:
+    if not path_value or not path_value.lower().endswith(".dds"):
+        return False
+    try:
+        with open(win_safe_path(path_value), "rb") as handle:
+            header = handle.read(88)
+    except OSError:
+        return False
+    return len(header) >= 88 and header[:4] == b"DDS " and header[84:88] == b"DX10"
+
+
+def _srt_copy_if_stale(source_path: str, staged_path: str) -> bool:
+    try:
+        if win_path_exists(staged_path):
+            src_mtime = os.path.getmtime(win_safe_path(source_path))
+            dst_mtime = os.path.getmtime(win_safe_path(staged_path))
+            if dst_mtime >= src_mtime and os.path.getsize(win_safe_path(staged_path)) > 0:
+                return True
+        os.makedirs(win_safe_path(os.path.dirname(staged_path)), exist_ok=True)
+        shutil.copy2(win_safe_path(source_path), win_safe_path(staged_path))
+        return win_path_exists(staged_path)
+    except Exception as exc:
+        log.warning("Failed staging SRT texture %s -> %s: %s", source_path, staged_path, exc)
+        return False
+
+
+def _stage_srt_texture_for_working_json(source_path: str, work_dir: str) -> str:
+    """Stage one SRT texture beside the working JSON and return the JSON value."""
+    source_path = win_unprefix_path(source_path or "")
+    if not source_path or not work_dir or not win_path_exists(source_path):
+        return ""
+
+    staged_source = source_path
+    if _srt_dds_has_dx10_header(source_path):
+        try:
+            from ..w3_material import _convert_dds_to_blender_image_cache
+
+            converted = _convert_dds_to_blender_image_cache(source_path)
+            if converted and win_path_exists(converted):
+                staged_source = converted
+            else:
+                return ""
+        except Exception as exc:
+            log.warning("Failed converting SRT DX10 DDS texture %s: %s", source_path, exc)
+            return ""
+
+    staged_ext = os.path.splitext(staged_source)[1] or os.path.splitext(source_path)[1] or ".tga"
+    staged_name = os.path.splitext(os.path.basename(source_path))[0] + staged_ext
+    staged_path = os.path.join(work_dir, staged_name)
+    if _srt_copy_if_stale(staged_source, staged_path):
+        return staged_name
+    return ""
+
+
+def _rewrite_srt_json_texture_paths(json_path: str, texture_replacements: dict[str, str], work_dir: str) -> str:
+    if not json_path or not texture_replacements or not work_dir:
+        return json_path
+
+    try:
+        with open(win_safe_path(json_path), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        log.warning("Failed reading SRT JSON for texture rewrite (%s): %s", json_path, exc)
+        return json_path
+
+    def replacement_for(value: str) -> str:
+        normalized = str(value or "").replace("/", "\\")
+        key = normalized.lower()
+        base = os.path.basename(normalized).lower()
+        return texture_replacements.get(key) or texture_replacements.get(base) or value
+
+    def rewrite(node):
+        if isinstance(node, dict):
+            return {key: rewrite(value) for key, value in node.items()}
+        if isinstance(node, list):
+            return [rewrite(value) for value in node]
+        if isinstance(node, str):
+            return replacement_for(node)
+        return node
+
+    rewritten = rewrite(data)
+    out_path = os.path.join(work_dir, os.path.basename(win_unprefix_path(json_path)))
+    try:
+        os.makedirs(win_safe_path(work_dir), exist_ok=True)
+        with open(win_safe_path(out_path), "w", encoding="utf-8") as fh:
+            json.dump(rewritten, fh)
+        return out_path
+    except Exception as exc:
+        log.warning("Failed writing working SRT JSON %s: %s", out_path, exc)
+        return json_path
+
+
 def _choose_srt_texture_cache_item(manager, tex_name: str, srt_rel_folder: str):
     tex_name = os.path.basename(tex_name or "")
     if not tex_name:
@@ -2008,9 +2156,15 @@ def _export_srt_textures_for_import(context, abs_srt_path: str, rel_srt_path: st
         "missing": [],
         "json_path": "",
         "import_path": abs_srt_path,
+        "working_dir": "",
     }
 
-    json_path = _srt_json_from_file(abs_srt_path)
+    srt_dir = os.path.dirname(abs_srt_path)
+    source_is_redkit = _srt_is_redkit_source_path(abs_srt_path)
+    working_dir = _srt_working_import_dir(abs_srt_path) if source_is_redkit else ""
+    result["working_dir"] = working_dir
+
+    json_path = _srt_json_from_file(abs_srt_path, output_dir=working_dir if source_is_redkit else "")
     result["json_path"] = json_path
     if json_path:
         # Use JSON directly to avoid running the converter twice in io_mesh_srt.
@@ -2021,10 +2175,34 @@ def _export_srt_textures_for_import(context, abs_srt_path: str, rel_srt_path: st
     if not tex_names:
         return result
 
-    srt_dir = os.path.dirname(abs_srt_path)
     rel_vanilla = get_vanilla_path(rel_srt_path, loadmods) or rel_srt_path or ""
     srt_rel_folder = os.path.dirname(rel_vanilla.replace("/", "\\"))
     uncook_root = get_uncook_path(context) or ""
+    texture_replacements: dict[str, str] = {}
+
+    def remember_replacement(original_name: str, replacement_name: str):
+        if not original_name or not replacement_name:
+            return
+        normalized = original_name.replace("/", "\\")
+        texture_replacements[normalized.lower()] = replacement_name
+        texture_replacements[os.path.basename(normalized).lower()] = replacement_name
+
+    def ensure_working_dir() -> str:
+        nonlocal working_dir
+        if not working_dir:
+            working_dir = _srt_working_import_dir(abs_srt_path)
+            result["working_dir"] = working_dir
+        return working_dir
+
+    def mark_texture_ready(source_file: str, original_name: str, counter: str) -> None:
+        requires_staging = bool(working_dir) or _srt_dds_has_dx10_header(source_file)
+        if requires_staging:
+            staged_name = _stage_srt_texture_for_working_json(source_file, ensure_working_dir())
+            if not staged_name:
+                result["missing"].append(original_name)
+                return
+            remember_replacement(original_name, staged_name)
+        result[counter] += 1
 
     try:
         manager = LoadTextureManager(loadmods=loadmods)
@@ -2034,10 +2212,16 @@ def _export_srt_textures_for_import(context, abs_srt_path: str, rel_srt_path: st
         return result
 
     for tex_name in tex_names:
-        out_path = os.path.join(srt_dir, tex_name)
+        source_path = tex_name if os.path.isabs(tex_name) else os.path.join(srt_dir, tex_name)
+        if win_path_exists(source_path):
+            mark_texture_ready(source_path, tex_name, "existing")
+            continue
+
+        target_dir = working_dir or srt_dir
+        out_path = os.path.join(target_dir, tex_name)
         out_dds = os.path.splitext(out_path)[0] + ".dds"
         if win_path_exists(out_dds):
-            result["existing"] += 1
+            mark_texture_ready(out_dds, tex_name, "existing")
             continue
 
         item = _choose_srt_texture_cache_item(manager, tex_name, srt_rel_folder)
@@ -2046,15 +2230,21 @@ def _export_srt_textures_for_import(context, abs_srt_path: str, rel_srt_path: st
             continue
 
         try:
-            if prepare_extraction_target(out_path, uncook_root):
+            can_write = bool(working_dir) or prepare_extraction_target(out_path, uncook_root)
+            if can_write:
                 item.extract_to_file(out_path)
             if win_path_exists(out_dds):
-                result["exported"] += 1
+                mark_texture_ready(out_dds, tex_name, "exported")
             else:
                 result["missing"].append(tex_name)
         except Exception as exc:
             log.warning("Failed extracting SRT texture %s -> %s: %s", tex_name, out_dds, exc)
             result["missing"].append(tex_name)
+
+    if texture_replacements and working_dir and json_path:
+        rewritten_json = _rewrite_srt_json_texture_paths(json_path, texture_replacements, working_dir)
+        result["import_path"] = rewritten_json
+        result["json_path"] = rewritten_json
 
     if result["requested"]:
         log.info(

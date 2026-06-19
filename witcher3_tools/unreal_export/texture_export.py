@@ -218,7 +218,7 @@ def stage_texture_as_dds(source_path: str, textures_dir: str, base_name: str) ->
     if ext == ".xbm":
         from ..CR2W import texture_converters
 
-        dds_path = texture_converters.convert_xbm_to_dds(source_path, force=False)
+        dds_path = texture_converters.convert_xbm_to_dds(source_path, force=False, out_path=output_path)
         return _copy_or_replace(dds_path, output_path)
     return _copy_or_replace(source_path, output_path)
 
@@ -234,13 +234,15 @@ def convert_texture_for_unreal(source_path: str, textures_dir: str, base_name: s
     if ext in (".xbm", ".dds"):
         from ..CR2W import texconv_wrapper
 
+        scratch_dir = os.path.join(textures_dir, "_convert_tmp", base_name)
+        os.makedirs(win_safe_path(scratch_dir), exist_ok=True)
         if ext == ".xbm":
             from ..CR2W import texture_converters
 
-            dds_path = texture_converters.convert_xbm_to_dds(source_path, force=False)
+            scratch_dds = os.path.join(scratch_dir, f"{base_name}.dds")
+            dds_path = texture_converters.convert_xbm_to_dds(source_path, force=False, out_path=scratch_dds)
         else:
             dds_path = source_path
-        scratch_dir = os.path.join(textures_dir, "_convert_tmp", base_name)
         png_path = texconv_wrapper.convert_dds_to_png(dds_path, output_dir=scratch_dir)
         result = _copy_or_replace(png_path, output_path)
         try:

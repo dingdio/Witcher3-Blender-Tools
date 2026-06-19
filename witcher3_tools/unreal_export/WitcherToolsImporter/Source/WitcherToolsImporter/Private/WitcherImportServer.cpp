@@ -130,8 +130,17 @@ bool FWitcherImportServer::SendResponse(FSocket* ClientSocket, const FString& Re
     Packet[3] = static_cast<uint8>((BodySize >> 24) & 0xff);
     FMemory::Memcpy(Packet.GetData() + 4, Converter.Get(), BodySize);
 
-    int32 BytesSent = 0;
-    return ClientSocket->Send(Packet.GetData(), Packet.Num(), BytesSent) && BytesSent == Packet.Num();
+    int32 TotalSent = 0;
+    while (TotalSent < Packet.Num())
+    {
+        int32 BytesSent = 0;
+        if (!ClientSocket->Send(Packet.GetData() + TotalSent, Packet.Num() - TotalSent, BytesSent) || BytesSent <= 0)
+        {
+            return false;
+        }
+        TotalSent += BytesSent;
+    }
+    return true;
 }
 
 void FWitcherImportServer::HandleClient(FSocket* ClientSocket) const
@@ -170,5 +179,8 @@ void FWitcherImportServer::HandleClient(FSocket* ClientSocket) const
         Promise->SetValue(FWitcherImportContext::HandleRequest(RequestJson));
     });
 
-    SendResponse(ClientSocket, Future.Get());
+    if (!SendResponse(ClientSocket, Future.Get()))
+    {
+        UE_LOG(LogWitcherImportServer, Warning, TEXT("Failed to send complete Witcher import response to Blender"));
+    }
 }

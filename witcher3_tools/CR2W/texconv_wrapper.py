@@ -42,6 +42,21 @@ def _load_dll():
     return _DLL
 
 
+def _win_safe_path(path):
+    try:
+        from .common_blender import win_safe_path
+
+        return win_safe_path(os.fspath(path))
+    except Exception:
+        return os.fspath(path)
+
+
+def _texconv_arg_path(path):
+    # Normalize before adding any Windows extended-length prefix. Do not
+    # normalize the prefixed result; normpath strips the \\?\ prefix.
+    return _win_safe_path(os.path.normpath(os.fspath(path)))
+
+
 def is_available():
     """Check whether texconv.dll is available."""
     return _get_dll_path() is not None
@@ -63,10 +78,10 @@ def convert_dds_to_tga(dds_path, output_dir=None, verbose=False):
     if output_dir is None:
         output_dir = os.path.dirname(dds_path)
 
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(_win_safe_path(output_dir), exist_ok=True)
 
     args = ['-ft', 'tga', '-f', 'rgba']
-    args += ['-y', '-o', output_dir, '--', os.path.normpath(dds_path)]
+    args += ['-y', '-o', _texconv_arg_path(output_dir), '--', _texconv_arg_path(dds_path)]
 
     return _run_texconv(dll, args, verbose=verbose, output_dir=output_dir,
                         input_path=dds_path, output_ext='tga')
@@ -88,10 +103,10 @@ def convert_dds_to_png(dds_path, output_dir=None, verbose=False):
     if output_dir is None:
         output_dir = os.path.dirname(dds_path)
 
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(_win_safe_path(output_dir), exist_ok=True)
 
     args = ['-ft', 'png', '-f', 'rgba']
-    args += ['-y', '-o', output_dir, '--', os.path.normpath(dds_path)]
+    args += ['-y', '-o', _texconv_arg_path(output_dir), '--', _texconv_arg_path(dds_path)]
 
     return _run_texconv(dll, args, verbose=verbose, output_dir=output_dir,
                         input_path=dds_path, output_ext='png')
@@ -113,14 +128,14 @@ def convert_to_dds(
     if output_dir is None:
         output_dir = os.path.dirname(input_path)
 
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(_win_safe_path(output_dir), exist_ok=True)
 
     args = ['-f', str(dds_fmt)]
     if no_mip:
         args += ['-m', '1']
     if image_filter and image_filter != "LINEAR":
         args += ['-if', str(image_filter)]
-    args += ['-y', '-o', output_dir, '--', os.path.normpath(input_path)]
+    args += ['-y', '-o', _texconv_arg_path(output_dir), '--', _texconv_arg_path(input_path)]
 
     return _run_texconv(
         dll,
@@ -155,7 +170,7 @@ def _run_texconv(
     base_name = '.'.join(base_name.split('.')[:-1] + [output_ext])
     output_path = os.path.join(output_dir, base_name)
 
-    if not os.path.isfile(output_path):
+    if not os.path.isfile(_win_safe_path(output_path)):
         raise RuntimeError(f"texconv did not produce expected output: {output_path}")
 
     return output_path

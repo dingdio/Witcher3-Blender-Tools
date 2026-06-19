@@ -1,5 +1,6 @@
 import logging
 import os
+import hashlib
 
 import bpy
 
@@ -351,7 +352,7 @@ def _store_world_layer_metadata(target, world_path="", world_root_collection=Non
 def AddCLayerGroup(groups, parent_collection, world_path=""):
     this_collection = bpy.data.collections.new(groups.name)
     this_collection['group_type'] = "LayerGroup"
-    this_collection['witcher_visible_on_start'] = int(getattr(groups, 'isVisibleOnStart', True))
+    this_collection['witcher_visible_on_start'] = bool(getattr(groups, 'isVisibleOnStart', True))
     if world_path and not parent_collection:
         this_collection["world_path"] = str(world_path)
     if parent_collection:
@@ -1113,12 +1114,58 @@ def _terrain_bake_enabled():
         return True
 
 
+def _terrain_preview_image_path(texture_path):
+    if not texture_path:
+        return ""
+    texture_path = str(texture_path)
+    if os.path.splitext(texture_path)[1].lower() != ".xbm":
+        return texture_path
+
+    source_path = os.path.abspath(texture_path)
+    if not os.path.isfile(win_safe_path(source_path)):
+        return ""
+
+    try:
+        stat = os.stat(win_safe_path(source_path))
+        key = f"{os.path.normcase(os.path.normpath(source_path))}|{stat.st_mtime_ns}|{stat.st_size}"
+    except Exception:
+        key = os.path.normcase(os.path.normpath(source_path))
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
+    stem = os.path.splitext(os.path.basename(source_path))[0] or "texture"
+    cache_dir = os.path.join(
+        get_redkit_working_root(create=True),
+        "_converted_textures",
+        "terrain_preview",
+        digest[:2],
+    )
+    out_path = os.path.join(cache_dir, f"{stem}_{digest[:16]}.dds")
+    try:
+        os.makedirs(win_safe_path(cache_dir), exist_ok=True)
+        if os.path.isfile(win_safe_path(out_path)):
+            return out_path
+        from ..CR2W import texture_converters
+
+        converted_path = texture_converters.convert_xbm_to_dds(
+            source_path,
+            force=False,
+            out_path=out_path,
+        )
+        if converted_path and os.path.isfile(win_safe_path(converted_path)):
+            return converted_path
+        if os.path.isfile(win_safe_path(out_path)):
+            return out_path
+    except Exception:
+        log.debug("Terrain bake XBM conversion failed for %s", texture_path, exc_info=True)
+    return ""
+
+
 def _avg_dds_color(dds_path):
-    if not dds_path or not os.path.isfile(dds_path):
+    image_path = _terrain_preview_image_path(dds_path)
+    if not image_path or not os.path.isfile(win_safe_path(image_path)):
         return None
     img = None
     try:
-        img = bpy_image_load_safe(dds_path, check_existing=False)
+        img = bpy_image_load_safe(image_path, check_existing=False)
         if img is None or img.size[0] == 0 or img.size[1] == 0:
             return None
         try:
@@ -1135,7 +1182,7 @@ def _avg_dds_color(dds_path):
         rgb = px.reshape(-1, 4)[:, :3].mean(axis=0)
         return (float(rgb[0]), float(rgb[1]), float(rgb[2]))
     except Exception:
-        log.debug("avg color failed for %s", dds_path, exc_info=True)
+        log.debug("avg color failed for %s", image_path, exc_info=True)
         return None
     finally:
         if img is not None:
@@ -1172,9 +1219,19 @@ def _compute_terrain_layer_colors(worldFile, output_dir, hub_name):
         return None
 
     colors = []
+    missing_colors = 0
     for layer in mset.layers:
         c = _avg_dds_color(getattr(layer, "diffuse_dds", ""))
-        colors.append(list(c) if c else [0.3, 0.3, 0.3])
+        if c:
+            colors.append(list(c))
+        else:
+            missing_colors += 1
+            colors.append([0.3, 0.3, 0.3])
+    if missing_colors:
+        log.warning(
+            "Terrain bake: %d diffuse texture(s) could not be sampled; using fallback layer colors.",
+            missing_colors,
+        )
 
     try:
         with open(cache_path, "w") as f:
@@ -1237,7 +1294,10 @@ def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=N
         return None
 
     output_dir = str(ctx["output_dir"])
-    combine_targets = ("heightmap", "tint") if ctx["working_tiles_dir"] else ("heightmap",)
+    combine_targets = (
+        ("heightmap", "overlay", "bkgrnd", "blend", "tint")
+        if ctx["working_tiles_dir"] else ("heightmap",)
+    )
     combined = terrain_w2ter.combine_w2ter_tiles(
         buffer_paths,
         output_dir,

@@ -1,6 +1,7 @@
 """Blender-free tests for the multi-layer .w2l Unreal bundle builder
 (``build_unreal_w2l_bundle_multi``) and the cross-layer placement dedupe."""
 
+import contextlib
 import os
 import sys
 import tempfile
@@ -272,11 +273,17 @@ class TestMultiLayerBundle(unittest.TestCase):
 
         common.repo_file = _repo_file
         common.win_safe_path = lambda path: path
+
+        @contextlib.contextmanager
+        def _redkit_repo_context(source_path=None, roots=None):
+            yield
+
+        common.redkit_repo_context = _redkit_repo_context
         sys.modules["witcher3_tools.CR2W.common_blender"] = common
 
         gather = types.ModuleType("witcher3_tools.unreal_export.gather")
 
-        def _gather(source, version=None, warnings=None):
+        def _gather(source, version=None, warnings=None, embedded_cmesh_chunk_index=None):
             test.gather_calls.append(source)
             return _FakeMesh(), [{"name": "m", "material_slot_index": 0}]
 

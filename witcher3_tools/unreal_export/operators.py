@@ -263,14 +263,19 @@ class WITCHER_OT_export_unreal_item(bpy.types.Operator):
 
                 if self.action == "SEND":
                     response = send_import_request(settings.host, settings.port, result["manifest_path"])
-                    success = bool(response.get("success"))
-                    settings.last_status = "Unreal import complete" if success else "Unreal import failed"
+                    success = _ue_import_succeeded(response)
+                    settings.last_status = (
+                        "Unreal import sent; response lost"
+                        if _ue_response_lost(response)
+                        else ("Unreal import complete" if success else "Unreal import failed")
+                    )
                     settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
                     if not success:
                         self.report({"ERROR"}, settings.last_status)
                         return {"CANCELLED"}
 
-            self.report({"INFO"}, settings.last_status)
+            report_level = _ue_report_level(settings.last_status)
+            self.report(report_level, settings.last_status)
             return {"FINISHED"}
         except Exception as exc:
             settings.last_status = "Unreal export failed"
@@ -321,14 +326,25 @@ class WITCHER_OT_export_unreal_world(bpy.types.Operator):
 
                 if self.action == "SEND":
                     response = send_import_request(settings.host, settings.port, result["manifest_path"])
-                    success = bool(response.get("success"))
-                    settings.last_status = "Unreal terrain import complete" if success else "Unreal terrain import failed"
+                    success = _ue_import_succeeded(response)
+                    status_suffix = _ue_status_suffix(response, result["manifest"].get("warnings", []))
+                    if _ue_response_lost(response):
+                        settings.last_status = "Unreal terrain import sent; response lost" + status_suffix
+                    elif success:
+                        settings.last_status = (
+                            "Unreal terrain import completed with warnings"
+                            if status_suffix else "Unreal terrain import complete"
+                        )
+                        settings.last_status += status_suffix
+                    else:
+                        settings.last_status = "Unreal terrain import failed" + status_suffix
                     settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
                     if not success:
                         self.report({"ERROR"}, settings.last_status)
                         return {"CANCELLED"}
 
-            self.report({"INFO"}, settings.last_status)
+            report_level = _ue_report_level(settings.last_status)
+            self.report(report_level, settings.last_status)
             return {"FINISHED"}
         except Exception as exc:
             settings.last_status = "Unreal world export failed"
@@ -383,8 +399,11 @@ class WITCHER_OT_export_unreal_placements(bpy.types.Operator):
                     settings.last_status = "Sending placements to Unreal"
                     response = send_import_request(settings.host, settings.port, result["manifest_path"])
                     send_seconds = time.perf_counter() - send_started
-                    success = bool(response.get("success"))
-                    settings.last_status = "Unreal placements import complete" if success else "Unreal placements import failed"
+                    success = _ue_import_succeeded(response)
+                    if _ue_response_lost(response):
+                        settings.last_status = "Unreal placements import sent; response lost"
+                    else:
+                        settings.last_status = "Unreal placements import complete" if success else "Unreal placements import failed"
                     if success:
                         settings.last_status += _ue_status_suffix(response, result["manifest"].get("warnings", []))
                     settings.last_details += (
@@ -396,7 +415,7 @@ class WITCHER_OT_export_unreal_placements(bpy.types.Operator):
                         self.report({"ERROR"}, settings.last_status)
                         return {"CANCELLED"}
 
-            self.report({"INFO"}, settings.last_status)
+            self.report(_ue_report_level(settings.last_status), settings.last_status)
             return {"FINISHED"}
         except Exception as exc:
             settings.last_status = "Unreal placements export failed"
@@ -463,8 +482,11 @@ class WITCHER_OT_export_unreal_w2l(bpy.types.Operator):
                     response = send_import_request(settings.host, settings.port, result["manifest_path"])
                     send_seconds = time.perf_counter() - send_started
                     total_seconds = time.perf_counter() - button_started
-                    success = bool(response.get("success"))
-                    settings.last_status = "Unreal layer import complete" if success else "Unreal layer import failed"
+                    success = _ue_import_succeeded(response)
+                    if _ue_response_lost(response):
+                        settings.last_status = "Unreal layer import sent; response lost"
+                    else:
+                        settings.last_status = "Unreal layer import complete" if success else "Unreal layer import failed"
                     if success:
                         settings.last_status += _ue_status_suffix(response, result["manifest"].get("warnings", []))
                     timing_report = _format_send_timing_report(
@@ -483,7 +505,7 @@ class WITCHER_OT_export_unreal_w2l(bpy.types.Operator):
                         return {"CANCELLED"}
                     settings.last_status += f" ({total_seconds:.1f}s)"
 
-            self.report({"INFO"}, settings.last_status)
+            self.report(_ue_report_level(settings.last_status), settings.last_status)
             return {"FINISHED"}
         except Exception as exc:
             settings.last_status = "Unreal layer export failed"
@@ -554,10 +576,13 @@ def run_send_layers_around_camera(context, *, camera_position=None, radius=None,
                 response = send_import_request(settings.host, settings.port, result["manifest_path"])
                 send_seconds = time.perf_counter() - send_started
                 total_seconds = time.perf_counter() - button_started
-                success = bool(response.get("success"))
-                settings.last_status = (
-                    "Unreal layers import complete" if success else "Unreal layers import failed"
-                )
+                success = _ue_import_succeeded(response)
+                if _ue_response_lost(response):
+                    settings.last_status = "Unreal layers import sent; response lost"
+                else:
+                    settings.last_status = (
+                        "Unreal layers import complete" if success else "Unreal layers import failed"
+                    )
                 if success:
                     settings.last_status += _ue_status_suffix(response, result["manifest"].get("warnings", []))
                 timing_report = _format_send_timing_report(
@@ -576,7 +601,7 @@ def run_send_layers_around_camera(context, *, camera_position=None, radius=None,
                     return {"status": "CANCELLED", "level": "ERROR", "message": settings.last_status}
                 settings.last_status += f" ({total_seconds:.1f}s)"
 
-        return {"status": "FINISHED", "level": "INFO", "message": settings.last_status}
+        return {"status": "FINISHED", "level": _ue_report_level_value(settings.last_status), "message": settings.last_status}
     except Exception as exc:
         settings.last_status = "Unreal layers export failed"
         settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
@@ -607,6 +632,159 @@ class WITCHER_OT_send_unreal_layers_around_camera(bpy.types.Operator):
 
     def execute(self, context):
         result = run_send_layers_around_camera(context, action=self.action)
+        self.report({result["level"]}, result["message"])
+        return {result["status"]}
+
+
+def run_send_w2l_collection(context, coll, *, action="SEND"):
+    button_started = time.perf_counter()
+    from ..ui.ui_map import collect_collection_w2l_send_selection
+
+    settings = context.scene.witcher_unreal_export
+    if not settings.export_folder:
+        settings.export_folder = bundle.default_export_folder()
+
+    try:
+        selection = collect_collection_w2l_send_selection(context, coll)
+    except ValueError as exc:
+        settings.last_status = "No layers to send"
+        settings.last_details = str(exc)
+        return {"status": "CANCELLED", "level": "ERROR", "message": str(exc)}
+
+    w2l_paths = selection.get("paths", [])
+    if not w2l_paths:
+        unresolved = selection.get("unresolved", [])
+        msg = "No resolvable .w2l layers found in the selected collection."
+        if unresolved:
+            msg += f" ({len(unresolved)} unresolved)"
+        settings.last_status = "No layers to send"
+        settings.last_details = msg
+        return {"status": "CANCELLED", "level": "WARNING", "message": msg}
+
+    if action == "SEND":
+        connection_error = _preflight_send_connection(settings)
+        if connection_error:
+            settings.last_status = "Unreal import server not reachable"
+            settings.last_details = connection_error
+            return {"status": "CANCELLED", "level": "ERROR", "message": connection_error}
+
+    label = str(getattr(coll, "name", "") or "layer")
+    layer_count = len(w2l_paths)
+    try:
+        with _quiet_send_logging(settings, action):
+            scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+            include_collision_blocks = bool(
+                getattr(settings, "placement_export_collision", False)
+                or getattr(scene_settings, "terrain_layer_do_import_collision", False)
+            )
+            result = w2l_placements.build_unreal_w2l_bundle_multi(
+                context,
+                settings,
+                w2l_paths,
+                include_collision_blocks=include_collision_blocks,
+                include_point_lights=bool(getattr(scene_settings, "terrain_layer_do_import_point_light", True)),
+                include_spot_lights=bool(getattr(scene_settings, "terrain_layer_do_import_spot_light", True)),
+                default_hidden_paths=selection.get("default_hidden_paths", []),
+            )
+            settings.last_manifest_path = result["manifest_path"]
+            warning_count = len(result["manifest"].get("warnings", []))
+            settings.last_status = (
+                f"Layer bundle ready ({layer_count} layer{'s' if layer_count != 1 else ''}, "
+                f"{warning_count} warning{'s' if warning_count != 1 else ''})"
+            )
+            settings.last_details = _format_w2l_multi_bundle_details(result, selection)
+
+            if action == "SEND":
+                settings.last_status = f"Sending {layer_count} layer{'s' if layer_count != 1 else ''} to Unreal"
+                send_started = time.perf_counter()
+                response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                send_seconds = time.perf_counter() - send_started
+                total_seconds = time.perf_counter() - button_started
+                success = _ue_import_succeeded(response)
+                if _ue_response_lost(response):
+                    settings.last_status = "Unreal layers import sent; response lost"
+                else:
+                    settings.last_status = (
+                        "Unreal layers import complete" if success else "Unreal layers import failed"
+                    )
+                if success:
+                    settings.last_status += _ue_status_suffix(response, result["manifest"].get("warnings", []))
+                timing_report = _format_send_timing_report(
+                    f"{label} ({layer_count} layer{'s' if layer_count != 1 else ''})",
+                    total_seconds,
+                    float(result.get("elapsed_seconds", 0.0) or 0.0),
+                    send_seconds,
+                    response,
+                    result.get("build_timings"),
+                )
+                print(timing_report)
+                _print_dropped_placements(response, result["manifest"].get("warnings", []))
+                settings.last_details += "\n\n" + timing_report
+                settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
+                if not success:
+                    return {"status": "CANCELLED", "level": "ERROR", "message": settings.last_status}
+                settings.last_status += f" ({total_seconds:.1f}s)"
+
+        return {"status": "FINISHED", "level": _ue_report_level_value(settings.last_status), "message": settings.last_status}
+    except Exception as exc:
+        settings.last_status = "Unreal layers export failed"
+        settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
+        return {"status": "CANCELLED", "level": "ERROR", "message": str(exc)}
+
+
+class WITCHER_OT_send_unreal_layer_collection(bpy.types.Operator):
+    bl_idname = "witcher.send_unreal_layer_collection"
+    bl_label = "Send Layer to Unreal"
+    bl_description = (
+        "Parse the active .w2l layer collection and send its placed meshes to "
+        "Unreal as positioned actors, without importing into Blender"
+    )
+    bl_options = {"REGISTER"}
+
+    action: EnumProperty(
+        name="Action",
+        items=[
+            ("BUNDLE", "Export Bundle", "Write the layer buffers, textures, and manifest"),
+            ("SEND", "Send to Unreal", "Write the bundle and send it to the running Unreal plugin"),
+        ],
+        default="SEND",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context is not None and context.collection is not None
+
+    def execute(self, context):
+        result = run_send_w2l_collection(context, context.collection, action=self.action)
+        self.report({result["level"]}, result["message"])
+        return {result["status"]}
+
+
+class WITCHER_OT_send_unreal_layer_group_collection(bpy.types.Operator):
+    bl_idname = "witcher.send_unreal_layer_group_collection"
+    bl_label = "Send LayerGroup to Unreal"
+    bl_description = (
+        "Recursively parse every .w2l layer beneath the active LayerGroup and send "
+        "their placed meshes to Unreal as positioned actors, without importing into "
+        "Blender. Run at a world root to send the whole map"
+    )
+    bl_options = {"REGISTER"}
+
+    action: EnumProperty(
+        name="Action",
+        items=[
+            ("BUNDLE", "Export Bundle", "Write the layer buffers, textures, and manifest"),
+            ("SEND", "Send to Unreal", "Write the bundle and send it to the running Unreal plugin"),
+        ],
+        default="SEND",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context is not None and context.collection is not None
+
+    def execute(self, context):
+        result = run_send_w2l_collection(context, context.collection, action=self.action)
         self.report({result["level"]}, result["message"])
         return {result["status"]}
 
@@ -932,6 +1110,27 @@ _DROP_WARNING_TOKENS = (
 )
 
 
+def _ue_response_lost(response: dict | None) -> bool:
+    return bool((response or {}).get("response_lost"))
+
+
+def _ue_import_succeeded(response: dict | None) -> bool:
+    return bool((response or {}).get("success"))
+
+
+def _ue_report_level_value(status: str) -> str:
+    lowered = str(status or "").lower()
+    if "response lost" in lowered:
+        return "WARNING"
+    if "warning" in lowered and "(0 warning" not in lowered:
+        return "WARNING"
+    return "INFO"
+
+
+def _ue_report_level(status: str) -> set[str]:
+    return {_ue_report_level_value(status)}
+
+
 def _ue_status_suffix(response: dict, build_warnings) -> str:
     ue = response or {}
     warning_lists = (build_warnings or [], ue.get("warnings", []) or [])
@@ -1155,7 +1354,7 @@ def _format_w2l_multi_bundle_details(result: dict, selection: dict | None = None
         f"Mode: {'FAST (geometry only, default material)' if result.get('skip_materials') else 'full materials + textures'}",
         "",
     ]
-    if selection:
+    if selection and selection.get("camera_position"):
         cam = selection.get("camera_position") or (0.0, 0.0, 0.0)
         lines.append(
             f"Camera: ({cam[0]:.1f}, {cam[1]:.1f}, {cam[2]:.1f})"
@@ -1228,6 +1427,8 @@ classes = (
     WITCHER_OT_export_unreal_placements,
     WITCHER_OT_export_unreal_w2l,
     WITCHER_OT_send_unreal_layers_around_camera,
+    WITCHER_OT_send_unreal_layer_collection,
+    WITCHER_OT_send_unreal_layer_group_collection,
     WITCHER_OT_unreal_overwrite_preset,
     WITCHER_OT_install_unreal_plugin,
     WITCHER_OT_unreal_export_details,

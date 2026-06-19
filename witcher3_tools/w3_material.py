@@ -7,6 +7,7 @@ log = logging.getLogger(__name__)
 from pathlib import Path
 from math import radians
 import hashlib
+import struct
 import time
 import tempfile
 from .CR2W import CR2W_reader
@@ -44,17 +45,29 @@ from .w3_material_w2_compat import (
     resolve_w2_bespoke_group_name,
 )
 from . import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext, get_texture_path
-from .extension_paths import get_texture_root
+from .extension_paths import get_texture_root, get_redkit_working_root
 from .CR2W.texture_converters import (
     convert_texarray_to_dds,
     convert_xbm_to_dds,
 )
+from .CR2W.texture_dds import dds_format_name_from_header
 from .ui.blender_fun import (
     load_image_with_dds_repair,
     load_w2cube_image,
     load_w2cube_blick_equirect_image,
 )
-from .CR2W.common_blender import repo_file, win_safe_path, bpy_image_load_safe, win_path_key, win_unprefix_path, overwrite_existing_enabled
+from .CR2W.common_blender import (
+    repo_file,
+    win_safe_path,
+    win_bpy_image_path,
+    bpy_image_load_safe,
+    win_path_key,
+    win_unprefix_path,
+    overwrite_existing_enabled,
+    _active_redkit_repo_roots,
+    _get_redkit_depot_roots,
+    _is_under_root,
+)
 
 possible_folders = [
     'files\\Raw\\Mod',
@@ -372,13 +385,213 @@ def _derived_file_is_current(output_path: str, source_path: str) -> bool:
     return output_mtime >= source_mtime
 
 
-def _cached_dds_path_for_xbm(xbm_path: str) -> str:
+def _redkit_source_roots() -> List[str]:
+    roots = []
+    try:
+        roots.extend(_active_redkit_repo_roots())
+    except Exception:
+        pass
+    try:
+        roots.extend(_get_redkit_depot_roots())
+    except Exception:
+        pass
+    seen = set()
+    result = []
+    for root in roots:
+        key = os.path.normcase(os.path.normpath(str(root or "")))
+        if key and key not in seen:
+            seen.add(key)
+            result.append(str(root))
+    return result
+
+
+def _is_redkit_source_path(path_value: str) -> bool:
+    if not path_value:
+        return False
+    path = win_unprefix_path(str(path_value))
+    for root in _redkit_source_roots():
+        if _is_under_root(path, root):
+            return True
+    return False
+
+
+def _safe_cache_file_stem(value: str) -> str:
+    stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(value or "texture"))
+    stem = stem.strip("._") or "texture"
+    return stem[:80]
+
+
+def _cached_redkit_dds_image_path(dds_path: str, extension: str) -> str:
+    source_path, mtime_ns, size = _source_file_cache_identity(dds_path)
+    key = f"{source_path.lower()}|{mtime_ns}|{size}|{extension.lower()}"
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
+    stem = _safe_cache_file_stem(Path(source_path).stem)
+    try:
+        texture_root = os.path.join(get_redkit_working_root(True), "_converted_textures")
+    except OSError:
+        texture_root = os.path.join(tempfile.gettempdir(), "witcher3_tools", "witcher_redkit_working", "_converted_textures")
+    cache_dir = os.path.join(texture_root, "converted_dds", digest[:2])
+    try:
+        os.makedirs(win_safe_path(cache_dir), exist_ok=True)
+    except OSError:
+        cache_dir = os.path.join(tempfile.gettempdir(), "witcher3_tools", "witcher_redkit_working", "_converted_textures", "converted_dds", digest[:2])
+        os.makedirs(win_safe_path(cache_dir), exist_ok=True)
+    extension = extension if extension.startswith(".") else f".{extension}"
+    return os.path.join(cache_dir, f"{stem}_{digest[:16]}{extension.lower()}")
+
+
+def _derived_image_is_current(output_path: str, source_path: str) -> bool:
+    if not _derived_file_is_current(output_path, source_path):
+        return False
+    try:
+        return os.path.getsize(win_safe_path(output_path)) > 0
+    except OSError:
+        return False
+
+
+def _read_dds_blender_cache_info(dds_path: str) -> Optional[Tuple[bytes, Optional[int], str]]:
+    try:
+        with open(win_safe_path(dds_path), "rb") as handle:
+            header = handle.read(148)
+    except OSError:
+        return None
+
+    if len(header) < 128 or header[:4] != b"DDS ":
+        return None
+
+    fourcc = header[84:88]
+    dxgi_format = None
+    if fourcc == b"DX10" and len(header) >= 132:
+        try:
+            dxgi_format = struct.unpack_from("<I", header, 128)[0]
+        except struct.error:
+            dxgi_format = None
+
+    format_name = ""
+    try:
+        format_name, _width, _height, _mip_count, _data_offset = dds_format_name_from_header(header)
+    except Exception:
+        # A DX10 header is enough to know Blender's legacy DDS path may reject
+        # the file, even if our lightweight parser does not know the DXGI enum.
+        format_name = ""
+
+    return fourcc, dxgi_format, format_name
+
+
+def _dds_needs_blender_image_cache(dds_path: str) -> bool:
+    if not dds_path or not str(dds_path).lower().endswith(".dds"):
+        return False
+    if not os.path.isfile(win_safe_path(dds_path)):
+        return False
+    info = _read_dds_blender_cache_info(dds_path)
+    if not info:
+        return False
+    fourcc, _dxgi_format, _format_name = info
+    return fourcc == b"DX10"
+
+
+def _replace_converted_cache_output(converted_path: str, output_path: str) -> str:
+    converted_path = win_unprefix_path(converted_path or "")
+    output_path = win_unprefix_path(output_path or "")
+    if not converted_path or not output_path or not os.path.isfile(win_safe_path(converted_path)):
+        return ""
+    if win_path_key(converted_path) != win_path_key(output_path):
+        os.makedirs(win_safe_path(os.path.dirname(output_path)), exist_ok=True)
+        os.replace(win_safe_path(converted_path), win_safe_path(output_path))
+    return output_path if os.path.isfile(win_safe_path(output_path)) else ""
+
+
+def _save_cached_tga_as_png(tga_path: str, png_path: str) -> str:
+    temp_image = None
+    try:
+        temp_image = bpy_image_load_safe(tga_path, check_existing=False)
+        if temp_image is None:
+            return ""
+        temp_image.filepath_raw = win_bpy_image_path(png_path)
+        temp_image.file_format = 'PNG'
+        temp_image.save()
+        if os.path.isfile(win_safe_path(png_path)) and os.path.getsize(win_safe_path(png_path)) > 0:
+            return png_path
+    except Exception:
+        log.debug("Failed to re-save converted DDS TGA as PNG: %s -> %s", tga_path, png_path, exc_info=True)
+    finally:
+        if temp_image is not None:
+            try:
+                bpy.data.images.remove(temp_image)
+            except Exception:
+                pass
+    return ""
+
+
+def _convert_dds_to_blender_image_cache(dds_path: str) -> str:
+    """Convert DX10 DDS variants that Blender cannot decode to a cached image."""
+    if not _dds_needs_blender_image_cache(dds_path):
+        return ""
+
+    png_path = _cached_redkit_dds_image_path(dds_path, ".png")
+    if _derived_image_is_current(png_path, dds_path):
+        return png_path
+
+    tga_path = _cached_redkit_dds_image_path(dds_path, ".tga")
+    if _derived_image_is_current(tga_path, dds_path):
+        png_from_tga = _save_cached_tga_as_png(tga_path, png_path)
+        return png_from_tga or tga_path
+
+    cache_dir = os.path.dirname(png_path)
+    info = _read_dds_blender_cache_info(dds_path)
+    format_label = ""
+    if info:
+        _fourcc, dxgi_format, format_name = info
+        format_label = format_name or (f"DXGI {dxgi_format}" if dxgi_format is not None else "DX10")
+
+    try:
+        from .CR2W import texconv_wrapper
+    except Exception:
+        log.warning("Cannot convert Blender-incompatible DDS because texconv is unavailable: %s", dds_path, exc_info=True)
+        return ""
+
+    png_error = None
+    try:
+        converted_png = texconv_wrapper.convert_dds_to_png(dds_path, output_dir=cache_dir)
+        converted_png = _replace_converted_cache_output(converted_png, png_path)
+        if _derived_image_is_current(converted_png, dds_path):
+            log.info("Converted Blender-incompatible DDS to PNG cache (%s): %s -> %s", format_label, dds_path, converted_png)
+            return converted_png
+    except Exception as exc:
+        png_error = exc
+        log.debug("DDS to PNG conversion failed, trying TGA fallback: %s", dds_path, exc_info=True)
+
+    try:
+        converted_tga = texconv_wrapper.convert_dds_to_tga(dds_path, output_dir=cache_dir)
+        converted_tga = _replace_converted_cache_output(converted_tga, tga_path)
+        png_from_tga = _save_cached_tga_as_png(converted_tga, png_path)
+        if _derived_image_is_current(png_from_tga, dds_path):
+            log.info("Converted Blender-incompatible DDS to PNG cache via TGA (%s): %s -> %s", format_label, dds_path, png_from_tga)
+            return png_from_tga
+        if _derived_image_is_current(converted_tga, dds_path):
+            if png_error is not None:
+                log.warning(
+                    "DDS to PNG conversion failed for %s; loading TGA cache instead: %s (%s)",
+                    dds_path,
+                    converted_tga,
+                    png_error,
+                )
+            return converted_tga
+    except Exception as exc:
+        log.warning("Failed to convert Blender-incompatible DDS for material preview: %s (%s)", dds_path, exc)
+    return ""
+
+
+def _cached_dds_path_for_xbm(xbm_path: str, use_redkit_working_root: bool = False) -> str:
     source_path, mtime_ns, size = _source_file_cache_identity(xbm_path)
     key = f"{source_path.lower()}|{mtime_ns}|{size}"
     digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
     stem = Path(source_path).stem or "texture"
     try:
-        texture_root = get_texture_root(True)
+        if use_redkit_working_root:
+            texture_root = os.path.join(get_redkit_working_root(True), "_converted_textures")
+        else:
+            texture_root = get_texture_root(True)
     except OSError:
         texture_root = os.path.join(tempfile.gettempdir(), "witcher3_tools", "witcher_textures")
     cache_dir = os.path.join(texture_root, "converted_xbm", digest[:2])
@@ -392,18 +605,24 @@ def _cached_dds_path_for_xbm(xbm_path: str) -> str:
 
 def _convert_xbm_to_writable_dds(xbm_path: str, preferred_dds_path: str = "") -> str:
     preferred_dds_path = preferred_dds_path or (os.path.splitext(xbm_path)[0] + ".dds")
-    if preferred_dds_path and _derived_file_is_current(preferred_dds_path, xbm_path):
+    redkit_source = _is_redkit_source_path(xbm_path)
+    preferred_allowed = preferred_dds_path and not _is_redkit_source_path(preferred_dds_path)
+    if preferred_allowed and _derived_file_is_current(preferred_dds_path, xbm_path):
         return preferred_dds_path
-    try:
-        converted_path = convert_xbm_to_dds(xbm_path, out_path=preferred_dds_path)
-        if converted_path and _derived_file_is_current(converted_path, xbm_path):
-            return converted_path
-        if preferred_dds_path and _derived_file_is_current(preferred_dds_path, xbm_path):
-            return preferred_dds_path
-    except OSError:
-        log.debug("Could not write DDS beside XBM, using texture cache: %s", xbm_path, exc_info=True)
+    if preferred_allowed:
+        try:
+            converted_path = convert_xbm_to_dds(xbm_path, out_path=preferred_dds_path)
+            if converted_path and _derived_file_is_current(converted_path, xbm_path):
+                return converted_path
+            if _derived_file_is_current(preferred_dds_path, xbm_path):
+                return preferred_dds_path
+        except OSError:
+            log.debug("Could not write preferred DDS, using texture cache: %s", xbm_path, exc_info=True)
 
-    cached_dds_path = _cached_dds_path_for_xbm(xbm_path)
+    cached_dds_path = _cached_dds_path_for_xbm(
+        xbm_path,
+        use_redkit_working_root=redkit_source,
+    )
     if _derived_file_is_current(cached_dds_path, xbm_path):
         return cached_dds_path
     converted_path = convert_xbm_to_dds(xbm_path, out_path=cached_dds_path)
@@ -2107,6 +2326,7 @@ def create_node_texture(
     conversion_seconds = 0.0
     image_load_seconds = 0.0
     converted_from_xbm = False
+    converted_from_dds = False
     if using_node_tree:
         nodes = node_ng.nodes
         links = node_ng.links
@@ -2275,8 +2495,22 @@ def create_node_texture(
             tex_path = dds_path
 
     
+    texture_source_path = tex_path
+    if tex_path and tex_path.lower().endswith(".dds"):
+        convert_started = time.perf_counter()
+        converted_image_path = _convert_dds_to_blender_image_cache(tex_path)
+        conversion_seconds += time.perf_counter() - convert_started
+        if converted_image_path:
+            tex_path = converted_image_path
+            converted_from_dds = True
+
     image_started = time.perf_counter()
-    node.image = load_texture(mat, tex_path, uncook_path)
+    node.image = load_texture(
+        mat,
+        tex_path,
+        uncook_path,
+        metadata_source_path=texture_source_path if converted_from_dds else "",
+    )
     image_load_seconds = time.perf_counter() - image_started
     if texarray_source_repo_path:
         node["witcher_texture_source_path"] = texarray_source_repo_path
@@ -2289,7 +2523,7 @@ def create_node_texture(
         node.label = "MISSING:" + par_value
 
     total_seconds = time.perf_counter() - texture_started
-    if total_seconds >= _TEXTURE_PROFILE_WARN_THRESHOLD or converted_from_xbm:
+    if total_seconds >= _TEXTURE_PROFILE_WARN_THRESHOLD or converted_from_xbm or converted_from_dds:
         _log_material_profile_warning(
             "texture node %s on %s total %.3fs (convert %.3fs, load %.3fs, source %s, final %s)",
             par_name,
@@ -2480,9 +2714,16 @@ def load_texture(
         mat: Material
         ,tex_path: str
         ,uncook_path: str
+        ,metadata_source_path: str = ""
     ) -> Image:
     texture_started = time.perf_counter()
     tex_path = win_unprefix_path(tex_path)
+    metadata_source_path = win_unprefix_path(metadata_source_path or tex_path)
+    if tex_path and tex_path.lower().endswith(".dds"):
+        converted_image_path = _convert_dds_to_blender_image_cache(tex_path)
+        if converted_image_path:
+            metadata_source_path = metadata_source_path or tex_path
+            tex_path = win_unprefix_path(converted_image_path)
     img_filename = os.path.basename(tex_path)	# Filename with extension.
     overwrite_existing = overwrite_existing_enabled()
 
@@ -2529,7 +2770,8 @@ def load_texture(
             img = bpy_image_load_safe(tex_path, check_existing=True)
 
     # Correct the image name.
-    filepath = img.filepath.replace(os.sep, "/")
+    display_filepath = metadata_source_path or img.filepath
+    filepath = display_filepath.replace(os.sep, "/")
     filename = filepath.split("/")[-1]
     file_parts = filename.split(".")
     img_name = file_parts[0]
@@ -2539,10 +2781,17 @@ def load_texture(
     #     img_name += end.split("texture")[1]
     img.name = img_name
 
-    if tex_path.lower().endswith('.dds'):
+    if tex_path.lower().endswith('.dds') or metadata_source_path.lower().endswith('.dds'):
         img.alpha_mode = 'CHANNEL_PACKED'
 
-    _apply_image_texture_metadata(img, tex_path)
+    if metadata_source_path and metadata_source_path != tex_path:
+        try:
+            img["witcher_original_texture_path"] = metadata_source_path
+            img["witcher_cached_texture_path"] = tex_path
+        except Exception:
+            pass
+
+    _apply_image_texture_metadata(img, metadata_source_path or tex_path)
 
     total_seconds = time.perf_counter() - texture_started
     if total_seconds >= _TEXTURE_PROFILE_WARN_THRESHOLD:

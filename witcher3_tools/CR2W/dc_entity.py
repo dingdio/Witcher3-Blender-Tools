@@ -290,6 +290,13 @@ def _repair_w2_component_mesh_path(chunk, repo_path: str):
         return candidate
     return repo_path
 def _resolve_repo_path_from_import_index(cr2w_file, import_index, expected_ext: str):
+    if import_index is not None:
+        try:
+            candidate = _normalize_repo_path_value(str(import_index), expected_ext)
+        except Exception:
+            candidate = None
+        if candidate:
+            return candidate
     if not cr2w_file:
         return None
     imports = getattr(cr2w_file, "CR2WImport", None) or []

@@ -7,9 +7,8 @@ terrain from -- the same data layer geometry (buildings) was placed against --
 so the Unreal landscape lines up with later layer imports by construction.
 
 Emits a manifest with a ``terrain`` section (heightmap R16 + landscape layout +
-actor transform + water) plus an optional tint texture for the base colour.
-Phase 4 will add the weight-blended terrain material; this is geometry + water +
-flat colour.
+actor transform + water) plus the terrain tint, layer textures, and packed
+control map needed by the Unreal blend material.
 """
 
 from __future__ import annotations
@@ -95,13 +94,57 @@ def _export_tint_texture(tint_dds: str, bundle_root: str, depot_rel: str,
     }
 
 
+def _ensure_terrain_control_sources(world, world_path: str, hub: str, heightmap_dir: str,
+                                    warnings: list[str]) -> None:
+    """Make sure combined overlay/bkgrnd/blend sidecars exist for UE terrain."""
+    required = (
+        os.path.join(heightmap_dir, f"combined.{hub}.overlay.data"),
+        os.path.join(heightmap_dir, f"combined.{hub}.bkgrnd.data"),
+        os.path.join(heightmap_dir, f"combined.{hub}.blendcontrol.data"),
+    )
+    if all(os.path.isfile(path) for path in required):
+        return
+    if not world_path:
+        warnings.append("Terrain control map export skipped: source .w2w path is missing.")
+        return
+
+    try:
+        from ..importers import import_w2w
+        from ..importers import terrain_w2ter
+
+        ctx = import_w2w._resolve_terrain_context(world, world_path)
+        buffer_paths = import_w2w._collect_tile_buffer_paths_for_combine(
+            ctx["terrain_tiles_dir"],
+            ctx["terrain_tiles_rel"],
+            ctx["n_tiles"],
+            ctx["tile_res"],
+            working_tiles_dir=ctx["working_tiles_dir"],
+        )
+        if not buffer_paths:
+            warnings.append("Terrain control map export skipped: no .w2ter buffer sidecars were found.")
+            return
+
+        terrain_w2ter.combine_w2ter_tiles(
+            buffer_paths,
+            heightmap_dir,
+            hub,
+            res_override=ctx["tile_res"],
+            x_tiles_override=ctx["n_tiles"],
+            y_tiles_override=ctx["n_tiles"],
+            targets=("overlay", "bkgrnd", "blend"),
+            skip_existing=True,
+        )
+    except Exception as exc:
+        warnings.append(f"Terrain control map export failed ({exc}); using flat tint.")
+
+
 def _export_terrain_blend_layers(world, hub: str, heightmap_dir: str, height_res: int,
                                  bundle_root: str, asset_rel: str,
                                  warnings: list[str]) -> tuple[list[dict], str, list[dict]]:
     """Extract the W3 terrain layer atlases + packed control map into the bundle.
 
-    Returns (layers_manifest, control_depot, texture_entries). Best-effort:
-    on any failure the caller falls back to the flat tint material.
+    Returns (layers_manifest, control_depot, texture_entries). The caller
+    rejects tint-only terrain when a source world is available.
     """
     from .texture_export import convert_texture_for_unreal
 
@@ -120,13 +163,13 @@ def _export_terrain_blend_layers(world, hub: str, heightmap_dir: str, height_res
             return ""
         stem = depot_rel.rsplit("/", 1)[-1]
         try:
-            png_path = convert_texture_for_unreal(dds_path, textures_dir, stem)
+            converted_path = convert_texture_for_unreal(dds_path, textures_dir, stem)
         except Exception as exc:
             warnings.append(f"terrain texture '{depot_rel}' conversion failed: {exc}")
             return ""
         texture_entries.append({
             "depot_path": depot_rel,
-            "file": relpath_for_manifest(png_path, bundle_root),
+            "file": relpath_for_manifest(converted_path, bundle_root),
             "srgb": srgb,
             "compression": compression,
         })
@@ -163,6 +206,8 @@ def _export_terrain_blend_layers(world, hub: str, heightmap_dir: str, height_res
             "srgb": False,
             "compression": "controlmap",
         })
+    else:
+        warnings.append("Terrain control map missing; Unreal will use the flat terrain tint material.")
 
     return layers_manifest, control_depot, texture_entries
 
@@ -298,23 +343,55 @@ def build_unreal_world_bundle(context, settings) -> dict[str, Any]:
     else:
         warnings.append("No terrain tint texture; landscape will use a neutral base colour.")
 
-    # Faithful weight-blended terrain layers (Phase 4): diffuse/normal atlases +
-    # overlay/bkgrnd/blend control maps. Best-effort; falls back to tint.
+    # Faithful weight-blended terrain layers: diffuse/normal atlases plus
+    # overlay/bkgrnd/blend control maps. Terrain sends must not silently degrade
+    # to tint-only when the source world is available.
     terrain_layers: list[dict] = []
     terrain_control: str = ""
     heightmap_dir = os.path.dirname(heightmap_png)
+    terrain_material_errors: list[str] = []
     try:
         from ..CR2W import CR2W_reader
+        from ..CR2W.common_blender import redkit_repo_context
 
-        world = CR2W_reader.load_w2w(world_path) if world_path else None
+        with redkit_repo_context(world_path):
+            world = CR2W_reader.load_w2w(world_path) if world_path else None
         if world is not None:
-            terrain_layers, terrain_control, layer_textures = _export_terrain_blend_layers(
-                world, hub, heightmap_dir, result.source_resolution,
-                bundle_root, asset_rel, warnings,
-            )
+            warning_start = len(warnings)
+            with redkit_repo_context(world_path):
+                _ensure_terrain_control_sources(world, world_path, hub, heightmap_dir, warnings)
+                terrain_layers, terrain_control, layer_textures = _export_terrain_blend_layers(
+                    world, hub, heightmap_dir, result.source_resolution,
+                    bundle_root, asset_rel, warnings,
+                )
             textures.extend(layer_textures)
+            if not terrain_layers:
+                detail = "; ".join(warnings[warning_start:]) or "no terrain layer textures were exported"
+                terrain_material_errors.append(f"Terrain layer texture export failed: {detail}")
+            elif not terrain_control:
+                terrain_material_errors.append("Terrain control map was not exported.")
+            else:
+                missing_diffuse = sum(1 for layer in terrain_layers if not layer.get("diffuse"))
+                normal_count = sum(1 for layer in terrain_layers if layer.get("normal"))
+                if missing_diffuse:
+                    terrain_material_errors.append(
+                        f"Terrain layer texture export failed: {missing_diffuse} diffuse layer texture(s) missing."
+                    )
+                if 0 < normal_count < len(terrain_layers):
+                    terrain_material_errors.append(
+                        "Terrain layer texture export failed: "
+                        f"{len(terrain_layers) - normal_count} normal layer texture(s) missing."
+                    )
+        elif world_path:
+            terrain_material_errors.append(f"Could not load source world for terrain materials: {world_path}")
     except Exception as exc:
-        warnings.append(f"Terrain blend-layer export failed ({exc}); using flat tint.")
+        terrain_material_errors.append(f"Terrain blend-layer export failed: {exc}")
+
+    if terrain_material_errors:
+        raise ValueError(
+            "Terrain material export failed; refusing to send tint-only Unreal terrain. "
+            + " ".join(terrain_material_errors)
+        )
 
     terrain_section: dict[str, Any] = {
         "name": safe_asset_name(hub),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import struct
 
@@ -40,6 +41,52 @@ _UNCOOKED_W2CUBE_COMPRESSION_HINTS = (
     (b"TCM_None", EFormat.R8G8B8A8_UNORM),       # uncompressed RGBA8-ish
     (b"TCM_QualityColor", EFormat.BC7_UNORM),    # BC7
 )
+
+
+def _redkit_working_default_dds_path(source_path: str) -> str:
+    try:
+        from .common_blender import (
+            _active_redkit_repo_roots,
+            _get_redkit_depot_roots,
+            _is_under_root,
+            win_safe_path,
+            win_unprefix_path,
+        )
+        from ..extension_paths import get_redkit_working_root
+    except Exception:
+        return ""
+
+    try:
+        source_path = os.path.abspath(win_unprefix_path(str(source_path or "")))
+    except Exception:
+        source_path = str(source_path or "")
+    roots = []
+    try:
+        roots.extend(_active_redkit_repo_roots())
+    except Exception:
+        pass
+    try:
+        roots.extend(_get_redkit_depot_roots())
+    except Exception:
+        pass
+    if not any(_is_under_root(source_path, root) for root in roots if root):
+        return ""
+
+    try:
+        stat = os.stat(win_safe_path(source_path))
+        key = f"{os.path.normcase(os.path.normpath(source_path))}|{stat.st_mtime_ns}|{stat.st_size}"
+    except Exception:
+        key = os.path.normcase(os.path.normpath(source_path))
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
+    stem = os.path.splitext(os.path.basename(source_path))[0] or "texture"
+    out_dir = os.path.join(
+        get_redkit_working_root(create=True),
+        "_converted_textures",
+        "xbm_default",
+        digest[:2],
+    )
+    os.makedirs(win_safe_path(out_dir), exist_ok=True)
+    return os.path.join(out_dir, f"{stem}_{digest[:16]}.dds")
 
 
 class ImageUtility():
@@ -164,7 +211,9 @@ def convert_xbm_to_dds(fdir, force=False, out_path=None):
 
     ddsheader = b'\x44\x44\x53\x20\x7C\x00\x00\x00\x07\x10\x0A\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x20\x00\x00\x00\x05\x00\x00\x00\x44\x58\x54\x31\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08\x10\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
 
-    dds_path = os.path.splitext(out_path or fdir)[0] + '.dds'
+    output_source = out_path or _redkit_working_default_dds_path(fdir) or fdir
+    effective_out_path = out_path or (output_source if output_source != fdir else None)
+    dds_path = os.path.splitext(output_source)[0] + '.dds'
     for chunk in xbmFile.CHUNKS.CHUNKS:
         if chunk.Type != "CBitmapTexture":
             continue
@@ -239,7 +288,7 @@ def convert_xbm_to_dds(fdir, force=False, out_path=None):
                         texture_item = item[-1]  # last bundle loaded, should be top mod
                         break
                 if texture_item:
-                    extractPath = _texture_cache_extract_path(texture_item, out_path)
+                    extractPath = _texture_cache_extract_path(texture_item, effective_out_path)
                     texture_item.extract_to_file(extractPath)
                     dds_path = os.path.splitext(extractPath)[0] + '.dds'
                 else:

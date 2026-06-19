@@ -164,6 +164,52 @@ def get_terrain_atlases(w2mg_abs_path: str) -> tuple[str, str]:
     return diffuse, normal
 
 
+def get_texture_array_bitmap_paths(texarray_abs_path: str) -> list[str]:
+    """Return source texture paths from a REDkit/source CTextureArray."""
+    from ..CR2W import CR2W_file
+
+    if not texarray_abs_path or not os.path.isfile(texarray_abs_path):
+        return []
+    try:
+        cr2w = CR2W_file.read_CR2W(texarray_abs_path)
+    except Exception:
+        return []
+
+    paths: list[str] = []
+    for chunk in getattr(getattr(cr2w, "CHUNKS", None), "CHUNKS", []) or []:
+        if getattr(chunk, "Type", "") != "CTextureArray":
+            continue
+        try:
+            bitmaps = chunk.GetVariableByName("bitmaps")
+        except Exception:
+            bitmaps = None
+        for element in getattr(bitmaps, "More", []) or []:
+            for prop in getattr(element, "MoreProps", []) or []:
+                if getattr(prop, "theName", "") != "m_texture":
+                    continue
+                index = getattr(prop, "Index", None)
+                path = str(getattr(index, "Path", "") or "").strip()
+                if path:
+                    paths.append(path)
+                    break
+    return paths
+
+
+def _resolved_existing_repo_files(repo_paths: list[str]) -> list[str]:
+    from ..CR2W.common_blender import repo_file, win_safe_path
+
+    resolved: list[str] = []
+    for path in repo_paths:
+        candidate = repo_file(path)
+        try:
+            if candidate and os.path.isfile(win_safe_path(candidate)):
+                resolved.append(candidate)
+        except Exception:
+            if candidate and os.path.isfile(candidate):
+                resolved.append(candidate)
+    return resolved
+
+
 def extract_terrain_material_set(world) -> TerrainMaterialSet:
     """Resolve the terrain material set and split both atlases into DDS slices."""
     from ..CR2W.common_blender import repo_file
@@ -185,10 +231,17 @@ def extract_terrain_material_set(world) -> TerrainMaterialSet:
         result.warnings.append("Terrain material graph has no diffuse texture array.")
         return result
 
-    diffuse_slices = convert_texarray_to_dds(repo_file(result.diffuse_texarray)) or []
+    diffuse_abs = repo_file(result.diffuse_texarray)
+    normal_abs = repo_file(result.normal_texarray) if result.normal_texarray else ""
+
+    diffuse_slices = convert_texarray_to_dds(diffuse_abs) or []
+    if not diffuse_slices:
+        diffuse_slices = _resolved_existing_repo_files(get_texture_array_bitmap_paths(diffuse_abs))
     normal_slices = []
     if result.normal_texarray:
-        normal_slices = convert_texarray_to_dds(repo_file(result.normal_texarray)) or []
+        normal_slices = convert_texarray_to_dds(normal_abs) or []
+        if not normal_slices:
+            normal_slices = _resolved_existing_repo_files(get_texture_array_bitmap_paths(normal_abs))
 
     texture_params = get_terrain_texture_params(world)
     count = len(diffuse_slices)

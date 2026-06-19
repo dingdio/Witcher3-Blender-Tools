@@ -9,6 +9,7 @@
 #include "Templates/Function.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/Skeleton.h"
+#include "AssetCompilingManager.h"
 #include "AssetImportTask.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
@@ -253,7 +254,7 @@ UMaterialInterface* CreateSimpleMaterial(
         if (TextureSample)
         {
             TextureSample->Texture = BaseColorTexture;
-            TextureSample->SamplerType = SAMPLERTYPE_Color;
+            TextureSample->SamplerType = BaseColorTexture->SRGB ? SAMPLERTYPE_Color : SAMPLERTYPE_LinearColor;
             BaseColorSource = TextureSample;
         }
     }
@@ -2159,6 +2160,8 @@ UMaterialInterface* FWitcherImportContext::BuildTerrainBlendMaterial(
     SpecularityBase.Init(0.5f, ParamCount);
     SpecularityScale.Init(0.0f, ParamCount);
     bool bAnyNormal = false;
+    int32 MissingDiffuseCount = 0;
+    int32 MissingNormalCount = 0;
     for (const TSharedPtr<FJsonValue>& Value : *Layers)
     {
         const TSharedPtr<FJsonObject> Layer = Value->AsObject();
@@ -2171,8 +2174,18 @@ UMaterialInterface* FWitcherImportContext::BuildTerrainBlendMaterial(
         {
             continue;
         }
-        DiffuseSlices[Index] = Cast<UTexture2D>(FindTexture(JsonString(Layer, TEXT("diffuse"))));
-        UTexture2D* NormalTex = Cast<UTexture2D>(FindTexture(JsonString(Layer, TEXT("normal"))));
+        const FString DiffuseDepot = JsonString(Layer, TEXT("diffuse"));
+        DiffuseSlices[Index] = Cast<UTexture2D>(FindTexture(DiffuseDepot));
+        if (DiffuseDepot.IsEmpty() || !DiffuseSlices[Index])
+        {
+            MissingDiffuseCount++;
+        }
+        const FString NormalDepot = JsonString(Layer, TEXT("normal"));
+        UTexture2D* NormalTex = Cast<UTexture2D>(FindTexture(NormalDepot));
+        if (!NormalDepot.IsEmpty() && !NormalTex)
+        {
+            MissingNormalCount++;
+        }
         NormalSlices[Index] = NormalTex;
         bAnyNormal = bAnyNormal || (NormalTex != nullptr);
         if (Index < ParamCount)
@@ -2193,6 +2206,20 @@ UMaterialInterface* FWitcherImportContext::BuildTerrainBlendMaterial(
                 JsonNumber(Layer, TEXT("specularity_scale"), SpecularityScale[Index]));
         }
     }
+    if (MissingDiffuseCount > 0)
+    {
+        AddError(FString::Printf(
+            TEXT("Terrain blend material: %d diffuse layer texture(s) missing; aborting."),
+            MissingDiffuseCount));
+        return nullptr;
+    }
+    if (MissingNormalCount > 0)
+    {
+        AddError(FString::Printf(
+            TEXT("Terrain blend material: %d normal layer texture(s) missing; aborting."),
+            MissingNormalCount));
+        return nullptr;
+    }
     const FString BlendSharpnessCode = HlslFloatArray(BlendSharpness);
     const FString SlopeBaseDampeningCode = HlslFloatArray(SlopeBaseDampening);
     const FString SlopeNormalDampeningCode = HlslFloatArray(SlopeNormalDampening);
@@ -2201,13 +2228,13 @@ UMaterialInterface* FWitcherImportContext::BuildTerrainBlendMaterial(
     const FString SpecularityBaseCode = HlslFloatArray(SpecularityBase);
     const FString SpecularityScaleCode = HlslFloatArray(SpecularityScale);
 
-    // Texture arrays need every slice valid + uniform; fill gaps with the first
-    // good slice so a single missing layer can't abort the whole material.
+    // Texture arrays need every diffuse slice valid. Optional normal slices are
+    // filled only after the manifest-resolved normal textures have been checked.
     UTexture2D* FallbackDiffuse = nullptr;
     for (UTexture2D* Slice : DiffuseSlices) { if (Slice) { FallbackDiffuse = Slice; break; } }
     if (!FallbackDiffuse)
     {
-        AddWarning(TEXT("Terrain blend material: no diffuse layer textures resolved; using tint."));
+        AddError(TEXT("Terrain blend material: no diffuse layer textures resolved; aborting."));
         return nullptr;
     }
     for (UTexture2D*& Slice : DiffuseSlices) { if (!Slice) { Slice = FallbackDiffuse; } }
@@ -2215,6 +2242,7 @@ UMaterialInterface* FWitcherImportContext::BuildTerrainBlendMaterial(
     UTexture2DArray* DiffuseArray = BuildTerrainTextureArray(DiffuseSlices, AssetRel + TEXT("_diffuse_array"), false);
     if (!DiffuseArray)
     {
+        AddError(TEXT("Terrain blend material: failed to build diffuse texture array."));
         return nullptr;
     }
     UTexture2DArray* NormalArray = nullptr;
@@ -2224,6 +2252,11 @@ UMaterialInterface* FWitcherImportContext::BuildTerrainBlendMaterial(
         for (UTexture2D* Slice : NormalSlices) { if (Slice) { FallbackNormal = Slice; break; } }
         for (UTexture2D*& Slice : NormalSlices) { if (!Slice) { Slice = FallbackNormal; } }
         NormalArray = BuildTerrainTextureArray(NormalSlices, AssetRel + TEXT("_normal_array"), true);
+        if (!NormalArray)
+        {
+            AddError(TEXT("Terrain blend material: failed to build normal texture array."));
+            return nullptr;
+        }
     }
     const bool bHasNormalArray = NormalArray != nullptr;
 
@@ -2233,7 +2266,7 @@ UMaterialInterface* FWitcherImportContext::BuildTerrainBlendMaterial(
     UTexture* TintTex = FindTexture(JsonString(Terrain, TEXT("base_color_texture")));
     if (!ControlTex)
     {
-        AddWarning(TEXT("Terrain blend material: control map missing; using tint."));
+        AddError(TEXT("Terrain blend material: control map missing; aborting."));
         return nullptr;
     }
 
@@ -2653,15 +2686,32 @@ void FWitcherImportContext::ImportTerrain()
     const FVector Location = JsonVector(TransformObj, TEXT("location"), FVector::ZeroVector);
     const FVector Scale = JsonVector(TransformObj, TEXT("scale"), FVector(100.0, 100.0, 100.0));
 
-    // --- landscape material (tint base colour; Phase 4 swaps in weight blends) ---
+    // --- landscape material ---
     const FString TerrainAssetRel = JsonString(Terrain, TEXT("asset_path"), TEXT("witcher_terrain"));
     UMaterialInterface* TerrainMaterial = nullptr;
     {
         const FString MaterialRel = TerrainAssetRel + TEXT("_terrain_m");
         const TArray<TSharedPtr<FJsonValue>>* Layers = nullptr;
-        if (Terrain->TryGetArrayField(TEXT("layers"), Layers) && Layers->Num() > 0)
+        const bool bHasLayers = Terrain->TryGetArrayField(TEXT("layers"), Layers) && Layers && Layers->Num() > 0;
+        const bool bSourceWorldTerrain = !JsonString(Terrain, TEXT("world_path")).IsEmpty();
+        if (bSourceWorldTerrain && !bHasLayers)
+        {
+            AddError(TEXT("Terrain import: manifest has no terrain blend layers; refusing tint-only import."));
+            return;
+        }
+        if (bHasLayers && JsonString(Terrain, TEXT("control")).IsEmpty())
+        {
+            AddError(TEXT("Terrain import: manifest has blend layers but no control map; refusing tint-only import."));
+            return;
+        }
+        if (bHasLayers)
         {
             TerrainMaterial = BuildTerrainBlendMaterial(Terrain, MaterialRel);
+            if (!TerrainMaterial)
+            {
+                AddError(TEXT("Terrain import: terrain blend material failed; refusing fallback tint material."));
+                return;
+            }
         }
         if (!TerrainMaterial)
         {
@@ -2831,6 +2881,9 @@ void FWitcherImportContext::ImportPlacements()
         return;
     }
 
+    //  Block until every built asset has finished compiling so placements render against real data.
+    FAssetCompilingManager::Get().FinishAllCompilation();
+
     for (const TSharedPtr<FJsonValue>& LayerValue : *Layers)
     {
         const TSharedPtr<FJsonObject> Layer = LayerValue->AsObject();
@@ -2852,6 +2905,9 @@ void FWitcherImportContext::ImportPlacements()
         const FString MeshFolder = SectorRoot + TEXT("/Mesh");
         const FString CollisionFolder = SectorRoot + TEXT("/Collision");
         const FString LightFolder = SectorRoot + TEXT("/Lights");
+        // Placed entities mirror the Blender layer: each CEntity/CGameplayEntity
+        // is one actor directly under the layer folder, not under CSectorData.
+        const FString EntityFolder = LayerRoot;
 
         bool bLayerMeshesReady = true;
         auto ValidateRequiredMesh = [&](const TSharedPtr<FJsonObject>& Entry, const TCHAR* Kind) -> bool
@@ -3369,13 +3425,202 @@ void FWitcherImportContext::ImportPlacements()
             }
         }
 
+        // Placed entities (mirrors the Blender empty + child-mesh hierarchy).
+        int32 EntityCount = 0;
+        int32 EntityComponentCount = 0;
+        const TArray<TSharedPtr<FJsonValue>>* Entities = nullptr;
+        if (Layer->TryGetArrayField(TEXT("entities"), Entities))
+        {
+            for (const TSharedPtr<FJsonValue>& EntityValue : *Entities)
+            {
+                const TSharedPtr<FJsonObject> EntityEntry = EntityValue->AsObject();
+                if (!EntityEntry.IsValid())
+                {
+                    continue;
+                }
+                const TArray<TSharedPtr<FJsonValue>>* Components = nullptr;
+                if (!EntityEntry->TryGetArrayField(TEXT("components"), Components) || Components->Num() == 0)
+                {
+                    continue;
+                }
+                const FString EntityName = JsonString(EntityEntry, TEXT("name"), TEXT("Entity"));
+                const bool bDefaultHidden = JsonBool(EntityEntry, TEXT("default_hidden"), false);
+
+                const TSharedPtr<FJsonObject>* EntityTransformPtr = nullptr;
+                EntityEntry->TryGetObjectField(TEXT("transform"), EntityTransformPtr);
+                const TSharedPtr<FJsonObject> EntityTransform = EntityTransformPtr ? *EntityTransformPtr : nullptr;
+                const FVector EntityLocation = JsonVector(EntityTransform, TEXT("location"), FVector::ZeroVector);
+                const FQuat EntityRotation = JsonQuat(EntityTransform, TEXT("rotation"));
+                const FVector EntityScale = JsonVector(EntityTransform, TEXT("scale"), FVector::OneVector);
+
+                int32 NumEngineHiddenComps = 0;
+                int32 NumVisibleComps = 0;
+                for (const TSharedPtr<FJsonValue>& ComponentValue : *Components)
+                {
+                    const TSharedPtr<FJsonObject> ComponentEntry = ComponentValue->AsObject();
+                    if (!ComponentEntry.IsValid())
+                    {
+                        continue;
+                    }
+                    if (JsonBool(ComponentEntry, TEXT("engine_hidden"), false))
+                    {
+                        ++NumEngineHiddenComps;
+                    }
+                    else
+                    {
+                        ++NumVisibleComps;
+                    }
+                }
+
+                // Build one entity actor holding just the components in a single
+                // visibility subset. Engine-hidden components are split onto their
+                // own actor (tagged EngineHidden) so the actor-granular visibility
+                // panel can count and toggle them -- a per-component SetVisibility
+                // is invisible to that panel, which is why hidden entity meshes
+                // were stuck off with a zero count.
+                auto BuildEntitySubsetActor = [&](bool bEngineHiddenSubset) -> AActor*
+                {
+                    AActor* EntityActor = World->SpawnActor<AActor>();
+                    if (!EntityActor)
+                    {
+                        return nullptr;
+                    }
+                    USceneComponent* Root = NewObject<USceneComponent>(EntityActor, TEXT("Root"));
+                    EntityActor->SetRootComponent(Root);
+                    Root->SetMobility(EComponentMobility::Movable);
+                    EntityActor->AddInstanceComponent(Root);
+                    Root->RegisterComponent();
+                    if (IsUsablePlacementTransform(EntityLocation, EntityRotation, EntityScale))
+                    {
+                        EntityActor->SetActorTransform(FTransform(EntityRotation, EntityLocation, EntityScale));
+                    }
+
+                    int32 PlacedComponents = 0;
+                    for (const TSharedPtr<FJsonValue>& ComponentValue : *Components)
+                    {
+                        const TSharedPtr<FJsonObject> ComponentEntry = ComponentValue->AsObject();
+                        if (!ComponentEntry.IsValid())
+                        {
+                            continue;
+                        }
+                        if (JsonBool(ComponentEntry, TEXT("engine_hidden"), false) != bEngineHiddenSubset)
+                        {
+                            continue;
+                        }
+                        const FString AssetRel = JsonString(ComponentEntry, TEXT("asset_path"));
+                        UStaticMesh* Mesh = FindPlacementMesh(AssetRel);
+                        if (!Mesh)
+                        {
+                            AddWarning(FString::Printf(
+                                TEXT("Entity '%s' component mesh not found for '%s' (layer '%s')."),
+                                *EntityName, *AssetRel, *LayerId));
+                            continue;
+                        }
+                        const TSharedPtr<FJsonObject>* CompTransformPtr = nullptr;
+                        ComponentEntry->TryGetObjectField(TEXT("transform"), CompTransformPtr);
+                        const TSharedPtr<FJsonObject> CompTransform = CompTransformPtr ? *CompTransformPtr : nullptr;
+                        const FVector CompLocation = JsonVector(CompTransform, TEXT("location"), FVector::ZeroVector);
+                        const FQuat CompRotation = JsonQuat(CompTransform, TEXT("rotation"));
+                        const FVector CompScale = JsonVector(CompTransform, TEXT("scale"), FVector::OneVector);
+                        if (!IsUsablePlacementTransform(CompLocation, CompRotation, CompScale))
+                        {
+                            AddWarning(FString::Printf(
+                                TEXT("Entity '%s' component '%s' has an invalid transform (layer '%s'); skipped."),
+                                *EntityName, *AssetRel, *LayerId));
+                            continue;
+                        }
+
+                        const FString ComponentName = JsonString(ComponentEntry, TEXT("name"), TEXT("Mesh"));
+                        UStaticMeshComponent* MeshComponent =
+                            NewObject<UStaticMeshComponent>(EntityActor, MakeUniqueObjectName(EntityActor, UStaticMeshComponent::StaticClass(), FName(*ComponentName)));
+                        MeshComponent->SetupAttachment(Root);
+                        MeshComponent->SetMobility(EComponentMobility::Movable);
+                        MeshComponent->SetStaticMesh(Mesh);
+                        ConfigureVisualPlacement(MeshComponent);
+                        EntityActor->AddInstanceComponent(MeshComponent);
+                        MeshComponent->RegisterComponent();
+                        MeshComponent->SetRelativeTransform(FTransform(CompRotation, CompLocation, CompScale));
+                        ++PlacedComponents;
+                        ++EntityComponentCount;
+
+                        // W3 collision lives in the global collision cache keyed by
+                        // mesh path; the bundle ships it as a separate collision mesh.
+                        // Add it as a hidden collision component at the same relative
+                        // transform so the entity actor blocks like its visual mesh.
+                        const FString CompCollisionRel = JsonString(ComponentEntry, TEXT("collision_asset_path"));
+                        if (!CompCollisionRel.IsEmpty())
+                        {
+                            if (UStaticMesh* CollisionMesh = FindPlacementMesh(CompCollisionRel))
+                            {
+                                UStaticMeshComponent* CollisionComponent =
+                                    NewObject<UStaticMeshComponent>(EntityActor, MakeUniqueObjectName(EntityActor, UStaticMeshComponent::StaticClass(), FName(*(ComponentName + TEXT("_Collision")))));
+                                CollisionComponent->SetupAttachment(Root);
+                                CollisionComponent->SetMobility(EComponentMobility::Movable);
+                                CollisionComponent->SetStaticMesh(CollisionMesh);
+                                ConfigureHiddenCollision(CollisionComponent);
+                                EntityActor->AddInstanceComponent(CollisionComponent);
+                                CollisionComponent->RegisterComponent();
+                                CollisionComponent->SetRelativeTransform(FTransform(CompRotation, CompLocation, CompScale));
+                            }
+                            else
+                            {
+                                AddWarning(FString::Printf(
+                                    TEXT("Entity '%s' collision mesh not found for '%s' (layer '%s')."),
+                                    *EntityName, *CompCollisionRel, *LayerId));
+                            }
+                        }
+                    }
+
+                    if (PlacedComponents == 0)
+                    {
+                        World->DestroyActor(EntityActor);
+                        return nullptr;
+                    }
+                    return EntityActor;
+                };
+
+                bool bSpawnedEntity = false;
+                if (NumVisibleComps > 0)
+                {
+                    if (AActor* VisibleEntity = BuildEntitySubsetActor(/*bEngineHiddenSubset=*/false))
+                    {
+                        PlaceActorCommon(VisibleEntity, EntityName, EntityFolder);
+                        if (bDefaultHidden)
+                        {
+                            MarkDefaultHidden(VisibleEntity);
+                        }
+                        bSpawnedEntity = true;
+                    }
+                }
+                if (NumEngineHiddenComps > 0)
+                {
+                    if (AActor* HiddenEntity = BuildEntitySubsetActor(/*bEngineHiddenSubset=*/true))
+                    {
+                        PlaceActorCommon(HiddenEntity, EntityName + TEXT("_EngineHidden"), EntityFolder);
+                        MarkEngineHidden(HiddenEntity);
+                        if (bDefaultHidden)
+                        {
+                            MarkDefaultHidden(HiddenEntity);
+                        }
+                        bSpawnedEntity = true;
+                    }
+                }
+                if (bSpawnedEntity)
+                {
+                    ++EntityCount;
+                }
+            }
+        }
+
         UE_LOG(LogWitcherImportContext, Log,
-            TEXT("Layer '%s': %d actor(s), %d collision actor(s), %d instanced placement(s), %d light(s)"),
+            TEXT("Layer '%s': %d actor(s), %d collision actor(s), %d instanced placement(s), %d light(s), %d entity(ies) (%d component(s))"),
             *LayerId,
             ActorCount,
             CollisionActorCount,
             InstanceCount,
-            LightCount);
+            LightCount,
+            EntityCount,
+            EntityComponentCount);
     }
 }
 

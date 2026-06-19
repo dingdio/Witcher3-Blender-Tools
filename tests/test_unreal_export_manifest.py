@@ -3,6 +3,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -31,7 +32,7 @@ from witcher3_tools.unreal_export.plugin_install import (
     install_or_update_plugin,
     plugin_target_dir,
 )
-from witcher3_tools.unreal_export.socket_client import encode_message, import_bundle_request
+from witcher3_tools.unreal_export.socket_client import encode_message, import_bundle_request, send_import_request
 
 for _name in [n for n in list(sys.modules) if n == "witcher3_tools" or n.startswith("witcher3_tools.")]:
     sys.modules.pop(_name, None)
@@ -1137,6 +1138,81 @@ class TestSocketClient(unittest.TestCase):
         decoded = json.loads(body.decode("utf-8"))
         self.assertEqual(decoded["command"], "import_bundle")
         self.assertEqual(decoded["schema"], SCHEMA)
+
+    def test_send_import_request_reports_response_lost_after_request_is_sent(self):
+        sent_payloads = []
+        aborted = OSError("An established connection was aborted by the software in your host machine")
+        aborted.winerror = 10053
+
+        class FakeConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def setsockopt(self, *args):
+                pass
+
+            def ioctl(self, *args):
+                pass
+
+            def sendall(self, payload):
+                sent_payloads.append(payload)
+
+            def recv(self, size):
+                raise aborted
+
+        socket_module = send_import_request.__globals__["socket"]
+        with mock.patch.object(socket_module, "create_connection", return_value=FakeConnection()):
+            response = send_import_request(
+                "127.0.0.1",
+                40777,
+                r"F:\bundle\witcher_unreal_export.json",
+                timeout=1.0,
+            )
+
+        self.assertTrue(sent_payloads)
+        self.assertTrue(response["success"])
+        self.assertTrue(response["response_lost"])
+        self.assertTrue(response["request_sent"])
+        self.assertIn("lost the socket", response["warning"])
+
+    def test_send_import_request_raises_when_request_was_not_sent(self):
+        aborted = OSError("An established connection was aborted by the software in your host machine")
+        aborted.winerror = 10053
+
+        class FakeConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def settimeout(self, timeout):
+                pass
+
+            def setsockopt(self, *args):
+                pass
+
+            def ioctl(self, *args):
+                pass
+
+            def sendall(self, payload):
+                raise aborted
+
+        socket_module = send_import_request.__globals__["socket"]
+        with mock.patch.object(socket_module, "create_connection", return_value=FakeConnection()):
+            with self.assertRaises(OSError):
+                send_import_request(
+                    "127.0.0.1",
+                    40777,
+                    r"F:\bundle\witcher_unreal_export.json",
+                    timeout=1.0,
+                )
 
 
 class TestPluginInstall(unittest.TestCase):

@@ -42,7 +42,7 @@ public:
     {
         Categories.Add({
             WitcherPlacementTags::Mesh(),
-            LOCTEXT("RegularMeshes", "Regular Meshes"),
+            LOCTEXT("RegularMeshes", "Mesh"),
             LOCTEXT("RegularMeshesTip", "Mesh placements excluding RED engine-hidden and default-hidden groups"),
             0, 0, 0, true, true, true, true
         });
@@ -71,6 +71,16 @@ public:
             0, 0, 0, false, false, false, false
         });
         RefreshState(/*bSyncSettings=*/true);
+
+        // Imports spawn actors after this panel is built
+        RegisterActiveTimer(
+            1.0f,
+            FWidgetActiveTimerDelegate::CreateLambda(
+                [this](double, float) -> EActiveTimerReturnType
+                {
+                    RefreshState(/*bSyncSettings=*/false);
+                    return EActiveTimerReturnType::Continue;
+                }));
 
         ChildSlot
         [

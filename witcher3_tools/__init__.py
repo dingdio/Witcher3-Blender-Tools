@@ -3540,6 +3540,36 @@ class WITCHER_OT_apply_terrain_material_values(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _collection_visible_on_start_get(collection):
+    try:
+        value = collection.get("witcher_visible_on_start", True)
+    except Exception:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
+
+
+def _collection_visible_on_start_set(collection, value):
+    try:
+        collection["witcher_visible_on_start"] = bool(value)
+    except Exception:
+        return
+    try:
+        ui_map.invalidate_layer_visibility_cache()
+    except Exception:
+        pass
+    try:
+        context = bpy.context
+        scene_settings = getattr(context.scene, "witcher_file_browser", None)
+        hide = bool(getattr(scene_settings, "terrain_layer_hide_default_hidden", False))
+        solo = bool(getattr(scene_settings, "terrain_layer_solo_default_hidden", False))
+        if hide or solo:
+            ui_map.apply_default_hidden_layer_groups(context, hide, solo)
+    except Exception:
+        pass
+
+
 class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
     bl_label = "Terrain"
     bl_options = {'DEFAULT_CLOSED'}
@@ -3598,6 +3628,8 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
 
                 if group_type:
                     col.prop(coll, '["group_type"]', text="group_type")
+                if group_type == "LayerGroup":
+                    col.prop(coll, "witcher_visible_on_start", text="isVisibleOnStart", toggle=True)
                 if world_path:
                     col.prop(coll, '["world_path"]', text="world_path")
                 if level_path:
@@ -3613,8 +3645,16 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                     col_load.operator("witcher.w2l_collection_details", text="Details", icon='INFO')
                     if has_level_button:
                         col_load.operator("witcher.load_layer", text="Load This Layer", icon='CUBE')
+                        col_load.operator(
+                            "witcher.send_unreal_layer_collection",
+                            text="Send Layer to Unreal", icon='URL',
+                        ).action = "SEND"
                     if has_group_button:
                         col_load.operator("witcher.load_layer_group", text="Load This LayerGroup", icon='OUTLINER_COLLECTION')
+                        col_load.operator(
+                            "witcher.send_unreal_layer_group_collection",
+                            text="Send LayerGroup to Unreal", icon='URL',
+                        ).action = "SEND"
             else:
                 col.label(text="No active collection", icon='INFO')
 
@@ -4483,6 +4523,13 @@ def register():
         items=WITCHER_TOOLS_TABS,
         default='TOOLS'
     )
+    bpy.types.Collection.witcher_visible_on_start = BoolProperty(
+        name="isVisibleOnStart",
+        description="Whether this RED layer group is visible when the world starts",
+        default=True,
+        get=_collection_visible_on_start_get,
+        set=_collection_visible_on_start_set,
+    )
     armature_context.register()
     for cls in _classes:
         register_class(cls)
@@ -4575,6 +4622,8 @@ def unregister():
     bpy.utils.unregister_class(WITCHER_OT_cache_info)
     bpy.utils.unregister_class(Witcher3AddonPrefs)
     del bpy.types.Scene.witcher_tools_tab
+    if hasattr(bpy.types.Collection, "witcher_visible_on_start"):
+        del bpy.types.Collection.witcher_visible_on_start
     armature_context.unregister()
     for cls in _classes:
         unregister_class(cls)

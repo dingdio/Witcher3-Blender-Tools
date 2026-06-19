@@ -90,6 +90,158 @@ def block_world_matrix(position, rotation_rows) -> np.ndarray:
     return m
 
 
+def _real(transform, name, default=0.0) -> float:
+    if transform is None:
+        return float(default)
+    value = transform.get(name, default) if isinstance(transform, dict) else getattr(transform, name, default)
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _engine_transform_local_matrix(transform) -> np.ndarray:
+    """Build a 4x4 from a normalized engine-transform dict, matching the Blender
+    importer (`_engine_transform_to_local_matrix`): YXZ Euler, then scale."""
+    from mathutils import Euler, Matrix
+
+    yaw = _real(transform, "Yaw")
+    pitch = _real(transform, "Pitch")
+    roll = _real(transform, "Roll")
+    if yaw == 0.0 and pitch == 0.0 and roll == 0.0:
+        mat = Matrix.Identity(4)
+    else:
+        mat = Euler((np.radians(yaw), np.radians(pitch), np.radians(roll)), "YXZ").to_matrix().to_4x4()
+    mat.translation = (_real(transform, "X"), _real(transform, "Y"), _real(transform, "Z"))
+    mat = mat @ Matrix.Diagonal((
+        _real(transform, "Scale_x", 1.0),
+        _real(transform, "Scale_y", 1.0),
+        _real(transform, "Scale_z", 1.0),
+        1.0,
+    ))
+    return np.asarray(mat, dtype=float)
+
+
+def _plan_item_local_matrix(item) -> np.ndarray:
+    transform = item.get("transform")
+    if transform:
+        return _engine_transform_local_matrix(transform)
+    rows = item.get("matrix")
+    translation = item.get("translation")
+    if rows:
+        return block_world_matrix(translation or (0.0, 0.0, 0.0), rows)
+    m = np.identity(4, dtype=float)
+    if translation:
+        try:
+            m[0, 3], m[1, 3], m[2, 3] = float(translation[0]), float(translation[1]), float(translation[2])
+        except Exception:
+            pass
+    return m
+
+
+_ENTITY_ROOT_KINDS = {"entity", "entity_empty"}
+_ENTITY_MESH_KINDS = {"component_mesh", "mesh"}
+
+
+def collect_entity_placements(level, context, warnings, assets, entities, skipped, *, include_proxy=False):
+    """Walk the level's placed entities via the headless import planner and emit
+    ONE grouped entity per top-level CEntity/CGameplayEntity"""
+    def _skip(reason):
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    try:
+        from ..importers import import_blender_fun
+    except Exception:
+        return
+
+    try:
+        plan = import_blender_fun.resolve_level_import_plan(
+            level,
+            context,
+            do_import_Mesh=False,
+            do_import_Collision=False,
+            do_import_RigidBody=False,
+            do_import_PointLight=False,
+            do_import_SpotLight=False,
+            do_import_Entity=True,
+            do_import_ProxyMesh=bool(include_proxy),
+        )
+    except Exception as exc:
+        warnings.append(f"entity placement planning failed: {exc}")
+        log.warning("Entity placement planning failed", exc_info=True)
+        return
+
+    items = plan.get("items", []) or []
+    children: dict[str, list] = {}
+    for item in items:
+        children.setdefault(str(item.get("parent_id", "") or ""), []).append(item)
+
+    identity = np.identity(4, dtype=float)
+
+    def gather_components(item, rel, out):
+        # rel = transform of this item relative to the owning entity root.
+        if str(item.get("kind", "")) in _ENTITY_MESH_KINDS:
+            comp = _entity_component(item, rel, assets, warnings, _skip, include_proxy)
+            if comp is not None:
+                out.append(comp)
+        for child in children.get(str(item.get("id", "") or ""), []):
+            gather_components(child, rel @ _plan_item_local_matrix(child), out)
+
+    for root in items:
+        if str(root.get("kind", "")) not in _ENTITY_ROOT_KINDS or str(root.get("parent_id", "") or ""):
+            continue
+        entity_world = _plan_item_local_matrix(root)
+        components: list[dict[str, Any]] = []
+        for child in children.get(str(root.get("id", "") or ""), []):
+            gather_components(child, _plan_item_local_matrix(child), components)
+        if not components:
+            continue
+        if not terrain_unreal.world_matrix_has_valid_basis(entity_world):
+            entity_world = identity
+        entities.append({
+            "name": str(root.get("name", "") or "Entity"),
+            "matrix": entity_world,
+            "components": components,
+        })
+
+
+def _entity_component(item, rel, assets, warnings, skip, include_proxy):
+    depot = str(item.get("repo_path", "") or "").strip()
+    if not depot:
+        skip("entity_empty_depot")
+        return None
+    if is_volume_depot(depot):
+        skip("entity_volume")
+        return None
+    if not include_proxy and (bool(item.get("is_proxy_mesh")) or is_proxy_depot(depot)):
+        skip("entity_proxy")
+        return None
+    if not terrain_unreal.world_matrix_has_valid_basis(rel):
+        skip("entity_degenerate_transform")
+        return None
+
+    embedded_index = item.get("embedded_cmesh_chunk_index")
+    base_asset_rel = depot_asset_rel(depot)
+    if not base_asset_rel:
+        warnings.append(f"{depot}: could not derive an Unreal asset path; entity component skipped.")
+        return None
+    asset_rel = base_asset_rel if embedded_index is None else f"{base_asset_rel}_c{int(embedded_index)}"
+    assets.setdefault(asset_rel, {
+        "depot": depot,
+        "kind": "mesh",
+        "base_asset_rel": base_asset_rel,
+        "embedded_cmesh_chunk_index": (None if embedded_index is None else int(embedded_index)),
+        "cr2w_version": item.get("cr2w_version"),
+    })
+    return {
+        "name": str(item.get("component_name", "") or item.get("name", "") or "Mesh"),
+        "type": str(item.get("component_type", "") or "CStaticMeshComponent"),
+        "asset_rel": asset_rel,
+        "rel_matrix": rel,
+        "engine_hidden": item.get("engine_visible") is False,
+    }
+
+
 def _color_rgb(color) -> list[float]:
     try:
         return [
@@ -183,10 +335,12 @@ def collect_w2l_placements(
     level,
     warnings: list[str],
     *,
+    context=None,
     instancer_threshold: int = DEFAULT_INSTANCER_THRESHOLD,
     include_collision_blocks: bool = False,
     include_point_lights: bool = True,
     include_spot_lights: bool = True,
+    include_entities: bool = True,
 ) -> dict[str, Any]:
     from ..CR2W.CR2W_helpers import Enums
 
@@ -199,14 +353,11 @@ def collect_w2l_placements(
     def _skip(reason: str) -> None:
         skipped[reason] = skipped.get(reason, 0) + 1
 
-    if not sector or not getattr(sector, "BlockData", None):
-        return {"assets": assets, "actors": [], "instancers": [], "lights": lights, "skipped": skipped}
-
     resources = getattr(sector, "Resources", None) or []
     mesh_types = {Enums.BlockDataObjectType.Mesh, Enums.BlockDataObjectType.RigidBody}
     collision_type = Enums.BlockDataObjectType.Collision
 
-    for block in sector.BlockData:
+    for block in (getattr(sector, "BlockData", None) or []):
         block_type = getattr(block, "packedObjectType", None)
         is_collision = block_type == collision_type
         if block_type == Enums.BlockDataObjectType.PointLight:
@@ -283,6 +434,8 @@ def collect_w2l_placements(
             "depot": entry["depot"],
             "kind": entry.get("kind", "mesh"),
             "base_asset_rel": entry.get("base_asset_rel") or asset_rel,
+            "embedded_cmesh_chunk_index": entry.get("embedded_cmesh_chunk_index"),
+            "cr2w_version": entry.get("cr2w_version"),
         }
         stem = asset_rel.rsplit("/", 1)[-1]
         group_stem = f"{stem}_EngineHidden" if engine_hidden else stem
@@ -304,7 +457,18 @@ def collect_w2l_placements(
                     actor["engine_hidden"] = True
                 actors.append(actor)
 
-    return {"assets": assets, "actors": actors, "instancers": instancers, "lights": lights, "skipped": skipped}
+    entities: list[dict[str, Any]] = []
+    if include_entities:
+        collect_entity_placements(level, context, warnings, assets, entities, skipped)
+
+    return {
+        "assets": assets,
+        "actors": actors,
+        "instancers": instancers,
+        "lights": lights,
+        "entities": entities,
+        "skipped": skipped,
+    }
 
 
 def _resolve_w2l_abspath(w2l_path: str) -> str:
@@ -391,6 +555,7 @@ def _gather_layer_assets(
             warnings.append(f"{depot}: source .w2mesh not found on disk; placement skipped.")
             failed_assets.add(asset_rel)
             continue
+        embedded_index = entry.get("embedded_cmesh_chunk_index")
         buffer_path = _unique_buffer_path(bundle_root, asset_rel, used_stems)
         _g0 = time.perf_counter()
         slot_infos: list[dict[str, Any]] = []
@@ -398,7 +563,12 @@ def _gather_layer_assets(
             pass
         else:
             try:
-                mesh, slot_infos = gather_placement_mesh(source, version=None, warnings=warnings)
+                mesh, slot_infos = gather_placement_mesh(
+                    source,
+                    version=entry.get("cr2w_version"),
+                    warnings=warnings,
+                    embedded_cmesh_chunk_index=embedded_index,
+                )
             except Exception as exc:
                 warnings.append(f"{depot}: mesh gather failed ({exc}); placement skipped.")
                 log.warning("Placement gather failed for %s", depot, exc_info=True)
@@ -524,7 +694,36 @@ def _layer_placement_group(layer_id, label, folder, collected, gathered_assets, 
             light_entry["default_hidden"] = True
         lights_out.append(light_entry)
 
-    if not actors_out and not instancers_out and not lights_out:
+    entities_out: list[dict[str, Any]] = []
+    for entity in collected.get("entities", []) or []:
+        comps_out = []
+        for comp in entity.get("components", []):
+            if comp["asset_rel"] not in gathered_assets:
+                continue
+            comp_entry = {
+                "name": comp.get("name", "Mesh"),
+                "type": comp.get("type", "CStaticMeshComponent"),
+                "asset_path": comp["asset_rel"],
+                "transform": terrain_unreal.w3_matrix_to_unreal(comp["rel_matrix"]),
+            }
+            if comp.get("engine_hidden"):
+                comp_entry["engine_hidden"] = True
+            collision_asset_path = collision_asset_paths.get(comp["asset_rel"])
+            if collision_asset_path:
+                comp_entry["collision_asset_path"] = collision_asset_path
+            comps_out.append(comp_entry)
+        if not comps_out:
+            continue
+        entity_entry = {
+            "name": entity.get("name", "Entity"),
+            "transform": terrain_unreal.w3_matrix_to_unreal(entity["matrix"]),
+            "components": comps_out,
+        }
+        if default_hidden:
+            entity_entry["default_hidden"] = True
+        entities_out.append(entity_entry)
+
+    if not actors_out and not instancers_out and not lights_out and not entities_out:
         return None
     return {
         "layer_id": layer_id,
@@ -533,6 +732,7 @@ def _layer_placement_group(layer_id, label, folder, collected, gathered_assets, 
         "actors": actors_out,
         "instancers": instancers_out,
         "lights": lights_out,
+        "entities": entities_out,
     }
 
 
@@ -547,6 +747,7 @@ def _build_unreal_w2l_bundle_core(
     default_hidden_paths=None,
 ) -> dict[str, Any]:
     from ..CR2W.CR2W_reader import load_w2l
+    from ..CR2W.common_blender import redkit_repo_context
 
     def _norm_abs(path):
         return os.path.normcase(os.path.normpath(str(path or "")))
@@ -615,47 +816,53 @@ def _build_unreal_w2l_bundle_core(
         abs_w2l = _resolve_w2l_abspath(raw_path)
         layer_id = _layer_id_for_w2l(abs_w2l)
         label, folder = _layer_label_and_folder(layer_id)
-        _parse0 = time.perf_counter()
-        level = load_w2l(abs_w2l)
-        collected = collect_w2l_placements(
-            level,
-            warnings,
-            include_collision_blocks=include_collision_blocks,
-            include_point_lights=include_point_lights,
-            include_spot_lights=include_spot_lights,
-        )
-        phase["parse"] += time.perf_counter() - _parse0
-        for reason, count in (collected.get("skipped") or {}).items():
-            skipped_totals[reason] = skipped_totals.get(reason, 0) + int(count or 0)
-        if not collected["assets"] and not collected.get("lights"):
-            continue
-        _ensure_bundle(level)
-        if collected["assets"]:
-            _gather_layer_assets(
-                collected,
+        # Resolve placed meshes/entities against the REDkit uncooked depot first
+        # (same dual-depot lookup the normal .w2l import uses) so we read the
+        # uncooked .w2mesh -- which carries embedded CCollisionMesh -- instead of
+        # the cooked uncook copy.
+        with redkit_repo_context(abs_w2l):
+            _parse0 = time.perf_counter()
+            level = load_w2l(abs_w2l)
+            collected = collect_w2l_placements(
+                level,
+                warnings,
                 context=context,
-                bundle_root=bundle_state["bundle_root"],
-                registry=bundle_state["registry"],
-                chain=bundle_state["chain"],
-                used_stems=bundle_state["used_stems"],
-                used_fbx_stems=bundle_state["used_fbx_stems"],
-                gathered_assets=bundle_state["gathered_assets"],
-                failed_assets=bundle_state["failed_assets"],
-                collision_asset_paths=bundle_state["collision_asset_paths"],
-                mesh_entries=bundle_state["mesh_entries"],
-                warnings=warnings,
-                phase=phase,
-                skip_materials=skip_materials,
-                export_visual_collision=export_visual_collision,
-                reuse_existing_collision_fbx=bundle_state["reuse_existing_collision_fbx"],
+                include_collision_blocks=include_collision_blocks,
+                include_point_lights=include_point_lights,
+                include_spot_lights=include_spot_lights,
             )
-        parsed.append({
-            "layer_id": layer_id,
-            "label": label,
-            "folder": folder,
-            "collected": collected,
-            "default_hidden": _norm_abs(abs_w2l) in default_hidden_set,
-        })
+            phase["parse"] += time.perf_counter() - _parse0
+            for reason, count in (collected.get("skipped") or {}).items():
+                skipped_totals[reason] = skipped_totals.get(reason, 0) + int(count or 0)
+            if not collected["assets"] and not collected.get("lights"):
+                continue
+            _ensure_bundle(level)
+            if collected["assets"]:
+                _gather_layer_assets(
+                    collected,
+                    context=context,
+                    bundle_root=bundle_state["bundle_root"],
+                    registry=bundle_state["registry"],
+                    chain=bundle_state["chain"],
+                    used_stems=bundle_state["used_stems"],
+                    used_fbx_stems=bundle_state["used_fbx_stems"],
+                    gathered_assets=bundle_state["gathered_assets"],
+                    failed_assets=bundle_state["failed_assets"],
+                    collision_asset_paths=bundle_state["collision_asset_paths"],
+                    mesh_entries=bundle_state["mesh_entries"],
+                    warnings=warnings,
+                    phase=phase,
+                    skip_materials=skip_materials,
+                    export_visual_collision=export_visual_collision,
+                    reuse_existing_collision_fbx=bundle_state["reuse_existing_collision_fbx"],
+                )
+            parsed.append({
+                "layer_id": layer_id,
+                "label": label,
+                "folder": folder,
+                "collected": collected,
+                "default_hidden": _norm_abs(abs_w2l) in default_hidden_set,
+            })
 
     if not bundle_state:
         labels = ", ".join(sorted({_layer_label_and_folder(_layer_id_for_w2l(_resolve_w2l_abspath(p)))[0] for p in w2l_paths}))
@@ -716,6 +923,8 @@ def _build_unreal_w2l_bundle_core(
     total_instancers = sum(len(g["instancers"]) for g in layers_out)
     total_instances = sum(len(i["instances"]) for g in layers_out for i in g["instancers"])
     total_lights = sum(len(g["lights"]) for g in layers_out)
+    total_entities = sum(len(g.get("entities", [])) for g in layers_out)
+    total_entity_components = sum(len(e.get("components", [])) for g in layers_out for e in g.get("entities", []))
 
     return {
         "asset_name": bundle_state["asset_name"],
@@ -730,6 +939,8 @@ def _build_unreal_w2l_bundle_core(
             "instancers": total_instancers,
             "instances": total_instances,
             "lights": total_lights,
+            "entities": total_entities,
+            "entity_components": total_entity_components,
             "materials": len(materials),
             "textures": len(texture_entries),
             "layers": len(w2l_paths),

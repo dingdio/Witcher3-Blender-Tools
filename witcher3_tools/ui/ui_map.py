@@ -4635,9 +4635,18 @@ def _iter_layer_groups(root_collection):
 
 def _default_hidden_group_cache_signature(root_collection):
     group_count = 0
-    for _coll in _iter_layer_groups(root_collection):
+    visible_flags = []
+    for coll in _iter_layer_groups(root_collection):
         group_count += 1
-    return (group_count, str(getattr(root_collection, "name_full", "") or getattr(root_collection, "name", "")))
+        visible_flags.append((
+            str(getattr(coll, "name_full", "") or getattr(coll, "name", "")),
+            int(coll.get("witcher_visible_on_start", 1)),
+        ))
+    return (
+        group_count,
+        str(getattr(root_collection, "name_full", "") or getattr(root_collection, "name", "")),
+        tuple(visible_flags),
+    )
 
 
 def _get_default_hidden_group_cache(root_collection):
@@ -4899,6 +4908,58 @@ def select_nearby_w2l_paths(
     }
 
 
+def collect_collection_w2l_send_selection(context, coll):
+    """Resolve .w2l paths for a layer collection. A LayerGroup recurses into every
+    LayerInfo beneath it; a LayerInfo resolves itself. Returns the same dict shape
+    that select_nearby_w2l_paths uses so the Unreal send path can be shared."""
+    if coll is None:
+        raise ValueError("No active collection.")
+    root_collection = _find_world_root_collection_for_collection(coll)
+    default_hidden_level_paths = _default_hidden_level_paths(root_collection)
+
+    layers = []
+
+    def visit(node):
+        gtype = str(node.get("group_type", "") or "").strip()
+        if gtype == "LayerInfo":
+            layers.append(node)
+        elif gtype == "LayerGroup":
+            for child in getattr(node, "children", []) or []:
+                visit(child)
+
+    if str(coll.get("group_type", "") or "").strip() == "LayerGroup":
+        visit(coll)
+    elif collection_w2layer_path(coll):
+        layers.append(coll)
+
+    paths = []
+    unresolved = []
+    default_hidden_paths = []
+    seen = set()
+    for layer in layers:
+        level_path = ensure_collection_w2layer_path(layer)
+        if not level_path:
+            continue
+        resolved = _resolve_level_file(context, level_path, root_collection)
+        if not resolved or not os.path.isfile(resolved):
+            unresolved.append(level_path)
+            continue
+        key = os.path.normcase(os.path.normpath(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(resolved)
+        if _normalize_level_path(level_path) in default_hidden_level_paths:
+            default_hidden_paths.append(resolved)
+
+    return {
+        "paths": paths,
+        "unresolved": unresolved,
+        "default_hidden_paths": default_hidden_paths,
+        "root_collection_name": getattr(root_collection, "name", "") if root_collection else "",
+    }
+
+
 _nearby_scan_label = "Scan Cache Nearby: click Scan to update"
 
 
@@ -5120,7 +5181,7 @@ def _w2l_collection_details_text(context, collection, resolved_path=""):
         lines.append(f"layerBuildTag: {layer_build_tag}")
     if group_type == "LayerGroup":
         lines.append(f"child_layers: {_count_layer_info_children(collection)}")
-        lines.append(f"visible_on_start: {int(collection.get('witcher_visible_on_start', 1) or 0)}")
+        lines.append(f"isVisibleOnStart: {int(collection.get('witcher_visible_on_start', 1) or 0)}")
     state = str(collection.get("witcher_layer_import_state", "") or "").strip()
     if state:
         lines.append(f"import_state: {state}")

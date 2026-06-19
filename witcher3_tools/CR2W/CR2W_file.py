@@ -1,4 +1,5 @@
 import logging
+import csv
 import os
 import math
 from pathlib import Path
@@ -295,7 +296,63 @@ def _build_world_groups_from_disk(world_name, file_path):
         for name in w2ls:
             depot = os.path.normpath(os.path.join(dirpath, name))
             group.ChildrenInfos.append(CLayerInfo(os.path.splitext(name)[0], depot, None))
+    _apply_disk_layer_group_visibility(root, _read_disk_default_hidden_layer_groups(file_path, world_name))
     return root
+
+
+def _normalize_disk_layer_group_path(path, world_name=""):
+    text = str(path or "").strip().strip('"').replace("/", "\\")
+    parts = tuple(part.strip() for part in text.split("\\") if part.strip())
+    if not parts:
+        return ()
+    aliases = {"world"}
+    if world_name:
+        aliases.add(str(world_name).strip().lower())
+    if parts[0].lower() in aliases:
+        parts = parts[1:]
+    return parts
+
+
+def _read_disk_default_hidden_layer_groups(file_path, world_name=""):
+    # REDkit source worlds keep default-hidden LayerGroup paths in a
+    # sibling <world>_lg.csv instead of embedding CLayerGroup chunks.
+    if not file_path:
+        return set()
+    level_dir = os.path.dirname(os.path.abspath(file_path))
+    world_stem = os.path.splitext(os.path.basename(file_path))[0]
+    csv_path = os.path.join(level_dir, f"{world_stem}_lg.csv")
+    if not os.path.isfile(csv_path):
+        return set()
+
+    hidden = set()
+    try:
+        with open(csv_path, newline="", encoding="utf-8-sig") as handle:
+            reader = csv.reader(handle)
+            for row_index, row in enumerate(reader):
+                if not row:
+                    continue
+                value = str(row[0] or "").strip()
+                if row_index == 0 and value.lower() == "layergrouppath":
+                    continue
+                parts = _normalize_disk_layer_group_path(value, world_name)
+                if parts:
+                    hidden.add(tuple(part.lower() for part in parts))
+    except Exception:
+        log.warning("Could not read REDkit layer group visibility CSV: %s", csv_path, exc_info=True)
+    return hidden
+
+
+def _apply_disk_layer_group_visibility(root_group, default_hidden_paths):
+    if root_group is None or not default_hidden_paths:
+        return
+
+    def visit(group, parts):
+        if tuple(part.lower() for part in parts) in default_hidden_paths:
+            group.isVisibleOnStart = False
+        for child in getattr(group, "ChildrenGroups", []) or []:
+            visit(child, parts + (child.name,))
+
+    visit(root_group, ())
 
 
 def create_world(file, file_path=None):
