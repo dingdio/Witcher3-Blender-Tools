@@ -66,6 +66,7 @@
 #include "Factories/FbxImportUI.h"
 #include "Factories/FbxSkeletalMeshImportData.h"
 #include "Factories/FbxStaticMeshImportData.h"
+#include "Factories/Factory.h"
 #include "Factories/MaterialFactoryNew.h"
 #include "Factories/TextureFactory.h"
 #include "FileHelpers.h"
@@ -84,9 +85,13 @@
 #include "Materials/MaterialInterface.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Modules/ModuleManager.h"
 #include "PhysicsEngine/BodySetup.h"
+#include "PhysicsEngine/SphylElem.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "UObject/UnrealType.h"
+#include "UObject/UObjectIterator.h"
 #include "WitcherImportedActor.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogWitcherImportContext, Log, All);
@@ -130,6 +135,231 @@ double JsonNumber(const TSharedPtr<FJsonObject>& Object, const FString& Field, d
         return DefaultValue;
     }
     return Object->HasTypedField<EJson::Number>(Field) ? Object->GetNumberField(Field) : DefaultValue;
+}
+
+bool EnsureSpeedTreeImporterModule()
+{
+    return FModuleManager::Get().LoadModule(FName(TEXT("SpeedTreeImporter"))) != nullptr;
+}
+
+void SetImportBool(UObject* Object, const TCHAR* PropertyName, bool bValue)
+{
+    if (!Object)
+    {
+        return;
+    }
+    if (FBoolProperty* Property = FindFProperty<FBoolProperty>(Object->GetClass(), FName(PropertyName)))
+    {
+        Property->SetPropertyValue_InContainer(Object, bValue);
+    }
+}
+
+void SetImportByte(UObject* Object, const TCHAR* PropertyName, uint8 Value)
+{
+    if (!Object)
+    {
+        return;
+    }
+    if (FByteProperty* Property = FindFProperty<FByteProperty>(Object->GetClass(), FName(PropertyName)))
+    {
+        Property->SetPropertyValue_InContainer(Object, Value);
+        return;
+    }
+    if (FEnumProperty* EnumProperty = FindFProperty<FEnumProperty>(Object->GetClass(), FName(PropertyName)))
+    {
+        EnumProperty->GetUnderlyingProperty()->SetIntPropertyValue(
+            EnumProperty->ContainerPtrToValuePtr<void>(Object),
+            static_cast<int64>(Value));
+    }
+}
+
+UFactory* CreateSpeedTreeImportFactory()
+{
+    if (!EnsureSpeedTreeImporterModule())
+    {
+        return nullptr;
+    }
+    UClass* FactoryClass = LoadClass<UFactory>(nullptr, TEXT("/Script/SpeedTreeImporter.SpeedTreeImportFactory"));
+    return FactoryClass ? NewObject<UFactory>(GetTransientPackage(), FactoryClass) : nullptr;
+}
+
+UObject* CreateSpeedTreeImportOptions(const TSharedPtr<FJsonObject>& SpeedTreeEntry)
+{
+    if (!EnsureSpeedTreeImporterModule())
+    {
+        return nullptr;
+    }
+    UClass* ImportDataClass = LoadClass<UObject>(nullptr, TEXT("/Script/SpeedTreeImporter.SpeedTreeImportData"));
+    if (!ImportDataClass)
+    {
+        return nullptr;
+    }
+
+    UObject* Options = NewObject<UObject>(GetTransientPackage(), ImportDataClass);
+    Options->LoadConfig();
+
+    TSharedPtr<FJsonObject> ImportOptionsObject;
+    const TSharedPtr<FJsonObject>* ImportOptions = nullptr;
+    if (SpeedTreeEntry.IsValid() && SpeedTreeEntry->TryGetObjectField(TEXT("import_options"), ImportOptions) && ImportOptions)
+    {
+        ImportOptionsObject = *ImportOptions;
+    }
+
+    // Mirrors SpeedTreeImportData.h enum values without linking against the non-exported importer classes.
+    SetImportByte(Options, TEXT("ImportGeometryType"), 0); // IGT_3D
+    SetImportByte(Options, TEXT("LODType"), 0); // ILT_PaintedFoliage
+    SetImportBool(Options, TEXT("IncludeCollision"), JsonBool(ImportOptionsObject, TEXT("include_collision"), true));
+    SetImportBool(Options, TEXT("MakeMaterialsCheck"), JsonBool(ImportOptionsObject, TEXT("create_materials"), true));
+    SetImportBool(Options, TEXT("IncludeNormalMapCheck"), JsonBool(ImportOptionsObject, TEXT("include_normal_maps"), true));
+    SetImportBool(Options, TEXT("IncludeDetailMapCheck"), JsonBool(ImportOptionsObject, TEXT("include_detail_maps"), true));
+    SetImportBool(Options, TEXT("IncludeSpecularMapCheck"), JsonBool(ImportOptionsObject, TEXT("include_specular_maps"), true));
+    SetImportBool(Options, TEXT("IncludeBranchSeamSmoothing"), JsonBool(ImportOptionsObject, TEXT("include_branch_seams"), true));
+    SetImportBool(Options, TEXT("IncludeSpeedTreeAO"), JsonBool(ImportOptionsObject, TEXT("include_speedtree_ao"), true));
+    SetImportBool(Options, TEXT("IncludeColorAdjustment"), JsonBool(ImportOptionsObject, TEXT("include_color_variation"), true));
+    SetImportBool(Options, TEXT("IncludeSubsurface"), JsonBool(ImportOptionsObject, TEXT("include_subsurface"), true));
+    SetImportBool(Options, TEXT("IncludeVertexProcessingCheck"), JsonBool(ImportOptionsObject, TEXT("include_vertex_processing"), true));
+    SetImportBool(Options, TEXT("IncludeWindCheck"), JsonBool(ImportOptionsObject, TEXT("include_wind"), true));
+    SetImportBool(Options, TEXT("IncludeSmoothLODCheck"), JsonBool(ImportOptionsObject, TEXT("include_smooth_lod"), true));
+    return Options;
+}
+
+void ConfigureSpeedTreeLods(UStaticMesh* Mesh, const TSharedPtr<FJsonObject>& SpeedTreeEntry)
+{
+    if (!Mesh)
+    {
+        return;
+    }
+
+    TArray<double> ConfiguredScreenSizes;
+    const TSharedPtr<FJsonObject>* ImportOptions = nullptr;
+    const TArray<TSharedPtr<FJsonValue>>* ScreenSizeValues = nullptr;
+    if (SpeedTreeEntry.IsValid()
+        && SpeedTreeEntry->TryGetObjectField(TEXT("import_options"), ImportOptions)
+        && ImportOptions
+        && (*ImportOptions)->TryGetArrayField(TEXT("lod_screen_sizes"), ScreenSizeValues)
+        && ScreenSizeValues)
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *ScreenSizeValues)
+        {
+            const double ScreenSize = Value.IsValid() ? Value->AsNumber() : 0.0;
+            if (ScreenSize > 0.0)
+            {
+                ConfiguredScreenSizes.Add(ScreenSize);
+            }
+        }
+    }
+
+    Mesh->SetAutoComputeLODScreenSize(false);
+    Mesh->SetRequiresLODDistanceConversion(false);
+
+    const int32 LODCount = Mesh->GetNumSourceModels();
+    for (int32 LODIndex = 0; LODIndex < LODCount; ++LODIndex)
+    {
+        const double ScreenSize = ConfiguredScreenSizes.IsValidIndex(LODIndex)
+            ? ConfiguredScreenSizes[LODIndex]
+            : FMath::Max(0.0025, 0.04 / FMath::Pow(2.0, FMath::Max(0, LODIndex - 1)));
+        Mesh->GetSourceModel(LODIndex).ScreenSize.Default = static_cast<float>(ScreenSize);
+    }
+    Mesh->MarkPackageDirty();
+}
+
+bool HasSimpleCollision(const UStaticMesh* Mesh)
+{
+    const UBodySetup* BodySetup = Mesh ? Mesh->GetBodySetup() : nullptr;
+    return BodySetup && BodySetup->AggGeom.GetElementCount() > 0;
+}
+
+bool PackageIsAtOrUnder(const FString& PackageName, const FString& PackagePath)
+{
+    const FString Prefix = PackagePath.EndsWith(TEXT("/")) ? PackagePath : PackagePath + TEXT("/");
+    return PackageName == PackagePath || PackageName.StartsWith(Prefix);
+}
+
+TSet<FString> DirtyPackageNamesUnder(const FString& PackagePath)
+{
+    TSet<FString> Names;
+    for (TObjectIterator<UPackage> It; It; ++It)
+    {
+        UPackage* Package = *It;
+        if (Package && Package->IsDirty() && PackageIsAtOrUnder(Package->GetName(), PackagePath))
+        {
+            Names.Add(Package->GetName());
+        }
+    }
+    return Names;
+}
+
+void AddNewDirtyPackagesUnder(const FString& PackagePath, const TSet<FString>& PreviousDirtyPackages, TArray<FString>& ImportedAssets)
+{
+    for (TObjectIterator<UPackage> It; It; ++It)
+    {
+        UPackage* Package = *It;
+        if (!Package || !Package->IsDirty() || !PackageIsAtOrUnder(Package->GetName(), PackagePath))
+        {
+            continue;
+        }
+        const FString PackageName = Package->GetName();
+        if (!PreviousDirtyPackages.Contains(PackageName))
+        {
+            ImportedAssets.AddUnique(PackageName);
+        }
+    }
+}
+
+void EnsureSpeedTreeFallbackCollision(UStaticMesh* Mesh, const TSharedPtr<FJsonObject>& SpeedTreeEntry)
+{
+    if (!Mesh || HasSimpleCollision(Mesh))
+    {
+        return;
+    }
+
+    TSharedPtr<FJsonObject> ImportOptionsObject;
+    const TSharedPtr<FJsonObject>* ImportOptions = nullptr;
+    if (SpeedTreeEntry.IsValid() && SpeedTreeEntry->TryGetObjectField(TEXT("import_options"), ImportOptions) && ImportOptions)
+    {
+        ImportOptionsObject = *ImportOptions;
+    }
+    if (!JsonBool(ImportOptionsObject, TEXT("fallback_trunk_collision"), false))
+    {
+        return;
+    }
+
+    const FBox Bounds = Mesh->GetBoundingBox();
+    if (!Bounds.IsValid)
+    {
+        return;
+    }
+
+    const FVector Extent = Bounds.GetExtent();
+    const float Height = Extent.Z * 2.0f;
+    const float RadiusSource = FMath::Min(Extent.X, Extent.Y);
+    if (Height <= 100.0f || RadiusSource <= 1.0f)
+    {
+        return;
+    }
+
+    Mesh->CreateBodySetup();
+    UBodySetup* BodySetup = Mesh->GetBodySetup();
+    if (!BodySetup)
+    {
+        return;
+    }
+
+    const float Radius = FMath::Clamp(RadiusSource * 0.18f, 12.0f, 120.0f);
+    const float CapsuleLength = FMath::Max(1.0f, Height - Radius * 2.0f);
+
+    FKSphylElem SphylElem;
+    SphylElem.Radius = Radius;
+    SphylElem.Length = CapsuleLength;
+    SphylElem.Center = FVector(Bounds.GetCenter().X, Bounds.GetCenter().Y, Bounds.Min.Z + Height * 0.5f);
+    BodySetup->AggGeom.SphylElems.Add(SphylElem);
+    BodySetup->CollisionTraceFlag = CTF_UseDefault;
+    BodySetup->ClearPhysicsMeshes();
+    BodySetup->InvalidatePhysicsData();
+    BodySetup->CreatePhysicsMeshes();
+
+    Mesh->MarkPackageDirty();
+    UE_LOG(LogWitcherImportContext, Display, TEXT("Added fallback trunk collision to SpeedTree '%s'."), *Mesh->GetName());
 }
 
 FString HlslFloatLiteral(float Value)
@@ -817,7 +1047,7 @@ FString FWitcherImportContext::ImportBundle()
     FSlateNotificationManager::Get().SetAllowNotifications(false);
     ON_SCOPE_EXIT { FSlateNotificationManager::Get().SetAllowNotifications(true); };
 
-    FScopedSlowTask SlowTask(10.0f, FText::FromString(TEXT("Importing Witcher bundle")));
+    FScopedSlowTask SlowTask(11.0f, FText::FromString(TEXT("Importing Witcher bundle")));
     SlowTask.MakeDialog(false);
 
     const double BundleStart = FPlatformTime::Seconds();
@@ -836,6 +1066,7 @@ FString FWitcherImportContext::ImportBundle()
     TimePhase(TEXT("materials"), 1.0f, TEXT("Importing material instances"), [&] { ImportMaterials(); });
     TimePhase(TEXT("rig"), 1.0f, TEXT("Importing rig"), [&] { ImportRig(); });
     TimePhase(TEXT("meshes"), 2.0f, TEXT("Importing meshes"), [&] { ImportMeshes(); });
+    TimePhase(TEXT("speedtrees"), 1.0f, TEXT("Importing SpeedTree assets"), [&] { ImportSpeedTrees(); });
     TimePhase(TEXT("animations"), 1.0f, TEXT("Importing animations"), [&] { ImportAnimations(); });
     TimePhase(TEXT("blueprint"), 1.0f, TEXT("Building blueprint"), [&] { ImportBlueprint(); });
     TimePhase(TEXT("terrain"), 0.5f, TEXT("Importing terrain"), [&] { ImportTerrain(); });
@@ -1575,6 +1806,124 @@ void FWitcherImportContext::ImportMeshes()
             continue;
         }
         AssignMaterialsToMesh(Imported, MeshEntry);
+    }
+}
+
+void FWitcherImportContext::ImportSpeedTrees()
+{
+    const TArray<TSharedPtr<FJsonValue>>* SpeedTrees = nullptr;
+    if (!Manifest->TryGetArrayField(TEXT("speedtrees"), SpeedTrees))
+    {
+        return;
+    }
+    for (const TSharedPtr<FJsonValue>& Value : *SpeedTrees)
+    {
+        const TSharedPtr<FJsonObject> SpeedTreeEntry = Value->AsObject();
+        if (!SpeedTreeEntry.IsValid())
+        {
+            continue;
+        }
+
+        const FString AssetRel = JsonString(SpeedTreeEntry, TEXT("asset_path"));
+        if (AssetRel.IsEmpty())
+        {
+            AddWarning(TEXT("SpeedTree entry has no asset_path."));
+            continue;
+        }
+
+        const bool bForceImport = JsonBool(SpeedTreeEntry, TEXT("force_import"), true);
+        if (!bForceImport && !ShouldOverwrite(TEXT("meshes")))
+        {
+            if (UObject* Existing = LoadAnyAsset(AssetRel))
+            {
+                continue;
+            }
+        }
+
+        const FString SourceFile = ResolveBundleFile(JsonString(SpeedTreeEntry, TEXT("file")));
+        if (!FPaths::FileExists(SourceFile))
+        {
+            AddError(FString::Printf(TEXT("SpeedTree .srt file does not exist: %s"), *SourceFile));
+            continue;
+        }
+
+        UFactory* SpeedTreeFactory = CreateSpeedTreeImportFactory();
+        UObject* SpeedTreeOptions = CreateSpeedTreeImportOptions(SpeedTreeEntry);
+        if (!SpeedTreeFactory || !SpeedTreeOptions)
+        {
+            AddError(TEXT("Failed to create Unreal SpeedTree import options. Enable Unreal's SpeedTree importer plugin."));
+            continue;
+        }
+
+        UAssetImportTask* Task = NewObject<UAssetImportTask>();
+        Task->Filename = SourceFile;
+        Task->DestinationPath = PackagePathFor(AssetRel);
+        Task->DestinationName = AssetRelName(AssetRel);
+        Task->Factory = SpeedTreeFactory;
+        Task->Options = SpeedTreeOptions;
+        Task->bAutomated = true;
+        Task->bSave = false;
+        Task->bReplaceExisting = true;
+
+        FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+        TArray<UAssetImportTask*> Tasks;
+        Tasks.Add(Task);
+        const TSet<FString> DirtyPackagesBeforeImport = DirtyPackageNamesUnder(Task->DestinationPath);
+        AssetToolsModule.Get().ImportAssetTasks(Tasks);
+
+        UObject* MainAsset = nullptr;
+        for (const FString& Path : Task->ImportedObjectPaths)
+        {
+            UObject* Imported = StaticLoadObject(UObject::StaticClass(), nullptr, *Path);
+            if (!Imported)
+            {
+                continue;
+            }
+            ImportedAssets.AddUnique(Path);
+            if (Imported->GetPathName() == ObjectPathFor(AssetRel))
+            {
+                MainAsset = Imported;
+            }
+            else if (!MainAsset && Imported->IsA<UStaticMesh>())
+            {
+                MainAsset = Imported;
+            }
+            else if (!MainAsset)
+            {
+                MainAsset = Imported;
+            }
+        }
+
+        if (!MainAsset)
+        {
+            MainAsset = LoadAnyAsset(AssetRel);
+            if (MainAsset)
+            {
+                ImportedAssets.AddUnique(MainAsset->GetPathName());
+            }
+        }
+
+        if (!MainAsset)
+        {
+            AddError(FString::Printf(
+                TEXT("Failed to import SpeedTree .srt '%s'. Enable Unreal's SpeedTree importer plugin and verify the staged textures are beside the .srt."),
+                *SourceFile));
+            continue;
+        }
+
+        if (UStaticMesh* StaticMesh = Cast<UStaticMesh>(MainAsset))
+        {
+            ConfigureSpeedTreeLods(StaticMesh, SpeedTreeEntry);
+            EnsureSpeedTreeFallbackCollision(StaticMesh, SpeedTreeEntry);
+        }
+        AddNewDirtyPackagesUnder(Task->DestinationPath, DirtyPackagesBeforeImport, ImportedAssets);
+
+        if (MainAsset->GetPathName() != ObjectPathFor(AssetRel))
+        {
+            AddWarning(FString::Printf(
+                TEXT("SpeedTree '%s' imported as '%s' instead of the mirrored depot path."),
+                *AssetRel, *MainAsset->GetPathName()));
+        }
     }
 }
 
@@ -3705,6 +4054,14 @@ void FWitcherImportContext::SaveImportedPackages()
     {
         if (AssetPath.StartsWith(ContentRootPrefix))
         {
+            if (UPackage* Package = FindPackage(nullptr, *AssetPath))
+            {
+                if (Package->IsDirty())
+                {
+                    Packages.Add(Package);
+                }
+                continue;
+            }
             ConsiderDirty(StaticLoadObject(UObject::StaticClass(), nullptr, *AssetPath));
         }
     }

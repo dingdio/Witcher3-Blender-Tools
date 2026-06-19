@@ -17,6 +17,7 @@ from . import manifest
 from . import world_bundle
 from . import placements_bundle
 from . import w2l_placements
+from . import speedtree_bundle
 from . import plugin_install
 from . import unreal_project
 from .socket_client import probe_import_server, send_import_request
@@ -75,6 +76,12 @@ def _on_unreal_project_update(self, context):
 
 def _preflight_send_connection(settings) -> str:
     return probe_import_server(settings.host, settings.port, timeout=1.0)
+
+
+def _unreal_collision_enabled(settings, scene_settings=None) -> bool:
+    if hasattr(settings, "placement_export_collision"):
+        return bool(getattr(settings, "placement_export_collision"))
+    return bool(getattr(scene_settings, "terrain_layer_do_import_collision", True))
 
 
 def _cancel_unreachable_unreal(operator, settings, message: str):
@@ -195,8 +202,8 @@ class WITCHER_PG_UnrealExportSettings(bpy.types.PropertyGroup):
     )
     placement_export_collision: BoolProperty(
         name="Collision",
-        default=False,
-        description="Export RED collision meshes as hidden Unreal collision actors. Slower",
+        default=True,
+        description="Export RED collision meshes as hidden Unreal collision actors by default. Slower",
     )
     placement_write_profile_log: BoolProperty(
         name="Profile Log",
@@ -514,6 +521,105 @@ class WITCHER_OT_export_unreal_w2l(bpy.types.Operator):
             return {"CANCELLED"}
 
 
+class WITCHER_OT_export_unreal_srt(bpy.types.Operator):
+    bl_idname = "witcher.export_unreal_srt"
+    bl_label = "Send .srt SpeedTree to Unreal"
+    bl_description = (
+        "Stage a native SpeedTree .srt plus its referenced textures and send it "
+        "to Unreal. Unreal imports the .srt directly"
+    )
+    bl_options = {"REGISTER"}
+
+    srt_path: StringProperty(
+        name=".srt",
+        description="Depot or absolute path to the SpeedTree .srt file",
+        subtype="FILE_PATH",
+        default="",
+    )
+    depot_path: StringProperty(
+        name="Depot Path",
+        description="Repo-relative Witcher path used for the mirrored Unreal asset path",
+        default="",
+    )
+    action: EnumProperty(
+        name="Action",
+        items=[
+            ("BUNDLE", "Export Bundle", "Write the native .srt, textures, and manifest"),
+            ("SEND", "Send to Unreal", "Write the bundle and send it to the running Unreal plugin"),
+        ],
+        default="SEND",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context is not None and context.scene is not None
+
+    def execute(self, context):
+        button_started = time.perf_counter()
+        settings = context.scene.witcher_unreal_export
+        if not settings.export_folder:
+            settings.export_folder = bundle.default_export_folder()
+        if not str(getattr(self, "srt_path", "") or "").strip():
+            settings.last_status = "No .srt selected"
+            settings.last_details = "Select a SpeedTree .srt file before sending to Unreal."
+            self.report({"ERROR"}, settings.last_details)
+            return {"CANCELLED"}
+        if self.action == "SEND":
+            connection_error = _preflight_send_connection(settings)
+            if connection_error:
+                return _cancel_unreachable_unreal(self, settings, connection_error)
+
+        try:
+            with _quiet_send_logging(settings, self.action):
+                result = speedtree_bundle.build_unreal_srt_bundle(
+                    context,
+                    settings,
+                    self.srt_path,
+                    depot_path=self.depot_path,
+                )
+                settings.last_manifest_path = result["manifest_path"]
+                warning_count = len(result["manifest"].get("warnings", []))
+                settings.last_status = f"SpeedTree bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
+                settings.last_details = _format_srt_bundle_details(result)
+
+                if self.action == "SEND":
+                    settings.last_status = "Sending SpeedTree to Unreal"
+                    send_started = time.perf_counter()
+                    response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                    send_seconds = time.perf_counter() - send_started
+                    total_seconds = time.perf_counter() - button_started
+                    success = _ue_import_succeeded(response)
+                    if _ue_response_lost(response):
+                        settings.last_status = "Unreal SpeedTree import sent; response lost"
+                    else:
+                        settings.last_status = "Unreal SpeedTree import complete" if success else "Unreal SpeedTree import failed"
+                    if success:
+                        settings.last_status += _ue_status_suffix(response, result["manifest"].get("warnings", []))
+                    timing_report = _format_send_timing_report(
+                        result.get("asset_name", "SpeedTree"),
+                        total_seconds,
+                        float(result.get("elapsed_seconds", 0.0) or 0.0),
+                        send_seconds,
+                        response,
+                        None,
+                    )
+                    print(timing_report)
+                    settings.last_details += "\n\n" + timing_report
+                    settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
+                    if not success:
+                        self.report({"ERROR"}, settings.last_status)
+                        return {"CANCELLED"}
+                    settings.last_status += f" ({total_seconds:.1f}s)"
+
+            self.report(_ue_report_level(settings.last_status), settings.last_status)
+            return {"FINISHED"}
+        except Exception as exc:
+            settings.last_status = "Unreal SpeedTree export failed"
+            settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+
 def run_send_layers_around_camera(context, *, camera_position=None, radius=None, action="SEND"):
     button_started = time.perf_counter()
     from ..ui.ui_map import select_nearby_w2l_paths
@@ -549,15 +655,11 @@ def run_send_layers_around_camera(context, *, camera_position=None, radius=None,
     try:
         with _quiet_send_logging(settings, action):
             scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
-            include_collision_blocks = bool(
-                getattr(settings, "placement_export_collision", False)
-                or getattr(scene_settings, "terrain_layer_do_import_collision", False)
-            )
             result = w2l_placements.build_unreal_w2l_bundle_multi(
                 context,
                 settings,
                 w2l_paths,
-                include_collision_blocks=include_collision_blocks,
+                include_collision_blocks=_unreal_collision_enabled(settings, scene_settings),
                 include_point_lights=bool(getattr(scene_settings, "terrain_layer_do_import_point_light", True)),
                 include_spot_lights=bool(getattr(scene_settings, "terrain_layer_do_import_spot_light", True)),
                 default_hidden_paths=selection.get("default_hidden_paths", []),
@@ -673,15 +775,11 @@ def run_send_w2l_collection(context, coll, *, action="SEND"):
     try:
         with _quiet_send_logging(settings, action):
             scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
-            include_collision_blocks = bool(
-                getattr(settings, "placement_export_collision", False)
-                or getattr(scene_settings, "terrain_layer_do_import_collision", False)
-            )
             result = w2l_placements.build_unreal_w2l_bundle_multi(
                 context,
                 settings,
                 w2l_paths,
-                include_collision_blocks=include_collision_blocks,
+                include_collision_blocks=_unreal_collision_enabled(settings, scene_settings),
                 include_point_lights=bool(getattr(scene_settings, "terrain_layer_do_import_point_light", True)),
                 include_spot_lights=bool(getattr(scene_settings, "terrain_layer_do_import_spot_light", True)),
                 default_hidden_paths=selection.get("default_hidden_paths", []),
@@ -1387,6 +1485,33 @@ def _format_w2l_multi_bundle_details(result: dict, selection: dict | None = None
     return "\n".join(lines)
 
 
+def _format_srt_bundle_details(result: dict) -> str:
+    manifest = result.get("manifest", {})
+    speedtrees = manifest.get("speedtrees", []) or []
+    entry = speedtrees[0] if speedtrees else {}
+    texture_stats = result.get("texture_stats", {}) or {}
+    lines = [
+        f"SRT: {result.get('depot_path', '') or result.get('srt_path', '')}",
+        f"Asset: {result.get('asset_name', '')}",
+        f"Bundle: {result.get('bundle_root', '')}",
+        f"Manifest: {result.get('manifest_path', '')}",
+        f"Content root: {manifest.get('content_root', '')}",
+        "",
+        "SpeedTree:",
+        f"- Asset path: {entry.get('asset_path', '')}",
+        f"- Source file: {entry.get('file', '')}",
+        f"- Textures staged: {texture_stats.get('staged', 0)} / {texture_stats.get('requested', 0)}",
+        "",
+        "Warnings:",
+    ]
+    warnings = manifest.get("warnings", [])
+    if warnings:
+        lines.extend(f"- {warning}" for warning in warnings)
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
 def _format_world_bundle_details(result: dict) -> str:
     manifest = result.get("manifest", {})
     terrain = manifest.get("terrain", {}) or {}
@@ -1426,6 +1551,7 @@ classes = (
     WITCHER_OT_export_unreal_world,
     WITCHER_OT_export_unreal_placements,
     WITCHER_OT_export_unreal_w2l,
+    WITCHER_OT_export_unreal_srt,
     WITCHER_OT_send_unreal_layers_around_camera,
     WITCHER_OT_send_unreal_layer_collection,
     WITCHER_OT_send_unreal_layer_group_collection,

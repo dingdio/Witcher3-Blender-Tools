@@ -15,7 +15,7 @@ if "witcher3_tools" not in sys.modules:
     _pkg.__package__ = "witcher3_tools"
     sys.modules["witcher3_tools"] = _pkg
 
-from witcher3_tools.unreal_export import bundle, texture_export, unreal_project
+from witcher3_tools.unreal_export import bundle, speedtree_bundle, texture_export, unreal_project
 from witcher3_tools.unreal_export.manifest import (
     SCHEMA,
     build_manifest,
@@ -1125,6 +1125,59 @@ class TestManifest(unittest.TestCase):
             manifest["animations"][0]["asset_path"],
             "animations/man/combat/man_geralt_sword/attack_fast_l_01",
         )
+
+    def test_manifest_includes_speedtree_entries(self):
+        manifest = build_manifest(
+            asset_name="malus",
+            bundle_root=r"F:\exports\malus",
+            speedtrees=[{
+                "asset_path": "environment/vegetation/trees/malus/malus",
+                "depot_path": r"environment\vegetation\trees\malus\malus.srt",
+                "file": "SpeedTrees/environment/vegetation/trees/malus/malus.srt",
+                "texture_files": ["SpeedTrees/environment/vegetation/trees/malus/malus_d.dds"],
+                "missing_textures": [],
+                "force_import": True,
+            }],
+        )
+
+        self.assertEqual(
+            manifest["speedtrees"][0]["asset_path"],
+            "environment/vegetation/trees/malus/malus",
+        )
+        self.assertTrue(manifest["speedtrees"][0]["force_import"])
+
+    def test_speedtree_bundle_declares_material_and_wind_import_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            srt_path = Path(tmp) / "malus.srt"
+            srt_path.write_bytes(b"SpeedTree___test")
+            settings = types.SimpleNamespace(
+                asset_name="",
+                export_folder=str(Path(tmp) / "out"),
+                content_root="",
+            )
+            context = types.SimpleNamespace(
+                scene=types.SimpleNamespace(
+                    witcher_file_browser=types.SimpleNamespace(loadmods=False),
+                ),
+            )
+
+            with mock.patch.object(speedtree_bundle, "_collect_srt_texture_names", return_value=[]):
+                result = speedtree_bundle.build_unreal_srt_bundle(
+                    context,
+                    settings,
+                    str(srt_path),
+                    r"environment\vegetation\trees\malus\malus.srt",
+                )
+
+        entry = result["manifest"]["speedtrees"][0]
+        self.assertTrue(entry["force_import"])
+        self.assertEqual(entry["asset_path"], "environment/vegetation/trees/malus/malus")
+        self.assertTrue(entry["import_options"]["create_materials"])
+        self.assertTrue(entry["import_options"]["include_collision"])
+        self.assertTrue(entry["import_options"]["fallback_trunk_collision"])
+        self.assertTrue(entry["import_options"]["include_vertex_processing"])
+        self.assertTrue(entry["import_options"]["include_wind"])
+        self.assertEqual(entry["import_options"]["lod_screen_sizes"][1], 0.04)
 
 
 class TestSocketClient(unittest.TestCase):

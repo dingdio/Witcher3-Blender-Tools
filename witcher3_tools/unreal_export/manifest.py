@@ -247,6 +247,7 @@ def build_manifest(
     materials: Iterable[dict[str, Any]] = (),
     textures: Iterable[dict[str, Any]] = (),
     animations: Iterable[dict[str, Any]] = (),
+    speedtrees: Iterable[dict[str, Any]] = (),
     rig: dict[str, Any] | None = None,
     blueprint: dict[str, Any] | None = None,
     terrain: dict[str, Any] | None = None,
@@ -266,6 +267,7 @@ def build_manifest(
         "materials": list(materials),
         "textures": list(textures),
         "animations": list(animations),
+        "speedtrees": list(speedtrees),
         "warnings": list(warnings),
     }
     if rig:

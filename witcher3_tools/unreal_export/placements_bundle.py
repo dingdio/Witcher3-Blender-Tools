@@ -769,7 +769,7 @@ def build_unreal_placements_bundle(context, settings) -> dict[str, Any]:
     bundle_root = os.path.join(export_root, asset_name)
     os.makedirs(bundle_root, exist_ok=True)
 
-    export_collision = bool(getattr(settings, "placement_export_collision", False))
+    export_collision = bool(getattr(settings, "placement_export_collision", True))
     overwrite = overwrite_policy_from_settings(settings)
     reuse_existing_fbx = not overwrite["meshes"]
     write_profile_log = bool(getattr(settings, "placement_write_profile_log", True))

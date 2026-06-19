@@ -767,7 +767,7 @@ def _build_unreal_w2l_bundle_core(
     started = time.perf_counter()
     phase = {"parse": 0.0, "gather": 0.0, "materials": 0.0, "textures": 0.0, "manifest": 0.0}
     skip_materials = bool(getattr(settings, "placement_skip_materials", False))
-    export_visual_collision = bool(getattr(settings, "placement_export_collision", False))
+    export_visual_collision = bool(getattr(settings, "placement_export_collision", True))
     if include_collision_blocks is None:
         include_collision_blocks = export_visual_collision
     include_collision_blocks = bool(include_collision_blocks)

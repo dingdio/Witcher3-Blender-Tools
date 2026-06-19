@@ -374,6 +374,7 @@ class MySettings(PropertyGroup):
         items=[
             ('NAME', 'Name', 'Sort by file name', 'SORTALPHA', 0),
             ('EXT', 'Extension', 'Sort by file extension then name', 'FILTER', 1),
+            ('SIZE', 'Size', 'Sort by item size', 'FILE', 2),
         ],
         default='NAME',
         update=_on_browser_grid_layout_update,
@@ -1318,7 +1319,7 @@ def _split_grid_display_name_lines(
 
 def _get_browser_sort_prefs(browser) -> tuple[str, bool]:
     sort_by = str(getattr(browser, "sort_by", "NAME") or "NAME")
-    if sort_by not in {"NAME", "EXT"}:
+    if sort_by not in {"NAME", "EXT", "SIZE"}:
         sort_by = "NAME"
     ascending = bool(getattr(browser, "sort_ascending", True))
     return sort_by, ascending
@@ -1326,7 +1327,20 @@ def _get_browser_sort_prefs(browser) -> tuple[str, bool]:
 
 def _sort_browser_items(items, browser):
     sort_by, ascending = _get_browser_sort_prefs(browser)
-    if sort_by == "EXT":
+    if sort_by == "SIZE":
+        context = bpy.context
+        cache_type = getattr(browser, "active_cache_type", "")
+        current_folder = str(getattr(browser, "current_folder", "") or "")
+        loadmods = bool(getattr(browser, "loadmods", False))
+
+        def key_fn(item):
+            name = item.get("name", "")
+            item_path = f"{current_folder}\\{name}" if current_folder else name
+            return (
+                _browser_item_size_bytes(context, cache_type, item_path, loadmods=loadmods),
+                name.lower(),
+            )
+    elif sort_by == "EXT":
         def key_fn(item):
             name = item.get("name", "")
             dot = name.rfind(".")
@@ -1340,7 +1354,14 @@ def _sort_browser_items(items, browser):
 def _sort_browser_search_results(results, browser):
     """Sort a flat list of path strings (search results)."""
     sort_by, ascending = _get_browser_sort_prefs(browser)
-    if sort_by == "EXT":
+    if sort_by == "SIZE":
+        context = bpy.context
+        cache_type = getattr(browser, "active_cache_type", "")
+        loadmods = bool(getattr(browser, "loadmods", False))
+
+        def key_fn(path):
+            return (_browser_item_size_bytes(context, cache_type, path, loadmods=loadmods), path.lower())
+    elif sort_by == "EXT":
         def key_fn(path):
             dot = path.rfind(".")
             ext = path[dot + 1:].lower() if dot >= 0 else ""
@@ -1353,7 +1374,18 @@ def _sort_browser_search_results(results, browser):
 def _sort_browser_global_search_results(results, browser):
     """Sort global search result tuples as (cache_type, path)."""
     sort_by, ascending = _get_browser_sort_prefs(browser)
-    if sort_by == "EXT":
+    if sort_by == "SIZE":
+        context = bpy.context
+        loadmods = bool(getattr(browser, "loadmods", False))
+
+        def key_fn(result):
+            cache_type, path = result
+            return (
+                _browser_item_size_bytes(context, cache_type, path, loadmods=loadmods),
+                path.lower(),
+                cache_type.lower(),
+            )
+    elif sort_by == "EXT":
         def key_fn(result):
             cache_type, path = result
             dot = path.rfind(".")
@@ -4267,6 +4299,35 @@ def get_cache_item_stats(context, cache_type: str, item_path: str, loadmods: boo
 
     return stats
 
+
+def _format_size_kb(size_bytes: int) -> str:
+    size_bytes = _safe_int(size_bytes)
+    if size_bytes <= 0:
+        return "0 KB"
+    return f"{max(1, (size_bytes + 1023) // 1024):,} KB"
+
+
+def _browser_item_size_bytes_from_stats(stats: dict) -> int:
+    for key in ("size_uncompressed", "size_compressed", "size_on_disk"):
+        size_bytes = _safe_int(stats.get(key, 0))
+        if size_bytes > 0:
+            return size_bytes
+    return 0
+
+
+def _browser_item_size_bytes(context, cache_type: str, item_path: str, loadmods: bool = False) -> int:
+    stats = get_cache_item_stats(context, cache_type, item_path, loadmods=loadmods)
+    return _browser_item_size_bytes_from_stats(stats)
+
+
+def _browser_item_size_label(context, cache_type: str, item_path: str, loadmods: bool = False) -> str:
+    stats = get_cache_item_stats(context, cache_type, item_path, loadmods=loadmods)
+    size_bytes = _browser_item_size_bytes_from_stats(stats)
+    if size_bytes > 0:
+        return _format_size_kb(size_bytes)
+    return "0 KB" if stats.get("found") else "? KB"
+
+
 def _expected_mod_from_item_path(item_path: str, loadmods: bool) -> str:
     if not loadmods or not item_path:
         return ""
@@ -5818,20 +5879,22 @@ class SimpleFileBrowser(Operator):
             op_sound.file_path = full_item_path
             op_sound.cache_type = witcher_file_browser.active_cache_type
 
-        if (
-            not is_disk_cache(witcher_file_browser.active_cache_type)
-            or _browser_item_can_send_to_unreal(witcher_file_browser.active_cache_type, full_item_path)
-        ):
-            menu_row = actions_row.row(align=True)
-            menu_row.operator_context = 'INVOKE_DEFAULT'
-            op_menu = menu_row.operator("witcher.file_action_menu", text="", icon='THREE_DOTS')
-            op_menu.file_path = item['name']
-            op_menu.cache_type = witcher_file_browser.active_cache_type
+        menu_row = actions_row.row(align=True)
+        menu_row.operator_context = 'INVOKE_DEFAULT'
+        op_menu = menu_row.operator("witcher.file_action_menu", text="", icon='THREE_DOTS')
+        op_menu.file_path = full_item_path
+        op_menu.cache_type = witcher_file_browser.active_cache_type
 
-        stats_op = actions_row.operator("witcher.file_item_stats", text="", icon='INFO')
-        stats_op.file_path = full_item_path
-        stats_op.cache_type = witcher_file_browser.active_cache_type
-        stats_op.loadmods = witcher_file_browser.loadmods
+        size_row = actions_row.row(align=True)
+        size_row.alignment = 'RIGHT'
+        size_row.label(
+            text=_browser_item_size_label(
+                context,
+                witcher_file_browser.active_cache_type,
+                full_item_path,
+                loadmods=witcher_file_browser.loadmods,
+            )
+        )
 
         is_revealed = _is_revealed_browser_item(witcher_file_browser, full_item_path)
         draw_name_lines = [str(line or "") for line in (name_lines or [display_name])]
@@ -6005,17 +6068,22 @@ class SimpleFileBrowser(Operator):
                 op = import_row.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
                 op.cache_type = cache_type
             op.file_path = item_path
-        if not is_disk_cache(cache_type) or _browser_item_can_send_to_unreal(cache_type, item_path):
-            menu_row = layout.row(align=True)
-            menu_row.operator_context = 'INVOKE_DEFAULT'
-            op = menu_row.operator("witcher.file_action_menu", text="", icon='THREE_DOTS')
-            op.file_path = item_path
-            op.cache_type = cache_type
+        menu_row = layout.row(align=True)
+        menu_row.operator_context = 'INVOKE_DEFAULT'
+        op = menu_row.operator("witcher.file_action_menu", text="", icon='THREE_DOTS')
+        op.file_path = item_path
+        op.cache_type = cache_type
 
-        stats_op = layout.operator("witcher.file_item_stats", text="", icon='INFO')
-        stats_op.file_path = item_path
-        stats_op.cache_type = cache_type
-        stats_op.loadmods = witcher_file_browser.loadmods
+        size_row = layout.row(align=True)
+        size_row.alignment = 'RIGHT'
+        size_row.label(
+            text=_browser_item_size_label(
+                context,
+                cache_type,
+                item_path,
+                loadmods=witcher_file_browser.loadmods,
+            )
+        )
 
     def _draw_search_result_list_row(
         self,
@@ -6789,15 +6857,11 @@ class SimpleFileBrowser(Operator):
                         op_sound.file_path = full_item_path
                         op_sound.cache_type = witcher_file_browser.active_cache_type
 
-                    if (
-                        not is_disk_cache(witcher_file_browser.active_cache_type)
-                        or _browser_item_can_send_to_unreal(witcher_file_browser.active_cache_type, full_item_path)
-                    ):
-                        menu_row = row.row(align=True)
-                        menu_row.operator_context = 'INVOKE_DEFAULT'
-                        op2 = menu_row.operator("witcher.file_action_menu", text="", icon='THREE_DOTS')
-                        op2.file_path = item['name']
-                        op2.cache_type = witcher_file_browser.active_cache_type
+                    menu_row = row.row(align=True)
+                    menu_row.operator_context = 'INVOKE_DEFAULT'
+                    op2 = menu_row.operator("witcher.file_action_menu", text="", icon='THREE_DOTS')
+                    op2.file_path = full_item_path
+                    op2.cache_type = witcher_file_browser.active_cache_type
 
                     is_revealed = _is_revealed_browser_item(witcher_file_browser, full_item_path)
                     icon_info = _get_browser_item_icon_info(
@@ -6816,10 +6880,16 @@ class SimpleFileBrowser(Operator):
                         fallback_icon='VIEWZOOM' if is_revealed else 'FILE',
                     )
 
-                    stats_op = row.operator("witcher.file_item_stats", text="", icon='INFO')
-                    stats_op.file_path = full_item_path
-                    stats_op.cache_type = witcher_file_browser.active_cache_type
-                    stats_op.loadmods = witcher_file_browser.loadmods
+                    size_row = row.row(align=True)
+                    size_row.alignment = 'RIGHT'
+                    size_row.label(
+                        text=_browser_item_size_label(
+                            context,
+                            witcher_file_browser.active_cache_type,
+                            full_item_path,
+                            loadmods=witcher_file_browser.loadmods,
+                        )
+                    )
 
 
             # File/folder count display at bottom
@@ -7881,8 +7951,8 @@ class SelectCacheTypeOperator(Operator):
                     continue
                 folder_structure.add_path(key_str)
 
-_UNREAL_BROWSER_SEND_EXTS = {".w2ent", ".w3app", ".w2mesh", ".w2l"}
-_UNREAL_BROWSER_HEADLESS_EXTS = {".w2l"}
+_UNREAL_BROWSER_SEND_EXTS = {".w2ent", ".w3app", ".w2mesh", ".w2l", ".srt"}
+_UNREAL_BROWSER_HEADLESS_EXTS = {".w2l", ".srt"}
 
 
 def _browser_item_is_headless_unreal_send(item_path: str) -> bool:
@@ -8716,14 +8786,44 @@ class FileActionMenuOperator(Operator):
     cache_type: StringProperty(default="")
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_popup(self, width=220)
+        return context.window_manager.invoke_popup(self, width=240)
 
     def execute(self, context):
-        return context.window_manager.invoke_popup(self, width=220)
+        return context.window_manager.invoke_popup(self, width=240)
 
     def draw(self, context):
         layout = self.layout
         cache_type = _browser_operator_cache_type(context, self.cache_type)
+        witcher_file_browser = getattr(context.scene, "witcher_file_browser", None)
+        loadmods = bool(getattr(witcher_file_browser, "loadmods", False))
+        file_exists, _size = get_file_info(context, cache_type, self.file_path, loadmods=loadmods)
+
+        copy_op = layout.operator("witcher.copy_path", text="Copy Path", icon="COPYDOWN")
+        copy_op.path = self.file_path
+
+        loc_row = layout.row(align=True)
+        loc_row.enabled = file_exists
+        loc_op = loc_row.operator("witcher.open_file_location", text="Open File Location", icon="FILEBROWSER")
+        loc_op.file_path = self.file_path
+        loc_op.cache_type = cache_type
+
+        import_row = layout.row(align=True)
+        import_row.enabled = cache_supports_scene_import(cache_type)
+        import_row.operator_context = 'INVOKE_DEFAULT'
+        import_op = import_row.operator("witcher.file_action_import_to_scene", text="Import to Scene", icon='IMPORT')
+        import_op.file_path = self.file_path
+        import_op.cache_type = cache_type
+
+        layout.separator()
+
+        stats_row = layout.row(align=True)
+        stats_row.operator_context = 'INVOKE_DEFAULT'
+        stats_op = stats_row.operator("witcher.file_item_stats", text="Item Stats", icon='INFO')
+        stats_op.file_path = self.file_path
+        stats_op.cache_type = cache_type
+        stats_op.loadmods = loadmods
+
+        layout.separator()
 
         export_row = layout.row(align=True)
         export_row.enabled = bool(cache_type) and not is_disk_cache(cache_type)
@@ -8758,7 +8858,7 @@ class FileActionSendToUnrealOperator(Operator):
     def execute(self, context):
         cache_type = _browser_operator_cache_type(context, self.cache_type)
         if not _browser_item_can_send_to_unreal(cache_type, self.file_path):
-            self.report({'WARNING'}, "Send to Unreal is available for entity, mesh, and .w2l layer browser items.")
+            self.report({'WARNING'}, "Send to Unreal is available for entity, mesh, .srt SpeedTree, and .w2l layer browser items.")
             return {'CANCELLED'}
         if not hasattr(context.scene, "witcher_unreal_export"):
             self.report({'ERROR'}, "Unreal export tools are not registered.")
@@ -8777,6 +8877,8 @@ class FileActionSendToUnrealOperator(Operator):
             return {'CANCELLED'}
 
         if _browser_item_is_headless_unreal_send(self.file_path):
+            if os.path.splitext(_normalize_virtual_path(self.file_path))[1].lower() == ".srt":
+                return self._send_srt_headless(context, cache_type)
             return self._send_w2l_headless(context, cache_type)
 
         before_objects = set(bpy.data.objects)
@@ -8825,6 +8927,34 @@ class FileActionSendToUnrealOperator(Operator):
         except RuntimeError as exc:
             message = str(exc).replace("Error: ", "").strip() or "Unreal layer send failed."
             settings.last_status = "Unreal layer import failed"
+            settings.last_details = message
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
+
+    def _send_srt_headless(self, context, cache_type):
+        settings = context.scene.witcher_unreal_export
+        try:
+            with mod_loading_context(context):
+                resolved = self._resolve_import_target(context)
+        except Exception as exc:
+            message = f"Could not resolve SpeedTree source: {exc}"
+            settings.last_status = "Unreal SpeedTree import failed"
+            settings.last_details = message
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
+        if not resolved:
+            return {'CANCELLED'}
+
+        depot_path = get_vanilla_path(resolved.get("full_path_norm", ""), resolved.get("loadmods", False))
+        try:
+            return bpy.ops.witcher.export_unreal_srt(
+                action='SEND',
+                srt_path=resolved["abs_file_path"],
+                depot_path=depot_path,
+            )
+        except RuntimeError as exc:
+            message = str(exc).replace("Error: ", "").strip() or "Unreal SpeedTree send failed."
+            settings.last_status = "Unreal SpeedTree import failed"
             settings.last_details = message
             self.report({'ERROR'}, message)
             return {'CANCELLED'}

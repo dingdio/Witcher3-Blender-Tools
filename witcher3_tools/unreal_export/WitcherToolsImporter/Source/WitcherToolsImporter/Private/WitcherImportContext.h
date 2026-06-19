@@ -33,6 +33,7 @@ private:
     void ImportMaterials();
     void ImportRig();
     void ImportMeshes();
+    void ImportSpeedTrees();
     void ImportAnimations();
     void ImportBlueprint();
     void ImportTerrain();

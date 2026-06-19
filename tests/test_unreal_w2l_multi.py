@@ -407,6 +407,46 @@ class TestMultiLayerBundle(unittest.TestCase):
                 self.assertIn("collision_asset_path", actor)
                 self.assertTrue(actor["collision_asset_path"].endswith("_collision"))
 
+    def test_missing_collision_setting_defaults_to_collision_companions(self):
+        self._install_fake_collision_exporter()
+        settings = types.SimpleNamespace(
+            asset_name="",
+            content_root="/Game/Witcher3",
+            export_folder=self.tmp,
+            placement_skip_materials=False,
+        )
+
+        result = w2l_placements.build_unreal_w2l_bundle_multi(None, settings, self.w2l_paths)
+
+        manifest = result["manifest"]
+        collision_meshes = [m for m in manifest["meshes"] if m.get("collision")]
+        self.assertEqual(len(collision_meshes), 3)
+        for layer in manifest["placements"]["layers"]:
+            for actor in layer["actors"]:
+                self.assertIn("collision_asset_path", actor)
+
+    def test_missing_collision_setting_includes_collision_blocks(self):
+        self._install_fake_collision_exporter()
+        collision_path = os.path.join(self.tmp, "default_collision.w2l")
+        with open(collision_path, "wb") as fh:
+            fh.write(b"w2l")
+        self.levels["default_collision.w2l"] = _Level(_Sector(
+            [_Block(_BlockDataObjectType.Collision, 0)],
+            ["a\\wall.w2mesh"],
+        ))
+        settings = types.SimpleNamespace(
+            asset_name="",
+            content_root="/Game/Witcher3",
+            export_folder=self.tmp,
+            placement_skip_materials=False,
+        )
+
+        result = w2l_placements.build_unreal_w2l_bundle(None, settings, collision_path)
+
+        actor = result["manifest"]["placements"]["layers"][0]["actors"][0]
+        self.assertEqual(actor["asset_path"], "a/wall_collision")
+        self.assertTrue(actor["collision_only"])
+
     def test_light_only_layer_builds_placement_manifest(self):
         light_path = os.path.join(self.tmp, "lights.w2l")
         with open(light_path, "wb") as fh:
