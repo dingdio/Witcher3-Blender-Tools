@@ -22,6 +22,9 @@
 #include "Components/SpotLightComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "EngineUtils.h"
+#include "FoliageType_InstancedStaticMesh.h"
+#include "FoliageModule.h"
+#include "InstancedFoliageActor.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "Engine/SCS_Node.h"
@@ -35,6 +38,9 @@
 #include "Engine/PointLight.h"
 #include "Engine/SpotLight.h"
 #include "Editor.h"
+#include "EditorModeManager.h"
+#include "EditorModes.h"
+#include "EditorFramework/AssetImportData.h"
 #include "Landscape.h"
 #include "LandscapeInfo.h"
 #include "LandscapeProxy.h"
@@ -73,11 +79,14 @@
 #include "GameFramework/Actor.h"
 #include "HAL/IConsoleManager.h"
 #include "IAssetTools.h"
+#include "PhysicsEngine/BodyInstance.h"
+#include "SceneTypes.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "MaterialEditingLibrary.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
+#include "Materials/MaterialExpressionSpeedTree.h"
 #include "Materials/MaterialExpressionTextureBase.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
@@ -173,6 +182,71 @@ void SetImportByte(UObject* Object, const TCHAR* PropertyName, uint8 Value)
     }
 }
 
+void SetImportFloat(UObject* Object, const TCHAR* PropertyName, float Value)
+{
+    if (!Object)
+    {
+        return;
+    }
+    if (FFloatProperty* Property = FindFProperty<FFloatProperty>(Object->GetClass(), FName(PropertyName)))
+    {
+        Property->SetPropertyValue_InContainer(Object, Value);
+        return;
+    }
+    if (FDoubleProperty* Property = FindFProperty<FDoubleProperty>(Object->GetClass(), FName(PropertyName)))
+    {
+        Property->SetPropertyValue_InContainer(Object, static_cast<double>(Value));
+    }
+}
+
+float DesiredSpeedTreeTreeScale(const TSharedPtr<FJsonObject>& SpeedTreeEntry)
+{
+    TSharedPtr<FJsonObject> ImportOptionsObject;
+    const TSharedPtr<FJsonObject>* ImportOptions = nullptr;
+    if (SpeedTreeEntry.IsValid() && SpeedTreeEntry->TryGetObjectField(TEXT("import_options"), ImportOptions) && ImportOptions)
+    {
+        ImportOptionsObject = *ImportOptions;
+    }
+    return static_cast<float>(JsonNumber(ImportOptionsObject, TEXT("tree_scale"), 100.0));
+}
+
+bool ReadFloatProperty(UObject* Object, const TCHAR* PropertyName, float& OutValue)
+{
+    if (!Object)
+    {
+        return false;
+    }
+    if (FFloatProperty* Property = FindFProperty<FFloatProperty>(Object->GetClass(), FName(PropertyName)))
+    {
+        OutValue = Property->GetPropertyValue_InContainer(Object);
+        return true;
+    }
+    if (FDoubleProperty* Property = FindFProperty<FDoubleProperty>(Object->GetClass(), FName(PropertyName)))
+    {
+        OutValue = static_cast<float>(Property->GetPropertyValue_InContainer(Object));
+        return true;
+    }
+    return false;
+}
+
+bool ExistingSpeedTreeNeedsReimport(UStaticMesh* ExistingMesh, const TSharedPtr<FJsonObject>& SpeedTreeEntry)
+{
+    if (!ExistingMesh)
+    {
+        return true;
+    }
+
+    UAssetImportData* ImportData = ExistingMesh->GetAssetImportData();
+    float ExistingTreeScale = 0.0f;
+    if (!ImportData || !ReadFloatProperty(ImportData, TEXT("TreeScale"), ExistingTreeScale))
+    {
+        return true;
+    }
+
+    const float DesiredTreeScale = DesiredSpeedTreeTreeScale(SpeedTreeEntry);
+    return !FMath::IsNearlyEqual(ExistingTreeScale, DesiredTreeScale, 0.01f);
+}
+
 UFactory* CreateSpeedTreeImportFactory()
 {
     if (!EnsureSpeedTreeImporterModule())
@@ -208,6 +282,7 @@ UObject* CreateSpeedTreeImportOptions(const TSharedPtr<FJsonObject>& SpeedTreeEn
     // Mirrors SpeedTreeImportData.h enum values without linking against the non-exported importer classes.
     SetImportByte(Options, TEXT("ImportGeometryType"), 0); // IGT_3D
     SetImportByte(Options, TEXT("LODType"), 0); // ILT_PaintedFoliage
+    SetImportFloat(Options, TEXT("TreeScale"), DesiredSpeedTreeTreeScale(SpeedTreeEntry));
     SetImportBool(Options, TEXT("IncludeCollision"), JsonBool(ImportOptionsObject, TEXT("include_collision"), true));
     SetImportBool(Options, TEXT("MakeMaterialsCheck"), JsonBool(ImportOptionsObject, TEXT("create_materials"), true));
     SetImportBool(Options, TEXT("IncludeNormalMapCheck"), JsonBool(ImportOptionsObject, TEXT("include_normal_maps"), true));
@@ -222,6 +297,38 @@ UObject* CreateSpeedTreeImportOptions(const TSharedPtr<FJsonObject>& SpeedTreeEn
     SetImportBool(Options, TEXT("IncludeSmoothLODCheck"), JsonBool(ImportOptionsObject, TEXT("include_smooth_lod"), true));
     return Options;
 }
+
+// SpeedTree-7 reads TreeScale from the import-data CDO/config instead of the
+// task options. W3 .srt geometry is metres, so force 100 cm during import.
+struct FScopedSpeedTreeTreeScale
+{
+    UObject* CDO = nullptr;
+    float PrevTreeScale = 30.48f;
+
+    explicit FScopedSpeedTreeTreeScale(float TreeScale)
+    {
+        UClass* ImportDataClass = EnsureSpeedTreeImporterModule()
+            ? LoadClass<UObject>(nullptr, TEXT("/Script/SpeedTreeImporter.SpeedTreeImportData"))
+            : nullptr;
+        CDO = ImportDataClass ? ImportDataClass->GetDefaultObject() : nullptr;
+        if (!CDO)
+        {
+            return;
+        }
+        ReadFloatProperty(CDO, TEXT("TreeScale"), PrevTreeScale);
+        SetImportFloat(CDO, TEXT("TreeScale"), TreeScale);
+        CDO->SaveConfig();
+    }
+
+    ~FScopedSpeedTreeTreeScale()
+    {
+        if (CDO)
+        {
+            SetImportFloat(CDO, TEXT("TreeScale"), PrevTreeScale);
+            CDO->SaveConfig();
+        }
+    }
+};
 
 void ConfigureSpeedTreeLods(UStaticMesh* Mesh, const TSharedPtr<FJsonObject>& SpeedTreeEntry)
 {
@@ -271,8 +378,209 @@ bool HasSimpleCollision(const UStaticMesh* Mesh)
 
 bool PackageIsAtOrUnder(const FString& PackageName, const FString& PackagePath)
 {
+    if (PackageName.IsEmpty() || PackagePath.IsEmpty())
+    {
+        return false;
+    }
     const FString Prefix = PackagePath.EndsWith(TEXT("/")) ? PackagePath : PackagePath + TEXT("/");
     return PackageName == PackagePath || PackageName.StartsWith(Prefix);
+}
+
+FString NormalizeUnrealRelativePath(FString Path)
+{
+    Path = Path.TrimStartAndEnd();
+    if (Path.StartsWith(TEXT("\"")) && Path.EndsWith(TEXT("\"")) && Path.Len() >= 2)
+    {
+        Path = Path.Mid(1, Path.Len() - 2);
+    }
+    Path.ReplaceInline(TEXT("\\"), TEXT("/"));
+    while (Path.Contains(TEXT("//")))
+    {
+        Path.ReplaceInline(TEXT("//"), TEXT("/"));
+    }
+    while (Path.StartsWith(TEXT("/")))
+    {
+        Path.RemoveAt(0);
+    }
+    while (Path.EndsWith(TEXT("/")))
+    {
+        Path.LeftChopInline(1);
+    }
+    return Path;
+}
+
+FString ParentFolderOfRelativePath(const FString& Path)
+{
+    const FString Normalized = NormalizeUnrealRelativePath(Path);
+    int32 SlashIndex = INDEX_NONE;
+    return Normalized.FindLastChar(TEXT('/'), SlashIndex)
+        ? Normalized.Left(SlashIndex)
+        : FString();
+}
+
+bool RelativePathHasSegment(const FString& Path, const FString& Segment)
+{
+    TArray<FString> Segments;
+    NormalizeUnrealRelativePath(Path).ParseIntoArray(Segments, TEXT("/"), true);
+    for (const FString& ExistingSegment : Segments)
+    {
+        if (ExistingSegment.Equals(Segment, ESearchCase::IgnoreCase))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+FString FoliageFolderForCell(const TSharedPtr<FJsonObject>& Cell, const FString& LayerId)
+{
+    FString Folder = NormalizeUnrealRelativePath(JsonString(Cell, TEXT("folder")));
+    if (Folder.IsEmpty())
+    {
+        Folder = ParentFolderOfRelativePath(LayerId);
+    }
+    if (Folder.IsEmpty())
+    {
+        return TEXT("source_foliage");
+    }
+    if (!RelativePathHasSegment(Folder, TEXT("source_foliage")))
+    {
+        Folder /= TEXT("source_foliage");
+    }
+    return Folder;
+}
+
+FString FoliageTypeRelForMesh(const FString& MeshAssetRel, const FString& FoliageFolder)
+{
+    const FString Folder = NormalizeUnrealRelativePath(FoliageFolder).IsEmpty()
+        ? FString(TEXT("source_foliage"))
+        : NormalizeUnrealRelativePath(FoliageFolder);
+    const FString MeshRel = NormalizeUnrealRelativePath(MeshAssetRel);
+    return MeshRel.IsEmpty()
+        ? FString::Printf(TEXT("%s/FoliageType"), *Folder)
+        : FString::Printf(TEXT("%s/%s_FoliageType"), *Folder, *MeshRel);
+}
+
+enum class EWitcherFoliageProfile : uint8
+{
+    GroundCover,
+    SmallWoody,
+    LargeTree,
+};
+
+bool FoliagePathHasToken(const FString& MeshAssetRel, const TCHAR* Token)
+{
+    FString Path = NormalizeUnrealRelativePath(MeshAssetRel).ToLower();
+    if (Path.IsEmpty())
+    {
+        return false;
+    }
+    Path = FString::Printf(TEXT("/%s/"), *Path);
+    return Path.Contains(FString::Printf(TEXT("/%s/"), Token)) || Path.Contains(Token);
+}
+
+EWitcherFoliageProfile GuessFoliageProfile(UStaticMesh* Mesh, const FString& MeshAssetRel)
+{
+    const double HeightCm = Mesh ? Mesh->GetBounds().BoxExtent.Z * 2.0 : 0.0;
+
+    if (FoliagePathHasToken(MeshAssetRel, TEXT("grass")) ||
+        FoliagePathHasToken(MeshAssetRel, TEXT("flower")) ||
+        FoliagePathHasToken(MeshAssetRel, TEXT("herb")) ||
+        (HeightCm > 0.0 && HeightCm <= 180.0))
+    {
+        return EWitcherFoliageProfile::GroundCover;
+    }
+
+    if (FoliagePathHasToken(MeshAssetRel, TEXT("bush")) ||
+        FoliagePathHasToken(MeshAssetRel, TEXT("shrub")) ||
+        FoliagePathHasToken(MeshAssetRel, TEXT("reed")) ||
+        (HeightCm > 0.0 && HeightCm <= 650.0))
+    {
+        return EWitcherFoliageProfile::SmallWoody;
+    }
+
+    return EWitcherFoliageProfile::LargeTree;
+}
+
+void ApplyGeneratedFoliageSettings(
+    UFoliageType_InstancedStaticMesh* FoliageType,
+    UStaticMesh* Mesh,
+    const FString& MeshAssetRel)
+{
+    if (!FoliageType)
+    {
+        return;
+    }
+
+    const EWitcherFoliageProfile Profile = GuessFoliageProfile(Mesh, MeshAssetRel);
+
+    FoliageType->bEvaluateWorldPositionOffset = true;
+    FoliageType->bEnableCullDistanceScaling = true;
+    FoliageType->bEnableDiscardOnLoad = false;
+    FoliageType->ShadowCacheInvalidationBehavior = EShadowCacheInvalidationBehavior::Rigid;
+
+    switch (Profile)
+    {
+    case EWitcherFoliageProfile::GroundCover:
+        FoliageType->CullDistance = FInt32Interval(9000, 14000);
+        FoliageType->WorldPositionOffsetDisableDistance = 7000;
+        FoliageType->CastShadow = false;
+        FoliageType->bCastDynamicShadow = false;
+        FoliageType->bCastStaticShadow = false;
+        FoliageType->bCastContactShadow = false;
+        FoliageType->bCastShadowAsTwoSided = false;
+        FoliageType->bAffectDynamicIndirectLighting = false;
+        FoliageType->bAffectDistanceFieldLighting = false;
+        FoliageType->bReceivesDecals = false;
+        FoliageType->bUseAsOccluder = false;
+        FoliageType->bVisibleInRayTracing = false;
+        FoliageType->bVisibleInReflections = false;
+        FoliageType->bEnableDensityScaling = true;
+        FoliageType->BodyInstance.SetCollisionProfileName(FName(TEXT("NoCollision")));
+        FoliageType->BodyInstance.SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        break;
+
+    case EWitcherFoliageProfile::SmallWoody:
+        FoliageType->CullDistance = FInt32Interval(25000, 45000);
+        FoliageType->WorldPositionOffsetDisableDistance = 20000;
+        FoliageType->CastShadow = true;
+        FoliageType->bCastDynamicShadow = true;
+        FoliageType->bCastStaticShadow = true;
+        FoliageType->bCastContactShadow = false;
+        FoliageType->bCastShadowAsTwoSided = false;
+        FoliageType->bAffectDynamicIndirectLighting = false;
+        FoliageType->bAffectDistanceFieldLighting = false;
+        FoliageType->bReceivesDecals = false;
+        FoliageType->bUseAsOccluder = false;
+        FoliageType->bVisibleInRayTracing = false;
+        FoliageType->bVisibleInReflections = false;
+        FoliageType->bEnableDensityScaling = false;
+        FoliageType->BodyInstance.SetCollisionProfileName(FName(TEXT("BlockAll")));
+        FoliageType->BodyInstance.SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        break;
+
+    case EWitcherFoliageProfile::LargeTree:
+        FoliageType->CullDistance = FInt32Interval(100000, 180000);
+        FoliageType->WorldPositionOffsetDisableDistance = 50000;
+        FoliageType->CastShadow = true;
+        FoliageType->bCastDynamicShadow = true;
+        FoliageType->bCastStaticShadow = true;
+        FoliageType->bCastContactShadow = false;
+        FoliageType->bCastShadowAsTwoSided = false;
+        FoliageType->bAffectDynamicIndirectLighting = false;
+        FoliageType->bAffectDistanceFieldLighting = true;
+        FoliageType->bReceivesDecals = false;
+        FoliageType->bUseAsOccluder = false;
+        FoliageType->bVisibleInRayTracing = true;
+        FoliageType->bVisibleInReflections = true;
+        FoliageType->bEnableDensityScaling = false;
+        FoliageType->BodyInstance.SetCollisionProfileName(FName(TEXT("BlockAll")));
+        FoliageType->BodyInstance.SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        break;
+    }
+
+    ++FoliageType->ChangeCount;
+    FoliageType->UpdateGuid = FGuid::NewGuid();
 }
 
 TSet<FString> DirtyPackageNamesUnder(const FString& PackagePath)
@@ -281,9 +589,14 @@ TSet<FString> DirtyPackageNamesUnder(const FString& PackagePath)
     for (TObjectIterator<UPackage> It; It; ++It)
     {
         UPackage* Package = *It;
-        if (Package && Package->IsDirty() && PackageIsAtOrUnder(Package->GetName(), PackagePath))
+        if (!Package || !Package->IsDirty())
         {
-            Names.Add(Package->GetName());
+            continue;
+        }
+        const FString PackageName = Package->GetName();
+        if (PackageIsAtOrUnder(PackageName, PackagePath))
+        {
+            Names.Add(PackageName);
         }
     }
     return Names;
@@ -294,11 +607,15 @@ void AddNewDirtyPackagesUnder(const FString& PackagePath, const TSet<FString>& P
     for (TObjectIterator<UPackage> It; It; ++It)
     {
         UPackage* Package = *It;
-        if (!Package || !Package->IsDirty() || !PackageIsAtOrUnder(Package->GetName(), PackagePath))
+        if (!Package || !Package->IsDirty())
         {
             continue;
         }
         const FString PackageName = Package->GetName();
+        if (!PackageIsAtOrUnder(PackageName, PackagePath))
+        {
+            continue;
+        }
         if (!PreviousDirtyPackages.Contains(PackageName))
         {
             ImportedAssets.AddUnique(PackageName);
@@ -411,6 +728,25 @@ FVector JsonVector(const TSharedPtr<FJsonObject>& Object, const FString& Field, 
             (*Values)[2]->AsNumber());
     }
     return DefaultValue;
+}
+
+bool JsonVector2D(const TSharedPtr<FJsonObject>& Object, const FString& Field, FVector2D& OutValue)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+    double X = 0.0;
+    double Y = 0.0;
+    if (Object.IsValid()
+        && Object->TryGetArrayField(Field, Values)
+        && Values->Num() >= 2
+        && (*Values)[0].IsValid()
+        && (*Values)[1].IsValid()
+        && (*Values)[0]->TryGetNumber(X)
+        && (*Values)[1]->TryGetNumber(Y))
+    {
+        OutValue = FVector2D(X, Y);
+        return true;
+    }
+    return false;
 }
 
 FQuat JsonQuat(const TSharedPtr<FJsonObject>& Object, const FString& Field)
@@ -737,6 +1073,267 @@ void ConfigureStaticMeshAsCollisionMesh(UStaticMesh* Mesh)
     }
 }
 
+FString NormalizedDepotFragment(const FString& Value)
+{
+    FString Normalized = Value.Replace(TEXT("\\"), TEXT("/")).ToLower();
+    while (Normalized.Contains(TEXT("//")))
+    {
+        Normalized.ReplaceInline(TEXT("//"), TEXT("/"));
+    }
+    return Normalized;
+}
+
+bool IsGrassSpeedTreeEntry(const FString& AssetRel, const TSharedPtr<FJsonObject>& SpeedTreeEntry)
+{
+    const FString Combined =
+        NormalizedDepotFragment(AssetRel)
+        + TEXT("/")
+        + NormalizedDepotFragment(JsonString(SpeedTreeEntry, TEXT("depot_path")))
+        + TEXT("/")
+        + NormalizedDepotFragment(JsonString(SpeedTreeEntry, TEXT("file")));
+    return Combined.Contains(TEXT("environment/vegetation/grass/"));
+}
+
+bool IsSpeedTreeCardMaterialName(const FString& MaterialName)
+{
+    const FString Lower = MaterialName.ToLower();
+    return Lower.Contains(TEXT("_fronds"))
+        || Lower.Contains(TEXT("_leaves"))
+        || Lower.Contains(TEXT("_facingleaves"));
+}
+
+ESpeedTreeGeometryType GuessSpeedTreeGeometryType(const FString& MaterialName)
+{
+    const FString Lower = MaterialName.ToLower();
+    if (Lower.Contains(TEXT("_facingleaves")))
+    {
+        return STG_FacingLeaf;
+    }
+    if (Lower.Contains(TEXT("_leaves")))
+    {
+        return STG_Leaf;
+    }
+    return STG_Frond;
+}
+
+UMaterialExpressionSpeedTree* FindSpeedTreeExpression(UMaterial* Material)
+{
+    if (!Material)
+    {
+        return nullptr;
+    }
+    for (UMaterialExpression* Expression : Material->GetExpressions())
+    {
+        if (UMaterialExpressionSpeedTree* SpeedTreeExpression = Cast<UMaterialExpressionSpeedTree>(Expression))
+        {
+            return SpeedTreeExpression;
+        }
+    }
+    return nullptr;
+}
+
+UMaterialExpressionTextureSample* FindLikelyDiffuseTextureSample(UMaterial* Material, UMaterialEditorOnlyData* EditorOnly)
+{
+    if (!Material)
+    {
+        return nullptr;
+    }
+    if (EditorOnly)
+    {
+        if (UMaterialExpressionTextureSample* BaseTexture =
+            Cast<UMaterialExpressionTextureSample>(EditorOnly->BaseColor.Expression))
+        {
+            return BaseTexture;
+        }
+    }
+
+    UMaterialExpressionTextureSample* FirstColorSample = nullptr;
+    for (UMaterialExpression* Expression : Material->GetExpressions())
+    {
+        UMaterialExpressionTextureSample* TextureSample = Cast<UMaterialExpressionTextureSample>(Expression);
+        if (!TextureSample || !TextureSample->Texture)
+        {
+            continue;
+        }
+
+        const FString TextureName = TextureSample->Texture->GetName().ToLower();
+        const bool bLooksLikePackedNormalOrSpec =
+            TextureName.Contains(TEXT("_n_"))
+            || TextureName.Contains(TEXT("_n_dds"))
+            || TextureName.EndsWith(TEXT("_n"))
+            || TextureName.Contains(TEXT("_s_"))
+            || TextureName.Contains(TEXT("_s_dds"))
+            || TextureName.EndsWith(TEXT("_s"));
+        if (!bLooksLikePackedNormalOrSpec)
+        {
+            return TextureSample;
+        }
+        if (!FirstColorSample && TextureSample->SamplerType == SAMPLERTYPE_Color)
+        {
+            FirstColorSample = TextureSample;
+        }
+    }
+    return FirstColorSample;
+}
+
+bool EnsureMaterialOpacityMask(UMaterial* Material, UMaterialEditorOnlyData* EditorOnly)
+{
+    if (!Material || !EditorOnly)
+    {
+        return false;
+    }
+    if (EditorOnly->OpacityMask.Expression)
+    {
+        return true;
+    }
+
+    UMaterialExpressionTextureSample* DiffuseTexture = FindLikelyDiffuseTextureSample(Material, EditorOnly);
+    if (!DiffuseTexture)
+    {
+        return false;
+    }
+
+    UMaterialExpressionComponentMask* AlphaMask = Cast<UMaterialExpressionComponentMask>(
+        UMaterialEditingLibrary::CreateMaterialExpression(
+            Material, UMaterialExpressionComponentMask::StaticClass(), -150, 120));
+    if (!AlphaMask)
+    {
+        return false;
+    }
+    AlphaMask->R = false;
+    AlphaMask->G = false;
+    AlphaMask->B = false;
+    AlphaMask->A = true;
+    AlphaMask->Input.Connect(5, DiffuseTexture);
+    EditorOnly->OpacityMask.Expression = AlphaMask;
+    return true;
+}
+
+bool PatchGrassSpeedTreeMaterial(UMaterial* Material)
+{
+    if (!Material || !IsSpeedTreeCardMaterialName(Material->GetName()))
+    {
+        return false;
+    }
+
+    UMaterialEditorOnlyData* EditorOnly = Material->GetEditorOnlyData();
+    if (!EditorOnly)
+    {
+        return false;
+    }
+
+    const bool bHadMask = EditorOnly->OpacityMask.Expression != nullptr;
+    if (!bHadMask && !FindLikelyDiffuseTextureSample(Material, EditorOnly))
+    {
+        return false;
+    }
+
+    bool bChanged = false;
+    Material->PreEditChange(nullptr);
+
+    if (!bHadMask)
+    {
+        if (!EnsureMaterialOpacityMask(Material, EditorOnly))
+        {
+            Material->PostEditChange();
+            return false;
+        }
+        bChanged = true;
+    }
+
+    if (Material->BlendMode != BLEND_Masked)
+    {
+        Material->BlendMode = BLEND_Masked;
+        Material->OpacityMaskClipValue = 0.3333f;
+        Material->SetCastShadowAsMasked(true);
+        bChanged = true;
+    }
+    if (!Material->TwoSided)
+    {
+        Material->TwoSided = true;
+        bChanged = true;
+    }
+
+    UMaterialExpressionSpeedTree* SpeedTreeExpression = FindSpeedTreeExpression(Material);
+    if (!SpeedTreeExpression)
+    {
+        SpeedTreeExpression = Cast<UMaterialExpressionSpeedTree>(
+            UMaterialEditingLibrary::CreateMaterialExpression(
+                Material, UMaterialExpressionSpeedTree::StaticClass(), 150, 520));
+        bChanged = SpeedTreeExpression != nullptr || bChanged;
+    }
+    if (SpeedTreeExpression)
+    {
+        const ESpeedTreeGeometryType GeometryType = GuessSpeedTreeGeometryType(Material->GetName());
+        if (SpeedTreeExpression->GeometryType != GeometryType)
+        {
+            SpeedTreeExpression->GeometryType = GeometryType;
+            bChanged = true;
+        }
+        if (SpeedTreeExpression->WindType == STW_None)
+        {
+            SpeedTreeExpression->WindType = STW_Best;
+            bChanged = true;
+        }
+        if (SpeedTreeExpression->LODType != STLOD_Smooth)
+        {
+            SpeedTreeExpression->LODType = STLOD_Smooth;
+            bChanged = true;
+        }
+        if (!EditorOnly->WorldPositionOffset.Expression)
+        {
+            EditorOnly->WorldPositionOffset.Expression = SpeedTreeExpression;
+            bChanged = true;
+        }
+    }
+
+    if (!bChanged)
+    {
+        Material->PostEditChange();
+        return false;
+    }
+
+    Material->PostEditChange();
+    Material->MarkPackageDirty();
+    UMaterialEditingLibrary::RecompileMaterial(Material);
+    return true;
+}
+
+int32 PatchGrassSpeedTreeMaterials(
+    UStaticMesh* Mesh,
+    const FString& AssetRel,
+    const TSharedPtr<FJsonObject>& SpeedTreeEntry,
+    TArray<FString>& ImportedAssets)
+{
+    if (!Mesh || !IsGrassSpeedTreeEntry(AssetRel, SpeedTreeEntry))
+    {
+        return 0;
+    }
+
+    int32 PatchedCount = 0;
+    for (FStaticMaterial& StaticMaterial : Mesh->GetStaticMaterials())
+    {
+        UMaterial* Material = Cast<UMaterial>(StaticMaterial.MaterialInterface.Get());
+        if (!Material)
+        {
+            continue;
+        }
+        if (PatchGrassSpeedTreeMaterial(Material))
+        {
+            ++PatchedCount;
+            ImportedAssets.AddUnique(Material->GetPathName());
+        }
+    }
+
+    if (PatchedCount > 0)
+    {
+        UE_LOG(LogWitcherImportContext, Display,
+            TEXT("Patched %d grass SpeedTree material(s) for '%s' with masked opacity and SpeedTree wind."),
+            PatchedCount, *AssetRel);
+    }
+    return PatchedCount;
+}
+
 void SetStringArray(TSharedPtr<FJsonObject> Object, const FString& Field, const TArray<FString>& Values)
 {
     TArray<TSharedPtr<FJsonValue>> JsonValues;
@@ -1047,7 +1644,7 @@ FString FWitcherImportContext::ImportBundle()
     FSlateNotificationManager::Get().SetAllowNotifications(false);
     ON_SCOPE_EXIT { FSlateNotificationManager::Get().SetAllowNotifications(true); };
 
-    FScopedSlowTask SlowTask(11.0f, FText::FromString(TEXT("Importing Witcher bundle")));
+    FScopedSlowTask SlowTask(11.5f, FText::FromString(TEXT("Importing Witcher bundle")));
     SlowTask.MakeDialog(false);
 
     const double BundleStart = FPlatformTime::Seconds();
@@ -1071,6 +1668,7 @@ FString FWitcherImportContext::ImportBundle()
     TimePhase(TEXT("blueprint"), 1.0f, TEXT("Building blueprint"), [&] { ImportBlueprint(); });
     TimePhase(TEXT("terrain"), 0.5f, TEXT("Importing terrain"), [&] { ImportTerrain(); });
     TimePhase(TEXT("placements"), 0.5f, TEXT("Placing layer actors"), [&] { ImportPlacements(); });
+    TimePhase(TEXT("foliage"), 0.5f, TEXT("Placing foliage"), [&] { ImportFoliage(); });
     TimePhase(TEXT("save"), 1.0f, TEXT("Saving assets"), [&] { SaveImportedPackages(); });
 
     TotalImportSeconds = FPlatformTime::Seconds() - BundleStart;
@@ -1836,7 +2434,20 @@ void FWitcherImportContext::ImportSpeedTrees()
         {
             if (UObject* Existing = LoadAnyAsset(AssetRel))
             {
-                continue;
+                if (UStaticMesh* ExistingMesh = Cast<UStaticMesh>(Existing))
+                {
+                    if (!ExistingSpeedTreeNeedsReimport(ExistingMesh, SpeedTreeEntry))
+                    {
+                        PatchGrassSpeedTreeMaterials(ExistingMesh, AssetRel, SpeedTreeEntry, ImportedAssets);
+                        continue;
+                    }
+                    UE_LOG(LogWitcherImportContext, Display,
+                        TEXT("Reimporting SpeedTree '%s' because its import scale is stale."), *AssetRel);
+                }
+                else
+                {
+                    continue;
+                }
             }
         }
 
@@ -1855,10 +2466,16 @@ void FWitcherImportContext::ImportSpeedTrees()
             continue;
         }
 
+        FScopedSpeedTreeTreeScale ScopedTreeScale(DesiredSpeedTreeTreeScale(SpeedTreeEntry));
+
+        const FString DestinationPath = PackagePathFor(AssetRel);
+        const FString DestinationName = AssetRelName(AssetRel);
         UAssetImportTask* Task = NewObject<UAssetImportTask>();
+        Task->AddToRoot();
+        ON_SCOPE_EXIT { Task->RemoveFromRoot(); };
         Task->Filename = SourceFile;
-        Task->DestinationPath = PackagePathFor(AssetRel);
-        Task->DestinationName = AssetRelName(AssetRel);
+        Task->DestinationPath = DestinationPath;
+        Task->DestinationName = DestinationName;
         Task->Factory = SpeedTreeFactory;
         Task->Options = SpeedTreeOptions;
         Task->bAutomated = true;
@@ -1868,11 +2485,12 @@ void FWitcherImportContext::ImportSpeedTrees()
         FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
         TArray<UAssetImportTask*> Tasks;
         Tasks.Add(Task);
-        const TSet<FString> DirtyPackagesBeforeImport = DirtyPackageNamesUnder(Task->DestinationPath);
+        const TSet<FString> DirtyPackagesBeforeImport = DirtyPackageNamesUnder(DestinationPath);
         AssetToolsModule.Get().ImportAssetTasks(Tasks);
+        const TArray<FString> ImportedObjectPaths = Task->ImportedObjectPaths;
 
         UObject* MainAsset = nullptr;
-        for (const FString& Path : Task->ImportedObjectPaths)
+        for (const FString& Path : ImportedObjectPaths)
         {
             UObject* Imported = StaticLoadObject(UObject::StaticClass(), nullptr, *Path);
             if (!Imported)
@@ -1915,8 +2533,9 @@ void FWitcherImportContext::ImportSpeedTrees()
         {
             ConfigureSpeedTreeLods(StaticMesh, SpeedTreeEntry);
             EnsureSpeedTreeFallbackCollision(StaticMesh, SpeedTreeEntry);
+            PatchGrassSpeedTreeMaterials(StaticMesh, AssetRel, SpeedTreeEntry, ImportedAssets);
         }
-        AddNewDirtyPackagesUnder(Task->DestinationPath, DirtyPackagesBeforeImport, ImportedAssets);
+        AddNewDirtyPackagesUnder(DestinationPath, DirtyPackagesBeforeImport, ImportedAssets);
 
         if (MainAsset->GetPathName() != ObjectPathFor(AssetRel))
         {
@@ -3971,6 +4590,287 @@ void FWitcherImportContext::ImportPlacements()
             EntityCount,
             EntityComponentCount);
     }
+}
+
+UFoliageType_InstancedStaticMesh* FWitcherImportContext::EnsureFoliageType(
+    UStaticMesh* Mesh,
+    const FString& MeshAssetRel,
+    const FString& FoliageFolder)
+{
+    // Save one UFoliageType asset per SpeedTree under the source_foliage cell
+    // folder, so foliage imports are grouped by their source layer instead of
+    // scattered beside the mesh assets they wrap.
+    const FString FtRel = FoliageTypeRelForMesh(MeshAssetRel, FoliageFolder);
+    UFoliageType_InstancedStaticMesh* FoliageType =
+        LoadExistingAsset<UFoliageType_InstancedStaticMesh>(ObjectPathFor(FtRel));
+    const bool bExisting = FoliageType != nullptr;
+    if (bExisting && !ShouldOverwrite(TEXT("meshes")))
+    {
+        ApplyGeneratedFoliageSettings(FoliageType, FoliageType->GetStaticMesh() ? FoliageType->GetStaticMesh() : Mesh, MeshAssetRel);
+        FoliageType->MarkPackageDirty();
+        ImportedAssets.AddUnique(FoliageType->GetPathName());
+        return FoliageType;
+    }
+    if (!FoliageType)
+    {
+        const FString PackageName = FString::Printf(TEXT("%s/%s"), *ContentRoot, *FtRel);
+        UPackage* Package = CreatePackage(*PackageName);
+        FoliageType = NewObject<UFoliageType_InstancedStaticMesh>(
+            Package, *AssetRelName(FtRel), RF_Public | RF_Standalone);
+    }
+    if (!FoliageType)
+    {
+        return nullptr;
+    }
+    FoliageType->SetStaticMesh(Mesh);
+    ApplyGeneratedFoliageSettings(FoliageType, Mesh, MeshAssetRel);
+    if (!bExisting)
+    {
+        FAssetRegistryModule::AssetCreated(FoliageType);
+    }
+    FoliageType->MarkPackageDirty();
+    ImportedAssets.AddUnique(FoliageType->GetPathName());
+    return FoliageType;
+}
+
+void FWitcherImportContext::ImportFoliage()
+{
+    const TSharedPtr<FJsonObject>* FoliagePtr = nullptr;
+    if (!Manifest->TryGetObjectField(TEXT("foliage"), FoliagePtr) || !FoliagePtr)
+    {
+        return;
+    }
+    const TArray<TSharedPtr<FJsonValue>>* Cells = nullptr;
+    if (!(*FoliagePtr)->TryGetArrayField(TEXT("cells"), Cells))
+    {
+        return;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        AddError(TEXT("Foliage import: no editor world available."));
+        return;
+    }
+    // SpeedTree meshes were imported in an earlier phase; block on their compile
+    // so the FoliageTypes reference fully-built meshes (matches ImportPlacements).
+    FAssetCompilingManager::Get().FinishAllCompilation();
+
+    // Foliage edit mode assumes user painting and can crash during programmatic
+    // instance edits, so disable it while importing and restore it after.
+    const bool bCanTouchEditorModes = !IsRunningCommandlet();
+    const bool bFoliageModeWasActive =
+        bCanTouchEditorModes && GLevelEditorModeTools().IsModeActive(FBuiltinEditorModes::EM_Foliage);
+    if (bFoliageModeWasActive)
+    {
+        GLevelEditorModeTools().DeactivateMode(FBuiltinEditorModes::EM_Foliage);
+    }
+    auto RestoreFoliageMode = [bCanTouchEditorModes, bFoliageModeWasActive]()
+    {
+        if (bCanTouchEditorModes && bFoliageModeWasActive)
+        {
+            GLevelEditorModeTools().ActivateMode(FBuiltinEditorModes::EM_Foliage);
+        }
+    };
+
+    // UE 5.8 can dereference a null foliage base component; use a transient
+    // sentinel while still storing imported instances as unbased foliage.
+    IFoliageEditModuleBase* FoliageEditModule = IFoliageEditModuleBase::Get();
+    USceneComponent* NullBaseComponentSentinel = nullptr;
+    bool bRegisteredNullBaseIgnore = false;
+    if (FoliageEditModule)
+    {
+        NullBaseComponentSentinel = NewObject<USceneComponent>(GetTransientPackage(), NAME_None, RF_Transient);
+        if (NullBaseComponentSentinel && !FoliageEditModule->ShouldIgnoreComponentForBaseID(NullBaseComponentSentinel))
+        {
+            FoliageEditModule->RegisterComponentBaseIDClassToIgnore(USceneComponent::StaticClass());
+            bRegisteredNullBaseIgnore = true;
+        }
+    }
+    ON_SCOPE_EXIT
+    {
+        if (FoliageEditModule && bRegisteredNullBaseIgnore)
+        {
+            FoliageEditModule->UnregisterComponentBaseIDClassToIgnore(USceneComponent::StaticClass());
+        }
+        RestoreFoliageMode();
+    };
+
+    int32 TypeCount = 0;
+    int32 InstanceCount = 0;
+    int32 RemovedInstanceCount = 0;
+
+    auto RemoveExistingFoliageForMeshInBounds = [&](UStaticMesh* Mesh, const FBox& Bounds) -> int32
+    {
+        int32 RemovedForType = 0;
+        for (TActorIterator<AInstancedFoliageActor> It(World); It; ++It)
+        {
+            It->ForEachFoliageInfo([&](UFoliageType* ExistingType, FFoliageInfo& Info)
+            {
+                const UFoliageType_InstancedStaticMesh* ExistingMeshType =
+                    Cast<UFoliageType_InstancedStaticMesh>(ExistingType);
+                if (!ExistingMeshType || ExistingMeshType->GetStaticMesh() != Mesh || !Info.IsInitialized())
+                {
+                    return true;
+                }
+
+                TArray<int32> ExistingInstances;
+                Info.GetInstancesInsideBounds(Bounds, ExistingInstances);
+                if (ExistingInstances.Num() > 0)
+                {
+                    Info.RemoveInstances(ExistingInstances, /*RebuildFoliageTree=*/true);
+                    RemovedForType += ExistingInstances.Num();
+                }
+                return true;
+            });
+        }
+        return RemovedForType;
+    };
+
+    for (const TSharedPtr<FJsonValue>& CellValue : *Cells)
+    {
+        const TSharedPtr<FJsonObject> Cell = CellValue->AsObject();
+        if (!Cell.IsValid())
+        {
+            continue;
+        }
+        const FString LayerId = JsonString(Cell, TEXT("layer_id"), TEXT("foliage"));
+        const FString FoliageFolder = FoliageFolderForCell(Cell, LayerId);
+
+        FBox CellBounds(ForceInit);
+        bool bHasCellBounds = false;
+        const TSharedPtr<FJsonObject>* BoundsObject = nullptr;
+        if (Cell->TryGetObjectField(TEXT("bounds"), BoundsObject) && BoundsObject && BoundsObject->IsValid())
+        {
+            FVector2D MinXY(0.0, 0.0);
+            FVector2D MaxXY(0.0, 0.0);
+            if (JsonVector2D(*BoundsObject, TEXT("min"), MinXY) && JsonVector2D(*BoundsObject, TEXT("max"), MaxXY))
+            {
+                CellBounds = FBox(
+                    FVector(FMath::Min(MinXY.X, MaxXY.X), FMath::Min(MinXY.Y, MaxXY.Y), -1.0e12),
+                    FVector(FMath::Max(MinXY.X, MaxXY.X), FMath::Max(MinXY.Y, MaxXY.Y), 1.0e12)).ExpandBy(1.0);
+                bHasCellBounds = true;
+            }
+            else
+            {
+                AddWarning(FString::Printf(TEXT("Foliage cell '%s' has invalid bounds; existing instances will not be replaced."), *LayerId));
+            }
+        }
+
+        const TArray<TSharedPtr<FJsonValue>>* Types = nullptr;
+        if (!Cell->TryGetArrayField(TEXT("types"), Types))
+        {
+            continue;
+        }
+
+        for (const TSharedPtr<FJsonValue>& TypeValue : *Types)
+        {
+            const TSharedPtr<FJsonObject> Type = TypeValue->AsObject();
+            if (!Type.IsValid())
+            {
+                continue;
+            }
+            const FString AssetRel = JsonString(Type, TEXT("asset_path"));
+            const FString TypeName = JsonString(Type, TEXT("name"), TEXT("Foliage"));
+            if (AssetRel.IsEmpty())
+            {
+                AddWarning(FString::Printf(TEXT("Foliage type '%s' has no mesh asset path (cell '%s'); skipped."), *TypeName, *LayerId));
+                continue;
+            }
+            UStaticMesh* Mesh = FindPlacementMesh(AssetRel);
+            if (!Mesh)
+            {
+                AddWarning(FString::Printf(TEXT("Foliage SpeedTree mesh not found for '%s' (cell '%s'); skipped."), *AssetRel, *LayerId));
+                continue;
+            }
+            UFoliageType_InstancedStaticMesh* FoliageType = EnsureFoliageType(Mesh, AssetRel, FoliageFolder);
+            if (!FoliageType)
+            {
+                AddWarning(FString::Printf(TEXT("Could not create a FoliageType for '%s' (cell '%s'); skipped."), *AssetRel, *LayerId));
+                continue;
+            }
+            if (bHasCellBounds)
+            {
+                RemovedInstanceCount += RemoveExistingFoliageForMeshInBounds(Mesh, CellBounds);
+            }
+
+            const TArray<TSharedPtr<FJsonValue>>* Instances = nullptr;
+            if (!Type->TryGetArrayField(TEXT("instances"), Instances) || Instances->Num() == 0)
+            {
+                continue;
+            }
+
+            TArray<FTransform> Transforms;
+            Transforms.Reserve(Instances->Num());
+            for (const TSharedPtr<FJsonValue>& InstanceValue : *Instances)
+            {
+                const TSharedPtr<FJsonObject> Instance = InstanceValue->AsObject();
+                if (!Instance.IsValid())
+                {
+                    continue;
+                }
+                const FVector Location = JsonVector(Instance, TEXT("location"), FVector::ZeroVector);
+                const FQuat Rotation = JsonQuat(Instance, TEXT("rotation"));
+                const FVector ScaleVec = JsonVector(Instance, TEXT("scale"), FVector::OneVector);
+                if (!IsUsablePlacementTransform(Location, Rotation, ScaleVec))
+                {
+                    AddWarning(FString::Printf(TEXT("Foliage type '%s' has an invalid instance transform (cell '%s'); instance skipped."), *TypeName, *LayerId));
+                    continue;
+                }
+                Transforms.Emplace(Rotation, Location, ScaleVec);
+            }
+
+            if (Transforms.Num() > 0)
+            {
+                // Inline AddInstances because it is BlueprintCallable but not
+                // FOLIAGE_API-exported; grouping by IFA keeps WP placement correct.
+                TMap<AInstancedFoliageActor*, TArray<const FFoliageInstance*>> InstancesByIFA;
+                TArray<FFoliageInstance> FoliageInstances;
+                FoliageInstances.Reserve(Transforms.Num());
+                for (const FTransform& Xform : Transforms)
+                {
+                    AInstancedFoliageActor* IFA = AInstancedFoliageActor::Get(
+                        World, /*bCreateIfNone=*/true, World->PersistentLevel, Xform.GetLocation());
+                    if (!IFA)
+                    {
+                        continue;
+                    }
+                    if (!FoliageFolder.IsEmpty() && IFA->GetFolderPath().IsNone())
+                    {
+                        IFA->SetFolderPath(FName(*FoliageFolder));
+                    }
+                    FFoliageInstance FoliageInstance;
+                    FoliageInstance.Location = Xform.GetLocation();
+                    FoliageInstance.Rotation = Xform.GetRotation().Rotator();
+                    FoliageInstance.DrawScale3D = (FVector3f)Xform.GetScale3D();
+                    FoliageInstance.BaseComponent = NullBaseComponentSentinel;
+                    const int32 Idx = FoliageInstances.Add(FoliageInstance);
+                    InstancesByIFA.FindOrAdd(IFA).Add(&FoliageInstances[Idx]);
+                }
+
+                int32 AddedForType = 0;
+                for (const TPair<AInstancedFoliageActor*, TArray<const FFoliageInstance*>>& Pair : InstancesByIFA)
+                {
+                    FFoliageInfo* Info = nullptr;
+                    UFoliageType* LocalType = Pair.Key->AddFoliageType(FoliageType, &Info);
+                    if (LocalType && Info)
+                    {
+                        Info->AddInstances(LocalType, Pair.Value);
+                        AddedForType += Pair.Value.Num();
+                    }
+                }
+                InstanceCount += AddedForType;
+                if (AddedForType > 0)
+                {
+                    ++TypeCount;
+                }
+            }
+        }
+    }
+
+    UE_LOG(LogWitcherImportContext, Log,
+        TEXT("Foliage: %d type(s), %d instance(s) placed into the level InstancedFoliageActor; %d existing instance(s) replaced."),
+        TypeCount, InstanceCount, RemovedInstanceCount);
 }
 
 FString FWitcherImportContext::ResolveBundleFile(const FString& RelativePath) const

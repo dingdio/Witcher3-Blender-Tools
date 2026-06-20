@@ -7951,8 +7951,8 @@ class SelectCacheTypeOperator(Operator):
                     continue
                 folder_structure.add_path(key_str)
 
-_UNREAL_BROWSER_SEND_EXTS = {".w2ent", ".w3app", ".w2mesh", ".w2l", ".srt"}
-_UNREAL_BROWSER_HEADLESS_EXTS = {".w2l", ".srt"}
+_UNREAL_BROWSER_SEND_EXTS = {".w2ent", ".w3app", ".w2mesh", ".w2l", ".w2w", ".srt", ".flyr"}
+_UNREAL_BROWSER_HEADLESS_EXTS = {".w2l", ".srt", ".flyr"}
 
 
 def _browser_item_is_headless_unreal_send(item_path: str) -> bool:
@@ -8043,6 +8043,16 @@ def _browser_select_send_objects(context, imported_objects):
         obj.select_set(True)
     context.view_layer.objects.active = selected[0]
     return selected
+
+
+def _browser_selected_full_map_terrain(selected_objects):
+    for obj in selected_objects or []:
+        try:
+            if obj.get("terrain_mode") == "full_map":
+                return obj
+        except Exception:
+            pass
+    return None
 
 
 class FileActionOperatorImportToScene(Operator):
@@ -8858,7 +8868,7 @@ class FileActionSendToUnrealOperator(Operator):
     def execute(self, context):
         cache_type = _browser_operator_cache_type(context, self.cache_type)
         if not _browser_item_can_send_to_unreal(cache_type, self.file_path):
-            self.report({'WARNING'}, "Send to Unreal is available for entity, mesh, .srt SpeedTree, and .w2l layer browser items.")
+            self.report({'WARNING'}, "Send to Unreal is available for entity, mesh, .w2w terrain, .srt SpeedTree, .w2l layer, and .flyr foliage browser items.")
             return {'CANCELLED'}
         if not hasattr(context.scene, "witcher_unreal_export"):
             self.report({'ERROR'}, "Unreal export tools are not registered.")
@@ -8877,8 +8887,11 @@ class FileActionSendToUnrealOperator(Operator):
             return {'CANCELLED'}
 
         if _browser_item_is_headless_unreal_send(self.file_path):
-            if os.path.splitext(_normalize_virtual_path(self.file_path))[1].lower() == ".srt":
+            headless_ext = os.path.splitext(_normalize_virtual_path(self.file_path))[1].lower()
+            if headless_ext == ".srt":
                 return self._send_srt_headless(context, cache_type)
+            if headless_ext == ".flyr":
+                return self._send_flyr_headless(context, cache_type)
             return self._send_w2l_headless(context, cache_type)
 
         before_objects = set(bpy.data.objects)
@@ -8896,11 +8909,23 @@ class FileActionSendToUnrealOperator(Operator):
             imported_objects = [obj for obj in bpy.data.objects if obj not in before_objects]
             selected = _browser_select_send_objects(context, imported_objects)
             if not selected:
-                self.report({'ERROR'}, "No imported mesh or armature was available to send.")
+                self.report({'ERROR'}, "No imported terrain, mesh, or armature was available to send.")
                 return {'CANCELLED'}
 
             try:
-                result = bpy.ops.witcher.export_unreal_item(action='SEND')
+                imported_ext = os.path.splitext(_normalize_virtual_path(self.file_path))[1].lower()
+                terrain_obj = _browser_selected_full_map_terrain(selected)
+                if imported_ext == ".w2w" and terrain_obj is None:
+                    message = "No full-map terrain was imported. Set Terrain Import to Full Map, then send the .w2w again."
+                    settings.last_status = "Unreal terrain export failed"
+                    settings.last_details = message
+                    self.report({'ERROR'}, message)
+                    return {'CANCELLED'}
+                result = (
+                    bpy.ops.witcher.export_unreal_world(action='SEND')
+                    if terrain_obj is not None
+                    else bpy.ops.witcher.export_unreal_item(action='SEND')
+                )
             except RuntimeError as exc:
                 message = str(exc).replace("Error: ", "").strip() or "Unreal send failed."
                 settings.last_status = "Unreal import failed"
@@ -8927,6 +8952,26 @@ class FileActionSendToUnrealOperator(Operator):
         except RuntimeError as exc:
             message = str(exc).replace("Error: ", "").strip() or "Unreal layer send failed."
             settings.last_status = "Unreal layer import failed"
+            settings.last_details = message
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
+
+    def _send_flyr_headless(self, context, cache_type):
+        settings = context.scene.witcher_unreal_export
+        state = self._build_import_state(context)
+        flyr_arg = state["full_path"]
+        try:
+            if is_disk_cache(cache_type):
+                abs_path = get_disk_abs_path(cache_type, state["full_path"])
+                if abs_path:
+                    flyr_arg = abs_path
+        except Exception:
+            pass
+        try:
+            return bpy.ops.witcher.export_unreal_flyr(action='SEND', flyr_path=flyr_arg)
+        except RuntimeError as exc:
+            message = str(exc).replace("Error: ", "").strip() or "Unreal foliage send failed."
+            settings.last_status = "Unreal foliage import failed"
             settings.last_details = message
             self.report({'ERROR'}, message)
             return {'CANCELLED'}

@@ -18,6 +18,7 @@ from . import world_bundle
 from . import placements_bundle
 from . import w2l_placements
 from . import speedtree_bundle
+from . import foliage_bundle
 from . import plugin_install
 from . import unreal_project
 from .socket_client import probe_import_server, send_import_request
@@ -143,9 +144,7 @@ class WITCHER_PG_UnrealExportSettings(bpy.types.PropertyGroup):
         default=False,
         description="Show which existing Unreal assets a re-import is allowed to replace",
     )
-    # Per-category overwrite policy. All default False (reuse every existing
-    # Unreal asset) -- the historical "existing UE assets win" behaviour. These
-    # serialize into the manifest's ``overwrite`` block; see manifest.py.
+    # Per-category overwrite policy. All default False
     overwrite_meshes: BoolProperty(
         name="Meshes",
         default=False,
@@ -218,6 +217,11 @@ class WITCHER_PG_UnrealExportSettings(bpy.types.PropertyGroup):
             "(fastest, for placement iteration). Off by default; full material sends "
             "stage cached PNG textures and use packed alpha in the Unreal shader"
         ),
+    )
+    include_world_foliage: BoolProperty(
+        name="Foliage",
+        default=True,
+        description="Include all .flyr cells from the world's source_foliage folder when sending terrain",
     )
     export_folder: StringProperty(name="Export Folder", subtype="DIR_PATH", default="")
     content_root: StringProperty(
@@ -615,6 +619,95 @@ class WITCHER_OT_export_unreal_srt(bpy.types.Operator):
             return {"FINISHED"}
         except Exception as exc:
             settings.last_status = "Unreal SpeedTree export failed"
+            settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+
+class WITCHER_OT_export_unreal_flyr(bpy.types.Operator):
+    bl_idname = "witcher.export_unreal_flyr"
+    bl_label = "Send .flyr Foliage to Unreal"
+    bl_description = (
+        "Parse a Witcher .flyr foliage layer directly and send its SpeedTree "
+        "instances to Unreal"
+    )
+    bl_options = {"REGISTER"}
+
+    flyr_path: StringProperty(
+        name=".flyr",
+        description="Depot or absolute path to the .flyr foliage layer file",
+        subtype="FILE_PATH",
+        default="",
+    )
+    action: EnumProperty(
+        name="Action",
+        items=[
+            ("BUNDLE", "Export Bundle", "Write the SpeedTrees, textures, placements, and manifest"),
+            ("SEND", "Send to Unreal", "Write the bundle and send it to the running Unreal plugin"),
+        ],
+        default="SEND",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context is not None and context.scene is not None
+
+    def execute(self, context):
+        button_started = time.perf_counter()
+        settings = context.scene.witcher_unreal_export
+        if not settings.export_folder:
+            settings.export_folder = bundle.default_export_folder()
+        if not str(getattr(self, "flyr_path", "") or "").strip():
+            settings.last_status = "No .flyr selected"
+            settings.last_details = "Select a .flyr foliage layer file before sending to Unreal."
+            self.report({"ERROR"}, settings.last_details)
+            return {"CANCELLED"}
+        if self.action == "SEND":
+            connection_error = _preflight_send_connection(settings)
+            if connection_error:
+                return _cancel_unreachable_unreal(self, settings, connection_error)
+
+        try:
+            with _quiet_send_logging(settings, self.action):
+                result = foliage_bundle.build_unreal_flyr_bundle(context, settings, self.flyr_path)
+                settings.last_manifest_path = result["manifest_path"]
+                warning_count = len(result["manifest"].get("warnings", []))
+                settings.last_status = f"Foliage bundle ready ({warning_count} warning{'s' if warning_count != 1 else ''})"
+                settings.last_details = _format_flyr_bundle_details(result)
+
+                if self.action == "SEND":
+                    settings.last_status = "Sending foliage to Unreal"
+                    send_started = time.perf_counter()
+                    response = send_import_request(settings.host, settings.port, result["manifest_path"])
+                    send_seconds = time.perf_counter() - send_started
+                    total_seconds = time.perf_counter() - button_started
+                    success = _ue_import_succeeded(response)
+                    if _ue_response_lost(response):
+                        settings.last_status = "Unreal foliage import sent; response lost"
+                    else:
+                        settings.last_status = "Unreal foliage import complete" if success else "Unreal foliage import failed"
+                    if success:
+                        settings.last_status += _ue_status_suffix(response, result["manifest"].get("warnings", []))
+                    timing_report = _format_send_timing_report(
+                        result.get("asset_name", "Foliage"),
+                        total_seconds,
+                        float(result.get("elapsed_seconds", 0.0) or 0.0),
+                        send_seconds,
+                        response,
+                        None,
+                    )
+                    print(timing_report)
+                    settings.last_details += "\n\n" + timing_report
+                    settings.last_details += "\n\nUnreal response:\n" + json.dumps(response, indent=2)
+                    if not success:
+                        self.report({"ERROR"}, settings.last_status)
+                        return {"CANCELLED"}
+                    settings.last_status += f" ({total_seconds:.1f}s)"
+
+            self.report(_ue_report_level(settings.last_status), settings.last_status)
+            return {"FINISHED"}
+        except Exception as exc:
+            settings.last_status = "Unreal foliage export failed"
             settings.last_details = f"{exc}\n\n{traceback.format_exc()}"
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1114,6 +1207,8 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
 
         box.separator()
         box.label(text="World Terrain (Landscape)", icon="WORLD")
+        terrain_opts = box.column(align=True)
+        terrain_opts.prop(settings, "include_world_foliage", text="Include Foliage")
         world_row = box.row(align=True)
         w_bundle = world_row.operator(
             WITCHER_OT_export_unreal_world.bl_idname, text="Export Terrain", icon="FILE_TICK"
@@ -1512,11 +1607,39 @@ def _format_srt_bundle_details(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_flyr_bundle_details(result: dict) -> str:
+    manifest = result.get("manifest", {})
+    counts = result.get("counts", {}) or {}
+    texture_stats = result.get("texture_stats", {}) or {}
+    lines = [
+        f"Foliage: {result.get('layer_id', '') or result.get('flyr_path', '')}",
+        f"Asset: {result.get('asset_name', '')}",
+        f"Bundle: {result.get('bundle_root', '')}",
+        f"Manifest: {result.get('manifest_path', '')}",
+        f"Content root: {manifest.get('content_root', '')}",
+        "",
+        "Foliage:",
+        f"- SpeedTree types (FoliageTypes): {counts.get('tree_types', 0)}",
+        f"- Instances: {counts.get('instances', 0)}",
+        f"- Missing .srt sources: {counts.get('missing_srt', 0)}",
+        f"- Textures staged: {texture_stats.get('staged', 0)} / {texture_stats.get('requested', 0)}",
+        "",
+        "Warnings:",
+    ]
+    warnings = manifest.get("warnings", [])
+    if warnings:
+        lines.extend(f"- {warning}" for warning in warnings)
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
 def _format_world_bundle_details(result: dict) -> str:
     manifest = result.get("manifest", {})
     terrain = manifest.get("terrain", {}) or {}
     transform = terrain.get("transform", {}) or {}
     elevation = terrain.get("elevation", {}) or {}
+    foliage_stats = result.get("foliage_stats", {}) or {}
     lines = [
         f"Asset: {result.get('asset_name', '')}",
         f"Bundle: {result.get('bundle_root', '')}",
@@ -1535,6 +1658,15 @@ def _format_world_bundle_details(result: dict) -> str:
         f"- Scale (cm): {transform.get('scale', '')}",
         f"- Base colour tex: {terrain.get('base_color_texture', '') or '(none)'}",
         "",
+        "Foliage:",
+        f"- Cells: {foliage_stats.get('cells_exported', 0)} / {foliage_stats.get('cells_found', 0)}",
+        f"- SpeedTrees staged: {foliage_stats.get('speedtrees', 0)}",
+        f"- FoliageTypes: {foliage_stats.get('tree_types', 0)}",
+        f"- Instances: {foliage_stats.get('instances', 0)}",
+        f"- Missing .srt sources: {foliage_stats.get('missing_srt', 0)}",
+        f"- Cell cache hits: {foliage_stats.get('cache_hits', 0)}",
+        f"- Textures staged: {foliage_stats.get('textures_staged', 0)} / {foliage_stats.get('textures_requested', 0)}",
+        "",
         "Warnings:",
     ]
     warnings = manifest.get("warnings", [])
@@ -1552,6 +1684,7 @@ classes = (
     WITCHER_OT_export_unreal_placements,
     WITCHER_OT_export_unreal_w2l,
     WITCHER_OT_export_unreal_srt,
+    WITCHER_OT_export_unreal_flyr,
     WITCHER_OT_send_unreal_layers_around_camera,
     WITCHER_OT_send_unreal_layer_collection,
     WITCHER_OT_send_unreal_layer_group_collection,

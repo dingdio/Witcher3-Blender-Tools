@@ -27,48 +27,12 @@ def build_unreal_srt_bundle(context, settings, srt_path: str, depot_path: str = 
     os.makedirs(_safe_path(bundle_root), exist_ok=True)
 
     warnings: list[str] = []
-    staged_srt_path = _stage_srt_source(abs_srt_path, resolved_depot_path, bundle_root)
-    texture_files, texture_stats = _stage_srt_textures(
-        context,
-        abs_srt_path,
-        resolved_depot_path,
-        os.path.dirname(staged_srt_path),
-        bundle_root,
-        warnings,
+    speedtree_entry, texture_stats = build_speedtree_entry(
+        context, settings, abs_srt_path, resolved_depot_path, bundle_root, warnings
     )
 
     source_game = "w3"
     content_root = _resolve_content_root_setting(getattr(settings, "content_root", ""), source_game)
-    asset_path = depot_asset_rel(resolved_depot_path or os.path.basename(abs_srt_path))
-    speedtree_entry = {
-        "asset_path": asset_path,
-        "depot_path": _depot_display_path(resolved_depot_path),
-        "file": relpath_for_manifest(staged_srt_path, bundle_root),
-        "texture_files": texture_files,
-        "missing_textures": texture_stats["missing"],
-        "force_import": True,
-        "import_options": {
-            "create_materials": True,
-            "include_collision": True,
-            "fallback_trunk_collision": True,
-            "include_vertex_processing": True,
-            "include_wind": True,
-            "include_smooth_lod": True,
-            "lod_screen_sizes": [1.0, 0.04, 0.02, 0.01, 0.005, 0.0025],
-        },
-    }
-
-    if texture_stats["requested"] and texture_stats["missing"]:
-        warnings.append(
-            f"SRT textures missing for {os.path.basename(abs_srt_path)}: "
-            + ", ".join(texture_stats["missing"][:8])
-            + ("..." if len(texture_stats["missing"]) > 8 else "")
-        )
-    elif not texture_stats["requested"]:
-        warnings.append(
-            f"No SRT texture references were discovered for {os.path.basename(abs_srt_path)}; "
-            "Unreal will import only textures it can resolve from the .srt file."
-        )
 
     manifest = build_manifest(
         asset_name=asset_name,
@@ -94,6 +58,64 @@ def build_unreal_srt_bundle(context, settings, srt_path: str, depot_path: str = 
         "texture_stats": texture_stats,
         "elapsed_seconds": time.perf_counter() - started,
     }
+
+
+def build_speedtree_entry(
+    context,
+    settings,
+    abs_srt_path: str,
+    resolved_depot_path: str,
+    bundle_root: str,
+    warnings: list[str],
+    *,
+    force_import: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Stage one .srt plus its textures into ``bundle_root`` and return its
+    ``speedtrees`` manifest entry and texture stats. Shared by the single-srt
+    send and the .flyr foliage send, which stages many trees into one bundle."""
+    staged_srt_path = _stage_srt_source(abs_srt_path, resolved_depot_path, bundle_root)
+    texture_files, texture_stats = _stage_srt_textures(
+        context,
+        abs_srt_path,
+        resolved_depot_path,
+        os.path.dirname(staged_srt_path),
+        bundle_root,
+        warnings,
+    )
+
+    asset_path = depot_asset_rel(resolved_depot_path or os.path.basename(abs_srt_path))
+    speedtree_entry = {
+        "asset_path": asset_path,
+        "depot_path": _depot_display_path(resolved_depot_path),
+        "file": relpath_for_manifest(staged_srt_path, bundle_root),
+        "texture_files": texture_files,
+        "missing_textures": texture_stats["missing"],
+        "force_import": bool(force_import),
+        "import_options": {
+            "tree_scale": 100.0,
+            "create_materials": True,
+            "include_collision": True,
+            "fallback_trunk_collision": True,
+            "include_vertex_processing": True,
+            "include_wind": True,
+            "include_smooth_lod": True,
+            "lod_screen_sizes": [1.0, 0.04, 0.02, 0.01, 0.005, 0.0025],
+        },
+    }
+
+    if texture_stats["requested"] and texture_stats["missing"]:
+        warnings.append(
+            f"SRT textures missing for {os.path.basename(abs_srt_path)}: "
+            + ", ".join(texture_stats["missing"][:8])
+            + ("..." if len(texture_stats["missing"]) > 8 else "")
+        )
+    elif not texture_stats["requested"]:
+        warnings.append(
+            f"No SRT texture references were discovered for {os.path.basename(abs_srt_path)}; "
+            "Unreal will import only textures it can resolve from the .srt file."
+        )
+
+    return speedtree_entry, texture_stats
 
 
 def _resolve_srt_source(context, srt_path: str, depot_path: str = "") -> tuple[str, str]:

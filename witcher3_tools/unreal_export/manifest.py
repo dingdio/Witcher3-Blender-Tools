@@ -252,6 +252,7 @@ def build_manifest(
     blueprint: dict[str, Any] | None = None,
     terrain: dict[str, Any] | None = None,
     placements: dict[str, Any] | None = None,
+    foliage: dict[str, Any] | None = None,
     warnings: Iterable[str] = (),
 ) -> dict[str, Any]:
     game = normalize_source_game(source_game)
@@ -278,4 +279,6 @@ def build_manifest(
         manifest["terrain"] = terrain
     if placements:
         manifest["placements"] = placements
+    if foliage:
+        manifest["foliage"] = foliage
     return manifest

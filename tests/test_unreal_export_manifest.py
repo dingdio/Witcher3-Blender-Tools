@@ -1146,6 +1146,32 @@ class TestManifest(unittest.TestCase):
         )
         self.assertTrue(manifest["speedtrees"][0]["force_import"])
 
+    def test_manifest_includes_foliage_cells(self):
+        manifest = build_manifest(
+            asset_name="foliage_320.00_192.00",
+            bundle_root=r"F:\exports\foliage",
+            speedtrees=[{"asset_path": "environment/vegetation/trees/malus/malus", "force_import": True}],
+            foliage={"cells": [{
+                "layer_id": r"levels\prolog_village\source_foliage\foliage_320.00_192.00.flyr",
+                "label": "foliage_320.00_192.00",
+                "folder": "levels/prolog_village/source_foliage",
+                "bounds": {"min": [0.0, 0.0], "max": [6400.0, 6400.0]},
+                "types": [{
+                    "name": "malus",
+                    "asset_path": "environment/vegetation/trees/malus/malus",
+                    "instances": [{"location": [1.0, 2.0, 3.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]}],
+                }],
+            }]},
+        )
+
+        cell = manifest["foliage"]["cells"][0]
+        self.assertEqual(cell["types"][0]["asset_path"], "environment/vegetation/trees/malus/malus")
+        # The FoliageType wraps the same mesh the SpeedTree import produces.
+        self.assertEqual(cell["types"][0]["asset_path"], manifest["speedtrees"][0]["asset_path"])
+        self.assertEqual(len(cell["types"][0]["instances"]), 1)
+        # Foliage uses the `foliage` section, never `placements`.
+        self.assertNotIn("placements", manifest)
+
     def test_speedtree_bundle_declares_material_and_wind_import_options(self):
         with tempfile.TemporaryDirectory() as tmp:
             srt_path = Path(tmp) / "malus.srt"
@@ -1172,6 +1198,7 @@ class TestManifest(unittest.TestCase):
         entry = result["manifest"]["speedtrees"][0]
         self.assertTrue(entry["force_import"])
         self.assertEqual(entry["asset_path"], "environment/vegetation/trees/malus/malus")
+        self.assertEqual(entry["import_options"]["tree_scale"], 100.0)
         self.assertTrue(entry["import_options"]["create_materials"])
         self.assertTrue(entry["import_options"]["include_collision"])
         self.assertTrue(entry["import_options"]["fallback_trunk_collision"])

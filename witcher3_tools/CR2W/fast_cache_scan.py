@@ -1,5 +1,6 @@
 import io
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -1358,16 +1359,21 @@ def _foliage_transform_position(transform):
 def _copy_foliage_transform(transform):
     if transform is None:
         return None
+    scale = float(getattr(transform, "Yaw", 1.0) or 1.0)
+    qz = float(getattr(transform, "Pitch", 0.0) or 0.0)
+    qw = float(getattr(transform, "Roll", 1.0) or 1.0)
     return {
         "X": float(getattr(transform, "X", 0.0) or 0.0),
         "Y": float(getattr(transform, "Y", 0.0) or 0.0),
         "Z": float(getattr(transform, "Z", 0.0) or 0.0),
-        "Yaw": float(getattr(transform, "Yaw", 0.0) or 0.0),
-        "Pitch": float(getattr(transform, "Pitch", 0.0) or 0.0),
-        "Roll": float(getattr(transform, "Roll", 0.0) or 0.0),
-        "Scale_x": 1.0,
-        "Scale_y": 1.0,
-        "Scale_z": 1.0,
+        "Yaw": math.degrees(2.0 * math.atan2(qz, qw)),
+        "Pitch": 0.0,
+        "Roll": 0.0,
+        "Scale_x": scale,
+        "Scale_y": scale,
+        "Scale_z": scale,
+        "Quat_z": qz,
+        "Quat_w": qw,
     }
 
 

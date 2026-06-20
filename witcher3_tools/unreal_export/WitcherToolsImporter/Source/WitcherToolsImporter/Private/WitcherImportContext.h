@@ -38,6 +38,11 @@ private:
     void ImportBlueprint();
     void ImportTerrain();
     void ImportPlacements();
+    void ImportFoliage();
+    class UFoliageType_InstancedStaticMesh* EnsureFoliageType(
+        class UStaticMesh* Mesh,
+        const FString& MeshAssetRel,
+        const FString& FoliageFolder);
     class UStaticMesh* FindPlacementMesh(const FString& AssetRel);
     class UTexture2DArray* BuildTerrainTextureArray(const TArray<class UTexture2D*>& Slices, const FString& AssetRel, bool bNormal);
     UMaterialInterface* BuildTerrainBlendMaterial(const TSharedPtr<FJsonObject>& Terrain, const FString& AssetRel);

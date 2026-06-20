@@ -1098,6 +1098,8 @@ def import_combined_terrain_full_map(
 
 
 FULLMAP_BAKE_RES_DEFAULT = 8192
+TERRAIN_LAYER_COLOR_CACHE_VERSION = 2
+_TERRAIN_LAYER_FALLBACK_COLOR = (0.3, 0.3, 0.3)
 
 
 def _get_scene_terrain_bake_res():
@@ -1112,6 +1114,55 @@ def _terrain_bake_enabled():
         return bool(getattr(bpy.context.scene.witcher_file_browser, "terrain_bake_diffuse", True))
     except Exception:
         return True
+
+
+def _terrain_layer_color_cache_path(output_dir, hub_name):
+    return os.path.join(output_dir, f"{hub_name}.layercolors.json")
+
+
+def _looks_like_fallback_layer_colors(colors):
+    try:
+        arr = np.asarray(colors, dtype=np.float32)
+    except Exception:
+        return False
+    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] != 3:
+        return False
+    fallback = np.asarray(_TERRAIN_LAYER_FALLBACK_COLOR, dtype=np.float32)
+    return bool(np.allclose(arr, fallback[None, :], atol=1e-6))
+
+
+def _cached_layer_colors_are_complete(cached):
+    if not isinstance(cached, dict) or not cached.get("colors"):
+        return False
+    if "complete" in cached and not bool(cached.get("complete")):
+        return False
+    try:
+        if int(cached.get("missing_colors", 0) or 0) > 0:
+            return False
+    except Exception:
+        return False
+    # Legacy cache files did not record completeness. Reject the known poisoned
+    # state where every layer was cached as the fallback gray.
+    if "complete" not in cached and "missing_colors" not in cached:
+        if _looks_like_fallback_layer_colors(cached.get("colors")):
+            return False
+    return True
+
+
+def _read_cached_layer_colors(cache_path, texarray):
+    if not os.path.isfile(cache_path):
+        return None
+    try:
+        import json
+        with open(cache_path, "r") as f:
+            cached = json.load(f)
+        if cached.get("texarray") != texarray:
+            return None
+        if not _cached_layer_colors_are_complete(cached):
+            return None
+        return np.array(cached["colors"], dtype=np.float32)
+    except Exception:
+        return None
 
 
 def _terrain_preview_image_path(texture_path):
@@ -1194,7 +1245,7 @@ def _avg_dds_color(dds_path):
 
 def _compute_terrain_layer_colors(worldFile, output_dir, hub_name):
     import json
-    cache_path = os.path.join(output_dir, f"{hub_name}.layercolors.json")
+    cache_path = _terrain_layer_color_cache_path(output_dir, hub_name)
     try:
         from ..unreal_export.terrain_material import extract_terrain_material_set
         mset = extract_terrain_material_set(worldFile)
@@ -1204,14 +1255,9 @@ def _compute_terrain_layer_colors(worldFile, output_dir, hub_name):
 
     texarray = getattr(mset, "diffuse_texarray", "") if mset else ""
 
-    if os.path.isfile(cache_path):
-        try:
-            with open(cache_path, "r") as f:
-                cached = json.load(f)
-            if cached.get("texarray") == texarray and cached.get("colors"):
-                return np.array(cached["colors"], dtype=np.float32)
-        except Exception:
-            pass
+    cached_colors = _read_cached_layer_colors(cache_path, texarray)
+    if cached_colors is not None:
+        return cached_colors
 
     if not mset or not getattr(mset, "layers", None):
         if mset and getattr(mset, "warnings", None):
@@ -1235,7 +1281,13 @@ def _compute_terrain_layer_colors(worldFile, output_dir, hub_name):
 
     try:
         with open(cache_path, "w") as f:
-            json.dump({"texarray": texarray, "colors": colors}, f)
+            json.dump({
+                "version": TERRAIN_LAYER_COLOR_CACHE_VERSION,
+                "texarray": texarray,
+                "colors": colors,
+                "complete": missing_colors == 0,
+                "missing_colors": missing_colors,
+            }, f)
     except Exception:
         pass
     return np.array(colors, dtype=np.float32)
@@ -1247,13 +1299,23 @@ def _bake_fullmap_diffuse(worldFile, output_dir, hub_name, tiles, tile_res, n_ti
     try:
         baked_path = os.path.join(output_dir, f"{hub_name}.terrain_baked.png")
         src_mtime = terrain_w2ter._max_source_mtime(buffer_paths)
-        if terrain_w2ter._is_fresh(baked_path, src_mtime):
+        cache_path = _terrain_layer_color_cache_path(output_dir, hub_name)
+        cache_mtime = terrain_w2ter._safe_mtime(cache_path)
+        cache_complete = False
+        try:
+            import json
+            with open(cache_path, "r") as f:
+                cache_complete = _cached_layer_colors_are_complete(json.load(f))
+        except Exception:
+            cache_complete = False
+        if cache_complete and terrain_w2ter._is_fresh(baked_path, max(src_mtime, cache_mtime)):
             return baked_path
 
         layer_colors = _compute_terrain_layer_colors(worldFile, output_dir, hub_name)
         if layer_colors is None or not len(layer_colors):
             log.info("Terrain bake skipped (no layer colors); using overlay palette")
             return None
+        src_mtime = max(src_mtime, terrain_w2ter._safe_mtime(cache_path))
         return terrain_w2ter.bake_terrain_fullmap_from_tiles(
             tiles, tile_res, n_tiles, n_tiles, layer_colors, baked_path,
             out_res=_get_scene_terrain_bake_res(),

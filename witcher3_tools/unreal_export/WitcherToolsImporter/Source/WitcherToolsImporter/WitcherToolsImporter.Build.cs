@@ -24,6 +24,7 @@ public class WitcherToolsImporter : ModuleRules
             "MaterialEditor",
             "UnrealEd",
             "WitcherToolsRuntime",
+            "Foliage",
             "Landscape",
             "LandscapeEditor",
             "MeshDescription",
