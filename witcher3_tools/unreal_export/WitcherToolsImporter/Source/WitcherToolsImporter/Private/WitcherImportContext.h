@@ -9,6 +9,8 @@ class UAnimSequence;
 class USkeleton;
 class UTexture;
 class UObject;
+class UWorld;
+class AActor;
 class FJsonObject;
 class FJsonValue;
 
@@ -44,6 +46,33 @@ private:
         const FString& MeshAssetRel,
         const FString& FoliageFolder);
     class UStaticMesh* FindPlacementMesh(const FString& AssetRel);
+
+    struct FPlacementLayer
+    {
+        UWorld* World = nullptr;
+        FString LayerId;
+        FName LayerTag;
+        FString MeshFolder;
+        FString CollisionFolder;
+        FString LightFolder;
+        FString EntityFolder;
+    };
+    struct FPlacementLayerStats
+    {
+        int32 Actors = 0;
+        int32 CollisionActors = 0;
+        int32 Instances = 0;
+        int32 Lights = 0;
+        int32 Entities = 0;
+        int32 EntityComponents = 0;
+    };
+    bool ArePlacementLayerMeshesReady(const TSharedPtr<FJsonObject>& Layer, const FString& LayerId);
+    void TagPlacementActor(const FPlacementLayer& Layer, AActor* Actor, const FString& ActorName, const FString& ActorFolder);
+    void ImportPlacementActors(const FPlacementLayer& Layer, const TArray<TSharedPtr<FJsonValue>>& Actors, FPlacementLayerStats& Stats);
+    void ImportPlacementInstancers(const FPlacementLayer& Layer, const TArray<TSharedPtr<FJsonValue>>& Instancers, FPlacementLayerStats& Stats);
+    void ImportPlacementLights(const FPlacementLayer& Layer, const TArray<TSharedPtr<FJsonValue>>& Lights, FPlacementLayerStats& Stats);
+    void ImportPlacementEntities(const FPlacementLayer& Layer, const TArray<TSharedPtr<FJsonValue>>& Entities, FPlacementLayerStats& Stats);
+
     class UTexture2DArray* BuildTerrainTextureArray(const TArray<class UTexture2D*>& Slices, const FString& AssetRel, bool bNormal);
     UMaterialInterface* BuildTerrainBlendMaterial(const TSharedPtr<FJsonObject>& Terrain, const FString& AssetRel);
 
