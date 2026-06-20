@@ -205,6 +205,7 @@ void FWitcherImportContext::ImportMasters()
     }
 }
 
+
 UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr<FJsonObject>& MasterObject)
 {
     if (!MasterObject.IsValid())
@@ -294,6 +295,21 @@ UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr
         UMaterialEditingLibrary::DeleteAllMaterialExpressions(Material);
     }
 
+    FMasterMaterialSources Sources;
+    CreateMasterMaterialParams(Material, MasterObject, AssetRel, Sources);
+    WireMasterMaterialPins(Material, Sources);
+
+    Material->PostEditChange();
+    Material->MarkPackageDirty();
+    UMaterialEditingLibrary::RecompileMaterial(Material);
+    ImportedAssets.AddUnique(Material->GetPathName());
+    MastersByRel.Add(AssetRel, Material);
+    return Material;
+}
+
+void FWitcherImportContext::CreateMasterMaterialParams(
+    UMaterial* Material, const TSharedPtr<FJsonObject>& MasterObject, const FString& AssetRel, FMasterMaterialSources& Out)
+{
     UMaterialExpression* BaseColorSource = nullptr;
     UMaterialExpression* NormalSource = nullptr;
     UMaterialExpression* RoughTextureSource = nullptr;
@@ -419,7 +435,24 @@ UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr
             }
         }
     }
+    Out.BaseColorSource = BaseColorSource;
+    Out.NormalSource = NormalSource;
+    Out.RoughTextureSource = RoughTextureSource;
+    Out.RoughScalarSource = RoughScalarSource;
+    Out.BaseColorTextureSource = BaseColorTextureSource;
+    Out.NormalTextureSource = NormalTextureSource;
+    Out.NodeY = NodeY;
+}
 
+void FWitcherImportContext::WireMasterMaterialPins(UMaterial* Material, const FMasterMaterialSources& Sources)
+{
+    UMaterialExpression* BaseColorSource = Sources.BaseColorSource;
+    UMaterialExpression* NormalSource = Sources.NormalSource;
+    UMaterialExpression* RoughTextureSource = Sources.RoughTextureSource;
+    UMaterialExpression* RoughScalarSource = Sources.RoughScalarSource;
+    UMaterialExpressionTextureSampleParameter2D* BaseColorTextureSource = Sources.BaseColorTextureSource;
+    UMaterialExpressionTextureSampleParameter2D* NormalTextureSource = Sources.NormalTextureSource;
+    const int32 NodeY = Sources.NodeY;
     // Only connect texture pins whose node has a valid default texture.
     auto NodeHasTexture = [](UMaterialExpression* Expression) -> bool
     {
@@ -509,14 +542,8 @@ UMaterialInterface* FWitcherImportContext::EnsureMasterMaterial(const TSharedPtr
     {
         UMaterialEditingLibrary::ConnectMaterialProperty(RoughScalarSource, TEXT(""), MP_Roughness);
     }
-
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
-    UMaterialEditingLibrary::RecompileMaterial(Material);
-    ImportedAssets.AddUnique(Material->GetPathName());
-    MastersByRel.Add(AssetRel, Material);
-    return Material;
 }
+
 
 void FWitcherImportContext::ImportMaterials()
 {

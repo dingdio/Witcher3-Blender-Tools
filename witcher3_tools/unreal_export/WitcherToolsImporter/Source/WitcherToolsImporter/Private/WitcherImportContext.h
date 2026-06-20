@@ -5,6 +5,8 @@
 class UMaterial;
 class UMaterialInterface;
 class UMaterialInstanceConstant;
+class UMaterialExpression;
+class UMaterialExpressionTextureSampleParameter2D;
 class UAnimSequence;
 class USkeleton;
 class UTexture;
@@ -74,10 +76,43 @@ private:
     void ImportPlacementEntities(const FPlacementLayer& Layer, const TArray<TSharedPtr<FJsonValue>>& Entities, FPlacementLayerStats& Stats);
 
     class UTexture2DArray* BuildTerrainTextureArray(const TArray<class UTexture2D*>& Slices, const FString& AssetRel, bool bNormal);
+
+    struct FTerrainBlendInputs
+    {
+        class UTexture2DArray* DiffuseArray = nullptr;
+        class UTexture2DArray* NormalArray = nullptr;
+        bool bHasNormalArray = false;
+        UTexture* ControlTex = nullptr;
+        UTexture* TintTex = nullptr;
+        float SizeCm = 0.0f;
+        FVector Location = FVector::ZeroVector;
+        int32 LayerCount = 0;
+        int32 ParamCount = 0;
+        FString BlendSharpnessCode;
+        FString SlopeBaseDampeningCode;
+        FString SlopeNormalDampeningCode;
+        FString FalloffCode;
+        FString SpecularityCode;
+        FString SpecularityBaseCode;
+        FString SpecularityScaleCode;
+    };
+    bool GatherTerrainBlendInputs(const TSharedPtr<FJsonObject>& Terrain, const FString& AssetRel, FTerrainBlendInputs& Out);
     UMaterialInterface* BuildTerrainBlendMaterial(const TSharedPtr<FJsonObject>& Terrain, const FString& AssetRel);
 
     UTexture* ImportTexture(const TSharedPtr<FJsonObject>& TextureObject);
     UMaterialInterface* EnsureMasterMaterial(const TSharedPtr<FJsonObject>& MasterObject);
+    struct FMasterMaterialSources
+    {
+        UMaterialExpression* BaseColorSource = nullptr;
+        UMaterialExpression* NormalSource = nullptr;
+        UMaterialExpression* RoughTextureSource = nullptr;
+        UMaterialExpression* RoughScalarSource = nullptr;
+        UMaterialExpressionTextureSampleParameter2D* BaseColorTextureSource = nullptr;
+        UMaterialExpressionTextureSampleParameter2D* NormalTextureSource = nullptr;
+        int32 NodeY = 0;
+    };
+    void CreateMasterMaterialParams(UMaterial* Material, const TSharedPtr<FJsonObject>& MasterObject, const FString& AssetRel, FMasterMaterialSources& Out);
+    void WireMasterMaterialPins(UMaterial* Material, const FMasterMaterialSources& Sources);
     UMaterialInterface* ImportMaterialInstance(const TSharedPtr<FJsonObject>& MaterialObject);
     UMaterialInterface* ResolveParent(const TSharedPtr<FJsonObject>& MaterialObject);
     void ApplyInstanceParams(UMaterialInstanceConstant* Instance, const TSharedPtr<FJsonObject>& MaterialObject);
