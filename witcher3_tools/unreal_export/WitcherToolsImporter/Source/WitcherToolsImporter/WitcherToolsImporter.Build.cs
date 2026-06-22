@@ -36,7 +36,18 @@ public class WitcherToolsImporter : ModuleRules
             "SlateCore",
             "ToolMenus",
             "LevelEditor",
-            "EditorFramework"
+            "EditorFramework",
+            "IKRig",
+            "IKRigDeveloper",
+            "IKRigEditor",
+            "ControlRig",
+            "ControlRigDeveloper",
+            "ControlRigEditor",
+            "ContentBrowser",
+            "RigVM",
+            "RigVMDeveloper",
+            "RigVMEditor",
+            "FullBodyIK"
         });
     }
 }

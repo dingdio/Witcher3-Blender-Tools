@@ -1,9 +1,11 @@
 #include "WitcherImportBundleCommandlet.h"
 
 #include "FileHelpers.h"
+#include "Misc/PackageName.h"
 #include "Misc/Parse.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "UObject/SavePackage.h"
 #include "WitcherImportContext.h"
 
 namespace
@@ -30,6 +32,37 @@ bool ResponseSucceeded(const FString& ResponseJson)
         Response->GetBoolField(TEXT("success"));
 }
 
+bool SavePackageDirect(UPackage* Package)
+{
+    if (!Package || !Package->IsDirty())
+    {
+        return true;
+    }
+
+    const FString PackageName = Package->GetName();
+    FString PackageFilename;
+    if (!FPackageName::TryConvertLongPackageNameToFilename(
+            PackageName,
+            PackageFilename,
+            FPackageName::GetAssetPackageExtension()))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Could not resolve package filename for '%s'"), *PackageName);
+        return false;
+    }
+
+    UE_LOG(LogTemp, Display, TEXT("Saving imported package: %s"), *PackageName);
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags = SAVE_NoError;
+    SaveArgs.bSlowTask = false;
+    const bool bSaved = UPackage::SavePackage(Package, nullptr, *PackageFilename, SaveArgs);
+    if (!bSaved)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Failed to save imported package: %s"), *PackageName);
+    }
+    return bSaved;
+}
+
 bool SaveImportedPackages(const FString& ResponseJson)
 {
     TSharedPtr<FJsonObject> Response;
@@ -48,16 +81,25 @@ bool SaveImportedPackages(const FString& ResponseJson)
     TSet<UPackage*> Packages;
     for (const TSharedPtr<FJsonValue>& Value : *ImportedAssets)
     {
-        UObject* Object = StaticLoadObject(UObject::StaticClass(), nullptr, *Value->AsString());
-        if (Object)
+        const FString AssetPath = Value->AsString();
+        if (UPackage* Package = FindPackage(nullptr, *FPackageName::ObjectPathToPackageName(AssetPath)))
+        {
+            Packages.Add(Package);
+            continue;
+        }
+        if (UObject* Object = FindObject<UObject>(nullptr, *AssetPath))
         {
             Packages.Add(Object->GetOutermost());
         }
     }
 
-    TArray<UPackage*> PackageArray = Packages.Array();
-    UE_LOG(LogTemp, Display, TEXT("Saving %d imported packages"), PackageArray.Num());
-    return UEditorLoadingAndSavingUtils::SavePackages(PackageArray, false);
+    bool bAllSaved = true;
+    UE_LOG(LogTemp, Display, TEXT("Saving %d imported packages"), Packages.Num());
+    for (UPackage* Package : Packages)
+    {
+        bAllSaved = SavePackageDirect(Package) && bAllSaved;
+    }
+    return bAllSaved;
 }
 }
 

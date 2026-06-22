@@ -1,10 +1,33 @@
 #include "WitcherImportContext.h"
 #include "WitcherImportContextInternal.h"
 
+#include "Factories/FbxFactory.h"
+#include "UObject/GarbageCollection.h"
+
 using namespace WitcherImportInternal;
 
 namespace
 {
+bool MoveExistingAssetOutOfImportPath(UObject* Existing)
+{
+    if (!Existing)
+    {
+        return true;
+    }
+    FAssetCompilingManager::Get().FinishAllCompilation();
+    const FString OldPath = Existing->GetPathName();
+    FAssetRegistryModule::AssetDeleted(Existing);
+    if (!Existing->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors | REN_NonTransactional))
+    {
+        UE_LOG(LogWitcherImportContext, Warning, TEXT("Could not move existing asset out of import path: %s"), *OldPath);
+        return false;
+    }
+    Existing->ClearFlags(RF_Public | RF_Standalone);
+    Existing->MarkAsGarbage();
+    CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+    return true;
+}
+
 void ConfigureStaticMeshAsCollisionMesh(UStaticMesh* Mesh)
 {
     if (!Mesh)
@@ -67,11 +90,17 @@ void FWitcherImportContext::ImportMeshes()
         {
             continue;
         }
-        const FString AssetRel = JsonString(MeshEntry, TEXT("asset_path"));
+        FString SourceAssetRel = JsonString(MeshEntry, TEXT("asset_path"));
+        SourceAssetRel = SourceAssetRel.Replace(TEXT("\\"), TEXT("/"));
         const bool bSkeletal = JsonString(MeshEntry, TEXT("kind")) == TEXT("skeletal");
         const bool bCollisionMesh = JsonBool(MeshEntry, TEXT("collision"), false);
         const bool bOwnSkeleton = JsonBool(MeshEntry, TEXT("own_skeleton"), false);
         USkeleton* MeshSkeleton = (bSkeletal && !bOwnSkeleton) ? SharedSkeleton.Get() : nullptr;
+        const FString ReservedRel = MeshAssetRelBySource.FindRef(SourceAssetRel);
+        const FString AssetRel = ClassSafeAssetRel(
+            ReservedRel.IsEmpty() ? SourceAssetRel : ReservedRel,
+            bSkeletal ? USkeletalMesh::StaticClass() : UStaticMesh::StaticClass(),
+            TEXT("_mesh"));
 
         if (!ShouldOverwrite(TEXT("meshes")))
         {
@@ -80,7 +109,11 @@ void FWitcherImportContext::ImportMeshes()
                 : static_cast<UObject*>(LoadExistingAsset<UStaticMesh>(ObjectPathFor(AssetRel)));
             if (ExistingMesh)
             {
-                MeshesByAssetRel.Add(AssetRel, ExistingMesh);
+                MeshesByAssetRel.Add(SourceAssetRel, ExistingMesh);
+                if (AssetRel != SourceAssetRel)
+                {
+                    MeshesByAssetRel.Add(AssetRel, ExistingMesh);
+                }
                 if (bSkeletal && !bOwnSkeleton && !SharedSkeleton.IsValid())
                 {
                     if (USkeletalMesh* SkeletalMesh = Cast<USkeletalMesh>(ExistingMesh))
@@ -92,15 +125,44 @@ void FWitcherImportContext::ImportMeshes()
             }
         }
 
-        UObject* Imported = MeshEntry->HasField(TEXT("buffer"))
-            ? ImportBufferMesh(JsonString(MeshEntry, TEXT("buffer")), AssetRel, bSkeletal, MeshSkeleton)
-            : ImportFbxMesh(JsonString(MeshEntry, TEXT("fbx")), AssetRel, bSkeletal, MeshSkeleton);
+        UObject* Imported = nullptr;
+        const FString BufferRel = JsonString(MeshEntry, TEXT("buffer"));
+        const FString FbxRel = JsonString(MeshEntry, TEXT("fbx"));
+        if (!BufferRel.IsEmpty())
+        {
+            Imported = ImportBufferMesh(BufferRel, AssetRel, bSkeletal, MeshSkeleton);
+        }
+        else if (!bSkeletal)
+        {
+            const FString SiblingBufferRel = FPaths::ChangeExtension(FbxRel, TEXT(".w3buf"));
+            if (!SiblingBufferRel.IsEmpty() && FPaths::FileExists(ResolveBundleFile(SiblingBufferRel)))
+            {
+                AddWarning(FString::Printf(
+                    TEXT("Static mesh '%s': using sibling mesh buffer '%s' instead of automated FBX import"),
+                    *AssetRel, *SiblingBufferRel));
+                Imported = ImportBufferMesh(SiblingBufferRel, AssetRel, false, nullptr);
+            }
+            else
+            {
+                AddError(FString::Printf(
+                    TEXT("Static mesh '%s' has no mesh buffer. Static FBX import is disabled in the automated pipeline."),
+                    *AssetRel));
+            }
+        }
+        else
+        {
+            Imported = ImportFbxMesh(FbxRel, AssetRel, true, MeshSkeleton);
+        }
         if (!Imported)
         {
-            AddError(FString::Printf(TEXT("Failed to import mesh '%s'"), *AssetRel));
+            AddError(FString::Printf(TEXT("Failed to import mesh '%s'"), *SourceAssetRel));
             continue;
         }
-        MeshesByAssetRel.Add(AssetRel, Imported);
+        MeshesByAssetRel.Add(SourceAssetRel, Imported);
+        if (AssetRel != SourceAssetRel)
+        {
+            MeshesByAssetRel.Add(AssetRel, Imported);
+        }
         if (bSkeletal && !bOwnSkeleton && !SharedSkeleton.IsValid())
         {
             if (USkeletalMesh* SkeletalMesh = Cast<USkeletalMesh>(Imported))
@@ -117,7 +179,8 @@ void FWitcherImportContext::ImportMeshes()
     }
 }
 
-UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, const FString& AssetRel, bool bSkeletal, USkeleton* Skeleton)
+UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, const FString& AssetRel, bool bSkeletal,
+    USkeleton* Skeleton, const bool bApplyRetargetPreviewFacing)
 {
     const FString FbxPath = ResolveBundleFile(BundleRelativeFbx);
     if (!FPaths::FileExists(FbxPath))
@@ -126,13 +189,26 @@ UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, 
         return nullptr;
     }
 
+    UObject* ExistingBeforeImport = LoadAnyAsset(AssetRel);
+    UClass* ExpectedMeshClass = bSkeletal ? USkeletalMesh::StaticClass() : UStaticMesh::StaticClass();
+    if (ExistingBeforeImport && !ExistingBeforeImport->IsA(ExpectedMeshClass))
+    {
+        AddError(FString::Printf(
+            TEXT("Refusing to overwrite non-mesh asset '%s' (%s) with mesh import"),
+            *AssetRel,
+            *ExistingBeforeImport->GetClass()->GetName()));
+        return nullptr;
+    }
+
     UAssetImportTask* Task = NewObject<UAssetImportTask>();
     Task->Filename = FbxPath;
     Task->DestinationPath = PackagePathFor(AssetRel);
     Task->DestinationName = AssetRelName(AssetRel);
     Task->bAutomated = true;
+    Task->bAsync = false;
     Task->bSave = false;
     Task->bReplaceExisting = true;
+    Task->bReplaceExistingSettings = true;
 
     UFbxImportUI* Options = NewObject<UFbxImportUI>();
     Options->bImportMaterials = false;
@@ -141,7 +217,9 @@ UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, 
     Options->bCreatePhysicsAsset = false;
     Options->bAutomatedImportShouldDetectType = false;
     Options->MeshTypeToImport = bSkeletal ? FBXIT_SkeletalMesh : FBXIT_StaticMesh;
+    Options->OriginalImportType = Options->MeshTypeToImport;
     Options->bImportAsSkeletal = bSkeletal;
+    Options->bImportMesh = true;
     if (Skeleton)
     {
         Options->Skeleton = Skeleton;
@@ -152,6 +230,12 @@ UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, 
         // Honor the custom split normals + tangent basis the Blender exporter
         Options->SkeletalMeshImportData->NormalImportMethod = FBXNIM_ImportNormalsAndTangents;
         Options->SkeletalMeshImportData->NormalGenerationMethod = EFBXNormalGenerationMethod::MikkTSpace;
+        // Keep normal Witcher imports in their native basis.
+        if (bApplyRetargetPreviewFacing)
+        {
+            // Rotate only the combined retarget preview to Unreal forward.
+            Options->SkeletalMeshImportData->ImportRotation = FRotator(0.0f, 180.0f, 0.0f);
+        }
     }
     if (Options->StaticMeshImportData)
     {
@@ -161,6 +245,11 @@ UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, 
         Options->StaticMeshImportData->NormalGenerationMethod = EFBXNormalGenerationMethod::MikkTSpace;
     }
     Task->Options = Options;
+
+    UFbxFactory* FbxFactory = NewObject<UFbxFactory>();
+    FbxFactory->ImportUI = Options;
+    FbxFactory->SetDetectImportTypeOnImport(false);
+    Task->Factory = FbxFactory;
 
     FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
     TArray<UAssetImportTask*> Tasks;
@@ -180,6 +269,24 @@ UObject* FWitcherImportContext::ImportFbxMesh(const FString& BundleRelativeFbx, 
         {
             MainAsset = Imported;
         }
+    }
+
+    if (!MainAsset)
+    {
+        UObject* TargetAsset = LoadAnyAsset(AssetRel);
+        if (TargetAsset && (TargetAsset != ExistingBeforeImport || TargetAsset->GetOutermost()->IsDirty()))
+        {
+            if (TargetAsset->IsA<USkeletalMesh>() || TargetAsset->IsA<UStaticMesh>())
+            {
+                MainAsset = TargetAsset;
+                ImportedAssets.AddUnique(TargetAsset->GetPathName());
+            }
+        }
+    }
+    if (!MainAsset && Task->ImportedObjectPaths.Num() == 0)
+    {
+        AddWarning(FString::Printf(TEXT("FBX import produced no mesh asset for '%s' from '%s'"),
+            *AssetRel, *FbxPath));
     }
 
     if (MainAsset && MainAsset->GetPathName() != ObjectPathFor(AssetRel))
@@ -203,15 +310,25 @@ UObject* FWitcherImportContext::ImportBufferMesh(const FString& BundleRelativeBu
         return nullptr;
     }
 
+    UObject* ExistingAtPath = LoadAnyAsset(AssetRel);
+    UClass* ExpectedMeshClass = bSkeletal ? USkeletalMesh::StaticClass() : UStaticMesh::StaticClass();
+    if (ExistingAtPath && !ExistingAtPath->IsA(ExpectedMeshClass))
+    {
+        AddError(FString::Printf(
+            TEXT("Refusing to overwrite non-mesh asset '%s' (%s) with buffer mesh import"),
+            *AssetRel,
+            *ExistingAtPath->GetClass()->GetName()));
+        return nullptr;
+    }
+
+    if (!MoveExistingAssetOutOfImportPath(ExistingAtPath))
+    {
+        AddError(FString::Printf(TEXT("Could not overwrite existing buffer mesh '%s'"), *AssetRel));
+        return nullptr;
+    }
+
     UPackage* Package = CreatePackage(*FString::Printf(TEXT("%s/%s"), *ContentRoot, *AssetRel));
     const FName ObjectName(*AssetRelName(AssetRel));
-    if (UObject* Existing = LoadAnyAsset(AssetRel))
-    {
-        Existing->Rename(nullptr, GetTransientPackage(),
-            REN_DontCreateRedirectors | REN_ForceNoResetLoaders | REN_NonTransactional);
-        Existing->ClearFlags(RF_Public | RF_Standalone);
-        Existing->MarkAsGarbage();
-    }
 
     UObject* Result = nullptr;
     if (bSkeletal)
@@ -296,13 +413,17 @@ UAnimSequence* FWitcherImportContext::ImportAnimation(const TSharedPtr<FJsonObje
         return nullptr;
     }
 
+    UAnimSequence* ExistingBeforeImport = LoadExistingAsset<UAnimSequence>(ObjectPathFor(AssetRel));
+
     UAssetImportTask* Task = NewObject<UAssetImportTask>();
     Task->Filename = FbxPath;
     Task->DestinationPath = PackagePathFor(AssetRel);
     Task->DestinationName = AssetRelName(AssetRel);
     Task->bAutomated = true;
+    Task->bAsync = false;
     Task->bSave = false;
     Task->bReplaceExisting = true;
+    Task->bReplaceExistingSettings = true;
 
     UFbxImportUI* Options = NewObject<UFbxImportUI>();
     Options->bImportMaterials = false;
@@ -311,16 +432,22 @@ UAnimSequence* FWitcherImportContext::ImportAnimation(const TSharedPtr<FJsonObje
     Options->bCreatePhysicsAsset = false;
     Options->bAutomatedImportShouldDetectType = false;
     Options->MeshTypeToImport = FBXIT_Animation;
+    Options->OriginalImportType = Options->MeshTypeToImport;
     Options->bImportAsSkeletal = true;
     Options->Skeleton = SharedSkeleton.Get();
     Options->bImportMesh = false;
     if (Options->AnimSequenceImportData)
     {
-        // Match skeletal mesh import, which folds Blender's Armature m->cm
-        // factor into the root bone; otherwise clips collapse the root 100x.
+        // Match skeletal import root scale; clips otherwise collapse 100x.
         Options->AnimSequenceImportData->ImportUniformScale = 100.0f;
+        // Retarget-facing yaw belongs in the generated pose.
     }
     Task->Options = Options;
+
+    UFbxFactory* FbxFactory = NewObject<UFbxFactory>();
+    FbxFactory->ImportUI = Options;
+    FbxFactory->SetDetectImportTypeOnImport(false);
+    Task->Factory = FbxFactory;
 
     FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
     TArray<UAssetImportTask*> Tasks;
@@ -340,6 +467,20 @@ UAnimSequence* FWitcherImportContext::ImportAnimation(const TSharedPtr<FJsonObje
         {
             AnimSequence = Cast<UAnimSequence>(Imported);
         }
+    }
+    if (!AnimSequence)
+    {
+        UAnimSequence* TargetAsset = LoadExistingAsset<UAnimSequence>(ObjectPathFor(AssetRel));
+        if (TargetAsset && (TargetAsset != ExistingBeforeImport || TargetAsset->GetOutermost()->IsDirty()))
+        {
+            AnimSequence = TargetAsset;
+            ImportedAssets.AddUnique(TargetAsset->GetPathName());
+        }
+    }
+    if (!AnimSequence && Task->ImportedObjectPaths.Num() == 0)
+    {
+        AddWarning(FString::Printf(TEXT("FBX import produced no animation asset for '%s' from '%s'"),
+            *AssetRel, *FbxPath));
     }
     return AnimSequence;
 }

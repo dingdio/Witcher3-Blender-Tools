@@ -8,6 +8,7 @@ class UMaterialInstanceConstant;
 class UMaterialExpression;
 class UMaterialExpressionTextureSampleParameter2D;
 class UAnimSequence;
+class USkeletalMesh;
 class USkeleton;
 class UTexture;
 class UObject;
@@ -40,6 +41,7 @@ private:
     void ImportSpeedTrees();
     void ImportAnimations();
     void ImportBlueprint();
+    void ImportRetargetSetup();
     void ImportTerrain();
     void ImportPlacements();
     void ImportFoliage();
@@ -118,7 +120,8 @@ private:
     void ApplyInstanceParams(UMaterialInstanceConstant* Instance, const TSharedPtr<FJsonObject>& MaterialObject);
     UTexture* FindTexture(const FString& DepotRel);
 
-    UObject* ImportFbxMesh(const FString& BundleRelativeFbx, const FString& AssetRel, bool bSkeletal, USkeleton* Skeleton);
+    UObject* ImportFbxMesh(const FString& BundleRelativeFbx, const FString& AssetRel, bool bSkeletal, USkeleton* Skeleton,
+        bool bApplyRetargetPreviewFacing = false);
     UObject* ImportBufferMesh(const FString& BundleRelativeBuffer, const FString& AssetRel, bool bSkeletal, USkeleton* Skeleton);
     UAnimSequence* ImportAnimation(const TSharedPtr<FJsonObject>& AnimationObject);
     void AssignMaterialsToMesh(UObject* MeshObject, const TSharedPtr<FJsonObject>& MeshEntry);
@@ -127,6 +130,7 @@ private:
     FString PackagePathFor(const FString& AssetRel) const;
     FString ObjectPathFor(const FString& AssetRel) const;
     UObject* LoadAnyAsset(const FString& AssetRel) const;
+    void BuildManifestAssetPathReservations();
     FString ClassSafeAssetRel(const FString& AssetRel, UClass* DesiredClass, const FString& Suffix);
     FString ResolveBundleFile(const FString& RelativePath) const;
     bool ShouldOverwrite(const FString& Category) const;
@@ -148,8 +152,11 @@ private:
     double TotalImportSeconds = 0.0;
 
     TMap<FString, TWeakObjectPtr<UTexture>> TexturesByDepot;
+    TMap<FString, FString> TextureAssetRelByDepot;
     TMap<FString, TWeakObjectPtr<UMaterialInterface>> MastersByRel;
     TMap<FString, TWeakObjectPtr<UMaterialInterface>> MaterialsById;
     TMap<FString, TWeakObjectPtr<UObject>> MeshesByAssetRel;
+    TMap<FString, FString> MeshAssetRelBySource;
     TWeakObjectPtr<USkeleton> SharedSkeleton;
+    TWeakObjectPtr<USkeletalMesh> RetargetPreviewMesh;
 };

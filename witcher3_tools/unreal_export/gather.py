@@ -8,6 +8,7 @@ from . import mesh_buffer
 def extract_armature_skeleton(armature) -> dict:
     import mathutils
 
+    # Match mesh-buffer W3 -> UE basis conversion.
     T = mathutils.Matrix.Diagonal((1.0, -1.0, 1.0, 1.0))
     Tinv = T.inverted()
 

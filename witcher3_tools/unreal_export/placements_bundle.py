@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from collections import defaultdict
@@ -33,6 +34,7 @@ from .bundle import (
     _object_lod_index,
     _object_source_game,
     _resolve_content_root_setting,
+    _unique_bundle_file,
     _unique_fbx_path,
     default_export_folder,
     export_fbx,
@@ -523,6 +525,96 @@ def _ensure_collision_export_uv(objects) -> None:
             pass
 
 
+def _unique_collision_buffer_path(bundle_root: str, asset_rel: str, used_stems: dict[str, str]) -> str:
+    return _unique_bundle_file(bundle_root, asset_rel, used_stems, "Meshes", ".w3buf")
+
+
+def _material_name_for_collision_polygon(mesh, material_index: int) -> str:
+    try:
+        if 0 <= material_index < len(mesh.materials):
+            material = mesh.materials[material_index]
+            name = getattr(material, "name", "") if material else ""
+            if name:
+                return str(name)
+    except Exception:
+        pass
+    return "collision"
+
+
+def _collision_objects_to_mesh_buffer(objects, mesh_name: str, depot_path: str):
+    """Bake RED collision objects into static placement buffers."""
+    from .mesh_buffer import MeshBuffer, SubmeshBuffer
+
+    mesh = MeshBuffer(mesh_name, depot_path=depot_path, is_skinned=False)
+    submesh_data: dict[str, dict[str, Any]] = {}
+    depsgraph = None
+    try:
+        import bpy
+
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except Exception:
+        depsgraph = None
+
+    for obj in objects or []:
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        eval_obj = None
+        eval_mesh = None
+        try:
+            eval_obj = obj.evaluated_get(depsgraph) if depsgraph is not None else obj
+            eval_mesh = eval_obj.to_mesh() if hasattr(eval_obj, "to_mesh") else getattr(obj, "data", None)
+            if eval_mesh is None:
+                continue
+            eval_mesh.calc_loop_triangles()
+            world = getattr(eval_obj, "matrix_world", None) or getattr(obj, "matrix_world", None)
+            if world is None:
+                continue
+
+            for tri in getattr(eval_mesh, "loop_triangles", []) or []:
+                poly = eval_mesh.polygons[tri.polygon_index]
+                material_name = _material_name_for_collision_polygon(eval_mesh, int(poly.material_index))
+                data = submesh_data.get(material_name)
+                if data is None:
+                    data = {
+                        "mat_id": len(submesh_data),
+                        "positions": [],
+                        "indices": [],
+                    }
+                    submesh_data[material_name] = data
+
+                positions = data["positions"]
+                indices = data["indices"]
+                base = len(positions) // 3
+                valid_triangle = True
+                for vertex_index in tri.vertices:
+                    co = world @ eval_mesh.vertices[vertex_index].co
+                    xyz = (float(co.x), float(co.y), float(co.z))
+                    if not all(math.isfinite(value) for value in xyz):
+                        valid_triangle = False
+                        break
+                    positions.extend(xyz)
+                if not valid_triangle:
+                    continue
+                indices.extend((base, base + 1, base + 2))
+        finally:
+            if eval_obj is not None and eval_mesh is not None and hasattr(eval_obj, "to_mesh_clear"):
+                try:
+                    eval_obj.to_mesh_clear()
+                except Exception:
+                    pass
+
+    for material_name, data in submesh_data.items():
+        positions = data["positions"]
+        indices = data["indices"]
+        if len(positions) < 9 or len(indices) < 3:
+            continue
+        sm = SubmeshBuffer(lod=0, mat_id=data["mat_id"], material=material_name)
+        sm.set_positions(positions)
+        sm.set_indices(indices)
+        mesh.submeshes.append(sm)
+    return mesh
+
+
 _EMBEDDED_COLLISION_BUILDERS = {
     "CCollisionShapeConvex": ("CCollisionShapeConvex", "createCol"),
     "CCollisionShapeTriMesh": ("CCollisionShapeTriMesh", "createTri"),
@@ -649,13 +741,13 @@ def _export_collision_mesh_for_asset(
     profile: Optional[_PlacementExportProfile] = None,
 ) -> Optional[dict[str, Any]]:
     collision_asset = _collision_asset_rel(asset_rel)
-    fbx_path = _unique_fbx_path(bundle_root, collision_asset, used_fbx_stems, subdir="Collision")
-    if reuse_existing_fbx and os.path.exists(fbx_path):
+    buffer_path = _unique_collision_buffer_path(bundle_root, collision_asset, used_fbx_stems)
+    if reuse_existing_fbx and os.path.exists(buffer_path) and os.path.getsize(buffer_path) > 0:
         if profile:
-            profile.count("collision_fbx_reused")
+            profile.count("collision_buffer_reused")
         return {
             "name": collision_asset.rsplit("/", 1)[-1],
-            "fbx": relpath_for_manifest(fbx_path, bundle_root),
+            "buffer": relpath_for_manifest(buffer_path, bundle_root),
             "asset_path": collision_asset,
             "kind": "static",
             "collision": True,
@@ -670,19 +762,23 @@ def _export_collision_mesh_for_asset(
         return None
 
     try:
-        _ensure_collision_export_uv(collision_objects)
-        section = profile.section("collision_fbx_export", asset_rel) if profile else nullcontext()
+        section = profile.section("collision_buffer_write", asset_rel) if profile else nullcontext()
         with section:
-            export_fbx(context, collision_objects, fbx_path, object_types={"MESH"})
+            from .mesh_buffer import write_mesh_buffer
+
+            mesh = _collision_objects_to_mesh_buffer(collision_objects, collision_asset.rsplit("/", 1)[-1], depot_path)
+            if not mesh.submeshes:
+                return None
+            write_mesh_buffer(buffer_path, mesh)
         if profile:
-            profile.count("collision_fbx_exported")
+            profile.count("collision_buffer_exported")
     finally:
         for obj in created_objects:
             _remove_object(obj)
 
     return {
         "name": collision_asset.rsplit("/", 1)[-1],
-        "fbx": relpath_for_manifest(fbx_path, bundle_root),
+        "buffer": relpath_for_manifest(buffer_path, bundle_root),
         "asset_path": collision_asset,
         "kind": "static",
         "collision": True,

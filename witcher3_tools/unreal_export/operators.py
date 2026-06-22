@@ -186,6 +186,11 @@ class WITCHER_PG_UnrealExportSettings(bpy.types.PropertyGroup):
             "default to protect hand-tweaked texture import settings"
         ),
     )
+    overwrite_retarget_assets: BoolProperty(
+        name="Retarget Assets",
+        default=False,
+        description="Regenerate generated IK Rig, IK Retargeter, and Control Rig assets under /Game/RETARGET_",
+    )
     prefer_source_buffers: BoolProperty(
         name="Fast Mesh Buffers",
         default=True,
@@ -1242,7 +1247,7 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
             placement_options.prop(settings, "placement_skip_materials", text="Fast .w2l (geometry only)")
             placement_options.prop(settings, "placement_export_collision", text="Collision")
             placement_options.prop(settings, "placement_write_profile_log", text="Profile Log")
-            placement_options.label(text="FBX reuse follows Overwrite Policy > Meshes", icon="INFO")
+            placement_options.label(text="Collision reuse follows Overwrite Policy > Meshes", icon="INFO")
 
         if _expander(box, settings, "show_connection", "Connection"):
             conn = box.column()
@@ -1295,6 +1300,7 @@ class WITCH_PT_UnrealExport(WITCH_PT_Base, bpy.types.Panel):
         cats.prop(settings, "overwrite_material_instances")
         cats.prop(settings, "overwrite_materials_base")
         cats.prop(settings, "overwrite_textures")
+        cats.prop(settings, "overwrite_retarget_assets")
 
 
 _DROP_WARNING_TOKENS = (
@@ -1428,11 +1434,11 @@ def _format_placements_bundle_details(result: dict) -> str:
         f"Total time: {profile.get('total_seconds', 0.0):.3f}s"
         f" | FBX: {profile_totals.get('visual_fbx_export', 0.0):.3f}s"
         f" | Materials: {profile_totals.get('material_scan', 0.0):.3f}s"
-        f" | Collision: {profile_totals.get('collision_fbx_export', 0.0):.3f}s",
+        f" | Collision: {profile_totals.get('collision_buffer_write', profile_totals.get('collision_fbx_export', 0.0)):.3f}s",
         f"FBX exported: {profile_counts.get('visual_fbx_exported', 0)}"
         f" | reused: {profile_counts.get('visual_fbx_reused', 0)}"
-        f" | collision exported: {profile_counts.get('collision_fbx_exported', 0)}"
-        f" | collision reused: {profile_counts.get('collision_fbx_reused', 0)}",
+        f" | collision exported: {profile_counts.get('collision_buffer_exported', profile_counts.get('collision_fbx_exported', 0))}"
+        f" | collision reused: {profile_counts.get('collision_buffer_reused', profile_counts.get('collision_fbx_reused', 0))}",
         "",
         "Placements per layer:",
     ]

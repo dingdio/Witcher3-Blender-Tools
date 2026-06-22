@@ -1,6 +1,9 @@
 #include "WitcherImportContext.h"
 #include "WitcherImportContextInternal.h"
 
+#include "Misc/PackageName.h"
+#include "UObject/SavePackage.h"
+
 using namespace WitcherImportInternal;
 
 namespace
@@ -58,6 +61,38 @@ struct FScopedLegacyFbxImport
     IConsoleVariable* CVar = nullptr;
     bool bWasEnabled = false;
 };
+
+bool SavePackageDirect(UPackage* Package, const TCHAR* LogCategoryName)
+{
+    if (!Package || !Package->IsDirty())
+    {
+        return true;
+    }
+
+    const FString PackageName = Package->GetName();
+    FString PackageFilename;
+    if (!FPackageName::TryConvertLongPackageNameToFilename(
+            PackageName,
+            PackageFilename,
+            FPackageName::GetAssetPackageExtension()))
+    {
+        UE_LOG(LogWitcherImportContext, Warning, TEXT("%s: could not resolve package filename for '%s'"),
+            LogCategoryName, *PackageName);
+        return false;
+    }
+
+    UE_LOG(LogWitcherImportContext, Display, TEXT("%s: saving %s"), LogCategoryName, *PackageName);
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags = SAVE_NoError;
+    SaveArgs.bSlowTask = false;
+    const bool bSaved = UPackage::SavePackage(Package, nullptr, *PackageFilename, SaveArgs);
+    if (!bSaved)
+    {
+        UE_LOG(LogWitcherImportContext, Warning, TEXT("%s: failed to save %s"), LogCategoryName, *PackageName);
+    }
+    return bSaved;
+}
 }
 
 FString FWitcherImportContext::HandleRequest(const FString& RequestJson)
@@ -125,6 +160,7 @@ FWitcherImportContext::FWitcherImportContext(const TSharedPtr<FJsonObject>& InMa
     {
         OverwriteObject = *OverwritePtr;
     }
+    BuildManifestAssetPathReservations();
 }
 
 bool FWitcherImportContext::ShouldOverwrite(const FString& Category) const
@@ -145,7 +181,7 @@ FString FWitcherImportContext::ImportBundle()
     FSlateNotificationManager::Get().SetAllowNotifications(false);
     ON_SCOPE_EXIT { FSlateNotificationManager::Get().SetAllowNotifications(true); };
 
-    FScopedSlowTask SlowTask(11.5f, FText::FromString(TEXT("Importing Witcher bundle")));
+    FScopedSlowTask SlowTask(12.0f, FText::FromString(TEXT("Importing Witcher bundle")));
     SlowTask.MakeDialog(false);
 
     const double BundleStart = FPlatformTime::Seconds();
@@ -167,6 +203,7 @@ FString FWitcherImportContext::ImportBundle()
     TimePhase(TEXT("speedtrees"), 1.0f, TEXT("Importing SpeedTree assets"), [&] { ImportSpeedTrees(); });
     TimePhase(TEXT("animations"), 1.0f, TEXT("Importing animations"), [&] { ImportAnimations(); });
     TimePhase(TEXT("blueprint"), 1.0f, TEXT("Building blueprint"), [&] { ImportBlueprint(); });
+    TimePhase(TEXT("retarget_setup"), 0.5f, TEXT("Repairing retarget setup"), [&] { ImportRetargetSetup(); });
     TimePhase(TEXT("terrain"), 0.5f, TEXT("Importing terrain"), [&] { ImportTerrain(); });
     TimePhase(TEXT("placements"), 0.5f, TEXT("Placing layer actors"), [&] { ImportPlacements(); });
     TimePhase(TEXT("foliage"), 0.5f, TEXT("Placing foliage"), [&] { ImportFoliage(); });
@@ -207,6 +244,61 @@ FString FWitcherImportContext::ObjectPathFor(const FString& AssetRel) const
 UObject* FWitcherImportContext::LoadAnyAsset(const FString& AssetRel) const
 {
     return StaticLoadObject(UObject::StaticClass(), nullptr, *ObjectPathFor(AssetRel), nullptr, LOAD_NoWarn | LOAD_Quiet);
+}
+
+void FWitcherImportContext::BuildManifestAssetPathReservations()
+{
+    TSet<FString> TexturePaths;
+    TSet<FString> MeshPaths;
+
+    const TArray<TSharedPtr<FJsonValue>>* Textures = nullptr;
+    if (Manifest.IsValid() && Manifest->TryGetArrayField(TEXT("textures"), Textures))
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *Textures)
+        {
+            const TSharedPtr<FJsonObject> TextureObject = Value->AsObject();
+            FString DepotRel = JsonString(TextureObject, TEXT("depot_path"));
+            DepotRel = DepotRel.Replace(TEXT("\\"), TEXT("/"));
+            if (!DepotRel.IsEmpty())
+            {
+                TexturePaths.Add(DepotRel);
+            }
+        }
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* Meshes = nullptr;
+    if (Manifest.IsValid() && Manifest->TryGetArrayField(TEXT("meshes"), Meshes))
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *Meshes)
+        {
+            const TSharedPtr<FJsonObject> MeshObject = Value->AsObject();
+            FString AssetRel = JsonString(MeshObject, TEXT("asset_path"));
+            AssetRel = AssetRel.Replace(TEXT("\\"), TEXT("/"));
+            if (!AssetRel.IsEmpty())
+            {
+                MeshPaths.Add(AssetRel);
+            }
+        }
+    }
+
+    for (const FString& DepotRel : TexturePaths)
+    {
+        FString SafeRel = DepotRel;
+        if (MeshPaths.Contains(DepotRel))
+        {
+            SafeRel += TEXT("_tex");
+            AddWarning(FString::Printf(
+                TEXT("Manifest path collision: '%s' is both a texture and mesh; importing texture as '%s'"),
+                *DepotRel,
+                *SafeRel));
+        }
+        TextureAssetRelByDepot.Add(DepotRel, SafeRel);
+    }
+
+    for (const FString& MeshRel : MeshPaths)
+    {
+        MeshAssetRelBySource.Add(MeshRel, MeshRel);
+    }
 }
 
 FString FWitcherImportContext::ClassSafeAssetRel(const FString& AssetRel, UClass* DesiredClass, const FString& Suffix)
@@ -257,7 +349,8 @@ void FWitcherImportContext::SaveImportedPackages()
     {
         if (AssetPath.StartsWith(ContentRootPrefix))
         {
-            if (UPackage* Package = FindPackage(nullptr, *AssetPath))
+            const FString PackageName = FPackageName::ObjectPathToPackageName(AssetPath);
+            if (UPackage* Package = FindPackage(nullptr, *PackageName))
             {
                 if (Package->IsDirty())
                 {
@@ -265,7 +358,7 @@ void FWitcherImportContext::SaveImportedPackages()
                 }
                 continue;
             }
-            ConsiderDirty(StaticLoadObject(UObject::StaticClass(), nullptr, *AssetPath));
+            ConsiderDirty(FindObject<UObject>(nullptr, *AssetPath));
         }
     }
 
@@ -292,9 +385,13 @@ void FWitcherImportContext::SaveImportedPackages()
         return;
     }
 
-    TArray<UPackage*> PackageArray = Packages.Array();
-    UE_LOG(LogWitcherImportContext, Display, TEXT("Saving %d imported asset package(s)"), PackageArray.Num());
-    if (!UEditorLoadingAndSavingUtils::SavePackages(PackageArray, false))
+    bool bAllSaved = true;
+    UE_LOG(LogWitcherImportContext, Display, TEXT("Saving %d imported asset package(s)"), Packages.Num());
+    for (UPackage* Package : Packages)
+    {
+        bAllSaved = SavePackageDirect(Package, TEXT("Imported asset save")) && bAllSaved;
+    }
+    if (!bAllSaved)
     {
         AddWarning(TEXT("One or more imported asset packages could not be saved."));
     }

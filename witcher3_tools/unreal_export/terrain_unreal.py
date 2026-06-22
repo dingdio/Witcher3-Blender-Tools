@@ -14,13 +14,15 @@ is centimetres, X-forward, Y-right, Z-up, left-handed. The canonical mapping is
     UE = ( w3.x * 100,  w3.y * 100 * UNREAL_Y_SIGN,  w3.z * 100 )
 
 with ``UNREAL_Y_SIGN = -1`` (the standard Blender->Unreal handedness flip that
-matches the FBX export preset ``axis_forward=-Z, axis_up=Y``). Every actor we
-later place from W3 world coordinates -- terrain AND imported layer geometry
-(buildings) -- MUST go through :func:`w3_world_to_unreal` so they share one
-frame and line up exactly. See :func:`compute_landscape_transform` for how the
-landscape transform is derived from this mapping; the derivation cancels the
-Y flip against the heightmap's row order, so the heightmap is fed to Unreal in
-PNG row order with no extra flip (see ``HEIGHTMAP_FLIP_V``).
+keeps world placements aligned with decoded static geometry). Character
+skeletal assets use their own export-space basis conversion so their saved UE
+assets face +X. Every actor we later place from W3 world coordinates -- terrain
+AND imported layer geometry (buildings) -- MUST go through
+:func:`w3_world_to_unreal` so they share one frame and line up exactly. See
+:func:`compute_landscape_transform` for how the landscape transform is derived
+from this mapping; the derivation cancels the Y flip against the heightmap's
+row order, so the heightmap is fed to Unreal in PNG row order with no extra
+flip (see ``HEIGHTMAP_FLIP_V``).
 """
 
 from __future__ import annotations

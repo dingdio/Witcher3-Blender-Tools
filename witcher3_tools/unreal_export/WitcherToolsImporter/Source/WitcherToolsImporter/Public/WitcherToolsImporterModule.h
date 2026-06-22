@@ -13,6 +13,8 @@ public:
 private:
     void RegisterMenus();
     void OnLoadW2LAroundCamera();
+    void OnSendAnimationToBlender();
+    void OnCreateWomanBaseRetargetSetup();
 
     TUniquePtr<FWitcherImportServer> Server;
 };

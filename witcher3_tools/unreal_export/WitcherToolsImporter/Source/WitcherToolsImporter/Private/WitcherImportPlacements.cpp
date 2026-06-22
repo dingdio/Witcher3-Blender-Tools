@@ -89,9 +89,18 @@ void ConfigurePointLight(UPointLightComponent* Component, const TSharedPtr<FJson
 UStaticMesh* FWitcherImportContext::FindPlacementMesh(const FString& AssetRel)
 {
     UStaticMesh* Mesh = Cast<UStaticMesh>(MeshesByAssetRel.FindRef(AssetRel).Get());
+    const FString ReservedRel = MeshAssetRelBySource.FindRef(AssetRel);
+    if (!Mesh && !ReservedRel.IsEmpty())
+    {
+        Mesh = LoadExistingAsset<UStaticMesh>(ObjectPathFor(ReservedRel));
+    }
     if (!Mesh)
     {
         Mesh = LoadExistingAsset<UStaticMesh>(ObjectPathFor(AssetRel));
+    }
+    if (!Mesh)
+    {
+        Mesh = LoadExistingAsset<UStaticMesh>(ObjectPathFor(AssetRel + TEXT("_mesh")));
     }
     return Mesh;
 }

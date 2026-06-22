@@ -294,7 +294,8 @@ def _find_attachment_armature_for_missing_bones(group_armature, missing_names: l
         parented = sum(1 for bone in bones.values() if getattr(bone, "parent", None) is not None)
         single_root = 1 if _armature_root_count(candidate) == 1 else 0
         not_group = 1 if candidate is not group_armature else 0
-        return (contains, single_root, parented, not_group)
+        covers_all = 1 if contains == len(missing) else 0
+        return (covers_all, contains, single_root, parented, not_group)
 
     best = max(candidates, key=score, default=None)
     if best is None or not missing.intersection(_armature_bones_by_name(best)):
@@ -355,6 +356,153 @@ def _main_root_bone_name(armature) -> str:
     return ""
 
 
+def _copy_source_bone_to_edit_bones(edit_bones, bone_name: str, source_bones: dict,
+                                    source_armature, target_armature, root_name: str):
+    from mathutils import Vector
+
+    if bone_name in edit_bones:
+        return None
+    source_bone = source_bones.get(bone_name)
+    if source_bone is None:
+        return None
+
+    edit_bone = edit_bones.new(bone_name)
+    edit_bone.use_connect = False
+    try:
+        edit_bone.use_deform = bool(getattr(source_bone, "use_deform", True))
+    except Exception:
+        pass
+
+    parent = getattr(source_bone, "parent", None)
+    parent_name = str(getattr(parent, "name", "") or "")
+    if parent_name and parent_name in edit_bones:
+        edit_bone.parent = edit_bones[parent_name]
+        source_parent_inv = parent.matrix_local.inverted()
+        target_parent_matrix = edit_bones[parent_name].matrix.copy()
+        target_matrix = target_parent_matrix @ (source_parent_inv @ source_bone.matrix_local)
+        local_head = source_parent_inv @ source_bone.head_local
+        local_tail = source_parent_inv @ source_bone.tail_local
+        head = target_parent_matrix @ local_head
+        tail = target_parent_matrix @ local_tail
+    else:
+        if root_name and root_name in edit_bones:
+            edit_bone.parent = edit_bones[root_name]
+        target_inv = target_armature.matrix_world.inverted()
+        source_world = source_armature.matrix_world
+        target_matrix = target_inv @ source_world @ source_bone.matrix_local
+        head = target_inv @ (source_world @ source_bone.head_local)
+        tail = target_inv @ (source_world @ source_bone.tail_local)
+
+    if (tail - head).length < 0.000001:
+        tail = head + Vector((0.0, 0.01, 0.0))
+    edit_bone.head = head
+    edit_bone.tail = tail
+    try:
+        edit_bone.matrix = target_matrix
+    except Exception:
+        pass
+    return edit_bone
+
+
+@contextmanager
+def _combined_export_armature_for_mesh_groups(context, group_armatures, main_armature, asset_rel: str,
+                                              warnings: list[str],
+                                              force_full_source_bone_names: set[str] | None = None,
+                                              exclude_bone_names: set[str] | None = None):
+    """Build one temporary armature with the union skeleton needed by preview meshes."""
+    if main_armature is None:
+        yield None
+        return
+
+    force_full_source_bone_names = set(force_full_source_bone_names or ())
+    exclude_bone_names = set(exclude_bone_names or ())
+
+    import bpy
+
+    temp_data = main_armature.data.copy()
+    temp_obj = bpy.data.objects.new(
+        _unique_temp_object_name("__witcher_unreal_export_preview_armature", _iter_bpy_objects()),
+        temp_data,
+    )
+    try:
+        temp_obj.matrix_world = main_armature.matrix_world.copy()
+    except Exception:
+        pass
+
+    collection = getattr(context, "collection", None)
+    if collection is None:
+        collection = getattr(getattr(context, "scene", None), "collection", None)
+    if collection is None:
+        collection = bpy.context.scene.collection
+    collection.objects.link(temp_obj)
+
+    saved_state = _snapshot_object_state(context)
+    try:
+        if saved_state[2] != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.select_all(action="DESELECT")
+        temp_obj.select_set(True)
+        context.view_layer.objects.active = temp_obj
+        bpy.ops.object.mode_set(mode="EDIT")
+
+        edit_bones = temp_data.edit_bones
+        root_name = _main_root_bone_name(main_armature)
+
+        def current_names() -> set[str]:
+            return {str(getattr(bone, "name", "") or "") for bone in edit_bones}
+
+        for group_armature in group_armatures or []:
+            if group_armature is None or group_armature is main_armature:
+                continue
+            missing = [
+                name for name in _armature_bones_by_name(group_armature)
+                if name not in current_names() and name not in exclude_bone_names
+            ]
+            if not missing:
+                continue
+            source_armature = (
+                _find_attachment_armature_for_missing_bones(group_armature, missing)
+                or group_armature
+            )
+            source_bones = _armature_bones_by_name(source_armature)
+            if force_full_source_bone_names.intersection(source_bones):
+                wanted = [
+                    name for name in source_bones
+                    if name not in current_names() and name not in exclude_bone_names
+                ]
+            else:
+                wanted = [name for name in missing if name in source_bones and name not in exclude_bone_names]
+            if not wanted:
+                continue
+            required_names = [
+                name for name in _required_source_bone_names(source_armature, wanted, current_names())
+                if name not in exclude_bone_names
+            ]
+
+            for bone_name in required_names:
+                _copy_source_bone_to_edit_bones(
+                    edit_bones,
+                    bone_name,
+                    source_bones,
+                    source_armature,
+                    temp_obj,
+                    root_name,
+                )
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        yield temp_obj
+    except Exception:
+        try:
+            if bpy.context.object and bpy.context.object.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception:
+            pass
+        raise
+    finally:
+        _restore_object_state(context, saved_state)
+        _remove_object(temp_obj)
+
+
 @contextmanager
 def _export_armature_for_mesh_group(context, group_armature, main_armature, asset_rel: str,
                                     warnings: list[str]):
@@ -398,8 +546,6 @@ def _export_armature_for_mesh_group(context, group_armature, main_armature, asse
 def _create_merged_export_armature(context, main_armature, source_armature, wanted_names: list[str],
                                    asset_rel: str, warnings: list[str]):
     import bpy
-    from mathutils import Vector
-
     main_bones = _armature_bones_by_name(main_armature)
     source_bones = _armature_bones_by_name(source_armature)
     wanted = [name for name in wanted_names if name in source_bones]
@@ -445,41 +591,16 @@ def _create_merged_export_armature(context, main_armature, source_armature, want
 
         edit_bones = temp_data.edit_bones
         root_name = _main_root_bone_name(main_armature)
-        temp_inv = temp_obj.matrix_world.inverted()
-        source_world = source_armature.matrix_world
 
         for bone_name in required_names:
-            if bone_name in edit_bones:
-                continue
-            source_bone = source_bones.get(bone_name)
-            if source_bone is None:
-                continue
-
-            edit_bone = edit_bones.new(bone_name)
-            source_head = source_world @ source_bone.head_local
-            source_tail = source_world @ source_bone.tail_local
-            head = temp_inv @ source_head
-            tail = temp_inv @ source_tail
-            if (tail - head).length < 0.000001:
-                tail = head + Vector((0.0, 0.01, 0.0))
-            edit_bone.head = head
-            edit_bone.tail = tail
-            try:
-                edit_bone.matrix = temp_inv @ source_world @ source_bone.matrix_local
-            except Exception:
-                pass
-            edit_bone.use_connect = False
-            try:
-                edit_bone.use_deform = bool(getattr(source_bone, "use_deform", True))
-            except Exception:
-                pass
-
-            parent = getattr(source_bone, "parent", None)
-            parent_name = str(getattr(parent, "name", "") or "")
-            if parent_name and parent_name in edit_bones:
-                edit_bone.parent = edit_bones[parent_name]
-            elif root_name and root_name in edit_bones:
-                edit_bone.parent = edit_bones[root_name]
+            _copy_source_bone_to_edit_bones(
+                edit_bones,
+                bone_name,
+                source_bones,
+                source_armature,
+                temp_obj,
+                root_name,
+            )
 
         bpy.ops.object.mode_set(mode="OBJECT")
     except Exception:

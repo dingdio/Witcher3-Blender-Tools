@@ -15,7 +15,7 @@ if "witcher3_tools" not in sys.modules:
     _pkg.__package__ = "witcher3_tools"
     sys.modules["witcher3_tools"] = _pkg
 
-from witcher3_tools.unreal_export import bundle, speedtree_bundle, texture_export, unreal_project
+from witcher3_tools.unreal_export import bundle, gather, speedtree_bundle, texture_export, unreal_project
 from witcher3_tools.unreal_export.manifest import (
     SCHEMA,
     build_manifest,
@@ -88,6 +88,8 @@ class TestFbxExportOptions(unittest.TestCase):
         self.assertFalse(captured["add_leaf_bones"])
         self.assertEqual(captured["armature_nodetype"], "NULL")
         self.assertFalse(captured["bake_anim"])
+        self.assertEqual(captured["axis_forward"], "-Z")
+        self.assertEqual(captured["axis_up"], "Y")
         # The m->cm factor rides the Armature root null; the UE plugin
         # compensates on animation imports with ImportUniformScale=100.
         self.assertEqual(captured["apply_scale_options"], "FBX_SCALE_NONE")
@@ -145,6 +147,8 @@ class TestFbxExportOptions(unittest.TestCase):
         self.assertFalse(captured["bake_anim_use_nla_strips"])
         self.assertEqual(captured["bake_anim_simplify_factor"], 0.0)
         self.assertEqual(captured["armature_nodetype"], "NULL")
+        self.assertEqual(captured["axis_forward"], "-Z")
+        self.assertEqual(captured["axis_up"], "Y")
         self.assertEqual(captured["apply_scale_options"], "FBX_SCALE_NONE")
 
     def test_export_fbx_temporarily_uses_unreal_armature_wrapper_name(self):
@@ -203,6 +207,94 @@ class TestFbxExportOptions(unittest.TestCase):
         self.assertNotEqual(captured["collision_name"], "Armature")
         self.assertEqual(armature.name, "geralt_player:CMovingPhysicalAgentComponent2_ARM")
         self.assertEqual(existing_armature_name.name, "Armature")
+
+    def test_buffer_skeleton_pose_uses_same_y_mirror_as_buffer_import(self):
+        class FakeBone:
+            def __init__(self, name, matrix_local, parent=None):
+                self.name = name
+                self.matrix_local = matrix_local
+                self.parent = parent
+
+        class FakeVector:
+            def __init__(self, x, y, z):
+                self.x = float(x)
+                self.y = float(y)
+                self.z = float(z)
+
+            def __imul__(self, scalar):
+                self.x *= scalar
+                self.y *= scalar
+                self.z *= scalar
+                return self
+
+        class FakeQuat:
+            x = 0.0
+            y = 0.0
+            z = 0.0
+            w = 1.0
+
+        class FakeMatrix:
+            def __init__(self, rows):
+                self.rows = [[float(value) for value in row] for row in rows]
+
+            @classmethod
+            def Translation(cls, vec):
+                x, y, z = vec
+                return cls(((1, 0, 0, x), (0, 1, 0, y), (0, 0, 1, z), (0, 0, 0, 1)))
+
+            @classmethod
+            def Diagonal(cls, values):
+                vals = list(values)
+                return cls(tuple(tuple(vals[row] if row == col else 0.0 for col in range(4)) for row in range(4)))
+
+            def inverted(self):
+                # Enough for this test's rigid transforms.
+                r = [[self.rows[row][col] for col in range(3)] for row in range(3)]
+                t = [self.rows[row][3] for row in range(3)]
+                rt = [[r[col][row] for col in range(3)] for row in range(3)]
+                inv_t = [-sum(rt[row][col] * t[col] for col in range(3)) for row in range(3)]
+                return FakeMatrix((
+                    (rt[0][0], rt[0][1], rt[0][2], inv_t[0]),
+                    (rt[1][0], rt[1][1], rt[1][2], inv_t[1]),
+                    (rt[2][0], rt[2][1], rt[2][2], inv_t[2]),
+                    (0, 0, 0, 1),
+                ))
+
+            def __matmul__(self, other):
+                return FakeMatrix(
+                    tuple(
+                        tuple(sum(self.rows[row][k] * other.rows[k][col] for k in range(4)) for col in range(4))
+                        for row in range(4)
+                    )
+                )
+
+            def decompose(self):
+                return (
+                    FakeVector(self.rows[0][3], self.rows[1][3], self.rows[2][3]),
+                    FakeQuat(),
+                    FakeVector(1.0, 1.0, 1.0),
+                )
+
+        previous_mathutils = sys.modules.get("mathutils")
+        sys.modules["mathutils"] = types.SimpleNamespace(Matrix=FakeMatrix)
+        try:
+            root = FakeBone("Root", FakeMatrix.Translation((0.0, 0.0, 0.0)))
+            child = FakeBone("child", FakeMatrix.Translation((0.0, -1.0, 0.0)), root)
+            armature = types.SimpleNamespace(data=types.SimpleNamespace(bones=[root, child]))
+
+            skeleton = gather.extract_armature_skeleton(armature)
+        finally:
+            if previous_mathutils is None:
+                sys.modules.pop("mathutils", None)
+            else:
+                sys.modules["mathutils"] = previous_mathutils
+
+        # Match the .w3buf Blender/RED -> Unreal basis conversion.
+        pose = skeleton["poses"][1]
+        self.assertAlmostEqual(pose[0], 0.0)
+        self.assertAlmostEqual(pose[1], 1.0)
+        self.assertAlmostEqual(pose[2], 0.0)
+        self.assertEqual(skeleton["poses"][0][7:10], [100.0, 100.0, 100.0])
 
 
 class TestAnimationAssetPaths(unittest.TestCase):
@@ -657,6 +749,21 @@ class TestExportArmatureSelection(unittest.TestCase):
 
         self.assertIs(source, attachment_arm)
 
+    def test_partial_attachment_armature_does_not_beat_complete_mesh_armature(self):
+        group_arm = self._armature("flat_mesh_ARM", ["extra_a", "extra_b", "extra_c"])
+        partial_attachment_arm = self._armature(
+            "partial_attachment_ARM",
+            ["Root", "extra_a"],
+            {"extra_a": "Root"},
+        )
+        group_arm.parent = partial_attachment_arm
+
+        source = bundle._find_attachment_armature_for_missing_bones(
+            group_arm, ["extra_a", "extra_b", "extra_c"]
+        )
+
+        self.assertIs(source, group_arm)
+
     def test_retargeted_modifiers_restore_after_export(self):
         mesh_arm = object()
         main_arm = object()
@@ -721,6 +828,39 @@ class TestBlueprintEntry(unittest.TestCase):
                 "characters/models/common/woman_average/body/model/h_wa__neck_transition",
                 "characters/models/main_npc/ciri/model/body_01_wa__ciri",
             ],
+        )
+
+    def test_woman_base_blueprint_requests_retarget_setup(self):
+        blueprint = {
+            "base_mesh_asset_path": "characters/base_entities/woman_base/woman_base",
+        }
+        setup = bundle._build_retarget_setup(
+            {"asset_path": "characters/base_entities/woman_base/woman_base"},
+            blueprint,
+        )
+
+        self.assertEqual(setup["target_profile"], "woman_base")
+        self.assertNotIn("template_ik_rig_asset_path", setup)
+        self.assertEqual(setup["output_folder"], "/Game/RETARGET_")
+
+    def test_man_base_blueprint_requests_retarget_setup(self):
+        blueprint = {
+            "base_mesh_asset_path": "characters/base_entities/man_base/man_base",
+        }
+        setup = bundle._build_retarget_setup(
+            {"asset_path": "characters/base_entities/man_base/man_base"},
+            blueprint,
+        )
+
+        self.assertEqual(setup["target_profile"], "man_base")
+        self.assertEqual(setup["target_mesh_asset_path"], "characters/base_entities/man_base/man_base")
+        self.assertEqual(setup["target_skeleton_asset_path"], "characters/base_entities/man_base/man_base_Skeleton")
+        self.assertEqual(setup["output_folder"], "/Game/RETARGET_")
+
+    def test_retarget_preview_asset_path_mirrors_blueprint_folder(self):
+        self.assertEqual(
+            bundle._preview_mesh_asset_rel_for_blueprint("gameplay/templates/characters/player/ciri_player"),
+            "gameplay/templates/characters/player/SKM_ciri_player_RetargetPreview",
         )
 
     def test_blueprint_carries_first_exported_animation(self):
@@ -1109,6 +1249,14 @@ class TestManifest(unittest.TestCase):
             manifest["blueprint"]["base_mesh_asset_path"],
             "characters/base_entities/man_base/man_base",
         )
+
+    def test_manifest_includes_retarget_setup_when_present(self):
+        manifest = build_manifest(
+            asset_name="ciri",
+            bundle_root=r"F:\exports\ciri",
+            retarget_setup={"target_profile": "woman_base"},
+        )
+        self.assertEqual(manifest["retarget_setup"]["target_profile"], "woman_base")
 
     def test_manifest_includes_animation_entries(self):
         manifest = build_manifest(

@@ -34,6 +34,7 @@ OVERWRITE_CATEGORIES = (
     "material_instances",
     "materials_base",
     "textures",
+    "retarget_assets",
 )
 
 OVERWRITE_PROTECTED_CATEGORIES = ("materials_base", "textures")
@@ -253,6 +254,7 @@ def build_manifest(
     terrain: dict[str, Any] | None = None,
     placements: dict[str, Any] | None = None,
     foliage: dict[str, Any] | None = None,
+    retarget_setup: dict[str, Any] | None = None,
     warnings: Iterable[str] = (),
 ) -> dict[str, Any]:
     game = normalize_source_game(source_game)
@@ -281,4 +283,6 @@ def build_manifest(
         manifest["placements"] = placements
     if foliage:
         manifest["foliage"] = foliage
+    if retarget_setup:
+        manifest["retarget_setup"] = retarget_setup
     return manifest

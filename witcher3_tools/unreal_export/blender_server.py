@@ -112,6 +112,8 @@ def _dispatch(request):
     command = str(request.get("command", ""))
     if command == "load_w2l_around_camera":
         return _load_w2l_around_camera(request)
+    if command == "send_animation_to_blender":
+        return _send_animation_to_blender(request)
     return {"success": False, "error": f"Unknown command: {command}"}
 
 
@@ -133,6 +135,37 @@ def _load_w2l_around_camera(request):
         "success": result["status"] == "FINISHED",
         "status": result["status"],
         "message": result["message"],
+    }
+
+
+def _send_animation_to_blender(request):
+    from .unreal_animation import apply_unreal_animation_payload
+
+    stats = apply_unreal_animation_payload(bpy.context, request)
+    retarget_mode = str(stats.get("retarget_mode", "") or "")
+    mode = "world-delta" if retarget_mode in {"world_delta_to_target", "component_world_delta_to_target"} else "legacy"
+    apply_method = str(stats.get("apply_method", "") or "").replace("_", "-")
+    track_source = str(stats.get("track_source", "") or "")
+    source_label = ""
+    if track_source == "GetAnimationPose":
+        source_label = ", evaluated component" if stats.get("pose_space_source") == "component_tracks" else ", evaluated"
+    message = (
+        f"Loaded Unreal animation '{stats['name']}' on {stats['target']} "
+        f"({stats['matched_tracks']}/{stats['source_tracks']} tracks, {stats['num_frames']} frames, "
+        f"{mode}, {apply_method}{source_label})."
+    )
+    missing_core = list(stats.get("core_bones_missing_tracks") or ())
+    if missing_core:
+        message += f" Missing core tracks: {', '.join(str(name) for name in missing_core[:5])}."
+    if (
+        stats.get("retarget_mode") == "legacy_direct_source_local"
+        and abs(float(stats.get("preview_facing_yaw_degrees", 0.0) or 0.0)) > 1e-6
+    ):
+        message += " Preview facing reversed."
+    return {
+        "success": True,
+        "message": message,
+        "stats": stats,
     }
 
 

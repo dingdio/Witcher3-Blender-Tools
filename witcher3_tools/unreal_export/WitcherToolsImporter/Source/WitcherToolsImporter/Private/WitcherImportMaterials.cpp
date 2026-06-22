@@ -190,6 +190,13 @@ EMaterialSamplerType SamplerTypeForParamName(const FString& ParamName)
     }
     return SAMPLERTYPE_LinearColor;
 }
+
+bool IsUsableMaterialTexture(UTexture* Texture)
+{
+    return IsValid(Texture)
+        && Texture->IsValidLowLevelFast()
+        && Texture->GetOutermost() != GetTransientPackage();
+}
 }
 
 void FWitcherImportContext::ImportMasters()
@@ -710,7 +717,15 @@ void FWitcherImportContext::ApplyInstanceParams(UMaterialInstanceConstant* Insta
         {
             if (UTexture* Texture = FindTexture(JsonString(Param, TEXT("depot"))))
             {
-                Instance->SetTextureParameterValueEditorOnly(FMaterialParameterInfo(*Name), Texture);
+                if (IsUsableMaterialTexture(Texture))
+                {
+                    Instance->SetTextureParameterValueEditorOnly(FMaterialParameterInfo(*Name), Texture);
+                }
+                else
+                {
+                    AddWarning(FString::Printf(TEXT("%s: texture '%s' for parameter '%s' is not a valid material texture"),
+                        *Instance->GetName(), *JsonString(Param, TEXT("depot")), *Name));
+                }
             }
             else
             {

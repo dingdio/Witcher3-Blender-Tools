@@ -111,7 +111,8 @@ UTexture* FWitcherImportContext::ImportTexture(const TSharedPtr<FJsonObject>& Te
     {
         return nullptr;
     }
-    const FString DepotRel = JsonString(TextureObject, TEXT("depot_path"));
+    FString DepotRel = JsonString(TextureObject, TEXT("depot_path"));
+    DepotRel = DepotRel.Replace(TEXT("\\"), TEXT("/"));
     if (DepotRel.IsEmpty())
     {
         return nullptr;
@@ -121,7 +122,11 @@ UTexture* FWitcherImportContext::ImportTexture(const TSharedPtr<FJsonObject>& Te
         return Cached->Get();
     }
 
-    const FString AssetRel = ClassSafeAssetRel(DepotRel, UTexture::StaticClass(), TEXT("_tex"));
+    const FString ReservedRel = TextureAssetRelByDepot.FindRef(DepotRel);
+    const FString AssetRel = ClassSafeAssetRel(
+        ReservedRel.IsEmpty() ? DepotRel : ReservedRel,
+        UTexture::StaticClass(),
+        TEXT("_tex"));
 
     if (UTexture* Existing = LoadExistingAsset<UTexture>(ObjectPathFor(AssetRel)))
     {
@@ -172,22 +177,32 @@ UTexture* FWitcherImportContext::ImportTexture(const TSharedPtr<FJsonObject>& Te
 
 UTexture* FWitcherImportContext::FindTexture(const FString& DepotRel)
 {
-    if (DepotRel.IsEmpty())
+    FString NormalizedDepotRel = DepotRel.Replace(TEXT("\\"), TEXT("/"));
+    if (NormalizedDepotRel.IsEmpty())
     {
         return nullptr;
     }
-    if (const TWeakObjectPtr<UTexture>* Cached = TexturesByDepot.Find(DepotRel))
+    if (const TWeakObjectPtr<UTexture>* Cached = TexturesByDepot.Find(NormalizedDepotRel))
     {
         return Cached->Get();
     }
-    UTexture* Existing = LoadExistingAsset<UTexture>(ObjectPathFor(DepotRel));
+    UTexture* Existing = nullptr;
+    const FString ReservedRel = TextureAssetRelByDepot.FindRef(NormalizedDepotRel);
+    if (!ReservedRel.IsEmpty())
+    {
+        Existing = LoadExistingAsset<UTexture>(ObjectPathFor(ReservedRel));
+    }
     if (!Existing)
     {
-        Existing = LoadExistingAsset<UTexture>(ObjectPathFor(DepotRel + TEXT("_tex")));
+        Existing = LoadExistingAsset<UTexture>(ObjectPathFor(NormalizedDepotRel));
+    }
+    if (!Existing)
+    {
+        Existing = LoadExistingAsset<UTexture>(ObjectPathFor(NormalizedDepotRel + TEXT("_tex")));
     }
     if (Existing)
     {
-        TexturesByDepot.Add(DepotRel, Existing);
+        TexturesByDepot.Add(NormalizedDepotRel, Existing);
     }
     return Existing;
 }

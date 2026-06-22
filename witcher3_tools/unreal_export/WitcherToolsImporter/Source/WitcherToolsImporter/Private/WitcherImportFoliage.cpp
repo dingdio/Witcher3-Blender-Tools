@@ -1,6 +1,10 @@
 #include "WitcherImportContext.h"
 #include "WitcherImportContextInternal.h"
 
+#include "Runtime/Launch/Resources/Version.h"
+
+#define WITCHER_HAS_UE58_FOLIAGE_API (ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8))
+
 using namespace WitcherImportInternal;
 
 namespace
@@ -153,7 +157,9 @@ void ApplyGeneratedFoliageSettings(
         FoliageType->bReceivesDecals = false;
         FoliageType->bUseAsOccluder = false;
         FoliageType->bVisibleInRayTracing = false;
+#if WITCHER_HAS_UE58_FOLIAGE_API
         FoliageType->bVisibleInReflections = false;
+#endif
         FoliageType->bEnableDensityScaling = true;
         FoliageType->BodyInstance.SetCollisionProfileName(FName(TEXT("NoCollision")));
         FoliageType->BodyInstance.SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -172,7 +178,9 @@ void ApplyGeneratedFoliageSettings(
         FoliageType->bReceivesDecals = false;
         FoliageType->bUseAsOccluder = false;
         FoliageType->bVisibleInRayTracing = false;
+#if WITCHER_HAS_UE58_FOLIAGE_API
         FoliageType->bVisibleInReflections = false;
+#endif
         FoliageType->bEnableDensityScaling = false;
         FoliageType->BodyInstance.SetCollisionProfileName(FName(TEXT("BlockAll")));
         FoliageType->BodyInstance.SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
@@ -191,7 +199,9 @@ void ApplyGeneratedFoliageSettings(
         FoliageType->bReceivesDecals = false;
         FoliageType->bUseAsOccluder = false;
         FoliageType->bVisibleInRayTracing = true;
+#if WITCHER_HAS_UE58_FOLIAGE_API
         FoliageType->bVisibleInReflections = true;
+#endif
         FoliageType->bEnableDensityScaling = false;
         FoliageType->BodyInstance.SetCollisionProfileName(FName(TEXT("BlockAll")));
         FoliageType->BodyInstance.SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
@@ -299,6 +309,7 @@ void FWitcherImportContext::ImportFoliage()
         }
     };
 
+#if WITCHER_HAS_UE58_FOLIAGE_API
     // UE 5.8 can dereference a null foliage base component.
     IFoliageEditModuleBase* FoliageEditModule = IFoliageEditModuleBase::Get();
     USceneComponent* NullBaseComponentSentinel = nullptr;
@@ -320,6 +331,12 @@ void FWitcherImportContext::ImportFoliage()
         }
         RestoreFoliageMode();
     };
+#else
+    ON_SCOPE_EXIT
+    {
+        RestoreFoliageMode();
+    };
+#endif
 
     int32 TypeCount = 0;
     int32 InstanceCount = 0;
@@ -467,7 +484,9 @@ void FWitcherImportContext::ImportFoliage()
                     FoliageInstance.Location = Xform.GetLocation();
                     FoliageInstance.Rotation = Xform.GetRotation().Rotator();
                     FoliageInstance.DrawScale3D = (FVector3f)Xform.GetScale3D();
+#if WITCHER_HAS_UE58_FOLIAGE_API
                     FoliageInstance.BaseComponent = NullBaseComponentSentinel;
+#endif
                     const int32 Idx = FoliageInstances.Add(FoliageInstance);
                     InstancesByIFA.FindOrAdd(IFA).Add(&FoliageInstances[Idx]);
                 }

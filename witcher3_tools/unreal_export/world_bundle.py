@@ -103,17 +103,20 @@ def _export_tint_texture(tint_dds: str, bundle_root: str, depot_rel: str,
 
 
 def _ensure_terrain_control_sources(world, world_path: str, hub: str, heightmap_dir: str,
-                                    warnings: list[str]) -> None:
-    """Make sure combined overlay/bkgrnd/blend sidecars exist for UE terrain."""
-    required = (
-        os.path.join(heightmap_dir, f"combined.{hub}.overlay.data"),
-        os.path.join(heightmap_dir, f"combined.{hub}.bkgrnd.data"),
-        os.path.join(heightmap_dir, f"combined.{hub}.blendcontrol.data"),
-    )
-    if all(os.path.isfile(path) for path in required):
+                                    warnings: list[str],
+                                    targets: tuple[str, ...] = ("overlay", "bkgrnd", "blend")) -> None:
+    """Make sure combined terrain map sidecars exist and are generator-fresh."""
+    target_paths = {
+        "overlay": os.path.join(heightmap_dir, f"combined.{hub}.overlay.data"),
+        "bkgrnd": os.path.join(heightmap_dir, f"combined.{hub}.bkgrnd.data"),
+        "blend": os.path.join(heightmap_dir, f"combined.{hub}.blendcontrol.data"),
+        "tint": os.path.join(heightmap_dir, f"{hub}.tint.png"),
+    }
+    required = tuple(target_paths[name] for name in targets if name in target_paths)
+    if not required:
         return
     if not world_path:
-        warnings.append("Terrain control map export skipped: source .w2w path is missing.")
+        warnings.append("Terrain map source export skipped: source .w2w path is missing.")
         return
 
     try:
@@ -129,7 +132,10 @@ def _ensure_terrain_control_sources(world, world_path: str, hub: str, heightmap_
             working_tiles_dir=ctx["working_tiles_dir"],
         )
         if not buffer_paths:
-            warnings.append("Terrain control map export skipped: no .w2ter buffer sidecars were found.")
+            warnings.append("Terrain map source export skipped: no .w2ter buffer sidecars were found.")
+            return
+        src_mtime = terrain_w2ter._max_source_mtime(buffer_paths)
+        if all(terrain_w2ter._is_fresh(path, src_mtime) for path in required):
             return
 
         terrain_w2ter.combine_w2ter_tiles(
@@ -139,11 +145,11 @@ def _ensure_terrain_control_sources(world, world_path: str, hub: str, heightmap_
             res_override=ctx["tile_res"],
             x_tiles_override=ctx["n_tiles"],
             y_tiles_override=ctx["n_tiles"],
-            targets=("overlay", "bkgrnd", "blend"),
+            targets=targets,
             skip_existing=True,
         )
     except Exception as exc:
-        warnings.append(f"Terrain control map export failed ({exc}); using flat tint.")
+        warnings.append(f"Terrain map source export failed ({exc}); using existing terrain maps.")
 
 
 def _export_terrain_blend_layers(world, hub: str, heightmap_dir: str, height_res: int,
@@ -848,8 +854,30 @@ def build_unreal_world_bundle(context, settings) -> dict[str, Any]:
     if not asset_rel:
         asset_rel = f"levels/{safe_asset_name(hub)}/{safe_asset_name(hub)}"
 
+    heightmap_dir = os.path.dirname(heightmap_png)
     textures: list[dict[str, Any]] = []
     base_color_depot = ""
+
+    world = None
+    world_load_error = ""
+    redkit_repo_context = None
+    if world_path:
+        try:
+            from ..CR2W import CR2W_reader
+            from ..CR2W.common_blender import redkit_repo_context as _redkit_repo_context
+
+            redkit_repo_context = _redkit_repo_context
+            with redkit_repo_context(world_path):
+                world = CR2W_reader.load_w2w(world_path)
+        except Exception as exc:
+            world_load_error = str(exc) or world_path
+
+    if world is not None and redkit_repo_context is not None:
+        with redkit_repo_context(world_path):
+            _ensure_terrain_control_sources(
+                world, world_path, hub, heightmap_dir, warnings, targets=("tint",)
+            )
+
     tint_entry = _export_tint_texture(
         _tint_source_path(heightmap_png, hub), bundle_root, f"{asset_rel}_tint", warnings
     )
@@ -864,15 +892,9 @@ def build_unreal_world_bundle(context, settings) -> dict[str, Any]:
     # to tint-only when the source world is available.
     terrain_layers: list[dict] = []
     terrain_control: str = ""
-    heightmap_dir = os.path.dirname(heightmap_png)
     terrain_material_errors: list[str] = []
     try:
-        from ..CR2W import CR2W_reader
-        from ..CR2W.common_blender import redkit_repo_context
-
-        with redkit_repo_context(world_path):
-            world = CR2W_reader.load_w2w(world_path) if world_path else None
-        if world is not None:
+        if world is not None and redkit_repo_context is not None:
             warning_start = len(warnings)
             with redkit_repo_context(world_path):
                 _ensure_terrain_control_sources(world, world_path, hub, heightmap_dir, warnings)
@@ -898,8 +920,14 @@ def build_unreal_world_bundle(context, settings) -> dict[str, Any]:
                         "Terrain layer texture export failed: "
                         f"{len(terrain_layers) - normal_count} normal layer texture(s) missing."
                     )
+        elif world_load_error:
+            terrain_material_errors.append(
+                f"Could not load source world for terrain materials: {world_load_error}"
+            )
         elif world_path:
-            terrain_material_errors.append(f"Could not load source world for terrain materials: {world_path}")
+            terrain_material_errors.append(
+                f"Could not load source world for terrain materials: {world_path}"
+            )
     except Exception as exc:
         terrain_material_errors.append(f"Terrain blend-layer export failed: {exc}")
 

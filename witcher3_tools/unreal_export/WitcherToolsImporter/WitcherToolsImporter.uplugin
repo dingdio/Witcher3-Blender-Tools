@@ -10,6 +10,20 @@
   "IsBetaVersion": true,
   "IsExperimentalVersion": true,
   "Installed": false,
+  "Plugins": [
+    {
+      "Name": "IKRig",
+      "Enabled": true
+    },
+    {
+      "Name": "ControlRig",
+      "Enabled": true
+    },
+    {
+      "Name": "FullBodyIK",
+      "Enabled": true
+    }
+  ],
   "Modules": [
     {
       "Name": "WitcherToolsRuntime",

@@ -27,6 +27,7 @@ from .manifest import (
     safe_asset_name,
 )
 from .export_armature import (
+    _combined_export_armature_for_mesh_groups,
     _export_armature_for_mesh_group,
     _find_attachment_armature_for_missing_bones,  # re-exported for tests
     _group_armature,
@@ -54,6 +55,34 @@ _AUTO_CONTENT_ROOTS = {
     default_content_root("w2").lower(),
     default_content_root("w3").lower(),
 }
+_WOMAN_BASE_ASSET_REL = "characters/base_entities/woman_base/woman_base"
+_MAN_BASE_ASSET_REL = "characters/base_entities/man_base/man_base"
+_RETARGET_PREVIEW_FORCE_FULL_SOURCE_BONES = {
+    "dyng_hair_a_null",
+    "dyng_hair_b_null",
+    "dyng_hair_c_null",
+    "dyng_hair_d_null",
+    "dyng_hair_e_null",
+    "dyng_hair_x_null",
+    "iris",
+    "placer_iris",
+}
+_RETARGET_PREVIEW_EXCLUDED_BONES = {
+    "dyng_backbag_01",
+    "dyng_dagger_01",
+    "dyng_frontbag_01",
+    "steel_sword_scabbard",
+    "steel_sword_scabbard_1",
+    "steel_sword_scabbard_2",
+    "steel_sword_scabbard_3",
+}
+
+
+def _preview_mesh_asset_rel_for_blueprint(blueprint_asset_rel: str) -> str:
+    blueprint_asset_rel = str(blueprint_asset_rel or "").strip().replace("\\", "/")
+    folder, _, name = blueprint_asset_rel.rpartition("/")
+    preview_name = f"SKM_{safe_asset_name(name or blueprint_asset_rel)}_RetargetPreview"
+    return f"{folder}/{preview_name}" if folder else preview_name
 
 
 def default_export_folder() -> str:
@@ -180,6 +209,17 @@ def build_unreal_export_bundle(context, settings) -> dict[str, Any]:
     blueprint_entry = _build_blueprint_entry(
         main_armature, asset_name, mesh_entries, rig_entry, animation_entries
     )
+    if blueprint_entry is not None:
+        _export_retarget_preview_fbx(
+            context,
+            groups,
+            main_armature,
+            blueprint_entry,
+            bundle_root,
+            used_fbx_stems,
+            warnings,
+        )
+    retarget_setup = _build_retarget_setup(rig_entry, blueprint_entry)
 
     manifest = build_manifest(
         asset_name=asset_name,
@@ -194,6 +234,7 @@ def build_unreal_export_bundle(context, settings) -> dict[str, Any]:
         animations=animation_entries,
         rig=rig_entry,
         blueprint=blueprint_entry,
+        retarget_setup=retarget_setup,
         warnings=warnings + chain.warnings + registry.warnings,
     )
 
@@ -788,6 +829,129 @@ def _create_rig_dummy_mesh(context, armature):
     return obj
 
 
+def _scale_temp_armature_data(armature, scale: float) -> None:
+    if armature is None or abs(float(scale) - 1.0) < 0.000001:
+        return
+    from mathutils import Matrix
+
+    armature.data.transform(Matrix.Scale(float(scale), 4))
+
+
+@contextmanager
+def _scaled_mesh_object_copies(context, mesh_objects, scale: float):
+    if abs(float(scale) - 1.0) < 0.000001:
+        yield list(mesh_objects or [])
+        return
+
+    import bpy
+    from mathutils import Matrix
+
+    collection = getattr(context, "collection", None)
+    if collection is None:
+        collection = getattr(getattr(context, "scene", None), "collection", None)
+    if collection is None:
+        collection = bpy.context.scene.collection
+
+    scale_matrix = Matrix.Scale(float(scale), 4)
+    copies = []
+    try:
+        for obj in mesh_objects or []:
+            dup = obj.copy()
+            dup.name = _unique_temp_object_name("__witcher_unreal_export_preview_mesh", _iter_bpy_objects())
+            dup.data = obj.data.copy()
+            dup.data.name = _unique_temp_object_name("__witcher_unreal_export_preview_mesh_data", bpy.data.meshes)
+            dup.data.transform(scale_matrix)
+            try:
+                dup.data.update()
+            except Exception:
+                pass
+            try:
+                matrix = obj.matrix_world.copy()
+                matrix.translation = matrix.translation * float(scale)
+                dup.matrix_world = matrix
+            except Exception:
+                pass
+            collection.objects.link(dup)
+            copies.append(dup)
+        yield copies
+    finally:
+        for obj in copies:
+            _remove_object(obj)
+
+
+def _export_retarget_preview_fbx(context, groups, main_armature, blueprint_entry: dict[str, Any],
+                                 bundle_root: str, used_fbx_stems: dict[str, str],
+                                 warnings: list[str]) -> None:
+    if main_armature is None:
+        return
+
+    mesh_asset_paths = {
+        str(path or "").strip().replace("\\", "/")
+        for path in blueprint_entry.get("mesh_asset_paths", []) or []
+        if str(path or "").strip()
+    }
+    if not mesh_asset_paths:
+        return
+
+    preview_groups = []
+    preview_mesh_objects = []
+    for group in groups or []:
+        if str(group.get("asset_path", "") or "").replace("\\", "/") not in mesh_asset_paths:
+            continue
+        group_armature = _group_armature(group.get("objects", []))
+        if _special_attachment_socket(group_armature):
+            continue
+        if _hard_attachment_socket(group.get("objects", []), main_armature):
+            continue
+        preview_groups.append(group)
+        preview_mesh_objects.extend(group.get("objects", []) or [])
+
+    unique_preview_mesh_objects = []
+    seen_mesh_ids: set[int] = set()
+    for obj in preview_mesh_objects:
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        obj_id = id(obj)
+        if obj_id in seen_mesh_ids:
+            continue
+        seen_mesh_ids.add(obj_id)
+        unique_preview_mesh_objects.append(obj)
+    preview_mesh_objects = unique_preview_mesh_objects
+    if not preview_mesh_objects:
+        return
+
+    preview_asset_rel = _preview_mesh_asset_rel_for_blueprint(str(blueprint_entry.get("asset_path", "") or ""))
+    fbx_path = _unique_fbx_path(bundle_root, preview_asset_rel, used_fbx_stems)
+    group_armatures = [_group_armature(group.get("objects", [])) for group in preview_groups]
+    with _combined_export_armature_for_mesh_groups(
+        context,
+        group_armatures,
+        main_armature,
+        preview_asset_rel,
+        warnings,
+        force_full_source_bone_names=_RETARGET_PREVIEW_FORCE_FULL_SOURCE_BONES,
+        exclude_bone_names=_RETARGET_PREVIEW_EXCLUDED_BONES,
+    ) as preview_armature:
+        if preview_armature is None:
+            return
+        _scale_temp_armature_data(preview_armature, 100.0)
+        with _retargeted_armature_modifiers(preview_mesh_objects, preview_armature):
+            with _scaled_mesh_object_copies(context, preview_mesh_objects, 100.0) as scaled_preview_mesh_objects:
+                export_fbx(
+                    context,
+                    scaled_preview_mesh_objects + [preview_armature],
+                    fbx_path,
+                    apply_scale_options="FBX_SCALE_UNITS",
+                )
+
+    blueprint_entry["retarget_preview_asset_path"] = preview_asset_rel
+    blueprint_entry["retarget_preview_fbx"] = relpath_for_manifest(fbx_path, bundle_root)
+    warnings.append(
+        f"{preview_asset_rel}: exported combined retarget preview FBX with "
+        f"{len(preview_mesh_objects)} mesh object(s)"
+    )
+
+
 def _build_blueprint_entry(armature, asset_name: str, mesh_entries,
                            rig_entry=None, animation_entries=None) -> Optional[dict[str, Any]]:
     skeletal_entries = [entry for entry in mesh_entries if entry.get("kind") == "skeletal"]
@@ -831,6 +995,28 @@ def _build_blueprint_entry(armature, asset_name: str, mesh_entries,
         # the animation currently applied to the armature in Blender.
         entry["animation_asset_path"] = str(animation_entries[0].get("asset_path", "") or "")
     return entry
+
+
+def _build_retarget_setup(rig_entry=None, blueprint_entry=None) -> Optional[dict[str, Any]]:
+    rig_asset = str((rig_entry or {}).get("asset_path", "") or "").strip().replace("\\", "/").lower()
+    base_asset = str((blueprint_entry or {}).get("base_mesh_asset_path", "") or "").strip().replace("\\", "/").lower()
+    if rig_asset == _WOMAN_BASE_ASSET_REL or base_asset == _WOMAN_BASE_ASSET_REL:
+        target_profile = "woman_base"
+        target_asset = _WOMAN_BASE_ASSET_REL
+    elif rig_asset == _MAN_BASE_ASSET_REL or base_asset == _MAN_BASE_ASSET_REL:
+        target_profile = "man_base"
+        target_asset = _MAN_BASE_ASSET_REL
+    else:
+        return None
+    return {
+        "target_profile": target_profile,
+        "source_profile": "mannequin",
+        "target_mesh_asset_path": target_asset,
+        "target_skeleton_asset_path": target_asset + "_Skeleton",
+        "source_mesh_asset_path": "/Game/Characters/Mannequins/Meshes/SKM_Quinn_Simple",
+        "source_mesh_fallback_asset_path": "/Game/Characters/Mannequins/Meshes/SKM_Manny_Simple",
+        "output_folder": "/Game/RETARGET_",
+    }
 
 
 # ---- animation export ----
@@ -1071,7 +1257,8 @@ def export_animation_fbx(context, armature, action, fbx_path: str) -> None:
 
 
 def export_fbx(context, export_objects, fbx_path: str, *, object_types=None,
-               bake_anim: bool = False) -> None:
+               bake_anim: bool = False, apply_scale_options: str = "FBX_SCALE_NONE",
+               global_scale: float = 1.0) -> None:
     import bpy
 
     if object_types is None:
@@ -1088,6 +1275,7 @@ def export_fbx(context, export_objects, fbx_path: str, *, object_types=None,
             bpy.ops.export_scene.fbx(
                 filepath=fbx_path,
                 use_selection=True,
+                global_scale=global_scale,
                 object_types=object_types,
                 add_leaf_bones=False,
                 armature_nodetype="NULL",
@@ -1112,13 +1300,8 @@ def export_fbx(context, export_objects, fbx_path: str, *, object_types=None,
                 axis_forward="-Z",
                 axis_up="Y",
                 apply_unit_scale=True,
-                # FBX_SCALE_NONE puts the m->cm factor on the Armature root
-                # null. UE's legacy importer folds that into the root BONE for
-                # skeletal meshes (ref pose root scale=100) but divides it out
-                # of animation root tracks -- the plugin compensates with
-                # ImportUniformScale=100 on animation imports so both sides
-                # agree (see WitcherImportContext::ImportAnimation).
-                apply_scale_options="FBX_SCALE_NONE",
+                # Keep Blender's m->cm factor on the Armature root for UE import.
+                apply_scale_options=apply_scale_options,
                 bake_space_transform=False,
                 path_mode="AUTO",
             )
