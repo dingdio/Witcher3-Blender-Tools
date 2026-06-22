@@ -306,11 +306,6 @@ def get_raw_colormap_tile_res(tile_paths: Dict[Tuple[int, int], str]) -> Optiona
     return None
 
 
-def _is_editor_colormap_buffer_index(idx: int) -> bool:
-    # Editor/source terrain keeps height, control, and color buffers per mip.
-    return idx >= 3 and idx % 3 == 0
-
-
 def _infer_colormap_mip(res: int, tile_blocks: int) -> Optional[int]:
     tile_res_px = tile_blocks * 4
     if tile_res_px <= 0 or res % tile_res_px != 0:
@@ -320,6 +315,18 @@ def _infer_colormap_mip(res: int, tile_blocks: int) -> Optional[int]:
         return None
     mip = int(round(math.log2(ratio)))
     if (1 << mip) * tile_res_px != res:
+        return None
+    return mip
+
+
+def _infer_raw_colormap_mip(res: int, raw_res: int) -> Optional[int]:
+    if raw_res <= 0 or res % raw_res != 0:
+        return None
+    ratio = res // raw_res
+    if ratio <= 0:
+        return None
+    mip = int(round(math.log2(ratio)))
+    if (1 << mip) * raw_res != res:
         return None
     return mip
 
@@ -337,27 +344,44 @@ def _representative_buffer_size(tile_paths: Dict[Tuple[int, int], str]) -> Optio
     return max(counts.items(), key=lambda kv: kv[1])[0]
 
 
-def _expected_buffer_sizes(res: int, num_mips: int, colormap_start_mip: int) -> List[int]:
+def _bc1_size(width: int, height: int) -> int:
+    return max(1, (width + 3) // 4) * max(1, (height + 3) // 4) * 8
+
+
+def _expected_buffer_sizes(
+    res: int,
+    num_mips: int,
+    colormap_start_mip: int,
+    colormap_encoding: str,
+) -> List[int]:
     seq: List[int] = []
     for mip in range(num_mips):
         r = res >> mip
+        if r <= 0:
+            return []
         u16 = r * r * 2
-        bc1 = (r * r) // 2
         seq.append(u16)
         seq.append(u16)
         if mip >= colormap_start_mip:
-            seq.append(bc1)
+            if colormap_encoding == "raw_rgba":
+                seq.append(r * r * 4)
+            elif colormap_encoding == "bc1":
+                seq.append(_bc1_size(r, r))
+            else:
+                return []
     return seq
 
 
-def detect_colormap_start_mip(
+def _detect_colormap_layout(
     tiles: Dict[int, Dict[Tuple[int, int], str]],
     res: int,
-) -> Optional[int]:
+) -> Optional[Tuple[int, str]]:
     if not res or res <= 0:
         return None
     indices = sorted(tiles.keys())
     if not indices:
+        return None
+    if indices[0] != 1 or indices != list(range(1, indices[-1] + 1)):
         return None
     sizes: List[int] = []
     for idx in indices:
@@ -373,25 +397,47 @@ def detect_colormap_start_mip(
         num_mips = (total + start_mip) // 3
         if not 0 <= start_mip < num_mips:
             continue
-        if _expected_buffer_sizes(res, num_mips, start_mip) == sizes:
-            return start_mip
+        for encoding in ("raw_rgba", "bc1"):
+            if _expected_buffer_sizes(res, num_mips, start_mip, encoding) == sizes:
+                return start_mip, encoding
     return None
+
+
+def detect_colormap_start_mip(
+    tiles: Dict[int, Dict[Tuple[int, int], str]],
+    res: int,
+) -> Optional[int]:
+    layout = _detect_colormap_layout(tiles, res)
+    return layout[0] if layout else None
 
 
 def select_tintmap_buffer_index(
     tiles: Dict[int, Dict[Tuple[int, int], str]],
     res: int,
 ) -> Optional[int]:
+    layout = _detect_colormap_layout(tiles, res)
+    if layout is not None:
+        start_mip, encoding = layout
+        idx = start_mip * 2 + 3
+        if idx in tiles:
+            if encoding == "raw_rgba" and get_raw_colormap_tile_res(tiles[idx]):
+                return idx
+            if encoding == "bc1" and get_tintmap_tile_blocks(tiles[idx]):
+                return idx
+
     raw_candidates = []
     for idx, tile_paths in tiles.items():
-        if not _is_editor_colormap_buffer_index(idx):
-            continue
         raw_res = get_raw_colormap_tile_res(tile_paths)
         if not raw_res:
             continue
         if raw_res == res:
             return idx
-        raw_candidates.append((idx, raw_res))
+        mip = _infer_raw_colormap_mip(res, raw_res)
+        if mip is None:
+            continue
+        start_mip = 3 * mip + 3 - idx
+        if 0 <= start_mip <= mip:
+            raw_candidates.append((idx, raw_res))
     if raw_candidates:
         # REDkit/editor tiles store uncompressed RGBA colormaps per mip. Prefer
         # the largest available mip so it matches the full terrain resolution.
