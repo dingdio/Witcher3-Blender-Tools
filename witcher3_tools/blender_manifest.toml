@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "witcher3_tools"
-version = "1.0.1"
+version = "1.1.0"
 name = "Witcher 3 Tools"
 tagline = "Import and export Witcher assets"
 maintainer = "Dingdio"
