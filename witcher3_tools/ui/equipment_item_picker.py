@@ -7,6 +7,12 @@ from ..repo_paths import normalize_source_game as _normalize_source_game
 
 _EQUIPMENT_ITEM_PICKER_RECENTS = {}
 _EQUIPMENT_ITEM_PICKER_RECENT_LIMIT = 24
+# Draw-time memo keyed by (item, template, game).
+_INVENTORY_PRESET_ATTRS_MEMO = {}
+
+
+def clear_inventory_preset_attrs_memo():
+    _INVENTORY_PRESET_ATTRS_MEMO.clear()
 _EQUIPMENT_ITEM_PICKER_WIDTH = 720
 _EQUIPMENT_ITEM_PICKER_GRID_PAGE_ROWS = 4
 _EQUIPMENT_ITEM_PICKER_GRID_SIZES = {
@@ -427,6 +433,10 @@ def _inventory_preset_entry_attrs(entry, source_game="w3"):
     item_name = _inventory_preset_entry_item(entry)
     template = _inventory_preset_entry_template(entry)
     source_game = _inventory_preset_entry_source_game(entry, source_game)
+    memo_key = (item_name, template, source_game)
+    cached = _INVENTORY_PRESET_ATTRS_MEMO.get(memo_key)
+    if cached is not None:
+        return cached
     attrs = {}
     try:
         if item_name:
@@ -437,6 +447,9 @@ def _inventory_preset_entry_attrs(entry, source_game="w3"):
         attrs = {}
     if not isinstance(attrs, dict):
         attrs = {}
+    if len(_INVENTORY_PRESET_ATTRS_MEMO) > 2048:
+        _INVENTORY_PRESET_ATTRS_MEMO.clear()
+    _INVENTORY_PRESET_ATTRS_MEMO[memo_key] = attrs
     return attrs
 
 
@@ -1059,6 +1072,11 @@ def draw_inventory_preset_picker(context, layout):
     clear_op = clear_box.operator("witcher.equipment_clear_inventory_preset", text="", icon='X')
     clear_op.target = target
 
+    if equipment._equipment_icons_warming():
+        warm = layout.row(align=True)
+        warm.alignment = 'CENTER'
+        warm.label(text="Preparing item thumbnails…", icon='TIME')
+
     if page_count > 1:
         nav = layout.row(align=True)
         nav.alignment = 'CENTER'
@@ -1272,6 +1290,11 @@ class EQUIPMENT_OT_SearchDefaultItem(bpy.types.Operator):
         clear_op = action_box.operator("witcher.equipment_pick_default_item", text="None", icon='X')
         clear_op.entry_index = self.entry_index
         clear_op.item_name = "None"
+
+        if equipment._equipment_icons_warming():
+            warm = layout.row(align=True)
+            warm.alignment = 'CENTER'
+            warm.label(text="Preparing item thumbnails…", icon='TIME')
 
         if page_count > 1:
             nav = layout.row(align=True)

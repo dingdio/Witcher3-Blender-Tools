@@ -5,7 +5,7 @@ gives equipment and future browsers a public boundary so they do not import the
 file browser's private helpers directly.
 """
 
-from .browser_dummy_icons import ensure_browser_dummy_icon_path
+from .browser_dummy_icons import ensure_browser_dummy_icon_path, ensure_browser_error_icon_path
 
 
 def _file_browser():
@@ -43,3 +43,7 @@ def get_browser_item_icon_info(context, cache_type: str, item_path: str, loadmod
 
 def ensure_dummy_icon_path(cache_type: str, item_path: str) -> str:
     return ensure_browser_dummy_icon_path(cache_type, item_path)
+
+
+def ensure_error_icon_path() -> str:
+    return ensure_browser_error_icon_path()

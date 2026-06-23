@@ -7,6 +7,7 @@ import logging
 import re
 import hashlib
 import shutil
+import threading
 from contextlib import contextmanager
 from bpy.app.handlers import persistent
 from mathutils import Matrix
@@ -67,15 +68,26 @@ from .equipment_item_picker import (
     _on_equipment_preset_picker_filter_changed,
     draw_inventory_preset_picker,
     inventory_preset_picker_width,
+    clear_inventory_preset_attrs_memo,
 )
 
 _UNCOOK_ITEM_TEMPLATE_INDEX = {}
 _LAST_EQUIPMENT_LOAD_FAILURES = {}
 _OPERATOR_ENUM_CACHE = {}
+# cache_key -> icon_id. Absent means unresolved; 0 means neutral placeholder.
 _EQUIPMENT_ITEM_ICON_ID_CACHE = {}
 _EQUIPMENT_ITEM_ICON_REQUESTS = []
 _EQUIPMENT_ITEM_ICON_PENDING_KEYS = set()
 _EQUIPMENT_ITEM_ICON_TIMER_RUNNING = False
+_EQUIPMENT_ITEM_ICON_RETRY_COUNTS = {}
+_EQUIPMENT_ICON_CACHE_KEY_MEMO = {}
+_EQUIPMENT_ITEM_ICON_MAX_RETRIES = 2
+
+# Build heavy W3 cache managers off the UI thread, then resolve icons on timers.
+_EQUIPMENT_BACKEND_WARM_LOCK = threading.Lock()
+_EQUIPMENT_BACKEND_BUILD_LOCK = threading.Lock()
+_EQUIPMENT_BACKEND_WARMING = set()
+_EQUIPMENT_BACKEND_WARM_FAILED = {}
 # Persistent icon cache: resolved preview images are copied into a cache dir and
 # their paths recorded to JSON so icons load once and survive Blender restarts
 # (no re-resolution / no UI lag on later sessions).
@@ -87,16 +99,16 @@ _EQUIPMENT_ICON_PERSIST_DIR = Path(get_cache_root(create=True)) / "equipment_ico
 _ENTITY_APPEARANCE_CACHE = {}
 _EQUIPMENT_ENTITY_CACHE = {}
 _TEMPLATE_PATH_RESOLVE_CACHE = {}  # (template_key, roots_tuple) -> (repo_path, export_path)
-# How many icons the background timer resolves per tick. Resolution happens on
-# the main thread (DDS extraction), so keep this small to avoid UI stutter.
-# Placeholders are shown instantly, so a low value here only affects how fast
-# real thumbnails stream in — not whether the grid looks complete.
-_EQUIPMENT_ITEM_ICON_BATCH_SIZE = 2
+# Main-thread resolver budget: enough to stream thumbnails without visible stalls.
+_EQUIPMENT_ITEM_ICON_TICK_BUDGET = 0.018
+_EQUIPMENT_ITEM_ICON_TIMER_INTERVAL = 0.0
+_EQUIPMENT_ITEM_ICON_WARM_INTERVAL = 0.25
 
 # Lazily-built neutral placeholder shown at the exact size of a real icon while
-# the real one is still resolving (or can't be resolved at all).
+# the real one is still resolving or unavailable.
 _EQUIPMENT_PLACEHOLDER_PREVIEWS = None
 _EQUIPMENT_PLACEHOLDER_ICON_ID = 0
+_EQUIPMENT_ERROR_ICON_ID = 0
 
 def _clear_cache_if_oversized(cache, max_entries=64):
     if len(cache) > max_entries:
@@ -107,6 +119,15 @@ def _clear_equipment_item_icon_cache():
     _EQUIPMENT_ITEM_ICON_ID_CACHE.clear()
     _EQUIPMENT_ITEM_ICON_REQUESTS.clear()
     _EQUIPMENT_ITEM_ICON_PENDING_KEYS.clear()
+    _EQUIPMENT_ITEM_ICON_RETRY_COUNTS.clear()
+    _EQUIPMENT_ICON_CACHE_KEY_MEMO.clear()
+    try:
+        clear_inventory_preset_attrs_memo()
+    except Exception:
+        pass
+    # Allow failed warm-up epochs to be retried after a refresh.
+    with _EQUIPMENT_BACKEND_WARM_LOCK:
+        _EQUIPMENT_BACKEND_WARM_FAILED.clear()
 
 
 def _get_equipment_placeholder_icon_id():
@@ -139,8 +160,32 @@ def _get_equipment_placeholder_icon_id():
     return _EQUIPMENT_PLACEHOLDER_ICON_ID
 
 
+def _get_equipment_error_icon_id():
+    """Return a stable icon_id for a distinct red 'failed to load' icon."""
+    global _EQUIPMENT_PLACEHOLDER_PREVIEWS, _EQUIPMENT_ERROR_ICON_ID
+    if _EQUIPMENT_ERROR_ICON_ID:
+        return _EQUIPMENT_ERROR_ICON_ID
+    try:
+        from . import asset_previews
+
+        png_path = asset_previews.ensure_error_icon_path()
+        if not png_path:
+            return 0
+        if _EQUIPMENT_PLACEHOLDER_PREVIEWS is None:
+            _EQUIPMENT_PLACEHOLDER_PREVIEWS = bpy.utils.previews.new()
+        key = "equipment_item_error"
+        icon = _EQUIPMENT_PLACEHOLDER_PREVIEWS.get(key)
+        if icon is None:
+            icon = _EQUIPMENT_PLACEHOLDER_PREVIEWS.load(key, png_path, 'IMAGE')
+        _EQUIPMENT_ERROR_ICON_ID = int(getattr(icon, "icon_id", 0) or 0)
+    except Exception:
+        log.debug("Failed to build equipment error icon", exc_info=True)
+        _EQUIPMENT_ERROR_ICON_ID = 0
+    return _EQUIPMENT_ERROR_ICON_ID
+
+
 def _clear_equipment_placeholder_icon():
-    global _EQUIPMENT_PLACEHOLDER_PREVIEWS, _EQUIPMENT_PLACEHOLDER_ICON_ID
+    global _EQUIPMENT_PLACEHOLDER_PREVIEWS, _EQUIPMENT_PLACEHOLDER_ICON_ID, _EQUIPMENT_ERROR_ICON_ID
     if _EQUIPMENT_PLACEHOLDER_PREVIEWS is not None:
         try:
             bpy.utils.previews.remove(_EQUIPMENT_PLACEHOLDER_PREVIEWS)
@@ -148,6 +193,7 @@ def _clear_equipment_placeholder_icon():
             pass
     _EQUIPMENT_PLACEHOLDER_PREVIEWS = None
     _EQUIPMENT_PLACEHOLDER_ICON_ID = 0
+    _EQUIPMENT_ERROR_ICON_ID = 0
 
 
 # --- Persistent equipment icon cache (load once, survive restart, no lag) -----
@@ -1280,14 +1326,46 @@ def _resolve_equipment_item_entity_preview_path(
     return ""
 
 
+def _equipment_icon_attrs_sig(attrs):
+    a = attrs if isinstance(attrs, dict) else {}
+    return (
+        str(a.get("icon_path", "") or ""),
+        str(a.get("equip_template", "") or ""),
+        str(a.get("hold_template", "") or ""),
+        str(a.get("template_name", "") or ""),
+    )
+
+
+def _equipment_icon_context_sig(context):
+    """Cheap signature for context-dependent icon keys."""
+    armature, _rig = _get_safe_context_armature_and_rig_settings(context)
+    try:
+        ptr = armature.as_pointer() if armature else 0
+    except Exception:
+        ptr = 0
+    return (int(ptr), int(_get_equipment_icon_loadmods(context)))
+
+
 def _get_equipment_item_icon_cache_key(context, item_name, attrs=None, source_game="w3", fallback_template=""):
+    # Memoize the expensive icon-path/template/root resolution done during draw.
+    sg = _normalize_source_game(source_game)
+    memo_key = (
+        str(item_name or ""),
+        sg,
+        str(fallback_template or ""),
+        _equipment_icon_attrs_sig(attrs),
+        _equipment_icon_context_sig(context),
+    )
+    memo = _EQUIPMENT_ICON_CACHE_KEY_MEMO.get(memo_key)
+    if memo is not None:
+        return memo
+
     raw_icon_path = _resolve_equipment_item_icon_path(
         item_name,
         attrs,
-        source_game=source_game,
+        source_game=sg,
         fallback_template=fallback_template,
     )
-    source_game = _normalize_source_game(source_game)
     loadmods = _get_equipment_icon_loadmods(context)
     source_roots = _get_active_equipment_source_roots(context)
     source_path = _get_active_equipment_source_path(context)
@@ -1296,15 +1374,24 @@ def _get_equipment_item_icon_cache_key(context, item_name, attrs=None, source_ga
         for template in _iter_equipment_icon_template_candidates(item_name, attrs, fallback_template)
     )
     if not raw_icon_path and not template_keys:
-        return None, raw_icon_path, template_keys, loadmods
-    return (
-        source_game,
-        int(bool(loadmods)),
-        raw_icon_path.replace("/", "\\").strip("\\").lower(),
-        template_keys,
-        _norm_root_path(source_path),
-        tuple(_norm_root_path(root) for root in source_roots),
-    ), raw_icon_path, template_keys, loadmods
+        result = (None, raw_icon_path, template_keys, loadmods)
+    else:
+        result = (
+            (
+                sg,
+                int(bool(loadmods)),
+                raw_icon_path.replace("/", "\\").strip("\\").lower(),
+                template_keys,
+                _norm_root_path(source_path),
+                tuple(_norm_root_path(root) for root in source_roots),
+            ),
+            raw_icon_path,
+            template_keys,
+            loadmods,
+        )
+    _clear_cache_if_oversized(_EQUIPMENT_ICON_CACHE_KEY_MEMO, max_entries=4096)
+    _EQUIPMENT_ICON_CACHE_KEY_MEMO[memo_key] = result
+    return result
 
 
 def _resolve_equipment_item_preview_path(context, item_name, attrs=None, source_game="w3", fallback_template=""):
@@ -1368,6 +1455,113 @@ def _tag_equipment_item_icon_redraw():
         pass
 
 
+def _equipment_icon_base_path():
+    try:
+        from ..CR2W.witcher_cache.common_cache.WitcherArchiveManager import normalize_game_path
+        from ..CR2W.witcher_cache.blender_common import get_game_path
+
+        return normalize_game_path(get_game_path())
+    except Exception:
+        return ""
+
+
+def _manager_singleton_warm(mgr_cls, loadmods, base_path):
+    try:
+        mgr = mgr_cls.InstanceManagerMods if loadmods else mgr_cls.InstanceManager
+        return mgr is not None and getattr(mgr, "base_path", None) == base_path
+    except Exception:
+        return False
+
+
+def _equipment_backends_ready(loadmods, base_path):
+    """Check W3 bundle/texture manager readiness without building them."""
+    if not base_path:
+        return True
+    try:
+        from ..CR2W.witcher_cache.Bundles.BundleManager import BundleManager
+        from ..CR2W.witcher_cache.TextureCache.texture_manager import TextureManager
+    except Exception:
+        return False
+    return (
+        _manager_singleton_warm(BundleManager, loadmods, base_path)
+        and _manager_singleton_warm(TextureManager, loadmods, base_path)
+    )
+
+
+def _equipment_icons_warming():
+    with _EQUIPMENT_BACKEND_WARM_LOCK:
+        return bool(_EQUIPMENT_BACKEND_WARMING)
+
+
+def _reset_equipment_backend_warm_state():
+    with _EQUIPMENT_BACKEND_WARM_LOCK:
+        _EQUIPMENT_BACKEND_WARM_FAILED.clear()
+
+
+def _start_equipment_backend_warm(loadmods, base_path):
+    """Build W3 bundle/texture managers off-thread before icon resolution."""
+    if not base_path:
+        return
+    epoch = (bool(loadmods), base_path)
+    with _EQUIPMENT_BACKEND_WARM_LOCK:
+        if epoch in _EQUIPMENT_BACKEND_WARMING or epoch in _EQUIPMENT_BACKEND_WARM_FAILED:
+            return
+        _EQUIPMENT_BACKEND_WARMING.add(epoch)
+
+    def _worker():
+        ok = False
+        err = ""
+        try:
+            from ..CR2W.witcher_cache.common_cache import WitcherArchiveManager as _wam
+
+            with _EQUIPMENT_BACKEND_BUILD_LOCK:
+                _wam.set_forced_game_path(base_path)
+                try:
+                    from ..CR2W.witcher_cache.Bundles.BundleManager import BundleManager
+                    from ..CR2W.witcher_cache.TextureCache import LoadTextureManager
+
+                    BundleManager.Get(loadmods=loadmods)
+                    LoadTextureManager(loadmods=loadmods)
+                    ok = True
+                finally:
+                    _wam.set_forced_game_path(None)
+        except Exception as exc:
+            err = str(exc) or exc.__class__.__name__
+            log.warning("Equipment icon cache warm-up failed: %s", exc, exc_info=True)
+        with _EQUIPMENT_BACKEND_WARM_LOCK:
+            _EQUIPMENT_BACKEND_WARMING.discard(epoch)
+            if ok:
+                _EQUIPMENT_BACKEND_WARM_FAILED.pop(epoch, None)
+            else:
+                _EQUIPMENT_BACKEND_WARM_FAILED[epoch] = err or "unknown error"
+
+    try:
+        threading.Thread(target=_worker, name="witcher-equip-icon-warm", daemon=True).start()
+    except Exception:
+        with _EQUIPMENT_BACKEND_WARM_LOCK:
+            _EQUIPMENT_BACKEND_WARMING.discard(epoch)
+        log.warning("Could not start equipment icon warm thread", exc_info=True)
+
+
+def _record_equipment_icon_failure(cache_key, item_name, reason, force=False):
+    """Retry briefly, then cache the red failure icon."""
+    if cache_key is None:
+        return False
+    retries = _EQUIPMENT_ITEM_ICON_RETRY_COUNTS.get(cache_key, 0) + 1
+    _EQUIPMENT_ITEM_ICON_RETRY_COUNTS[cache_key] = retries
+    if force or retries >= _EQUIPMENT_ITEM_ICON_MAX_RETRIES:
+        log.warning(
+            "Could not load equipment thumbnail for '%s' (%s)%s",
+            item_name or "?",
+            reason,
+            "" if force else f" after {retries} attempts",
+        )
+        _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = int(_get_equipment_error_icon_id() or 0)
+        _EQUIPMENT_ITEM_ICON_RETRY_COUNTS.pop(cache_key, None)
+        return True
+    return False
+
+
 def _equipment_item_icon_timer():
     global _EQUIPMENT_ITEM_ICON_TIMER_RUNNING
 
@@ -1378,39 +1572,79 @@ def _equipment_item_icon_timer():
 
     context = bpy.context
     disk = _load_equipment_icon_path_disk()
+    loadmods = _get_equipment_icon_loadmods(context)
+    base_path = _equipment_icon_base_path()
+    ready = _equipment_backends_ready(loadmods, base_path)
+
     resolved_any = False
-    for _i in range(min(_EQUIPMENT_ITEM_ICON_BATCH_SIZE, len(_EQUIPMENT_ITEM_ICON_REQUESTS))):
+    waiting_for_warm = False
+    start = time.perf_counter()
+
+    while _EQUIPMENT_ITEM_ICON_REQUESTS and (time.perf_counter() - start) < _EQUIPMENT_ITEM_ICON_TICK_BUDGET:
+        if not ready:
+            epoch = (bool(loadmods), base_path)
+            with _EQUIPMENT_BACKEND_WARM_LOCK:
+                failed = epoch in _EQUIPMENT_BACKEND_WARM_FAILED
+            if failed:
+                request = _EQUIPMENT_ITEM_ICON_REQUESTS.pop(0)
+                cache_key = request.get("cache_key")
+                _record_equipment_icon_failure(
+                    cache_key, request.get("item_name", ""), "asset cache unavailable", force=True
+                )
+                _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(cache_key)
+                resolved_any = True
+                continue
+            _start_equipment_backend_warm(loadmods, base_path)
+            waiting_for_warm = True
+            break
+
         request = _EQUIPMENT_ITEM_ICON_REQUESTS.pop(0)
         cache_key = request.get("cache_key")
         stable_key = request.get("stable_key")
+        item_name = request.get("item_name", "")
+
         try:
             src_path = _resolve_equipment_item_preview_path(
                 context,
-                request.get("item_name", ""),
+                item_name,
                 request.get("attrs", {}),
                 source_game=request.get("source_game", "w3"),
                 fallback_template=request.get("fallback_template", ""),
             )
-            # Persist a copy + record the path so this never has to resolve again.
-            persistent = _persist_equipment_icon_image(src_path, stable_key) if src_path else ""
-            disk[stable_key] = persistent
-            _mark_equipment_icon_disk_dirty()
-            icon_id = _equipment_icon_id_from_path(stable_key, persistent) if persistent else 0
-            if cache_key is not None:
-                _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = int(icon_id or 0)
+        except Exception as exc:
+            _record_equipment_icon_failure(cache_key, item_name, f"resolve error: {exc}")
+            _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(cache_key)
             resolved_any = True
-        except Exception:
+            continue
+
+        if not src_path:
+            disk[stable_key] = ""
+            _mark_equipment_icon_disk_dirty()
             if cache_key is not None:
                 _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = 0
-        finally:
+                _EQUIPMENT_ITEM_ICON_RETRY_COUNTS.pop(cache_key, None)
+            _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(cache_key)
+            resolved_any = True
+            continue
+
+        persistent = _persist_equipment_icon_image(src_path, stable_key)
+        icon_id = _equipment_icon_id_from_path(stable_key, persistent) if persistent else 0
+        if icon_id:
+            disk[stable_key] = persistent
+            _mark_equipment_icon_disk_dirty()
             if cache_key is not None:
-                _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(cache_key)
+                _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = icon_id
+                _EQUIPMENT_ITEM_ICON_RETRY_COUNTS.pop(cache_key, None)
+        else:
+            _record_equipment_icon_failure(cache_key, item_name, "preview image could not be loaded")
+        _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(cache_key)
+        resolved_any = True
 
     if resolved_any:
         _tag_equipment_item_icon_redraw()
 
     if _EQUIPMENT_ITEM_ICON_REQUESTS:
-        return 0.03
+        return _EQUIPMENT_ITEM_ICON_WARM_INTERVAL if waiting_for_warm else _EQUIPMENT_ITEM_ICON_TIMER_INTERVAL
 
     _EQUIPMENT_ITEM_ICON_TIMER_RUNNING = False
     _save_equipment_icon_path_disk()
@@ -1422,7 +1656,7 @@ def _ensure_equipment_item_icon_timer():
     if _EQUIPMENT_ITEM_ICON_TIMER_RUNNING:
         return
     try:
-        bpy.app.timers.register(_equipment_item_icon_timer, first_interval=0.03)
+        bpy.app.timers.register(_equipment_item_icon_timer, first_interval=0.0)
         _EQUIPMENT_ITEM_ICON_TIMER_RUNNING = True
     except Exception:
         _EQUIPMENT_ITEM_ICON_TIMER_RUNNING = False

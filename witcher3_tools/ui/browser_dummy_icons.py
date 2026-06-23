@@ -13,7 +13,9 @@ from ..CR2W.common_blender import win_path_exists, win_safe_path
 log = logging.getLogger(__name__)
 
 _BROWSER_DUMMY_ICON_VERSION = "v4"
+_BROWSER_ERROR_ICON_VERSION = "v1"
 _browser_dummy_icon_path_cache = {}
+_browser_error_icon_path = ""
 _EXTERNAL_CACHE_EFFECTIVE_TYPES = {
     "External Bundle": "Bundle",
     "External Collision": "Collision",
@@ -23,7 +25,9 @@ _EXTERNAL_CACHE_EFFECTIVE_TYPES = {
 
 
 def clear_browser_dummy_icon_cache():
+    global _browser_error_icon_path
     _browser_dummy_icon_path_cache.clear()
+    _browser_error_icon_path = ""
 
 
 def _cache_bounded_store(cache: dict, key, value, max_entries: int = 2048):
@@ -331,3 +335,37 @@ def ensure_browser_dummy_icon_path(cache_type: str, item_path: str) -> str:
         return ""
     _cache_bounded_store(_browser_dummy_icon_path_cache, cache_key, dummy_path, max_entries=256)
     return dummy_path
+
+
+def ensure_browser_error_icon_path() -> str:
+    """Return a red failed-preview placeholder."""
+    global _browser_error_icon_path
+    if _browser_error_icon_path and win_path_exists(_browser_error_icon_path):
+        return _browser_error_icon_path
+
+    rgba = np.zeros((96, 96, 4), dtype=np.uint8)
+    rgba[:, :, 0] = 38
+    rgba[:, :, 1] = 12
+    rgba[:, :, 2] = 12
+    rgba[:, :, 3] = 255
+    _fill_browser_dummy_rect(rgba, 6, 6, 90, 90, (120, 26, 26))
+    _fill_browser_dummy_rect(rgba, 10, 10, 86, 86, (170, 44, 44))
+    _fill_browser_dummy_rect(rgba, 16, 16, 80, 54, (96, 20, 20))
+    for offset in range(0, 36):
+        top = 18 + offset
+        left = 22 + offset
+        right = 58 - offset
+        _fill_browser_dummy_rect(rgba, left, top, left + 5, top + 5, (250, 250, 250))
+        _fill_browser_dummy_rect(rgba, right, top, right + 5, top + 5, (250, 250, 250))
+    _fill_browser_dummy_rect(rgba, 16, 58, 80, 84, (18, 20, 24))
+    _draw_browser_dummy_text_line(
+        rgba, "ERR", 64, (255, 232, 232), shadow_color=(0, 0, 0), pixel_scale=3, spacing=2
+    )
+
+    preview_dir = os.path.join(tempfile.gettempdir(), "witcher_preview", "browser", "dummy")
+    os.makedirs(preview_dir, exist_ok=True)
+    path = win_safe_path(os.path.join(preview_dir, f"error.{_BROWSER_ERROR_ICON_VERSION}.png"))
+    if (not win_path_exists(path)) and (not _save_preview_png(path, rgba)):
+        return ""
+    _browser_error_icon_path = path
+    return path

@@ -19,8 +19,19 @@ def normalize_game_path(path: str) -> str:
         return os.path.normpath(path)
 
 
+# Main-thread override for background cache warmers; avoids bpy.context off-thread.
+_FORCED_GAME_PATH = None
+
+
+def set_forced_game_path(path):
+    global _FORCED_GAME_PATH
+    _FORCED_GAME_PATH = path
+
+
 def refresh_game_configuration_path() -> str:
-    base_path = normalize_game_path(get_game_path())
+    forced = _FORCED_GAME_PATH
+    raw_path = forced if forced is not None else get_game_path()
+    base_path = normalize_game_path(raw_path)
     Configuration.ExecutablePath = base_path
     Configuration.GameModDir = os.path.join(base_path, "mods") if base_path else ""
     Configuration.GameDlcDir = os.path.join(base_path, "dlc") if base_path else ""
