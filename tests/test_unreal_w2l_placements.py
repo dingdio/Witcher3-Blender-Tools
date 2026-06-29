@@ -49,7 +49,8 @@ def _install_stubs():
         sys.modules["witcher3_tools"] = pkg
 
     crw = types.ModuleType("witcher3_tools.CR2W")
-    crw.__path__ = []
+    crw.__path__ = [str(REPO_ROOT / "witcher3_tools" / "CR2W")]
+    crw.__package__ = "witcher3_tools.CR2W"
     helpers = types.ModuleType("witcher3_tools.CR2W.CR2W_helpers")
     helpers.Enums = _Enums
     crw.CR2W_helpers = helpers

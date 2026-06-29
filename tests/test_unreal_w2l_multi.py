@@ -38,7 +38,8 @@ def _install_pkg_stubs():
         sys.modules["witcher3_tools"] = pkg
 
     crw = types.ModuleType("witcher3_tools.CR2W")
-    crw.__path__ = []
+    crw.__path__ = [str(REPO_ROOT / "witcher3_tools" / "CR2W")]
+    crw.__package__ = "witcher3_tools.CR2W"
     helpers = types.ModuleType("witcher3_tools.CR2W.CR2W_helpers")
     helpers.Enums = _Enums
     crw.CR2W_helpers = helpers
@@ -46,7 +47,8 @@ def _install_pkg_stubs():
     sys.modules["witcher3_tools.CR2W.CR2W_helpers"] = helpers
 
     importers = types.ModuleType("witcher3_tools.importers")
-    importers.__path__ = []
+    importers.__path__ = [str(REPO_ROOT / "witcher3_tools" / "importers")]
+    importers.__package__ = "witcher3_tools.importers"
     import_mesh = types.ModuleType("witcher3_tools.importers.import_mesh")
     # Force the basename fallback in _layer_id_for_w2l (no depot rel resolution).
     import_mesh.get_repo_from_abs_path = lambda p: ""

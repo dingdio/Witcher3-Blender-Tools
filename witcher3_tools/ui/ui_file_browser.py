@@ -1,6 +1,7 @@
 import logging
 import addon_utils
 import hashlib
+import json
 import shutil
 
 from ..importers import import_mesh
@@ -43,6 +44,18 @@ from .. import (
     get_w2_unbundle_path,
     get_witcher2_game_path,
 )
+from ..read_game_bin import (
+    get_witcher3_exe_path,
+    get_witcher2_exe_path,
+    is_valid_witcher3_game_path,
+    is_valid_witcher2_game_path,
+    WITCHER3_EXE_REL,
+    WITCHER2_EXE_REL,
+)
+from ..extension_paths import get_extension_user_dir
+
+REDKIT_W3_URL = "https://www.thewitcher.com/es/en/redkit/modding"
+REDKIT_W2_URL = "https://redkitwiki.cdprojektred.com/welcome+to+the+redkit+wiki.htm"
 from ..importers import import_entity
 from ..mesh_import_settings import MeshImportSettings
 from ..CR2W.texture_converters import convert_xbm_to_dds, convert_w2cube_to_dds
@@ -250,6 +263,18 @@ class FolderStructure:
             return ""
         return "\\".join(path.split("\\")[:-1])
 
+
+_BROWSER_STATE_SAVE_SUSPENDED = False
+
+
+def _is_browser_state_save_suspended() -> bool:
+    return bool(_BROWSER_STATE_SAVE_SUSPENDED)
+
+
+def _set_browser_state_save_suspended(value: bool):
+    global _BROWSER_STATE_SAVE_SUSPENDED
+    _BROWSER_STATE_SAVE_SUSPENDED = bool(value)
+
 def _sync_path_to_address_bar(self, context):
     """Keep the address bar in sync when folder navigation changes."""
     if self.path_input != self.current_folder:
@@ -261,11 +286,43 @@ def _sync_path_to_address_bar(self, context):
 def _on_browser_query_filter_update(self, context):
     self.file_page_index = 0
     self.search_page_index = 0
+    if _is_browser_state_save_suspended():
+        return
+    try:
+        _persist_current_browser_state(context)
+    except Exception:
+        pass
+
+
+def _on_root_search_scope_update(self, context):
+    self.search_page_index = 0
+    clear_search_cache()
+    if _is_browser_state_save_suspended():
+        return
+    try:
+        _persist_current_browser_state(context)
+    except Exception:
+        pass
+
+
+def _on_browser_state_update(self, context):
+    if _is_browser_state_save_suspended():
+        return
+    try:
+        _persist_current_browser_state(context)
+    except Exception:
+        pass
 
 
 def _on_browser_grid_layout_update(self, context):
     self.file_page_index = 0
     self.search_page_index = 0
+    if _is_browser_state_save_suspended():
+        return
+    try:
+        _persist_current_browser_state(context)
+    except Exception:
+        pass
 
 
 def _on_external_extract_root_update(self, context):
@@ -284,24 +341,38 @@ class MySettings(PropertyGroup):
     search_query: StringProperty(
         name="Search",
         description=(
-            "Search asset paths. At Home it searches across all cache types; "
+            "Search asset paths. At Home it searches the selected game-cache scope; "
             "inside a cache it searches the current active cache"
         ),
         update=_on_browser_query_filter_update,
+    )
+    root_search_scope: EnumProperty(
+        name="Scope",
+        description="Game caches included in the Home search",
+        items=[
+            ('ALL', 'ALL', 'Search Witcher 3 and Witcher 2 game caches'),
+            ('W3', 'W3', 'Search Witcher 3 Bundle, Collision, Texture, Sound, and Speech caches'),
+            ('W2', 'W2', 'Search Witcher 2 DZIP and speech caches'),
+        ],
+        default='ALL',
+        update=_on_root_search_scope_update,
     )
     active_cache_type: StringProperty(default="")  # "", "Bundle", "Collision", "Texture", "Sound", "Speech"
     loadmods: BoolProperty(default=False)  # Persist loadmods from browser invocation
     use_mods_priority: BoolProperty(
         default=False,
-        description="Prefer installed mods over vanilla (off = mods only if vanilla missing)"
+        description="Prefer installed mods over vanilla (off = mods only if vanilla missing)",
+        update=_on_browser_state_update,
     )
     mods_overwrite: BoolProperty(
         default=False,
-        description="Overwrite existing extracted files (moves previous to backup)"
+        description="Overwrite existing extracted files (moves previous to backup)",
+        update=_on_browser_state_update,
     )
     open_import_dialog: BoolProperty(
         default=False,
-        description="Open the matching importer dialog for single-file imports when available"
+        description="Open the matching importer dialog for single-file imports when available",
+        update=_on_browser_state_update,
     )
     external_extract_root: StringProperty(
         name="Standalone Export Folder",
@@ -332,6 +403,7 @@ class MySettings(PropertyGroup):
         name="Standalone Mod Caches",
         description="Show tools for opening individual .cache/.bundle files",
         default=False,
+        update=_on_browser_state_update,
     )
     preview_texture_path: StringProperty(default="")  # For texture preview popup
     revealed_file_path: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
@@ -412,7 +484,8 @@ class MySettings(PropertyGroup):
             ('RECENT', 'Recent', 'Recently imported files', 'TIME', 1),
             ('BOOKMARKS', 'Bookmarks', 'Bookmarked paths', 'BOOKMARKS', 2),
         ],
-        default='BROWSE'
+        default='BROWSE',
+        update=_on_browser_state_update,
     )
     # Batch selection tracking
     batch_select_mode: BoolProperty(default=False, description="Enable batch selection mode")
@@ -1545,6 +1618,37 @@ def _normalize_dir(path: str) -> str:
         return ""
     return os.path.normpath(bpy.path.abspath(path))
 
+
+def _get_witcher3_game_path_issue(context) -> str:
+    try:
+        addon_prefs = get_all_addon_prefs(context)
+    except Exception:
+        return "Addon preferences unavailable."
+
+    raw_game_path = (getattr(addon_prefs, "witcher_game_path", "") or "").strip()
+    if not raw_game_path:
+        return f"Set Witcher 3 install folder ({WITCHER3_EXE_REL}) in add-on preferences."
+    game_path = _normalize_dir(raw_game_path)
+    if is_valid_witcher3_game_path(game_path):
+        return ""
+    return f"Invalid Witcher 3 path. Missing: {get_witcher3_exe_path(game_path)}"
+
+
+def _get_witcher2_game_path_issue(context) -> str:
+    try:
+        addon_prefs = get_all_addon_prefs(context)
+    except Exception:
+        return "Addon preferences unavailable."
+
+    raw_game_path = (getattr(addon_prefs, "witcher2_game_path", "") or "").strip()
+    if not raw_game_path:
+        return f"Set Witcher 2 install folder ({WITCHER2_EXE_REL}) in add-on preferences."
+    game_path = _normalize_dir(raw_game_path)
+    if is_valid_witcher2_game_path(game_path):
+        return ""
+    return f"Invalid Witcher 2 path. Missing: {get_witcher2_exe_path(game_path)}"
+
+
 def _get_witcher2_data_root(context) -> str:
     game_root = _normalize_dir(get_witcher2_game_path(context))
     if not game_root:
@@ -1552,6 +1656,33 @@ def _get_witcher2_data_root(context) -> str:
     if os.path.basename(os.path.normpath(game_root)).lower() == "data":
         return game_root
     return os.path.join(game_root, "data")
+
+
+def _get_w3_redkit_cache_types(context):
+    try:
+        prefs = get_all_addon_prefs(context)
+    except Exception:
+        return []
+
+    cache_types = []
+
+    if win_path_isdir(_normalize_dir(getattr(prefs, "redkit_depot_path", ""))):
+        cache_types.append(("REDkit Depot", "Depot", "FILE_FOLDER", "r4data source depot"))
+
+    if win_path_isdir(_normalize_dir(getattr(prefs, "redkit_uncooked_path", ""))):
+        cache_types.append(("REDkit Uncooked", "Uncooked", "FILE_FOLDER", "Generated asset depot"))
+
+    project_paths = [
+        _normalize_dir(getattr(p, "path", ""))
+        for p in getattr(prefs, "redkit_projects", [])
+        if win_path_isdir(_normalize_dir(getattr(p, "path", "")))
+    ]
+    if any(_get_workspace_root(project_path) for project_path in project_paths):
+        cache_types.append(("Workspace", "Workspace", "FILE_FOLDER", "Project workspace"))
+    if any(_get_cooked_content_roots(project_path) for project_path in project_paths):
+        cache_types.append(("Cooked", "Cooked", "PACKAGE", "Project cooked output"))
+
+    return cache_types
 
 
 def _get_witcher2_uncook_root(context, create: bool = False) -> str:
@@ -4368,16 +4499,57 @@ collision_extension_map: dict = {}
 _search_cache = {
     'query': '',
     'cache_type': '',  # "" for global, or specific cache type
+    'scope': 'ALL',
     'loadmods': False,
     'results': [],
 }
 
-def get_cached_search_results(query, cache_type, folder_struct, loadmods=False):
+
+def _normal_root_search_scope(scope):
+    scope = str(scope or "ALL").upper()
+    return scope if scope in {"ALL", "W3", "W2"} else "ALL"
+
+
+def _get_root_search_scope_label(scope):
+    scope = _normal_root_search_scope(scope)
+    if scope == "W3":
+        return "Witcher 3 game caches"
+    if scope == "W2":
+        return "Witcher 2 game caches"
+    return "All game caches"
+
+
+def _global_search_cache_loaders(scope, loadmods=False):
+    scope = _normal_root_search_scope(scope)
+    cache_loaders = []
+
+    if scope in {"ALL", "W3"}:
+        cache_loaders.extend([
+            ("Bundle", lambda: LoadBundleManager(loadmods=loadmods)),
+            ("Collision", lambda: LoadCollisionManager(loadmods=loadmods)),
+            ("Texture", lambda: LoadTextureManager(loadmods=loadmods)),
+            ("Sound", lambda: LoadSoundManager(loadmods=loadmods)),
+        ])
+        if not loadmods:
+            cache_loaders.append(("Speech", lambda: LoadSpeechManager()))
+
+    if scope in {"ALL", "W2"}:
+        cache_loaders.extend([
+            (WITCHER2_BUNDLE_CACHE_TYPE, lambda: LoadWitcher2BundleManager()),
+            (WITCHER2_SPEECH_CACHE_TYPE, lambda: LoadWitcher2SpeechManager()),
+        ])
+
+    return cache_loaders
+
+
+def get_cached_search_results(query, cache_type, folder_struct, loadmods=False, search_scope="ALL"):
     """Return cached search results, or perform search if query changed."""
     global _search_cache
+    search_scope = _normal_root_search_scope(search_scope)
 
     if (_search_cache['query'] == query
             and _search_cache['cache_type'] == cache_type
+            and _search_cache.get('scope', 'ALL') == search_scope
             and _search_cache['loadmods'] == loadmods):
         return _search_cache['results']
 
@@ -4388,21 +4560,13 @@ def get_cached_search_results(query, cache_type, folder_struct, loadmods=False):
         # Search within specific cache (uses folder_structure.index)
         results = folder_struct.search_items(query, max_results=BROWSER_SEARCH_RESULT_LIMIT)
     else:
-        # Global search across all caches - do this ONCE
-        cache_loaders = [
-            ("Bundle", lambda: LoadBundleManager(loadmods=loadmods)),
-            (WITCHER2_BUNDLE_CACHE_TYPE, lambda: LoadWitcher2BundleManager()),
-            (WITCHER2_SPEECH_CACHE_TYPE, lambda: LoadWitcher2SpeechManager()),
-            ("Collision", lambda: LoadCollisionManager(loadmods=loadmods)),
-            ("Texture", lambda: LoadTextureManager(loadmods=loadmods)),
-            ("Sound", lambda: LoadSoundManager(loadmods=loadmods)),
-        ]
+        cache_loaders = _global_search_cache_loaders(search_scope, loadmods=loadmods)
+        cache_matches = []
         for ct, loader in cache_loaders:
-            if len(results) >= BROWSER_SEARCH_RESULT_LIMIT:
-                break
             try:
                 manager = loader()
                 tokens = query.lower().replace('_', ' ').split()
+                matches = []
                 for key in manager.Items.keys():
                     if ct == WITCHER2_SPEECH_CACHE_TYPE:
                         key_str = _w2_speech_virtual_path(key)
@@ -4412,14 +4576,31 @@ def get_cached_search_results(query, cache_type, folder_struct, loadmods=False):
                         continue
                     normalized = key_str.lower().replace('_', ' ')
                     if all(token in normalized for token in tokens):
-                        results.append((ct, key_str))
-                        if len(results) >= BROWSER_SEARCH_RESULT_LIMIT:
+                        matches.append((ct, key_str))
+                        if len(matches) >= BROWSER_SEARCH_RESULT_LIMIT:
                             break
+                cache_matches.append(matches)
             except Exception as e:
                 log.error("Failed to search %s: %s", ct, e)
 
+        # Mix cache results before applying the global cap, so broad searches
+        # do not fill the whole result set from Bundle before other caches run.
+        row_index = 0
+        while len(results) < BROWSER_SEARCH_RESULT_LIMIT:
+            added = False
+            for matches in cache_matches:
+                if row_index < len(matches):
+                    results.append(matches[row_index])
+                    added = True
+                    if len(results) >= BROWSER_SEARCH_RESULT_LIMIT:
+                        break
+            if not added:
+                break
+            row_index += 1
+
     _search_cache['query'] = query
     _search_cache['cache_type'] = cache_type
+    _search_cache['scope'] = search_scope
     _search_cache['loadmods'] = loadmods
     _search_cache['results'] = results
     return results
@@ -4427,7 +4608,7 @@ def get_cached_search_results(query, cache_type, folder_struct, loadmods=False):
 def clear_search_cache():
     """Clear the search cache."""
     global _search_cache
-    _search_cache = {'query': '', 'cache_type': '', 'loadmods': False, 'results': []}
+    _search_cache = {'query': '', 'cache_type': '', 'scope': 'ALL', 'loadmods': False, 'results': []}
 
 
 def _report_locked_bundle_cache(reporter, manager):
@@ -4844,28 +5025,252 @@ def import_terrain_tiles_from_folder(
     return {"tile_count": count, "hub_name": hub_name}
 
 
-def save_browser_state(context, cache_type, folder):
-    """Save browser state to addon preferences for cross-session persistence."""
-    if is_external_cache(cache_type):
-        return
+BROWSER_PERSISTENCE_VERSION = 1
+BROWSER_PERSISTENCE_FILENAME = "asset_browser_state.json"
+
+
+def _browser_persistence_path(create=True):
+    try:
+        return os.path.join(get_extension_user_dir(create=create), BROWSER_PERSISTENCE_FILENAME)
+    except Exception:
+        return ""
+
+
+def _browser_persistence_defaults():
+    return {
+        "version": BROWSER_PERSISTENCE_VERSION,
+        "state": {},
+        "recent": [],
+        "bookmarks": [],
+    }
+
+
+def _read_json_list(value):
+    try:
+        data = json.loads(value or "[]")
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _normalize_bookmark_entry(entry):
+    if not isinstance(entry, dict):
+        return None
+    path = str(entry.get("path", "") or "")
+    cache_type = str(entry.get("cache_type", "") or "")
+    if not cache_type:
+        return None
+    normalized = {
+        "path": path,
+        "cache_type": cache_type,
+        "name": str(entry.get("name", "") or (path.split("\\")[-1] if path else cache_type)),
+    }
+    archive_path = str(entry.get("archive_path", "") or "")
+    if archive_path:
+        normalized["archive_path"] = archive_path
+    return normalized
+
+
+def _normalize_browser_state_entry(state):
+    if not isinstance(state, dict):
+        return {}
+    browser_view_mode = str(state.get("browser_view_mode", "BROWSE") or "BROWSE")
+    if browser_view_mode not in {"BROWSE", "RECENT", "BOOKMARKS"}:
+        browser_view_mode = "BROWSE"
+    file_display_mode = str(state.get("file_display_mode", "LIST") or "LIST")
+    if file_display_mode not in {"LIST", "GRID"}:
+        file_display_mode = "LIST"
+    sort_by = str(state.get("sort_by", "NAME") or "NAME")
+    if sort_by not in {"NAME", "EXT", "SIZE"}:
+        sort_by = "NAME"
+
+    return {
+        "active_cache_type": str(state.get("active_cache_type", "") or ""),
+        "current_folder": _normalize_virtual_path(state.get("current_folder", "") or ""),
+        "browser_view_mode": browser_view_mode,
+        "search_query": str(state.get("search_query", "") or ""),
+        "extension_filter": str(state.get("extension_filter", "") or ""),
+        "root_search_scope": _normal_root_search_scope(state.get("root_search_scope", "ALL")),
+        "file_display_mode": file_display_mode,
+        "sort_by": sort_by,
+        "sort_ascending": bool(state.get("sort_ascending", True)),
+        "show_standalone_archives": bool(state.get("show_standalone_archives", False)),
+        "loadmods": bool(state.get("loadmods", False)),
+        "use_mods_priority": bool(state.get("use_mods_priority", False)),
+        "mods_overwrite": bool(state.get("mods_overwrite", False)),
+        "open_import_dialog": bool(state.get("open_import_dialog", False)),
+    }
+
+
+def _browser_prefs_migration_snapshot(context):
+    snapshot = _browser_persistence_defaults()
     try:
         addon_prefs = get_all_addon_prefs(context)
-        addon_prefs.browser_last_cache_type = cache_type
-        addon_prefs.browser_last_folder = folder
     except Exception:
-        pass  # Silently fail if addon prefs not available
+        return snapshot
+
+    last_cache_type = str(getattr(addon_prefs, "browser_last_cache_type", "") or "")
+    last_folder = str(getattr(addon_prefs, "browser_last_folder", "") or "")
+    if last_cache_type or last_folder:
+        snapshot["state"] = _normalize_browser_state_entry({
+            "active_cache_type": last_cache_type,
+            "current_folder": last_folder,
+        })
+
+    snapshot["recent"] = [
+        item for item in (_normalize_recent_entry(r) for r in _read_json_list(getattr(addon_prefs, "browser_recent_imports", "[]"))) if item
+    ]
+    snapshot["bookmarks"] = [
+        item for item in (_normalize_bookmark_entry(b) for b in _read_json_list(getattr(addon_prefs, "browser_bookmarks", "[]"))) if item
+    ]
+    return snapshot
+
+
+def _load_browser_persistence(context=None):
+    data = _browser_persistence_defaults()
+    loaded_from_file = False
+    path = _browser_persistence_path(create=False)
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            if isinstance(raw, dict):
+                loaded_from_file = True
+                data["version"] = int(raw.get("version", BROWSER_PERSISTENCE_VERSION) or BROWSER_PERSISTENCE_VERSION)
+                data["state"] = _normalize_browser_state_entry(raw.get("state", {}))
+                data["recent"] = [
+                    item for item in (_normalize_recent_entry(r) for r in raw.get("recent", [])) if item
+                ]
+                data["bookmarks"] = [
+                    item for item in (_normalize_bookmark_entry(b) for b in raw.get("bookmarks", [])) if item
+                ]
+        except Exception as e:
+            log.error("Failed to read asset browser state file: %s", e)
+
+    if not loaded_from_file and context is not None:
+        data = _browser_prefs_migration_snapshot(context)
+        if data.get("state") or data.get("recent") or data.get("bookmarks"):
+            _save_browser_persistence(context, data)
+    return data
+
+
+def _save_browser_prefs_snapshot(context, data):
+    try:
+        addon_prefs = get_all_addon_prefs(context)
+        state = data.get("state", {}) if isinstance(data, dict) else {}
+        addon_prefs.browser_last_cache_type = str(state.get("active_cache_type", "") or "")
+        addon_prefs.browser_last_folder = str(state.get("current_folder", "") or "")
+        addon_prefs.browser_recent_imports = json.dumps(data.get("recent", []))
+        addon_prefs.browser_bookmarks = json.dumps(data.get("bookmarks", []))
+    except Exception:
+        pass
+
+
+def _save_browser_persistence(context, data):
+    data = data if isinstance(data, dict) else _browser_persistence_defaults()
+    data["version"] = BROWSER_PERSISTENCE_VERSION
+    data["state"] = _normalize_browser_state_entry(data.get("state", {}))
+    data["recent"] = [item for item in (_normalize_recent_entry(r) for r in data.get("recent", [])) if item]
+    data["bookmarks"] = [item for item in (_normalize_bookmark_entry(b) for b in data.get("bookmarks", [])) if item]
+
+    path = _browser_persistence_path(create=True)
+    if path:
+        try:
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+            os.replace(tmp_path, path)
+        except Exception as e:
+            log.error("Failed to save asset browser state file: %s", e)
+
+    _save_browser_prefs_snapshot(context, data)
+
+
+def _build_browser_state(context, cache_type=None, folder=None):
+    browser = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+    if browser is None:
+        return _normalize_browser_state_entry({
+            "active_cache_type": cache_type or "",
+            "current_folder": folder or "",
+        })
+
+    state_cache_type = str(cache_type if cache_type is not None else getattr(browser, "active_cache_type", "") or "")
+    state_folder = str(folder if folder is not None else getattr(browser, "current_folder", "") or "")
+    return _normalize_browser_state_entry({
+        "active_cache_type": state_cache_type,
+        "current_folder": state_folder,
+        "browser_view_mode": getattr(browser, "browser_view_mode", "BROWSE"),
+        "search_query": getattr(browser, "search_query", ""),
+        "extension_filter": getattr(browser, "extension_filter", ""),
+        "root_search_scope": getattr(browser, "root_search_scope", "ALL"),
+        "file_display_mode": getattr(browser, "file_display_mode", "LIST"),
+        "sort_by": getattr(browser, "sort_by", "NAME"),
+        "sort_ascending": getattr(browser, "sort_ascending", True),
+        "show_standalone_archives": getattr(browser, "show_standalone_archives", False),
+        "loadmods": getattr(browser, "loadmods", False),
+        "use_mods_priority": getattr(browser, "use_mods_priority", False),
+        "mods_overwrite": getattr(browser, "mods_overwrite", False),
+        "open_import_dialog": getattr(browser, "open_import_dialog", False),
+    })
+
+
+def _browser_state_has_location(state):
+    if not isinstance(state, dict):
+        return False
+    return bool(str(state.get("active_cache_type", "") or "") or str(state.get("current_folder", "") or ""))
+
+
+def _browser_state_is_empty_home(state):
+    if not isinstance(state, dict):
+        return True
+    return (
+        not str(state.get("active_cache_type", "") or "")
+        and not str(state.get("current_folder", "") or "")
+        and not str(state.get("search_query", "") or "")
+        and not str(state.get("extension_filter", "") or "")
+        and str(state.get("browser_view_mode", "BROWSE") or "BROWSE") == "BROWSE"
+    )
+
+
+def save_browser_state(context, cache_type=None, folder=None, *, allow_empty_home=False):
+    """Save durable asset-browser state outside the add-on install."""
+    state_cache_type = str(cache_type if cache_type is not None else "")
+    if state_cache_type and is_external_cache(state_cache_type):
+        return
+    try:
+        data = _load_browser_persistence(context)
+        state = _build_browser_state(context, cache_type, folder)
+        if (
+            not allow_empty_home
+            and _browser_state_is_empty_home(state)
+            and _browser_state_has_location(data.get("state", {}))
+        ):
+            return
+        data["state"] = state
+        _save_browser_persistence(context, data)
+    except Exception as e:
+        log.error("Failed to save asset browser state: %s", e)
+
+
+def _persist_current_browser_state(context):
+    browser = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+    if browser is None:
+        return
+    cache_type = str(getattr(browser, "active_cache_type", "") or "")
+    if is_external_cache(cache_type):
+        return
+    save_browser_state(context, cache_type, getattr(browser, "current_folder", ""))
+
+
+def load_browser_session_state(context):
+    """Load durable browser state, migrating old add-on preference values if needed."""
+    return dict(_load_browser_persistence(context).get("state", {}) or {})
 
 
 def load_browser_state(context):
-    """Load browser state from addon preferences."""
-    try:
-        addon_prefs = get_all_addon_prefs(context)
-        return addon_prefs.browser_last_cache_type, addon_prefs.browser_last_folder
-    except Exception:
-        return "", ""
-
-
-import json
+    """Load last cache/folder for backward-compatible callers."""
+    state = load_browser_session_state(context)
+    return state.get("active_cache_type", ""), state.get("current_folder", "")
 
 MAX_RECENT_ITEMS = 20
 RECENT_KIND_IMPORT = "import"
@@ -4911,9 +5316,8 @@ def _normalize_recent_entry(entry):
 def add_recent_entry(context, path, cache_type, kind=RECENT_KIND_IMPORT, archive_path="", display_name=""):
     """Add a recent browser activity entry."""
     try:
-        addon_prefs = get_all_addon_prefs(context)
-        raw_recent = json.loads(addon_prefs.browser_recent_imports or "[]")
-        recent = [item for item in (_normalize_recent_entry(r) for r in raw_recent) if item]
+        data = _load_browser_persistence(context)
+        recent = [item for item in (_normalize_recent_entry(r) for r in data.get("recent", [])) if item]
 
         entry = _normalize_recent_entry({
             "path": path,
@@ -4931,7 +5335,8 @@ def add_recent_entry(context, path, cache_type, kind=RECENT_KIND_IMPORT, archive
         recent.insert(0, entry)
         recent = recent[:MAX_RECENT_ITEMS]
 
-        addon_prefs.browser_recent_imports = json.dumps(recent)
+        data["recent"] = recent
+        _save_browser_persistence(context, data)
     except Exception as e:
         log.error("Failed to save recent browser entry: %s", e)
 
@@ -4967,9 +5372,8 @@ def add_recent_external_archive(context, cache_type, archive_path):
 def get_recent_imports(context):
     """Get recent browser activity entries."""
     try:
-        addon_prefs = get_all_addon_prefs(context)
-        raw_recent = json.loads(addon_prefs.browser_recent_imports or "[]")
-        return [item for item in (_normalize_recent_entry(r) for r in raw_recent) if item]
+        data = _load_browser_persistence(context)
+        return [item for item in (_normalize_recent_entry(r) for r in data.get("recent", [])) if item]
     except Exception:
         return []
 
@@ -4977,8 +5381,9 @@ def get_recent_imports(context):
 def clear_recent_imports(context):
     """Clear all recent browser activity."""
     try:
-        addon_prefs = get_all_addon_prefs(context)
-        addon_prefs.browser_recent_imports = "[]"
+        data = _load_browser_persistence(context)
+        data["recent"] = []
+        _save_browser_persistence(context, data)
     except Exception:
         pass
 
@@ -4994,8 +5399,8 @@ def get_last_recent_external_archive(context):
 def add_bookmark(context, path, cache_type, name=None, archive_path=""):
     """Add a bookmark."""
     try:
-        addon_prefs = get_all_addon_prefs(context)
-        bookmarks = json.loads(addon_prefs.browser_bookmarks or "[]")
+        data = _load_browser_persistence(context)
+        bookmarks = [item for item in (_normalize_bookmark_entry(b) for b in data.get("bookmarks", [])) if item]
         archive_path = str(archive_path or "")
         if is_external_cache(cache_type) and not archive_path:
             session = get_external_archive_session(cache_type)
@@ -5022,7 +5427,8 @@ def add_bookmark(context, path, cache_type, name=None, archive_path=""):
             bookmark['archive_path'] = archive_path
         bookmarks.append(bookmark)
 
-        addon_prefs.browser_bookmarks = json.dumps(bookmarks)
+        data["bookmarks"] = bookmarks
+        _save_browser_persistence(context, data)
         return True
     except Exception as e:
         log.error("Failed to add bookmark: %s", e)
@@ -5032,8 +5438,8 @@ def add_bookmark(context, path, cache_type, name=None, archive_path=""):
 def remove_bookmark(context, path, cache_type, archive_path=""):
     """Remove a bookmark."""
     try:
-        addon_prefs = get_all_addon_prefs(context)
-        bookmarks = json.loads(addon_prefs.browser_bookmarks or "[]")
+        data = _load_browser_persistence(context)
+        bookmarks = [item for item in (_normalize_bookmark_entry(b) for b in data.get("bookmarks", [])) if item]
         archive_path = str(archive_path or "")
         bookmarks = [
             b for b in bookmarks
@@ -5043,7 +5449,8 @@ def remove_bookmark(context, path, cache_type, archive_path=""):
                 and str(b.get('archive_path', '') or '') == archive_path
             )
         ]
-        addon_prefs.browser_bookmarks = json.dumps(bookmarks)
+        data["bookmarks"] = bookmarks
+        _save_browser_persistence(context, data)
         return True
     except Exception:
         return False
@@ -5052,8 +5459,8 @@ def remove_bookmark(context, path, cache_type, archive_path=""):
 def get_bookmarks(context):
     """Get list of bookmarks."""
     try:
-        addon_prefs = get_all_addon_prefs(context)
-        return json.loads(addon_prefs.browser_bookmarks or "[]")
+        data = _load_browser_persistence(context)
+        return [item for item in (_normalize_bookmark_entry(b) for b in data.get("bookmarks", [])) if item]
     except Exception:
         return []
 
@@ -5601,52 +6008,74 @@ class SimpleFileBrowser(Operator):
 
     def invoke(self, context, event):
         witcher_file_browser = context.scene.witcher_file_browser
-        witcher_file_browser.loadmods = self.loadmods  # Store for SelectCacheTypeOperator
-        witcher_file_browser.search_query = ""
+        _set_browser_state_save_suspended(True)
         try:
-            prefs = get_all_addon_prefs(context)
-            if prefs is not None:
-                preset_mode = str(getattr(prefs, "browser_grid_size_mode", DEFAULT_BROWSER_GRID_SIZE_MODE) or "")
-                if preset_mode not in BROWSER_GRID_SIZE_PRESETS:
-                    preset_mode = DEFAULT_BROWSER_GRID_SIZE_MODE
-                witcher_file_browser.grid_size_mode_live = preset_mode
-        except Exception:
-            pass
+            witcher_file_browser.loadmods = self.loadmods  # Store for SelectCacheTypeOperator
+            try:
+                prefs = get_all_addon_prefs(context)
+                if prefs is not None:
+                    preset_mode = str(getattr(prefs, "browser_grid_size_mode", DEFAULT_BROWSER_GRID_SIZE_MODE) or "")
+                    if preset_mode not in BROWSER_GRID_SIZE_PRESETS:
+                        preset_mode = DEFAULT_BROWSER_GRID_SIZE_MODE
+                    witcher_file_browser.grid_size_mode_live = preset_mode
+            except Exception:
+                pass
 
-        if self.loadmods:
-            refresh_mod_cache_managers(self)
+            if self.loadmods:
+                refresh_mod_cache_managers(self)
 
-        startup_cache_type = str(getattr(self, "startup_cache_type", "") or "")
-        startup_folder = str(getattr(self, "startup_folder", "") or "")
-        if startup_cache_type:
-            if is_external_cache(startup_cache_type) and not get_external_archive_session(startup_cache_type):
-                startup_cache_type, startup_folder = "", ""
+            startup_cache_type = str(getattr(self, "startup_cache_type", "") or "")
+            startup_folder = str(getattr(self, "startup_folder", "") or "")
+            if startup_cache_type:
+                if is_external_cache(startup_cache_type) and not get_external_archive_session(startup_cache_type):
+                    startup_cache_type, startup_folder = "", ""
 
-        if startup_cache_type:
-            witcher_file_browser.active_cache_type = startup_cache_type
-            witcher_file_browser.current_folder = startup_folder
-            SelectCacheTypeOperator.populate_folder_structure(self, startup_cache_type, context)
-            clear_nav_history()
-            add_to_nav_history(startup_cache_type, startup_folder)
-        else:
-            # Try to restore last browser state from addon preferences
-            last_cache_type, last_folder = load_browser_state(context)
-            if is_external_cache(last_cache_type) and not get_external_archive_session(last_cache_type):
-                last_cache_type, last_folder = "", ""
-
-            if self.restore_last_state and last_cache_type:
-                # Restore to last used cache type and folder
-                witcher_file_browser.active_cache_type = last_cache_type
-                witcher_file_browser.current_folder = last_folder
-                # Populate folder structure for this cache type
-                SelectCacheTypeOperator.populate_folder_structure(self, last_cache_type, context)
-                # Initialize navigation history with restored state
-                add_to_nav_history(last_cache_type, last_folder)
-            else:
-                # Reset to root level (cache type selection)
-                witcher_file_browser.current_folder = ""
-                witcher_file_browser.active_cache_type = ""
+            if startup_cache_type:
+                witcher_file_browser.browser_view_mode = 'BROWSE'
+                witcher_file_browser.active_cache_type = startup_cache_type
+                witcher_file_browser.current_folder = startup_folder
+                witcher_file_browser.search_query = ""
+                witcher_file_browser.extension_filter = ""
+                SelectCacheTypeOperator.populate_folder_structure(self, startup_cache_type, context)
                 clear_nav_history()
+                add_to_nav_history(startup_cache_type, startup_folder)
+                save_browser_state(context, startup_cache_type, startup_folder)
+            else:
+                saved_state = load_browser_session_state(context)
+                last_cache_type = saved_state.get("active_cache_type", "")
+                last_folder = saved_state.get("current_folder", "")
+                if is_external_cache(last_cache_type) and not get_external_archive_session(last_cache_type):
+                    last_cache_type, last_folder = "", ""
+
+                if self.restore_last_state and saved_state:
+                    witcher_file_browser.browser_view_mode = saved_state.get("browser_view_mode", "BROWSE")
+                    witcher_file_browser.search_query = saved_state.get("search_query", "")
+                    witcher_file_browser.extension_filter = saved_state.get("extension_filter", "")
+                    witcher_file_browser.root_search_scope = saved_state.get("root_search_scope", "ALL")
+                    witcher_file_browser.file_display_mode = saved_state.get("file_display_mode", "LIST")
+                    witcher_file_browser.sort_by = saved_state.get("sort_by", "NAME")
+                    witcher_file_browser.sort_ascending = bool(saved_state.get("sort_ascending", True))
+                    witcher_file_browser.show_standalone_archives = bool(saved_state.get("show_standalone_archives", False))
+                    witcher_file_browser.use_mods_priority = bool(saved_state.get("use_mods_priority", False))
+                    witcher_file_browser.mods_overwrite = bool(saved_state.get("mods_overwrite", False))
+                    witcher_file_browser.open_import_dialog = bool(saved_state.get("open_import_dialog", False))
+                    witcher_file_browser.active_cache_type = last_cache_type
+                    witcher_file_browser.current_folder = last_folder
+                    if last_cache_type:
+                        SelectCacheTypeOperator.populate_folder_structure(self, last_cache_type, context)
+                        add_to_nav_history(last_cache_type, last_folder)
+                    else:
+                        clear_nav_history()
+                    save_browser_state(context, last_cache_type, last_folder)
+                else:
+                    witcher_file_browser.current_folder = ""
+                    witcher_file_browser.active_cache_type = ""
+                    witcher_file_browser.search_query = ""
+                    witcher_file_browser.extension_filter = ""
+                    witcher_file_browser.browser_view_mode = 'BROWSE'
+                    clear_nav_history()
+        finally:
+            _set_browser_state_save_suspended(False)
 
         wm = context.window_manager
         self._remove_ui_refresh_timer(context)
@@ -6319,6 +6748,17 @@ class SimpleFileBrowser(Operator):
                     is_global=is_global,
                 )
 
+    def _draw_section_setup_hint(self, layout, message, url=None):
+        import textwrap
+        col = layout.column(align=True)
+        col.scale_y = 0.8
+        for i, line in enumerate(textwrap.wrap(message, 48) or [message]):
+            col.label(text=line, icon='INFO' if i == 0 else 'BLANK1')
+        btn_row = layout.row(align=True)
+        btn_row.operator("witcher.open_addon_preferences", text="Open Preferences", icon='PREFERENCES')
+        if url:
+            btn_row.operator("wm.url_open", text="Get REDkit", icon='URL').url = url
+
     def draw(self, context):
         layout = self.layout
         witcher_file_browser = context.scene.witcher_file_browser
@@ -6347,25 +6787,41 @@ class SimpleFileBrowser(Operator):
 
         # BROWSE MODE - ROOT LEVEL - Show cache type selection
         if not witcher_file_browser.active_cache_type:
-            layout.label(text="Select Cache Type:", icon='FILE_FOLDER')
-
-            # Global search bar at root level with clear button
-            layout.separator(factor=0.3)
             search_row = layout.row(align=True)
             search_row.prop(witcher_file_browser, "search_query", text="", icon="VIEWZOOM")
             if witcher_file_browser.search_query:
                 search_row.operator("witcher.clear_search", text="", icon="X")
+
+            filter_scope_row = layout.row(align=True)
+            filter_row = filter_scope_row.row(align=True)
+            filter_label = filter_row.row(align=True)
+            filter_label.ui_units_x = 7
+            filter_label.label(text="View Filter:", icon='FILTER')
+            filter_row.prop(witcher_file_browser, "extension_filter", text="")
+            if witcher_file_browser.extension_filter:
+                filter_row.operator("witcher.clear_extension_filter", text="", icon="X")
+            scope_row = filter_scope_row.row(align=True)
+            scope_row.ui_units_x = 7
+            scope_row.prop(witcher_file_browser, "root_search_scope", text="Game", expand=False)
             layout.separator(factor=0.3)
 
             if witcher_file_browser.search_query:
-                # Search across all caches (uses cached results)
                 self.draw_global_search_results(layout, witcher_file_browser.search_query)
             else:
-                # Show cache type buttons grouped by game/source family.
+                w3_game_ok = not _get_witcher3_game_path_issue(context)
+                w2_game_ok = not _get_witcher2_game_path_issue(context)
+                w3_redkit_types = _get_w3_redkit_cache_types(context)
+                w3_redkit_ok = bool(w3_redkit_types)
+                w2_redkit_ok = win_path_isdir(_get_witcher2_data_root(context))
+
                 cache_groups = [
                     (
                         "Witcher 3",
                         "PACKAGE",
+                        w3_game_ok,
+                        "Witcher 3 install not set. Add the game path in add-on "
+                        "preferences to browse its assets.",
+                        None,
                         [
                             ("Bundle", "Bundles", "PACKAGE", "Game asset bundles"),
                             ("Collision", "Collision", "MESH_CUBE", "Collision meshes"),
@@ -6376,17 +6832,20 @@ class SimpleFileBrowser(Operator):
                         (
                             "Witcher 3 REDkit",
                             "FILE_FOLDER",
-                            [
-                                ("REDkit Depot", "Depot", "FILE_FOLDER", "r4data source depot"),
-                                ("REDkit Uncooked", "Uncooked", "FILE_FOLDER", "Generated asset depot"),
-                                ("Workspace", "Workspace", "FILE_FOLDER", "Project workspace"),
-                                ("Cooked", "Cooked", "PACKAGE", "Project cooked output"),
-                            ],
+                            w3_redkit_ok,
+                            "REDkit not set. Add the REDkit depot/uncooked paths "
+                            "in preferences, or get REDkit:",
+                            REDKIT_W3_URL,
+                            w3_redkit_types,
                         ),
                     ),
                     (
                         "Witcher 2",
                         "PACKAGE",
+                        w2_game_ok,
+                        "Witcher 2 install not set. Add the game path in add-on "
+                        "preferences to browse its assets.",
+                        None,
                         [
                             (WITCHER2_BUNDLE_CACHE_TYPE, "DZIP Archives", "PACKAGE", "Witcher 2 DZIP archives"),
                             (WITCHER2_SPEECH_CACHE_TYPE, "W2Speech", "SPEAKER", "Witcher 2 speech archives"),
@@ -6394,31 +6853,41 @@ class SimpleFileBrowser(Operator):
                         (
                             "Witcher 2 REDkit",
                             "FILE_FOLDER",
+                            w2_redkit_ok,
+                            "REDkit 2 data not found. Set the Witcher 2 install "
+                            "path in preferences, or get REDkit:",
+                            REDKIT_W2_URL,
                             (
                                 ("Witcher 2 Data", "REDkit 2 Data", "FILE_FOLDER", "REDkit 2 data folder"),
                             ),
                         ),
                     ),
                 ]
-                for group_name, group_icon, cache_types, redkit_section in cache_groups:
+                for group_name, group_icon, group_ok, group_msg, group_url, cache_types, redkit_section in cache_groups:
                     group_box = layout.box()
                     group_box.label(text=group_name, icon=group_icon)
-                    cache_col = group_box.column(align=True)
-                    for cache_name, button_text, icon, desc in cache_types:
-                        row = cache_col.row(align=True)
-                        op = row.operator("witcher.select_cache_type", text=button_text, icon=icon)
-                        op.cache_type = cache_name
-                        row.label(text=desc)
+                    if group_ok:
+                        cache_col = group_box.column(align=True)
+                        for cache_name, button_text, icon, desc in cache_types:
+                            row = cache_col.row(align=True)
+                            op = row.operator("witcher.select_cache_type", text=button_text, icon=icon)
+                            op.cache_type = cache_name
+                            row.label(text=desc)
+                    else:
+                        self._draw_section_setup_hint(group_box, group_msg, group_url)
 
-                    section_name, section_icon, redkit_types = redkit_section
+                    section_name, section_icon, section_ok, section_msg, section_url, redkit_types = redkit_section
                     group_box.separator(factor=0.35)
                     redkit_col = group_box.column(align=True)
                     redkit_col.label(text=section_name, icon=section_icon)
-                    for cache_name, button_text, icon, desc in redkit_types:
-                        row = redkit_col.row(align=True)
-                        op = row.operator("witcher.select_cache_type", text=button_text, icon=icon)
-                        op.cache_type = cache_name
-                        row.label(text=desc)
+                    if section_ok:
+                        for cache_name, button_text, icon, desc in redkit_types:
+                            row = redkit_col.row(align=True)
+                            op = row.operator("witcher.select_cache_type", text=button_text, icon=icon)
+                            op.cache_type = cache_name
+                            row.label(text=desc)
+                    else:
+                        self._draw_section_setup_hint(redkit_col, section_msg, section_url)
 
                 layout.separator(factor=0.5)
                 ext_box = layout.box()
@@ -6508,17 +6977,18 @@ class SimpleFileBrowser(Operator):
 
         self._draw_external_archive_tools(layout, context, witcher_file_browser)
 
-        # Search + view filter on one row: search takes left ~60%, filter the rest
         layout.separator(factor=0.3)
         search_filter_row = layout.row(align=False)
-        search_split = search_filter_row.split(factor=0.60, align=True)
+        search_split = search_filter_row.split(factor=0.68, align=False)
         search_part = search_split.row(align=True)
         search_part.prop(witcher_file_browser, "search_query", text="", icon="VIEWZOOM")
         if witcher_file_browser.search_query:
             search_part.operator("witcher.clear_search", text="", icon="X")
         filter_part = search_split.row(align=True)
-        filter_part.label(text="", icon='FILTER')
-        filter_part.prop(witcher_file_browser, "extension_filter", text="View Filter")
+        filter_label = filter_part.row(align=True)
+        filter_label.ui_units_x = 7
+        filter_label.label(text="View Filter:", icon='FILTER')
+        filter_part.prop(witcher_file_browser, "extension_filter", text="")
         if witcher_file_browser.extension_filter:
             filter_part.operator("witcher.clear_extension_filter", text="", icon="X")
 
@@ -6900,15 +7370,28 @@ class SimpleFileBrowser(Operator):
 
 
     def draw_global_search_results(self, layout, query):
-        """Search across all cache types and display results with cache source."""
+        """Search selected game-cache scope and display results with cache source."""
         context = bpy.context
         witcher_file_browser = context.scene.witcher_file_browser
         loadmods = witcher_file_browser.loadmods
+        search_scope = getattr(witcher_file_browser, "root_search_scope", "ALL")
 
-        # Use cached search results (avoids re-searching on every UI redraw)
-        results = get_cached_search_results(query, "", folder_structure, loadmods=loadmods)
+        results = get_cached_search_results(
+            query,
+            "",
+            folder_structure,
+            loadmods=loadmods,
+            search_scope=search_scope,
+        )
         limit_reached = len(results) >= BROWSER_SEARCH_RESULT_LIMIT
+        filter_text = witcher_file_browser.extension_filter.strip().lower()
+        if filter_text:
+            results = [result for result in results if filter_text in result[1].lower()]
         results = _sort_browser_global_search_results(results, witcher_file_browser)
+        header = layout.row(align=True)
+        header.label(text=_get_root_search_scope_label(search_scope), icon='FILEBROWSER')
+        if filter_text:
+            header.label(text="Filtered", icon='FILTER')
         self._draw_search_results(
             layout,
             context,
@@ -7083,6 +7566,12 @@ class ClearSearchOperator(Operator):
         witcher_file_browser.search_query = ""
         clear_search_cache()
         witcher_file_browser.search_page_index = 0
+        save_browser_state(
+            context,
+            witcher_file_browser.active_cache_type,
+            witcher_file_browser.current_folder,
+            allow_empty_home=True,
+        )
         return {'FINISHED'}
 
 class StatusIconHelpOperator(Operator):
@@ -7225,8 +7714,9 @@ class GoHomeOperator(Operator):
         _nav_index = -1
 
         # Clear search cache
-        _search_cache = {'query': '', 'cache_type': '', 'loadmods': False, 'results': []}
+        _search_cache = {'query': '', 'cache_type': '', 'scope': 'ALL', 'loadmods': False, 'results': []}
 
+        save_browser_state(context, "", "", allow_empty_home=True)
         return {'FINISHED'}
 
 
@@ -7238,6 +7728,12 @@ class ClearExtensionFilterOperator(Operator):
     def execute(self, context):
         witcher_file_browser = context.scene.witcher_file_browser
         witcher_file_browser.extension_filter = ""
+        save_browser_state(
+            context,
+            witcher_file_browser.active_cache_type,
+            witcher_file_browser.current_folder,
+            allow_empty_home=True,
+        )
         return {'FINISHED'}
 
 
@@ -7463,7 +7959,11 @@ class BrowserPageOperator(Operator):
                     "",
                     folder_structure,
                     loadmods=browser.loadmods,
+                    search_scope=getattr(browser, "root_search_scope", "ALL"),
                 )
+                filter_text = browser.extension_filter.strip().lower()
+                if filter_text:
+                    items = [item for item in items if filter_text in item[1].lower()]
                 items = _sort_browser_global_search_results(items, browser)
 
             page_size = _get_browser_file_page_size(context, browser.file_display_mode)
@@ -7528,10 +8028,22 @@ class CopyAllSearchPathsOperator(Operator):
 
     def execute(self, context):
         wfb = context.scene.witcher_file_browser
-        results = get_cached_search_results(
-            wfb.search_query, wfb.active_cache_type, folder_structure, loadmods=wfb.loadmods
-        )
         filter_text = wfb.extension_filter.strip().lower()
+        if wfb.active_cache_type:
+            results = get_cached_search_results(
+                wfb.search_query,
+                wfb.active_cache_type,
+                folder_structure,
+                loadmods=wfb.loadmods,
+            )
+        else:
+            results = get_cached_search_results(
+                wfb.search_query,
+                "",
+                folder_structure,
+                loadmods=wfb.loadmods,
+                search_scope=getattr(wfb, "root_search_scope", "ALL"),
+            )
         if not results:
             self.report({'WARNING'}, "No search results to copy")
             return {'CANCELLED'}
@@ -7546,6 +8058,7 @@ class CopyAllSearchPathsOperator(Operator):
             paths = [
                 get_asset_browser_copy_path(path, loadmods=bool(getattr(wfb, "loadmods", False)))
                 for _, path in results
+                if not filter_text or filter_text in path.lower()
             ]
 
         if not paths:
@@ -7707,6 +8220,7 @@ class NavigateBackOperator(Operator):
         witcher_file_browser.current_folder = folder
         witcher_file_browser.search_query = ""
         _nav_updating = False
+        save_browser_state(context, cache_type, folder)
         return {'FINISHED'}
 
 
@@ -7740,6 +8254,7 @@ class NavigateForwardOperator(Operator):
         witcher_file_browser.current_folder = folder
         witcher_file_browser.search_query = ""
         _nav_updating = False
+        save_browser_state(context, cache_type, folder)
         return {'FINISHED'}
 
 
@@ -7814,6 +8329,7 @@ class NavigateFolderOperator(Operator):
             clear_search_cache()
             clear_nav_history()
             folder_structure.clear()
+            save_browser_state(context, "", "", allow_empty_home=True)
             return {'FINISHED'}
 
         _clear_browser_reveal(context)
