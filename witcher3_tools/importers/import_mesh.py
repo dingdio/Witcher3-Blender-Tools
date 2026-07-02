@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 _MESH_PROFILE_ENABLED = True
 _MESH_PROFILE_WARN_THRESHOLD = 0.25
 _MESH_PROFILE_MATERIAL_WARN_THRESHOLD = 0.10
+_MESH_SKELETON_CACHE = {}
 
 
 def _log_mesh_profile_warning(message, *args):
@@ -60,6 +61,261 @@ def _derive_mesh_is_static(CData):
     if mesh_infos:
         return not _mesh_has_skinned_chunks(CData)
     return bool(getattr(CData, "isStatic", False))
+
+
+def _bone_matrix_to_rest_matrix(bone_matrix):
+    fields = getattr(bone_matrix, "fields", bone_matrix)
+    mat = Matrix()
+    mat[0][0], mat[0][1], mat[0][2], mat[0][3] = fields[0], fields[4], fields[8], fields[12]
+    mat[1][0], mat[1][1], mat[1][2], mat[1][3] = fields[1], fields[5], fields[9], fields[13]
+    mat[2][0], mat[2][1], mat[2][2], mat[2][3] = fields[2], fields[6], fields[10], fields[14]
+    mat[3][0], mat[3][1], mat[3][2], mat[3][3] = fields[3], fields[7], fields[11], fields[15]
+    return mat.inverted()
+
+
+def mesh_bone_data_to_skeleton(CData):
+    if CData is None or not _mesh_has_skinned_chunks(CData):
+        return None
+    bone_data = getattr(CData, "boneData", None)
+    joint_names = list(getattr(bone_data, "jointNames", []) or [])
+    bone_matrices = list(getattr(bone_data, "boneMatrices", []) or [])
+    if not joint_names or not bone_matrices:
+        return None
+
+    bones = []
+    seen = set()
+    for idx, name in enumerate(joint_names):
+        name = str(name or "").strip()
+        if not name or name in seen or idx >= len(bone_matrices):
+            continue
+        seen.add(name)
+        mat = _bone_matrix_to_rest_matrix(bone_matrices[idx])
+        pos = mat.to_translation()
+        quat = mat.to_quaternion()
+        bones.append(w3_types.W3Bone(
+            len(bones),
+            name,
+            [float(pos.x), float(pos.y), float(pos.z), 1.0],
+            -1,
+            False,
+            w3_types.Quaternion(float(quat.x), float(quat.y), float(quat.z), float(quat.w)),
+            [1.0, 1.0, 1.0],
+        ))
+    return w3_types.CSkeleton(bones=bones) if bones else None
+
+
+def _skeleton_bone_name(bone) -> str:
+    if isinstance(bone, dict):
+        return str(bone.get("name", "") or "").strip()
+    return str(getattr(bone, "name", "") or "").strip()
+
+
+def _skeleton_bone_head(bone):
+    if isinstance(bone, dict):
+        value = bone.get("co")
+    else:
+        value = getattr(bone, "co", None)
+    if value is None or value is False:
+        return None
+    try:
+        return Vector((float(value[0]), float(value[1]), float(value[2])))
+    except Exception:
+        return None
+
+
+def _skeleton_is_dynamic_attachment_bind(bone_names) -> bool:
+    names = [str(name or "").strip() for name in (bone_names or []) if str(name or "").strip()]
+    if not names:
+        return False
+    anchor_names = {
+        "Root",
+        "head",
+        "neck",
+        "torso",
+        "torso2",
+        "torso3",
+        "pelvis",
+    }
+    driven_names = [name for name in names if name not in anchor_names]
+    if not driven_names:
+        return False
+    return all(name.startswith("dyng_") for name in driven_names)
+
+
+def mesh_skeleton_matches_target_armature(skeleton_data, target_armature, *, tolerance=0.05) -> bool:
+    if target_armature is None or getattr(target_armature, "type", None) != 'ARMATURE':
+        return False
+    bones = list(getattr(skeleton_data, "bones", []) or [])
+    if not bones:
+        return False
+    target_bones = getattr(getattr(target_armature, "data", None), "bones", None)
+    if target_bones is None:
+        return False
+
+    compared = 0
+    missing = 0
+    max_distance = 0.0
+    distances = []
+    compared_names = []
+    for bone in bones:
+        name = _skeleton_bone_name(bone)
+        if not name:
+            continue
+        target_bone = target_bones.get(name)
+        if target_bone is None:
+            missing += 1
+            continue
+        source_head = _skeleton_bone_head(bone)
+        if source_head is None:
+            continue
+        target_head = target_armature.matrix_world @ target_bone.head_local
+        distance = (source_head - target_head).length
+        distances.append(distance)
+        compared_names.append(name)
+        max_distance = max(max_distance, distance)
+        compared += 1
+    if compared <= 0 or missing:
+        return False
+    if max_distance <= tolerance:
+        return True
+
+    # Some character body meshes carry small asymmetric bind-pose offsets in
+    # extremities while the shared skeleton core still matches tightly. Allow
+    # those, but keep unrelated attachments rejected by requiring most bones to
+    # be nearly identical.
+    variant_tolerance = max(tolerance, 0.075)
+    core_tolerance = min(tolerance, 0.01)
+    close_count = sum(1 for distance in distances if distance <= core_tolerance)
+    close_ratio = close_count / float(compared)
+    if max_distance <= variant_tolerance and close_ratio >= 0.75:
+        return True
+
+    if _skeleton_is_dynamic_attachment_bind(compared_names):
+        return True
+
+    log.debug(
+        "Mesh skeleton does not match target armature '%s' rest space: max=%.6f tolerance=%.6f close_ratio=%.2f",
+        getattr(target_armature, "name", ""),
+        max_distance,
+        tolerance,
+        close_ratio,
+    )
+    return False
+
+
+def _target_armature_matches_mesh_bones(CData, target_armature, *, tolerance=0.05) -> bool:
+    return mesh_skeleton_matches_target_armature(
+        mesh_bone_data_to_skeleton(CData),
+        target_armature,
+        tolerance=tolerance,
+    )
+
+
+def read_mesh_skeleton_data(filename: str, *, keep_proxy_meshes=False, embedded_cmesh_chunk_index=None):
+    filename = str(filename or "").strip()
+    if not filename:
+        return None
+    try:
+        stat = os.stat(win_safe_path(filename))
+        cache_key = (
+            os.path.normcase(os.path.normpath(filename)),
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+            embedded_cmesh_chunk_index,
+            bool(keep_proxy_meshes),
+        )
+    except Exception:
+        cache_key = (
+            os.path.normcase(os.path.normpath(filename)),
+            embedded_cmesh_chunk_index,
+            bool(keep_proxy_meshes),
+        )
+    if cache_key in _MESH_SKELETON_CACHE:
+        return _MESH_SKELETON_CACHE[cache_key]
+    CData, _bufferInfos, _mat_names, _materials, _meshName, _meshFile = dc_mesh.load_bin_mesh(
+        filename,
+        keep_lod_meshes=True,
+        keep_proxy_meshes=keep_proxy_meshes,
+        embedded_cmesh_chunk_index=embedded_cmesh_chunk_index,
+    )
+    skeleton_data = mesh_bone_data_to_skeleton(CData)
+    _MESH_SKELETON_CACHE[cache_key] = skeleton_data
+    if len(_MESH_SKELETON_CACHE) > 64:
+        _MESH_SKELETON_CACHE.pop(next(iter(_MESH_SKELETON_CACHE.keys())), None)
+    return skeleton_data
+
+
+def mesh_file_matches_target_armature(filename: str, target_armature, *, tolerance=0.05,
+                                      keep_proxy_meshes=False, embedded_cmesh_chunk_index=None) -> bool:
+    skeleton_data = read_mesh_skeleton_data(
+        filename,
+        keep_proxy_meshes=keep_proxy_meshes,
+        embedded_cmesh_chunk_index=embedded_cmesh_chunk_index,
+    )
+    return mesh_skeleton_matches_target_armature(
+        skeleton_data,
+        target_armature,
+        tolerance=tolerance,
+    )
+
+
+def _mesh_object_setting(mesh_obj, key: str) -> str:
+    settings = getattr(mesh_obj, "witcherui_MeshSettings", None)
+    if settings is None:
+        return ""
+    try:
+        return str(settings[key] or "").strip()
+    except Exception:
+        return ""
+
+
+def _mesh_object_source_paths(mesh_obj) -> list[str]:
+    paths = []
+    for value in (
+        _mesh_object_setting(mesh_obj, "item_repo_path"),
+        _mesh_object_setting(mesh_obj, "source_mesh_path"),
+    ):
+        if value and value not in paths:
+            paths.append(value)
+    for key in ("witcher_path", "repo_path"):
+        try:
+            value = str(mesh_obj.get(key, "") or "").strip()
+        except Exception:
+            value = ""
+        if value and value not in paths:
+            paths.append(value)
+    return paths
+
+
+def mesh_object_target_rest_compatibility(mesh_obj, target_armature, *, tolerance=0.05):
+    """Return True/False when mesh source data can be inspected, otherwise None."""
+    for source_path in _mesh_object_source_paths(mesh_obj):
+        candidates = [source_path]
+        if not os.path.isabs(source_path):
+            try:
+                resolved = repo_file(source_path)
+            except Exception:
+                resolved = ""
+            if resolved and resolved not in candidates:
+                candidates.insert(0, resolved)
+        for candidate in candidates:
+            try:
+                skeleton_data = read_mesh_skeleton_data(candidate)
+                if skeleton_data is None:
+                    continue
+                return mesh_skeleton_matches_target_armature(
+                    skeleton_data,
+                    target_armature,
+                    tolerance=tolerance,
+                )
+            except Exception:
+                log.debug(
+                    "Could not inspect mesh skeleton compatibility for '%s' from '%s'",
+                    getattr(mesh_obj, "name", ""),
+                    candidate,
+                    exc_info=True,
+                )
+    return None
 
 
 def _ensure_armature_binding(mesh_obj, armature_obj):
@@ -379,6 +635,7 @@ def import_mesh(filename:str,
                 do_import_collision:bool = False,
                 hide_zero_weight_faces:bool = True,
                 build_material_nodes:bool = True,
+                target_armature=None,
                 embedded_cmesh_chunk_index=None) -> w3_types.CSkeletalAnimationSet:
     mesh_started = time.perf_counter()
     parse_seconds = 0.0
@@ -423,7 +680,8 @@ def import_mesh(filename:str,
                     keep_empty_lods,
                     keep_proxy_meshes,
                     hide_zero_weight_faces,
-                    build_material_nodes)
+                    build_material_nodes,
+                    target_armature)
                 prepare_seconds = time.perf_counter() - prepare_started
                 
                 if rotate_180:
@@ -664,7 +922,8 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                 keep_empty_lods,
                 keep_proxy_meshes,
                 hide_zero_weight_faces,
-                build_material_nodes=True):
+                build_material_nodes=True,
+                target_armature=None):
     #TODO proxy meshes don't have lod0 they start at lod1, should import proxy anyway if requested
     #meshData = meshFile
     created_mesh_bl = []
@@ -899,7 +1158,23 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
             mat_id,
         )
 
-    if do_import_armature:
+    bind_armature_obj = None
+    if (
+        target_armature is not None
+        and getattr(target_armature, "type", None) == 'ARMATURE'
+        and _mesh_has_skinned_chunks(CData)
+    ):
+        if _target_armature_matches_mesh_bones(CData, target_armature):
+            bind_armature_obj = target_armature
+        else:
+            log.info(
+                "Mesh '%s' does not match target '%s' rest space; importing its own armature.",
+                meshName,
+                getattr(target_armature, "name", ""),
+            )
+    create_mesh_armature = bool(do_import_armature and bind_armature_obj is None)
+
+    if create_mesh_armature:
         try:
             #==========#
             # Armature #
@@ -925,19 +1200,7 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                     
                 for idx, bone_matrix in enumerate(CData.boneData.boneMatrices):
                     bl_bone =  armature_obj.data.edit_bones.get(CData.boneData.jointNames[idx])
-                    bone_matrix = bone_matrix.fields
-                    mat:Matrix = Matrix()
-                    
-                    mat[0][0], mat[0][1], mat[0][2], mat[0][3] = bone_matrix[0], bone_matrix[4], bone_matrix[8], bone_matrix[12]
-                    mat[1][0], mat[1][1], mat[1][2], mat[1][3] = bone_matrix[1], bone_matrix[5], bone_matrix[9], bone_matrix[13]
-                    mat[2][0], mat[2][1], mat[2][2], mat[2][3] = bone_matrix[2], bone_matrix[6], bone_matrix[10], bone_matrix[14]
-                    mat[3][0], mat[3][1], mat[3][2], mat[3][3] = bone_matrix[3], bone_matrix[7], bone_matrix[11], bone_matrix[15]
-
-
-                    # poss = mat.to_translation()
-                    # quat = mat.to_quaternion()
-                    # scl = mat.to_scale()
-                    mat = mat.inverted()
+                    mat = _bone_matrix_to_rest_matrix(bone_matrix)
                     bl_bone.matrix = mat
     
                 # ROTATE ARM 180
@@ -1005,9 +1268,11 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                     
                 final_bl_meshes.append(joined_obj)
 
-                if (_mesh_has_skinned_chunks(CData) and do_import_armature):
-                    bpy.context.view_layer.objects.active = bpy.data.objects[armature_obj.name]
-                    _ensure_armature_binding(joined_obj, armature_obj)
+                if (_mesh_has_skinned_chunks(CData) and (bind_armature_obj is not None or create_mesh_armature)):
+                    target = bind_armature_obj or armature_obj
+                    if target is not None:
+                        bpy.context.view_layer.objects.active = target
+                        _ensure_armature_binding(joined_obj, target)
                 if not keep_lod_meshes and not keep_proxy_meshes:
                     break
                         # if bl_mesh != lod_meshes[0]:
@@ -1131,10 +1396,12 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
     #===========#
     #select everything just imported
     armatures = []
-    if (_mesh_has_skinned_chunks(CData) and do_import_armature):
+    if (_mesh_has_skinned_chunks(CData) and create_mesh_armature):
         armature_obj.select_set(True)
         bpy.context.view_layer.objects.active = armature_obj
         armatures.append(armature_obj)
+    elif bind_armature_obj is not None:
+        bpy.context.view_layer.objects.active = bind_armature_obj
     else:
         if final_bl_meshes:
             bpy.context.view_layer.objects.active = final_bl_meshes[0]
@@ -1704,4 +1971,3 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
         me.free_normals_split()
 
     return exportMeshdata
-

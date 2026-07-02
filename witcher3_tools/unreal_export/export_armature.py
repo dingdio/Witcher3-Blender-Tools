@@ -14,6 +14,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Optional
 
+from ..armature_merge import (
+    _armature_bones_by_name,
+    _copy_source_bone_to_edit_bones,
+    _find_attachment_armature_for_missing_bones,
+    _main_root_bone_name,
+    _missing_armature_bone_names,
+    _required_source_bone_names,
+)
 from .scene_utils import (
     _iter_bpy_objects,
     _remove_object,
@@ -234,174 +242,6 @@ def _resolve_export_armature(group_armature, main_armature, asset_rel: str,
         )
         return group_armature
     return main_armature
-
-
-def _armature_bones_by_name(armature) -> dict[str, Any]:
-    return {
-        str(getattr(bone, "name", "") or ""): bone
-        for bone in getattr(getattr(armature, "data", None), "bones", []) or []
-        if str(getattr(bone, "name", "") or "")
-    }
-
-
-def _missing_armature_bone_names(group_armature, main_armature) -> list[str]:
-    main_bones = set(_armature_bones_by_name(main_armature))
-    return [name for name in _armature_bones_by_name(group_armature) if name not in main_bones]
-
-
-def _armature_root_count(armature) -> int:
-    return sum(
-        1
-        for bone in getattr(getattr(armature, "data", None), "bones", []) or []
-        if getattr(bone, "parent", None) is None
-    )
-
-
-def _find_attachment_armature_for_missing_bones(group_armature, missing_names: list[str]):
-    missing = set(missing_names)
-    if not missing:
-        return None
-
-    candidates = []
-    seen = set()
-
-    def add(candidate):
-        if getattr(candidate, "type", "") != "ARMATURE":
-            return
-        ident = id(candidate)
-        if ident in seen:
-            return
-        seen.add(ident)
-        candidates.append(candidate)
-
-    add(getattr(group_armature, "parent", None))
-
-    pose_bones = getattr(getattr(group_armature, "pose", None), "bones", None)
-    if pose_bones is not None:
-        for bone_name in missing_names:
-            try:
-                pose_bone = pose_bones.get(bone_name)
-            except Exception:
-                pose_bone = None
-            for constraint in getattr(pose_bone, "constraints", []) or []:
-                add(getattr(constraint, "target", None))
-
-    add(group_armature)
-
-    def score(candidate):
-        bones = _armature_bones_by_name(candidate)
-        contains = len(missing.intersection(bones))
-        parented = sum(1 for bone in bones.values() if getattr(bone, "parent", None) is not None)
-        single_root = 1 if _armature_root_count(candidate) == 1 else 0
-        not_group = 1 if candidate is not group_armature else 0
-        covers_all = 1 if contains == len(missing) else 0
-        return (covers_all, contains, single_root, parented, not_group)
-
-    best = max(candidates, key=score, default=None)
-    if best is None or not missing.intersection(_armature_bones_by_name(best)):
-        return None
-    return best
-
-
-def _required_source_bone_names(source_armature, wanted_names: list[str], stop_names: set[str]) -> list[str]:
-    source_bones = _armature_bones_by_name(source_armature)
-    required: set[str] = set()
-
-    def add_chain(name: str):
-        bone = source_bones.get(name)
-        while bone is not None:
-            bone_name = str(getattr(bone, "name", "") or "")
-            if not bone_name or bone_name in stop_names:
-                break
-            if bone_name in required:
-                break
-            required.add(bone_name)
-            bone = getattr(bone, "parent", None)
-
-    for name in wanted_names:
-        add_chain(name)
-
-    ordered = []
-    visited: set[str] = set()
-
-    def visit(name: str):
-        if name in visited:
-            return
-        visited.add(name)
-        bone = source_bones.get(name)
-        parent = getattr(bone, "parent", None) if bone is not None else None
-        parent_name = str(getattr(parent, "name", "") or "")
-        if parent_name in required:
-            visit(parent_name)
-        if name in required:
-            ordered.append(name)
-
-    for bone in getattr(getattr(source_armature, "data", None), "bones", []) or []:
-        name = str(getattr(bone, "name", "") or "")
-        if name in required:
-            visit(name)
-    for name in sorted(required):
-        visit(name)
-    return ordered
-
-
-def _main_root_bone_name(armature) -> str:
-    bones = list(getattr(getattr(armature, "data", None), "bones", []) or [])
-    for bone in bones:
-        if getattr(bone, "name", "") == "Root":
-            return "Root"
-    for bone in bones:
-        if getattr(bone, "parent", None) is None:
-            return str(getattr(bone, "name", "") or "")
-    return ""
-
-
-def _copy_source_bone_to_edit_bones(edit_bones, bone_name: str, source_bones: dict,
-                                    source_armature, target_armature, root_name: str):
-    from mathutils import Vector
-
-    if bone_name in edit_bones:
-        return None
-    source_bone = source_bones.get(bone_name)
-    if source_bone is None:
-        return None
-
-    edit_bone = edit_bones.new(bone_name)
-    edit_bone.use_connect = False
-    try:
-        edit_bone.use_deform = bool(getattr(source_bone, "use_deform", True))
-    except Exception:
-        pass
-
-    parent = getattr(source_bone, "parent", None)
-    parent_name = str(getattr(parent, "name", "") or "")
-    if parent_name and parent_name in edit_bones:
-        edit_bone.parent = edit_bones[parent_name]
-        source_parent_inv = parent.matrix_local.inverted()
-        target_parent_matrix = edit_bones[parent_name].matrix.copy()
-        target_matrix = target_parent_matrix @ (source_parent_inv @ source_bone.matrix_local)
-        local_head = source_parent_inv @ source_bone.head_local
-        local_tail = source_parent_inv @ source_bone.tail_local
-        head = target_parent_matrix @ local_head
-        tail = target_parent_matrix @ local_tail
-    else:
-        if root_name and root_name in edit_bones:
-            edit_bone.parent = edit_bones[root_name]
-        target_inv = target_armature.matrix_world.inverted()
-        source_world = source_armature.matrix_world
-        target_matrix = target_inv @ source_world @ source_bone.matrix_local
-        head = target_inv @ (source_world @ source_bone.head_local)
-        tail = target_inv @ (source_world @ source_bone.tail_local)
-
-    if (tail - head).length < 0.000001:
-        tail = head + Vector((0.0, 0.01, 0.0))
-    edit_bone.head = head
-    edit_bone.tail = tail
-    try:
-        edit_bone.matrix = target_matrix
-    except Exception:
-        pass
-    return edit_bone
 
 
 @contextmanager

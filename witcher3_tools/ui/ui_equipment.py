@@ -33,6 +33,7 @@ from ..importers.import_anims import load_idle_animation_for_armature as _load_i
 from ..CR2W.dc_entity import LoadCEntityTemplateFile  # Import the function as per your setup
 from ..extension_paths import get_cache_root
 from .. import (
+    armature_merge,
     get_all_addon_prefs,
     get_uncook_path,
     get_do_import_redcloth,
@@ -109,6 +110,32 @@ _EQUIPMENT_ITEM_ICON_WARM_INTERVAL = 0.25
 _EQUIPMENT_PLACEHOLDER_PREVIEWS = None
 _EQUIPMENT_PLACEHOLDER_ICON_ID = 0
 _EQUIPMENT_ERROR_ICON_ID = 0
+
+
+@contextmanager
+def _active_graft_source(armature, guid):
+    if armature is None or not guid:
+        yield
+        return
+    had_old = False
+    old_value = None
+    try:
+        had_old = armature_merge.ACTIVE_GRAFT_SRC_PROP in armature
+        old_value = armature.get(armature_merge.ACTIVE_GRAFT_SRC_PROP, "")
+        armature[armature_merge.ACTIVE_GRAFT_SRC_PROP] = str(guid)
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        try:
+            if had_old:
+                armature[armature_merge.ACTIVE_GRAFT_SRC_PROP] = old_value
+            elif armature_merge.ACTIVE_GRAFT_SRC_PROP in armature:
+                del armature[armature_merge.ACTIVE_GRAFT_SRC_PROP]
+        except Exception:
+            pass
+
 
 def _clear_cache_if_oversized(cache, max_entries=64):
     if len(cache) > max_entries:
@@ -2008,6 +2035,12 @@ def _build_guid_index(prop_name="witcher_equip_guid"):
 
 def remove_objects_by_guid(guid, prop_name="witcher_equip_guid"):
     """Delete GUID-tagged scene objects without breaking external child hierarchies."""
+    if prop_name in {"witcher_equip_guid", "witcher_template_guid"}:
+        try:
+            armature_merge.remove_grafted_source_from_scene(guid, context=bpy.context)
+        except Exception:
+            log.warning("Failed to remove grafted bones for GUID '%s'.", guid, exc_info=True)
+
     tagged_objects = set(find_objects_by_guid(guid, prop_name))
     if not tagged_objects:
         return 0
@@ -2641,12 +2674,17 @@ def _set_pose_all_armatures(root_armature, pose_value):
 def _restore_pose_all_armatures(changed):
     """Restore pose_position for armatures changed by _set_pose_all_armatures."""
     for obj, prev_pose, action, action_slot in changed:
-        if obj and obj.type == 'ARMATURE':
-            obj.data.pose_position = prev_pose
-            if obj.animation_data is not None:
-                obj.animation_data.action = action
-                if action is not None and action_slot is not None and hasattr(obj.animation_data, "action_slot"):
-                    obj.animation_data.action_slot = action_slot
+        try:
+            if not obj or obj.type != 'ARMATURE':
+                continue
+        except ReferenceError:
+            # Armature was merged/removed (e.g. by unify) after the snapshot.
+            continue
+        obj.data.pose_position = prev_pose
+        if obj.animation_data is not None:
+            obj.animation_data.action = action
+            if action is not None and action_slot is not None and hasattr(obj.animation_data, "action_slot"):
+                obj.animation_data.action_slot = action_slot
     try:
         bpy.context.view_layer.update()
     except Exception:
@@ -3611,6 +3649,10 @@ def _import_item_entity(export_path, final_item_name, entity, armature, appearan
             _apx_exist, _apx_enabled = _addon_utils.check("io_scene_apx")
         if not _apx_enabled:
             _equip_import_redcloth = False
+    merged_armature_context = import_entity._new_merged_armature_context(
+        bpy.context,
+        root_armature=armature,
+    )
 
     def _import_equipment_template(template_source, *, template_data=None):
         if not template_source:
@@ -3632,6 +3674,7 @@ def _import_item_entity(export_path, final_item_name, entity, armature, appearan
             appearance_indices=None,
             use_app_drivers=use_app_drivers,
             bind_root_chunks_to_entity=bool(bind_root_chunks_to_entity),
+            merged_armature_context=merged_armature_context,
         )
 
     base_template_source = export_path if export_path and os.path.isabs(export_path) else final_item_name
@@ -4114,6 +4157,15 @@ def _should_use_bound_skinning_bridge(attachment_profile, mount_strategy, bound_
     return bool(getattr(attachment_profile, "has_skinned_mesh_payload", False))
 
 
+def _should_use_merged_own_skeleton_skinning_bridge(attachment_profile, target_armature):
+    return bool(
+        target_armature
+        and armature_merge.is_own_skeleton_attachment(target_armature)
+        and armature_merge.armature_is_in_merged_character_hierarchy(target_armature)
+        and bool(getattr(attachment_profile, "has_skinned_mesh_payload", False))
+    )
+
+
 def _maybe_log_legacy_attachment_type_conflict(item_name, attachment_type, attachment_profile):
     legacy_type = str(attachment_type or "").strip().lower()
     if not legacy_type or attachment_profile is None:
@@ -4226,12 +4278,31 @@ def _resolve_slot_visual_policy(slot, armature, rig_settings, *, item_entity=Non
         allow_unmounted_visual=allow_unmounted_visual,
     )
 
-def _bind_objects_to_armature(objects, target_armature):
+def _bind_objects_to_armature(objects, target_armature, *, strict_rest_check=False):
     if not target_armature:
         return
     for obj in objects:
         if obj.type != 'MESH':
             continue
+        if strict_rest_check:
+            target_compatible = None
+            try:
+                from ..importers import import_mesh as _import_mesh_module
+                target_compatible = _import_mesh_module.mesh_object_target_rest_compatibility(obj, target_armature)
+            except Exception:
+                log.debug(
+                    "Could not check mesh/armature rest-space compatibility for '%s' -> '%s'",
+                    getattr(obj, "name", ""),
+                    getattr(target_armature, "name", ""),
+                    exc_info=True,
+                )
+            if target_compatible is False:
+                log.info(
+                    "Skipping armature binding for mesh '%s': target '%s' uses a different rest space.",
+                    getattr(obj, "name", ""),
+                    getattr(target_armature, "name", ""),
+                )
+                continue
         if obj.parent and obj.parent.type == 'ARMATURE' and obj.parent != target_armature:
             saved_world = obj.matrix_world.copy()
             obj.parent = target_armature
@@ -4247,6 +4318,121 @@ def _bind_objects_to_armature(objects, target_armature):
         else:
             mod = obj.modifiers.new(name="W2_Skin", type='ARMATURE')
             mod.object = target_armature
+
+
+def _should_graft_imported_armatures_to_target(target_armature):
+    return bool(
+        target_armature
+        and armature_merge.is_own_skeleton_attachment(target_armature)
+        and armature_merge.armature_is_in_merged_character_hierarchy(target_armature)
+    )
+
+
+def _parent_bound_meshes_to_target(objects, target_armature):
+    if not target_armature:
+        return 0
+    parented = 0
+    for obj in objects or []:
+        if not armature_merge.object_still_exists(obj):
+            continue
+        if getattr(obj, "type", None) != 'MESH':
+            continue
+        bound_to_target = False
+        for mod in getattr(obj, "modifiers", []) or []:
+            if getattr(mod, "type", "") == 'ARMATURE' and getattr(mod, "object", None) is target_armature:
+                bound_to_target = True
+                break
+        if not bound_to_target:
+            continue
+        if getattr(obj, "parent", None) is target_armature:
+            continue
+        armature_merge._set_parent_keep_world(obj, target_armature)
+        parented += 1
+    return parented
+
+
+def _equipment_target_world_matrix(target_info, fallback_armature=None):
+    if not target_info or not target_info.get("is_valid"):
+        return None
+    if target_info.get("target_type") == "slot" and target_info.get("slot_empty") is not None:
+        slot_empty = target_info.get("slot_empty")
+        try:
+            dg = bpy.context.evaluated_depsgraph_get()
+            return slot_empty.evaluated_get(dg).matrix_world.copy()
+        except Exception:
+            try:
+                return slot_empty.matrix_world.copy()
+            except Exception:
+                return None
+
+    armature = target_info.get("armature") or fallback_armature
+    bone_name = str(target_info.get("bone_name", "") or "")
+    if not armature or getattr(armature, "type", None) != 'ARMATURE' or not bone_name:
+        return None
+    try:
+        dg = bpy.context.evaluated_depsgraph_get()
+        arm_eval = armature.evaluated_get(dg)
+        bone = arm_eval.pose.bones.get(bone_name)
+        if bone is not None:
+            return (arm_eval.matrix_world @ bone.matrix).copy()
+    except Exception:
+        pass
+    try:
+        bone = armature.pose.bones.get(bone_name)
+        if bone is not None:
+            return (armature.matrix_world @ bone.matrix).copy()
+    except Exception:
+        pass
+    return None
+
+
+def _align_imported_bind_clone_roots_to_target(objects, target_armature, target_info):
+    if not target_armature or getattr(target_armature, "type", None) != 'ARMATURE':
+        return 0
+    target_matrix = _equipment_target_world_matrix(target_info, target_armature)
+    if target_matrix is None:
+        return 0
+    target_bones = {bone.name for bone in getattr(target_armature.data, "bones", []) or []}
+    if not target_bones:
+        return 0
+
+    object_set = {obj for obj in (objects or []) if armature_merge.object_still_exists(obj)}
+    aligned = 0
+    for armature_obj in list(object_set):
+        if getattr(armature_obj, "type", None) != 'ARMATURE':
+            continue
+        source_bones = [bone.name for bone in getattr(armature_obj.data, "bones", []) or []]
+        if not source_bones or any(name not in target_bones for name in source_bones):
+            continue
+        try:
+            old_world = armature_obj.matrix_world.copy()
+            old_world_inv = old_world.inverted()
+        except Exception:
+            continue
+
+        bound_meshes = []
+        for obj in object_set:
+            if getattr(obj, "type", None) != 'MESH':
+                continue
+            if getattr(obj, "parent", None) is armature_obj:
+                bound_meshes.append((obj, old_world_inv @ obj.matrix_world.copy()))
+                continue
+            for mod in getattr(obj, "modifiers", []) or []:
+                if getattr(mod, "type", "") == 'ARMATURE' and getattr(mod, "object", None) is armature_obj:
+                    bound_meshes.append((obj, old_world_inv @ obj.matrix_world.copy()))
+                    break
+
+        try:
+            armature_obj.matrix_world = target_matrix
+        except Exception:
+            continue
+        for mesh_obj, local_matrix in bound_meshes:
+            try:
+                mesh_obj.matrix_world = target_matrix @ local_matrix
+            except Exception:
+                pass
+        aligned += 1
+    return aligned
 
 
 def _set_armature_pose_position(armature, pose_position="POSE"):
@@ -4324,9 +4510,16 @@ def _attach_imported_objects_via_skinning(objects, target_armature):
         return False
 
     object_set = {obj for obj in (objects or []) if obj is not None}
+    in_merged_hierarchy = armature_merge.armature_is_in_merged_character_hierarchy(target_armature)
     candidate_root_armatures = [
         obj for obj in object_set
-        if obj.type == 'ARMATURE' and (obj.parent is None or obj.parent not in object_set)
+        if obj.type == 'ARMATURE'
+        and (
+            obj.parent is None
+            or obj.parent not in object_set
+            # Merged mode: armatures under imported group empties are still roots.
+            or (in_merged_hierarchy and getattr(obj.parent, "type", None) != 'ARMATURE')
+        )
     ]
     for arm in candidate_root_armatures:
         _set_armature_pose_position(arm, "POSE")
@@ -4335,8 +4528,30 @@ def _attach_imported_objects_via_skinning(objects, target_armature):
         if not _armature_has_external_binding(arm, object_set)
     ]
     if root_armatures:
+        graft_to_target = _should_graft_imported_armatures_to_target(target_armature)
         for arm in root_armatures:
             _set_armature_pose_position(arm, "POSE")
+            if graft_to_target:
+                try:
+                    result = armature_merge.graft_armature_into_master(
+                        target_armature,
+                        arm,
+                        src_id=armature_merge.graft_source_id(target_armature, arm),
+                        source_objects=object_set,
+                        context=bpy.context,
+                        reparent_retargeted_meshes=True,
+                        parent_added_roots_to_master_root=False,
+                    )
+                    if result.merged:
+                        _parent_bound_meshes_to_target(object_set, target_armature)
+                        continue
+                except Exception:
+                    log.warning(
+                        "Failed to graft imported armature '%s' into target '%s'.",
+                        armature_merge.safe_object_name(arm),
+                        armature_merge.safe_object_name(target_armature),
+                        exc_info=True,
+                    )
             saved_world = arm.matrix_world.copy()
             arm.parent = target_armature
             arm.parent_type = 'OBJECT'
@@ -4349,7 +4564,13 @@ def _attach_imported_objects_via_skinning(objects, target_armature):
     if candidate_root_armatures:
         return True
 
-    _bind_objects_to_armature(object_set, target_armature)
+    _bind_objects_to_armature(
+        object_set,
+        target_armature,
+        strict_rest_check=in_merged_hierarchy,
+    )
+    if _should_graft_imported_armatures_to_target(target_armature):
+        _parent_bound_meshes_to_target(object_set, target_armature)
     return bool(object_set)
 
 
@@ -4720,24 +4941,25 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
         saved_world = _temp_reset_armature_world(armature)
         changed_poses = _set_pose_all_armatures(armature, "REST")
         try:
-            import_info = _import_item_entity(
-                export_path,
-                final_item.name,
-                entity,
-                bound_bind_armature,
-                appearance,
-                slot_index,
-                parent_empty,
-                use_app_drivers=_slot_uses_appearance_drivers(slot),
-                prepared_context=prepared,
-                attachment_profile=bound_attachment_profile,
-                bind_root_chunks_to_entity=(
-                    False if bound_use_skinning_bridge else _should_bind_root_chunks_to_entity(
-                        bound_attachment_profile,
-                        bound_mount_strategy,
-                    )
-                ),
-            )
+            with _active_graft_source(bound_bind_armature, slot.equip_guid):
+                import_info = _import_item_entity(
+                    export_path,
+                    final_item.name,
+                    entity,
+                    bound_bind_armature,
+                    appearance,
+                    slot_index,
+                    parent_empty,
+                    use_app_drivers=_slot_uses_appearance_drivers(slot),
+                    prepared_context=prepared,
+                    attachment_profile=bound_attachment_profile,
+                    bind_root_chunks_to_entity=(
+                        False if bound_use_skinning_bridge else _should_bind_root_chunks_to_entity(
+                            bound_attachment_profile,
+                            bound_mount_strategy,
+                        )
+                    ),
+                )
         finally:
             _restore_pose_all_armatures(changed_poses)
             _restore_armature_world(armature, saved_world)
@@ -4768,6 +4990,10 @@ def _load_bound_items(context, armature, rig_settings, slot_index, slot, parent_
         roots = _collect_mount_roots(new_objects, ignored_objects={parent_empty, bound_group})
         if bound_use_skinning_bridge:
             _attach_imported_objects_via_skinning(new_objects, bound_bind_armature)
+            new_objects = {
+                obj for obj in new_objects
+                if armature_merge.object_still_exists(obj)
+            }
         elif bound_use_owner_animated_bridge:
             if not _attach_imported_armatures_to_owner(new_objects, bound_bind_armature):
                 log.warning(
@@ -8624,25 +8850,33 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
 
     saved_world = _temp_reset_armature_world(armature)
     changed_poses = _set_pose_all_armatures(armature, "REST")
+    use_main_skinning_bridge = _should_use_merged_own_skeleton_skinning_bridge(
+        attachment_profile,
+        target_armature,
+    )
+    import_bind_armature = target_armature if use_main_skinning_bridge else armature
     _import_started = time.perf_counter()
     try:
-        import_info = _import_item_entity(
-            export_path,
-            final_item.name,
-            entity,
-            armature,
-            appearance,
-            slot_index,
-            empty_transform,
-            use_app_drivers=_slot_uses_appearance_drivers(slot),
-            prepared_context=prepared,
-            item_appearance_name=getattr(slot, 'item_appearance_name', None) or None,
-            attachment_profile=attachment_profile,
-            bind_root_chunks_to_entity=_should_bind_root_chunks_to_entity(
-                attachment_profile,
-                mount_strategy,
-            ),
-        )
+        with _active_graft_source(import_bind_armature, guid):
+            import_info = _import_item_entity(
+                export_path,
+                final_item.name,
+                entity,
+                import_bind_armature,
+                appearance,
+                slot_index,
+                empty_transform,
+                use_app_drivers=_slot_uses_appearance_drivers(slot),
+                prepared_context=prepared,
+                item_appearance_name=getattr(slot, 'item_appearance_name', None) or None,
+                attachment_profile=attachment_profile,
+                bind_root_chunks_to_entity=(
+                    False if use_main_skinning_bridge else _should_bind_root_chunks_to_entity(
+                        attachment_profile,
+                        mount_strategy,
+                    )
+                ),
+            )
         if not (set(bpy.data.objects) - before):
             # Equipment items must go through _import_item_entity only.
             # Do NOT fall back to import_direct_entity_file — that creates a
@@ -8755,6 +8989,19 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         elif mount_strategy == "slot_mount_static" and target_info["is_valid"]:
             for root in mount_roots:
                 _mount_object_to_target(root, target_info, fallback_armature=armature)
+        if use_main_skinning_bridge:
+            _align_imported_bind_clone_roots_to_target(new_objects, target_armature, target_info)
+            _attach_imported_objects_via_skinning(new_objects, target_armature)
+            if main_mount_anchor is not None and armature_merge.object_still_exists(main_mount_anchor):
+                try:
+                    if not list(main_mount_anchor.children):
+                        bpy.data.objects.remove(main_mount_anchor, do_unlink=True)
+                except Exception:
+                    pass
+            new_objects = {
+                obj for obj in new_objects
+                if armature_merge.object_still_exists(obj)
+            }
 
     slot.is_in_hold_slot = requested_mount_mode == "hold"
 
@@ -8922,6 +9169,12 @@ def load_equipment_items_batch(context, armature, slot_indices, rig_settings=Non
             except Exception:
                 pass
         _reload_seconds = time.perf_counter() - _reload_started
+        # Fold the freshly-loaded per-mesh equipment rigs into the master in one pass,
+        # after every item's pose/world state is restored and tagged with its GUID.
+        try:
+            armature_merge.unify_character_armatures(armature, context=context)
+        except Exception:
+            log.warning("Failed to unify equipment armatures into '%s'.", getattr(armature, "name", ""), exc_info=True)
         log.info(
             "[equip-profile] load_equipment_items_batch total %.3fs (prep %.3fs, post_reload %.3fs, "
             "requested %d, loaded %d)",
@@ -9042,11 +9295,17 @@ def load_template_item(context, armature, slot_index, rig_settings=None):
                 template_data = json.loads(slot.data_json)
             except Exception:
                 template_data = None
-        add_app_template(entity, armature, entity.name, ent_namespace,
-                         get_do_import_redcloth(context), slot_index, appearance,
-                         True, empty_transform, False, slot.template_filename,
-                         template_data=template_data,
-                         appearance_indices=template_appearances)
+        with _active_graft_source(armature, guid):
+            merged_armature_context = import_entity._new_merged_armature_context(
+                context,
+                root_armature=armature,
+            )
+            add_app_template(entity, armature, entity.name, ent_namespace,
+                             get_do_import_redcloth(context), slot_index, appearance,
+                             True, empty_transform, False, slot.template_filename,
+                             template_data=template_data,
+                             appearance_indices=template_appearances,
+                             merged_armature_context=merged_armature_context)
     finally:
         _restore_pose_all_armatures(changed_poses)
         _restore_armature_world(armature, saved_world)

@@ -225,7 +225,8 @@ def deduplicate_images():
 
 def import_model(filepath, ns="mesh", name=":", uncook_path=False, keep_lod_meshes = False,
                   keep_empty_lods = False, keep_proxy_meshes = False, hide_zero_weight_faces = True,
-                  embedded_cmesh_chunk_index=None, build_material_nodes=True):
+                  embedded_cmesh_chunk_index=None, build_material_nodes=True,
+                  target_armature=None):
     """Import a model file (.w2mesh/.w2ent or .fbx)."""
     filepath_lower = str(filepath or "").lower()
     if filepath_lower.endswith(".w2mesh") or filepath_lower.endswith(".w2ent") or embedded_cmesh_chunk_index is not None:
@@ -237,6 +238,7 @@ def import_model(filepath, ns="mesh", name=":", uncook_path=False, keep_lod_mesh
             keep_proxy_meshes = keep_proxy_meshes,
             hide_zero_weight_faces = hide_zero_weight_faces,
             build_material_nodes = build_material_nodes,
+            target_armature = target_armature,
             embedded_cmesh_chunk_index = embedded_cmesh_chunk_index,
         )
     else:

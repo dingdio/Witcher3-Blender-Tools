@@ -365,6 +365,13 @@ def get_do_fix_tail(context) -> bool:
     do_fix_tail = addon_prefs.do_fix_tail
     return do_fix_tail
 
+def get_unify_character_armature(context) -> bool:
+    try:
+        addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+        return bool(getattr(addon_prefs, "premerge_character_armature", False))
+    except Exception:
+        return False
+
 def get_rig_rot90_enabled(rig_settings, default=False):
     """Return whether the rig currently has rot90 applied."""
     if rig_settings is None:
@@ -1661,6 +1668,11 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
             "display more clearly with a -90 degree Z compensation. Enable for easier rig editing and "
             "attachments; disable to keep raw game orientation."
         )
+    )
+    premerge_character_armature: bpy.props.BoolProperty(
+        name="Pre-merge character armature on import",
+        default=False,
+        description="Experimental: import supported character templates as one precomputed armature instead of per-part armatures with constraints."
     )
 
     # Asset Browser state persistence
@@ -3981,6 +3993,8 @@ class WITCH_PT_Utils(WITCH_PT_Base, bpy.types.Panel):
             col = body.column(align=True)
             if hasattr(addon_prefs, "do_fix_tail"):
                 col.prop(addon_prefs, "do_fix_tail", text="Default On Import")
+            if hasattr(addon_prefs, "premerge_character_armature"):
+                col.prop(addon_prefs, "premerge_character_armature", text="Pre-merged Armature")
             obj = context.active_object
             armature = None
             if obj and obj.type == 'ARMATURE':
@@ -4180,6 +4194,8 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
                 addon_prefs = get_all_addon_prefs(context)
                 if hasattr(addon_prefs, "do_fix_tail"):
                     col.prop(addon_prefs, "do_fix_tail", text="Default On Import")
+                if hasattr(addon_prefs, "premerge_character_armature"):
+                    col.prop(addon_prefs, "premerge_character_armature", text="Pre-merged Armature")
                 obj = context.active_object
                 armature = None
                 if obj and obj.type == 'ARMATURE':

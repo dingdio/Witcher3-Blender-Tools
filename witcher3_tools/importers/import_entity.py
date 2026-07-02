@@ -31,6 +31,7 @@ from ..external_addon_tools import get_apx_addon_status, resolve_redcloth_apx
 from .. import fbx_util
 from .. import cloth_util
 from .. import constrain_util
+from .. import armature_merge
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.dc_entity import load_bin_entity
@@ -1252,15 +1253,96 @@ def _get_entity_static_mesh_chunks(entity):
 
 
 def _get_import_root_objects(objects):
-    imported_objects = [obj for obj in (objects or []) if obj is not None]
+    imported_objects = [
+        obj for obj in (objects or [])
+        if obj is not None and armature_merge.object_still_exists(obj)
+    ]
     if not imported_objects:
         return []
     imported_ids = {id(obj) for obj in imported_objects}
-    roots = [
-        obj for obj in imported_objects
-        if obj.parent is None or id(obj.parent) not in imported_ids
-    ]
+    roots = []
+    for obj in imported_objects:
+        try:
+            parent = obj.parent
+        except ReferenceError:
+            continue
+        except Exception:
+            parent = None
+        if parent is None or not armature_merge.object_still_exists(parent) or id(parent) not in imported_ids:
+            roots.append(obj)
     return roots or imported_objects
+
+
+def _new_merged_armature_context(context=None, root_armature=None):
+    if not armature_merge.should_unify_character_armature(context):
+        return None
+    return {
+        "enabled": True,
+        "skeleton": None,
+        "root_armature": root_armature,
+        "root_skeleton_path": "",
+        "root_chunk_key": "",
+        "mimic_face_file": "",
+    }
+
+
+def _merged_context_enabled(merged_armature_context) -> bool:
+    return bool(merged_armature_context and merged_armature_context.get("enabled"))
+
+
+def _merged_context_target(merged_armature_context):
+    if not _merged_context_enabled(merged_armature_context):
+        return None
+    target = merged_armature_context.get("root_armature")
+    if target is not None and getattr(target, "type", None) == 'ARMATURE':
+        return target
+    return None
+
+
+def _merged_chunk_keeps_own_skeleton(chunk) -> bool:
+    """Return true for own-skeleton attachments that must remain separate."""
+    chunk_type = str(_get_entry_attr(chunk, "type", "") or "")
+    return bool(chunk_type == "CAnimatedComponent" and _get_entry_attr(chunk, "skeleton", None))
+
+
+def _apply_merged_mimic_metadata(armature_obj, mimic_face_file=""):
+    if armature_obj is None or getattr(armature_obj, "type", None) != 'ARMATURE':
+        return
+    mimic_face_file = str(mimic_face_file or "").strip()
+    if not mimic_face_file:
+        return
+    armature_obj["mimicFace"] = armature_obj.name
+    armature_obj["mimicFaceFile"] = mimic_face_file
+    rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
+    if rig_settings is not None:
+        try:
+            rig_settings.main_face_skeleton = mimic_face_file
+        except Exception:
+            pass
+
+
+def _merge_skeleton_data_into_context(merged_armature_context, skeleton_data, *, target_armature=None,
+                                      exclude_bone_names=None, exclude_name_contains=None) -> int:
+    if not _merged_context_enabled(merged_armature_context) or skeleton_data is None:
+        return 0
+    target_armature = target_armature or _merged_context_target(merged_armature_context)
+    if target_armature is not None:
+        return armature_merge.append_skeleton_data_to_armature(
+            target_armature,
+            skeleton_data,
+            context=bpy.context,
+            exclude_bone_names=exclude_bone_names,
+            exclude_name_contains=exclude_name_contains,
+        )
+    if merged_armature_context.get("skeleton") is None:
+        merged_armature_context["skeleton"] = armature_merge.clone_skeleton_data(skeleton_data)
+        return len(getattr(merged_armature_context["skeleton"], "bones", []) or [])
+    return armature_merge.merge_skeleton_data(
+        merged_armature_context["skeleton"],
+        skeleton_data,
+        exclude_bone_names=exclude_bone_names,
+        exclude_name_contains=exclude_name_contains,
+    )
 
 
 def _normalize_repo_path(value) -> str:
@@ -1746,6 +1828,80 @@ def _ensure_imported_entity_face_morphs_loaded(context, armature_obj):
     return False
 
 
+def _mesh_has_armature_modifier(mesh_obj) -> bool:
+    for modifier in getattr(mesh_obj, "modifiers", []) or []:
+        if modifier.type == 'ARMATURE' and getattr(modifier, "object", None) is not None:
+            return True
+    return False
+
+
+def _mesh_source_is_skinned(mesh_obj) -> bool:
+    if mesh_obj is None or getattr(mesh_obj, "type", None) != 'MESH':
+        return False
+    try:
+        if str(mesh_obj.witcherui_MeshSettings['source_is_skinned']).lower() == "true":
+            return True
+    except Exception:
+        pass
+    return len(getattr(mesh_obj, "vertex_groups", []) or []) > 0
+
+
+def _bind_unbound_skinned_meshes_to_merged_armature(objects, target_armature) -> int:
+    if target_armature is None or getattr(target_armature, "type", None) != 'ARMATURE':
+        return 0
+    try:
+        from . import import_mesh as _import_mesh_module
+    except Exception:
+        log.debug("Could not import mesh helper for merged armature binding validation.", exc_info=True)
+        return 0
+
+    seen = set()
+    bound = 0
+    for obj in objects or []:
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if getattr(obj, "type", None) != 'MESH':
+            continue
+        if not _mesh_source_is_skinned(obj) or _mesh_has_armature_modifier(obj):
+            continue
+        try:
+            compatible = _import_mesh_module.mesh_object_target_rest_compatibility(obj, target_armature)
+        except Exception:
+            log.debug(
+                "Could not validate unbound skinned mesh '%s' against merged armature '%s'.",
+                getattr(obj, "name", ""),
+                getattr(target_armature, "name", ""),
+                exc_info=True,
+            )
+            continue
+        if compatible is not True:
+            continue
+        saved_parent = getattr(obj, "parent", None)
+        saved_world = obj.matrix_world.copy()
+        try:
+            _import_mesh_module._ensure_armature_binding(obj, target_armature)
+            if saved_parent is not None and obj.parent is not saved_parent:
+                obj.parent = saved_parent
+                obj.parent_type = 'OBJECT'
+                obj.matrix_world = saved_world
+            bound += 1
+        except Exception:
+            log.debug(
+                "Failed to bind unbound skinned mesh '%s' to merged armature '%s'.",
+                getattr(obj, "name", ""),
+                getattr(target_armature, "name", ""),
+                exc_info=True,
+            )
+    if bound:
+        log.info(
+            "Bound %d unbound skinned mesh(es) to merged armature '%s' after import validation.",
+            bound,
+            getattr(target_armature, "name", ""),
+        )
+    return bound
+
+
 def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                         parent_transform = None, selected_appearance_name = "",
                         mesh_import_settings = None, entity_namespace = ""):
@@ -1814,6 +1970,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
         )
         created_entity_root = entity_root
 
+    merged_armature_context = _new_merged_armature_context(context)
     base_animation_skeleton = import_MovingPhysicalAgentComponent(
         entity,
         entity_root,
@@ -1822,6 +1979,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
         source_game=entity_source_game,
         target_collection=target_collection,
         mesh_import_settings=mesh_import_settings,
+        merged_armature_context=merged_armature_context,
     )
     main_arm_obj = base_animation_skeleton
 
@@ -1879,6 +2037,15 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
             refresh_slot_constraints(main_arm_obj)
         except Exception:
             pass
+
+        # Collapse the per-mesh/cloth/hair rigs bound to the main skeleton into one
+        # armature (pref-gated, off by default). Done once here, after every
+        # component/slot is bound, so the importer's earlier passes never see a
+        # half-merged scene.
+        try:
+            armature_merge.unify_character_armatures(main_arm_obj, context=context)
+        except Exception:
+            log.warning("Failed to unify character armatures for '%s'.", getattr(main_arm_obj, "name", ""), exc_info=True)
 
         if load_face_poses:
             _ensure_imported_entity_face_morphs_loaded(context, main_arm_obj)
@@ -4563,8 +4730,14 @@ def process_constraints(constrains, objdict, group_parent=None):
         if parent_obj_name in objdict and child_obj_name in objdict:
             parent_obj = objdict[parent_obj_name]
             child_obj = objdict[child_obj_name]
+            if not armature_merge.object_still_exists(parent_obj) or not armature_merge.object_still_exists(child_obj):
+                log.debug("Skipping stale constraint pair %s -> %s", child_obj_name, parent_obj_name)
+                continue
             if parent_obj == child_obj:
                 continue
+            # Bind with constraints during import; merging into one armature is a
+            # single post-import pass (unify_character_armatures) so the importer's
+            # later passes never trip over an armature that was deleted mid-flight.
             constrain_util.CreateConstraints2(parent_obj, child_obj)
 
             # If the object is a Cloth group, attach the group to the appearance instead.
@@ -4619,6 +4792,8 @@ def process_special_attachment(constraint, objdict):
     if parent_arm_name in objdict and child_name in objdict:
         parent_arm = objdict[parent_arm_name]
         target_object = objdict[child_name]
+        if parent_arm is target_object:
+            return
         rig_settings = getattr(parent_arm.data, "witcherui_RigSettings", None)
         use_rot90 = get_do_fix_tail(bpy.context)
         if rig_settings is not None:
@@ -4755,7 +4930,8 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                  HardAttachments, hide_shadowmesh, root_skeleton, i,
                  selectedAppearance=None, import_redcloth_enabled=True, morphs_todo=None,
                  bind_root_chunks_to_entity=True, direct_entity_path="", source_game="",
-                 source_entity_path="", target_collection=None, mesh_import_settings=None):
+                 source_entity_path="", target_collection=None, mesh_import_settings=None,
+                 merged_armature_context=None):
     if morphs_todo is None:
         morphs_todo = []
     if target_collection is None:
@@ -5118,7 +5294,159 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         return root_skeleton
 
     has_moving_agent = False
-    
+
+    def _merge_chunk_skeleton_sources(target_armature=None):
+        if not _merged_context_enabled(merged_armature_context):
+            return 0
+        merged_count = 0
+        mergeable_chunks = [
+            source_chunk for source_chunk in cur_chunks
+            if not _merged_chunk_keeps_own_skeleton(source_chunk)
+        ]
+
+        for source_chunk in mergeable_chunks:
+            if _get_entry_attr(source_chunk, "skeleton", None):
+                try:
+                    skeleton_path = _resolve_required_chunk_resource(source_chunk, 'skeleton', 'skeleton')
+                    skeleton_data = armature_merge.load_skeleton_data(skeleton_path)
+                    merged_count += _merge_skeleton_data_into_context(
+                        merged_armature_context,
+                        skeleton_data,
+                        target_armature=target_armature,
+                    )
+                except Exception:
+                    log.debug(
+                        "Skipping skeleton pre-merge for %s #%s",
+                        _get_entry_attr(source_chunk, "type", ""),
+                        _get_entry_attr(source_chunk, "chunkIndex", ""),
+                        exc_info=True,
+                    )
+
+        for source_chunk in mergeable_chunks:
+            if _get_entry_attr(source_chunk, "dyng", None):
+                try:
+                    dyng_path = _resolve_required_chunk_resource(source_chunk, 'dyng', 'dynamic rig')
+                    dyng_data = armature_merge.load_skeleton_data(dyng_path)
+                    merged_count += _merge_skeleton_data_into_context(
+                        merged_armature_context,
+                        dyng_data,
+                        target_armature=target_armature,
+                    )
+                except Exception:
+                    log.debug(
+                        "Skipping dynamic-rig pre-merge for %s #%s",
+                        _get_entry_attr(source_chunk, "type", ""),
+                        _get_entry_attr(source_chunk, "chunkIndex", ""),
+                        exc_info=True,
+                    )
+
+        for source_chunk in mergeable_chunks:
+            if _get_entry_attr(source_chunk, "mimicFace", None):
+                try:
+                    mimic_face_path = _resolve_required_chunk_resource(source_chunk, 'mimicFace', 'mimic face')
+                    face_data = import_rig.loadFaceFile(mimic_face_path)
+                    if face_data is not None:
+                        merged_count += _merge_skeleton_data_into_context(
+                            merged_armature_context,
+                            getattr(face_data, "mimicSkeleton", None),
+                            target_armature=target_armature,
+                        )
+                        merged_armature_context["mimic_face_file"] = str(_get_entry_attr(source_chunk, "mimicFace", "") or "")
+                        if target_armature is not None:
+                            _apply_merged_mimic_metadata(target_armature, merged_armature_context["mimic_face_file"])
+                except Exception:
+                    log.debug(
+                        "Skipping mimic pre-merge for %s #%s",
+                        _get_entry_attr(source_chunk, "type", ""),
+                        _get_entry_attr(source_chunk, "chunkIndex", ""),
+                        exc_info=True,
+                    )
+
+        for source_chunk in mergeable_chunks:
+            if _get_entry_attr(source_chunk, "mesh", None):
+                try:
+                    mesh_path = _resolve_required_chunk_resource(source_chunk, 'mesh', 'mesh')
+                    from . import import_mesh as _import_mesh_module
+                    mesh_skeleton = _import_mesh_module.read_mesh_skeleton_data(
+                        mesh_path,
+                        keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
+                    )
+                    merged_count += _merge_skeleton_data_into_context(
+                        merged_armature_context,
+                        mesh_skeleton,
+                        target_armature=target_armature,
+                    )
+                except Exception:
+                    log.debug(
+                        "Skipping mesh-bone pre-merge for %s #%s",
+                        _get_entry_attr(source_chunk, "type", ""),
+                        _get_entry_attr(source_chunk, "chunkIndex", ""),
+                        exc_info=True,
+                    )
+        return merged_count
+
+    def _ensure_merged_root_armature():
+        nonlocal root_skeleton, has_moving_agent
+        if not _merged_context_enabled(merged_armature_context):
+            return root_skeleton
+
+        existing_root = _merged_context_target(merged_armature_context)
+        if existing_root is not None:
+            root_skeleton = existing_root
+            _merge_chunk_skeleton_sources(target_armature=existing_root)
+            return root_skeleton
+
+        moving_chunk = None
+        for source_chunk in cur_chunks:
+            if (
+                _get_entry_attr(source_chunk, "type", "") == "CMovingPhysicalAgentComponent"
+                and _get_entry_attr(source_chunk, "skeleton", None)
+            ):
+                moving_chunk = source_chunk
+                break
+        if moving_chunk is None:
+            return root_skeleton
+
+        chunk_ns = get_chunk_namespace(moving_chunk)
+        try:
+            skeleton_path = _resolve_required_chunk_resource(moving_chunk, 'skeleton', 'skeleton')
+            base_skeleton = armature_merge.load_skeleton_data(skeleton_path)
+            if base_skeleton is None:
+                return root_skeleton
+            merged_armature_context["skeleton"] = armature_merge.clone_skeleton_data(base_skeleton)
+            merged_armature_context["root_skeleton_path"] = skeleton_path
+            merged_armature_context["root_chunk_key"] = chunk_ns
+            moving_agent = import_rig.create_armature(
+                base_skeleton,
+                chunk_ns,
+                fileName=skeleton_path,
+            )
+            moving_agent["witcher_merged_character_armature"] = True
+            moving_agent["witcher_merged_preimport"] = True
+            add_chunk_metadata(moving_agent, moving_chunk, _get_entry_attr(moving_chunk, "skeleton", ""))
+            objdict[chunk_ns] = moving_agent
+            objdict.setdefault(entity.name, moving_agent)
+            root_skeleton = moving_agent
+            has_moving_agent = True
+            merged_armature_context["root_armature"] = moving_agent
+            _merge_chunk_skeleton_sources(target_armature=moving_agent)
+            _store_armature_bone_order_from_skeleton(moving_agent, moving_agent.data)
+            if merged_armature_context.get("mimic_face_file"):
+                _apply_merged_mimic_metadata(moving_agent, merged_armature_context.get("mimic_face_file", ""))
+            _apply_chunk_transform_to_import_roots(moving_chunk, armatures=[moving_agent])
+            return moving_agent
+        except Exception:
+            log.warning(
+                "Failed to create pre-merged character armature for '%s'; falling back to normal import.",
+                getattr(entity, "name", ""),
+                exc_info=True,
+            )
+            if merged_armature_context is not None:
+                merged_armature_context["enabled"] = False
+            return root_skeleton
+
+    _ensure_merged_root_armature()
+
     # Handle base constraints first
     if bind_root_chunks_to_entity:
         for chunk in cur_chunks:
@@ -5184,6 +5512,9 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                         resolved_mesh_path,
                     )
                 component_name = _get_chunk_component_name(chunk)
+                merged_mesh_target = None
+                if not _merged_chunk_keeps_own_skeleton(chunk):
+                    merged_mesh_target = _merged_context_target(merged_armature_context)
                 try:
                     meshes, armatures = fbx_util.import_model(
                         resolved_mesh_path,
@@ -5195,6 +5526,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                         hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
                         build_material_nodes=mesh_import_settings["build_material_nodes"],
                         embedded_cmesh_chunk_index=selected_cmesh_chunk_index,
+                        target_armature=merged_mesh_target,
                     )
                 except Exception as mesh_err:
                     raise RuntimeError(
@@ -5232,6 +5564,8 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                                 chunk.get('type'), chunk.get('chunkIndex'), exc_info=True,
                             )
                     objdict[chunk_ns] = arm
+                if merged_mesh_target is not None and not armatures:
+                    objdict[chunk_ns] = merged_mesh_target
 
                 for mesh in meshes:
                     add_chunk_metadata(mesh, chunk, mesh_path, component_name=component_name)
@@ -5337,6 +5671,9 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 )
                 continue
             try:
+                merged_morph_target = None
+                if not _merged_chunk_keeps_own_skeleton(chunk):
+                    merged_morph_target = _merged_context_target(merged_armature_context)
                 morph_source_meshes, morph_source_arms = fbx_util.import_model(
                     morph_source_path,
                     f"{chunk['type']}{i}{chunk['chunkIndex']}",
@@ -5346,6 +5683,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
                     hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
                     build_material_nodes=mesh_import_settings["build_material_nodes"],
+                    target_armature=merged_morph_target,
                 )
                 morph_target_meshes, morph_target_arms = fbx_util.import_model(
                     morph_target_path,
@@ -5356,6 +5694,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
                     hide_zero_weight_faces=mesh_import_settings["hide_zero_weight_faces"],
                     build_material_nodes=mesh_import_settings["build_material_nodes"],
+                    target_armature=merged_morph_target,
                 )
             except Exception as morph_err:
                 log.warning(
@@ -5387,6 +5726,13 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         # Handle skeletons
         if chunk['type'] == "CMovingPhysicalAgentComponent":
             if 'skeleton' in chunk:
+                merged_target = _merged_context_target(merged_armature_context)
+                if merged_target is not None:
+                    objdict[chunk_ns] = merged_target
+                    objdict.setdefault(entity.name, merged_target)
+                    root_skeleton = merged_target
+                    has_moving_agent = True
+                    continue
                 reused_agent = _try_reuse_owner_moving_agent(chunk, chunk_ns)
                 if reused_agent is not None:
                     root_skeleton = reused_agent
@@ -5404,6 +5750,12 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 has_moving_agent = True
                 _apply_chunk_transform_to_import_roots(chunk, armatures=[moving_agent])
         elif "skeleton" in chunk and chunk['skeleton'] is not None:
+            merged_target = None if _merged_chunk_keeps_own_skeleton(chunk) else _merged_context_target(merged_armature_context)
+            if merged_target is not None:
+                objdict[chunk_ns] = merged_target
+                if not has_moving_agent:
+                    root_skeleton = merged_target
+                continue
             try:
                 skeleton_path = _resolve_required_chunk_resource(chunk, 'skeleton', 'skeleton')
             except FileNotFoundError as exc:
@@ -5423,6 +5775,10 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
 
         # Handle dynamic rigs
         if "dyng" in chunk and chunk['dyng'] is not None:
+            merged_target = None if _merged_chunk_keeps_own_skeleton(chunk) else _merged_context_target(merged_armature_context)
+            if merged_target is not None:
+                objdict[chunk_ns] = merged_target
+                continue
             dyng_path = _resolve_required_chunk_resource(chunk, 'dyng', 'dynamic rig')
             root_bone = import_rig.import_w3_rig(
                 dyng_path,
@@ -5439,6 +5795,16 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             if faceData is None:
                 log.warning("Failed to load mimic face: %s", chunk['mimicFace'])
             else:
+                merged_target = None if _merged_chunk_keeps_own_skeleton(chunk) else _merged_context_target(merged_armature_context)
+                if merged_target is not None:
+                    _merge_skeleton_data_into_context(
+                        merged_armature_context,
+                        getattr(faceData, "mimicSkeleton", None),
+                        target_armature=merged_target,
+                    )
+                    _apply_merged_mimic_metadata(merged_target, chunk['mimicFace'])
+                    objdict[chunk_ns] = merged_target
+                    continue
                 try:
                     bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
                 except Exception:
@@ -5640,7 +6006,8 @@ def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_
 
 
 def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_entity_path="", source_game="", source_entity_path="",
-                                        target_collection=None, mesh_import_settings=None):
+                                        target_collection=None, mesh_import_settings=None,
+                                        merged_armature_context=None):
     #entity = fixed_chunk_paths(entity, entity.version)
     ent_namespace = entity.name+":"
     if target_collection is None:
@@ -5682,6 +6049,7 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
             source_entity_path=source_entity_path,
             target_collection=target_collection,
             mesh_import_settings=mesh_import_settings,
+            merged_armature_context=merged_armature_context,
         )
 
     if not root_skeleton:
@@ -5863,10 +6231,11 @@ def add_app_template(   entity,
                                 templateFilename,
                                 template_data=None,
                                 appearance_indices=None,
-                                use_app_drivers=True,
-                                morphs_todo_accum=None,
-                                bind_root_chunks_to_entity=True,
-                                target_collection=None):
+                                 use_app_drivers=True,
+                                 morphs_todo_accum=None,
+                                 bind_root_chunks_to_entity=True,
+                                 target_collection=None,
+                                 merged_armature_context=None):
     source_context_path = templateFilename if templateFilename and os.path.isabs(str(templateFilename)) else _repo_context_source_for_armature(base_animation_skeleton)
     if source_context_path and not getattr(add_app_template, "_repo_context_active", False):
         add_app_template._repo_context_active = True
@@ -5890,6 +6259,7 @@ def add_app_template(   entity,
                     morphs_todo_accum=morphs_todo_accum,
                     bind_root_chunks_to_entity=bind_root_chunks_to_entity,
                     target_collection=target_collection,
+                    merged_armature_context=merged_armature_context,
                 )
         finally:
             add_app_template._repo_context_active = False
@@ -5941,6 +6311,7 @@ def add_app_template(   entity,
         source_entity_path=source_context_path,
         target_collection=target_collection,
         mesh_import_settings=mesh_import_settings,
+        merged_armature_context=merged_armature_context,
     )
     if morphs_todo_accum is not None and local_morphs_todo:
         morphs_todo_accum.extend(local_morphs_todo)
@@ -5955,16 +6326,19 @@ def add_app_template(   entity,
 
     imported_objects = [
         obj for key, obj in objdict.items()
-        if obj is not None and key != entity.name
+        if obj is not None and key != entity.name and obj is not base_animation_skeleton
     ]
-    imported_objects.extend([obj for obj in meshdict.values() if obj is not None])
+    imported_objects.extend([
+        obj for obj in meshdict.values()
+        if obj is not None and obj is not base_animation_skeleton
+    ])
     grouped_root_objects = _get_import_root_objects(imported_objects)
 
     #if grouping the entire appreance together
     if group_parent:
         if bind_root_chunks_to_entity:
             group_objects = apperance_level_objects
-            if template_source_game == "w2":
+            if template_source_game == "w2" or _merged_context_enabled(merged_armature_context):
                 seen = {id(o) for o in group_objects}
                 for obj in grouped_root_objects:
                     if obj is not None and id(obj) not in seen:
@@ -5987,6 +6361,9 @@ def add_app_template(   entity,
             for obj in group_objects:
                 if obj is not None:
                     create_app_drivers(base_animation_skeleton, obj, appearance_indices)
+
+    if _merged_context_enabled(merged_armature_context):
+        _bind_unbound_skinned_meshes_to_merged_armature(imported_objects, base_animation_skeleton)
     
 
 def _apply_coloring_entries_to_objects(objects, coloring_entries, appearance_name):
@@ -6098,6 +6475,10 @@ def import_app(context,
     morphs_todo = []
 
     rig_settings = base_animation_skeleton.data.witcherui_RigSettings
+    merged_armature_context = _new_merged_armature_context(
+        context,
+        root_armature=base_animation_skeleton,
+    )
 
     # =====================================================
     # TEMPLATE LOADING (shared-aware, GUID-tracked)
@@ -6177,7 +6558,8 @@ def import_app(context,
                              selectedAppearance.includedTemplates[i],
                              template_appearances,
                              morphs_todo_accum=morphs_todo,
-                             target_collection=target_collection)
+                             target_collection=target_collection,
+                             merged_armature_context=merged_armature_context)
 
             new_objects = _tag_new_collection_objects_with_guid(
                 target_collection,
@@ -6225,7 +6607,8 @@ def import_app(context,
                          selectedAppearance.includedTemplates[i],
                          template_appearances,
                          morphs_todo_accum=morphs_todo,
-                         target_collection=target_collection)
+                         target_collection=target_collection,
+                         merged_armature_context=merged_armature_context)
 
         new_objects = _tag_new_collection_objects_with_guid(
             target_collection,

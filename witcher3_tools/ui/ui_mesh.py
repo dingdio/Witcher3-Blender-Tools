@@ -93,6 +93,7 @@ from .. import file_helpers
 from ..importers import import_mesh, import_rig
 from ..mesh_import_settings import MeshImportSettings
 from .. import (
+    armature_merge,
     constrain_util,
     get_W3_REDCLOTH_PATH,
     get_uncook_path,
@@ -2599,138 +2600,24 @@ def _merge_hierarchy_world_space_bone_data(arm_obj, bone):
     return head, tail, mat
 
 
-def _merge_hierarchy_merge_armature_into(target_arm, source_arm, attachment_parent_bone=""):
-    source_bones_data = {}
-    for bone in source_arm.data.bones:
-        head_ws, tail_ws, mat_ws = _merge_hierarchy_world_space_bone_data(source_arm, bone)
-        source_bones_data[bone.name] = {
-            'head': head_ws,
-            'tail': tail_ws,
-            'matrix': mat_ws,
-            'parent_name': bone.parent.name if bone.parent else None,
-            'use_connect': bool(bone.use_connect),
-            'collections': [c.name for c in bone.collections] if hasattr(bone, 'collections') else [],
-        }
-
-    all_children = [obj for obj in bpy.data.objects if obj.parent == source_arm]
-    child_parent_cache = []
-    for child_obj in all_children:
-        child_parent_cache.append({
-            "obj": child_obj,
-            "world_mat": child_obj.matrix_world.copy(),
-            "parent_type": child_obj.parent_type,
-            "parent_bone": child_obj.parent_bone if child_obj.parent_type == 'BONE' else "",
-        })
-
+def _merge_hierarchy_merge_armature_into(target_arm, source_arm, attachment_parent_bone="",
+                                         include_own_skeleton_attachments=False):
+    source_name = source_arm.name
+    target_name = target_arm.name
     attachment_parent_bone = str(attachment_parent_bone or "").strip()
     if not attachment_parent_bone:
         attachment_parent_bone = _merge_hierarchy_guess_attachment_bone(source_arm, target_arm)
-
-    for obj in bpy.data.objects:
-        if obj.type != 'MESH':
-            continue
-        for mod in obj.modifiers:
-            if mod.type == 'ARMATURE' and mod.object == source_arm:
-                mod.object = target_arm
-
-    _merge_hierarchy_deselect_all()
-    _merge_hierarchy_set_active(target_arm)
-    bpy.ops.object.mode_set(mode='EDIT')
-
-    target_inv = target_arm.matrix_world.inverted()
-    edit_bones = target_arm.data.edit_bones
-    existing_target_bones = {bone.name for bone in target_arm.data.bones}
-    source_root_bones = {bname for bname, bdata in source_bones_data.items() if not bdata['parent_name']}
-    skipped_source_roots = {bname for bname in source_root_bones if bname in existing_target_bones}
-
-    for bname, bdata in source_bones_data.items():
-        if bname in existing_target_bones:
-            # Keep top-rig bone shape/length exactly as authored on the target rig.
-            continue
-
-        eb = edit_bones.get(bname)
-        if eb is None:
-            eb = edit_bones.new(bname)
-
-        head_local = target_inv @ bdata['head']
-        tail_local = target_inv @ bdata['tail']
-        if (tail_local - head_local).length < 1e-8:
-            tail_local = head_local + Vector((0.0, 0.01, 0.0))
-
-        eb.head = head_local
-        eb.tail = tail_local
-        try:
-            roll_vec = (target_inv.to_3x3() @ bdata['matrix'].to_3x3()) @ Vector((0.0, 0.0, 1.0))
-            eb.align_roll(roll_vec)
-        except Exception:
-            pass
-
-    for bname, bdata in source_bones_data.items():
-        if bname in existing_target_bones:
-            # Do not re-parent or reconnect bones that already exist on the top rig.
-            continue
-
-        eb = edit_bones.get(bname)
-        if eb is None:
-            continue
-        parent_name = bdata['parent_name']
-        if parent_name and parent_name in skipped_source_roots and attachment_parent_bone and attachment_parent_bone in edit_bones:
-            # Exception: source root bone was skipped (name collision). Re-anchor that subtree to the
-            # source armature's mount bone on the target rig (e.g. scabbard Root -> torso3).
-            eb.parent = edit_bones[attachment_parent_bone]
-            eb.use_connect = False
-        elif parent_name and parent_name in edit_bones:
-            eb.parent = edit_bones[parent_name]
-            eb.use_connect = bdata['use_connect']
-        elif (not parent_name) and attachment_parent_bone and attachment_parent_bone in edit_bones:
-            # Preserve source-armature mount point (for example parented/constraint-mounted to jaw).
-            eb.parent = edit_bones[attachment_parent_bone]
-            eb.use_connect = False
-
-    bpy.ops.object.mode_set(mode='OBJECT')
-
-    for child_data in child_parent_cache:
-        child_obj = child_data["obj"]
-        if child_obj is None or child_obj.name not in bpy.data.objects:
-            continue
-        world_mat = child_data["world_mat"]
-        original_parent_bone = str(child_data.get("parent_bone", "") or "")
-
-        child_obj.parent = target_arm
-        if original_parent_bone and target_arm.data.bones.get(original_parent_bone):
-            child_obj.parent_type = 'BONE'
-            child_obj.parent_bone = original_parent_bone
-        else:
-            child_obj.parent_type = 'OBJECT'
-            child_obj.parent_bone = ''
-        child_obj.matrix_world = world_mat
-
-    if hasattr(target_arm.data, 'collections'):
-        for bname, bdata in source_bones_data.items():
-            bone = target_arm.data.bones.get(bname)
-            if bone is None:
-                continue
-            for coll_name in bdata['collections']:
-                coll = target_arm.data.collections.get(coll_name)
-                if coll is None:
-                    coll = target_arm.data.collections.new(coll_name)
-                if hasattr(coll, 'assign'):
-                    coll.assign(bone)
-
-    source_name = source_arm.name
-    target_name = target_arm.name
-
-    # Update mimicFace references that point to the source armature being deleted
-    for obj in bpy.data.objects:
-        if obj.type == 'ARMATURE' and obj.get('mimicFace') == source_name:
-            obj['mimicFace'] = target_name
-
-    source_arm_data = source_arm.data
-    bpy.data.objects.remove(source_arm, do_unlink=True)
-    if source_arm_data and source_arm_data.users == 0:
-        bpy.data.armatures.remove(source_arm_data)
-
-    log.info("Merged armature '%s' -> '%s'", source_name, target_name)
+    result = armature_merge.graft_armature_into_master(
+        target_arm,
+        source_arm,
+        src_id=armature_merge.graft_source_id(target_arm, source_arm),
+        attachment_parent_bone=attachment_parent_bone,
+        context=bpy.context,
+        include_own_skeleton_attachments=include_own_skeleton_attachments,
+    )
+    if result.merged:
+        log.info("Merged armature '%s' -> '%s'", source_name, target_name)
+    return result
 
 
 def _merge_hierarchy_cleanup_childless_empties(empty_names):
@@ -2756,21 +2643,28 @@ def _merge_hierarchy_cleanup_childless_empties(empty_names):
 
 
 class WITCH_OT_merge_armature_hierarchy(bpy.types.Operator):
-    """Merge selected armatures into one rig (experimental and destructive)"""
+    """Merge selected character armature hierarchy with the shared graft logic."""
     bl_idname = "witcher.merge_armature_hierarchy"
     bl_label = "Merge Armature Hierarchy"
     bl_description = (
-        "Experimental and destructive. Merge selected armature hierarchy into one rig. "
-        "Recommended only for final full-model export (for example Unreal Engine). "
-        "This will break equipment and appearance-changing systems."
+        "Destructive. Bake selected/related character armatures with the same graft logic "
+        "used by unified character imports."
     )
     bl_options = {'REGISTER', 'UNDO'}
 
     confirm_ok: BoolProperty(
         name="OK",
         description=(
-            "Required confirmation. This operation is experimental and will break equipment and "
-            "appearance-changing systems on the merged character."
+            "Required confirmation. This destructive operation bakes related character armatures "
+            "into the selected rig where possible."
+        ),
+        default=False,
+    )
+    merge_own_skeleton_attachments: BoolProperty(
+        name="Include hard attachment sub-skeletons",
+        description=(
+            "Also merge hard-attached animated sub-skeletons such as scabbards."
+            "Leave off to match unified import mode."
         ),
         default=False,
     )
@@ -2783,6 +2677,7 @@ class WITCH_OT_merge_armature_hierarchy(bpy.types.Operator):
 
     def invoke(self, context, event):
         self.confirm_ok = False
+        self.merge_own_skeleton_attachments = False
         return context.window_manager.invoke_props_dialog(self, width=560)
 
     def draw(self, context):
@@ -2790,9 +2685,10 @@ class WITCH_OT_merge_armature_hierarchy(bpy.types.Operator):
         warn = layout.box()
         col = warn.column(align=True)
         col.label(text="Hierarchy Merge", icon='INFO')
-        col.label(text="Merges selected armatures into a single top-level rig.")
-        col.label(text="Breaks equipment and appearance-changing systems.")
-        col.label(text="Recommended only for final full-model export (e.g. Unreal Engine).")
+        col.label(text="Bakes related armatures into the selected top rig.")
+        col.label(text="Uses the same graft logic as unified character imports.")
+        col.label(text="Own-skeleton attachments stay separate by default.")
+        layout.prop(self, "merge_own_skeleton_attachments")
         layout.prop(self, "confirm_ok", text="OK, I understand and want to continue")
 
     def execute(self, context):
@@ -2861,6 +2757,17 @@ class WITCH_OT_merge_armature_hierarchy(bpy.types.Operator):
         success = False
 
         try:
+            top_rig = _merge_hierarchy_safe_get(top_rig_name)
+            if top_rig is None:
+                self.report({'ERROR'}, f"Top rig '{top_rig_name}' disappeared")
+                return {'CANCELLED'}
+            merged_count += armature_merge.unify_character_armatures(
+                top_rig,
+                context=context,
+                force=True,
+                include_own_skeleton_attachments=False,
+            )
+
             for arm_name in prep_order:
                 arm_obj = _merge_hierarchy_safe_get(arm_name)
                 if arm_obj is None:
@@ -2883,12 +2790,14 @@ class WITCH_OT_merge_armature_hierarchy(bpy.types.Operator):
                 if target == source:
                     continue
 
-                _merge_hierarchy_merge_armature_into(
+                result = _merge_hierarchy_merge_armature_into(
                     target,
                     source,
                     attachment_parent_bone=source_attachment_bones.get(arm_name, ""),
+                    include_own_skeleton_attachments=self.merge_own_skeleton_attachments,
                 )
-                merged_count += 1
+                if result.merged:
+                    merged_count += 1
 
             deleted_empties = _merge_hierarchy_cleanup_childless_empties(selected_empty_names)
             success = True
