@@ -257,9 +257,28 @@ def create_armature(mdl: w3_types.CSkeleton, nsp="", scale=1.0, do_fix_tail=None
 
 
 
+def create_armature_from_skeleton_data(w3Data, fileName=False, ns="", do_fix_tail=None, context=None):
+    arm = create_armature(w3Data, ns, 1.0, do_fix_tail, context, fileName=fileName)
+    arm.data.witcherui_RigSettings.main_entity_skeleton = fileName or ""
+
+    tracks_bone: bpy.types.PoseBone = None
+    if "Camera_Node" in arm.pose.bones:
+        tracks_bone = arm.pose.bones["Camera_Node"]
+
+    for bonedata in w3Data.bones:
+        bone = arm.data.witcherui_RigSettings.bone_order_list.add()
+        bone.name = bonedata.name
+    if tracks_bone:
+        camera_track_names = [str(track) for track in (getattr(w3Data, "tracks", None) or [])]
+        if not camera_track_names:
+            camera_track_names = list(CAMERA_TRACK_NAMES)
+        ensure_camera_track_properties(arm, track_names=camera_track_names)
+        for track in camera_track_names:
+            witcherui_add_redmorph(arm.data.witcherui_RigSettings.witcher_tracks_list, [track, track, 0])
+    return arm
+
+
 def start_rig_import(fileName=False, ns="", do_fix_tail=None, context=None):
-    #if not fileName:
-        #fileName = r":\w3.modding\modkit\r4data\characters\models\geralt\scabbards\model\scabbards_crossbow.w2rig"
     log.info("Importing rig file: %s", fileName)
     if fileName.endswith('.w2rig') or fileName.endswith('.w3dyng'):
         w3Data = load_bin_skeleton(fileName)
@@ -267,32 +286,9 @@ def start_rig_import(fileName=False, ns="", do_fix_tail=None, context=None):
         w3Data = load_json_skeleton(fileName)
     else:
         return {'ERROR'}
-    arm = create_armature(w3Data, ns, 1.0, do_fix_tail, context, fileName = fileName)
-    arm.data.witcherui_RigSettings.main_entity_skeleton = fileName
-    
-    tracks_bone:bpy.types.PoseBone = None
-    if "Camera_Node" in arm.pose.bones:
-        tracks_bone = arm.pose.bones["Camera_Node"]
-    
-    for bonedata in w3Data.bones:
-        bone = arm.data.witcherui_RigSettings.bone_order_list.add()
-        bone.name = bonedata.name
-    if  tracks_bone:
-        camera_track_names = [str(track) for track in (getattr(w3Data, "tracks", None) or [])]
-        if not camera_track_names:
-            camera_track_names = list(CAMERA_TRACK_NAMES)
-        ensure_camera_track_properties(arm, track_names=camera_track_names)
-        for track in camera_track_names:
-            witcherui_add_redmorph(arm.data.witcherui_RigSettings.witcher_tracks_list, [track, track, 0])
-
-    # for bone in arm.pose.bones:
-    #     print(bone.name)
-    #     if bone.name == ns+"pelvis":
-    #         adw = "ddaw"
-    return arm
+    return create_armature_from_skeleton_data(w3Data, fileName, ns, do_fix_tail, context)
 
 def import_w3_rig(filename, ns="", do_fix_tail=None, context=None):
-    #print("Importing file: ", filename)
     arm = start_rig_import(filename, ns, do_fix_tail, context)
     return arm
 

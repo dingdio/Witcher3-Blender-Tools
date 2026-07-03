@@ -124,6 +124,315 @@ def _source_bone_indices_by_name(skeleton_data) -> dict[str, int]:
     return out
 
 
+def _rest_repair_names(name: str) -> tuple[str, ...]:
+    name = str(name or "")
+    aliases = {
+        "dyng_l_rein_hand_left_00": "dyng_l_rein_hand_IK",
+        "dyng_r_rein_hand_right_00": "dyng_r_rein_hand_IK",
+    }
+    out = [name] if name else []
+    alias = aliases.get(name)
+    if alias and alias not in out:
+        out.append(alias)
+    return tuple(out)
+
+
+def _bone_local_matrix(bone):
+    from mathutils import Matrix, Vector
+
+    pos = Vector(_w3_vec3(getattr(bone, "co", bone.get("co") if isinstance(bone, dict) else None)))
+    rot = _w3_quat(getattr(bone, "ro_quat", bone.get("ro_quat") if isinstance(bone, dict) else None))
+    return Matrix.Translation(pos) @ rot.to_matrix().to_4x4()
+
+
+def _set_bone_local_matrix(bone, mat):
+    from .CR2W import w3_types
+
+    pos = mat.to_translation()
+    quat = mat.to_quaternion()
+    co = [float(pos.x), float(pos.y), float(pos.z), 1.0]
+    ro_quat = w3_types.Quaternion(float(quat.x), float(quat.y), float(quat.z), float(quat.w))
+    sc = [1.0, 1.0, 1.0]
+    if isinstance(bone, dict):
+        bone["co"] = co
+        bone["ro_quat"] = ro_quat
+        bone["sc"] = sc
+    else:
+        bone.co = co
+        bone.ro_quat = ro_quat
+        bone.sc = sc
+
+
+def _matrix_has_useful_rest_transform(mat, *, tolerance=1e-6) -> bool:
+    try:
+        if mat.to_translation().length > tolerance:
+            return True
+        quat = mat.to_quaternion()
+        return abs(float(quat.x)) > tolerance or abs(float(quat.y)) > tolerance or abs(float(quat.z)) > tolerance or abs(abs(float(quat.w)) - 1.0) > tolerance
+    except Exception:
+        return False
+
+
+def _bone_has_default_rest_transform(bone, *, tolerance=1e-6) -> bool:
+    pos = _w3_vec3(getattr(bone, "co", bone.get("co") if isinstance(bone, dict) else None))
+    quat = _w3_quat(getattr(bone, "ro_quat", bone.get("ro_quat") if isinstance(bone, dict) else None))
+    scale = _w3_vec3(getattr(bone, "sc", bone.get("sc") if isinstance(bone, dict) else None), default=(1.0, 1.0, 1.0))
+    return (
+        all(abs(float(value)) <= tolerance for value in pos)
+        and abs(float(quat.x)) <= tolerance
+        and abs(float(quat.y)) <= tolerance
+        and abs(float(quat.z)) <= tolerance
+        and abs(abs(float(quat.w)) - 1.0) <= tolerance
+        and all(abs(float(value) - 1.0) <= tolerance for value in scale)
+    )
+
+
+def skeleton_has_placeholder_rest_bones(skeleton_data, *, tolerance=1e-6) -> bool:
+    for bone in list(getattr(skeleton_data, "bones", []) or []):
+        if _skeleton_bone_name(bone) in {"Root", "Trajectory"}:
+            continue
+        if _bone_has_default_rest_transform(bone, tolerance=tolerance):
+            return True
+    return False
+
+
+def fill_placeholder_skeleton_transforms_from_sources(target_skeleton, source_skeletons, *, tolerance=1e-6) -> int:
+    """Repair placeholder local transforms from source skeletons."""
+    if target_skeleton is None or not skeleton_has_placeholder_rest_bones(target_skeleton, tolerance=tolerance):
+        return 0
+
+    target_bones = list(getattr(target_skeleton, "bones", []) or [])
+    if not target_bones:
+        return 0
+
+    source_world_by_name = {}
+    sources = sorted(
+        [source for source in (source_skeletons or []) if source is not None],
+        key=lambda source: len(getattr(source, "bones", []) or []),
+        reverse=True,
+    )
+    for source in sources:
+        source_world = _skeleton_world_matrices(source)
+        for bone in getattr(source, "bones", []) or []:
+            name = _skeleton_bone_name(bone)
+            if not name:
+                continue
+            if _bone_has_default_rest_transform(bone, tolerance=tolerance):
+                continue
+            mat = source_world.get(name)
+            if _matrix_has_useful_rest_transform(mat, tolerance=tolerance):
+                for repair_name in _rest_repair_names(name):
+                    source_world_by_name.setdefault(repair_name, mat.copy())
+
+    if not source_world_by_name:
+        return 0
+
+    from mathutils import Matrix
+
+    world_by_idx = {}
+    updating = set()
+    updated = 0
+
+    def target_world_matrix(idx: int):
+        nonlocal updated
+        if idx in world_by_idx:
+            return world_by_idx[idx]
+        if idx in updating or idx < 0 or idx >= len(target_bones):
+            return Matrix.Identity(4)
+        updating.add(idx)
+        bone = target_bones[idx]
+        parent_idx = _skeleton_bone_parent_id(bone)
+        parent_world = target_world_matrix(parent_idx) if 0 <= parent_idx < len(target_bones) else Matrix.Identity(4)
+        name = _skeleton_bone_name(bone)
+        source_world = source_world_by_name.get(name)
+        if (
+            source_world is not None
+            and name not in {"Root", "Trajectory"}
+            and _bone_has_default_rest_transform(bone, tolerance=tolerance)
+        ):
+            local_mat = parent_world.inverted() @ source_world
+            _set_bone_local_matrix(bone, local_mat)
+            world_by_idx[idx] = source_world
+            updated += 1
+        else:
+            world_by_idx[idx] = parent_world @ _bone_local_matrix(bone)
+        updating.discard(idx)
+        return world_by_idx[idx]
+
+    for idx in range(len(target_bones)):
+        target_world_matrix(idx)
+
+    if updated:
+        target_skeleton.bones = target_bones
+        _rebuild_skeleton_compat_fields(target_skeleton)
+    return updated
+
+
+def _fill_placeholder_armature_transforms_from_matrices(master_armature, source_matrices_by_name, *,
+                                                        context=None, tolerance=1e-6) -> int:
+    import bpy
+    from mathutils import Vector
+    from .unreal_export.scene_utils import _restore_object_state, _snapshot_object_state
+
+    if master_armature is None or safe_object_type(master_armature) != "ARMATURE":
+        return 0
+    if not object_still_exists(master_armature):
+        return 0
+    if not source_matrices_by_name:
+        return 0
+
+    existing_bones = _armature_bones_by_name(master_armature)
+    wanted_names = [
+        name for name, bone in existing_bones.items()
+        if (
+            name not in {"Root", "Trajectory"}
+            and name in source_matrices_by_name
+            and getattr(bone, "head_local", None) is not None
+            and bone.head_local.length <= tolerance
+        )
+    ]
+    if not wanted_names:
+        return 0
+
+    saved_state = _snapshot_object_state(context or bpy.context)
+    updated = 0
+    updated_names = []
+    try:
+        if saved_state[2] != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.select_all(action="DESELECT")
+        master_armature.select_set(True)
+        (context or bpy.context).view_layer.objects.active = master_armature
+        bpy.ops.object.mode_set(mode="EDIT")
+        edit_bones = master_armature.data.edit_bones
+        for name in wanted_names:
+            edit_bone = edit_bones.get(name)
+            mat = source_matrices_by_name.get(name)
+            if edit_bone is None or mat is None:
+                continue
+            current_length = (edit_bone.tail - edit_bone.head).length
+            if current_length <= 0.000001:
+                current_length = 0.01
+            head = mat.to_translation()
+            direction = mat.to_3x3() @ Vector((0.0, 0.01, 0.0))
+            if direction.length <= 0.000001:
+                direction = Vector((0.0, 0.01, 0.0))
+            edit_bone.head = head
+            edit_bone.tail = head + direction.normalized() * current_length
+            try:
+                edit_bone.matrix = mat
+            except Exception:
+                pass
+            updated_names.append(name)
+            updated += 1
+        for name in updated_names:
+            edit_bone = edit_bones.get(name)
+            if edit_bone is None or not edit_bone.children:
+                continue
+            current_direction = edit_bone.tail - edit_bone.head
+            if current_direction.length <= 0.000001:
+                continue
+            current_direction = current_direction.normalized()
+            best_child = None
+            best_dot = 0.0
+            for child in edit_bone.children:
+                direction_to_child = child.head - edit_bone.head
+                if direction_to_child.length <= 0.000001:
+                    continue
+                dot = current_direction.dot(direction_to_child.normalized())
+                if dot > best_dot:
+                    best_dot = dot
+                    best_child = child
+            if best_child is not None and best_dot > 0.995:
+                edit_bone.tail = best_child.head.copy()
+        bpy.ops.object.mode_set(mode="OBJECT")
+    finally:
+        try:
+            if bpy.context.object and bpy.context.object.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception:
+            pass
+        _restore_object_state(context or bpy.context, saved_state)
+    return updated
+
+
+def fill_placeholder_armature_transforms_from_skeletons(master_armature, source_skeletons, *,
+                                                        context=None, tolerance=1e-6) -> int:
+    sources = sorted(
+        [source for source in (source_skeletons or []) if source is not None],
+        key=lambda source: len(getattr(source, "bones", []) or []),
+        reverse=True,
+    )
+    if not sources:
+        return 0
+
+    source_matrices_by_name = {}
+    use_rot90 = _armature_uses_rot90(master_armature)
+    for source in sources:
+        source_world = _skeleton_world_matrices(source, rotate_90=use_rot90)
+        for bone in getattr(source, "bones", []) or []:
+            name = _skeleton_bone_name(bone)
+            if not name or _bone_has_default_rest_transform(bone, tolerance=tolerance):
+                continue
+            mat = source_world.get(name)
+            if not _matrix_has_useful_rest_transform(mat, tolerance=tolerance):
+                continue
+            for repair_name in _rest_repair_names(name):
+                source_matrices_by_name.setdefault(repair_name, mat.copy())
+    return _fill_placeholder_armature_transforms_from_matrices(
+        master_armature,
+        source_matrices_by_name,
+        context=context,
+        tolerance=tolerance,
+    )
+
+
+def fill_placeholder_armature_transforms_from_armatures(master_armature, source_armatures, *,
+                                                       context=None, tolerance=1e-6) -> int:
+    if master_armature is None or safe_object_type(master_armature) != "ARMATURE":
+        return 0
+    if not object_still_exists(master_armature):
+        return 0
+
+    def source_score(source):
+        path = str(source.get("witcher_path", "") or "").lower() if hasattr(source, "get") else ""
+        is_mesh = 1 if path.endswith(".w2mesh") else 0
+        return (is_mesh, len(getattr(getattr(source, "data", None), "bones", []) or []))
+
+    sources = sorted(
+        [
+            source for source in (source_armatures or [])
+            if source is not master_armature
+            and safe_object_type(source) == "ARMATURE"
+            and object_still_exists(source)
+        ],
+        key=source_score,
+        reverse=True,
+    )
+    if not sources:
+        return 0
+
+    source_matrices_by_name = {}
+    target_inv = master_armature.matrix_world.inverted()
+    for source in sources:
+        source_world = source.matrix_world
+        for bone in getattr(getattr(source, "data", None), "bones", []) or []:
+            name = str(getattr(bone, "name", "") or "")
+            if not name:
+                continue
+            mat = target_inv @ source_world @ bone.matrix_local
+            if mat.to_translation().length <= tolerance:
+                continue
+            for repair_name in _rest_repair_names(name):
+                source_matrices_by_name.setdefault(repair_name, mat.copy())
+    return _fill_placeholder_armature_transforms_from_matrices(
+        master_armature,
+        source_matrices_by_name,
+        context=context,
+        tolerance=tolerance,
+    )
+
+
 def merge_skeleton_data(target_skeleton, source_skeleton, *,
                         exclude_bone_names=None,
                         exclude_name_contains=None) -> int:

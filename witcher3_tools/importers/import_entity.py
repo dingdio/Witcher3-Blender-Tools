@@ -1327,13 +1327,19 @@ def _merge_skeleton_data_into_context(merged_armature_context, skeleton_data, *,
         return 0
     target_armature = target_armature or _merged_context_target(merged_armature_context)
     if target_armature is not None:
-        return armature_merge.append_skeleton_data_to_armature(
+        repaired = armature_merge.fill_placeholder_armature_transforms_from_skeletons(
+            target_armature,
+            [skeleton_data],
+            context=bpy.context,
+        )
+        added = armature_merge.append_skeleton_data_to_armature(
             target_armature,
             skeleton_data,
             context=bpy.context,
             exclude_bone_names=exclude_bone_names,
             exclude_name_contains=exclude_name_contains,
         )
+        return repaired + added
     if merged_armature_context.get("skeleton") is None:
         merged_armature_context["skeleton"] = armature_merge.clone_skeleton_data(skeleton_data)
         return len(getattr(merged_armature_context["skeleton"], "bones", []) or [])
@@ -5308,7 +5314,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             if _get_entry_attr(source_chunk, "skeleton", None):
                 try:
                     skeleton_path = _resolve_required_chunk_resource(source_chunk, 'skeleton', 'skeleton')
-                    skeleton_data = armature_merge.load_skeleton_data(skeleton_path)
+                    skeleton_data = _load_skeleton_data_with_repaired_rest(skeleton_path, include_mesh_rest=True)
                     merged_count += _merge_skeleton_data_into_context(
                         merged_armature_context,
                         skeleton_data,
@@ -5326,7 +5332,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             if _get_entry_attr(source_chunk, "dyng", None):
                 try:
                     dyng_path = _resolve_required_chunk_resource(source_chunk, 'dyng', 'dynamic rig')
-                    dyng_data = armature_merge.load_skeleton_data(dyng_path)
+                    dyng_data = _load_skeleton_data_with_repaired_rest(dyng_path)
                     merged_count += _merge_skeleton_data_into_context(
                         merged_armature_context,
                         dyng_data,
@@ -5385,6 +5391,74 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     )
         return merged_count
 
+    def _mesh_skeleton_sources_for_repair():
+        sources = []
+        for source_chunk in cur_chunks:
+            if _merged_chunk_keeps_own_skeleton(source_chunk):
+                continue
+            if not _get_entry_attr(source_chunk, "mesh", None):
+                continue
+            try:
+                mesh_path = _resolve_required_chunk_resource(source_chunk, 'mesh', 'mesh')
+                from . import import_mesh as _import_mesh_module
+                mesh_skeleton = _import_mesh_module.read_mesh_skeleton_data(
+                    mesh_path,
+                    keep_proxy_meshes=mesh_import_settings["keep_proxy_meshes"],
+                )
+                if mesh_skeleton is not None:
+                    sources.append(mesh_skeleton)
+            except Exception:
+                log.debug(
+                    "Skipping mesh-bone skeleton repair source for %s #%s",
+                    _get_entry_attr(source_chunk, "type", ""),
+                    _get_entry_attr(source_chunk, "chunkIndex", ""),
+                    exc_info=True,
+                )
+        return sources
+
+    def _load_skeleton_data_with_repaired_rest(skeleton_path, *, include_mesh_rest=False):
+        skeleton_data = armature_merge.load_skeleton_data(skeleton_path)
+        if skeleton_data is None:
+            return None
+
+        has_placeholder_rest = armature_merge.skeleton_has_placeholder_rest_bones(skeleton_data)
+        if not has_placeholder_rest:
+            return skeleton_data
+
+        repair_sources = _mesh_skeleton_sources_for_repair() if include_mesh_rest else []
+        if has_placeholder_rest and not repair_sources:
+            return skeleton_data
+
+        repaired_skeleton = armature_merge.clone_skeleton_data(skeleton_data)
+        repaired_count = armature_merge.fill_placeholder_skeleton_transforms_from_sources(
+            repaired_skeleton,
+            repair_sources,
+        )
+        if repaired_count:
+            log.info(
+                "Repaired skeleton rest data for %s (%d transforms filled)",
+                skeleton_path,
+                repaired_count,
+            )
+            return repaired_skeleton
+        return skeleton_data
+
+    def _import_skeleton_armature_with_repaired_rest(skeleton_path, chunk_ns, *, include_mesh_rest=False):
+        skeleton_data = _load_skeleton_data_with_repaired_rest(
+            skeleton_path,
+            include_mesh_rest=include_mesh_rest,
+        )
+        if skeleton_data is not None:
+            return import_rig.create_armature_from_skeleton_data(
+                skeleton_data,
+                skeleton_path,
+                chunk_ns,
+            )
+        return import_rig.import_w3_rig(
+            skeleton_path,
+            chunk_ns
+        )
+
     def _ensure_merged_root_armature():
         nonlocal root_skeleton, has_moving_agent
         if not _merged_context_enabled(merged_armature_context):
@@ -5410,7 +5484,10 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
         chunk_ns = get_chunk_namespace(moving_chunk)
         try:
             skeleton_path = _resolve_required_chunk_resource(moving_chunk, 'skeleton', 'skeleton')
-            base_skeleton = armature_merge.load_skeleton_data(skeleton_path)
+            base_skeleton = _load_skeleton_data_with_repaired_rest(
+                skeleton_path,
+                include_mesh_rest=True,
+            )
             if base_skeleton is None:
                 return root_skeleton
             merged_armature_context["skeleton"] = armature_merge.clone_skeleton_data(base_skeleton)
@@ -5739,9 +5816,10 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     has_moving_agent = True
                     continue
                 skeleton_path = _resolve_required_chunk_resource(chunk, 'skeleton', 'skeleton')
-                moving_agent = import_rig.import_w3_rig(
+                moving_agent = _import_skeleton_armature_with_repaired_rest(
                     skeleton_path,
-                    chunk_ns
+                    chunk_ns,
+                    include_mesh_rest=True,
                 )
                 add_chunk_metadata(moving_agent, chunk, chunk['skeleton'])
                 objdict[chunk_ns] = moving_agent
@@ -5763,9 +5841,10 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     log.warning("Skipping optional Witcher 2 skeleton component: %s", exc)
                     continue
                 raise
-            root_bone = import_rig.import_w3_rig(
+            root_bone = _import_skeleton_armature_with_repaired_rest(
                 skeleton_path,
-                chunk_ns
+                chunk_ns,
+                include_mesh_rest=True,
             )
             add_chunk_metadata(root_bone, chunk, chunk['skeleton'])
             objdict[chunk_ns] = root_bone
@@ -5780,9 +5859,9 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 objdict[chunk_ns] = merged_target
                 continue
             dyng_path = _resolve_required_chunk_resource(chunk, 'dyng', 'dynamic rig')
-            root_bone = import_rig.import_w3_rig(
+            root_bone = _import_skeleton_armature_with_repaired_rest(
                 dyng_path,
-                chunk_ns
+                chunk_ns,
             )
             add_chunk_metadata(root_bone, chunk, chunk['dyng'])
             objdict[chunk_ns] = root_bone
@@ -6315,6 +6394,26 @@ def add_app_template(   entity,
     )
     if morphs_todo_accum is not None and local_morphs_todo:
         morphs_todo_accum.extend(local_morphs_todo)
+    source_armatures = []
+    seen_source_armatures = set()
+    for obj in objdict.values():
+        if getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        ident = id(obj)
+        if ident in seen_source_armatures:
+            continue
+        seen_source_armatures.add(ident)
+        source_armatures.append(obj)
+    for target_armature in (base_animation_skeleton, root_skeleton):
+        if getattr(target_armature, "type", None) != 'ARMATURE':
+            continue
+        repaired = armature_merge.fill_placeholder_armature_transforms_from_armatures(
+            target_armature,
+            source_armatures,
+            context=bpy.context,
+        )
+        if repaired:
+            log.info("Repaired %d placeholder rest transforms on %s", repaired, target_armature.name)
     #TODO do_constraints after each chunk not all together
     apperance_level_objects = do_constraints(constrains, objdict, meshdict, HardAttachments, group_parent)
 
