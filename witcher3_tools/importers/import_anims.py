@@ -842,200 +842,117 @@ def _is_standard_cutscene_root_motion_rig(arm_obj):
 def _base_bone_name(bone_name):
     return rm_ns(str(bone_name or "")).strip()
 
-def slerp_quaternion(q1, q2, t):
-    """Spherical linear interpolation between two Quaternion objects"""
-    # Compute dot product
-    dot = q1.w * q2.w + q1.x * q2.x + q1.y * q2.y + q1.z * q2.z
-    
-    # If negative dot, negate q2 to take shorter path
-    if dot < 0:
-        q2 = Quaternion((-q2.w, -q2.x, -q2.y, -q2.z))
-        dot = -dot
-    
-    # If very close, use linear interpolation
-    if dot > 0.9995:
-        result = Quaternion((
-            q1.w + t * (q2.w - q1.w),
-            q1.x + t * (q2.x - q1.x),
-            q1.y + t * (q2.y - q1.y),
-            q1.z + t * (q2.z - q1.z)
-        ))
-        result.normalize()
-        return result
-    
-    # SLERP
-    theta_0 = math.acos(min(1.0, max(-1.0, dot)))
-    theta = theta_0 * t
-    sin_theta = math.sin(theta)
-    sin_theta_0 = math.sin(theta_0)
-    
-    s1 = math.cos(theta) - dot * sin_theta / sin_theta_0
-    s2 = sin_theta / sin_theta_0
-    
-    result = Quaternion((
-        s1 * q1.w + s2 * q2.w,
-        s1 * q1.x + s2 * q2.x,
-        s1 * q1.y + s2 * q2.y,
-        s1 * q1.z + s2 * q2.z
-    ))
-    result.normalize()
-    return result
+FOOT_IK_CHAINS = (
+    ("l_thigh", "l_shin", "l_foot", "IK_l_foot"),
+    ("r_thigh", "r_shin", "r_foot", "IK_r_foot"),
+)
 
-def lerp_vector(v1, v2, t):
-    """Linear interpolation between two vectors (lists)"""
-    return [v1[i] + t * (v2[i] - v1[i]) for i in range(len(v1))]
 
-def catmull_rom_vector(p0, p1, p2, p3, t):
-    """Uniform Catmull-Rom spline interpolation for mathutils.Vector"""
-    t2 = t * t
-    t3 = t2 * t
-    return 0.5 * (
-        (2.0 * p1) +
-        (-p0 + p2) * t +
-        (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
-        (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
-    )
+def apply_foot_ik_cleanup(armObj, action, total_frames):
+    """Re-solve the leg chains against the skeleton's IK reference tracks and
+    bake the result back onto the FK bones (rotation only, every frame).
 
-def nlerp_quaternion(q1, q2, t):
-    """Normalized linear interpolation between two Quaternion objects"""
-    dot = q1.w * q2.w + q1.x * q2.x + q1.y * q2.y + q1.z * q2.z
-    if dot < 0:
-        q2 = Quaternion((-q2.w, -q2.x, -q2.y, -q2.z))
-    result = Quaternion((
-        q1.w + t * (q2.w - q1.w),
-        q1.x + t * (q2.x - q1.x),
-        q1.y + t * (q2.y - q1.y),
-        q1.z + t * (q2.z - q1.z)
-    ))
-    result.normalize()
-    return result
+    Some compressed clips store foot reference tracks denser than the FK leg
+    chain, so using them as targets reduces residual foot popping in Blender."""
+    pose_bones = armObj.pose.bones
+    chains = [c for c in FOOT_IK_CHAINS if all(b in pose_bones for b in c)]
+    if not chains:
+        return False
 
-def build_anchor_mask(total_frames, base_dt, track_dt, tol=1e-4):
-    """Return a boolean mask for frames that align to original track keys."""
-    if total_frames <= 0 or base_dt <= 0 or track_dt <= 0:
-        return None
-    mask = [False] * total_frames
-    for i in range(total_frames):
-        t = i * base_dt
-        idx = t / track_dt
-        if abs(idx - round(idx)) <= tol:
-            mask[i] = True
-    if mask:
-        mask[0] = True
-        mask[-1] = True
-    return mask
+    # Not every clip carries usable IK data: some are exported with static
+    # (single-frame) IK reference tracks.
+    # Constraining feet to a frozen target would wreck the animation.
+    animated = set()
+    for fc in iter_action_fcurves(action, target=armObj):
+        if len(fc.keyframe_points) > 1 and fc.data_path.startswith('pose.bones["IK_'):
+            animated.add(fc.data_path.split('"')[1])
+    skipped = [c[3] for c in chains if c[3] not in animated]
+    chains = [c for c in chains if c[3] in animated]
+    if skipped:
+        log.info("Foot IK cleanup: skipping %s (IK reference tracks are static in this clip)", ", ".join(skipped))
+    if not chains:
+        return False
 
-def smooth_vector_frames(frames, anchor_mask=None):
-    """Light smoothing for vector frames; skips anchor frames."""
-    if len(frames) < 3:
-        return frames
-    out = list(frames)
-    for i in range(1, len(frames) - 1):
-        if anchor_mask and anchor_mask[i]:
-            continue
-        out[i] = (frames[i - 1] + frames[i] + frames[i + 1]) / 3.0
-    out[0] = frames[0]
-    out[-1] = frames[-1]
-    return out
+    scene = bpy.context.scene
+    prev_frame = scene.frame_current
+    ad = armObj.animation_data
+    prev_action = ad.action if ad else None
+    prev_mutes = []
+    constraints = []
+    try:
+        if ad:
+            for track in ad.nla_tracks:
+                prev_mutes.append((track, track.mute))
+                track.mute = True
+        assign_action(armObj, action)
+        if ad is None:
+            ad = armObj.animation_data
 
-def smooth_quaternion_frames(frames, anchor_mask=None):
-    """Light smoothing for quaternion frames; skips anchor frames."""
-    if len(frames) < 3:
-        return frames
-    out = list(frames)
-    for i in range(1, len(frames) - 1):
-        if anchor_mask and anchor_mask[i]:
-            continue
-        q_prev = frames[i - 1]
-        q_curr = frames[i]
-        q_next = frames[i + 1]
-        if q_prev.dot(q_curr) < 0.0:
-            q_prev = Quaternion((-q_prev.w, -q_prev.x, -q_prev.y, -q_prev.z))
-        if q_next.dot(q_curr) < 0.0:
-            q_next = Quaternion((-q_next.w, -q_next.x, -q_next.y, -q_next.z))
-        q = Quaternion((
-            q_prev.w + q_curr.w + q_next.w,
-            q_prev.x + q_curr.x + q_next.x,
-            q_prev.y + q_curr.y + q_next.y,
-            q_prev.z + q_curr.z + q_next.z
-        ))
-        q.normalize()
-        out[i] = q
-    out[0] = frames[0]
-    out[-1] = frames[-1]
-    return out
+        for thigh, shin, foot, ik_ref in chains:
+            con = pose_bones[shin].constraints.new('IK')
+            con.target = armObj
+            con.subtarget = ik_ref
+            con.chain_count = 2
+            constraints.append((pose_bones[shin], con))
+            con = pose_bones[foot].constraints.new('COPY_ROTATION')
+            con.target = armObj
+            con.subtarget = ik_ref
+            constraints.append((pose_bones[foot], con))
 
-def resample_position_frames(pos_frames, bone_dt, duration, target_frames, mode="linear"):
-    """Resample position frames to have keyframes at every integer Blender frame"""
-    if len(pos_frames) <= 1 or len(pos_frames) >= target_frames:
-        return pos_frames, False  # No resampling needed
+        chain_bones = [b for chain in chains for b in chain[:3]]
+        solved = {b: [] for b in chain_bones}
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        for frame in range(total_frames):
+            scene.frame_set(frame)
+            depsgraph.update()
+            arm_eval = armObj.evaluated_get(depsgraph)
+            for bone_name in chain_bones:
+                pb = arm_eval.pose.bones[bone_name]
+                parent = pb.parent
+                # pose = parent_pose @ rest_offset @ basis
+                if parent is not None:
+                    rest_offset = parent.bone.matrix_local.inverted() @ pb.bone.matrix_local
+                    basis = rest_offset.inverted() @ parent.matrix.inverted() @ pb.matrix
+                else:
+                    basis = pb.bone.matrix_local.inverted() @ pb.matrix
+                solved[bone_name].append(basis.to_quaternion())
 
-    pos_frames = [p if isinstance(p, Vector) else Vector(p) for p in pos_frames]
-    
-    resampled = []
-    src_duration = (len(pos_frames) - 1) * bone_dt
-    
-    for blender_frame in range(target_frames):
-        # Convert Blender frame to time
-        t = (blender_frame / (target_frames - 1)) * duration if target_frames > 1 else 0
-        # Clamp time to source duration
-        t = min(t, src_duration)
-        # Find source frame index
-        src_idx = t / bone_dt if bone_dt > 0 else 0
-        src_floor = min(int(src_idx), len(pos_frames) - 1)
-        src_ceil = min(src_floor + 1, len(pos_frames) - 1)
-        frac = src_idx - src_floor
-        
-        if src_floor == src_ceil or frac == 0:
-            resampled.append(pos_frames[src_floor])
-        else:
-            if mode == "linear":
-                interp = lerp_vector(pos_frames[src_floor], pos_frames[src_ceil], frac)
-                resampled.append(Vector(interp))
-            else:
-                # Catmull-Rom using neighboring samples when available
-                p0 = pos_frames[src_floor - 1] if src_floor - 1 >= 0 else pos_frames[src_floor]
-                p1 = pos_frames[src_floor]
-                p2 = pos_frames[src_ceil]
-                p3 = pos_frames[src_ceil + 1] if src_ceil + 1 < len(pos_frames) else pos_frames[src_ceil]
-                resampled.append(catmull_rom_vector(p0, p1, p2, p3, frac))
-    
-    if resampled:
-        resampled[0] = pos_frames[0]
-        resampled[-1] = pos_frames[-1]
-    return resampled, True
-
-def resample_rotation_frames(rot_frames, bone_dt, duration, target_frames, mode="nlerp"):
-    """Resample rotation frames (Quaternions) to have keyframes at every integer Blender frame"""
-    if len(rot_frames) <= 1 or len(rot_frames) >= target_frames:
-        return rot_frames, False  # No resampling needed
-    
-    resampled = []
-    src_duration = (len(rot_frames) - 1) * bone_dt
-    
-    for blender_frame in range(target_frames):
-        # Convert Blender frame to time
-        t = (blender_frame / (target_frames - 1)) * duration if target_frames > 1 else 0
-        # Clamp time to source duration
-        t = min(t, src_duration)
-        # Find source frame index
-        src_idx = t / bone_dt if bone_dt > 0 else 0
-        src_floor = min(int(src_idx), len(rot_frames) - 1)
-        src_ceil = min(src_floor + 1, len(rot_frames) - 1)
-        frac = src_idx - src_floor
-        
-        if src_floor == src_ceil or frac == 0:
-            resampled.append(rot_frames[src_floor])
-        else:
-            if mode == "slerp":
-                resampled.append(slerp_quaternion(rot_frames[src_floor], rot_frames[src_ceil], frac))
-            else:
-                resampled.append(nlerp_quaternion(rot_frames[src_floor], rot_frames[src_ceil], frac))
-    
-    if resampled:
-        resampled[0] = rot_frames[0]
-        resampled[-1] = rot_frames[-1]
-    return resampled, True
+        fcurve_map = {}
+        for fc in iter_action_fcurves(action, target=armObj):
+            fcurve_map[(fc.data_path, fc.array_index)] = fc
+        for bone_name in chain_bones:
+            quats = solved[bone_name]
+            for k in range(1, len(quats)):
+                if quats[k - 1].dot(quats[k]) < 0.0:
+                    quats[k] = -quats[k]
+            data_path = 'pose.bones["%s"].rotation_quaternion' % bone_name
+            for i in range(4):
+                fc = fcurve_map.get((data_path, i))
+                if fc is None:
+                    fc = new_action_fcurve(action, armObj, data_path=data_path, index=i, group_name=bone_name)
+                fc.keyframe_points.clear()
+                fc.keyframe_points.add(len(quats))
+                for frame, (kp, q) in enumerate(zip(fc.keyframe_points, quats)):
+                    kp.co = (float(frame), q[i])
+                    kp.interpolation = 'LINEAR'
+                fc.update()
+    finally:
+        for pb, con in constraints:
+            try:
+                pb.constraints.remove(con)
+            except Exception:
+                pass
+        try:
+            scene.frame_set(prev_frame)
+        except Exception:
+            pass
+        if ad:
+            for track, mute in prev_mutes:
+                track.mute = mute
+            if ad.action != prev_action:
+                ad.action = prev_action
+    log.info("Foot IK cleanup applied to %s (%d legs, %d frames)", action.name, len(chains), total_frames)
+    return True
 
 
 class animFile:
@@ -1239,7 +1156,11 @@ class AnimImporter:
 
         if not self.__use_NLA:
             assign_action(target, action)
+            if hasattr(target.animation_data, "use_nla"):
+                target.animation_data.use_nla = False
         else:
+            if hasattr(target.animation_data, "use_nla"):
+                target.animation_data.use_nla = True
             #frame_current = bpy.context.scene.frame_current
             is_multi_subsequent = self.__AnimationBufferType == AnimationBufferType.Multi and self.__frame_current != 0
 
@@ -1393,9 +1314,18 @@ class AnimImporter:
                 root_bone.positionFrames = [[0.0, 0.0, 0.0]]
                 root_bone.position_dt = source_bone.position_dt
                 root_bone.position_numFrames = 1
-                # Keep authored Root rotation. Trajectory/Reference carry their
-                # own yaw and can be opposite to Root in dialog clips.
-                if not _anim_bone_has_track_frames(root_bone, "rotationFramesQuat", "rotation_numFrames"):
+                # Keep authored Root rotation only while it keeps the character
+                # upright (dialog clips carry a meaningful 180 deg yaw there).
+                # Some gameplay clips carry pitched Root rotations; for those
+                # fall back to Trajectory/Reference like before.
+                root_rot_upright = False
+                if _anim_bone_has_track_frames(root_bone, "rotationFramesQuat", "rotation_numFrames"):
+                    q0 = root_bone.rotationFramesQuat[0]
+                    q0 = Quaternion((q0.W, q0.X, q0.Y, q0.Z))
+                    if q0.dot(q0) > 1e-12:
+                        q0.normalize()
+                        root_rot_upright = (q0.to_matrix() @ Vector((0.0, 0.0, 1.0))).z >= 0.5
+                if not root_rot_upright:
                     root_bone.rotationFrames = source_bone.rotationFrames
                     root_bone.rotationFramesQuat = source_bone.rotationFramesQuat
                     root_bone.rotation_dt = source_bone.rotation_dt
@@ -1509,19 +1439,45 @@ class AnimImporter:
         base_dt = round(base_dt, 8)
         # Conversion factor from time (seconds) to Blender frames
         time_to_frame = 1.0 / base_dt if base_dt > 0 else 1.0
-        smooth_missing = getattr(bpy.context.scene, 'witcher_smooth_missing_frames', False)
-        witcher_bake_every_frame = getattr(bpy.context.scene, 'witcher_bake_every_frame', True)
+        witcher_bake_every_frame = getattr(bpy.context.scene, 'witcher_bake_every_frame', False)
         witcher_scale_keys_to_duration = getattr(bpy.context.scene, 'witcher_scale_keys_to_duration', False)
+        foot_ik_cleanup = getattr(bpy.context.scene, 'witcher_smooth_missing_frames', False)
 
-        def _needs_resample(track_frames, track_dt):
-            if len(track_frames) <= 1 or total_frames <= 1:
-                return False
-            if len(track_frames) != total_frames:
-                return True
-            if track_dt and abs(track_dt - base_dt) > 1e-6:
-                return True
-            return False
-        
+        # Skip-frame compressed tracks only store every Nth frame. Raw FK
+        # playback in Blender can expose those gaps as visible jitter, so sparse
+        # tracks get C1 (auto-clamped bezier) interpolation instead of linear.
+        # Keyed values stay bit-exact; full-rate tracks are untouched. With
+        # bake-every-frame the same curves are then sampled per frame, so both
+        # modes play back identically.
+        smooth_sparse_tracks = not camera_animation
+
+        def _track_interp(num_track_frames):
+            if smooth_sparse_tracks and 1 < num_track_frames < total_frames:
+                return 'BEZIER'
+            return 'LINEAR'
+
+        def _add_key(curve, frame, value, interp):
+            curve.keyframe_points.add(1)
+            kp = curve.keyframe_points[-1]
+            kp.co = (frame, value)
+            kp.interpolation = interp
+            if interp == 'BEZIER':
+                kp.handle_left_type = 'AUTO_CLAMPED'
+                kp.handle_right_type = 'AUTO_CLAMPED'
+
+        def _densify_fcurve(curve):
+            n = len(curve.keyframe_points)
+            if not (1 < n < total_frames):
+                return
+            curve.update()
+            values = [curve.evaluate(float(fr)) for fr in range(total_frames)]
+            curve.keyframe_points.clear()
+            curve.keyframe_points.add(total_frames)
+            for fr, kp in enumerate(curve.keyframe_points):
+                kp.co = (float(fr), values[fr])
+                kp.interpolation = 'LINEAR'
+            curve.update()
+
         start_time = time.time()
         for bone in anim_desc.bones:
             keyFrames_rot = bone.rotationFramesQuat
@@ -1559,35 +1515,24 @@ class AnimImporter:
             else:
                 pos_dt = bone.position_dt if bone.position_dt and bone.position_dt > 0 else base_dt
                 pos_dt = round(pos_dt, 8)
-                pos_resampled = False
-                if witcher_bake_every_frame and _needs_resample(pos_frames, pos_dt):
-                    pos_frames, pos_resampled = resample_position_frames(pos_frames, pos_dt, duration, total_frames)
-                    if smooth_missing and pos_resampled:
-                        anchor_mask = build_anchor_mask(total_frames, base_dt, pos_dt)
-                        pos_frames = smooth_vector_frames(pos_frames, anchor_mask)
                 num_pos_frames = len(pos_frames)
+                pos_interp = _track_interp(num_pos_frames)
                 prev_loc_frame = None
                 last_frame = total_frames - 1
                 for n, pos_frame in enumerate(pos_frames):
-                    if witcher_bake_every_frame:
-                        if pos_resampled or num_pos_frames == total_frames:
-                            loc_frame = n
-                        else:
-                            loc_frame = n * (pos_dt / base_dt if base_dt > 0 else 1.0)
+                    if num_pos_frames == 1:
+                        loc_frame = 0.0
+                    elif witcher_scale_keys_to_duration and num_pos_frames > 1:
+                        loc_frame = n * (last_frame / (num_pos_frames - 1))
                     else:
-                        if num_pos_frames == 1:
-                            loc_frame = 0.0
-                        elif witcher_scale_keys_to_duration and num_pos_frames > 1:
-                            loc_frame = n * (last_frame / (num_pos_frames - 1))
-                        else:
-                            loc_frame = n * (pos_dt / base_dt if base_dt > 0 else 1.0)
-                            if n == num_pos_frames - 1:
-                                loc_frame = last_frame
-                            elif loc_frame > last_frame:
-                                loc_frame = last_frame
-                        if prev_loc_frame is not None and abs(loc_frame - prev_loc_frame) < 1e-6:
-                            continue
-                        prev_loc_frame = loc_frame
+                        loc_frame = n * (pos_dt / base_dt if base_dt > 0 else 1.0)
+                        if n == num_pos_frames - 1:
+                            loc_frame = last_frame
+                        elif loc_frame > last_frame:
+                            loc_frame = last_frame
+                    if prev_loc_frame is not None and abs(loc_frame - prev_loc_frame) < 1e-6:
+                        continue
+                    prev_loc_frame = loc_frame
                     if bl_bone.parent:
                         objectMatrix = bl_bone.parent.bone.matrix_local.inverted()
                         origPos = objectMatrix @ bl_bone.bone.matrix_local.translation
@@ -1625,9 +1570,13 @@ class AnimImporter:
                     if zero_cutscene_root and _base_bone_name(mdl_bone.BoneName).lower() == "root":
                         pos = Vector((0.0, 0.0, 0.0))
                     for i in range(3):
-                        pos_curves[i].keyframe_points.add(1)
-                        pos_curves[i].keyframe_points[-1].co = (loc_frame, pos[i])
-                        pos_curves[i].keyframe_points[-1].interpolation = 'LINEAR'
+                        _add_key(pos_curves[i], loc_frame, pos[i], pos_interp)
+                if pos_interp == 'BEZIER':
+                    for i in range(3):
+                        pos_curves[i].update()
+                if witcher_bake_every_frame:
+                    for i in range(3):
+                        _densify_fcurve(pos_curves[i])
 
             #! ROTATION FRAMES
             
@@ -1639,37 +1588,26 @@ class AnimImporter:
             else:
                 rot_dt = bone.rotation_dt if bone.rotation_dt and bone.rotation_dt > 0 else base_dt
                 rot_dt = round(rot_dt, 8)
-                rot_resampled = False
-                if witcher_bake_every_frame and _needs_resample(rot_frames, rot_dt):
-                    rot_frames, rot_resampled = resample_rotation_frames(rot_frames, rot_dt, duration, total_frames)
-                    if smooth_missing and rot_resampled:
-                        anchor_mask = build_anchor_mask(total_frames, base_dt, rot_dt)
-                        rot_frames = smooth_quaternion_frames(rot_frames, anchor_mask)
                 num_rot_frames = len(rot_frames)
-                
+                rot_interp = _track_interp(num_rot_frames)
+
                 prev_rot_frame = None
                 prev_fixed_rot = None
                 last_frame = total_frames - 1
                 for n, rot_frame in enumerate(rot_frames):
-                    if witcher_bake_every_frame:
-                        if rot_resampled or num_rot_frames == total_frames:
-                            frame = n
-                        else:
-                            frame = n * (rot_dt / base_dt if base_dt > 0 else 1.0)
+                    if num_rot_frames == 1:
+                        frame = 0.0
+                    elif witcher_scale_keys_to_duration and num_rot_frames > 1:
+                        frame = n * (last_frame / (num_rot_frames - 1))
                     else:
-                        if num_rot_frames == 1:
-                            frame = 0.0
-                        elif witcher_scale_keys_to_duration and num_rot_frames > 1:
-                            frame = n * (last_frame / (num_rot_frames - 1))
-                        else:
-                            frame = n * (rot_dt / base_dt if base_dt > 0 else 1.0)
-                            if n == num_rot_frames - 1:
-                                frame = last_frame
-                            elif frame > last_frame:
-                                frame = last_frame
-                        if prev_rot_frame is not None and abs(frame - prev_rot_frame) < 1e-6:
-                            continue
-                        prev_rot_frame = frame
+                        frame = n * (rot_dt / base_dt if base_dt > 0 else 1.0)
+                        if n == num_rot_frames - 1:
+                            frame = last_frame
+                        elif frame > last_frame:
+                            frame = last_frame
+                    if prev_rot_frame is not None and abs(frame - prev_rot_frame) < 1e-6:
+                        continue
+                    prev_rot_frame = frame
                     fixed_rot = rot_frame
                     
                     if not face_animation and SkeletalAnimationType != "SAT_Additive":
@@ -1716,9 +1654,13 @@ class AnimImporter:
                     prev_fixed_rot = fixed_rot.copy()
 
                     for i in range(4):
-                        rot_curves[i].keyframe_points.add(1)
-                        rot_curves[i].keyframe_points[-1].co = (frame, fixed_rot[i])
-                        rot_curves[i].keyframe_points[-1].interpolation = 'LINEAR'
+                        _add_key(rot_curves[i], frame, fixed_rot[i], rot_interp)
+                if rot_interp == 'BEZIER':
+                    for i in range(4):
+                        rot_curves[i].update()
+                if witcher_bake_every_frame:
+                    for i in range(4):
+                        _densify_fcurve(rot_curves[i])
         _safe_mode_set('OBJECT', armObj)
         log.debug(' Finished adding keyframes in %f seconds.', time.time() - start_time)
 
@@ -1814,7 +1756,14 @@ class AnimImporter:
         self.__assign_action(armObj, action, camera_cut_frames=camera_cut_frames)
         if morph_action_target is not None and morph_action_target != armObj:
             self.__assign_action(morph_action_target, action)
-        
+
+        if (foot_ik_cleanup and not face_animation and not camera_animation
+                and not self.facePose and SkeletalAnimationType != "SAT_Additive"):
+            try:
+                apply_foot_ik_cleanup(armObj, action, total_frames)
+            except Exception:
+                log.warning("Foot IK cleanup failed for %s", action.name, exc_info=True)
+
     def __assignToArmature(self, armObj, action_name=None):
 
         def detect_maya_namespace(s):
@@ -2305,24 +2254,29 @@ def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=Fa
 #     global GLOBAL_ANIMSET
 #     GLOBAL_ANIMSET = the_set
 
-def import_from_list_item(context, item, ANIMSET, target_obj=None):
+def import_from_list_item(context, item, ANIMSET, target_obj=None, use_NLA=None, nla_mode='replace'):
     for anim_set_entry in ANIMSET.animations:
         if anim_set_entry.animation.name == item.name:
             if ':face' in str(anim_set_entry.animation.name or "").lower():
+                clip_use_nla = True if use_NLA is None else bool(use_NLA)
                 import_anim(
                     context,
                     "lipsync_from_list",
                     anim_set_entry,
-                    use_NLA=True,
+                    use_NLA=clip_use_nla,
                     NLA_track="mimic_import",
                     override_select=target_obj if target_obj else False,
+                    nla_mode=nla_mode,
                 )
             else:
+                clip_use_nla = False if use_NLA is None else bool(use_NLA)
                 import_anim(
                     context,
                     "from_list",
                     anim_set_entry,
+                    use_NLA=clip_use_nla,
                     override_select=target_obj if target_obj else False,
+                    nla_mode=nla_mode,
                 )
 
 def _is_w2_cr2w_version(filename):

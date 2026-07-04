@@ -592,26 +592,31 @@ def _resolve_root_orientation_action(armature_obj):
     if not armature_obj or armature_obj.type != 'ARMATURE' or not armature_obj.animation_data:
         return None
 
+    anim_data = armature_obj.animation_data
     action = None
-    if armature_obj.animation_data.nla_tracks:
-        anim_import_track = armature_obj.animation_data.nla_tracks.get('anim_import')
+
+    if not getattr(anim_data, "use_nla", False):
+        action = anim_data.action
+
+    if action is None and anim_data.nla_tracks:
+        anim_import_track = anim_data.nla_tracks.get('anim_import')
         if anim_import_track and anim_import_track.strips:
             for strip in reversed(anim_import_track.strips):
                 if strip.action:
                     action = strip.action
                     break
 
-    if action is None:
-        action = armature_obj.animation_data.action
-
-    if action is None and armature_obj.animation_data.nla_tracks:
-        for track in armature_obj.animation_data.nla_tracks:
+    if action is None and anim_data.nla_tracks:
+        for track in anim_data.nla_tracks:
             for strip in track.strips:
                 if strip.action:
                     action = strip.action
                     break
             if action:
                 break
+
+    if action is None:
+        action = anim_data.action
 
     return action
 
@@ -696,6 +701,14 @@ def _scene_nla_mode(scene):
     return _NLA_MODE_MAP.get(getattr(scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
 
 
+def _scene_load_clips_to_nla(scene):
+    return bool(getattr(scene, "witcher_anim_load_to_nla", True))
+
+
+def _scene_clip_nla_mode(scene):
+    return _scene_nla_mode(scene) if _scene_load_clips_to_nla(scene) else 'replace'
+
+
 def on_anim_list_index_changed(self, context):
     """Callback when animation list selection changes. Auto-loads if enabled."""
     if not getattr(context.scene, 'witcher_load_anim_on_select', False):
@@ -722,15 +735,16 @@ def on_anim_list_index_changed(self, context):
         return
 
     try:
-        _nla_mode = _scene_nla_mode(context.scene)
         target_component = str(getattr(context.scene, "witcher_loaded_w2anims_target_component", "") or "").strip()
+        use_nla = _scene_load_clips_to_nla(context.scene)
         load_anim_into_scene(
             context,
             anim_name,
             fdir_abs,
             main_arm_obj,
-            nla_mode=_nla_mode,
+            nla_mode=_scene_clip_nla_mode(context.scene),
             target_component=target_component,
+            use_NLA=use_nla,
         )
         # Apply root orientation if enabled
         auto_orient = getattr(context.scene, 'witcher_auto_orient_root', False)
@@ -4232,6 +4246,7 @@ class TOOL_OT_List_LoadAnim(Operator):
                 _basename, ext = os.path.splitext(file)
                 try:
                     target_component = str(getattr(scene, "witcher_loaded_w2anims_target_component", "") or "").strip()
+                    use_nla = _scene_load_clips_to_nla(context.scene)
                     if ext.lower() == '.json':
                         _resolved_main_arm_obj, target_armatures, rig_path, _face_animation = resolve_animation_load_context(
                             context,
@@ -4248,6 +4263,8 @@ class TOOL_OT_List_LoadAnim(Operator):
                             item,
                             animset,
                             target_obj=target_obj,
+                            use_NLA=use_nla,
+                            nla_mode=_scene_clip_nla_mode(context.scene),
                         )
                     else:
                         load_anim_into_scene(
@@ -4256,8 +4273,9 @@ class TOOL_OT_List_LoadAnim(Operator):
                             fdir_abs,
                             main_arm_obj,
                             face_target_mode="owner" if action == "load_cutscene" else "auto",
-                            nla_mode=_scene_nla_mode(context.scene),
+                            nla_mode=_scene_clip_nla_mode(context.scene),
                             target_component=target_component,
+                            use_NLA=use_nla,
                         )
                 except FileNotFoundError as e:
                     self.report({'ERROR'}, str(e))
@@ -4721,6 +4739,8 @@ def apply_root_orientation(armature_obj):
     root_bone = pose_bones["Root"]
 
     initial_quat, source_bone, source_up_dot = _select_root_orientation_quat(action, armature_obj)
+    # Flatten to the yaw component so the character always ends up upright
+    initial_quat = _flatten_quat_to_yaw(initial_quat)
 
     # Step 2: Remove ALL fcurves for Root bone (rotation, location, scale)
     root_data_paths = [
@@ -4768,6 +4788,17 @@ def apply_root_orientation(armature_obj):
     log.info(f"  Root initial quaternion: {initial_quat} source={source_bone} upDot={source_up_dot:.4f}")
 
     return True
+
+
+def _flatten_quat_to_yaw(quat):
+    """Z-axis twist component of a quaternion (rotation about world up)."""
+    if quat is None:
+        return mathutils.Quaternion()
+    twist = mathutils.Quaternion((quat.w, 0.0, 0.0, quat.z))
+    if twist.dot(twist) <= 1e-12:
+        return mathutils.Quaternion()
+    twist.normalize()
+    return twist
 
 
 def _quat_world_up_dot(quat):
@@ -6167,11 +6198,18 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             row.operator("witcher.list_loadanim", text="Load Clip", icon='PLAY').action = "load"
             row.prop(scene, "witcher_load_anim_on_select", text="Load on Select")
 
+            placement_box = box.box()
+            placement_box.label(text="Clip Placement", icon='NLA')
+            placement_box.prop(scene, "witcher_anim_load_to_nla", text="Use NLA")
+            nla_mode_row = placement_box.row()
+            nla_mode_row.enabled = _scene_load_clips_to_nla(scene)
+            nla_mode_row.prop(scene, "witcher_anim_nla_mode", text="NLA Mode")
+
             opts = box.box()
             opts.label(text="Import / Decode Options", icon='SETTINGS')
             opts.prop(scene, "witcher_prefer_uncompressed_anims", text="Prefer Uncompressed Data")
             opts.prop(scene, "witcher_bake_every_frame", text="Bake Every Frame")
-            opts.prop(scene, "witcher_smooth_missing_frames", text="Smooth Missing Frames")
+            opts.prop(scene, "witcher_smooth_missing_frames", text="Fix Foot Popping (IK)")
             opts.prop(scene, "witcher_scale_keys_to_duration", text="Scale Keys to Duration")
 
             motion_box = box.box()
@@ -6183,7 +6221,6 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             orient_row = box.row(align=True)
             orient_row.prop(scene, "witcher_auto_orient_root", text="Auto Orient Root")
             orient_row.operator(WITCH_OT_ApplyRootOrientation.bl_idname, text="", icon='ORIENTATION_GLOBAL')
-            box.prop(scene, "witcher_anim_nla_mode", text="NLA Load Mode")
 
             item, _safe_index = _get_selected_collection_item(
                 scene,
@@ -6258,8 +6295,12 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
 
             if hasattr(scene, "witcher_auto_orient_root"):
                 col.prop(scene, "witcher_auto_orient_root", text="Auto Orient Root")
+            if hasattr(scene, "witcher_anim_load_to_nla"):
+                col.prop(scene, "witcher_anim_load_to_nla", text="Use NLA")
             if hasattr(scene, "witcher_anim_nla_mode"):
-                col.prop(scene, "witcher_anim_nla_mode", text="NLA Load Mode")
+                nla_mode_row = col.row()
+                nla_mode_row.enabled = _scene_load_clips_to_nla(scene)
+                nla_mode_row.prop(scene, "witcher_anim_nla_mode", text="NLA Mode")
             if hasattr(scene, "witcher_quick_anim_auto_collapse_categories"):
                 col.prop(scene, "witcher_quick_anim_auto_collapse_categories", text="Auto Collapse Categories")
             if hasattr(scene, "witcher_quick_anim_source"):
@@ -7703,6 +7744,12 @@ def register():
         default=False
     )
 
+    bpy.types.Scene.witcher_anim_load_to_nla = BoolProperty(
+        name="Use NLA",
+        description="Load clips into anim_import/mimic_import NLA tracks instead of assigning the clip action directly. Multipart buffers still use NLA. Recommended to keep on",
+        default=True,
+    )
+
     bpy.types.Scene.witcher_anim_nla_mode = EnumProperty(
         name="NLA Load Mode",
         description="How the clip is placed on the anim_import / mimic_import / voice_import NLA track",
@@ -7904,17 +7951,17 @@ def register():
     )
     bpy.types.Scene.witcher_bake_every_frame = BoolProperty(
         name="Bake Every Frame",
-        description="Insert keyframes on every frame after resampling (more accurate, less smooth)",
-        default=True
+        description="Insert a key on every frame by sampling the imported curves (heavier actions)",
+        default=False
     )
     bpy.types.Scene.witcher_smooth_missing_frames = BoolProperty(
-        name="Smooth Missing Frames",
-        description="Apply light smoothing to resampled missing frames (may reduce pops, less accurate)",
+        name="Fix Foot Popping (IK)",
+        description="Re-solve the leg chains against the skeleton's IK reference tracks after import (if present). Improves display of decompressed animation.",
         default=False
     )
     bpy.types.Scene.witcher_scale_keys_to_duration = BoolProperty(
         name="Scale Keys to Duration",
-        description="When not baking every frame, scale key times to fit the animation duration using animation dt",
+        description="Scale key times to fit the animation duration using animation dt (distorts timing; normally leave off)",
         default=False
     )
 
@@ -7973,6 +8020,7 @@ def unregister():
         "witcher_loaded_w2anims_target_component",
         "witcher_animset_filter_text",
         "witcher_load_anim_on_select",
+        "witcher_anim_load_to_nla",
         "witcher_anim_nla_mode",
         "witcher_w3_anim_source",
         "witcher_auto_orient_root",

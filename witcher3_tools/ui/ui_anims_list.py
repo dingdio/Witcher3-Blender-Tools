@@ -1202,6 +1202,10 @@ def _apply_cached_items_to_scene(scene, cached_items, preferred_id=None):
         _POPULATING_QUICK_ANIM_LIST = False
 
 
+def _scene_load_clips_to_nla(scene):
+    return bool(getattr(scene, "witcher_anim_load_to_nla", True))
+
+
 def _load_selected_quick_anim(context):
     main_arm_obj = _resolve_main_armature(context)
     scene = context.scene
@@ -1223,9 +1227,21 @@ def _load_selected_quick_anim(context):
         return False
     source_override = _resolve_quick_anim_source(context.scene, main_arm_obj)
     fdir_abs = repo_file_for_source(fdir, source_override)
+    use_nla = _scene_load_clips_to_nla(context.scene)
     _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
-    _nla_mode = _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
-    load_anim_into_scene(context, anim_name, fdir_abs, main_arm_obj, nla_mode=_nla_mode, source_game=source_override)
+    _nla_mode = (
+        _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+        if use_nla else 'replace'
+    )
+    load_anim_into_scene(
+        context,
+        anim_name,
+        fdir_abs,
+        main_arm_obj,
+        nla_mode=_nla_mode,
+        source_game=source_override,
+        use_NLA=use_nla,
+    )
     if getattr(context.scene, "witcher_auto_orient_root", True):
         try:
             from ..ui.ui_anims import apply_root_orientation
@@ -1802,7 +1818,8 @@ def _retarget_w2_animation_entry(context, animation_entry, source_rig_path, targ
 
 
 def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0,
-                         face_target_mode="auto", nla_mode='replace', target_component="", source_game=""):
+                         face_target_mode="auto", nla_mode='replace', target_component="", source_game="",
+                         use_NLA=True):
     face_animation = is_face_animation(anim_name, fdir)
     if face_target_mode == "owner" and face_animation:
         main_arm_obj, owner_armature, rig_path = resolve_owner_face_animation_context(
@@ -1915,7 +1932,7 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
         context,
         fdir,
         animation,
-        use_NLA=True,
+        use_NLA=use_NLA,
         NLA_track=effective_track,
         override_select=actual_target_armatures if len(actual_target_armatures) > 1 else actual_target_armatures[0],
         at_frame=effective_at_frame,

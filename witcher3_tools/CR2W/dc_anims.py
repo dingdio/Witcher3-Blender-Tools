@@ -63,6 +63,44 @@ class CVector3D:
         return [self.x, self.y, self.z]
 
 
+def read_compressed_quaternion(f, orientationCompressionMethod, compression=0):
+    if "ABOCM_PackIn48bitsW" in orientationCompressionMethod:
+        bits = ReadUlong48(f)
+        orients = [
+            (bits & 0x0000FFF000000000) >> 36,
+            (bits & 0x0000000FFF000000) >> 24,
+            (bits & 0x0000000000FFF000) >> 12,
+            (bits & 0x0000000000000FFF),
+        ]
+        vals = [(2047.0 - v) * (1 / 2048.0) for v in orients]
+        return Quaternion(vals[0], vals[1], vals[2], vals[3])
+    if "ABOCM_AsFloat_XYZSignedWInLastBit" in orientationCompressionMethod:
+        (x, y, z) = CVector3D(f, compression).getList()
+        z_bytes = struct.pack("<f", z)
+        signW = (z_bytes[compression] & 1) > 0
+        minScalar = min(x * x + y * y + z * z, 1.0)
+        w = math.sqrt(1.0 - minScalar)
+        if signW:
+            w = -w
+        return Quaternion(x, y, z, w)
+    if "ABOCM_PackIn64bitsW" in orientationCompressionMethod:
+        orients = [readUShort(f), readUShort(f), readUShort(f), readUShort(f)]
+        vals = [(32768.0 - v) * (1 / 32767.0) for v in orients]
+        return Quaternion(vals[0], vals[1], vals[2], vals[3])
+    if "ABOCM_PackIn40bitsW" in orientationCompressionMethod:
+        bits = ReadUlong40(f)
+        orients = [
+            (bits >> 30) & 0b1111111111,
+            (bits >> 20) & 0b1111111111,
+            (bits >> 10) & 0b1111111111,
+            bits & 0b1111111111,
+        ]
+        vals = [(511.0 - v) * (1 / 512.0) for v in orients]
+        return Quaternion(vals[0], vals[1], vals[2], vals[3])
+    log.error('UNDEFINED orientationCompressionMethod FOUND')
+    return None
+
+
 def _read_source_anim_data_header(embedded_data):
     """Validate source animation data and return its header."""
     if not embedded_data:
@@ -1168,49 +1206,9 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
         actual_addr = dataAddrFallback if use_fallback else dataAddr
         f.seek(actual_addr)
         for _ in range(0, this_bone.rotation_numFrames):
-            if "ABOCM_PackIn48bitsW" in orientationCompressionMethod:
-                bits = ReadUlong48(f)
-                orients = []
-                orients.append((bits & 0x0000FFF000000000) >> 36)
-                orients.append((bits & 0x0000000FFF000000) >> 24)
-                orients.append((bits & 0x0000000000FFF000) >> 12)
-                orients.append((bits & 0x0000000000000FFF))
-                for (i, item) in enumerate(orients):
-                    orients[i] = (2047.0 - orients[i]) * (1 / 2048.0)
-                this_bone.rotationFrames.append(Quaternion(orients[0], orients[1], orients[2], orients[3]))
-                #print(bits)
-            elif "ABOCM_AsFloat_XYZSignedWInLastBit" in orientationCompressionMethod:
-                (x, y, z) = CVector3D(f, compression).getList()
-                int_values = [x for x in bytearray(struct.pack("f", z))]
-                signW = (int_values[0] & 1) > 0
-                minScalar = min(x * x + y * y + z * z, 1.0)
-                w = math.sqrt(1.0 - minScalar)
-                if signW:
-                    w = -w
-                this_bone.rotationFrames.append(Quaternion(x, y, z, w))
-            elif "ABOCM_PackIn64bitsW" in orientationCompressionMethod:
-                orients = []
-                orients.append(readUShort(f))
-                orients.append(readUShort(f))
-                orients.append(readUShort(f))
-                orients.append(readUShort(f))
-
-                for (i, item) in enumerate(orients):
-                    orients[i] = (32768.0 - orients[i]) * (1 / 32767.0)
-                this_bone.rotationFrames.append(Quaternion(orients[0], orients[1], orients[2], orients[3]))
-            elif "ABOCM_PackIn40bitsW" in orientationCompressionMethod:
-                bits = ReadUlong40(f)
-                orients = []
-                orients.append((bits >> 30) & 0b1111111111)
-                orients.append((bits >> 20) & 0b1111111111)
-                orients.append((bits >> 10) & 0b1111111111)
-                orients.append(bits & 0b1111111111)
-                for (i, item) in enumerate(orients):
-                    orients[i] = (511.0 - orients[i]) * (1 / 512.0)
-                this_bone.rotationFrames.append(Quaternion(orients[0], orients[1], orients[2], orients[3]))
-            else:
-                log.error('UNDEFINED orientationCompressionMethod FOUND')
-                #raise Exception('UNDEFINED orientationCompressionMethod FOUND')
+            quat = read_compressed_quaternion(f, orientationCompressionMethod, compression)
+            if quat is not None:
+                this_bone.rotationFrames.append(quat)
         this_bone.scale_dt = bone.scale.GetVariableByName('dt').Value
         this_bone.scale_numFrames = bone.scale.GetVariableByName('numFrames').Value
         compression = bone.scale.GetVariableByName('compression')
