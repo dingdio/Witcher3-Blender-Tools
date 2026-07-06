@@ -60,13 +60,11 @@ def _restore_object_state(context, state, *, restore_mode: bool = True) -> None:
     saved_active, saved_selection, saved_mode = state
     _deselect_all(context)
     for obj in saved_selection:
-        if not _object_still_exists(obj):
-            continue
         try:
             obj.select_set(True)
         except Exception:
             pass
-    if saved_active is not None and _object_still_exists(saved_active):
+    if saved_active is not None:
         _set_active_object(context, saved_active)
     if restore_mode and saved_mode != "OBJECT" and _active_object(context):
         try:

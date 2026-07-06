@@ -1150,6 +1150,24 @@ def armature_is_in_merged_character_hierarchy(armature) -> bool:
     return False
 
 
+def _is_dangle_constraint_armature(obj) -> bool:
+    if obj is None or safe_object_type(obj) != "ARMATURE":
+        return False
+    try:
+        return str(obj.get("witcher_type", "") or "").startswith("CAnimDangleConstraint_")
+    except Exception:
+        return False
+
+
+def _is_dangle_buffer_armature(obj) -> bool:
+    if obj is None or safe_object_type(obj) != "ARMATURE":
+        return False
+    try:
+        return str(obj.get("witcher_type", "") or "") == "CAnimDangleBufferComponent"
+    except Exception:
+        return False
+
+
 def _iter_bpy_objects():
     import bpy
     try:
@@ -1227,7 +1245,7 @@ def _graft_reparent_target(master_armature, child_armature, parent_bone: str = "
         and visual_parent is not master_armature
         and visual_parent is not child_armature
         and visual_parent_type == "OBJECT"
-        and object_still_exists(visual_parent)
+        and bool(safe_object_name(visual_parent))
     ):
         return visual_parent, "OBJECT", ""
 
@@ -1263,6 +1281,195 @@ def _retarget_constraints_to_armature(source_armature, target_armature, *, objec
                 changed += 1
             except Exception:
                 continue
+    return changed
+
+
+def _pose_bones(obj):
+    pose = getattr(obj, "pose", None)
+    return getattr(pose, "bones", []) or []
+
+
+def _pose_bone_named(obj, name: str):
+    bones = _pose_bones(obj)
+    getter = getattr(bones, "get", None)
+    if callable(getter):
+        try:
+            return getter(name)
+        except Exception:
+            pass
+    for bone in bones:
+        if str(getattr(bone, "name", "") or "") == name:
+            return bone
+    return None
+
+
+def _is_dangle_driver_constraint(constraint) -> bool:
+    return (
+        getattr(constraint, "type", "") == "COPY_TRANSFORMS"
+        and _is_dangle_constraint_armature(getattr(constraint, "target", None))
+    )
+
+
+def _has_matching_pose_constraint(pose_bone, source_constraint) -> bool:
+    for constraint in getattr(pose_bone, "constraints", []) or []:
+        if (
+            getattr(constraint, "type", "") == getattr(source_constraint, "type", "")
+            and getattr(constraint, "target", None) is getattr(source_constraint, "target", None)
+            and str(getattr(constraint, "subtarget", "") or "") == str(getattr(source_constraint, "subtarget", "") or "")
+        ):
+            return True
+    return False
+
+
+def _copy_pose_constraint(pose_bone, source_constraint):
+    constraints = getattr(pose_bone, "constraints", None)
+    new_constraint = getattr(constraints, "new", None)
+    if not callable(new_constraint):
+        return None
+    constraint_type = getattr(source_constraint, "type", "COPY_TRANSFORMS")
+    try:
+        copied = new_constraint(type=constraint_type)
+    except TypeError:
+        copied = new_constraint(constraint_type)
+    for attr in (
+        "name",
+        "target",
+        "subtarget",
+        "influence",
+        "mute",
+        "owner_space",
+        "target_space",
+        "mix_mode",
+        "head_tail",
+        "use_offset",
+    ):
+        if not hasattr(source_constraint, attr):
+            continue
+        try:
+            setattr(copied, attr, getattr(source_constraint, attr))
+        except Exception:
+            pass
+    return copied
+
+
+def _copy_dangle_driver_constraints_to_master(source_armature, target_armature) -> int:
+    if source_armature is None or target_armature is None or source_armature is target_armature:
+        return 0
+    changed = 0
+    for source_bone in _pose_bones(source_armature):
+        bone_name = str(getattr(source_bone, "name", "") or "")
+        if not bone_name:
+            continue
+        target_bone = _pose_bone_named(target_armature, bone_name)
+        if target_bone is None:
+            continue
+        for constraint in getattr(source_bone, "constraints", []) or []:
+            if not _is_dangle_driver_constraint(constraint):
+                continue
+            if _has_matching_pose_constraint(target_bone, constraint):
+                continue
+            if _copy_pose_constraint(target_bone, constraint) is not None:
+                changed += 1
+    return changed
+
+
+_DANGLE_BREAST_BONES = {"l_boob", "r_boob"}
+
+
+def _is_dangle_dynamic_bone_name(bone_name: str) -> bool:
+    return str(bone_name or "").startswith("dyng_") or str(bone_name or "") in _DANGLE_BREAST_BONES
+
+
+def _dangle_driver_can_drive_bone(driver_armature, bone_name: str) -> bool:
+    driver_type = ""
+    try:
+        driver_type = str(driver_armature.get("witcher_type", "") or "")
+    except Exception:
+        driver_type = ""
+    if driver_type == "CAnimDangleConstraint_Dyng":
+        return str(bone_name or "").startswith("dyng_")
+    if driver_type == "CAnimDangleConstraint_Breast":
+        return str(bone_name or "") in _DANGLE_BREAST_BONES
+    return False
+
+
+def copy_dangle_driver_constraints_to_armature(target_armature, driver_armature) -> int:
+    if target_armature is None or not _is_dangle_constraint_armature(driver_armature):
+        return 0
+    if safe_object_type(target_armature) != "ARMATURE":
+        return 0
+    changed = 0
+    for driver_bone in _pose_bones(driver_armature):
+        bone_name = str(getattr(driver_bone, "name", "") or "")
+        if not bone_name or not _dangle_driver_can_drive_bone(driver_armature, bone_name):
+            continue
+        target_bone = _pose_bone_named(target_armature, bone_name)
+        if target_bone is None:
+            continue
+        spec = type("_ConstraintSpec", (), {})()
+        spec.type = "COPY_TRANSFORMS"
+        spec.name = f"W3_DANGLE_{bone_name}"
+        spec.target = driver_armature
+        spec.subtarget = bone_name
+        spec.influence = 1.0
+        spec.mute = False
+        if _has_matching_pose_constraint(target_bone, spec):
+            continue
+        if _copy_pose_constraint(target_bone, spec) is not None:
+            changed += 1
+    return changed
+
+
+def copy_dangle_anchor_constraints_to_armature(target_armature, source_armature) -> int:
+    if target_armature is None or source_armature is None or target_armature is source_armature:
+        return 0
+    if safe_object_type(target_armature) != "ARMATURE" or safe_object_type(source_armature) != "ARMATURE":
+        return 0
+    changed = 0
+    for target_bone in _pose_bones(target_armature):
+        bone_name = str(getattr(target_bone, "name", "") or "")
+        if not bone_name or _is_dangle_dynamic_bone_name(bone_name):
+            continue
+        if _pose_bone_named(source_armature, bone_name) is None:
+            continue
+        spec = type("_ConstraintSpec", (), {})()
+        spec.type = "COPY_TRANSFORMS"
+        spec.name = f"W3_DANGLE_ANCHOR_{bone_name}"
+        spec.target = source_armature
+        spec.subtarget = bone_name
+        spec.influence = 1.0
+        spec.mute = False
+        if _has_matching_pose_constraint(target_bone, spec):
+            continue
+        if _copy_pose_constraint(target_bone, spec) is not None:
+            changed += 1
+    return changed
+
+
+def copy_dangle_anchor_constraints_to_driver(driver_armature, target_armature) -> int:
+    if not _is_dangle_constraint_armature(driver_armature):
+        return 0
+    if target_armature is None or safe_object_type(target_armature) != "ARMATURE":
+        return 0
+    changed = 0
+    for driver_bone in _pose_bones(driver_armature):
+        bone_name = str(getattr(driver_bone, "name", "") or "")
+        if not bone_name or _dangle_driver_can_drive_bone(driver_armature, bone_name):
+            continue
+        target_bone = _pose_bone_named(target_armature, bone_name)
+        if target_bone is None:
+            continue
+        spec = type("_ConstraintSpec", (), {})()
+        spec.type = "COPY_TRANSFORMS"
+        spec.name = f"W3_DANGLE_ANCHOR_{bone_name}"
+        spec.target = target_armature
+        spec.subtarget = bone_name
+        spec.influence = 1.0
+        spec.mute = False
+        if _has_matching_pose_constraint(driver_bone, spec):
+            continue
+        if _copy_pose_constraint(driver_bone, spec) is not None:
+            changed += 1
     return changed
 
 
@@ -1663,6 +1870,7 @@ def graft_armature_into_master(master_armature, child_armature, *, src_id: str =
     _compensate_meshes_for_same_name_bone_retarget(retargeted, child_armature, master_armature)
     changed_mods = _retarget_armature_modifiers(retargeted, child_armature, master_armature)
     changed_constraints = _retarget_constraints_to_armature(child_armature, master_armature)
+    changed_constraints += _copy_dangle_driver_constraints_to_master(child_armature, master_armature)
 
     for child_data in reparent_cache:
         obj = child_data["obj"]
@@ -1758,6 +1966,10 @@ def unify_character_armatures(master_armature, *, context=None, src_id: str = ""
         if not name:
             continue
         if is_own_skeleton_attachment(obj) and not include_own_skeleton_attachments:
+            continue
+        if _is_dangle_constraint_armature(obj):
+            continue
+        if _is_dangle_buffer_armature(obj):
             continue
         pool.append(obj)
 

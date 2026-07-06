@@ -1161,9 +1161,11 @@ class CHardAttachment(SkinningAttachment):
 
 class CAnimDangleConstraint_Breast(JsonChunk):
     """docstring for CAnimDangleConstraint_Breast."""
-    def __init__(self, skeleton):
+    def __init__(self, skeleton, settings=None):
         super(CAnimDangleConstraint_Breast, self).__init__()
         self.skeleton = skeleton
+        for key, value in (settings or {}).items():
+            setattr(self, key, value)
 
 class CAnimDangleConstraint_Collar(JsonChunk):
     """docstring for CAnimDangleConstraint_Collar."""
@@ -1197,10 +1199,12 @@ class CAnimDangleConstraint_Dress(JsonChunk):
 
 class CAnimDangleConstraint_Dyng(JsonChunk):
     """docstring for CAnimDangleConstraint_Dyng."""
-    def __init__(self, skeleton, dyng):
+    def __init__(self, skeleton, dyng, settings=None):
         super(CAnimDangleConstraint_Dyng, self).__init__()
         self.skeleton = skeleton
         self.dyng = dyng
+        for key, value in (settings or {}).items():
+            setattr(self, key, value)
 
 class CSkeletonBoneSlot(JsonChunk):
     """docstring for CSkeletonBoneSlot."""
@@ -1489,9 +1493,148 @@ def _find_prop_by_name(container, prop_name: str):
     return None
 
 
-def _chunk_prop_string(container, prop_name: str, default=""):
-    value = _prop_to_string(_find_prop_by_name(container, prop_name))
-    return value if value is not None else default
+def _chunk_prop_string(container, *prop_names: str, default=""):
+    for prop_name in prop_names:
+        value = _prop_to_string(_find_prop_by_name(container, prop_name))
+        if value is not None:
+            return value
+    return default
+
+
+def _chunk_prop_scalar(container, *prop_names, default=None):
+    for prop_name in prop_names:
+        prop = _find_prop_by_name(container, prop_name)
+        if prop is None:
+            continue
+        for attr_name in ("Value", "value"):
+            if hasattr(prop, attr_name):
+                value = getattr(prop, attr_name)
+                if isinstance(value, list):
+                    continue
+                return value
+        value = _prop_to_string(prop)
+        if value is not None:
+            return value
+    return default
+
+
+def _chunk_prop_bool(container, *prop_names, default=None):
+    value = _chunk_prop_scalar(container, *prop_names, default=default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    lowered = str(value).strip().lower()
+    if lowered in {"true", "1", "yes"}:
+        return True
+    if lowered in {"false", "0", "no"}:
+        return False
+    return default
+
+
+def _chunk_prop_float(container, *prop_names, default=None):
+    value = _chunk_prop_scalar(container, *prop_names, default=default)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _chunk_prop_int(container, *prop_names, default=None):
+    value = _chunk_prop_scalar(container, *prop_names, default=default)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+
+def _chunk_prop_vector4(container, *prop_names, default=None):
+    for prop_name in prop_names:
+        prop = _find_prop_by_name(container, prop_name)
+        if prop is None:
+            continue
+        for attr_name in ("Value", "value"):
+            direct = getattr(prop, attr_name, None)
+            if isinstance(direct, (list, tuple)) and len(direct) >= 4:
+                try:
+                    return tuple(float(direct[i]) for i in range(4))
+                except (TypeError, ValueError):
+                    pass
+        values = {}
+        for attr_name in ("MoreProps", "More", "PROPS"):
+            for child in getattr(prop, attr_name, None) or []:
+                name = str(getattr(child, "theName", "") or "")
+                if name in {"X", "Y", "Z", "W"}:
+                    value = getattr(child, "Value", getattr(child, "value", None))
+                    if value is not None:
+                        values[name] = value
+        if values:
+            try:
+                return (
+                    float(values.get("X", 0.0)),
+                    float(values.get("Y", 0.0)),
+                    float(values.get("Z", 0.0)),
+                    float(values.get("W", 0.0)),
+                )
+            except (TypeError, ValueError):
+                pass
+        text = _prop_to_string(prop)
+        if text:
+            parts = [part.strip() for part in text.replace(";", ",").split(",")]
+            if len(parts) >= 4:
+                try:
+                    return tuple(float(parts[i]) for i in range(4))
+                except (TypeError, ValueError):
+                    pass
+    return default
+
+
+def _dyng_constraint_settings_from_chunk(chunk):
+    settings = {
+        "dampening": _chunk_prop_float(chunk, "m_dampening", "dampening"),
+        "gravity": _chunk_prop_float(chunk, "m_gravity", "gravity"),
+        "speed": _chunk_prop_float(chunk, "m_speed", "speed"),
+        "wind": _chunk_prop_float(chunk, "m_wind", "wind"),
+        "shake": _chunk_prop_float(chunk, "m_shake", "shake"),
+        "dt": _chunk_prop_float(chunk, "m_dt", "dt"),
+        "useOffsets": _chunk_prop_bool(chunk, "m_useOffsets", "useOffsets"),
+        "planeCollision": _chunk_prop_bool(chunk, "m_planeCollision", "planeCollision"),
+        "maxLinksIterations": _chunk_prop_int(
+            chunk,
+            "m_max_links_iterations",
+            "m_maxLinksIterations",
+            "maxLinksIterations",
+        ),
+    }
+    return {key: value for key, value in settings.items() if value is not None}
+
+
+def _breast_constraint_settings_from_chunk(chunk):
+    settings = {
+        "preset": _chunk_prop_string(chunk, "m_preset", "preset", default=None),
+        "simTime": _chunk_prop_float(chunk, "m_simTime", "simTime"),
+        "ellipse": _chunk_prop_vector4(chunk, "m_elA", "elA", "ellipse"),
+        "startSimPointOffset": _chunk_prop_float(chunk, "m_startSimPointOffset", "startSimPointOffset"),
+        "velDamp": _chunk_prop_float(chunk, "m_velDamp", "velDamp"),
+        "bounceDamp": _chunk_prop_float(chunk, "m_bounceDamp", "bounceDamp"),
+        "inAcc": _chunk_prop_float(chunk, "m_inAcc", "inAcc"),
+        "inertiaScaler": _chunk_prop_float(chunk, "m_inertiaScaler", "inertiaScaler"),
+        "blackHole": _chunk_prop_float(chunk, "m_blackHole", "blackHole"),
+        "velClamp": _chunk_prop_float(chunk, "m_velClamp", "velClamp"),
+        "gravity": _chunk_prop_float(chunk, "m_gravity", "gravity"),
+        "movementBoneWeight": _chunk_prop_float(chunk, "m_movementBoneWeight", "movementBoneWeight"),
+        "rotationBoneWeight": _chunk_prop_float(chunk, "m_rotationBoneWeight", "rotationBoneWeight"),
+    }
+    return {key: value for key, value in settings.items() if value is not None}
 
 
 def _iter_struct_items(prop):
@@ -2450,7 +2593,10 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
             if not dyng and chunk.GetVariableByName("dyng"):
                 dyng = _resolve_repo_path(chunk, "dyng", ".dyng")
             skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig") if chunk.GetVariableByName("skeleton") else None
-            chunk_append(new_mesh, chunk, CAnimDangleConstraint_Dyng(skeleton, dyng))
+            chunk_append(new_mesh, chunk, CAnimDangleConstraint_Dyng(skeleton, dyng, _dyng_constraint_settings_from_chunk(chunk)))
+        elif (chunk.Type == "CAnimDangleConstraint_Breast"):
+            skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig")
+            chunk_append(new_mesh, chunk, CAnimDangleConstraint_Breast(skeleton, _breast_constraint_settings_from_chunk(chunk)))
         elif (chunk.Type in CAnimDangleConstraint_types):
             skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig")
             chunk_append(new_mesh, chunk, CAnimDangleConstraint_types[chunk.Type](skeleton))
@@ -4016,7 +4162,10 @@ def create_CEntity(file, _inherit_visited=None):
             if not dyng and chunk.GetVariableByName("dyng"):
                 dyng = _resolve_repo_path(chunk, "dyng", ".dyng")
             skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig") if chunk.GetVariableByName("skeleton") else None
-            chunk_append(new_mesh, chunk, CAnimDangleConstraint_Dyng(skeleton, dyng))
+            chunk_append(new_mesh, chunk, CAnimDangleConstraint_Dyng(skeleton, dyng, _dyng_constraint_settings_from_chunk(chunk)))
+        elif (chunk.Type == "CAnimDangleConstraint_Breast"):
+            skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig")
+            chunk_append(new_mesh, chunk, CAnimDangleConstraint_Breast(skeleton, _breast_constraint_settings_from_chunk(chunk)))
         elif (chunk.Type in CAnimDangleConstraint_types):
             skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig")
             chunk_append(new_mesh, chunk, CAnimDangleConstraint_types[chunk.Type](skeleton))

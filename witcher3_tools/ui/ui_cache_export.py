@@ -1372,6 +1372,8 @@ def draw_import_options_ui(layout, context) -> None:
     entity_col.prop(prefs, "import_idle_animation")
     if hasattr(prefs, "premerge_character_armature"):
         entity_col.prop(prefs, "premerge_character_armature", text="Pre-merged Armature")
+    if hasattr(prefs, "import_physics_enabled"):
+        entity_col.prop(prefs, "import_physics_enabled", text="Physics Enabled")
 
     redcloth_col = options_box.column(align=True)
     redcloth_col.label(text="Redcloth (.apx)", icon='MATCLOTH')

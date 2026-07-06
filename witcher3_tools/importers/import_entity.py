@@ -24,6 +24,7 @@ from .. import (
     get_W3_REDCLOTH_PATH,
     get_addon_name,
     get_do_import_redcloth,
+    get_import_physics_enabled,
     set_external_import_dependency_alert,
 )
 from ..external_addon_tools import get_apx_addon_status, resolve_redcloth_apx
@@ -1303,6 +1304,18 @@ def _merged_chunk_keeps_own_skeleton(chunk) -> bool:
     """Return true for own-skeleton attachments that must remain separate."""
     chunk_type = str(_get_entry_attr(chunk, "type", "") or "")
     return bool(chunk_type == "CAnimatedComponent" and _get_entry_attr(chunk, "skeleton", None))
+
+
+def _chunk_is_dangle_constraint(chunk) -> bool:
+    return str(_get_entry_attr(chunk, "type", "") or "").startswith("CAnimDangleConstraint_")
+
+
+def _chunk_is_dangle_buffer(chunk) -> bool:
+    return str(_get_entry_attr(chunk, "type", "") or "") == "CAnimDangleBufferComponent"
+
+
+def _merged_chunk_imports_own_skeleton(chunk) -> bool:
+    return _merged_chunk_keeps_own_skeleton(chunk) or _chunk_is_dangle_buffer(chunk) or _chunk_is_dangle_constraint(chunk)
 
 
 def _apply_merged_mimic_metadata(armature_obj, mimic_face_file=""):
@@ -4719,6 +4732,164 @@ def _set_parent_keep_world(obj, parent_obj, *, parent_type='OBJECT', parent_bone
             pass
 
 
+def _has_copy_transform_to(pose_bone, target_obj, subtarget):
+    for constraint in pose_bone.constraints:
+        if (
+            constraint.type == 'COPY_TRANSFORMS'
+            and getattr(constraint, "target", None) == target_obj
+            and getattr(constraint, "subtarget", "") == subtarget
+        ):
+            return True
+    return False
+
+
+_BREAST_DANGLE_BONES = {"l_boob", "r_boob"}
+
+
+def _dangle_constraint_drives_bone(candidate_obj, bone_name):
+    constraint_type = str(candidate_obj.get("witcher_type", "") or "")
+    if constraint_type == "CAnimDangleConstraint_Dyng":
+        return str(bone_name or "").startswith("dyng_")
+    if constraint_type == "CAnimDangleConstraint_Breast":
+        return bone_name in _BREAST_DANGLE_BONES
+    return False
+
+
+def _is_dangle_constraint_armature(obj):
+    return (
+        obj is not None
+        and getattr(obj, "type", None) == 'ARMATURE'
+        and str(obj.get("witcher_type", "") or "").startswith("CAnimDangleConstraint_")
+    )
+
+
+def _is_dangle_buffer_armature(obj):
+    return (
+        obj is not None
+        and getattr(obj, "type", None) == 'ARMATURE'
+        and str(obj.get("witcher_type", "") or "") == "CAnimDangleBufferComponent"
+    )
+
+
+def _remove_copy_transform_to(pose_bone, target_obj, subtarget):
+    removed = 0
+    for constraint in list(pose_bone.constraints):
+        if (
+            constraint.type == 'COPY_TRANSFORMS'
+            and getattr(constraint, "target", None) == target_obj
+            and getattr(constraint, "subtarget", "") == subtarget
+        ):
+            pose_bone.constraints.remove(constraint)
+            removed += 1
+    return removed
+
+
+def _build_dangle_driver_map(constrains, objdict):
+    drivers_by_parent = {}
+    for parent_obj_name, child_obj_name in constrains:
+        parent_obj = objdict.get(parent_obj_name)
+        child_obj = objdict.get(child_obj_name)
+        parent_type = ""
+        parent_is_merged = False
+        if parent_obj is not None:
+            try:
+                parent_type = str(parent_obj.get("witcher_type", "") or "")
+                parent_is_merged = bool(parent_obj.get("witcher_merged_character_armature", False))
+            except Exception:
+                pass
+        if (
+            parent_obj is None
+            or child_obj is None
+            or getattr(parent_obj, "type", None) != 'ARMATURE'
+            or (parent_type != "CAnimDangleBufferComponent" and not parent_is_merged)
+            or not _is_dangle_constraint_armature(child_obj)
+        ):
+            continue
+
+        child_bones = getattr(getattr(child_obj, "pose", None), "bones", None)
+        if not child_bones:
+            continue
+
+        bone_drivers = drivers_by_parent.setdefault(id(parent_obj), {})
+        for pose_bone in child_bones:
+            if _dangle_constraint_drives_bone(child_obj, pose_bone.name):
+                bone_drivers[pose_bone.name] = child_obj
+    return drivers_by_parent
+
+
+def _retarget_buffer_child_dangle_bones(parent_obj, child_obj, bone_drivers):
+    if (
+        parent_obj is None
+        or child_obj is None
+        or getattr(parent_obj, "type", None) != 'ARMATURE'
+        or getattr(child_obj, "type", None) != 'ARMATURE'
+        or str(parent_obj.get("witcher_type", "")) != "CAnimDangleBufferComponent"
+        or _is_dangle_constraint_armature(child_obj)
+        or not bone_drivers
+    ):
+        return 0
+
+    changed = 0
+    child_bones = getattr(getattr(child_obj, "pose", None), "bones", None)
+    if not child_bones:
+        return 0
+
+    for child_bone in child_bones:
+        dangle_target = bone_drivers.get(child_bone.name)
+        if dangle_target is None:
+            continue
+        dangle_bones = getattr(getattr(dangle_target, "pose", None), "bones", None)
+        if dangle_bones is None or dangle_bones.get(child_bone.name) is None:
+            continue
+
+        changed += _remove_copy_transform_to(child_bone, parent_obj, child_bone.name)
+        if not _has_copy_transform_to(child_bone, dangle_target, child_bone.name):
+            copy_transform = child_bone.constraints.new('COPY_TRANSFORMS')
+            copy_transform.name = f"W3_DANGLE_{child_bone.name}"
+            copy_transform.target = dangle_target
+            copy_transform.subtarget = child_bone.name
+            changed += 1
+    return changed
+
+
+def _retarget_merged_dangle_bones(target_obj, bone_drivers):
+    if (
+        target_obj is None
+        or getattr(target_obj, "type", None) != 'ARMATURE'
+        or not bone_drivers
+    ):
+        return 0
+    changed = 0
+    seen = set()
+    for dangle_target in bone_drivers.values():
+        if dangle_target is None or id(dangle_target) in seen:
+            continue
+        seen.add(id(dangle_target))
+        changed += armature_merge.copy_dangle_driver_constraints_to_armature(target_obj, dangle_target)
+    return changed
+
+
+def _is_merged_character_armature(obj):
+    if obj is None or getattr(obj, "type", None) != 'ARMATURE':
+        return False
+    try:
+        return bool(obj.get("witcher_merged_character_armature", False))
+    except Exception:
+        return False
+
+
+def _merged_parent_armature(obj):
+    parent = getattr(obj, "parent", None)
+    if _is_merged_character_armature(parent):
+        return parent
+    for pose_bone in getattr(getattr(obj, "pose", None), "bones", []) or []:
+        for constraint in getattr(pose_bone, "constraints", []) or []:
+            target = getattr(constraint, "target", None)
+            if _is_merged_character_armature(target):
+                return target
+    return None
+
+
 def process_constraints(constrains, objdict, group_parent=None):
     """
     Process and apply constraints between parent and child objects.
@@ -4732,6 +4903,7 @@ def process_constraints(constrains, objdict, group_parent=None):
         list: List of objects that are parented to the group_parent
     """
     return_objs = []
+    dangle_drivers_by_parent = _build_dangle_driver_map(constrains, objdict)
     for parent_obj_name, child_obj_name in constrains:
         if parent_obj_name in objdict and child_obj_name in objdict:
             parent_obj = objdict[parent_obj_name]
@@ -4740,11 +4912,42 @@ def process_constraints(constrains, objdict, group_parent=None):
                 log.debug("Skipping stale constraint pair %s -> %s", child_obj_name, parent_obj_name)
                 continue
             if parent_obj == child_obj:
+                _retarget_merged_dangle_bones(
+                    parent_obj,
+                    dangle_drivers_by_parent.get(id(parent_obj), {}),
+                )
+                continue
+            parent_is_merged = _is_merged_character_armature(parent_obj)
+            child_is_merged = _is_merged_character_armature(child_obj)
+            if parent_is_merged and _is_dangle_buffer_armature(child_obj):
+                armature_merge.copy_dangle_anchor_constraints_to_armature(child_obj, parent_obj)
+                _set_parent_keep_world(child_obj, parent_obj)
+                continue
+            if _is_dangle_buffer_armature(parent_obj) and child_is_merged:
+                continue
+            if parent_is_merged and _is_dangle_constraint_armature(child_obj):
+                armature_merge.copy_dangle_anchor_constraints_to_driver(child_obj, parent_obj)
+                _set_parent_keep_world(child_obj, parent_obj)
+                continue
+            if _is_dangle_constraint_armature(parent_obj) and child_is_merged:
+                armature_merge.copy_dangle_anchor_constraints_to_driver(parent_obj, child_obj)
+                armature_merge.copy_dangle_driver_constraints_to_armature(child_obj, parent_obj)
                 continue
             # Bind with constraints during import; merging into one armature is a
             # single post-import pass (unify_character_armatures) so the importer's
             # later passes never trip over an armature that was deleted mid-flight.
             constrain_util.CreateConstraints2(parent_obj, child_obj)
+            if _is_dangle_constraint_armature(parent_obj):
+                armature_merge.copy_dangle_driver_constraints_to_armature(child_obj, parent_obj)
+            if _is_dangle_buffer_armature(parent_obj) and _is_dangle_constraint_armature(child_obj):
+                merged_parent = _merged_parent_armature(parent_obj)
+                if merged_parent is not None:
+                    armature_merge.copy_dangle_driver_constraints_to_armature(merged_parent, child_obj)
+            _retarget_buffer_child_dangle_bones(
+                parent_obj,
+                child_obj,
+                dangle_drivers_by_parent.get(id(parent_obj), {}),
+            )
 
             # If the object is a Cloth group, attach the group to the appearance instead.
             if child_obj.parent and ":_grp" in child_obj.parent.name:
@@ -5068,6 +5271,53 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 obj['witcher_source_entity_path'] = source_entity_path
             if source_game:
                 obj['witcher_source_game'] = source_game
+            if chunk.get('type') == "CAnimDangleConstraint_Dyng":
+                dyng_prop_map = {
+                    'dampening': 'witcher_dyng_dampening',
+                    'gravity': 'witcher_dyng_gravity',
+                    'speed': 'witcher_dyng_speed',
+                    'wind': 'witcher_dyng_wind',
+                    'shake': 'witcher_dyng_shake',
+                    'useOffsets': 'witcher_dyng_use_offsets',
+                    'planeCollision': 'witcher_dyng_plane_collision',
+                    'maxLinksIterations': 'witcher_dyng_link_iterations',
+                }
+                for chunk_key, prop_name in dyng_prop_map.items():
+                    value = chunk.get(chunk_key, None)
+                    if value is not None:
+                        obj[prop_name] = value
+                try:
+                    from ..physics import dyng_blender
+
+                    dyng_blender.configure_imported_dyng(obj, enabled=get_import_physics_enabled(bpy.context))
+                except Exception:
+                    log.debug("Failed to configure imported Dyng dangle: %s", getattr(obj, "name", obj), exc_info=True)
+            if chunk.get('type') == "CAnimDangleConstraint_Breast":
+                breast_prop_map = {
+                    'preset': 'witcher_breast_preset',
+                    'simTime': 'witcher_breast_sim_time',
+                    'ellipse': 'witcher_breast_ellipse',
+                    'velDamp': 'witcher_breast_vel_damp',
+                    'bounceDamp': 'witcher_breast_bounce_damp',
+                    'inAcc': 'witcher_breast_in_acc',
+                    'inertiaScaler': 'witcher_breast_inertia_scaler',
+                    'blackHole': 'witcher_breast_black_hole',
+                    'velClamp': 'witcher_breast_vel_clamp',
+                    'gravity': 'witcher_breast_gravity',
+                    'movementBoneWeight': 'witcher_breast_movement_weight',
+                    'rotationBoneWeight': 'witcher_breast_rotation_weight',
+                    'startSimPointOffset': 'witcher_breast_start_offset',
+                }
+                for chunk_key, prop_name in breast_prop_map.items():
+                    value = chunk.get(chunk_key, None)
+                    if value is not None:
+                        obj[prop_name] = value
+                try:
+                    from ..physics import breast_blender
+
+                    breast_blender.configure_imported_breast(obj, enabled=get_import_physics_enabled(bpy.context))
+                except Exception:
+                    log.debug("Failed to configure imported Breast dangle: %s", getattr(obj, "name", obj), exc_info=True)
 
     def import_w2_mimic_support_chunk(chunk, chunk_ns):
         """Import W2 CHeadDefinifion mimic resources without touching W3 .w3fac state."""
@@ -5828,7 +6078,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 has_moving_agent = True
                 _apply_chunk_transform_to_import_roots(chunk, armatures=[moving_agent])
         elif "skeleton" in chunk and chunk['skeleton'] is not None:
-            merged_target = None if _merged_chunk_keeps_own_skeleton(chunk) else _merged_context_target(merged_armature_context)
+            merged_target = None if _merged_chunk_imports_own_skeleton(chunk) else _merged_context_target(merged_armature_context)
             if merged_target is not None:
                 objdict[chunk_ns] = merged_target
                 if not has_moving_agent:
@@ -5854,7 +6104,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
 
         # Handle dynamic rigs
         if "dyng" in chunk and chunk['dyng'] is not None:
-            merged_target = None if _merged_chunk_keeps_own_skeleton(chunk) else _merged_context_target(merged_armature_context)
+            merged_target = None if _merged_chunk_imports_own_skeleton(chunk) else _merged_context_target(merged_armature_context)
             if merged_target is not None:
                 objdict[chunk_ns] = merged_target
                 continue
@@ -5874,7 +6124,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             if faceData is None:
                 log.warning("Failed to load mimic face: %s", chunk['mimicFace'])
             else:
-                merged_target = None if _merged_chunk_keeps_own_skeleton(chunk) else _merged_context_target(merged_armature_context)
+                merged_target = None if _merged_chunk_imports_own_skeleton(chunk) else _merged_context_target(merged_armature_context)
                 if merged_target is not None:
                     _merge_skeleton_data_into_context(
                         merged_armature_context,

@@ -19,7 +19,7 @@ from ..CR2W import read_json_w3
 from ..w3_armature_constants import *
 from ..camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties
 from ..ui.ui_morphs import witcherui_add_redmorph
-from .. import get_uncook_path, get_do_fix_tail, set_rig_rot90_enabled
+from .. import get_uncook_path, get_do_fix_tail, get_import_physics_enabled, set_rig_rot90_enabled
 import logging
 log = logging.getLogger(__name__)
 
@@ -260,6 +260,17 @@ def create_armature(mdl: w3_types.CSkeleton, nsp="", scale=1.0, do_fix_tail=None
 def create_armature_from_skeleton_data(w3Data, fileName=False, ns="", do_fix_tail=None, context=None):
     arm = create_armature(w3Data, ns, 1.0, do_fix_tail, context, fileName=fileName)
     arm.data.witcherui_RigSettings.main_entity_skeleton = fileName or ""
+    if fileName and str(fileName).lower().endswith((".w3dyng", ".dyng")):
+        try:
+            from ..physics.dyng import attach_dyng_resource_to_object
+
+            resource = attach_dyng_resource_to_object(arm, fileName)
+            if resource is not None:
+                from ..physics import dyng_blender
+
+                dyng_blender.configure_imported_dyng(arm, enabled=get_import_physics_enabled(context or bpy.context))
+        except Exception:
+            log.warning("Failed to attach Dyng physics data: %s", fileName, exc_info=True)
 
     tracks_bone: bpy.types.PoseBone = None
     if "Camera_Node" in arm.pose.bones:

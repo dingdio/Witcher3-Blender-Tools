@@ -372,6 +372,13 @@ def get_unify_character_armature(context) -> bool:
     except Exception:
         return False
 
+def get_import_physics_enabled(context) -> bool:
+    try:
+        addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+        return bool(getattr(addon_prefs, "import_physics_enabled", True))
+    except Exception:
+        return True
+
 def get_rig_rot90_enabled(rig_settings, default=False):
     """Return whether the rig currently has rot90 applied."""
     if rig_settings is None:
@@ -442,6 +449,7 @@ from .ui import ui_import_menu
 from .ui import ui_dialog_language
 from .ui import ui_cutscene
 from .ui import ui_scene
+from .ui import ui_physics
 from .ui import armature_context
 from .ui import ui_cache_export
 from . import lipsync
@@ -1673,6 +1681,11 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         name="Pre-merge character armature on import",
         default=False,
         description="Experimental: import supported character templates as one precomputed armature instead of per-part armatures with constraints."
+    )
+    import_physics_enabled: bpy.props.BoolProperty(
+        name="Physics Enabled",
+        default=True,
+        description="Enable imported Dyng and Breast physics by default."
     )
 
     # Asset Browser state persistence
@@ -3995,6 +4008,8 @@ class WITCH_PT_Utils(WITCH_PT_Base, bpy.types.Panel):
                 col.prop(addon_prefs, "do_fix_tail", text="Default On Import")
             if hasattr(addon_prefs, "premerge_character_armature"):
                 col.prop(addon_prefs, "premerge_character_armature", text="Pre-merged Armature")
+            if hasattr(addon_prefs, "import_physics_enabled"):
+                col.prop(addon_prefs, "import_physics_enabled", text="Physics Enabled")
             obj = context.active_object
             armature = None
             if obj and obj.type == 'ARMATURE':
@@ -4175,11 +4190,6 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
                 col_row = col.row(align=True)
                 col_row.operator(WITCH_OT_ENTITY_lod_toggle.bl_idname, text="Hide", icon='HIDE_ON').action = "_collisionHide"
                 col_row.operator(WITCH_OT_ENTITY_lod_toggle.bl_idname, text="Show", icon='HIDE_OFF').action = "_collisionShow"
-                col.separator()
-                col.label(text="Cloth Simulation", icon='PHYSICS')
-                cloth_row = col.row(align=True)
-                cloth_row.operator("witcher.toggle_cloth_simulation", text="Hide", icon='HIDE_ON').show = False
-                cloth_row.operator("witcher.toggle_cloth_simulation", text="Show", icon='HIDE_OFF').show = True
 
             body = section("witcher_tools_rig", "Rig Tools", 'ARMATURE_DATA')
             if body:
@@ -4196,6 +4206,8 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
                     col.prop(addon_prefs, "do_fix_tail", text="Default On Import")
                 if hasattr(addon_prefs, "premerge_character_armature"):
                     col.prop(addon_prefs, "premerge_character_armature", text="Pre-merged Armature")
+                if hasattr(addon_prefs, "import_physics_enabled"):
+                    col.prop(addon_prefs, "import_physics_enabled", text="Physics Enabled")
                 obj = context.active_object
                 armature = None
                 if obj and obj.type == 'ARMATURE':
@@ -4558,6 +4570,7 @@ def register():
     ui_import_menu.register()
     ui_dialog_language.register()
     ui_anims.register()
+    ui_physics.register()
     ui_speech.register()
     ui_scene.register()
     ui_cutscene.register()
@@ -4648,6 +4661,7 @@ def unregister():
     ui_cutscene.unregister()
     ui_scene.unregister()
     ui_speech.unregister()
+    ui_physics.unregister()
     ui_anims.unregister()
     ui_dialog_language.unregister()
     ui_material.unregister()
