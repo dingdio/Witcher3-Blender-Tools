@@ -90,11 +90,29 @@ W2_FEMALE_SKELETON_MARKERS = (
     "characters\\base_entities\\woman_base\\woman_base.w2rig",
 )
 
+_CUTSCENE_TEMPLATE_CACHE = {}
+_CUTSCENE_TEMPLATE_CACHE_MAX = 2
+
+
 def loadCutsceneFile(filename):
     ext = os.path.splitext(filename)[1]
-    if ext.lower().endswith('.w2cutscene'):
-        return load_bin_cutscene(filename)
-    return None
+    if not ext.lower().endswith('.w2cutscene'):
+        return None
+    try:
+        stat = os.stat(filename)
+        cache_key = (os.path.normcase(os.path.abspath(filename)), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        cache_key = None
+    if cache_key is not None:
+        cached = _CUTSCENE_TEMPLATE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+    template = load_bin_cutscene(filename)
+    if cache_key is not None and template is not None:
+        while len(_CUTSCENE_TEMPLATE_CACHE) >= _CUTSCENE_TEMPLATE_CACHE_MAX:
+            _CUTSCENE_TEMPLATE_CACHE.pop(next(iter(_CUTSCENE_TEMPLATE_CACHE)))
+        _CUTSCENE_TEMPLATE_CACHE[cache_key] = template
+    return template
 
 
 def _is_w2_cutscene_file(filename):
@@ -1453,9 +1471,12 @@ def remove_cutscene_actor_hierarchy(actor_obj, object_names=None):
     return removed
 
 
-def unload_cutscene_actor(actor_obj):
+def unload_cutscene_actor(actor_obj, force_remove=False):
     if actor_obj is None:
         return 0
+
+    if force_remove:
+        return remove_cutscene_actor_hierarchy(actor_obj)
 
     clear_cutscene_actor_animation_tracks(actor_obj)
 
@@ -1790,8 +1811,17 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
     imported_new = bool(getattr(actor_obj, "get", lambda *_args, **_kwargs: False)(CUTSCENE_ACTOR_IMPORTED_PROP, False)) if actor_obj else False
     cutscene_guid = str(getattr(actor_obj, "get", lambda *_args, **_kwargs: "")(CUTSCENE_GUID_PROP, "") or "").strip() if actor_obj else ""
     actor_cache_key = f"{load_source_game}:{load_template_path}".lower()
+    # Prefer a source prepared with the same appearance: its duplicate needs no
+    # appearance re-import and no face-morph rebuild.
+    actor_cache_appearance_key = (
+        f"{actor_cache_key}|{preferred_appearance_name}".lower()
+        if preferred_appearance_name
+        else actor_cache_key
+    )
     if not actor_obj and load_template_path and int(duplicate_count or 0) > 1 and actor_cache is not None:
-        cached_actor = actor_cache.get(actor_cache_key)
+        cached_actor = actor_cache.get(actor_cache_appearance_key)
+        if cached_actor is None or getattr(cached_actor, "name", None) not in bpy.data.objects:
+            cached_actor = actor_cache.get(actor_cache_key)
         if cached_actor is not None and getattr(cached_actor, "name", None) in bpy.data.objects:
             actor_obj, cutscene_guid = _duplicate_cutscene_actor_from_source(
                 cached_actor,
@@ -1874,6 +1904,8 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
 
     _ensure_cutscene_actor_appearance(actor_obj, preferred_appearance_name)
     _ensure_cutscene_face_setup(actor_obj)
+    if actor_cache is not None and load_template_path and not retargeted_kind:
+        actor_cache.setdefault(actor_cache_appearance_key, actor_obj)
     if imported_new and cutscene_guid:
         _tag_cutscene_object_hierarchy(actor_obj, cutscene_guid)
     actor_proxy = _cutscene_actor_proxy_from_values(
@@ -3011,6 +3043,7 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
                 face_target_mode=face_target_mode,
                 target_component=target_component,
                 source_game=cutscene_source_game,
+                cutscene_template=None if cutscene_source_game == "w2" else cutscene_template,
             )
             _tag_cutscene_animation_actions(
                 target_armatures,

@@ -1,3 +1,4 @@
+import copy
 import logging
 log = logging.getLogger(__name__)
 import os
@@ -2146,3 +2147,100 @@ def load_bin_cutscene(fileName) -> w3_types.CCutsceneTemplate:
     theFile = getCR2W(open_cr2w_read_stream(fileName), do_read_anim_buffer=True)
     anim_set = create_CCutscene(theFile)
     return anim_set
+
+
+_RIG_NAMING_INFO_CACHE = {}
+
+
+def _rig_naming_info(rigPath):
+    """Return cached rig bone/track naming metadata."""
+    try:
+        stat = os.stat(rigPath)
+        cache_key = (os.path.normcase(os.path.abspath(rigPath)), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        cache_key = None
+    if cache_key is not None:
+        info = _RIG_NAMING_INFO_CACHE.get(cache_key)
+        if info is not None:
+            return info
+    rig = load_base_skeleton(rigPath)
+    if rig is None:
+        return None
+    bone_names = _skeleton_bone_names(rig)
+    tracks = getattr(rig, "tracks", None)
+    info = (
+        list(bone_names),
+        _skeleton_bone_count(rig, bone_names),
+        list(tracks) if tracks is not None else None,
+    )
+    if cache_key is not None:
+        _RIG_NAMING_INFO_CACHE[cache_key] = info
+    return info
+
+
+def _rebind_decoded_buffer_to_rig(buffer, bone_names, bone_count, track_names):
+    """Apply rig bone and track names to a copied decoded buffer."""
+    parts = getattr(buffer, "parts", None)
+    if parts is not None:
+        new_buffer = copy.copy(buffer)
+        new_buffer.parts = [
+            _rebind_decoded_buffer_to_rig(part, bone_names, bone_count, track_names)
+            for part in parts
+        ]
+        return new_buffer
+
+    new_buffer = copy.copy(buffer)
+    source_bones = getattr(buffer, "bones", None) or []
+    if len(source_bones) > bone_count:
+        log.warning(
+            'Animation has more bone entiries than skeleton. Rig:%s  Anim:%s',
+            bone_count,
+            len(source_bones),
+        )
+    new_bones = []
+    for idx, bone in enumerate(source_bones[:bone_count]):
+        new_bone = copy.copy(bone)
+        new_bone.BoneName = _safe_bone_name(bone_names, idx)
+        new_bones.append(new_bone)
+    new_buffer.bones = new_bones
+    new_tracks = []
+    for idx, track in enumerate(getattr(buffer, "tracks", None) or []):
+        new_track = copy.copy(track)
+        if track_names is not None and 0 <= idx < len(track_names):
+            new_track.trackName = track_names[idx]
+        else:
+            new_track.trackName = idx
+        new_tracks.append(new_track)
+    new_buffer.tracks = new_tracks
+    return new_buffer
+
+
+def build_cutscene_anim_entry_for_rig(cutscene_template, anim_name, rigPath=None):
+    """Build one rig-bound animation entry from a parsed W3 cutscene."""
+    anim_name = str(anim_name or "")
+    if not anim_name:
+        return None
+    source_entry = None
+    for entry in getattr(cutscene_template, "animations", None) or []:
+        animation = getattr(entry, "animation", None)
+        if str(getattr(animation, "name", "") or "") == anim_name:
+            source_entry = entry
+            break
+    if source_entry is None:
+        return None
+
+    if not rigPath:
+        rigPath = repo_file(r"characters\models\geralt\head\model\h_01_mg__geralt.w3fac")
+    info = _rig_naming_info(rigPath)
+    if info is None:
+        return None
+    bone_names, bone_count, track_names = info
+
+    new_animation = copy.copy(source_entry.animation)
+    new_animation.animBuffer = _rebind_decoded_buffer_to_rig(
+        source_entry.animation.animBuffer,
+        bone_names,
+        bone_count,
+        track_names,
+    )
+    return w3_types.CSkeletalAnimationSetEntry(new_animation, getattr(source_entry, "entries", None) or [])

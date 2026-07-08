@@ -2298,6 +2298,186 @@ def create_control_bone(arm_obj:bpy.types.Object, name = "w3_face_poses"):
         except Exception:
             pass
 
+def _face_mesh_donor_key(mesh_obj):
+    """Return a stable identity for face morph donor matching."""
+    if mesh_obj is None or getattr(mesh_obj, "type", None) != 'MESH' or getattr(mesh_obj, "data", None) is None:
+        return None
+    import hashlib
+    import struct
+
+    from ..unreal_export.mesh_signature import mesh_geometry_signature
+
+    signature = mesh_geometry_signature(mesh_obj)
+    if not signature:
+        return None
+    digest = hashlib.blake2b(digest_size=12)
+    digest.update(signature.encode())
+    digest.update(";".join(group.name for group in mesh_obj.vertex_groups).encode())
+    pack_weight = struct.Struct("<Hi").pack
+    for vertex in mesh_obj.data.vertices:
+        for group_entry in vertex.groups:
+            digest.update(pack_weight(group_entry.group, int(round(group_entry.weight * 10000.0))))
+    for row in mesh_obj.matrix_local:
+        digest.update(struct.pack("<4f", *(round(value, 5) for value in row)))
+    for modifier in mesh_obj.modifiers:
+        if not getattr(modifier, "show_viewport", True):
+            continue
+        digest.update(modifier.type.encode())
+        target = getattr(modifier, "object", None)
+        if getattr(target, "type", None) == 'ARMATURE':
+            pack_vec = struct.Struct("<3f").pack
+            for bone in target.data.bones:
+                digest.update(bone.name.encode())
+                digest.update(pack_vec(*(round(value, 5) for value in bone.head_local)))
+                digest.update(pack_vec(*(round(value, 5) for value in bone.tail_local)))
+    return digest.hexdigest()
+
+
+def try_copy_face_morphs_from_donor(context, main_obj):
+    """Clone baked face morphs from an identical actor."""
+    try:
+        if main_obj is None or getattr(main_obj, "type", None) != 'ARMATURE':
+            return False
+        face_file = str(main_obj.get('mimicFaceFile', '') or '').strip()
+        if not face_file or 'mimicFace' not in main_obj:
+            return False
+
+        faceData = import_rig.loadFaceFile(repo_file(face_file))
+        if faceData is None:
+            return False
+        pose_names = [str(getattr(pose, "name", "") or "") for pose in getattr(faceData, "mimicPoses", None) or []]
+        pose_names = [name for name in pose_names if name]
+        if not pose_names:
+            return False
+
+        target_meshes, face_rig = _resolve_face_mesh_objects_for_face_setup(context, main_obj, faceData=faceData)
+        if not target_meshes or face_rig is None:
+            return False
+        target_keys = {}
+        for mesh_obj in target_meshes:
+            mesh_key = _face_mesh_donor_key(mesh_obj)
+            if mesh_key is None:
+                return False
+            target_keys[mesh_obj.name] = mesh_key
+
+        face_file_key = face_file.lower()
+        donor_map = None
+        donor_names = None
+        donor_candidates = [main_obj]
+        donor_candidates.extend(
+            obj for obj in context.scene.objects
+            if obj is not main_obj and getattr(obj, "type", None) == 'ARMATURE'
+        )
+        for donor in donor_candidates:
+            if str(donor.get('mimicFaceFile', '') or '').strip().lower() != face_file_key:
+                continue
+            donor_meshes, donor_face_rig = _resolve_face_mesh_objects_for_face_setup(context, donor, faceData=faceData)
+            if not donor_meshes or donor_face_rig is None:
+                continue
+            donor_rig_settings = getattr(donor.data, "witcherui_RigSettings", None)
+            donor_reload_names = _collect_face_reload_shape_key_names(
+                faceData,
+                getattr(donor_rig_settings, "witcher_morphs_list", None),
+            )
+            candidate_map = {}
+            candidate_names = {}
+            for donor_mesh in donor_meshes:
+                shape_keys = getattr(donor_mesh.data, "shape_keys", None)
+                key_blocks = getattr(shape_keys, "key_blocks", None) if shape_keys else None
+                if not key_blocks or len(key_blocks) < 2:
+                    continue
+                baked_names = [
+                    kb.name for kb in key_blocks
+                    if kb != key_blocks[0] and kb.name in donor_reload_names
+                ]
+                if not baked_names:
+                    continue
+                mesh_key = _face_mesh_donor_key(donor_mesh)
+                if mesh_key is None or mesh_key in candidate_map:
+                    continue
+                candidate_map[mesh_key] = donor_mesh
+                candidate_names[mesh_key] = baked_names
+            if all(mesh_key in candidate_map for mesh_key in target_keys.values()):
+                donor_map = candidate_map
+                donor_names = candidate_names
+                break
+        if donor_map is None:
+            return False
+
+        scene = getattr(context, "scene", None)
+        if scene is not None:
+            set_main_armature(scene, main_obj)
+        create_control_bone(main_obj, W3_FACE_POSES_BONE)
+        _safe_mode_set('OBJECT', main_obj)
+        control_bone = main_obj.pose.bones.get(W3_FACE_POSES_BONE)
+        if control_bone is None:
+            return False
+
+        rig_settings = main_obj.data.witcherui_RigSettings
+        rig_settings.model_armature_object = main_obj
+        morph_list = rig_settings.witcher_morphs_list
+        existing_morph_keys = {(el.name, el.path, el.type) for el in morph_list}
+        for pose_name in pose_names:
+            control_bone[pose_name] = 0.0
+            control_bone.id_properties_ui(pose_name).update(min=0., max=1.)
+            witcherui_add_redmorph(morph_list, [pose_name, pose_name, 4], existing_keys=existing_morph_keys)
+
+        copied_keys = 0
+        for mesh_obj in target_meshes:
+            donor_mesh = donor_map[target_keys[mesh_obj.name]]
+            copy_names = donor_names[target_keys[mesh_obj.name]]
+            if donor_mesh is mesh_obj or donor_mesh.data is mesh_obj.data:
+                copied_keys += len(copy_names)
+                continue
+            _remove_face_reload_shape_keys([mesh_obj], set(copy_names))
+            donor_blocks = donor_mesh.data.shape_keys.key_blocks
+            coords = [0.0] * (len(donor_mesh.data.vertices) * 3)
+            for key_name in copy_names:
+                donor_block = donor_blocks.get(key_name)
+                if donor_block is None:
+                    continue
+                donor_block.data.foreach_get("co", coords)
+                if _write_morph_shape_key_coords(
+                    main_obj,
+                    mesh_obj,
+                    key_name,
+                    coords,
+                    control_bone_name=W3_FACE_POSES_BONE,
+                    ensure_driver=False,
+                ):
+                    copied_keys += 1
+        if not copied_keys:
+            return False
+
+        for pose_name in pose_names:
+            for mesh_obj in target_meshes:
+                ensure_morph_driver(main_obj, mesh_obj, pose_name, control_bone_name=W3_FACE_POSES_BONE)
+        for mesh_obj in target_meshes:
+            shape_keys = mesh_obj.data.shape_keys
+            if shape_keys and shape_keys.animation_data:
+                for driver_curve in shape_keys.animation_data.drivers:
+                    _refresh_driver_expression(driver_curve.driver)
+
+        _activate_object(main_obj)
+        try:
+            op_result = bpy.ops.witcher.load_face_phonemes()
+            if 'FINISHED' not in op_result:
+                log.warning("Phoneme refresh after face morph reuse returned %s", op_result)
+        except Exception as exc:
+            log.warning("Phoneme refresh after face morph reuse failed: %s", exc)
+
+        log.info(
+            "Reused %d baked face morph shape key(s) for %s from an identical head already in the scene.",
+            copied_keys,
+            main_obj.name,
+        )
+        return True
+    except Exception:
+        log.warning("Face morph reuse failed for '%s'; falling back to full bake.",
+                    getattr(main_obj, "name", "<unknown>"), exc_info=True)
+        return False
+
+
 class WITCH_OT_morphs(bpy.types.Operator):
     """Load face morph drivers for the currently targeted character armature."""
     bl_idname = "witcher.load_face_morphs"

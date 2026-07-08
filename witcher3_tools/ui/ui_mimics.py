@@ -254,6 +254,16 @@ def _ensure_face_morphs_loaded(context, armature_obj, force=False):
     if not has_w3_mimic and not has_w2_mimic:
         return False
 
+    if has_w3_mimic:
+        # An identical, already-baked head in the scene
+        try:
+            from .ui_morphs import try_copy_face_morphs_from_donor
+
+            if try_copy_face_morphs_from_donor(context, armature_obj) and _has_face_morphs_loaded(armature_obj):
+                return True
+        except Exception:
+            log.debug("Face morph donor reuse failed; falling back to bake.", exc_info=True)
+
     view_layer = context.view_layer
     prev_active = view_layer.objects.active
     prev_selected = [obj for obj in context.selected_objects]

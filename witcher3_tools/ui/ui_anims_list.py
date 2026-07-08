@@ -3,7 +3,7 @@ from pathlib import Path
 from .. import import_anims
 #from io_import_w2l.filter_list import memory
 log = logging.getLogger(__name__)
-from ..CR2W.dc_anims import load_bin_anims_single
+from ..CR2W.dc_anims import build_cutscene_anim_entry_for_rig, load_bin_anims_single
 from ..repo_paths import (
     normalize_source_game,
     repo_file_for_source,
@@ -1819,7 +1819,7 @@ def _retarget_w2_animation_entry(context, animation_entry, source_rig_path, targ
 
 def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0,
                          face_target_mode="auto", nla_mode='replace', target_component="", source_game="",
-                         use_NLA=True):
+                         use_NLA=True, cutscene_template=None):
     face_animation = is_face_animation(anim_name, fdir)
     if face_target_mode == "owner" and face_animation:
         main_arm_obj, owner_armature, rig_path = resolve_owner_face_animation_context(
@@ -1864,14 +1864,24 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
             raise RuntimeError(f"W2 source rig for retarget was not found. Configure W2 Retarget Source Rig. Roots: {roots}")
         load_rig_path = retarget_source_rig_path
 
-    result = load_bin_anims_single(
-        fdir,
-        anim_name,
-        rigPath=load_rig_path,
-    )
-    if not result or not result.animations:
-        raise RuntimeError(f"Animation '{anim_name}' was not found in {fdir}")
-    animation = result.animations[0]
+    animation = None
+    if cutscene_template is not None and not retarget_w2 and effective_source_game != "w2":
+        # W3 cutscene fast path: the template load already decoded every clip;
+        # rebinding it to the rig avoids re-parsing the cutscene per animation.
+        try:
+            animation = build_cutscene_anim_entry_for_rig(cutscene_template, anim_name, rigPath=load_rig_path)
+        except Exception:
+            log.warning("Cutscene template reuse failed for '%s'; falling back to file parse.", anim_name, exc_info=True)
+            animation = None
+    if animation is None:
+        result = load_bin_anims_single(
+            fdir,
+            anim_name,
+            rigPath=load_rig_path,
+        )
+        if not result or not result.animations:
+            raise RuntimeError(f"Animation '{anim_name}' was not found in {fdir}")
+        animation = result.animations[0]
     if retarget_w2:
         animation = _retarget_w2_animation_entry(
             context,

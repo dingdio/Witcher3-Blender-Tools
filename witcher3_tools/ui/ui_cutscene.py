@@ -566,6 +566,41 @@ def _join_cutscene_metadata_list(values):
     return "; ".join(items)
 
 
+def _cutscene_fixed_row(layout, ui_units_x):
+    row = layout.row(align=True)
+    row.ui_units_x = max(1.0, float(ui_units_x or 1.0))
+    return row
+
+
+def _cutscene_label_units(text, icon=False, minimum=3.0, maximum=12.0):
+    base = 2.0 if icon else 1.2
+    units = base + (len(str(text or "")) * 0.45)
+    return max(float(minimum), min(float(maximum), units))
+
+
+def _cutscene_fixed_label(
+    layout,
+    text="",
+    icon=None,
+    units=None,
+    minimum=3.0,
+    maximum=12.0,
+    enabled=True,
+    alignment=None,
+):
+    if units is None:
+        units = _cutscene_label_units(text, icon=bool(icon), minimum=minimum, maximum=maximum)
+    row = _cutscene_fixed_row(layout, units)
+    row.enabled = enabled
+    if alignment:
+        row.alignment = alignment
+    if icon:
+        row.label(text=text, icon=icon)
+    else:
+        row.label(text=text)
+    return row
+
+
 def _set_cutscene_export_metadata_scene_state(scene, point_tags=(), last_level_loaded="", used_in_files=(), synced=False):
     if hasattr(scene, export_cutscene.CUTSCENE_POINT_TAGS_PROP):
         scene.witcher_cutscene_point_tags = _join_cutscene_metadata_list(point_tags)
@@ -642,12 +677,18 @@ class WITCH_UL_CutsceneActorPreview(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
-            row.prop(item, "selected", text="")
+            _cutscene_fixed_row(row, 1.4).prop(item, "selected", text="")
             row.label(text=item.label or item.actor_name or "Actor", icon='ARMATURE_DATA')
             if item.already_in_scene:
-                row.label(text="IN SCENE", icon='CHECKMARK')
+                _cutscene_fixed_label(row, "IN SCENE", icon='CHECKMARK', units=6.8)
             if item.appearance_name:
-                row.label(text=item.appearance_name, icon='MATERIAL_DATA')
+                _cutscene_fixed_label(
+                    row,
+                    item.appearance_name,
+                    icon='MATERIAL_DATA',
+                    minimum=7.0,
+                    maximum=12.0,
+                )
         elif self.layout_type in {'GRID'}:
             layout.alignment = 'CENTER'
             layout.label(text="")
@@ -659,10 +700,16 @@ class WITCH_UL_CutsceneAnimationPreview(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
-            row.prop(item, "selected", text="")
+            _cutscene_fixed_row(row, 1.4).prop(item, "selected", text="")
             row.label(text=_get_cutscene_animation_label(item), icon='ACTION')
             if item.component_name:
-                row.label(text=item.component_name, icon='BONE_DATA')
+                _cutscene_fixed_label(
+                    row,
+                    item.component_name,
+                    icon='BONE_DATA',
+                    minimum=4.4,
+                    maximum=8.0,
+                )
         elif self.layout_type in {'GRID'}:
             layout.alignment = 'CENTER'
             layout.label(text="")
@@ -865,14 +912,20 @@ class WITCH_UL_LoadedActorList(UIList):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
             state = _get_cutscene_actor_display_state(item)
-            row.label(text="", icon='CHECKMARK' if state["is_loaded"] else 'RADIOBUT_OFF')
+            _cutscene_fixed_label(row, "", icon='CHECKMARK' if state["is_loaded"] else 'RADIOBUT_OFF', units=1.4)
             label = item.label or item.actor_name or f"Actor {item.source_index + 1}"
             row.label(text=label, icon='ARMATURE_DATA')
             if item.appearance_name:
-                row.label(text=item.appearance_name, icon='MATERIAL_DATA')
+                _cutscene_fixed_label(
+                    row,
+                    item.appearance_name,
+                    icon='MATERIAL_DATA',
+                    minimum=7.0,
+                    maximum=12.0,
+                )
             atype = str(item.actor_type or "").replace("CAT_", "")
             if atype and atype != "Actor":
-                row.label(text=atype)
+                _cutscene_fixed_label(row, atype, minimum=4.0, maximum=6.0)
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text="")
@@ -920,13 +973,13 @@ class WITCH_UL_LoadedAnimList(UIList):
             if item.source_index == -1:
                 row.label(text="Cutscene", icon='SCENE_DATA')
             else:
-                row.label(text="", icon='CHECKMARK' if item.is_loaded else 'RADIOBUT_OFF')
+                _cutscene_fixed_label(row, "", icon='CHECKMARK' if item.is_loaded else 'RADIOBUT_OFF', units=1.4)
                 row.label(text=_get_cutscene_animation_label(item), icon='ACTION')
                 part_count = _count_cutscene_anim_parts(context, item)
                 if part_count > 1:
-                    row.label(text=f"×{part_count}", icon='BLANK1')
+                    _cutscene_fixed_label(row, f"×{part_count}", icon='BLANK1', units=3.0, alignment='RIGHT')
                 if item.duration:
-                    row.label(text=f"{item.duration:.2f}s")
+                    _cutscene_fixed_label(row, f"{item.duration:.2f}s", units=4.6, alignment='RIGHT')
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text="")
@@ -1303,6 +1356,141 @@ def _load_cutscene_dialogs_into_scene(context):
 
     _finalize_cutscene_dialog_item_ranges(scene)
     return {"loaded": loaded, "skipped": skipped, "total": len(dialog_items), "sound_loaded": sound_loaded}
+
+
+def _cutscene_dialog_data_from_item(item):
+    return {
+        "actor": str(getattr(item, "actor", "") or ""),
+        "voice_file": str(getattr(item, "voice_file", "") or ""),
+        "sound_event": str(getattr(item, "sound_event", "") or ""),
+        "line_id": str(getattr(item, "line_id", "") or ""),
+        "line_index": int(getattr(item, "line_index", 0) or 0),
+        "line_text": str(getattr(item, "line_text", "") or ""),
+        "scene_path": str(getattr(item, "scene_path", "") or ""),
+        "source_game": str(getattr(item, "source_game", "") or ""),
+    }
+
+
+def _dialog_item_matches_actor_entry(item, actor_entry):
+    dialog_actor = str(getattr(item, "actor", "") or "").strip().lower()
+    if not dialog_actor or actor_entry is None:
+        return False
+    actor_names = set()
+    for value in (
+        getattr(actor_entry, "actor_name", ""),
+        getattr(actor_entry, "voice_tag", ""),
+    ):
+        value = str(value or "").strip().lower()
+        if value:
+            actor_names.add(value)
+    tag_value = str(getattr(actor_entry, "tag", "") or "").replace(",", ";")
+    for value in tag_value.split(";"):
+        value = value.strip().lower()
+        if value:
+            actor_names.add(value)
+    return dialog_actor in actor_names
+
+
+def _restore_cutscene_actor_dialog_lipsync(context, actor_entry, actor_obj):
+    from ..ui.ui_voice import load_voice_and_lipsync, load_w2_voice_and_lipsync
+
+    scene = getattr(context, "scene", None) if context is not None else None
+    if scene is None or actor_entry is None or actor_obj is None:
+        return {"loaded": 0, "skipped": 0, "sound_loaded": 0}
+
+    filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+    dialog_items = [
+        item for item in getattr(scene, "witcher_cutscene_dialog_items", []) or []
+        if _dialog_item_matches_actor_entry(item, actor_entry)
+    ]
+    if not filepath or not dialog_items:
+        return {"loaded": 0, "skipped": 0, "sound_loaded": 0}
+
+    loaded = 0
+    skipped = 0
+    sound_loaded = 0
+    for item in dialog_items:
+        dialog_data = _cutscene_dialog_data_from_item(item)
+        line_id = str(getattr(item, "line_id", "") or _cutscene_dialog_line_id(dialog_data)).strip()
+        at_frame = float(getattr(item, "start_frame", 0) or 0)
+        strip_props = _cutscene_dialog_strip_props(filepath, dialog_data, item=item)
+        soundstrip = None
+        imported_line = False
+
+        try:
+            if line_id or dialog_data["sound_event"]:
+                import_cutscene.remove_cutscene_dialog_audio_strips(
+                    scene,
+                    source_path=filepath,
+                    line_id=line_id,
+                    sound_event=dialog_data["sound_event"],
+                )
+        except Exception:
+            log.debug("Could not remove existing dialog audio for line %s", line_id, exc_info=True)
+
+        for voice_id in _cutscene_dialog_voice_id_candidates(dialog_data):
+            try:
+                load_voice = (
+                    load_w2_voice_and_lipsync
+                    if str(dialog_data.get("source_game", "") or "").upper() == "W2"
+                    else load_voice_and_lipsync
+                )
+                soundstrip = load_voice(
+                    str(voice_id),
+                    actor=actor_obj,
+                    context=context,
+                    at_frame=at_frame,
+                    strip_props=strip_props,
+                    nla_mode="replace",
+                )
+                imported_line = True
+                break
+            except Exception as exc:
+                log.warning(
+                    "Failed to restore dialog lipsync line %s for actor %s: %s",
+                    voice_id,
+                    getattr(actor_entry, "actor_name", ""),
+                    exc,
+                )
+
+        if soundstrip is None and dialog_data["sound_event"]:
+            try:
+                soundstrip = import_cutscene.import_sound_event_to_timeline(
+                    context,
+                    dialog_data["sound_event"],
+                    frame_start=at_frame,
+                    source_path=filepath,
+                    line_id=line_id,
+                    line_text=dialog_data["line_text"],
+                    strip_props=strip_props,
+                )
+                imported_line = imported_line or soundstrip is not None
+            except Exception as exc:
+                log.warning(
+                    "Failed to restore dialog sound event %s for actor %s: %s",
+                    dialog_data["sound_event"],
+                    getattr(actor_entry, "actor_name", ""),
+                    exc,
+                )
+
+        if soundstrip is not None:
+            item.imported_sound = True
+            sound_loaded += 1
+            try:
+                item.end_frame = max(
+                    int(getattr(item, "end_frame", 0) or 0),
+                    int(math.ceil(float(getattr(soundstrip, "frame_final_end", at_frame) or at_frame))),
+                )
+            except Exception:
+                pass
+
+        if imported_line:
+            loaded += 1
+        else:
+            skipped += 1
+
+    _finalize_cutscene_dialog_item_ranges(scene)
+    return {"loaded": loaded, "skipped": skipped, "sound_loaded": sound_loaded}
 
 
 class WITCH_OT_LoadCutsceneDialogs(Operator):
@@ -1895,6 +2083,243 @@ def _rebuild_cutscene_actor_animations(scene, actor_entry):
             animation_entry.is_loaded = int(animation_entry.source_index) in applied_indices
     return applied_indices, error_messages
 
+
+def _find_loaded_actor_entry_index(scene, source_index=-1, object_name="", actor_name=""):
+    object_name = str(object_name or "").strip()
+    actor_name = str(actor_name or "").strip()
+    try:
+        source_index = int(source_index)
+    except Exception:
+        source_index = -1
+    entries = list(getattr(scene, "witcher_cutscene_actor_items", []) or [])
+    if object_name:
+        for idx, entry in enumerate(entries):
+            if str(getattr(entry, "object_name", "") or "").strip() == object_name:
+                return idx
+    if source_index >= 0:
+        for idx, entry in enumerate(entries):
+            if int(getattr(entry, "source_index", -1)) == source_index:
+                return idx
+    if actor_name:
+        for idx, entry in enumerate(entries):
+            if str(getattr(entry, "actor_name", "") or "").strip() == actor_name:
+                return idx
+    return -1
+
+
+def _find_loaded_actor_entry(scene, source_index=-1, object_name="", actor_name=""):
+    items = getattr(scene, "witcher_cutscene_actor_items", None)
+    idx = _find_loaded_actor_entry_index(scene, source_index, object_name, actor_name)
+    if items is not None and idx >= 0:
+        return items[idx]
+    return None
+
+
+def _clear_loaded_actor_animation_flags(scene, actor_entry):
+    if actor_entry is None:
+        return
+    for animation_entry in getattr(scene, "witcher_cutscene_animation_items", []):
+        if _animation_matches_actor_entry(scene, animation_entry, actor_entry):
+            animation_entry.is_loaded = False
+
+
+def _is_cutscene_face_animation_entry(animation_entry):
+    component_name = str(getattr(animation_entry, "component_name", "") or "").strip().lower()
+    if component_name == "face":
+        return True
+    full_name = str(getattr(animation_entry, "full_name", "") or "")
+    return import_cutscene._is_face_cutscene_animation(full_name)
+
+
+def _actor_animation_entries_for_layer(scene, actor_entry, layer="ALL"):
+    layer = str(layer or "ALL").upper()
+    entries = []
+    for animation_entry in getattr(scene, "witcher_cutscene_animation_items", []):
+        if _coerce_cutscene_index(getattr(animation_entry, "source_index", -1)) < 0:
+            continue
+        if not _animation_matches_actor_entry(scene, animation_entry, actor_entry):
+            continue
+        is_face = _is_cutscene_face_animation_entry(animation_entry)
+        if layer == "FACE" and not is_face:
+            continue
+        if layer == "ROOT" and is_face:
+            continue
+        entries.append(animation_entry)
+    return entries
+
+
+def _actor_animation_layer_state(scene, actor_entry, layer="ALL"):
+    entries = _actor_animation_entries_for_layer(scene, actor_entry, layer=layer)
+    loaded_count = 0
+    for animation_entry in entries:
+        if _get_cutscene_animation_display_state(scene, animation_entry)["is_loaded"]:
+            loaded_count += 1
+    return loaded_count, len(entries)
+
+
+def _actor_metadata_from_object(obj):
+    def _get(name, default=""):
+        try:
+            return str(obj.get(name, default) or "").strip()
+        except Exception:
+            return str(default)
+
+    return {
+        "actor_name": _get("cutscene_actor_name"),
+        "tag": _get("cutscene_actor_tag"),
+        "voice_tag": _get("cutscene_actor_voice_tag"),
+        "template_path": _get("cutscene_actor_template"),
+        "appearance_name": _get("cutscene_actor_appearance"),
+        "actor_type": _get("cutscene_actor_type", "CAT_Actor"),
+        "final_position": _get("cutscene_actor_final_position"),
+        "anim_final_pos": _get("cutscene_actor_anim_final_pos"),
+        "source_game": _loaded_cutscene_actor_source_game(obj, fallback=""),
+        "kill_me": bool(obj.get("cutscene_actor_kill_me", False)),
+        "use_mimic": bool(obj.get("cutscene_actor_use_mimic", False)),
+    }
+
+
+def _sync_actor_items_with_scene(scene):
+    """Sync scene-tagged actors into the actor list."""
+    items = getattr(scene, "witcher_cutscene_actor_items", None)
+    if items is None:
+        return 0
+    existing_object_names = {
+        str(getattr(item, "object_name", "") or "").strip()
+        for item in items
+        if str(getattr(item, "object_name", "") or "").strip()
+    }
+    existing_actor_names = {
+        str(getattr(item, "actor_name", "") or "").strip().lower()
+        for item in items
+        if str(getattr(item, "actor_name", "") or "").strip()
+    }
+    added = 0
+    for obj in scene.objects:
+        if getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        obj_name = str(getattr(obj, "name", "") or "")
+        actor_name = str(obj.get("cutscene_actor_name", "") or "").strip()
+        if not actor_name:
+            continue
+        if obj_name in existing_object_names:
+            continue
+        # An unloaded imported-file entry may already hold this actor name; don't duplicate.
+        if actor_name.lower() in existing_actor_names:
+            entry = _find_loaded_actor_entry(scene, actor_name=actor_name)
+            if entry is not None:
+                entry.object_name = obj_name
+                entry.is_loaded = True
+                entry.cutscene_guid = str(obj.get(import_cutscene.CUTSCENE_GUID_PROP, "") or "")
+                entry.imported_by_cutscene = bool(obj.get(import_cutscene.CUTSCENE_ACTOR_IMPORTED_PROP, False))
+            continue
+        meta = _actor_metadata_from_object(obj)
+        item = items.add()
+        item.source_index = -1
+        item.label = meta["actor_name"]
+        item.actor_name = meta["actor_name"]
+        item.tag = meta["tag"]
+        item.voice_tag = meta["voice_tag"]
+        item.template_path = meta["template_path"]
+        item.source_game = meta["source_game"]
+        item.appearance_name = meta["appearance_name"]
+        item.actor_type = meta["actor_type"]
+        item.final_position = meta["final_position"]
+        item.kill_me = meta["kill_me"]
+        item.use_mimic = meta["use_mimic"]
+        item.anim_final_pos = meta["anim_final_pos"]
+        item.object_name = obj_name
+        item.cutscene_guid = str(obj.get(import_cutscene.CUTSCENE_GUID_PROP, "") or "")
+        item.is_loaded = True
+        item.imported_by_cutscene = bool(obj.get(import_cutscene.CUTSCENE_ACTOR_IMPORTED_PROP, False))
+        existing_object_names.add(obj_name)
+        existing_actor_names.add(actor_name.lower())
+        added += 1
+    return added
+
+
+_ACTOR_SYNC_DEFERRED = set()
+
+
+def _scene_needs_actor_sync(scene):
+    items = getattr(scene, "witcher_cutscene_actor_items", None)
+    if items is None:
+        return False
+    known_objects = {
+        str(getattr(i, "object_name", "") or "")
+        for i in items if str(getattr(i, "object_name", "") or "")
+    }
+    known_names = {
+        str(getattr(i, "actor_name", "") or "").strip().lower()
+        for i in items if str(getattr(i, "actor_name", "") or "").strip()
+    }
+    for obj in scene.objects:
+        if getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        actor_name = str(obj.get("cutscene_actor_name", "") or "").strip()
+        if not actor_name:
+            continue
+        if obj.name in known_objects or actor_name.lower() in known_names:
+            continue
+        return True
+    return False
+
+
+def _schedule_actor_items_sync(scene):
+    """Run _sync_actor_items_with_scene on a timer so it never mutates during draw."""
+    scene_name = str(getattr(scene, "name", "") or "")
+    if not scene_name or scene_name in _ACTOR_SYNC_DEFERRED:
+        return
+    _ACTOR_SYNC_DEFERRED.add(scene_name)
+
+    def _do_sync():
+        _ACTOR_SYNC_DEFERRED.discard(scene_name)
+        target = bpy.data.scenes.get(scene_name)
+        if target is None:
+            return
+        try:
+            _sync_actor_items_with_scene(target)
+        except Exception:
+            log.debug("Deferred actor-item sync failed.", exc_info=True)
+
+    try:
+        bpy.app.timers.register(_do_sync, first_interval=0.0)
+    except Exception:
+        _ACTOR_SYNC_DEFERRED.discard(scene_name)
+
+
+def _actor_has_resolveable_template(entry, scene):
+    template_path = str(getattr(entry, "template_path", "") or "").strip()
+    if not template_path:
+        return False
+    try:
+        resolved = import_cutscene.resolve_cutscene_actor_replacement_template_path(
+            template_path,
+            cutscene_filename=str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or ""),
+            source_game=str(getattr(entry, "source_game", "") or "W3").upper() or "W3",
+            context=bpy.context,
+        )
+    except Exception:
+        resolved = ""
+    return bool(resolved) and import_cutscene.win_path_isfile(resolved)
+
+
+def _restore_actor_rest_pose(actor_obj):
+    """Clear pose offsets on the actor's related armatures so it returns to rest."""
+    if actor_obj is None:
+        return
+    try:
+        from .ui_morphs import _clear_pose_bones
+    except Exception:
+        log.debug("Could not import _clear_pose_bones for rest-pose restore.", exc_info=True)
+        return
+    for arm_obj in import_cutscene._iter_cutscene_related_armatures(actor_obj):
+        try:
+            _clear_pose_bones(getattr(getattr(arm_obj, "pose", None), "bones", None))
+        except Exception:
+            log.debug("Failed to clear pose on %s", getattr(arm_obj, "name", ""), exc_info=True)
+
+
 class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
     """Import W2 Cutscee"""
     bl_idname = "witcher.import_w2_cutscene"
@@ -2067,8 +2492,7 @@ class ButtonOperatorImportW2cutscene(Operator, ImportHelper):
         }
 
         if not selected_actor_indices and not selected_animation_indices:
-            self.report({'WARNING'}, "Nothing selected to import.")
-            return {'CANCELLED'}
+            self.report({'INFO'}, "Nothing auto-selected; loading cutscene list only.")
 
         try:
             if self.retarget_w2_to_w3 and hasattr(context.scene, "witcher_w2_retarget_to_w3"):
@@ -2241,11 +2665,11 @@ class WITCH_OT_SetCutsceneAnimationLoaded(Operator):
             return {'CANCELLED'}
         actor_state = _get_cutscene_actor_display_state(actor_entry)
 
+        # Actors and animations are decoupled: activating an animation never implicitly
+        # imports its actor. The anim row offers an explicit "Import Actor" button instead.
         if self.load and not actor_state["is_loaded"]:
-            actor_obj = _load_cutscene_actor_entry(scene, actor_entry)
-            if actor_obj is None:
-                self.report({'ERROR'}, "Failed to load the actor required by this animation.")
-                return {'CANCELLED'}
+            self.report({'ERROR'}, "Import this animation's actor first.")
+            return {'CANCELLED'}
 
         animation_entry.is_loaded = bool(self.load)
         applied_indices, error_messages = _rebuild_cutscene_actor_animations(scene, actor_entry)
@@ -2258,25 +2682,229 @@ class WITCH_OT_SetCutsceneAnimationLoaded(Operator):
             self.report({'ERROR'}, message)
             return {'CANCELLED'}
 
+        # Deactivating the last cutscene animation for an actor returns it to rest pose.
+        if not self.load:
+            actor_obj = actor_state["actor_obj"]
+            if actor_obj is not None and not _loaded_actor_active_animation_indices(scene, actor_entry):
+                _restore_actor_rest_pose(actor_obj)
+
         if self.load:
             self.report({'INFO'}, f"Loaded animation '{_get_cutscene_animation_label(animation_entry)}'.")
         else:
             self.report({'INFO'}, f"Unloaded animation '{_get_cutscene_animation_label(animation_entry)}'.")
         return {'FINISHED'}
 
+
+class WITCH_OT_SetCutsceneActorAnimationLayer(Operator):
+    bl_idname = "witcher.set_cutscene_actor_animation_layer"
+    bl_label = "Toggle Actor Animations"
+    bl_description = "Activate or deactivate this actor's root/body or face cutscene animations"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    source_index: IntProperty(default=-1)
+    object_name: StringProperty(default="")
+    actor_name: StringProperty(default="")
+    layer: EnumProperty(
+        items=[
+            ('ROOT', "Root", "Root/body animations for this actor"),
+            ('FACE', "Face", "Face/mimic animations for this actor"),
+            ('ALL', "All", "All animations for this actor"),
+        ],
+        default='ROOT',
+    )
+    load: BoolProperty(default=True)
+
+    def execute(self, context):
+        scene = context.scene
+        actor_entry = _find_loaded_actor_entry(scene, self.source_index, self.object_name, self.actor_name)
+        if actor_entry is None:
+            self.report({'ERROR'}, "Cutscene actor entry not found.")
+            return {'CANCELLED'}
+
+        actor_state = _get_cutscene_actor_display_state(actor_entry)
+        if self.load and not actor_state["is_loaded"]:
+            self.report({'ERROR'}, "Activate this actor first.")
+            return {'CANCELLED'}
+
+        entries = _actor_animation_entries_for_layer(scene, actor_entry, self.layer)
+        if not entries:
+            self.report({'WARNING'}, f"No {self.layer.lower()} animations for this actor.")
+            return {'CANCELLED'}
+
+        requested_indices = {_coerce_cutscene_index(getattr(entry, "source_index", -1)) for entry in entries}
+        for entry in entries:
+            entry.is_loaded = bool(self.load)
+
+        applied_indices, error_messages = _rebuild_cutscene_actor_animations(scene, actor_entry)
+        layer_label = self.layer.capitalize()
+        if self.load:
+            failed_indices = sorted(idx for idx in requested_indices if idx not in applied_indices)
+            if failed_indices:
+                first_error = str(error_messages.get(failed_indices[0], "") or "").strip()
+                if len(failed_indices) == len(requested_indices):
+                    message = f"Failed to load {layer_label} animations"
+                    if first_error:
+                        message = f"{message}: {first_error}"
+                    self.report({'ERROR'}, message)
+                    return {'CANCELLED'}
+                message = f"Loaded {len(requested_indices) - len(failed_indices)}/{len(requested_indices)} {layer_label} animations"
+                if first_error:
+                    message = f"{message}: {first_error}"
+                self.report({'WARNING'}, message)
+                return {'FINISHED'}
+            self.report({'INFO'}, f"Loaded {len(requested_indices)} {layer_label} animation(s).")
+            return {'FINISHED'}
+
+        actor_obj = actor_state["actor_obj"]
+        if actor_obj is not None and not _loaded_actor_active_animation_indices(scene, actor_entry):
+            _restore_actor_rest_pose(actor_obj)
+        self.report({'INFO'}, f"Unloaded {len(requested_indices)} {layer_label} animation(s).")
+        return {'FINISHED'}
+
+
+class WITCH_OT_SetCutsceneActorLoaded(Operator):
+    bl_idname = "witcher.set_cutscene_actor_loaded"
+    bl_label = "Toggle Cutscene Actor"
+    bl_description = (
+        "Activate (import) or deactivate (delete) this actor's entity. The actor stays in the list"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    source_index: IntProperty(default=-1)
+    object_name: StringProperty(default="")
+    actor_name: StringProperty(default="")
+    load: BoolProperty(default=True)
+
+    def execute(self, context):
+        scene = context.scene
+        entry = _find_loaded_actor_entry(scene, self.source_index, self.object_name, self.actor_name)
+        if entry is None:
+            self.report({'ERROR'}, "Cutscene actor entry not found.")
+            return {'CANCELLED'}
+        label = str(getattr(entry, "label", "") or getattr(entry, "actor_name", "") or "actor")
+
+        if self.load:
+            filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+            if int(getattr(entry, "source_index", -1)) < 0 or not filepath:
+                self.report({'ERROR'}, "This actor can't be re-spawned here; use 'Assign Selected Armature' to add it again.")
+                return {'CANCELLED'}
+            actor_obj = _load_cutscene_actor_entry(scene, entry)
+            if actor_obj is None:
+                self.report({'ERROR'}, f"Failed to import actor '{label}'.")
+                return {'CANCELLED'}
+            _sync_actor_items_with_scene(scene)
+            try:
+                dialog_stats = _restore_cutscene_actor_dialog_lipsync(context, entry, actor_obj)
+            except Exception as exc:
+                log.warning("Failed to restore dialog lipsync for actor %s: %s", label, exc)
+                self.report({'WARNING'}, f"Imported actor '{label}', but dialog lipsync restore failed: {exc}")
+                return {'FINISHED'}
+            dialog_count = int(dialog_stats.get("loaded", 0) or 0)
+            message = f"Imported actor '{label}'."
+            if dialog_count:
+                message = f"{message} Restored {dialog_count} dialog line(s)."
+            self.report({'INFO'}, message)
+            return {'FINISHED'}
+
+        actor_obj = _get_loaded_cutscene_actor_object(entry)
+        obj_name = str(getattr(actor_obj, "name", "") or getattr(entry, "object_name", "") or "")
+        if actor_obj is not None:
+            import_cutscene.unload_cutscene_actor(actor_obj, force_remove=True)
+        _clear_loaded_actor_animation_flags(scene, entry)
+        entry.object_name = ""
+        entry.cutscene_guid = ""
+        entry.is_loaded = False
+        entry.imported_by_cutscene = False
+        if obj_name and str(getattr(scene, "witcher_cutscene_selected_actor_obj", "") or "") == obj_name:
+            scene.witcher_cutscene_selected_actor_obj = ""
+        self.report({'INFO'}, f"Removed entity for '{label}' (actor kept in list).")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneRemoveActorFull(Operator):
+    bl_idname = "witcher.cutscene_remove_actor_full"
+    bl_label = "Remove Cutscene Actor"
+    bl_description = "Remove this actor from the cutscene entirely: delete its entity and drop it from the list"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    source_index: IntProperty(default=-1)
+    object_name: StringProperty(default="")
+    actor_name: StringProperty(default="")
+
+    def execute(self, context):
+        scene = context.scene
+        entry = _find_loaded_actor_entry(scene, self.source_index, self.object_name, self.actor_name)
+        label = str(getattr(entry, "label", "") or getattr(entry, "actor_name", "") or self.actor_name or "actor") if entry else (self.actor_name or "actor")
+        obj_name = str(getattr(entry, "object_name", "") or "") if entry else str(self.object_name or "")
+        actor_obj = bpy.data.objects.get(obj_name) if obj_name else None
+        if actor_obj is not None:
+            import_cutscene.unload_cutscene_actor(actor_obj, force_remove=True)
+        _clear_loaded_actor_animation_flags(scene, entry)
+        if obj_name and str(getattr(scene, "witcher_cutscene_selected_actor_obj", "") or "") == obj_name:
+            scene.witcher_cutscene_selected_actor_obj = ""
+        if entry is not None:
+            items = getattr(scene, "witcher_cutscene_actor_items", None)
+            if items is not None:
+                idx = _find_loaded_actor_entry_index(scene, self.source_index, self.object_name, self.actor_name)
+                if idx >= 0:
+                    items.remove(idx)
+        self.report({'INFO'}, f"Removed actor '{label}' from cutscene.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneImportActorForAnim(Operator):
+    bl_idname = "witcher.cutscene_import_actor_for_anim"
+    bl_label = "Import Actor"
+    bl_description = "Import the actor required by this animation into the scene"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    source_index: IntProperty(default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        animation_entry = _find_loaded_cutscene_animation_entry(scene, self.source_index)
+        if animation_entry is None:
+            self.report({'ERROR'}, "Cutscene animation entry not found.")
+            return {'CANCELLED'}
+        actor_entry = _find_actor_entry_for_animation(scene, animation_entry)
+        if actor_entry is None:
+            self.report({'ERROR'}, "No matching cutscene actor for this animation.")
+            return {'CANCELLED'}
+        actor_obj = _load_cutscene_actor_entry(scene, actor_entry)
+        if actor_obj is None:
+            self.report({'ERROR'}, "Failed to import the actor.")
+            return {'CANCELLED'}
+        _sync_actor_items_with_scene(scene)
+        label = getattr(actor_entry, 'actor_name', '') or getattr(actor_entry, 'label', '')
+        try:
+            dialog_stats = _restore_cutscene_actor_dialog_lipsync(context, actor_entry, actor_obj)
+        except Exception as exc:
+            log.warning("Failed to restore dialog lipsync for actor %s: %s", label, exc)
+            self.report({'WARNING'}, f"Imported actor '{label}', but dialog lipsync restore failed: {exc}")
+            return {'FINISHED'}
+        dialog_count = int(dialog_stats.get("loaded", 0) or 0)
+        message = f"Imported actor '{label}'."
+        if dialog_count:
+            message = f"{message} Restored {dialog_count} dialog line(s)."
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
 def _draw_event_list_item(self, layout, item):
     if self.layout_type in {'DEFAULT', 'COMPACT'}:
         row = layout.row(align=True)
         row.label(text=_get_cutscene_event_label(item), icon=_event_type_icon(item.event_type))
-        # Short class name badge
-        cls_badge = row.row(align=True)
-        cls_badge.enabled = False
-        cls_badge.scale_x = 0.7
         cls_short = str(item.event_type or "").replace("CExtAnimCutscene","").replace("CExtAnim","")
-        cls_badge.label(text=cls_short)
-        row.label(text=f"{item.start_time:.2f}s")
+        _cutscene_fixed_label(
+            row,
+            cls_short,
+            minimum=6.5,
+            maximum=10.0,
+            enabled=False,
+        )
+        _cutscene_fixed_label(row, f"{item.start_time:.2f}s", units=4.6, alignment='RIGHT')
         if item.duration > 0.0:
-            row.label(text=f"+{item.duration:.2f}s")
+            _cutscene_fixed_label(row, f"+{item.duration:.2f}s", units=4.6, alignment='RIGHT')
     elif self.layout_type == 'GRID':
         layout.alignment = 'CENTER'
         layout.label(text="")
@@ -2330,7 +2958,11 @@ class WITCH_UL_ActorEntryEventList(UIList):
     def filter_items(self, context, data, propname):
         items = getattr(data, propname, [])
         scene = context.scene
-        actor_filter = str(getattr(scene, "witcher_cs_actor_event_filter", "") or "").strip().lower()
+        actor_items = list(getattr(scene, "witcher_cutscene_actor_items", []) or [])
+        actor_ui_idx = int(getattr(scene, "witcher_cutscene_loaded_actor_index", 0) or 0)
+        actor_filter = ""
+        if 0 <= actor_ui_idx < len(actor_items):
+            actor_filter = str(getattr(actor_items[actor_ui_idx], "actor_name", "") or "").strip().lower()
         anims = list(getattr(scene, "witcher_cutscene_animation_items", []))
         actor_anim_indices = {
             int(getattr(a, "source_index", -1))
@@ -2950,37 +3582,76 @@ def _draw_cutscene_template_tab(layout, scene):
 
 
 def _draw_cutscene_actors_tab(layout, scene, context=None):
-    actor_objects = [
-        obj for obj in scene.objects
-        if getattr(obj, "type", None) == 'ARMATURE'
-        and str(obj.get("cutscene_actor_name", "") or "").strip()
-    ]
-    actor_objects.sort(key=lambda o: str(o.get("cutscene_actor_name", "") or o.name).lower())
-
-    selected_obj_name = str(getattr(scene, "witcher_cutscene_selected_actor_obj", "") or "")
-    selected_obj = bpy.data.objects.get(selected_obj_name) if selected_obj_name else None
-    if selected_obj not in actor_objects:
-        selected_obj = None
+    if _scene_needs_actor_sync(scene):
+        _schedule_actor_items_sync(scene)
+    items = list(getattr(scene, "witcher_cutscene_actor_items", []) or [])
+    idx = int(getattr(scene, "witcher_cutscene_loaded_actor_index", 0) or 0)
+    if idx < 0 or idx >= len(items):
+        idx = max(0, len(items) - 1)
+    active_entry = items[idx] if items else None
 
     # --- Actor list ---
-    if actor_objects:
-        list_box = layout.box()
-        for obj in actor_objects:
-            actor_name = str(obj.get("cutscene_actor_name", "") or obj.name)
-            actor_type = str(obj.get("cutscene_actor_type", "") or "CAT_Actor")
-            is_sel = (obj == selected_obj)
-            type_icon = 'CAMERA_DATA' if actor_type == 'CAT_Camera' else ('OBJECT_DATA' if actor_type == 'CAT_Prop' else 'ARMATURE_DATA')
-            row = list_box.row(align=True)
-            sel_op = row.operator("witcher.cutscene_select_actor", text=actor_name, icon=type_icon, emboss=is_sel, depress=is_sel)
-            sel_op.object_name = obj.name
-            badge = row.row(align=True)
-            badge.enabled = False
-            badge.scale_x = 0.55
-            badge.label(text=actor_type.replace("CAT_", ""))
-            rm_op = row.operator("witcher.cutscene_remove_actor", text="", icon='X')
-            rm_op.object_name = obj.name
+    if items:
+        layout.template_list(
+            "WITCH_UL_LoadedActorList", "",
+            scene, "witcher_cutscene_actor_items",
+            scene, "witcher_cutscene_loaded_actor_index",
+            rows=min(len(items), 8),
+        )
     else:
         layout.label(text="No actors in cutscene.", icon='INFO')
+
+    # --- Per-entry actions ---
+    if active_entry is not None:
+        actor_state = _get_cutscene_actor_display_state(active_entry)
+        is_loaded = bool(actor_state["is_loaded"])
+        restorable = int(getattr(active_entry, "source_index", -1)) >= 0
+        _src = int(getattr(active_entry, "source_index", -1))
+        _obj = str(getattr(active_entry, "object_name", "") or "")
+        _name = str(getattr(active_entry, "actor_name", "") or "")
+        action_row = layout.row(align=True)
+        toggle_op = None
+        if restorable:
+            if is_loaded:
+                toggle_op = action_row.operator(WITCH_OT_SetCutsceneActorLoaded.bl_idname, text="Deactivate", icon='HIDE_ON')
+                toggle_op.load = False
+            else:
+                toggle_op = action_row.operator(WITCH_OT_SetCutsceneActorLoaded.bl_idname, text="Activate", icon='HIDE_OFF')
+                toggle_op.load = True
+        elif is_loaded:
+            action_row.label(text="Remove deletes the entity", icon='INFO')
+        else:
+            action_row.label(text="Use Assign to re-add this actor", icon='INFO')
+        rm_op = action_row.operator(WITCH_OT_CutsceneRemoveActorFull.bl_idname, text="Remove", icon='X')
+        rm_op.source_index = _src
+        rm_op.object_name = _obj
+        rm_op.actor_name = _name
+        if toggle_op is not None:
+            toggle_op.source_index = _src
+            toggle_op.object_name = _obj
+            toggle_op.actor_name = _name
+        if is_loaded:
+            root_loaded, root_total = _actor_animation_layer_state(scene, active_entry, "ROOT")
+            face_loaded, face_total = _actor_animation_layer_state(scene, active_entry, "FACE")
+            if root_total or face_total:
+                anim_row = layout.row(align=True)
+                anim_row.label(text="Animations", icon='ACTION')
+                for layer, label, loaded_count, total_count in (
+                    ("ROOT", "Root", root_loaded, root_total),
+                    ("FACE", "Face", face_loaded, face_total),
+                ):
+                    if not total_count:
+                        continue
+                    layer_op = anim_row.operator(
+                        WITCH_OT_SetCutsceneActorAnimationLayer.bl_idname,
+                        text=f"{label} {loaded_count}/{total_count}",
+                        icon='HIDE_ON' if loaded_count else 'HIDE_OFF',
+                    )
+                    layer_op.source_index = _src
+                    layer_op.object_name = _obj
+                    layer_op.actor_name = _name
+                    layer_op.layer = layer
+                    layer_op.load = not bool(loaded_count)
 
     retarget_box = layout.box()
     retarget_header = retarget_box.row(align=True)
@@ -2995,7 +3666,8 @@ def _draw_cutscene_actors_tab(layout, scene, context=None):
     retarget_box.prop(scene, "witcher_cutscene_retarget_male_template", text="Male")
     retarget_box.prop(scene, "witcher_cutscene_retarget_female_template", text="Female")
 
-    # --- Selected actor detail panel ---
+    # --- Selected actor detail panel (active entry's entity, if present) ---
+    selected_obj = _get_loaded_cutscene_actor_object(active_entry) if active_entry else None
     if selected_obj is not None:
         layout.separator(factor=0.3)
         detail_box = layout.box()
@@ -3054,6 +3726,9 @@ def _draw_cutscene_actors_tab(layout, scene, context=None):
                     _draw_event_detail(detail_box, ev)
         else:
             detail_box.label(text="No events for this actor.", icon='INFO')
+    elif active_entry is not None:
+        layout.separator(factor=0.3)
+        layout.label(text="Activate this actor to edit its properties.", icon='INFO')
 
     layout.separator(factor=0.5)
 
@@ -3091,8 +3766,23 @@ def _draw_cutscene_anims_tab(layout, scene, context=None):
             detail_box = layout.box()
             detail_row = detail_box.row(align=True)
             detail_row.label(text=_get_cutscene_animation_label(anim), icon='ACTION')
-            # Active / inactive toggle
-            if anim_state["is_loaded"]:
+            # Actor entity drives anim activation. Offer to import a missing actor; an
+            # animation can't be active without its actor in the scene.
+            actor_obj = (anim_state.get("actor_state") or {}).get("actor_obj")
+            actor_entry = anim_state.get("actor_entry")
+            filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
+            can_import_actor = (
+                actor_obj is None
+                and bool(filepath)
+                and actor_entry is not None
+                and int(getattr(actor_entry, "source_index", -1)) >= 0
+            )
+            if can_import_actor:
+                imp_op = detail_row.operator(WITCH_OT_CutsceneImportActorForAnim.bl_idname, text="Import Actor", icon='IMPORT')
+                imp_op.source_index = anim.source_index
+            elif actor_obj is None:
+                detail_row.label(text="Actor missing", icon='ERROR')
+            elif anim_state["is_loaded"]:
                 op = detail_row.operator(WITCH_OT_SetCutsceneAnimationLoaded.bl_idname, text="Deactivate", icon='HIDE_ON')
                 op.source_index = anim.source_index
                 op.load = False
@@ -3535,6 +4225,10 @@ classes = [
     WITCH_OT_ImportCutsceneBurnedAudio,
     WITCH_OT_RemoveCutsceneBurnedAudio,
     WITCH_OT_SetCutsceneAnimationLoaded,
+    WITCH_OT_SetCutsceneActorAnimationLayer,
+    WITCH_OT_SetCutsceneActorLoaded,
+    WITCH_OT_CutsceneRemoveActorFull,
+    WITCH_OT_CutsceneImportActorForAnim,
     WITCH_OT_LoadCutsceneDialogs,
     WITCHER_PT_cutscene_panel,
 ]

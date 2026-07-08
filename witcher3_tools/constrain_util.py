@@ -132,7 +132,9 @@ def should_auto_align_armatures(arm_parent, arm_child):
 
     match_count = len(matches)
     smaller_rig = min(parent_bone_count, child_bone_count)
-    if child_bone_count >= 2 and match_count == child_bone_count:
+    if match_count == child_bone_count and (
+        child_bone_count >= 2 or _is_mesh_component_armature(arm_child)
+    ):
         return True
     if smaller_rig >= 4 and match_count >= 4 and (match_count / smaller_rig) >= 0.6:
         return True

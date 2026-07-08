@@ -33,7 +33,7 @@ from typing import Union
 import numpy as np
 
 import bpy
-from ..action_compat import assign_action, bind_strip_action_slot, iter_action_fcurves, new_action_fcurve, resolve_action_slot
+from ..action_compat import assign_action, bind_strip_action_slot, get_action_channelbag, iter_action_fcurves, new_action_fcurve, resolve_action_slot
 matmul = (lambda a, b: a*b) if bpy.app.version < (2, 80, 0) else (lambda a, b: a.__matmul__(b))
 
 W3_MOTION_EXTRACTION_FINAL_LOCATION_PROP = "w3_motion_extraction_final_location"
@@ -955,6 +955,44 @@ def apply_foot_ik_cleanup(armObj, action, total_frames):
     return True
 
 
+def _copy_anim_part_for_import(part):
+    """Copy animation wrapper data that import mutates."""
+    part_copy = copy.copy(part)
+    if getattr(part, "bones", None):
+        part_copy.bones = [copy.copy(bone) for bone in part.bones]
+    if getattr(part, "tracks", None):
+        part_copy.tracks = [copy.copy(track) for track in part.tracks]
+    return part_copy
+
+
+_KEYFRAME_ENUM_CACHE = {}
+
+
+def _keyframe_enum_value(prop_name, identifier):
+    key = (prop_name, identifier)
+    value = _KEYFRAME_ENUM_CACHE.get(key)
+    if value is None:
+        value = bpy.types.Keyframe.bl_rna.properties[prop_name].enum_items[identifier].value
+        _KEYFRAME_ENUM_CACHE[key] = value
+    return value
+
+
+def _fill_keyframe_batch(curve, frames, values, interp):
+    n = len(frames)
+    points = curve.keyframe_points
+    points.add(n)
+    co = [0.0] * (2 * n)
+    co[0::2] = frames
+    co[1::2] = values
+    points.foreach_set('co', co)
+    points.foreach_set('interpolation', [_keyframe_enum_value('interpolation', interp)] * n)
+    if interp == 'BEZIER':
+        handle = [_keyframe_enum_value('handle_left_type', 'AUTO_CLAMPED')] * n
+        points.foreach_set('handle_left_type', handle)
+        points.foreach_set('handle_right_type', handle)
+    curve.update()
+
+
 class animFile:
     def __init__(self):
         self.filepath = None
@@ -1251,7 +1289,7 @@ class AnimImporter:
                     camera_animation = True
                     break
 
-        anim_desc = copy.deepcopy(SkeletalAnimationData)
+        anim_desc = _copy_anim_part_for_import(SkeletalAnimationData)
         w2_face_float_animation = bool(
             face_animation
             and not camera_animation
@@ -1393,14 +1431,16 @@ class AnimImporter:
             armObj.animation_data.action is not None
             else None)
 
-        class _Dummy: pass
-        dummy_keyframe_points = iter(lambda: _Dummy, None)
         prop_rot_map = {'QUATERNION':'rotation_quaternion', 'AXIS_ANGLE':'rotation_axis_angle'}
 
         world_pos_list = [] #['r_weapon', 'l_weapon']#,
                         #   'silver_sword_back',
                         #   'steel_sword_back' ,
                         #   'crossbow_back'] #TODO look at this
+        # FCurves are created lazily at flush time so channels the loops skip
+        # (face poses) never allocate curves; the channelbag lookup is hoisted
+        # out of the per-curve calls.
+        action_channelbag = get_action_channelbag(action, target=armObj, ensure=True)
         curve_per_bone = {}
         valid_bones = []
         for bone_data in anim_desc.bones:
@@ -1413,24 +1453,28 @@ class AnimImporter:
                 log.warning('Animation data has unknown bone ' + bone_name)
                 continue
             valid_bones.append(bone_data)
-            pos_curves = [dummy_keyframe_points] * 3
-            rot_curves = [dummy_keyframe_points] * 4
-            fcurves_rot = [dummy_keyframe_points]*4 # r0, r1, r2, (r3)
-            fcurves_loc = [dummy_keyframe_points]*3 # x, y, z
             data_path_rot = prop_rot_map.get(bl_bone.rotation_mode, 'rotation_quaternion')
-            bone_rotation = getattr(bl_bone, data_path_rot)
-            data_path = 'pose.bones["%s"].location'%bl_bone.name
-            for axis_i in range(3):
-                fcurves_loc[axis_i] = new_action_fcurve(action, armObj, data_path=data_path, index=axis_i, group_name=bl_bone.name)
-            data_path = 'pose.bones["%s"].%s'%(bl_bone.name, data_path_rot)
-            for axis_i in range(len(bone_rotation)):
-                fcurves_rot[axis_i] = new_action_fcurve(action, armObj, data_path=data_path, index=axis_i, group_name=bl_bone.name)
-
-            pos_curves = fcurves_loc
-            rot_curves = fcurves_rot
-
-            curve_per_bone[bone_name] = pos_curves, rot_curves
+            curve_per_bone[bone_name] = (
+                'pose.bones["%s"].location' % bl_bone.name,
+                'pose.bones["%s"].%s' % (bl_bone.name, data_path_rot),
+            )
         anim_desc.bones = valid_bones
+
+        def _flush_channel_batch(data_path, group_name, frames, value_axes, interp, densify=False):
+            if not frames:
+                return
+            for axis_i, values in enumerate(value_axes):
+                curve = new_action_fcurve(
+                    action,
+                    armObj,
+                    data_path=data_path,
+                    index=axis_i,
+                    group_name=group_name,
+                    channelbag=action_channelbag,
+                )
+                _fill_keyframe_batch(curve, frames, values, interp)
+                if densify:
+                    _densify_fcurve(curve)
         total_frames = anim_desc.numFrames
         duration = anim_desc.duration if anim_desc.duration > 0 else 1.0
         base_dt = getattr(anim_desc, "dt", 0.0) or 0.0
@@ -1455,15 +1499,6 @@ class AnimImporter:
             if smooth_sparse_tracks and 1 < num_track_frames < total_frames:
                 return 'BEZIER'
             return 'LINEAR'
-
-        def _add_key(curve, frame, value, interp):
-            curve.keyframe_points.add(1)
-            kp = curve.keyframe_points[-1]
-            kp.co = (frame, value)
-            kp.interpolation = interp
-            if interp == 'BEZIER':
-                kp.handle_left_type = 'AUTO_CLAMPED'
-                kp.handle_right_type = 'AUTO_CLAMPED'
 
         def _densify_fcurve(curve):
             n = len(curve.keyframe_points)
@@ -1496,7 +1531,8 @@ class AnimImporter:
             
             #! 
             rot_frames = [Quaternion((rot.W, rot.X, rot.Y, rot.Z)) for rot in bone.rotationFramesQuat]
-            pos_curves, rot_curves = curve_per_bone[mdl_bone.BoneName]
+            loc_data_path, rot_data_path = curve_per_bone[mdl_bone.BoneName]
+            zero_root_bone = zero_cutscene_root and _base_bone_name(mdl_bone.BoneName).lower() == "root"
 
             #! SCALE FRAMES
             bone_frames = len(bone.scaleFrames)
@@ -1519,6 +1555,17 @@ class AnimImporter:
                 pos_interp = _track_interp(num_pos_frames)
                 prev_loc_frame = None
                 last_frame = total_frames - 1
+                if bl_bone.parent:
+                    origPos = bl_bone.parent.bone.matrix_local.inverted() @ bl_bone.bone.matrix_local.translation
+                else:
+                    origPos = bl_bone.bone.matrix_local.translation
+                origPos = Vector(( origPos.x, origPos.y, origPos.z ))
+                pos_rot90_matrix = Matrix.Rotation(math.radians(90), 4, 'Z') if use_rot90 else None
+                additive_pos = SkeletalAnimationType == "SAT_Additive" or face_animation
+                keep_world_pos = self.facePose or mdl_bone.BoneName in world_pos_list
+                bone_rest_rot_inv = None if (additive_pos or keep_world_pos) else bl_bone.bone.matrix.to_quaternion().inverted()
+                loc_key_frames = []
+                loc_key_values = ([], [], [])
                 for n, pos_frame in enumerate(pos_frames):
                     if num_pos_frames == 1:
                         loc_frame = 0.0
@@ -1533,50 +1580,33 @@ class AnimImporter:
                     if prev_loc_frame is not None and abs(loc_frame - prev_loc_frame) < 1e-6:
                         continue
                     prev_loc_frame = loc_frame
-                    if bl_bone.parent:
-                        objectMatrix = bl_bone.parent.bone.matrix_local.inverted()
-                        origPos = objectMatrix @ bl_bone.bone.matrix_local.translation
-                    else:
-                        #objectMatrix = armObj.matrix_world.inverted()
-                        origPos = bl_bone.bone.matrix_local.translation
-                    
-                    origPos = Vector(( origPos.x, origPos.y, origPos.z ))
-                    #origRot = bl_bone.bone.matrix_local.to_quaternion()  # LOCAL EditBone
-                    
-                    if use_rot90:
-                        rotation_angle = math.radians(90)  # Convert -90 degrees to radians
-                        rotation_matrix = Matrix.Rotation(rotation_angle, 4, 'Z')
-                        pos_frame = rotation_matrix @ pos_frame
-                        #origPos = rotation_matrix @ origPos
-                    
-                    pos_fix = pos_frame
-                    
-                    if SkeletalAnimationType == "SAT_Additive" or face_animation:
-                        pos_fix = pos_fix
+
+                    if pos_rot90_matrix is not None:
+                        pos_frame = pos_rot90_matrix @ pos_frame
+
+                    if additive_pos:
+                        pos_fix = pos_frame
                     else:
                         pos_fix = pos_frame - origPos
-                        #! DISABLE FOR FACE POSES
-                        if self.facePose or mdl_bone.BoneName in world_pos_list :
-                            log.debug("face mode active")
-                        else:
-                            pos_fix = bl_bone.bone.matrix.to_quaternion().inverted() @ pos_fix #origRot.inverted() @ pos_fix
-                    pos_fix = Vector(( round(pos_fix.x, 8), round(pos_fix.y, 8), round(pos_fix.z, 8) ))
-                    
-                    do_retarget = False #! set this on to not import postions #!REMOVE
-                    if do_retarget:
-                        pos = pos_fix if mdl_bone.BoneName.lower() in ['Root', 'pelvis'] else Vector(( 0, 0, 0 ))
-                    else:
-                        pos = pos_fix
-                    if zero_cutscene_root and _base_bone_name(mdl_bone.BoneName).lower() == "root":
-                        pos = Vector((0.0, 0.0, 0.0))
-                    for i in range(3):
-                        _add_key(pos_curves[i], loc_frame, pos[i], pos_interp)
-                if pos_interp == 'BEZIER':
-                    for i in range(3):
-                        pos_curves[i].update()
-                if witcher_bake_every_frame:
-                    for i in range(3):
-                        _densify_fcurve(pos_curves[i])
+                        if bone_rest_rot_inv is not None:
+                            pos_fix = bone_rest_rot_inv @ pos_fix
+                    if zero_root_bone:
+                        loc_key_frames.append(loc_frame)
+                        for i in range(3):
+                            loc_key_values[i].append(0.0)
+                        continue
+                    loc_key_frames.append(loc_frame)
+                    loc_key_values[0].append(round(pos_fix.x, 8))
+                    loc_key_values[1].append(round(pos_fix.y, 8))
+                    loc_key_values[2].append(round(pos_fix.z, 8))
+                _flush_channel_batch(
+                    loc_data_path,
+                    bl_bone.name,
+                    loc_key_frames,
+                    loc_key_values,
+                    pos_interp,
+                    densify=witcher_bake_every_frame,
+                )
 
             #! ROTATION FRAMES
             
@@ -1594,6 +1624,19 @@ class AnimImporter:
                 prev_rot_frame = None
                 prev_fixed_rot = None
                 last_frame = total_frames - 1
+                world_space_rot = not face_animation and SkeletalAnimationType != "SAT_Additive"
+                rotate_by = 90 if use_rot90 else 0
+                z_plus_90 = Quaternion((0, 0, 1), math.radians(-rotate_by))
+                z_minus_90 = Quaternion((0, 0, 1), math.radians(rotate_by))
+                origRotP = None
+                origRot_inv = None
+                if world_space_rot:
+                    rotation_matrix = Matrix.Rotation(math.radians(rotate_by), 4, 'Z')
+                    if bl_bone.parent:
+                        origRotP = (bl_bone.parent.bone.matrix_local @ rotation_matrix).to_quaternion()
+                    origRot_inv = (bl_bone.bone.matrix_local @ rotation_matrix).to_quaternion().inverted()
+                rot_key_frames = []
+                rot_key_values = ([], [], [], [])
                 for n, rot_frame in enumerate(rot_frames):
                     if num_rot_frames == 1:
                         frame = 0.0
@@ -1609,40 +1652,19 @@ class AnimImporter:
                         continue
                     prev_rot_frame = frame
                     fixed_rot = rot_frame
-                    
-                    if not face_animation and SkeletalAnimationType != "SAT_Additive":
-                        rotate_by = 0
-                        if use_rot90:
-                            rotate_by = 90
-                        
-                        # Constants
-                        z_plus_90 = Quaternion((0, 0, 1), math.radians(-rotate_by))
-                        z_minus_90 = Quaternion((0, 0, 1), math.radians(rotate_by))
-                        rotation_matrix = Matrix.Rotation(math.radians(rotate_by), 4, 'Z')
 
-                        if bl_bone.parent:
-                            origRotP_matrix = bl_bone.parent.bone.matrix_local @ rotation_matrix
-                            origRotP = origRotP_matrix.to_quaternion()
+                    if world_space_rot:
+                        if origRotP is not None:
                             fixed_rot = origRotP @ fixed_rot
-
-                        origRot_matrix = bl_bone.bone.matrix_local @ rotation_matrix
-                        origRot = origRot_matrix.to_quaternion()
-                        fixed_rot = origRot.inverted() @ fixed_rot
-
+                        fixed_rot = origRot_inv @ fixed_rot
                         # Apply the axis swap
                         fixed_rot = z_minus_90 @ fixed_rot @ z_plus_90
-
-                        # Normalize the quaternion
                         fixed_rot.normalize()
-                    else:
-                        if use_rot90:
-                            rotate_by = 90
-                            z_plus_90 = Quaternion((0, 0, 1), math.radians(-rotate_by))
-                            z_minus_90 = Quaternion((0, 0, 1), math.radians(rotate_by))
-                            fixed_rot = z_minus_90 @ fixed_rot @ z_plus_90
-                            fixed_rot.normalize()
+                    elif use_rot90:
+                        fixed_rot = z_minus_90 @ fixed_rot @ z_plus_90
+                        fixed_rot.normalize()
 
-                    if zero_cutscene_root and _base_bone_name(mdl_bone.BoneName).lower() == "root":
+                    if zero_root_bone:
                         fixed_rot = Quaternion((1.0, 0.0, 0.0, 0.0))
 
                     if fixed_rot.dot(fixed_rot) <= 1e-12:
@@ -1653,14 +1675,17 @@ class AnimImporter:
                         fixed_rot = -fixed_rot
                     prev_fixed_rot = fixed_rot.copy()
 
+                    rot_key_frames.append(frame)
                     for i in range(4):
-                        _add_key(rot_curves[i], frame, fixed_rot[i], rot_interp)
-                if rot_interp == 'BEZIER':
-                    for i in range(4):
-                        rot_curves[i].update()
-                if witcher_bake_every_frame:
-                    for i in range(4):
-                        _densify_fcurve(rot_curves[i])
+                        rot_key_values[i].append(fixed_rot[i])
+                _flush_channel_batch(
+                    rot_data_path,
+                    bl_bone.name,
+                    rot_key_frames,
+                    rot_key_values,
+                    rot_interp,
+                    densify=witcher_bake_every_frame,
+                )
         _safe_mode_set('OBJECT', armObj)
         log.debug(' Finished adding keyframes in %f seconds.', time.time() - start_time)
 

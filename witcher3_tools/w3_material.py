@@ -197,7 +197,7 @@ def ensure_node_group(ng_name, resource_path=RES_PATH):
     resource_path = resource_path or RES_PATH
     ng_name = _find_available_node_group_name(ng_name, resource_path) or ng_name
     if ng_name not in bpy.data.node_groups:
-        with bpy.data.libraries.load(resource_path) as (data_from, data_to):
+        with bpy.data.libraries.load(resource_path, relative=False) as (data_from, data_to):
             for ng in data_from.node_groups:
                 if ng == ng_name:
                     data_to.node_groups.append(ng)
@@ -239,7 +239,7 @@ def _resource_node_group_names(resource_path: str = RES_PATH) -> Set[str]:
 
     node_group_names: Set[str] = set()
     try:
-        with bpy.data.libraries.load(resource_path) as (data_from, _data_to):
+        with bpy.data.libraries.load(resource_path, relative=False) as (data_from, _data_to):
             node_group_names = set(data_from.node_groups or [])
     except Exception:
         log.exception("Failed to inspect material node groups from %s", resource_path)

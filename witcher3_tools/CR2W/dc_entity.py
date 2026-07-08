@@ -2344,6 +2344,40 @@ _VISUAL_MESH_COMPONENT_TYPES = {
     "CDressMeshComponent",
 }
 
+# Synthetic chunk indices for streamed items live well above any real chunk index
+# so the hard attachments we fabricate can reference each streamed mesh uniquely.
+_STREAMED_ATTACHMENT_SYNTH_INDEX_BASE = 1_000_000
+
+
+def _read_streamed_attachment_slots(CHUNKS):
+    """Return streamed component names mapped to hard-attachment bone slots."""
+    slots = {}
+    for tchunk in CHUNKS:
+        if getattr(tchunk, "Type", None) != "CEntityTemplate":
+            continue
+        prop = _find_prop_by_name(tchunk, "streamedAttachments")
+        elements = getattr(prop, "More", None) if prop is not None else None
+        if not elements:
+            continue
+        for el in elements:
+            try:
+                child = _prop_to_string(el.GetVariableByName("childName"))
+                data_prop = el.GetVariableByName("data")
+                raw = bytes(getattr(data_prop, "More", None) or [])
+                if not child or not raw:
+                    continue
+                sub = getCR2W(bReadStream(raw, name="streamedAttachmentData"))
+                for ach in sub.CHUNKS.CHUNKS:
+                    if ach.Type != "CHardAttachment":
+                        continue
+                    slot = _prop_to_string(ach.GetVariableByName("parentSlotName"))
+                    if slot:
+                        slots[str(child).strip()] = str(slot).strip()
+                    break
+            except Exception:
+                log.debug("Failed to read a streamedAttachment slot", exc_info=True)
+    return slots
+
 
 def _w2_chunk_type_name(chunk):
     return str(getattr(chunk, "type", None) or getattr(chunk, "Type", None) or "").strip()
@@ -2672,6 +2706,10 @@ def create_CEntity(file, _inherit_visited=None):
     new_mesh = ModelEnt("staticMeshes", "staticMeshes")
     added_chunks = set()  # Track chunk indices already added to avoid duplicates
     seen_streamed_mesh_paths = set()  # Track mesh paths already added via streamingDataBuffer to avoid duplicates
+    streamed_attachment_slots = _read_streamed_attachment_slots(CHUNKS)
+    streamed_synth_counter = [0]
+    streamed_hard_attached = set()  # component names already bone-slot attached
+    pending_streamed_hard = []      # (mesh chunkIndex, bone slot) to wire after the loop
     seen_mesh_signatures = set()
     seen_light_signatures = set()
     seen_animated_signatures = set()
@@ -2710,6 +2748,26 @@ def create_CEntity(file, _inherit_visited=None):
             mesh_import_cursor += 1
             return path
         return None
+
+    def _register_streamed_slot_mesh(mc, comp_type):
+        """Append a streamed mesh as a synthetic hard-attached slot item."""
+        name = str(getattr(mc, "name", "") or "").strip()
+        slot = streamed_attachment_slots.get(name) if (name and mc.mesh) else None
+        if not slot:
+            return False
+        if name in streamed_hard_attached:
+            return True  # already added via the other streamed buffer path
+        streamed_hard_attached.add(name)
+        streamed_synth_counter[0] += 1
+        mesh_idx = _STREAMED_ATTACHMENT_SYNTH_INDEX_BASE + streamed_synth_counter[0]
+        comp_transform = getattr(mc, "transform", None)
+        mc.transform = None
+        mc.type = comp_type
+        mc.chunkIndex = mesh_idx
+        new_mesh.chunks.append(mc)
+        pending_streamed_hard.append((mesh_idx, slot, comp_transform))
+        log.debug('Registered streamed %s "%s" -> bone slot %s (%s)', comp_type, name, slot, mc.mesh)
+        return True
 
     def _append_unique_chunk(source_chunk, converted_chunk, added_chunks=None):
         _attach_w2_embedded_mesh_info(source_chunk, converted_chunk)
@@ -3951,6 +4009,8 @@ def create_CEntity(file, _inherit_visited=None):
                         mc.mesh = _resolve_mesh_path(buf_chunk, mc.mesh)
                         if not mc.mesh:
                             mc.mesh = _next_mesh_import_path()
+                        if _register_streamed_slot_mesh(mc, buf_chunk.Type):
+                            continue
                         if mc.mesh and mc.mesh not in seen_streamed_mesh_paths:
                             chunk_append(new_mesh, entity_chunk, mc, added_chunks)
                             new_mesh.chunks[-1].type = buf_chunk.Type
@@ -4304,6 +4364,8 @@ def create_CEntity(file, _inherit_visited=None):
                                     component.mesh = _resolve_mesh_path(buf_chunk, component.mesh)
                                     if not component.mesh:
                                         component.mesh = _next_mesh_import_path()
+                                    if _register_streamed_slot_mesh(component, buf_chunk.Type):
+                                        continue
                                     if component.mesh and component.mesh not in seen_streamed_mesh_paths:
                                         chunk_append(new_mesh, buf_chunk, component)
                                         seen_streamed_mesh_paths.add(component.mesh)
@@ -4323,6 +4385,30 @@ def create_CEntity(file, _inherit_visited=None):
                                 )
                 except Exception as e:
                     log.warning(f"Failed to process flatCompiledData chunk {sub_chunk.Type}: {e}")
+
+    # Wire streamed slot items to the animated component now that every chunk is known.
+    if pending_streamed_hard:
+        anim_parent_index = next(
+            (getattr(c, "chunkIndex", None) for c in new_mesh.chunks
+             if getattr(c, "type", None) == "CAnimatedComponent"),
+            entity_animated_component_chunk_index,
+        )
+        if anim_parent_index is not None:
+            for mesh_idx, slot, comp_transform in pending_streamed_hard:
+                hard = CHardAttachment()
+                hard.parent = anim_parent_index
+                hard.child = mesh_idx
+                hard.parentSlotName = slot
+                hard.relativeTransform = comp_transform
+                hard.type = 'CHardAttachment'
+                streamed_synth_counter[0] += 1
+                hard.chunkIndex = _STREAMED_ATTACHMENT_SYNTH_INDEX_BASE + streamed_synth_counter[0]
+                new_mesh.chunks.append(hard)
+        else:
+            log.warning(
+                "Streamed slot items found but no CAnimatedComponent to attach them to (%d items)",
+                len(pending_streamed_hard),
+            )
 
     if pending_w2_appearances:
         search_chunks = CHUNKS + [chunk for chunk in w2_related_search_chunks if chunk not in CHUNKS]

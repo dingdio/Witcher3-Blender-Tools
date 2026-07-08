@@ -203,7 +203,7 @@ def iter_action_fcurves(action, target=None, slot=None):
     return tuple(channelbag.fcurves)
 
 
-def new_action_fcurve(action, target, data_path, index=None, group_name=None, slot=None):
+def new_action_fcurve(action, target, data_path, index=None, group_name=None, slot=None, channelbag=None):
     kwargs = {"data_path": data_path}
     if index is not None:
         kwargs["index"] = index
@@ -213,7 +213,8 @@ def new_action_fcurve(action, target, data_path, index=None, group_name=None, sl
             kwargs["action_group"] = group_name
         return action.fcurves.new(**kwargs)
 
-    channelbag = get_action_channelbag(action, target=target, slot=slot, ensure=True)
+    if channelbag is None:
+        channelbag = get_action_channelbag(action, target=target, slot=slot, ensure=True)
     if channelbag is None:
         raise AttributeError(f"Unable to access FCurves for action {action.name}")
 

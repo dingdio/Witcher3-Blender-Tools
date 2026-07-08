@@ -6,11 +6,10 @@ from nodeitems_utils import NodeCategory, NodeItem
 
 def AppendRENodeTree(reShaderName) -> bpy.types.ShaderNodeTree:
     path = os.path.join(os.path.dirname(__file__), "witcher3_materials.blend")
-    bpy.ops.wm.append(
-        filepath=os.path.join(path, 'NodeTree', reShaderName),
-        directory=os.path.join(path, 'NodeTree'),
-        filename=reShaderName
-    )
+    if reShaderName not in bpy.data.node_groups:
+        with bpy.data.libraries.load(path, relative=False) as (data_from, data_to):
+            if reShaderName in data_from.node_groups:
+                data_to.node_groups.append(reShaderName)
 
     return bpy.data.node_groups.get(reShaderName)
 
