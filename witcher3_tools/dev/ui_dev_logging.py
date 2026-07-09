@@ -36,7 +36,7 @@ MODULE_GROUPS = [
         "CR2W.dc_mesh",
         "CR2W.dc_entity",
         "ui.ui_entity",
-        "w3_material",
+        "materials",
         "importers.import_blender_fun",
     ]),
     ("Scene / Map", [

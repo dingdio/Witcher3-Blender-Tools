@@ -15,8 +15,9 @@ from bpy.props import StringProperty, BoolProperty, FloatProperty
 from mathutils import Vector
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 import addon_utils
-from .. import file_helpers, w3_material_blender, CR2W, get_texture_path, get_uncook_path
-from ..cloth_util import setup_w3_material_CR2W
+from .. import file_helpers, CR2W, get_texture_path, get_uncook_path
+from ..materials import w2mg
+from ..materials.cr2w import setup_w3_material_CR2W
 from ..CR2W.common_blender import bpy_image_load_safe, win_safe_path
 from ..CR2W.texture_dds import (
     DDSMetadata,
@@ -1242,7 +1243,7 @@ class WITCH_OT_w2mg(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
         ext = file_helpers.getFilenameType(fdir)
         if ext == ".w2mg":
-            w3_material_blender.import_w2mg(fdir, self)
+            w2mg.import_w2mg(fdir, self)
         else:
             self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
             return {'CANCELLED'}

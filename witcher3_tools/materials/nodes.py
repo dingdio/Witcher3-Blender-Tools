@@ -4,20 +4,20 @@ import re
 from contextlib import contextmanager
 
 import bpy
-from .CR2W.witcher_cache.Bundles import LoadBundleManager
-from .w3_material import (
+from ..CR2W.witcher_cache.Bundles import LoadBundleManager
+from .material import (
     ensure_node_group_for_recommendation,
     find_group_input_socket,
     get_active_witcher_group_node,
     get_recommended_node_group_for_base_path,
     init_material_nodes,
 )
-from .w3_material_base_path import (
+from .base_path import (
     create_base_material_helper,
     inspect_material_base_path,
     refresh_base_material_entry_state,
 )
-from .w3_material_chain import (
+from .chain import (
     CHAIN_NODE_ROW_Y,
     LOCAL_NODE_COLOR,
     chain_color_for_index,
@@ -27,22 +27,22 @@ from .w3_material_chain import (
     coerce_source_index,
     local_node_x,
 )
-from .w3_material_reader import normalize_depot_path
-from .w3_material_constants import (
+from .reader import normalize_depot_path
+from .constants import (
     DEFAULT_W2_MATERIAL_BASE,
     DEFAULT_W3_MATERIAL_BASE,
     WITCHER2_MATERIALS,
 )
-from .w3_vector_param import (
+from .vector_param import (
     get_legacy_w_value,
     get_mapping_vector_input,
     get_vector_node_values,
     is_vector_param_node,
     mark_vector_param_node,
 )
-from . import get_all_addon_prefs, get_texture_path, get_uncook_path
-from .extension_paths import get_cache_root
-from .repo_paths import (
+from .. import get_all_addon_prefs, get_texture_path, get_uncook_path
+from ..extension_paths import get_cache_root
+from ..repo_paths import (
     normalize_source_game as _normalize_material_source_game,
     w2_source_repo_root_if_configured,
     w2_source_roots,
@@ -3218,7 +3218,7 @@ def get_group_inputs(mat):
         ]
     return None
 
-from .CR2W.common_blender import repo_file, win_safe_path, win_unprefix_path
+from ..CR2W.common_blender import repo_file, win_safe_path, win_unprefix_path
 
 
 possible_folders = [
@@ -3230,7 +3230,7 @@ possible_folders = [
     'files\\DLC\\Uncooked',
 ]
 
-from . import get_mod_directory, get_modded_texture_path
+from .. import get_mod_directory, get_modded_texture_path
 # def get_repo_from_abs_path(texture_path_input):
 #     texture_path = os.path.realpath(bpy.path.abspath(texture_path_input))
 #     TEXTURE_PATH = get_texture_path(bpy.context)

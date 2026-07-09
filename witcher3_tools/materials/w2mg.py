@@ -1,9 +1,9 @@
 
 from pathlib import Path
-from . import CR2W
+from .. import CR2W
 import bpy
 from bpy.types import Image, Material, Object, Node
-from .w3_material import _ngt_new_input
+from .material import _ngt_new_input
 
 def init_shader_nodes(material: Material, group_name: str, clear:bool = True, x_loc:int = -250):
     """Wipe all nodes, then create a node group node and return it."""
@@ -224,26 +224,3 @@ def import_w2mg(mat_fileName, self = None):
     else:
         obj.data.materials.append(finished_mat)
     return
-    bpy.ops.mesh.primitive_plane_add()
-    obj = bpy.context.selected_objects[:][0]
-    instance_filename = Path(fdir).stem
-    materials = []
-    material_file_chunks = CR2W.CR2W_reader.load_material(fdir)
-    for idx, mat in enumerate(material_file_chunks):
-        # if idx > 0:
-        #     raise Exception('wut')
-        target_mat = False
-        if self.do_update_mats:
-            if instance_filename in obj.data.materials:
-                target_mat = obj.data.materials[instance_filename] #None
-            if instance_filename in bpy.data.materials:
-                target_mat = bpy.data.materials[instance_filename] #None
-        if not target_mat:
-            target_mat = bpy.data.materials.new(name=instance_filename)
-
-        finished_mat = setup_w3_material_CR2W(get_texture_path(context), target_mat, mat, force_update=True, mat_filename=instance_filename, is_instance_file = True)
-
-        if instance_filename in obj.data.materials and not self.do_update_mats:
-            obj.material_slots[target_mat.name].material = finished_mat
-        else:
-            obj.data.materials.append(finished_mat)

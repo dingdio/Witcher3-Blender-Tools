@@ -18,27 +18,22 @@ def _log_redcloth_profile_warning(message, *args):
     log.info("[redcloth-profile] " + str(message), *args)
 
 from .importers.import_rig import rotate_and_connect_bones
-from .w3_material import create_param, read_2wmi_params2, setup_w3_material, xml_data_from_CR2W
 from . import CR2W, get_do_fix_tail
 import bpy, os, filecmp, shutil
 from typing import List, Tuple, Dict
-from bpy.types import Image, Material, Object, Node
-import re
+from bpy.types import Object
 import numpy as np
 from xml.etree import ElementTree
-Element = ElementTree.Element
-from xml.dom import minidom
 
 from . import get_uncook_path
 from . import get_fbx_uncook_path
 from . import get_texture_path
 from . import get_DO_WEAR_CLOTH, get_redcloth_simulation_enabled, get_redcloth_wind_velocity
 from .extension_paths import get_temp_root
-
-from . import CR2W
-import bpy
-
-log = logging.getLogger(__name__)
+from .materials.cr2w import (
+    find_matching_material_on_object,
+    load_w3_materials_CR2W,
+)
 
 def _resolve_collection_ref(collection_ref):
     if collection_ref is None:
@@ -141,118 +136,6 @@ def move_objects_between_collections(old_collection_name, new_collection_name):
         log.debug("Cannot delete 'Scene Collection'.")
 
 
-def prettify(elem):
-    """Return a pretty-printed XML string for the Element.
-    """
-    rough_string = ElementTree.tostring(elem, 'utf-8')
-    try:
-        reparsed = minidom.parseString(rough_string)
-        return reparsed.toprettyxml(indent="\t")
-    except Exception:
-        log.warning("Material XML prettify failed; storing compact XML instead.", exc_info=True)
-        return rough_string.decode("utf-8", errors="ignore")
-
-def setup_w3_material_CR2W(
-        uncook_path: str
-        ,bl_material: Material
-        ,mat_bin:str
-        ,force_update = False	# Set to True when re-importing stuff to test changes with the latest material set-up code.
-        ,mat_filename = str
-        ,is_instance_file = False
-        ,build_nodes = True
-        ):
-        new_xml = xml_data_from_CR2W(mat_bin, bl_material.name)
-        bl_material.use_nodes = bool(build_nodes)
-                    
-        ##return base mat path and if it is local chunk handle
-        bl_material.witcher_props.name = bl_material.name
-        #bl_material.witcher_props.base = "custom"
-        bl_material.witcher_props.base_custom = new_xml.get('base')
-        bl_material.witcher_props.local = True
-        bl_material.witcher_props.xml_text = prettify(new_xml)
-        #enableMask
-        # if hasattr(mat_bin , 'local') and mat_bin.local == True:
-        #     bl_material.witcher_props.local = True
-        if hasattr(mat_bin ,'DepotPath') and hasattr(mat_bin , 'local') and mat_bin.local == False:
-            bl_material.witcher_props.base_custom = mat_bin.DepotPath
-            bl_material.witcher_props.local = False
-        
-        if mat_bin.get_CR2W_version() <= 115:
-            bl_material.witcher_props.material_version = "witcher2"
-            
-        enableMask = mat_bin.GetVariableByName('enableMask')
-        if enableMask and enableMask.Value == 1:
-            bl_material.witcher_props.enableMask = True
-        if not build_nodes:
-            return bl_material
-        from .w3_material_nodes import (
-            auto_load_base_material_snapshot,
-            refresh_witcher_include_state,
-            suspend_witcher_include_updates,
-        )
-
-        finished_mat = setup_w3_material(uncook_path, bl_material, xml_data=new_xml, xml_path=mat_filename, force_update=force_update, is_instance_file = is_instance_file, defer_include_refresh=True)
-        try:
-            with suspend_witcher_include_updates():
-                auto_load_base_material_snapshot(bpy.context, finished_mat, create_missing=True)
-        except Exception:
-            log.warning("Failed to auto-load Base Path snapshot for material '%s'", getattr(finished_mat, "name", "<unknown>"), exc_info=True)
-        finally:
-            refresh_witcher_include_state(finished_mat)
-        return finished_mat
-
-def load_w3_materials_CR2W(
-        obj: Object
-        ,uncook_path: str
-        ,materials_bin: str
-        ,material_names: str
-        ,force_mat_update = False
-        ,mat_filename = str
-    ):
-    for idx, mat in enumerate(materials_bin):
-        if mat is None:
-            log.warning(f"Skipping unresolved material at slot {idx} ({material_names[idx] if idx < len(material_names) else '?'})")
-            continue
-        xml_mat_name = material_names[idx]
-        log.info(xml_mat_name)
-        target_mat = _find_matching_material_on_object(obj, xml_mat_name)
-        if not target_mat:
-            # Didn't find a matching blender material.
-            # Must be a material that's only for LODs, so let's ignore.
-            continue
-
-        finished_mat = setup_w3_material_CR2W(uncook_path, target_mat, mat, force_update=force_mat_update, mat_filename=mat_filename)
-        obj.material_slots[target_mat.name].material = finished_mat
-
-
-def _material_name_base(name: str) -> str:
-    return re.sub(r"\.\d{3}$", "", str(name or ""))
-
-
-def _find_matching_material_on_object(obj: Object, xml_mat_name: str):
-    if obj is None or getattr(obj, "type", None) != 'MESH':
-        return None
-
-    try:
-        if xml_mat_name in obj.data.materials:
-            return obj.data.materials[xml_mat_name]
-    except Exception:
-        pass
-
-    xml_base = _material_name_base(xml_mat_name)
-    for m in obj.data.materials:
-        if m is None:
-            continue
-        m_base = _material_name_base(m.name)
-        if m_base == xml_base:
-            log.info("redcloth material base match %s -> %s", xml_mat_name, m.name)
-            return m
-        if xml_base and (xml_base in m_base or m_base in xml_base):
-            log.info("redcloth material partial match %s -> %s", xml_mat_name, m.name)
-            return m
-    return None
-
-
 def _redcloth_material_name_prefix(redcloth_resource: str = "", fallback_path: str = "") -> str:
     source_path = str(redcloth_resource or fallback_path or "").strip()
     if not source_path:
@@ -326,7 +209,7 @@ def apply_redcloth_materials_to_meshes(
             if idx >= len(material_names):
                 break
             xml_mat_name = material_names[idx]
-            target_mat = _find_matching_material_on_object(mesh_obj, xml_mat_name)
+            target_mat = find_matching_material_on_object(mesh_obj, xml_mat_name)
             if target_mat:
                 break
 

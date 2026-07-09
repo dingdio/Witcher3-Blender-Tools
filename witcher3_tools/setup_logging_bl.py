@@ -48,7 +48,7 @@ LOG_LEVELS = {
     _mod("ui.ui_entity"): logging.WARNING,         # Animation UI
 
     # Materials
-    _mod("w3_material"): logging.WARNING,
+    _mod("materials"): logging.WARNING,
     _mod("importers.import_blender_fun"): logging.WARNING,
 
     # Scene/Map

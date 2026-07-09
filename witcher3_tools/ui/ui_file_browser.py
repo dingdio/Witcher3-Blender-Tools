@@ -2166,7 +2166,7 @@ def _srt_working_import_dir(abs_srt_path: str) -> str:
 
 def _srt_is_redkit_source_path(path_value: str) -> bool:
     try:
-        from ..w3_material import _is_redkit_source_path
+        from ..materials.material import _is_redkit_source_path
 
         if _is_redkit_source_path(path_value):
             return True
@@ -2212,7 +2212,7 @@ def _stage_srt_texture_for_working_json(source_path: str, work_dir: str) -> str:
     staged_source = source_path
     if _srt_dds_has_dx10_header(source_path):
         try:
-            from ..w3_material import _convert_dds_to_blender_image_cache
+            from ..materials.material import _convert_dds_to_blender_image_cache
 
             converted = _convert_dds_to_blender_image_cache(source_path)
             if converted and win_path_exists(converted):

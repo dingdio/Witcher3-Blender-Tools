@@ -11,7 +11,7 @@ import bpy, os, sys
 import time
 from math import pi
 
-from .w3_material import load_w3_materials_XML
+from .materials.material import load_w3_materials_XML
 
 log = logging.getLogger(__name__)
 
@@ -275,4 +275,3 @@ def importFbx(filepath, ns="mesh", name=":", uncook_path=False, keep_lod_meshes 
         keep_proxy_meshes,
         hide_zero_weight_faces,
     )
-

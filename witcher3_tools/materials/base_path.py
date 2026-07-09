@@ -3,14 +3,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from bpy.types import Material, Node
 
-from .w3_material import (
+from .material import (
     build_param_element,
     create_node_for_param,
     find_group_input_socket,
     get_active_witcher_group_node,
     node_tree_inputs_new,
 )
-from .w3_material_chain import (
+from .chain import (
     CHAIN_NODE_ROW_Y,
     chain_color_for_index,
     chain_node_x,
@@ -18,8 +18,8 @@ from .w3_material_chain import (
     chain_row_step_for_type,
     coerce_source_index,
 )
-from .w3_material_constants import IGNORED_PARAMS, PARAM_ORDER
-from .w3_material_reader import (
+from .constants import IGNORED_PARAMS, PARAM_ORDER
+from .reader import (
     collect_material_chain,
     read_declared_graph_params,
     read_local_material_params_from_bin,

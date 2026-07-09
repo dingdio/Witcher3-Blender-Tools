@@ -1,4 +1,4 @@
-"""Tests for the session-level material root chunk cache in w3_material_reader."""
+"""Tests for the session-level material root chunk cache."""
 
 import sys
 import types
@@ -15,7 +15,7 @@ if "witcher3_tools" not in sys.modules:
     _pkg.get_addon_name = lambda: "witcher3_tools"
     sys.modules["witcher3_tools"] = _pkg
 
-from witcher3_tools import w3_material_reader as reader
+from witcher3_tools.materials import reader
 
 for _name in [n for n in list(sys.modules) if n == "witcher3_tools" or n.startswith("witcher3_tools.")]:
     sys.modules.pop(_name, None)

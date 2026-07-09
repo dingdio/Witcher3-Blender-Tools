@@ -1,4 +1,4 @@
-"""Tests for the W2 bespoke node group policy (w3_material_w2_compat).
+"""Tests for the W2 bespoke node group policy.
 
 Pin lists mirror the bundled witcher3_materials.blend node groups; declared
 parameter sets mirror the real Witcher 2 shader graphs (including the junk
@@ -20,7 +20,7 @@ if "witcher3_tools" not in sys.modules:
     _pkg.get_addon_name = lambda: "witcher3_tools"
     sys.modules["witcher3_tools"] = _pkg
 
-from witcher3_tools.w3_material_w2_compat import (
+from witcher3_tools.materials.w2_compat import (
     canonical_w2_pin_key,
     is_w2_srgb_texture_param,
     plan_w2_socket_renames,

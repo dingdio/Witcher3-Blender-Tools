@@ -1,4 +1,4 @@
-# Modified w3_material.py from Mets3D orignal
+# Originally based on material code from Mets3D.
 # https://github.com/Mets3D/batch_import_witcher3_fbx
 
 import logging
@@ -10,7 +10,7 @@ import hashlib
 import struct
 import time
 import tempfile
-from .CR2W import CR2W_reader
+from ..CR2W import CR2W_reader
 import bpy, os
 from typing import Any, List, Dict, Optional, Set, Tuple
 from bpy.types import Image, Material, Object, Node
@@ -18,9 +18,9 @@ from bpy.types import Image, Material, Object, Node
 from xml.etree import ElementTree
 Element = ElementTree.Element
 
-from .w3_material_constants import *
-from .w3_material_chain import chain_color_for_index, coerce_source_index
-from .w3_vector_param import (
+from .constants import *
+from .chain import chain_color_for_index, coerce_source_index
+from .vector_param import (
     VECTOR_PARAM_KIND,
     VECTOR_SOURCE_XYZ,
     get_mapping_vector_input,
@@ -29,7 +29,7 @@ from .w3_vector_param import (
     get_vector_w,
     mark_vector_param_node,
 )
-from .w3_material_reader import (
+from .reader import (
     _read_material_params_from_bin,
     collect_material_chain,
     normalize_depot_path,
@@ -39,24 +39,24 @@ from .w3_material_reader import (
     read_material_params_from_path,
     resolve_w2mg,
 )
-from .w3_material_w2_compat import (
+from .w2_compat import (
     get_or_create_w2_bespoke_node_group,
     is_w2_srgb_texture_param,
     resolve_w2_bespoke_group_name,
 )
-from . import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext, get_texture_path
-from .extension_paths import get_texture_root, get_redkit_working_root
-from .CR2W.texture_converters import (
+from .. import get_modded_texture_path, get_uncook_path, get_mod_directory, get_tex_ext, get_texture_path
+from ..extension_paths import get_texture_root, get_redkit_working_root
+from ..CR2W.texture_converters import (
     convert_texarray_to_dds,
     convert_xbm_to_dds,
 )
-from .CR2W.texture_dds import dds_format_name_from_header
-from .ui.blender_fun import (
+from ..CR2W.texture_dds import dds_format_name_from_header
+from ..ui.blender_fun import (
     load_image_with_dds_repair,
     load_w2cube_image,
     load_w2cube_blick_equirect_image,
 )
-from .CR2W.common_blender import (
+from ..CR2W.common_blender import (
     repo_file,
     win_safe_path,
     win_bpy_image_path,
@@ -157,7 +157,7 @@ def _apply_image_texture_metadata(image: Optional[Image], source_path: str) -> N
         return
 
     try:
-        from .ui.ui_texture_export import apply_texture_image_metadata
+        from ..ui.ui_texture_export import apply_texture_image_metadata
 
         apply_texture_image_metadata(bpy.context, image, source_path)
     except Exception:
@@ -545,7 +545,7 @@ def _convert_dds_to_blender_image_cache(dds_path: str) -> str:
         format_label = format_name or (f"DXGI {dxgi_format}" if dxgi_format is not None else "DX10")
 
     try:
-        from .CR2W import texconv_wrapper
+        from ..CR2W import texconv_wrapper
     except Exception:
         log.warning("Cannot convert Blender-incompatible DDS because texconv is unavailable: %s", dds_path, exc_info=True)
         return ""
@@ -1405,7 +1405,7 @@ def setup_w3_material(
         #     xml_data = new_xml
 
         node_started = time.perf_counter()
-        from .w3_material_nodes import suspend_witcher_include_updates, refresh_witcher_include_state
+        from .nodes import suspend_witcher_include_updates, refresh_witcher_include_state
         #log.warning(ElementTree.tostring(xml_data, encoding='utf8', method='xml'))
         #all_children2 = list(xml_data.iter())
         # Bulk node setup: each witcher_include write would otherwise trigger a

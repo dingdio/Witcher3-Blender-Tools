@@ -1,7 +1,7 @@
 """Build manifest material entries from Witcher material chains.
 
 For each Blender material slot this walks the ``.w2mi`` baseMaterial chain
-(via :mod:`witcher3_tools.w3_material_reader`) and emits one manifest material
+(via :mod:`witcher3_tools.materials.reader`) and emits one manifest material
 instance per chain level at its depot path, plus a master material spec for
 the terminal ``.w2mg`` graph. Local (in-mesh) materials become instances in
 the mesh's depot folder, mirroring how REDkit stores them.
@@ -32,13 +32,13 @@ def is_volume_master_path(path: str) -> bool:
 
 
 def _default_chain_reader(material_path: str, version: int) -> dict[str, Any]:
-    from ..w3_material_reader import collect_material_chain
+    from ..materials.reader import collect_material_chain
 
     return collect_material_chain(material_path, version=version)
 
 
 def _default_params_reader(material_bin) -> dict[str, tuple[str, str]]:
-    from ..w3_material_reader import read_local_material_params_from_bin
+    from ..materials.reader import read_local_material_params_from_bin
 
     return read_local_material_params_from_bin(material_bin)
 

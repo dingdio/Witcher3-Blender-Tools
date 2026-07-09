@@ -421,7 +421,6 @@ from .exporters import (
                                     )
 from . import constrain_util
 from . import file_helpers
-#from io_import_w2l.cloth_util import setup_w3_material_CR2W
 
 
 #ui
@@ -480,9 +479,8 @@ from .ui.ui_material import WITCH_OT_w2mg, WITCH_OT_w2mi, WITCH_OT_xbm, WITCH_OT
 
 from .ui.ui_anims import WITCH_OT_ImportW2Rig, WITCH_OT_ExportW2AnimJson, WITCH_OT_ExportW2RigJson
 
-from . import w3_material_nodes
-from . import w3_material_blender
-from . import w3_material_nodes_custom
+from .materials import nodes as material_nodes
+from .materials import nodes_custom as material_nodes_custom
 from . import w3_asset_browser
 from . import unreal_export
 
@@ -4600,8 +4598,8 @@ def register():
     ui_mimics.register()
     ui_re_anims.register()
     ui_anims_list.register()
-    w3_material_nodes.register()
-    w3_material_nodes_custom.register()
+    material_nodes.register()
+    material_nodes_custom.register()
     w3_asset_browser.register()
     unreal_export.register()
     
@@ -4654,7 +4652,7 @@ def unregister():
 
     unreal_export.unregister()
     w3_asset_browser.unregister()
-    w3_material_nodes_custom.unregister()
+    material_nodes_custom.unregister()
     unregister_class(WITCH_PT_Quick)
     ui_cache_export.unregister()
     bpy.utils.unregister_class(WITCHER_OT_refresh_cache)
@@ -4688,6 +4686,6 @@ def unregister():
     ui_mimics.unregister()
     ui_re_anims.unregister()
     ui_anims_list.unregister()
-    w3_material_nodes.unregister()
+    material_nodes.unregister()
     ui_custom_icons.unregister()
 

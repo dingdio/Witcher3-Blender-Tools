@@ -3,9 +3,9 @@ import os
 from typing import Any, Dict, List, Optional, Set
 from xml.etree.ElementTree import Element
 
-from .CR2W import CR2W_reader
-from .CR2W.bin_helpers import ReadVLQInt32, readU32, readUByte, readUShort
-from .CR2W.common_blender import repo_file, win_path_key, win_safe_path
+from ..CR2W import CR2W_reader
+from ..CR2W.bin_helpers import ReadVLQInt32, readU32, readUByte, readUShort
+from ..CR2W.common_blender import repo_file, win_path_key, win_safe_path
 
 log = logging.getLogger(__name__)
 

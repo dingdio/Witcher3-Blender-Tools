@@ -144,7 +144,7 @@ def extract_bone_data(armature, matrix_ref=None, rotate_bones_90=False):
     return bone_data
 
 
-from ..w3_material_nodes import (
+from ..materials.nodes import (
     get_group_inputs,
     get_socket_value,
     get_repo_from_abs_path,

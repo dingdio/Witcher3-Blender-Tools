@@ -27,7 +27,7 @@ try:
 except ImportError:  # Allow standalone use (tests, CR2W forensics scripts).
     bpy = None
 
-from .w3_material_reader import normalize_depot_path, read_declared_graph_params
+from .reader import normalize_depot_path, read_declared_graph_params
 
 log = logging.getLogger(__name__)
 

@@ -11,7 +11,7 @@ import array
 from ..CR2W.common_blender import repo_file, get_collision_for_mesh, get_collision_for_mesh_with_poses, win_safe_path
 from ..importers.import_rig import rotate_and_connect_bones
 
-from ..cloth_util import setup_w3_material_CR2W
+from ..materials.cr2w import setup_w3_material_CR2W
 from .. import (
     get_all_addon_prefs,
     get_mod_directory,

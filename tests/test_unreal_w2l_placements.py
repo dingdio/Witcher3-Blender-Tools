@@ -57,9 +57,9 @@ def _install_stubs():
     sys.modules["witcher3_tools.CR2W"] = crw
     sys.modules["witcher3_tools.CR2W.CR2W_helpers"] = helpers
 
-    material = types.ModuleType("witcher3_tools.w3_material")
+    material = types.ModuleType("witcher3_tools.materials.material")
     material.xml_data_from_CR2W = _fake_xml_data_from_CR2W
-    sys.modules["witcher3_tools.w3_material"] = material
+    sys.modules["witcher3_tools.materials.material"] = material
 
 
 _install_stubs()

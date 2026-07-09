@@ -20,7 +20,7 @@ def _embedded_material_props(meshFile, reference, slot_name: str, warnings: list
         warnings.append(f"{slot_name}: embedded material chunk {reference} missing; using fallback master")
         return {"base_custom": "", "local": True, "input_props": []}
     try:
-        from ..w3_material import xml_data_from_CR2W
+        from ..materials.material import xml_data_from_CR2W
 
         xml = xml_data_from_CR2W(chunk, slot_name)
     except Exception as exc:
