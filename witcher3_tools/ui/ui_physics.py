@@ -50,8 +50,8 @@ _IDPROP_DESCRIPTIONS = {
     dyng_blender.DYNG_DAMPENING_PROP: "dampening. Velocity retention factor; lower values damp motion faster",
     dyng_blender.DYNG_SPEED_PROP: "speed. Simulation speed multiplier for preview, step, cache, and bake",
     dyng_blender.DYNG_LINK_ITERATIONS_PROP: "max_links_iterations. Maximum solver passes for link constraints",
-    dyng_blender.DYNG_USE_OFFSETS_PROP: "useOffsets. Use resource offset matrices when solving Dyng node distances",
-    dyng_blender.DYNG_PLANE_COLLISION_PROP: "planeCollision. Keep nodes on the non-penetrating side of their local plane",
+    dyng_blender.DYNG_USE_OFFSETS_PROP: "useOffsets component flag. Center node tethers on authored offset matrices; useful for hair containment",
+    dyng_blender.DYNG_PLANE_COLLISION_PROP: "planeCollision. Keep nodes on one side of each local bone plane; this is not mesh collision",
     dyng_blender.DYNG_BODY_COLLISION_PROP: "bodyCollision. Use Blender-side body collision when supported",
     dyng_blender.DYNG_BODY_COLLISION_RADIUS_PROP: "bodyCollisionRadius. Radius used by Dyng body collision",
     dyng_blender.DYNG_BODY_COLLISION_STRENGTH_PROP: "bodyCollisionStrength. Strength of Dyng body collision response",
@@ -61,6 +61,7 @@ _IDPROP_DESCRIPTIONS = {
     dyng_blender.DYNG_ACCESSORY_PREVIEW_PROP: "accessoryPreview. Let accessory Dyng resources respond to wind in preview",
     dyng_blender.DYNG_LAST_STEP_PROP: "lastStep. Duration in seconds of the last Dyng simulation step",
     dyng_blender.DYNG_CACHE_STATUS_PROP: "cacheStatus. Last Dyng cache status",
+    dyng_blender.DYNG_BAKE_STATUS_PROP: "bakeStatus. Last managed Dyng bake operation status",
     breast_blender.BREAST_SIM_TIME_PROP: "simTime. Simulation time step from the Breast constraint",
     breast_blender.BREAST_ELLIPSE_PROP: "elA. Ellipse center and radius values used by the Breast solver",
     breast_blender.BREAST_VEL_DAMP_PROP: "velDamp. Velocity retention factor; lower values damp motion faster",
@@ -475,6 +476,13 @@ def _on_breast_ellipse_preview_changed(scene, context):
     _sync_breast_ellipse_preview_handler(scene)
 
 
+def _on_physics_live_preview_changed(scene, context):
+    # Rebuild handlers in both directions.  In particular, a handler removes
+    # itself after a frame change while global preview is off.
+    dyng_blender.ensure_frame_handler()
+    breast_blender.ensure_frame_handler()
+
+
 def _refresh_breast_ellipse_preview(context):
     scene = getattr(context, "scene", None)
     if scene is not None and bool(getattr(scene, _BREAST_ELLIPSE_PREVIEW_ATTR, False)):
@@ -723,22 +731,110 @@ class WITCH_OT_DyngReset(bpy.types.Operator):
 class WITCH_OT_DyngBake(bpy.types.Operator):
     bl_idname = "witcher.dyng_bake"
     bl_label = "Bake Dyng"
-    bl_description = "Bake Dyng simulation to pose-bone keyframes over the scene frame range"
+    bl_description = "Bake Dyng into an owned Action while preserving non-Dyng source animation"
     bl_options = {"REGISTER", "UNDO"}
 
     object_name: StringProperty(options={"HIDDEN"})
 
     def execute(self, context):
-        obj = _operator_dyng_object(context, self.object_name)
-        if obj is None:
-            self.report({"WARNING"}, "Select a Dyng armature.")
+        obj = bpy.data.objects.get(self.object_name) if self.object_name else None
+        if obj is None or not dyng_blender.is_dyng_armature(obj):
+            self.report({"WARNING"}, "The specified Dyng armature no longer exists.")
             return {"CANCELLED"}
         scene = context.scene
-        count = dyng_blender.bake_object(context, obj, int(scene.frame_start), int(scene.frame_end))
+        frame_start = int(scene.frame_start)
+        frame_end = int(scene.frame_end)
+        total_frames = abs(frame_end - frame_start) + 1
+        window_manager = context.window_manager
+        window_manager.progress_begin(0, total_frames)
+        try:
+            count = dyng_blender.bake_object(
+                context,
+                obj,
+                frame_start,
+                frame_end,
+                progress_callback=lambda completed, _total: window_manager.progress_update(completed),
+            )
+        except Exception as exc:
+            if not str(obj.get(dyng_blender.DYNG_BAKE_STATUS_PROP, "")).startswith("Bake failed"):
+                obj[dyng_blender.DYNG_BAKE_STATUS_PROP] = "Bake failed; see report"
+            self.report({"ERROR"}, f"Dyng bake failed: {exc}")
+            return {"CANCELLED"}
+        finally:
+            window_manager.progress_end()
         if count <= 0:
             self.report({"WARNING"}, "No Dyng keys were baked.")
             return {"CANCELLED"}
-        self.report({"INFO"}, f"Baked {count} Dyng bone keys.")
+        self.report({"INFO"}, f"Baked {count} Dyng bone-frame samples.")
+        return {"FINISHED"}
+
+
+class WITCH_OT_DyngDeleteBake(bpy.types.Operator):
+    bl_idname = "witcher.dyng_delete_bake"
+    bl_label = "Delete Entire Generated Dyng Action"
+    bl_description = "Delete the entire generated Action, including later edits, and restore the source Action"
+    bl_options = {"REGISTER", "UNDO"}
+
+    object_name: StringProperty(options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context, "scene", None) is not None
+
+    def invoke(self, context, event):
+        obj = bpy.data.objects.get(self.object_name)
+        if obj is None or not dyng_blender.is_dyng_armature(obj):
+            self.report({"WARNING"}, "The specified Dyng armature no longer exists.")
+            return {"CANCELLED"}
+        info = dyng_blender.bake_info(obj)
+        if not info.managed:
+            self.report({"WARNING"}, "This armature has no managed Dyng bake.")
+            return {"CANCELLED"}
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        # Destructive operations never fall back to selection or another list row.
+        obj = bpy.data.objects.get(self.object_name)
+        if obj is None or not dyng_blender.is_dyng_armature(obj):
+            self.report({"WARNING"}, "The specified Dyng armature no longer exists.")
+            return {"CANCELLED"}
+        info = dyng_blender.bake_info(obj)
+        if not info.managed or not dyng_blender.delete_bake(obj):
+            status = str(obj.get(dyng_blender.DYNG_BAKE_STATUS_PROP, "No owned Dyng bake was deleted."))
+            self.report({"WARNING"}, status)
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Deleted Dyng bake from {obj.name}.")
+        return {"FINISHED"}
+
+
+class WITCH_OT_DyngDeleteLegacyBake(bpy.types.Operator):
+    bl_idname = "witcher.dyng_delete_legacy_bake"
+    bl_label = "Delete Possible Legacy Dyng Bake"
+    bl_description = "Permanently delete an untagged Action that looks like an old Dyng bake; verify it is not user animation"
+    bl_options = {"REGISTER", "UNDO"}
+
+    object_name: StringProperty(options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        obj = bpy.data.objects.get(self.object_name)
+        info = dyng_blender.bake_info(obj) if obj is not None else None
+        if obj is None or not dyng_blender.is_dyng_armature(obj) or info is None or not info.legacy:
+            self.report({"WARNING"}, "No strictly recognized legacy Dyng bake was found.")
+            return {"CANCELLED"}
+        if int(getattr(info.action, "users", 0) or 0) != 1:
+            self.report({"WARNING"}, "The legacy Action is shared and cannot be safely deleted.")
+            return {"CANCELLED"}
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.object_name)
+        if obj is None or not dyng_blender.is_dyng_armature(obj):
+            self.report({"WARNING"}, "The specified Dyng armature no longer exists.")
+            return {"CANCELLED"}
+        if not dyng_blender.delete_legacy_bake(obj):
+            self.report({"WARNING"}, "The legacy Action changed or is not safe to delete.")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Deleted legacy Dyng bake from {obj.name}.")
         return {"FINISHED"}
 
 
@@ -1618,6 +1714,92 @@ def _draw_breast_preset_controls(layout, obj):
         delete_op.preset = "__NONE__"
 
 
+def _draw_dyng_bake_controls(layout, context, obj):
+    bake = _draw_detail_panel(
+        layout,
+        "witcher_physics_dyng_bake",
+        "Cache & Bake",
+        "ACTION",
+        default_closed=False,
+    )
+    if not bake:
+        return
+
+    scene = context.scene
+    target_row = bake.row()
+    target_row.prop(obj, "name", text="Target")
+
+    range_row = bake.row(align=True)
+    range_row.prop(scene, "frame_start", text="Start")
+    range_row.prop(scene, "frame_end", text="End")
+    bake.label(text="Bake starts from a reset pose", icon="INFO")
+
+    cache_row = bake.row(align=True)
+    cache_op = cache_row.operator(WITCH_OT_DyngCache.bl_idname, text="Cache Range", icon="FILE_REFRESH")
+    cache_op.object_name = obj.name
+    cache_row.label(text=_short_label(dyng_blender.cache_summary(obj), 28), icon="TIME")
+
+    info = dyng_blender.bake_info(obj)
+    bake.separator(factor=0.4)
+    if info.managed:
+        if info.restore_missing:
+            bake.label(text="Status: Source Action/slot missing", icon="ERROR")
+            bake.label(text="Delete and re-bake are blocked", icon="INFO")
+        elif not info.verified:
+            bake.label(text="Status: Owned bake; Dyng data unavailable", icon="ERROR")
+        elif not info.valid:
+            bake.label(text="Status: Bake modified or incomplete", icon="ERROR")
+        elif info.overridden:
+            bake.label(text="Status: Live preview overrides bake", icon="ERROR")
+        elif info.active:
+            bake.label(text="Status: Baked and active", icon="CHECKMARK")
+        elif info.nla:
+            bake.label(text="Status: Baked in NLA", icon="CHECKMARK")
+        else:
+            bake.label(text="Status: Baked, not active", icon="ERROR")
+        bake.prop(info.action, "name", text="Action")
+        if info.frame_start is not None and info.frame_end is not None:
+            bake.label(text=f"Baked Range: {info.frame_start} to {info.frame_end}", icon="PREVIEW_RANGE")
+            frame_count = info.frame_end - info.frame_start + 1
+            bake.label(text=f"Frames: {frame_count}    Bones: {info.bone_count}", icon="BONE_DATA")
+        bake.label(text=f"Dyng Curve Keys: {info.key_count}", icon="KEY_HLT")
+    elif info.legacy:
+        bake.label(text="Status: Possible unmanaged legacy bake", icon="ERROR")
+        bake.prop(info.action, "name", text="Action")
+        if info.frame_start is not None and info.frame_end is not None:
+            bake.label(text=f"Detected Range: {info.frame_start} to {info.frame_end}", icon="PREVIEW_RANGE")
+        bake.label(text="Full-frame curve signature detected.", icon="INFO")
+    elif info.missing:
+        bake.label(text="Status: Managed bake Action is missing", icon="ERROR")
+        if info.restore_missing:
+            bake.label(text="Source Action/slot is also missing", icon="ERROR")
+        else:
+            bake.label(text="Rebake to replace stale tracking", icon="INFO")
+    else:
+        status = str(obj.get(dyng_blender.DYNG_BAKE_STATUS_PROP, "Not baked") or "Not baked")
+        bake.label(text=f"Last Operation: {_short_label(status, 32)}", icon="INFO")
+
+    action_row = bake.row(align=True)
+    bake_slot = action_row.row(align=True)
+    bake_slot.enabled = not info.restore_missing
+    bake_op = bake_slot.operator(WITCH_OT_DyngBake.bl_idname, text="Bake Range", icon="KEY_HLT")
+    bake_op.object_name = obj.name
+    if info.legacy:
+        legacy_slot = action_row.row(align=True)
+        legacy_slot.enabled = int(getattr(info.action, "users", 0) or 0) == 1
+        legacy_op = legacy_slot.operator(
+            WITCH_OT_DyngDeleteLegacyBake.bl_idname,
+            text="Delete Possible Legacy...",
+            icon="TRASH",
+        )
+        legacy_op.object_name = obj.name
+    else:
+        delete_slot = action_row.row(align=True)
+        delete_slot.enabled = info.managed and not info.restore_missing
+        delete_op = delete_slot.operator(WITCH_OT_DyngDeleteBake.bl_idname, text="Delete Bake...", icon="TRASH")
+        delete_op.object_name = obj.name
+
+
 def _draw_dyng_details(layout, context, obj):
     resource = _draw_detail_panel(layout, "witcher_physics_dyng_resource", "Resource Data", "PROPERTIES", default_closed=False)
     if resource:
@@ -1649,8 +1831,8 @@ def _draw_dyng_details(layout, context, obj):
             (dyng_blender.DYNG_SPEED_PROP, "Speed"),
             (dyng_blender.DYNG_LINK_ITERATIONS_PROP, "Link Iterations"),
             (dyng_blender.DYNG_BLEND_PROP, "Blend"),
-            (dyng_blender.DYNG_USE_OFFSETS_PROP, "Use Offsets"),
-            (dyng_blender.DYNG_PLANE_COLLISION_PROP, "Ground Plane"),
+            (dyng_blender.DYNG_USE_OFFSETS_PROP, "Use Authored Offsets"),
+            (dyng_blender.DYNG_PLANE_COLLISION_PROP, "Local Plane Limit"),
             (dyng_blender.DYNG_SHAKE_PROP, "Shake"),
             (dyng_blender.DYNG_WIND_PROP, "Wind Influence"),
             (dyng_blender.DYNG_ACCESSORY_PREVIEW_PROP, "Accessory Preview"),
@@ -1659,6 +1841,11 @@ def _draw_dyng_details(layout, context, obj):
             runtime.separator(factor=0.4)
             for key, label in runtime_keys:
                 _draw_idprop(runtime, obj, key, label)
+            if (
+                dyng_blender.has_authored_offsets(obj)
+                and not bool(obj.get(dyng_blender.DYNG_USE_OFFSETS_PROP, False))
+            ):
+                runtime.label(text="Offsets available; enable for containment", icon="INFO")
         else:
             runtime.label(text="Load Dyng data first.", icon="INFO")
         runtime.separator(factor=0.4)
@@ -1667,11 +1854,8 @@ def _draw_dyng_details(layout, context, obj):
         step_op.object_name = obj.name
         reset_op = row.operator(WITCH_OT_DyngReset.bl_idname, text="Reset", icon="LOOP_BACK")
         reset_op.object_name = obj.name
-        cache_op = runtime.operator(WITCH_OT_DyngCache.bl_idname, text="Cache Range", icon="FILE_REFRESH")
-        cache_op.object_name = obj.name
-        bake_op = runtime.operator(WITCH_OT_DyngBake.bl_idname, text="Bake Range", icon="KEY_HLT")
-        bake_op.object_name = obj.name
-        runtime.label(text=_short_label(dyng_blender.cache_summary(obj), 48), icon="TIME")
+
+    _draw_dyng_bake_controls(layout, context, obj)
 
 
 def _draw_breast_details(layout, context, obj):
@@ -1797,6 +1981,8 @@ classes = [
     WITCH_OT_DyngStep,
     WITCH_OT_DyngReset,
     WITCH_OT_DyngBake,
+    WITCH_OT_DyngDeleteBake,
+    WITCH_OT_DyngDeleteLegacyBake,
     WITCH_OT_DyngCache,
     WITCH_OT_DyngApplyUserPreset,
     WITCH_OT_DyngSaveUserPreset,
@@ -1895,7 +2081,9 @@ def register():
             name="Physics Live Preview",
             description="Allow enabled physics armatures to update on frame changes",
             default=True,
+            update=_on_physics_live_preview_changed,
         ),
+        replace=True,
     )
     _register_scene_property(
         _BREAST_ELLIPSE_PREVIEW_ATTR,

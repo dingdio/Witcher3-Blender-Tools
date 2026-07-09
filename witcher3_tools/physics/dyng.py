@@ -1,4 +1,4 @@
-"""Dyng resource parsing and Blender-side simulation."""
+"""Dyng resource parsing and Blender-native position-based simulation."""
 
 from __future__ import annotations
 
@@ -575,10 +575,11 @@ def _unit_noise(step: int, index: int, salt: int) -> float:
 
 
 class DyngSimulator:
-    """Position-based Dyng solver for Blender preview."""
+    """Blender-native position-based solver using Dyng resource parameters."""
 
-    _GRAVITY_ACCEL = 19.62
-    _WIND_ACCEL = 18.0
+    # These are per-evaluation velocity impulses. Gravity is intentionally frame based rather than scaled by dt
+    _GRAVITY_VELOCITY_IMPULSE = 0.327
+    _WIND_VELOCITY_IMPULSE = 0.3
 
     def __init__(self, resource: DyngResourceData, target_transforms: Sequence[Sequence[Sequence[float]]]):
         if len(resource.nodes) != len(target_transforms):
@@ -649,23 +650,23 @@ class DyngSimulator:
                 self.lookats[parent_index] = -1
             child_count[parent_index] += 1
 
-    def _mobility(self, index: int) -> float:
-        if index < 0 or index >= len(self.distances) or self.distances[index] <= 0.0:
-            return 0.0
-        return max(abs(self.masses[index]), 0.001)
-
     def _prepare_link_shares(self) -> None:
         self._link_shares = []
         for node_a, node_b in zip(self.link_a, self.link_b):
-            mobility_a = self._mobility(node_a)
-            mobility_b = self._mobility(node_b)
-            total = mobility_a + mobility_b
-            if total <= 1e-12:
-                share_a, share_b = 0.0, 0.0
+            mass_a = self.masses[node_a]
+            mass_b = self.masses[node_b]
+            if mass_a <= 0.0 and mass_b <= 0.0:
+                weight = 0.0
+            elif self.distances[node_a] <= 0.0:
+                weight = 1.0
+            elif self.distances[node_b] <= 0.0:
+                weight = 0.0
             else:
-                share_a = mobility_a / total
-                share_b = mobility_b / total
-            self._link_shares.append((share_a, share_b))
+                total = mass_a + mass_b
+                # Keep malformed zero-sum resources usable with a balanced
+                # fallback while preserving normal mass weighting.
+                weight = mass_a / total if abs(total) > 1e-12 else 0.5
+            self._link_shares.append((1.0 - weight, weight))
 
     def force_reset(self, target_transforms: Optional[Sequence[Sequence[Sequence[float]]]] = None) -> None:
         if target_transforms is not None:
@@ -673,7 +674,9 @@ class DyngSimulator:
         self._step_index = 0
         for index, transform in enumerate(self.global_transforms):
             self.velocities[index] = (0.0, 0.0, 0.0)
-            self.positions[index] = self._anchor_position(index, transform)
+            # Reset nodes to their animated targets. Offset envelopes are
+            # enforced by the following distance projection.
+            self.positions[index] = matrix_translation(transform)
 
     def step(
         self,
@@ -719,20 +722,26 @@ class DyngSimulator:
             return self.global_transforms
 
         self.dt = effective_dt
-        self._step_index += 1
         self.relaxed_mode = bool(relaxed)
-        substeps = 30 if relaxed else 1
-        sub_dt = effective_dt / substeps
-        for _ in range(substeps):
-            previous = list(self.positions)
-            self._pin_anchors()
-            self._integrate_free_nodes(sub_dt, wind, wind_vector)
+        evaluations = 30 if relaxed else 1
+        self._step_index += 1
+        # Wind is applied before reset, so a reset intentionally discards the
+        # current evaluation's wind impulse.
+        if not force_reset:
+            self._apply_wind(wind, wind_vector)
+        for evaluation in range(evaluations):
+            if evaluation:
+                self._step_index += 1
+            # Tether before and after integration, solve links, then damp and
+            # tether once more. Positional corrections also update velocity.
+            self._project_anchor_limits()
+            self._integrate_nodes(effective_dt)
             self._project_anchor_limits()
             for _iteration in range(max(0, self.max_link_iterations)):
                 self._project_links()
             self._project_body_colliders()
+            self._dampen_velocities()
             self._project_anchor_limits()
-            self._update_velocities(previous, sub_dt)
         self.relaxed_mode = False
         self._rebuild_transforms()
         return self.global_transforms
@@ -772,34 +781,39 @@ class DyngSimulator:
     def _anchor_matrix(self, index: int) -> List[List[float]]:
         transform = self.global_transforms[index]
         if self.use_offsets:
-            return matrix_mul(transform, self.offsets[index])
+            # Resource matrices use row-vector transform order, which maps to
+            # the mathematical offset * global product here.
+            return matrix_mul(self.offsets[index], transform)
         return transform
 
     def _anchor_position(self, index: int, transform: Optional[Sequence[Sequence[float]]] = None) -> Vector3:
         if transform is None:
             return matrix_translation(self._anchor_matrix(index))
         if self.use_offsets:
-            return matrix_translation(matrix_mul(transform, self.offsets[index]))
+            return matrix_translation(matrix_mul(self.offsets[index], transform))
         return matrix_translation(transform)
 
     def _pin_anchors(self) -> None:
+        """Refresh fixed nodes without evaluating dt-dependent constraints."""
         for index, distance in enumerate(self.distances):
             if distance <= 0.0:
                 self.positions[index] = self._anchor_position(index)
                 self.velocities[index] = (0.0, 0.0, 0.0)
 
-    def _integrate_free_nodes(self, dt: float, wind: float, wind_vector: Vector3) -> None:
-        wind_amount = max(0.0, min(1.0, float(wind)))
-        wind_active = wind_amount > 0.0001 and _v_len(wind_vector) > 0.0001
+    def _apply_wind(self, wind: float, wind_vector: Vector3) -> None:
+        wind_amount = max(0.0, float(wind))
+        if wind_amount <= 0.0001 or _v_len(wind_vector) <= 0.0001:
+            return
+        for index in range(len(self.positions)):
+            random_weight = _unit_noise(self._step_index, index, 0)
+            impulse = wind_amount * random_weight * random_weight * self._WIND_VELOCITY_IMPULSE
+            self.velocities[index] = _v_add(self.velocities[index], _v_mul(wind_vector, impulse))
+
+    def _integrate_nodes(self, dt: float) -> None:
         for index, position in enumerate(self.positions):
-            if self.distances[index] <= 0.0:
-                continue
             velocity = self.velocities[index]
-            acceleration = (0.0, 0.0, -self._GRAVITY_ACCEL * self.masses[index] * self.gravity)
-            if wind_active:
-                r = _unit_noise(self._step_index, index, 0)
-                acceleration = _v_add(acceleration, _v_mul(wind_vector, wind_amount * r * r * self._WIND_ACCEL))
-            velocity = _v_add(velocity, _v_mul(acceleration, dt))
+            gravity_impulse = -self._GRAVITY_VELOCITY_IMPULSE * self.masses[index] * self.gravity
+            velocity = _v_add(velocity, (0.0, 0.0, gravity_impulse))
             if self.shaking > 0.0001 and self.shake_weights[index] > 0.0001:
                 amount = self.shaking * self.shake_weights[index] * dt
                 jitter = (
@@ -815,12 +829,17 @@ class DyngSimulator:
         for index, distance in enumerate(self.distances):
             if distance <= 0.0:
                 self.positions[index] = self._anchor_position(index)
+                self.velocities[index] = (0.0, 0.0, 0.0)
                 continue
-            self._project_half_space(index)
             if self.use_offsets:
-                self._project_offset_radius(index, distance)
+                self._project_offset_constraints(index, distance)
             else:
+                self._project_half_space(index)
                 self._project_world_radius(index, distance)
+
+    def _apply_position_correction(self, index: int, correction: Vector3) -> None:
+        self.positions[index] = _v_add(self.positions[index], correction)
+        self.velocities[index] = _v_add(self.velocities[index], _v_div(correction, self.dt))
 
     def _project_half_space(self, index: int) -> None:
         if not self.plane_collision:
@@ -830,16 +849,17 @@ class DyngSimulator:
         plane_axis = (float(transform[1][0]), float(transform[1][1]), float(transform[1][2]))
         penetration = _v_dot(plane_axis, _v_sub(self.positions[index], plane_origin))
         if penetration < 0.0:
-            self.positions[index] = _v_add(self.positions[index], _v_mul(plane_axis, -penetration))
+            self._apply_position_correction(index, _v_mul(plane_axis, -penetration))
 
     def _project_world_radius(self, index: int, distance: float) -> None:
         center = matrix_translation(self.global_transforms[index])
         delta = _v_sub(self.positions[index], center)
         direction, length = _v_norm(delta)
         if length > distance > 0.0:
-            self.positions[index] = _v_add(center, _v_mul(direction, distance))
+            target = _v_add(center, _v_mul(direction, distance))
+            self._apply_position_correction(index, _v_sub(target, self.positions[index]))
 
-    def _project_offset_radius(self, index: int, distance: float) -> None:
+    def _project_offset_constraints(self, index: int, distance: float) -> None:
         anchor = self._anchor_matrix(index)
         center = matrix_translation(anchor)
         delta_world = _v_sub(self.positions[index], center)
@@ -853,8 +873,12 @@ class DyngSimulator:
             denom = _v_dot(axis, axis)
             local.append(0.0 if abs(denom) <= 1e-12 else _v_dot(delta_world, axis) / denom)
         direction, length = _v_norm((local[0], local[1], local[2]))
+        # Compute the offset-space radius vector before the optional
+        # base-transform plane correction.
+        self._project_half_space(index)
         if length > distance > 0.0:
-            self.positions[index] = transform_point(anchor, _v_mul(direction, distance))
+            target = transform_point(anchor, _v_mul(direction, distance))
+            self._apply_position_correction(index, _v_sub(target, self.positions[index]))
 
     def _project_links(self) -> None:
         for index, (node_a, node_b) in enumerate(zip(self.link_a, self.link_b)):
@@ -878,8 +902,8 @@ class DyngSimulator:
             if share_a <= 0.0 and share_b <= 0.0:
                 continue
             correction = _v_mul(direction, diff)
-            self.positions[node_a] = _v_add(self.positions[node_a], _v_mul(correction, share_a))
-            self.positions[node_b] = _v_sub(self.positions[node_b], _v_mul(correction, share_b))
+            self._apply_position_correction(node_a, _v_mul(correction, share_a))
+            self._apply_position_correction(node_b, _v_mul(correction, -share_b))
 
     def _project_body_colliders(self) -> None:
         if not self.body_collision:
@@ -893,7 +917,7 @@ class DyngSimulator:
         for index, transform in enumerate(self.global_transforms):
             if self.distances[index] > 0.0:
                 continue
-            collider_matrix = matrix_mul(transform, self.offsets[index])
+            collider_matrix = matrix_mul(self.offsets[index], transform)
             radius = max(0.0, float(self.body_radii[index])) + radius_margin
             if radius > 1e-8:
                 colliders.append((matrix_translation(collider_matrix), radius))
@@ -913,18 +937,17 @@ class DyngSimulator:
                     direction, length = _v_norm(_v_sub(target, center))
                     if length <= 1e-8:
                         direction = (1.0, 0.0, 0.0)
-                position = _v_add(position, _v_mul(direction, (radius - length) * strength))
+                correction = _v_mul(direction, (radius - length) * strength)
+                position = _v_add(position, correction)
+                self.velocities[index] = _v_add(self.velocities[index], _v_div(correction, self.dt))
             self.positions[index] = position
 
-    def _update_velocities(self, previous: Sequence[Vector3], dt: float) -> None:
+    def _dampen_velocities(self) -> None:
         damping = max(0.0, float(self.dampening))
         if self.relaxed_mode:
             damping *= 0.9
-        for index, (old_position, new_position) in enumerate(zip(previous, self.positions)):
-            if self.distances[index] <= 0.0:
-                self.velocities[index] = (0.0, 0.0, 0.0)
-            else:
-                self.velocities[index] = _v_mul(_v_div(_v_sub(new_position, old_position), dt), damping)
+        for index, velocity in enumerate(self.velocities):
+            self.velocities[index] = _v_mul(velocity, damping)
 
     def _rebuild_transforms(self) -> None:
         for index, transform in enumerate(self.global_transforms):

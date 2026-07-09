@@ -22,6 +22,17 @@ def _slot_target_id_type(slot):
     return getattr(slot, "target_id_type", getattr(slot, "id_root", None))
 
 
+def _slot_names(slot):
+    """Return the user-facing and stable names exposed across Action Slot APIs."""
+
+    names = []
+    for attr in ("name", "name_display", "display_name", "identifier"):
+        value = getattr(slot, attr, None)
+        if value and value not in names:
+            names.append(value)
+    return tuple(names)
+
+
 def _create_action_slot(action, target, slot_name=None):
     slots = getattr(action, "slots", None)
     if slots is None or target is None:
@@ -39,11 +50,15 @@ def _create_action_slot(action, target, slot_name=None):
     for attempt in create_attempts:
         try:
             slot = attempt()
-            if getattr(slot, "name", None) in (None, "") and name:
-                try:
-                    slot.name = name
-                except Exception:
-                    pass
+            if not _slot_names(slot) and name:
+                for attr in ("name", "name_display", "display_name"):
+                    if not hasattr(slot, attr):
+                        continue
+                    try:
+                        setattr(slot, attr, name)
+                        break
+                    except Exception:
+                        pass
             return slot
         except TypeError:
             continue
@@ -69,7 +84,7 @@ def resolve_action_slot(action, target=None, slot=None, slot_name=None, ensure=F
 
     if slot_name:
         for candidate in slots:
-            if getattr(candidate, "name", None) == slot_name:
+            if slot_name in _slot_names(candidate):
                 return candidate
 
     target_id_type = getattr(target, "id_type", None) if target is not None else None

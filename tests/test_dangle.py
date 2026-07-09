@@ -416,6 +416,17 @@ class DyngSolverTests(unittest.TestCase):
         self.assertEqual(simulator.positions[0], before_root)
         self.assertLess(simulator.positions[1][2], before_child[2])
 
+    def test_zero_dt_refreshes_fixed_anchor_without_evaluating_constraints(self):
+        data = parse_dyng_chunk(fake_dyng_chunk(), source_path="sample.w3dyng")
+        targets = [node.transform for node in data.nodes]
+        moved_root = transform_from_axes((1, 0, 0), (0, 1, 0), (0, 0, 1), (2.0, 3.0, 4.0))
+        moved_targets = [moved_root, targets[1]]
+        simulator = DyngSimulator(data, targets)
+
+        simulator.step(moved_targets, 0.0)
+
+        assert_vector_almost_equal(self, simulator.positions[0], (2.0, 3.0, 4.0))
+
     def test_simulator_is_deterministic_for_same_inputs(self):
         data = parse_dyng_chunk(fake_dyng_chunk(), source_path="sample.w3dyng")
         targets = [node.transform for node in data.nodes]
@@ -452,6 +463,81 @@ class DyngSolverTests(unittest.TestCase):
         windy.step(targets, 1.0 / 60.0, gravity=0.0, wind=1.0, wind_vector=(0.0, 1.0, 0.0))
 
         self.assertGreater(windy.positions[1][1], calm.positions[1][1])
+
+    def test_free_link_uses_opposite_mass_shares(self):
+        point_a = transform_from_axes((1, 0, 0), (0, 1, 0), (0, 0, 1), (0.0, 0.0, 0.0))
+        point_b = transform_from_axes((1, 0, 0), (0, 1, 0), (0, 0, 1), (2.0, 0.0, 0.0))
+        data = DyngResourceData(
+            "",
+            "weighted-link",
+            (
+                dyng.DyngNode("a", "", 1.0, 0.0, 10.0, point_a),
+                dyng.DyngNode("b", "", 3.0, 0.0, 10.0, point_b),
+            ),
+            (dyng.DyngLink(0, 1.0, 0, 1),),
+            (),
+            (),
+        )
+        simulator = DyngSimulator(data, (point_a, point_b))
+
+        simulator.step((point_a, point_b), 1.0 / 60.0, gravity=0.0, dampening=1.0, max_link_iterations=1)
+
+        self.assertAlmostEqual(simulator.positions[0][0], 0.75)
+        self.assertAlmostEqual(simulator.positions[1][0], 1.75)
+
+    def test_preintegration_tether_correction_updates_position_and_velocity(self):
+        target = transform_from_axes((1, 0, 0), (0, 1, 0), (0, 0, 1), (0.0, 0.0, 0.0))
+        data = DyngResourceData(
+            "",
+            "tether-order",
+            (dyng.DyngNode("point", "", 1.0, 0.0, 1.0, target),),
+            (),
+            (),
+            (),
+        )
+        simulator = DyngSimulator(data, (target,))
+        simulator.positions[0] = (2.0, 0.0, 0.0)
+
+        simulator.step((target,), 0.02, gravity=0.0, dampening=0.5, max_link_iterations=0)
+
+        self.assertAlmostEqual(simulator.positions[0][0], 0.0)
+        self.assertAlmostEqual(simulator.velocities[0][0], -25.0)
+
+    def test_gravity_is_per_evaluation_velocity_impulse(self):
+        target = transform_from_axes((1, 0, 0), (0, 1, 0), (0, 0, 1), (0.0, 0.0, 0.0))
+        data = DyngResourceData(
+            "",
+            "gravity-impulse",
+            (dyng.DyngNode("point", "", 2.0, 0.0, 100.0, target),),
+            (),
+            (),
+            (),
+        )
+        short_step = DyngSimulator(data, (target,))
+        long_step = DyngSimulator(data, (target,))
+
+        short_step.step((target,), 0.01, dampening=1.0, max_link_iterations=0)
+        long_step.step((target,), 0.02, dampening=1.0, max_link_iterations=0)
+
+        self.assertAlmostEqual(short_step.velocities[0][2], -0.654)
+        self.assertAlmostEqual(long_step.velocities[0][2], -0.654)
+        self.assertAlmostEqual(long_step.positions[0][2], short_step.positions[0][2] * 2.0)
+
+    def test_relaxed_mode_runs_thirty_full_evaluations(self):
+        target = transform_from_axes((1, 0, 0), (0, 1, 0), (0, 0, 1), (0.0, 0.0, 0.0))
+        data = DyngResourceData(
+            "",
+            "relaxed",
+            (dyng.DyngNode("point", "", 1.0, 0.0, 100.0, target),),
+            (),
+            (),
+            (),
+        )
+        simulator = DyngSimulator(data, (target,))
+
+        simulator.step((target,), 0.01, dampening=1.0 / 0.9, max_link_iterations=0, relaxed=True)
+
+        self.assertAlmostEqual(simulator.velocities[0][2], -9.81)
 
     def test_body_collision_pushes_dynamic_node_out_of_static_collider(self):
         target = transform_from_axes(
@@ -505,6 +591,23 @@ class DyngSolverTests(unittest.TestCase):
         self.assertAlmostEqual(simulator.positions[1][1], 0.25)
         self.assertAlmostEqual(simulator.positions[1][2], 0.0)
 
+    def test_use_offsets_composes_collision_transform_in_bone_space(self):
+        target = transform_from_axes((0, 1, 0), (-1, 0, 0), (0, 0, 1), (1.0, 2.0, 3.0))
+        offset = transform_from_axes((1, 0, 0), (0, 1, 0), (0, 0, 1), (0.0, 0.25, 0.0))
+        data = DyngResourceData(
+            "",
+            "rotated-offset",
+            (dyng.DyngNode("anchor", "", 0.0, 0.0, 0.0, target),),
+            (),
+            (),
+            (dyng.DyngCollision("anchor", 0.0, 0.0, offset),),
+        )
+        simulator = DyngSimulator(data, (target,))
+
+        simulator.step((target,), 1.0 / 60.0, gravity=0.0, use_offsets=True, max_link_iterations=0)
+
+        assert_vector_almost_equal(self, simulator.positions[0], (0.75, 2.0, 3.0))
+
     def test_offsets_plane_collision_uses_base_transform_axis(self):
         target = transform_from_axes((1, 0, 0), (0, 1, 0), (0, 0, 1), (1.0, 0.0, 0.0))
         collision_offset = transform_from_axes((1, 0, 0), (0, 0, 1), (0, -1, 0), (0.0, 0.0, 0.0))
@@ -535,7 +638,9 @@ class DyngSolverTests(unittest.TestCase):
             max_link_iterations=0,
         )
 
-        self.assertAlmostEqual(simulator.positions[1][1], 0.0)
+        # The plane correction updates velocity before integration, so a
+        # 0.5-unit correction advances another 0.5.
+        self.assertAlmostEqual(simulator.positions[1][1], 0.5)
 
     def test_lookat_rotation_rotates_existing_basis(self):
         matrix = transform_from_axes((1, 0, 0), (0, 1, 0), (0, 0, 1), (0, 0, 0))

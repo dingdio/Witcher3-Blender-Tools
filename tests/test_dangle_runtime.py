@@ -151,6 +151,67 @@ class FakeScene:
         self.frame_current = int(frame)
 
 
+class FakeBakePoint:
+    def __init__(self, frame, value=0.0):
+        self.co = (float(frame), float(value))
+
+
+class FakeBakeFCurve:
+    def __init__(self, data_path, array_index, frames):
+        self.data_path = data_path
+        self.array_index = int(array_index)
+        self.keyframe_points = [FakeBakePoint(frame) for frame in frames]
+
+    def range(self):
+        frames = [point.co[0] for point in self.keyframe_points]
+        return min(frames), max(frames)
+
+
+class FakeBakeAction(dict):
+    def __init__(self, name, fcurves=(), *, users=1, slots=None):
+        super().__init__()
+        self.name = name
+        self.fcurves = list(fcurves)
+        self.users = users
+        self.library = None
+        self.is_library_indirect = False
+        if slots is not None:
+            self.slots = slots
+
+
+class FakeBakePoseBone:
+    def __init__(self, owner, name="dyng_test"):
+        self.id_data = owner
+        self.name = name
+        self.constraints = []
+        self.rotation_mode = "XYZ"
+        self.location = (0.0, 0.0, 0.0)
+        self.rotation_euler = (0.0, 0.0, 0.0)
+        self.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+        self.rotation_axis_angle = (0.0, 0.0, 1.0, 0.0)
+        self.scale = (1.0, 1.0, 1.0)
+
+    def path_from_id(self, prop):
+        return f'pose.bones["{self.name}"].{prop}'
+
+
+def _fake_bake_resource_and_object(name="dyng_bake_test"):
+    obj = FakeObject(name)
+    bone = FakeBakePoseBone(obj)
+    obj.pose = types.SimpleNamespace(bones=FakePoseBones([bone]))
+    node = types.SimpleNamespace(name=bone.name, distance=0.2)
+    resource = dyng_blender.DyngResourceData("", "test", (node,), (), (), ())
+    return obj, bone, resource
+
+
+def _fake_transform_curves(bone, frames):
+    curves = []
+    for prop, size in (("location", 3), ("rotation_euler", 3), ("scale", 3)):
+        data_path = bone.path_from_id(prop)
+        curves.extend(FakeBakeFCurve(data_path, index, frames) for index in range(size))
+    return curves
+
+
 class FakePoseBones(list):
     def get(self, name):
         for bone in self:
@@ -515,10 +576,10 @@ class RuntimeOptInTests(unittest.TestCase):
         self.assertEqual(first.name, "first")
         self.assertEqual(second.name, "second")
 
-    def test_raw_dyng_resource_defaults_match_import_defaults(self):
+    def test_resource_offsets_do_not_override_component_default(self):
         obj = FakeObject("raw_dyng")
         resource = types.SimpleNamespace(
-            nodes=(object(),),
+            nodes=(types.SimpleNamespace(distance=0.2),),
             triangles=(),
             collisions=(types.SimpleNamespace(transform=((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0.2, 0, 1))),),
         )
@@ -527,8 +588,42 @@ class RuntimeOptInTests(unittest.TestCase):
 
         self.assertFalse(obj[dyng_blender.DYNG_USE_OFFSETS_PROP])
         self.assertFalse(obj[dyng_blender.DYNG_PLANE_COLLISION_PROP])
+        self.assertEqual(obj[dyng_blender.DYNG_WIND_PROP], 0.0)
         self.assertEqual(obj[dyng_blender.DYNG_BLEND_PROP], 1.0)
         self.assertTrue(obj[dyng_blender.DYNG_ACCESSORY_PREVIEW_PROP])
+
+        self.assertTrue(dyng_blender._resource_has_authored_offsets(resource))
+
+    def test_identity_dynamic_offsets_remain_disabled_by_default(self):
+        obj = FakeObject("plain_dyng")
+        resource = types.SimpleNamespace(
+            nodes=(types.SimpleNamespace(distance=0.2),),
+            triangles=(),
+            collisions=(types.SimpleNamespace(transform=((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))),),
+        )
+
+        dyng_blender._ensure_resource_default_props(obj, resource)
+
+        self.assertFalse(obj[dyng_blender.DYNG_USE_OFFSETS_PROP])
+
+    def test_explicit_offset_setting_is_not_replaced_by_resource_default(self):
+        obj = FakeObject("explicit_offsets_off")
+        obj[dyng_blender.DYNG_USE_OFFSETS_PROP] = False
+        resource = types.SimpleNamespace(
+            nodes=(types.SimpleNamespace(distance=0.2),),
+            triangles=(),
+            collisions=(types.SimpleNamespace(transform=((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0.2, 0, 1))),),
+        )
+
+        dyng_blender._ensure_resource_default_props(obj, resource)
+
+        self.assertFalse(obj[dyng_blender.DYNG_USE_OFFSETS_PROP])
+
+    def test_ciri_hair_preset_enables_authored_offsets(self):
+        preset = dyng_blender._user_preset_by_name("Ciri_Hair_Reactive")
+
+        self.assertIsNotNone(preset)
+        self.assertTrue(preset.use_offsets)
 
     def test_hair_like_dyng_resource_defaults_to_full_blend(self):
         obj = FakeObject("hair_dyng")
@@ -865,6 +960,247 @@ class RuntimeOptInTests(unittest.TestCase):
         self.assertEqual(scene.frame_current, 42)
         self.assertEqual(scene.frame_history[-1], 42)
 
+    def test_dyng_managed_bake_requires_matching_object_and_action_id(self):
+        class FakeActions(list):
+            def get(self, name):
+                return next((action for action in self if action.name == name), None)
+
+        class FakeAction(dict):
+            def __init__(self, name):
+                super().__init__()
+                self.name = name
+
+        obj = FakeObject("dyng_managed")
+        action = FakeAction("dyng_managed_DYNG_Bake")
+        action[dyng_blender.DYNG_BAKE_GENERATED_PROP] = True
+        action[dyng_blender.DYNG_BAKE_ID_PROP] = "bake-id"
+        obj[dyng_blender.DYNG_BAKE_ACTION_PROP] = action.name
+        obj[dyng_blender.DYNG_BAKE_ID_PROP] = "bake-id"
+        obj.animation_data = types.SimpleNamespace(action=action, nla_tracks=[])
+        resource = dyng_blender.DyngResourceData("", "empty", (), (), (), ())
+        original_actions = getattr(bpy.data, "actions", None)
+        original_load = dyng_blender.load_resource_for_object
+        original_stats = dyng_blender._action_curve_stats
+        try:
+            bpy.data.actions = FakeActions([action])
+            dyng_blender.load_resource_for_object = lambda _obj: resource
+            dyng_blender._action_curve_stats = lambda *_args: (True, 3, 90, 1.0, 10.0)
+
+            self.assertTrue(dyng_blender.bake_info(obj).managed)
+            action.name = "renamed_DYNG_Bake"
+            renamed_info = dyng_blender.bake_info(obj)
+            self.assertTrue(renamed_info.managed)
+            self.assertIs(renamed_info.action, action)
+            self.assertEqual(obj[dyng_blender.DYNG_BAKE_ACTION_PROP], "dyng_managed_DYNG_Bake")
+            obj[dyng_blender.DYNG_BAKE_ID_PROP] = "different-id"
+            self.assertFalse(dyng_blender.bake_info(obj).managed)
+        finally:
+            if original_actions is None:
+                delattr(bpy.data, "actions")
+            else:
+                bpy.data.actions = original_actions
+            dyng_blender.load_resource_for_object = original_load
+            dyng_blender._action_curve_stats = original_stats
+
+    def test_dyng_delete_refuses_unmanaged_legacy_bake(self):
+        obj = FakeObject("legacy_bake")
+        original_info = dyng_blender.bake_info
+        try:
+            dyng_blender.bake_info = lambda _obj: dyng_blender.DyngBakeInfo(
+                action=object(),
+                legacy=True,
+            )
+            self.assertFalse(dyng_blender.delete_bake(obj))
+        finally:
+            dyng_blender.bake_info = original_info
+
+        self.assertEqual(obj[dyng_blender.DYNG_BAKE_STATUS_PROP], "No managed bake to delete")
+
+    def test_dyng_legacy_delete_refuses_shared_action(self):
+        obj = FakeObject("legacy_shared")
+        action = types.SimpleNamespace(users=2)
+        obj.animation_data = types.SimpleNamespace(action=action)
+        original_info = dyng_blender.bake_info
+        try:
+            dyng_blender.bake_info = lambda _obj: dyng_blender.DyngBakeInfo(
+                action=action,
+                legacy=True,
+                active=True,
+            )
+            self.assertFalse(dyng_blender.delete_legacy_bake(obj))
+        finally:
+            dyng_blender.bake_info = original_info
+
+    def test_dyng_bake_tracking_cleanup_includes_runtime_state(self):
+        obj = FakeObject("tracked_bake")
+        for key in (
+            dyng_blender.DYNG_BAKE_ID_PROP,
+            dyng_blender.DYNG_BAKE_ACTION_PROP,
+            dyng_blender.DYNG_BAKE_PREVIOUS_ACTION_PROP,
+            dyng_blender.DYNG_BAKE_PREVIOUS_SLOT_PROP,
+            dyng_blender.DYNG_BAKE_PREVIOUS_RUNTIME_PROP,
+        ):
+            obj[key] = "value"
+
+        dyng_blender._clear_bake_tracking(obj)
+
+        for key in (
+            dyng_blender.DYNG_BAKE_ID_PROP,
+            dyng_blender.DYNG_BAKE_ACTION_PROP,
+            dyng_blender.DYNG_BAKE_PREVIOUS_ACTION_PROP,
+            dyng_blender.DYNG_BAKE_PREVIOUS_SLOT_PROP,
+            dyng_blender.DYNG_BAKE_PREVIOUS_RUNTIME_PROP,
+        ):
+            self.assertNotIn(key, obj)
+
+    def test_blender_5_action_slot_identifier_is_preserved(self):
+        slot = types.SimpleNamespace(identifier="OBdyng", handle=17)
+
+        self.assertEqual(dyng_blender._action_slot_identifier(slot), "OBdyng")
+
+    def test_blender_5_action_slot_name_display_is_preserved(self):
+        slot = types.SimpleNamespace(name_display="Dyng Slot", handle=17)
+
+        self.assertEqual(dyng_blender._action_slot_identifier(slot), "Dyng Slot")
+
+    def test_assign_action_with_missing_slot_does_not_fall_back(self):
+        obj = FakeObject("slot_target")
+        original_action = object()
+        original_slot = object()
+        obj.animation_data = types.SimpleNamespace(action=original_action, action_slot=original_slot)
+        action = FakeBakeAction(
+            "layered",
+            slots=[types.SimpleNamespace(identifier="OBfirst", name_display="First")],
+        )
+
+        self.assertFalse(dyng_blender._assign_action_with_slot(obj, action, "OBmissing"))
+        self.assertIs(obj.animation_data.action, original_action)
+        self.assertIs(obj.animation_data.action_slot, original_slot)
+
+    def test_renamed_previous_action_recovers_only_exact_slot(self):
+        class FakeActions(list):
+            def get(self, name):
+                return next((action for action in self if action.name == name), None)
+
+        obj = FakeObject("renamed_source")
+        obj[dyng_blender.DYNG_BAKE_PREVIOUS_ACTION_PROP] = "old_name"
+        obj[dyng_blender.DYNG_BAKE_PREVIOUS_SLOT_PROP] = "OBsource"
+        expected = FakeBakeAction(
+            "new_name",
+            slots=[types.SimpleNamespace(identifier="OBsource")],
+        )
+        unrelated = FakeBakeAction(
+            "unrelated",
+            slots=[types.SimpleNamespace(identifier="OBother")],
+        )
+        original_actions = getattr(bpy.data, "actions", None)
+        try:
+            bpy.data.actions = FakeActions([unrelated, expected])
+            action, slot = dyng_blender._find_previous_action(obj)
+        finally:
+            if original_actions is None:
+                delattr(bpy.data, "actions")
+            else:
+                bpy.data.actions = original_actions
+
+        self.assertIs(action, expected)
+        self.assertEqual(slot, "OBsource")
+
+    def test_owned_bake_remains_deletable_when_resource_is_unavailable(self):
+        class FakeActions(list):
+            def get(self, name):
+                return next((action for action in self if action.name == name), None)
+
+        obj = FakeObject("resource_missing")
+        action = FakeBakeAction("resource_missing_DYNG_Bake")
+        action[dyng_blender.DYNG_BAKE_GENERATED_PROP] = True
+        action[dyng_blender.DYNG_BAKE_ID_PROP] = "managed-id"
+        action[dyng_blender.DYNG_BAKE_OWNER_PROP] = obj.name
+        action[dyng_blender.DYNG_BAKE_FRAME_START_PROP] = -3
+        action[dyng_blender.DYNG_BAKE_FRAME_END_PROP] = 2
+        action[dyng_blender.DYNG_BAKE_BONE_COUNT_PROP] = 4
+        action[dyng_blender.DYNG_BAKE_SAMPLE_COUNT_PROP] = 24
+        action[dyng_blender.DYNG_BAKE_KEY_COUNT_PROP] = 240
+        obj[dyng_blender.DYNG_BAKE_ACTION_PROP] = action.name
+        obj[dyng_blender.DYNG_BAKE_ID_PROP] = "managed-id"
+        obj[dyng_blender.DYNG_ENABLED_PROP] = True
+        obj[dyng_blender.DYNG_RUNTIME_OPT_IN_PROP] = True
+        obj.animation_data = types.SimpleNamespace(action=action, nla_tracks=[])
+        original_actions = getattr(bpy.data, "actions", None)
+        original_load = dyng_blender.load_resource_for_object
+        try:
+            bpy.data.actions = FakeActions([action])
+            dyng_blender.load_resource_for_object = lambda _obj: None
+            info = dyng_blender.bake_info(obj)
+            deleted = dyng_blender.delete_bake(obj)
+        finally:
+            if original_actions is None:
+                delattr(bpy.data, "actions")
+            else:
+                bpy.data.actions = original_actions
+            dyng_blender.load_resource_for_object = original_load
+
+        self.assertTrue(info.managed)
+        self.assertFalse(info.verified)
+        self.assertTrue(info.overridden)
+        self.assertEqual((info.frame_start, info.frame_end), (-3, 2))
+        self.assertEqual((info.bone_count, info.sample_count, info.key_count), (4, 24, 240))
+        self.assertTrue(deleted)
+        self.assertNotIn(dyng_blender.DYNG_BAKE_ID_PROP, obj)
+
+    def test_managed_bake_validity_detects_missing_and_duplicate_curves(self):
+        class FakeActions(list):
+            def get(self, name):
+                return next((action for action in self if action.name == name), None)
+
+        obj, bone, resource = _fake_bake_resource_and_object("managed_validity")
+        action = FakeBakeAction("managed_validity_DYNG_Bake", _fake_transform_curves(bone, (-2, 1, 2, 3, 7)))
+        action[dyng_blender.DYNG_BAKE_GENERATED_PROP] = True
+        action[dyng_blender.DYNG_BAKE_ID_PROP] = "validity-id"
+        action[dyng_blender.DYNG_BAKE_OWNER_PROP] = obj.name
+        action[dyng_blender.DYNG_BAKE_FRAME_START_PROP] = 1
+        action[dyng_blender.DYNG_BAKE_FRAME_END_PROP] = 3
+        action[dyng_blender.DYNG_BAKE_BONE_COUNT_PROP] = 1
+        action[dyng_blender.DYNG_BAKE_SAMPLE_COUNT_PROP] = 3
+        action[dyng_blender.DYNG_BAKE_KEY_COUNT_PROP] = 27
+        obj[dyng_blender.DYNG_BAKE_ACTION_PROP] = action.name
+        obj[dyng_blender.DYNG_BAKE_ID_PROP] = "validity-id"
+        obj.animation_data = types.SimpleNamespace(action=action, nla_tracks=[])
+        original_actions = getattr(bpy.data, "actions", None)
+        original_load = dyng_blender.load_resource_for_object
+        try:
+            bpy.data.actions = FakeActions([action])
+            dyng_blender.load_resource_for_object = lambda _obj: resource
+            self.assertTrue(dyng_blender.bake_info(obj).valid)
+
+            missing_point = action.fcurves[0].keyframe_points.pop(1)
+            self.assertFalse(dyng_blender.bake_info(obj).valid)
+            action.fcurves[0].keyframe_points.insert(1, missing_point)
+
+            action.fcurves.append(FakeBakeFCurve(action.fcurves[0].data_path, 0, (1, 2, 3)))
+            self.assertFalse(dyng_blender.bake_info(obj).valid)
+        finally:
+            if original_actions is None:
+                delattr(bpy.data, "actions")
+            else:
+                bpy.data.actions = original_actions
+            dyng_blender.load_resource_for_object = original_load
+
+    def test_legacy_bake_signature_rejects_duplicate_channels(self):
+        obj, bone, resource = _fake_bake_resource_and_object("legacy_signature")
+        curves = _fake_transform_curves(bone, (1, 2, 3))
+        curves.append(FakeBakeFCurve(curves[0].data_path, curves[0].array_index, (1, 2, 3)))
+        action = FakeBakeAction(f"{obj.name}Action", curves)
+
+        self.assertFalse(dyng_blender._is_legacy_bake_action(obj, resource, action, verify_all_frames=True))
+
+    def test_cache_summary_ignores_stale_persisted_status(self):
+        obj = FakeObject("stale_cache")
+        obj[dyng_blender.DYNG_CACHE_STATUS_PROP] = "Cached 1-250"
+        dyng_blender._FRAME_CACHES.pop(dyng_blender._state_key(obj), None)
+
+        self.assertEqual(dyng_blender.cache_summary(obj), "No memory cache")
+
     def test_dyng_cache_restores_original_frame_on_step_error(self):
         obj = FakeObject("dyng_cache")
         scene = FakeScene(frame_current=37)
@@ -894,6 +1230,36 @@ class RuntimeOptInTests(unittest.TestCase):
 
         self.assertEqual(scene.frame_current, 37)
         self.assertEqual(scene.frame_history[-1], 37)
+
+    def test_dyng_cache_reversed_negative_range_resets_only_first_frame(self):
+        obj = FakeObject("dyng_negative_cache")
+        scene = FakeScene(frame_current=42)
+        context = types.SimpleNamespace(scene=scene)
+        resource = dyng_blender.DyngResourceData("", "empty", (), (), (), ())
+        reset_frames = []
+        step_frames = []
+        original_load = dyng_blender.load_resource_for_object
+        original_reset = dyng_blender.reset_object
+        original_step = dyng_blender.step_object
+        original_capture = dyng_blender._capture_dynamic_matrices
+        try:
+            dyng_blender.load_resource_for_object = lambda _obj: resource
+            dyng_blender.reset_object = lambda *_args, **_kwargs: reset_frames.append(scene.frame_current) or True
+            dyng_blender.step_object = lambda *_args, **_kwargs: step_frames.append(scene.frame_current) or True
+            dyng_blender._capture_dynamic_matrices = lambda *_args: {}
+
+            count = dyng_blender.build_cache_for_object(context, obj, 1, -3)
+        finally:
+            dyng_blender.load_resource_for_object = original_load
+            dyng_blender.reset_object = original_reset
+            dyng_blender.step_object = original_step
+            dyng_blender._capture_dynamic_matrices = original_capture
+            dyng_blender._FRAME_CACHES.pop(dyng_blender._state_key(obj), None)
+
+        self.assertEqual(count, 5)
+        self.assertEqual(reset_frames, [-3])
+        self.assertEqual(step_frames, [-2, -1, 0, 1])
+        self.assertEqual(scene.frame_current, 42)
 
     def test_breast_bake_restores_original_frame_on_step_error(self):
         obj = FakeObject("breast_bake")

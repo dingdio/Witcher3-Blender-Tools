@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -12,6 +13,14 @@ import bpy
 from bpy.app.handlers import persistent
 from mathutils import Matrix, Vector
 
+from ..action_compat import (
+    assign_action,
+    get_action_channelbag,
+    iter_action_fcurves,
+    new_action_fcurve,
+    remove_action_fcurve,
+    resolve_action_slot,
+)
 from . import presets as physics_presets
 from . import runtime as physics_runtime
 from .dyng import (
@@ -51,6 +60,21 @@ DYNG_BLEND_PROP = "witcher_dyng_blend"
 DYNG_ACCESSORY_PREVIEW_PROP = "witcher_dyng_accessory_preview"
 DYNG_CACHE_STATUS_PROP = "witcher_dyng_cache_status"
 DYNG_PRESET_PROP = "witcher_dyng_preset"
+DYNG_BAKE_STATUS_PROP = "witcher_dyng_bake_status"
+DYNG_BAKE_ID_PROP = "witcher_dyng_bake_id"
+DYNG_BAKE_ACTION_PROP = "witcher_dyng_bake_action"
+DYNG_BAKE_PREVIOUS_ACTION_PROP = "witcher_dyng_bake_previous_action"
+DYNG_BAKE_PREVIOUS_SLOT_PROP = "witcher_dyng_bake_previous_slot"
+DYNG_BAKE_PREVIOUS_RUNTIME_PROP = "witcher_dyng_bake_previous_runtime"
+
+DYNG_BAKE_GENERATED_PROP = "witcher_dyng_bake_generated"
+DYNG_BAKE_OWNER_PROP = "witcher_dyng_bake_owner"
+DYNG_BAKE_FRAME_START_PROP = "witcher_dyng_bake_frame_start"
+DYNG_BAKE_FRAME_END_PROP = "witcher_dyng_bake_frame_end"
+DYNG_BAKE_BONE_COUNT_PROP = "witcher_dyng_bake_bone_count"
+DYNG_BAKE_SAMPLE_COUNT_PROP = "witcher_dyng_bake_sample_count"
+DYNG_BAKE_KEY_COUNT_PROP = "witcher_dyng_bake_key_count"
+DYNG_BAKE_SLOT_PROP = "witcher_dyng_bake_slot"
 
 SCENE_WIND_ENABLED_ATTR = "witcher_dyng_wind_enabled"
 SCENE_WIND_OBJECT_ATTR = "witcher_dyng_wind_object"
@@ -93,6 +117,29 @@ class _FrameCache:
     matrices: Dict[int, Dict[str, Matrix]]
 
 
+@dataclass(frozen=True)
+class DyngBakeInfo:
+    action: Optional[bpy.types.Action] = None
+    managed: bool = False
+    legacy: bool = False
+    verified: bool = False
+    valid: bool = False
+    missing: bool = False
+    restore_missing: bool = False
+    overridden: bool = False
+    active: bool = False
+    nla: bool = False
+    frame_start: Optional[int] = None
+    frame_end: Optional[int] = None
+    bone_count: int = 0
+    sample_count: int = 0
+    key_count: int = 0
+
+    @property
+    def exists(self) -> bool:
+        return self.action is not None
+
+
 _STATES: Dict[str, _ObjectState] = {}
 _FRAME_CACHES: Dict[str, _FrameCache] = {}
 _RESOURCE_CACHES: Dict[str, Tuple[str, DyngResourceData]] = {}
@@ -106,7 +153,7 @@ _ROT90_TO_GAME = Matrix.Rotation(math.radians(90.0), 4, 'Z')
 _ROT90_FROM_GAME = Matrix.Rotation(math.radians(-90.0), 4, 'Z')
 
 DYNG_USER_PRESETS: Tuple[DyngUserPreset, ...] = (
-    DyngUserPreset("Ciri_Hair_Reactive", 1.0, 0.88, 1.35, 12, False, False, False, 0.0, 1.0, 0.0, 1.0, 1.0),
+    DyngUserPreset("Ciri_Hair_Reactive", 1.0, 0.88, 1.35, 12, True, False, False, 0.0, 1.0, 0.0, 1.0, 1.0),
     DyngUserPreset("Weighted_Accessory", 1.25, 0.82, 1.4, 18, True, True, False, 0.0, 1.0, 0.0, 0.0, 1.0),
 )
 
@@ -158,8 +205,31 @@ def is_dyng_armature(obj: Optional[bpy.types.Object]) -> bool:
     return _is_dyng_path(str(obj.get("witcher_path", "")))
 
 
-def _default_use_offsets(resource: Optional[DyngResourceData]) -> bool:
+def _resource_has_authored_offsets(resource: Optional[DyngResourceData]) -> bool:
+    if resource is None:
+        return False
+    for index, node in enumerate(resource.nodes):
+        if float(getattr(node, "distance", 0.0) or 0.0) <= 0.0 or index >= len(resource.collisions):
+            continue
+        transform = resource.collisions[index].transform
+        for row in range(4):
+            for column in range(4):
+                identity_value = 1.0 if row == column else 0.0
+                if abs(float(transform[row][column]) - identity_value) > 1e-5:
+                    return True
     return False
+
+
+def _default_use_offsets(resource: Optional[DyngResourceData]) -> bool:
+    # Offset use is a per-component choice, not a resource-level default. The
+    # same .w3dyng resource may be instanced with different settings.
+    return False
+
+
+def has_authored_offsets(obj: Optional[bpy.types.Object]) -> bool:
+    if obj is None or not is_dyng_armature(obj):
+        return False
+    return _resource_has_authored_offsets(load_resource_for_object(obj))
 
 
 def _default_plane_collision(resource: Optional[DyngResourceData]) -> bool:
@@ -175,9 +245,7 @@ def _default_body_collision_radius(obj: Optional[bpy.types.Object], resource: Op
 
 
 def _default_wind_strength(resource: Optional[DyngResourceData]) -> float:
-    if resource is None:
-        return 0.0
-    return 1.0 if resource.triangles else 0.0
+    return 0.0
 
 
 def is_wind_field_object(obj: Optional[bpy.types.Object]) -> bool:
@@ -436,6 +504,22 @@ def enable_dyng_object(obj: bpy.types.Object, enabled: bool) -> bool:
         if not _RUNTIME_OBJECT_NAMES and not enabled_dyng_objects(bpy.context.scene):
             remove_frame_handler()
     return True
+
+
+def _set_dyng_runtime_opt_in(obj: bpy.types.Object, enabled: bool) -> None:
+    """Set the saved per-object runtime state without depending on the global preview gate."""
+
+    ensure_default_props(obj, enabled=enabled)
+    key = _state_key(obj)
+    if enabled:
+        _RUNTIME_OBJECT_NAMES.add(key)
+        ensure_frame_handler()
+        return
+    _RUNTIME_OBJECT_NAMES.discard(key)
+    _restore_external_constraints(obj)
+    clear_state(obj)
+    if not _RUNTIME_OBJECT_NAMES:
+        remove_frame_handler()
 
 
 def enable_dyng_objects(objects: Sequence[bpy.types.Object], enabled: bool) -> int:
@@ -836,7 +920,10 @@ def _mute_external_copy_transforms(pose_bone: bpy.types.PoseBone) -> None:
 def _restore_external_constraints(obj: bpy.types.Object) -> None:
     if obj.type != "ARMATURE":
         return
-    for pose_bone in obj.pose.bones:
+    pose = getattr(obj, "pose", None)
+    if pose is None:
+        return
+    for pose_bone in pose.bones:
         for constraint in pose_bone.constraints:
             key = _constraint_mute_key(pose_bone, constraint)
             if key in _CONSTRAINT_MUTES:
@@ -1196,44 +1283,870 @@ def remove_frame_handler() -> None:
     )
 
 
+def _action_slot_identifier(slot) -> str:
+    if slot is None:
+        return ""
+    for attr in ("identifier", "name", "name_display", "display_name"):
+        value = getattr(slot, attr, None)
+        if value:
+            return str(value)
+    return ""
+
+
+def _action_slot_names(slot) -> Tuple[str, ...]:
+    names = []
+    for attr in ("identifier", "name", "name_display", "display_name"):
+        value = getattr(slot, attr, None)
+        if value and str(value) not in names:
+            names.append(str(value))
+    return tuple(names)
+
+
+def _find_exact_action_slot(action, slot_identifier: str):
+    """Find a stored slot without action_compat's intentional fallback behavior."""
+
+    if action is None or not slot_identifier:
+        return None
+    slots = getattr(action, "slots", None)
+    if slots is None:
+        return None
+    return next(
+        (slot for slot in slots if slot_identifier in _action_slot_names(slot)),
+        None,
+    )
+
+
+def _assign_action_with_slot(obj: bpy.types.Object, action, slot_identifier: str = "") -> bool:
+    if action is None:
+        animation_data = getattr(obj, "animation_data", None)
+        if animation_data is not None:
+            animation_data.action = None
+        return True
+
+    slot = None
+    if slot_identifier:
+        slot = _find_exact_action_slot(action, slot_identifier)
+        if slot is None:
+            return False
+
+    animation_data = getattr(obj, "animation_data", None)
+    previous_action = getattr(animation_data, "action", None) if animation_data is not None else None
+    previous_slot = getattr(animation_data, "action_slot", None) if animation_data is not None else None
+    try:
+        assign_action(obj, action)
+        animation_data = getattr(obj, "animation_data", None)
+        if animation_data is not None and hasattr(animation_data, "action_slot") and slot is not None:
+            animation_data.action_slot = slot
+    except Exception:
+        log.debug("Unable to restore action slot %s on %s", slot_identifier, obj.name, exc_info=True)
+        animation_data = getattr(obj, "animation_data", None)
+        if animation_data is not None:
+            try:
+                animation_data.action = previous_action
+                if previous_slot is not None and hasattr(animation_data, "action_slot"):
+                    animation_data.action_slot = previous_slot
+            except Exception:
+                log.warning("Unable to roll back Action assignment on %s", obj.name, exc_info=True)
+        return False
+    return True
+
+
+def _find_previous_action(obj: bpy.types.Object):
+    action_name = str(obj.get(DYNG_BAKE_PREVIOUS_ACTION_PROP, "") or "")
+    slot_identifier = str(obj.get(DYNG_BAKE_PREVIOUS_SLOT_PROP, "") or "")
+    if action_name:
+        action = bpy.data.actions.get(action_name)
+        if action is not None:
+            return action, slot_identifier
+    if not slot_identifier:
+        return None, ""
+
+    candidates = []
+    for action in bpy.data.actions:
+        if _is_managed_bake_action(action):
+            continue
+        slot = _find_exact_action_slot(action, slot_identifier)
+        if slot is not None:
+            candidates.append(action)
+    if len(candidates) == 1:
+        return candidates[0], slot_identifier
+    return None, slot_identifier
+
+
+def _pose_bone_transform_paths(pose_bone) -> Dict[str, str]:
+    paths = {}
+    for prop in ("location", "rotation_euler", "rotation_quaternion", "rotation_axis_angle", "scale"):
+        try:
+            paths[prop] = pose_bone.path_from_id(prop)
+        except Exception:
+            escaped_name = str(pose_bone.name).replace("\\", "\\\\").replace('"', '\\"')
+            paths[prop] = f'pose.bones["{escaped_name}"].{prop}'
+    return paths
+
+
+def _dyng_curve_channels(obj: bpy.types.Object, resource: DyngResourceData) -> Dict[Tuple[str, int], str]:
+    channels: Dict[Tuple[str, int], str] = {}
+    for index in _dynamic_bone_indices(resource):
+        pose_bone = obj.pose.bones.get(resource.nodes[index].name)
+        if pose_bone is None or not _can_simulate_pose_bone(pose_bone):
+            continue
+        rotation_prop = {
+            "QUATERNION": "rotation_quaternion",
+            "AXIS_ANGLE": "rotation_axis_angle",
+        }.get(pose_bone.rotation_mode, "rotation_euler")
+        paths = _pose_bone_transform_paths(pose_bone)
+        for prop in ("location", rotation_prop, "scale"):
+            for array_index in range(len(getattr(pose_bone, prop))):
+                channels[(paths[prop], array_index)] = pose_bone.name
+    return channels
+
+
+def _fcurve_frame_range(fcurve):
+    try:
+        frame_range = fcurve.range()
+        return float(frame_range[0]), float(frame_range[1])
+    except Exception:
+        points = getattr(fcurve, "keyframe_points", ())
+        if not points:
+            return None, None
+        try:
+            return float(points[0].co[0]), float(points[-1].co[0])
+        except Exception:
+            return None, None
+
+
+def _keyframe_range_indices(points, frame_start: float, frame_end: float) -> Tuple[int, int]:
+    """Return the sorted keyframe slice inside an inclusive frame range."""
+
+    epsilon = 1e-5
+    low = 0
+    high = len(points)
+    while low < high:
+        middle = (low + high) // 2
+        if float(points[middle].co[0]) < frame_start - epsilon:
+            low = middle + 1
+        else:
+            high = middle
+    first = low
+    high = len(points)
+    while low < high:
+        middle = (low + high) // 2
+        if float(points[middle].co[0]) <= frame_end + epsilon:
+            low = middle + 1
+        else:
+            high = middle
+    return first, low
+
+
+def _action_target_fcurves(obj: bpy.types.Object, action):
+    slot_identifier = str(action.get(DYNG_BAKE_SLOT_PROP, "") or "") if action is not None else ""
+    slot = None
+    if slot_identifier:
+        slot = _find_exact_action_slot(action, slot_identifier)
+        if slot is None:
+            return (), False
+    return tuple(iter_action_fcurves(action, target=obj, slot=slot)), True
+
+
+def _action_curve_stats(obj: bpy.types.Object, resource: DyngResourceData, action):
+    expected_channels = _dyng_curve_channels(obj, resource)
+    curves, slot_valid = _action_target_fcurves(obj, action)
+    matched_curves = tuple(
+        fcurve
+        for fcurve in curves
+        if (getattr(fcurve, "data_path", ""), int(getattr(fcurve, "array_index", 0))) in expected_channels
+    )
+    actual_channels = {
+        (getattr(fcurve, "data_path", ""), int(getattr(fcurve, "array_index", 0)))
+        for fcurve in matched_curves
+    }
+    allow_extra_channels = _is_managed_bake_action(action)
+    valid = (
+        slot_valid
+        and bool(expected_channels)
+        and actual_channels == set(expected_channels)
+        and len(matched_curves) == len(actual_channels)
+        and (allow_extra_channels or len(curves) == len(matched_curves))
+    )
+    bone_names = {
+        expected_channels.get((getattr(fcurve, "data_path", ""), int(getattr(fcurve, "array_index", 0))))
+        for fcurve in matched_curves
+    }
+    bone_names.discard(None)
+    key_count = 0
+    first_frame = None
+    last_frame = None
+    managed_range = None
+    if allow_extra_channels:
+        try:
+            managed_range = (
+                float(action[DYNG_BAKE_FRAME_START_PROP]),
+                float(action[DYNG_BAKE_FRAME_END_PROP]),
+            )
+        except (KeyError, TypeError, ValueError):
+            managed_range = None
+    for fcurve in matched_curves:
+        points = getattr(fcurve, "keyframe_points", ())
+        if managed_range is not None and points:
+            first_index, end_index = _keyframe_range_indices(points, *managed_range)
+            key_count += end_index - first_index
+            if first_index < end_index:
+                curve_start = float(points[first_index].co[0])
+                curve_end = float(points[end_index - 1].co[0])
+            else:
+                curve_start = None
+                curve_end = None
+        else:
+            key_count += len(points)
+            curve_start, curve_end = _fcurve_frame_range(fcurve)
+        if curve_start is not None:
+            first_frame = curve_start if first_frame is None else min(first_frame, curve_start)
+        if curve_end is not None:
+            last_frame = curve_end if last_frame is None else max(last_frame, curve_end)
+    return valid, len(bone_names), key_count, first_frame, last_frame
+
+
+def _managed_bake_matches_metadata(obj: bpy.types.Object, resource: DyngResourceData, action) -> bool:
+    valid, bone_count, key_count, first_frame, last_frame = _action_curve_stats(obj, resource, action)
+    if not valid or first_frame is None or last_frame is None:
+        return False
+    try:
+        expected_start = int(action[DYNG_BAKE_FRAME_START_PROP])
+        expected_end = int(action[DYNG_BAKE_FRAME_END_PROP])
+        expected_bones = int(action[DYNG_BAKE_BONE_COUNT_PROP])
+        expected_samples = int(action[DYNG_BAKE_SAMPLE_COUNT_PROP])
+        expected_keys = int(action[DYNG_BAKE_KEY_COUNT_PROP])
+    except (KeyError, TypeError, ValueError):
+        return False
+    frame_count = expected_end - expected_start + 1
+    if frame_count <= 0:
+        return False
+    if (
+        abs(first_frame - expected_start) > 1e-5
+        or abs(last_frame - expected_end) > 1e-5
+        or bone_count != expected_bones
+        or expected_samples != expected_bones * frame_count
+        or key_count != expected_keys
+    ):
+        return False
+    expected_channels = _dyng_curve_channels(obj, resource)
+    curves, slot_valid = _action_target_fcurves(obj, action)
+    if not slot_valid:
+        return False
+    matched_curves = [
+        fcurve
+        for fcurve in curves
+        if (getattr(fcurve, "data_path", ""), int(getattr(fcurve, "array_index", 0))) in expected_channels
+    ]
+    if expected_keys != len(expected_channels) * frame_count or len(matched_curves) != len(expected_channels):
+        return False
+    for fcurve in matched_curves:
+        points = getattr(fcurve, "keyframe_points", ())
+        first_index, end_index = _keyframe_range_indices(points, expected_start, expected_end)
+        curve_start = float(points[first_index].co[0]) if first_index < end_index else None
+        curve_end = float(points[end_index - 1].co[0]) if first_index < end_index else None
+        if (
+            end_index - first_index != frame_count
+            or curve_start is None
+            or abs(curve_start - expected_start) > 1e-5
+            or abs(curve_end - expected_end) > 1e-5
+        ):
+            return False
+    return True
+
+
+def _is_managed_bake_action(action) -> bool:
+    return bool(action is not None and action.get(DYNG_BAKE_GENERATED_PROP, False))
+
+
+def _is_legacy_bake_action(
+    obj: bpy.types.Object,
+    resource: DyngResourceData,
+    action,
+    *,
+    verify_all_frames: bool = False,
+) -> bool:
+    if action is None or _is_managed_bake_action(action):
+        return False
+    if getattr(action, "library", None) is not None or bool(getattr(action, "is_library_indirect", False)):
+        return False
+    slots = getattr(action, "slots", None)
+    if slots is not None and len(slots) != 1:
+        return False
+    if str(getattr(action, "name", "")) != f"{obj.name}Action":
+        return False
+    valid, _bones, _keys, first_frame, last_frame = _action_curve_stats(obj, resource, action)
+    if not valid or first_frame is None or last_frame is None:
+        return False
+    rounded_start = int(round(first_frame))
+    rounded_end = int(round(last_frame))
+    if abs(first_frame - rounded_start) > 1e-5 or abs(last_frame - rounded_end) > 1e-5:
+        return False
+    expected_count = rounded_end - rounded_start + 1
+    if expected_count < 2:
+        return False
+    curves, slot_valid = _action_target_fcurves(obj, action)
+    if not slot_valid:
+        return False
+    for fcurve in curves:
+        points = getattr(fcurve, "keyframe_points", ())
+        if len(points) != expected_count:
+            return False
+        curve_start, curve_end = _fcurve_frame_range(fcurve)
+        if curve_start is None or abs(curve_start - rounded_start) > 1e-5 or abs(curve_end - rounded_end) > 1e-5:
+            return False
+        if verify_all_frames:
+            for offset, point in enumerate(points):
+                try:
+                    frame = float(point.co[0])
+                except Exception:
+                    return False
+                if abs(frame - (rounded_start + offset)) > 1e-5:
+                    return False
+    return True
+
+
+def _managed_action_owned_by(obj: bpy.types.Object, action, active_action=None) -> bool:
+    owner_name = str(action.get(DYNG_BAKE_OWNER_PROP, "") or "")
+    if owner_name == obj.name:
+        return True
+    if int(getattr(action, "users", 0) or 0) > 1:
+        return False
+    objects = getattr(bpy.data, "objects", None)
+    owner = objects.get(owner_name) if owner_name and hasattr(objects, "get") else None
+    if owner is not None:
+        return False
+    return active_action == action or _action_is_in_object_nla(obj, action)
+
+
+def _action_is_in_object_nla(obj: bpy.types.Object, action) -> bool:
+    animation_data = getattr(obj, "animation_data", None)
+    if animation_data is None:
+        return False
+    for track in getattr(animation_data, "nla_tracks", ()):
+        if any(getattr(strip, "action", None) == action for strip in track.strips):
+            return True
+    return False
+
+
+def bake_info(obj: bpy.types.Object) -> DyngBakeInfo:
+    resource = load_resource_for_object(obj)
+    animation_data = getattr(obj, "animation_data", None)
+    active_action = getattr(animation_data, "action", None) if animation_data is not None else None
+    action = None
+    managed = False
+    legacy = False
+
+    tracked_name = str(obj.get(DYNG_BAKE_ACTION_PROP, "") or "")
+    tracked_id = str(obj.get(DYNG_BAKE_ID_PROP, "") or "")
+    if tracked_name and tracked_id:
+        tracked_action = bpy.data.actions.get(tracked_name)
+        action_id = str(tracked_action.get(DYNG_BAKE_ID_PROP, "") or "") if tracked_action is not None else ""
+        if (
+            _is_managed_bake_action(tracked_action)
+            and action_id == tracked_id
+            and _managed_action_owned_by(obj, tracked_action, active_action)
+        ):
+            action = tracked_action
+            managed = True
+
+    if action is None and tracked_id and _is_managed_bake_action(active_action):
+        action_id = str(active_action.get(DYNG_BAKE_ID_PROP, "") or "")
+        if action_id == tracked_id and _managed_action_owned_by(obj, active_action, active_action):
+            action = active_action
+            managed = True
+
+    if action is None and tracked_id:
+        matching_actions = [
+            candidate
+            for candidate in bpy.data.actions
+            if _is_managed_bake_action(candidate)
+            and str(candidate.get(DYNG_BAKE_ID_PROP, "") or "") == tracked_id
+        ]
+        owned_matches = [
+            candidate
+            for candidate in matching_actions
+            if _managed_action_owned_by(obj, candidate, active_action)
+        ]
+        if len(owned_matches) == 1:
+            action = owned_matches[0]
+            managed = True
+
+    if action is None and resource is not None and _is_legacy_bake_action(obj, resource, active_action):
+        action = active_action
+        legacy = True
+
+    if action is None:
+        restore_missing = False
+        if tracked_id and bool(str(obj.get(DYNG_BAKE_PREVIOUS_ACTION_PROP, "") or "")):
+            previous_action, previous_slot = _find_previous_action(obj)
+            restore_missing = previous_action is None or bool(
+                previous_slot and _find_exact_action_slot(previous_action, previous_slot) is None
+            )
+        return DyngBakeInfo(missing=bool(tracked_id), restore_missing=restore_missing)
+
+    verified = resource is not None
+    valid = False
+    actual_bones = 0
+    actual_keys = 0
+    first_frame = None
+    last_frame = None
+    if resource is not None:
+        curve_valid, actual_bones, actual_keys, first_frame, last_frame = _action_curve_stats(
+            obj,
+            resource,
+            action,
+        )
+        valid = _managed_bake_matches_metadata(obj, resource, action) if managed else curve_valid
+
+    frame_start = first_frame if first_frame is not None else action.get(DYNG_BAKE_FRAME_START_PROP)
+    frame_end = last_frame if last_frame is not None else action.get(DYNG_BAKE_FRAME_END_PROP)
+    bone_count = actual_bones or int(action.get(DYNG_BAKE_BONE_COUNT_PROP, 0) or 0)
+    key_count = actual_keys or int(action.get(DYNG_BAKE_KEY_COUNT_PROP, 0) or 0)
+    sample_count = int(action.get(DYNG_BAKE_SAMPLE_COUNT_PROP, 0) or 0)
+    if not sample_count and frame_start is not None and frame_end is not None:
+        sample_count = bone_count * (int(round(float(frame_end))) - int(round(float(frame_start))) + 1)
+    had_previous_action = managed and bool(str(obj.get(DYNG_BAKE_PREVIOUS_ACTION_PROP, "") or ""))
+    restore_missing = False
+    if had_previous_action:
+        previous_action, previous_slot = _find_previous_action(obj)
+        restore_missing = previous_action is None or bool(
+            previous_slot and _find_exact_action_slot(previous_action, previous_slot) is None
+        )
+
+    return DyngBakeInfo(
+        action=action,
+        managed=managed,
+        legacy=legacy,
+        verified=verified,
+        valid=valid,
+        restore_missing=restore_missing,
+        overridden=managed and _has_dyng_runtime_opt_in_props(obj),
+        active=active_action == action,
+        nla=_action_is_in_object_nla(obj, action),
+        frame_start=int(round(float(frame_start))) if frame_start is not None else None,
+        frame_end=int(round(float(frame_end))) if frame_end is not None else None,
+        bone_count=bone_count,
+        sample_count=sample_count,
+        key_count=key_count,
+    )
+
+
+def _capture_bake_samples(obj: bpy.types.Object, resource: DyngResourceData, frame: int, samples) -> int:
+    captured = 0
+    for index in _dynamic_bone_indices(resource):
+        pose_bone = obj.pose.bones.get(resource.nodes[index].name)
+        if pose_bone is None or not _can_simulate_pose_bone(pose_bone):
+            continue
+        rotation_prop = {
+            "QUATERNION": "rotation_quaternion",
+            "AXIS_ANGLE": "rotation_axis_angle",
+        }.get(pose_bone.rotation_mode, "rotation_euler")
+        paths = _pose_bone_transform_paths(pose_bone)
+        for prop in ("location", rotation_prop, "scale"):
+            values = tuple(float(value) for value in getattr(pose_bone, prop))
+            data_path = paths[prop]
+            for array_index, value in enumerate(values):
+                samples.setdefault((pose_bone.name, data_path, array_index), []).append((frame, value))
+        captured += 1
+    return captured
+
+
+def _write_bake_action(
+    obj: bpy.types.Object,
+    bake_id: str,
+    frame_start: int,
+    frame_end: int,
+    samples,
+    *,
+    base_action=None,
+    base_slot_identifier: str = "",
+):
+    action = base_action.copy() if base_action is not None else bpy.data.actions.new(name=f"{obj.name}_DYNG_Bake")
+    action.name = f"{obj.name}_DYNG_Bake"
+    if hasattr(action, "use_fake_user"):
+        action.use_fake_user = False
+    try:
+        if base_action is not None and base_slot_identifier:
+            slot = _find_exact_action_slot(action, base_slot_identifier)
+            if slot is None:
+                raise RuntimeError("The source Action slot was not preserved in the bake copy")
+        else:
+            slot = resolve_action_slot(action, target=obj, ensure=True)
+        channelbag = get_action_channelbag(action, target=obj, slot=slot, ensure=True)
+        sample_channels = {
+            (data_path, int(array_index))
+            for _bone_name, data_path, array_index in samples
+        }
+        existing_curves = {}
+        for fcurve in tuple(iter_action_fcurves(action, target=obj, slot=slot)):
+            channel = (getattr(fcurve, "data_path", ""), int(getattr(fcurve, "array_index", 0)))
+            if channel in sample_channels:
+                if channel in existing_curves:
+                    remove_action_fcurve(action, fcurve, target=obj, slot=slot)
+                else:
+                    existing_curves[channel] = fcurve
+
+        key_count = 0
+        bone_names = set()
+        for (bone_name, data_path, array_index), values in samples.items():
+            channel = (data_path, int(array_index))
+            fcurve = existing_curves.get(channel)
+            is_new_curve = fcurve is None
+            if is_new_curve:
+                fcurve = new_action_fcurve(
+                    action,
+                    obj,
+                    data_path=data_path,
+                    index=array_index,
+                    group_name=bone_name,
+                    slot=slot,
+                    channelbag=channelbag,
+                )
+            keyframe_points = fcurve.keyframe_points
+            first_replaced, end_replaced = _keyframe_range_indices(keyframe_points, frame_start, frame_end)
+            for point_index in reversed(range(first_replaced, end_replaced)):
+                point = keyframe_points[point_index]
+                try:
+                    keyframe_points.remove(point, fast=True)
+                except TypeError:
+                    keyframe_points.remove(point)
+            for modifier in list(getattr(fcurve, "modifiers", ())):
+                fcurve.modifiers.remove(modifier)
+            first_new_point = len(keyframe_points)
+            keyframe_points.add(len(values))
+            if is_new_curve:
+                coordinates = [
+                    coordinate
+                    for frame, value in values
+                    for coordinate in (float(frame), float(value))
+                ]
+                keyframe_points.foreach_set("co", coordinates)
+                for point in keyframe_points:
+                    point.interpolation = "LINEAR"
+            else:
+                for offset, (frame, value) in enumerate(values):
+                    point = keyframe_points[first_new_point + offset]
+                    point.co = (float(frame), float(value))
+                    point.interpolation = "LINEAR"
+            fcurve.update()
+            key_count += len(values)
+            bone_names.add(bone_name)
+
+        pose_sample_count = len(bone_names) * (frame_end - frame_start + 1)
+        action[DYNG_BAKE_GENERATED_PROP] = True
+        action[DYNG_BAKE_ID_PROP] = bake_id
+        action[DYNG_BAKE_OWNER_PROP] = obj.name
+        action[DYNG_BAKE_FRAME_START_PROP] = int(frame_start)
+        action[DYNG_BAKE_FRAME_END_PROP] = int(frame_end)
+        action[DYNG_BAKE_BONE_COUNT_PROP] = len(bone_names)
+        action[DYNG_BAKE_SAMPLE_COUNT_PROP] = pose_sample_count
+        action[DYNG_BAKE_KEY_COUNT_PROP] = key_count
+        if bool(getattr(action, "use_frame_range", False)):
+            try:
+                action.frame_start = min(float(action.frame_start), float(frame_start))
+                action.frame_end = max(float(action.frame_end), float(frame_end))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        slot_identifier = _action_slot_identifier(slot)
+        if slot_identifier:
+            action[DYNG_BAKE_SLOT_PROP] = slot_identifier
+        elif DYNG_BAKE_SLOT_PROP in action:
+            del action[DYNG_BAKE_SLOT_PROP]
+        return action, slot, pose_sample_count, key_count
+    except Exception:
+        if getattr(action, "users", 0) == 0:
+            bpy.data.actions.remove(action)
+        raise
+
+
+def _clear_bake_tracking(obj: bpy.types.Object) -> None:
+    for key in _BAKE_TRACKING_KEYS:
+        if key in obj:
+            del obj[key]
+
+
+_BAKE_TRACKING_KEYS = (
+    DYNG_BAKE_ACTION_PROP,
+    DYNG_BAKE_ID_PROP,
+    DYNG_BAKE_PREVIOUS_ACTION_PROP,
+    DYNG_BAKE_PREVIOUS_SLOT_PROP,
+    DYNG_BAKE_PREVIOUS_RUNTIME_PROP,
+)
+
+
+def _snapshot_bake_tracking(obj: bpy.types.Object) -> Dict[str, object]:
+    return {key: obj[key] for key in _BAKE_TRACKING_KEYS if key in obj}
+
+
+def _restore_bake_tracking(obj: bpy.types.Object, snapshot: Dict[str, object]) -> None:
+    _clear_bake_tracking(obj)
+    for key, value in snapshot.items():
+        obj[key] = value
+
+
+def _remove_action_from_object_nla(obj: bpy.types.Object, action) -> None:
+    animation_data = getattr(obj, "animation_data", None)
+    if animation_data is None:
+        return
+    for track in getattr(animation_data, "nla_tracks", ()):
+        for strip in list(track.strips):
+            if getattr(strip, "action", None) == action:
+                track.strips.remove(strip)
+
+
 def bake_object(
     context: bpy.types.Context,
     obj: bpy.types.Object,
     frame_start: int,
     frame_end: int,
+    *,
+    progress_callback=None,
 ) -> int:
     frame_start, frame_end = physics_runtime.normalized_frame_range(frame_start, frame_end)
     resource = load_resource_for_object(obj)
     if resource is None:
         return 0
+    existing_bake = bake_info(obj)
+    tracking_snapshot = _snapshot_bake_tracking(obj)
+    previous_runtime_enabled = (
+        bool(obj.get(DYNG_BAKE_PREVIOUS_RUNTIME_PROP, False))
+        if existing_bake.managed or existing_bake.missing
+        else _has_dyng_runtime_opt_in_props(obj)
+    )
+    animation_data = getattr(obj, "animation_data", None)
+    original_action = getattr(animation_data, "action", None) if animation_data is not None else None
+    original_slot = getattr(animation_data, "action_slot", None) if animation_data is not None else None
+    original_slot_identifier = _action_slot_identifier(original_slot)
+
+    if existing_bake.missing and original_action is None:
+        had_previous_action = bool(str(obj.get(DYNG_BAKE_PREVIOUS_ACTION_PROP, "") or ""))
+        base_action, base_slot_identifier = _find_previous_action(obj)
+        if had_previous_action and base_action is None:
+            raise RuntimeError("Cannot re-bake because the saved source Action is missing or ambiguous")
+        simulation_action = base_action
+        simulation_slot_identifier = base_slot_identifier
+    elif existing_bake.managed and original_action == existing_bake.action:
+        had_previous_action = bool(str(obj.get(DYNG_BAKE_PREVIOUS_ACTION_PROP, "") or ""))
+        base_action, base_slot_identifier = _find_previous_action(obj)
+        if had_previous_action and base_action is None:
+            raise RuntimeError("Cannot re-bake because the source Action is missing or ambiguous")
+        simulation_action = base_action
+        simulation_slot_identifier = base_slot_identifier
+    elif existing_bake.legacy and original_action == existing_bake.action:
+        # Do not feed a previous unowned bake back into the simulation. Keep it
+        # as an orphan datablock, but never infer ownership, delete, or restore it.
+        base_action = None
+        base_slot_identifier = ""
+        simulation_action = None
+        simulation_slot_identifier = ""
+    else:
+        base_action = original_action
+        base_slot_identifier = original_slot_identifier
+        simulation_action = base_action
+        simulation_slot_identifier = base_slot_identifier
+
+    if not _assign_action_with_slot(obj, simulation_action, simulation_slot_identifier):
+        raise RuntimeError("Unable to select the source Action slot for Dyng baking")
     clear_state(obj)
+    clear_cache(obj)
+    samples = {}
     baked = 0
     scene = context.scene
     original_frame = int(scene.frame_current)
     dt = physics_runtime.scene_frame_dt(scene)
+    obj[DYNG_BAKE_STATUS_PROP] = f"Baking {frame_start}-{frame_end}"
     global _SUPPRESS_FRAME_HANDLER
     was_suppressed = _SUPPRESS_FRAME_HANDLER
     _SUPPRESS_FRAME_HANDLER = True
+    capture_error = None
+    restore_error = None
     try:
         for frame in range(frame_start, frame_end + 1):
+            if progress_callback is not None:
+                progress_callback(frame - frame_start, frame_end - frame_start + 1)
             scene.frame_set(frame)
-            if frame == frame_start or frame <= 0:
+            if frame == frame_start:
                 reset_object(obj, update_status=False)
             else:
                 step_object(obj, dt, reset=False, update_status=False)
-            for index in _dynamic_bone_indices(resource):
-                pose_bone = obj.pose.bones.get(resource.nodes[index].name)
-                if pose_bone is None or not _can_simulate_pose_bone(pose_bone):
-                    continue
-                physics_runtime.keyframe_pose_bone_transform(pose_bone, frame)
-                baked += 1
+            baked += _capture_bake_samples(obj, resource, frame, samples)
+    except Exception as exc:
+        capture_error = (exc, exc.__traceback__)
     finally:
         try:
-            scene.frame_set(original_frame)
+            try:
+                if not _assign_action_with_slot(obj, original_action, original_slot_identifier):
+                    raise RuntimeError("Unable to restore the original Action slot after Dyng baking")
+            except Exception as exc:
+                restore_error = exc
+            try:
+                scene.frame_set(original_frame)
+            except Exception as exc:
+                if restore_error is None:
+                    restore_error = exc
+            try:
+                _restore_external_constraints(obj)
+                clear_state(obj)
+            except Exception as exc:
+                if restore_error is None:
+                    restore_error = exc
         finally:
             _SUPPRESS_FRAME_HANDLER = was_suppressed
-    obj[DYNG_SIM_STATUS_PROP] = f"Baked {frame_start}-{frame_end}"
-    return baked
+
+    if capture_error is not None:
+        obj[DYNG_BAKE_STATUS_PROP] = "Bake failed during simulation"
+        if restore_error is not None:
+            log.warning(
+                "Dyng bake cleanup also failed",
+                exc_info=(type(restore_error), restore_error, restore_error.__traceback__),
+            )
+        error, traceback = capture_error
+        raise error.with_traceback(traceback)
+    if restore_error is not None:
+        obj[DYNG_BAKE_STATUS_PROP] = "Bake failed while restoring the scene"
+        raise restore_error
+
+    if baked <= 0 or not samples:
+        obj[DYNG_BAKE_STATUS_PROP] = "Bake failed: no simulated bones"
+        return 0
+
+    bake_id = uuid.uuid4().hex
+    action, slot, pose_samples, key_count = _write_bake_action(
+        obj,
+        bake_id,
+        frame_start,
+        frame_end,
+        samples,
+        base_action=base_action,
+        base_slot_identifier=base_slot_identifier,
+    )
+    runtime_before_commit = _has_dyng_runtime_opt_in_props(obj)
+    try:
+        if not _assign_action_with_slot(obj, action, _action_slot_identifier(slot)):
+            raise RuntimeError("Unable to assign the generated Dyng bake Action slot")
+        obj[DYNG_BAKE_ACTION_PROP] = action.name
+        obj[DYNG_BAKE_ID_PROP] = bake_id
+        obj[DYNG_BAKE_PREVIOUS_RUNTIME_PROP] = previous_runtime_enabled
+        if base_action is not None:
+            obj[DYNG_BAKE_PREVIOUS_ACTION_PROP] = base_action.name
+            if base_slot_identifier:
+                obj[DYNG_BAKE_PREVIOUS_SLOT_PROP] = base_slot_identifier
+            elif DYNG_BAKE_PREVIOUS_SLOT_PROP in obj:
+                del obj[DYNG_BAKE_PREVIOUS_SLOT_PROP]
+        else:
+            for key in (DYNG_BAKE_PREVIOUS_ACTION_PROP, DYNG_BAKE_PREVIOUS_SLOT_PROP):
+                if key in obj:
+                    del obj[key]
+
+        if _has_dyng_runtime_opt_in_props(obj):
+            _set_dyng_runtime_opt_in(obj, False)
+    except Exception:
+        _assign_action_with_slot(obj, original_action, original_slot_identifier)
+        _restore_bake_tracking(obj, tracking_snapshot)
+        if runtime_before_commit != _has_dyng_runtime_opt_in_props(obj):
+            _set_dyng_runtime_opt_in(obj, runtime_before_commit)
+        _restore_external_constraints(obj)
+        clear_state(obj)
+        if getattr(action, "users", 0) == 0:
+            bpy.data.actions.remove(action)
+        raise
+
+    old_action = existing_bake.action if existing_bake.managed else None
+    old_cleanup_failed = False
+    if old_action is not None and old_action != action:
+        try:
+            _remove_action_from_object_nla(obj, old_action)
+            if bool(getattr(old_action, "use_fake_user", False)) and int(getattr(old_action, "users", 0) or 0) == 1:
+                old_action.use_fake_user = False
+            if getattr(old_action, "users", 0) == 0:
+                bpy.data.actions.remove(old_action)
+        except Exception:
+            old_cleanup_failed = True
+            log.warning("New Dyng bake committed but the previous bake could not be removed", exc_info=True)
+
+    obj[DYNG_BAKE_STATUS_PROP] = (
+        f"Baked {frame_start}-{frame_end}; previous bake retained"
+        if old_cleanup_failed
+        else f"Baked {frame_start}-{frame_end}"
+    )
+    obj[DYNG_SIM_STATUS_PROP] = f"Baked {pose_samples} Dyng bone samples"
+    if progress_callback is not None:
+        progress_callback(frame_end - frame_start + 1, frame_end - frame_start + 1)
+    return pose_samples
+
+
+def delete_bake(obj: bpy.types.Object) -> bool:
+    info = bake_info(obj)
+    if not info.managed:
+        obj[DYNG_BAKE_STATUS_PROP] = "No managed bake to delete"
+        return False
+
+    action = info.action
+    restore_runtime = bool(obj.get(DYNG_BAKE_PREVIOUS_RUNTIME_PROP, False))
+    had_previous_action = bool(str(obj.get(DYNG_BAKE_PREVIOUS_ACTION_PROP, "") or ""))
+    previous_action, previous_slot = _find_previous_action(obj)
+    if had_previous_action and (
+        previous_action is None
+        or bool(previous_slot and _find_exact_action_slot(previous_action, previous_slot) is None)
+    ):
+        obj[DYNG_BAKE_STATUS_PROP] = "Delete blocked: source Action or slot is missing"
+        return False
+
+    animation_data = getattr(obj, "animation_data", None)
+    if animation_data is not None and getattr(animation_data, "action", None) == action:
+        if previous_action is not None:
+            if not _assign_action_with_slot(obj, previous_action, previous_slot):
+                obj[DYNG_BAKE_STATUS_PROP] = "Delete blocked: previous Action slot is missing"
+                return False
+        else:
+            _assign_action_with_slot(obj, None)
+
+    try:
+        _remove_action_from_object_nla(obj, action)
+        if bool(getattr(action, "use_fake_user", False)) and int(getattr(action, "users", 0) or 0) == 1:
+            action.use_fake_user = False
+        if getattr(action, "users", 0) == 0:
+            bpy.data.actions.remove(action)
+    except Exception:
+        obj[DYNG_BAKE_STATUS_PROP] = "Delete failed: bake Action could not be removed"
+        log.warning("Unable to remove managed Dyng bake %s", getattr(action, "name", "<unknown>"), exc_info=True)
+        return False
+
+    _clear_bake_tracking(obj)
+    clear_state(obj)
+    clear_cache(obj)
+    if restore_runtime:
+        _set_dyng_runtime_opt_in(obj, True)
+    obj[DYNG_BAKE_STATUS_PROP] = "Bake deleted"
+    obj[DYNG_SIM_STATUS_PROP] = "Dyng bake deleted"
+    return True
+
+
+def delete_legacy_bake(obj: bpy.types.Object) -> bool:
+    """Delete a narrowly recognized pre-ownership bake from its sole active user."""
+
+    info = bake_info(obj)
+    action = info.action
+    animation_data = getattr(obj, "animation_data", None)
+    if not info.legacy or action is None or animation_data is None:
+        return False
+    if getattr(animation_data, "action", None) != action:
+        return False
+    if int(getattr(action, "users", 0) or 0) != 1:
+        return False
+    resource = load_resource_for_object(obj)
+    if resource is None or not _is_legacy_bake_action(obj, resource, action, verify_all_frames=True):
+        return False
+
+    animation_data.action = None
+    clear_state(obj)
+    clear_cache(obj)
+    if getattr(action, "users", 0) == 0:
+        bpy.data.actions.remove(action)
+    obj[DYNG_BAKE_STATUS_PROP] = "Legacy bake deleted"
+    obj[DYNG_SIM_STATUS_PROP] = "Legacy Dyng bake deleted"
+    return True
 
 
 def build_cache_for_object(
@@ -1265,7 +2178,7 @@ def build_cache_for_object(
     try:
         for frame in range(frame_start, frame_end + 1):
             scene.frame_set(frame)
-            if frame == frame_start or frame <= 0:
+            if frame == frame_start:
                 reset_object(obj, update_status=False)
             else:
                 step_object(obj, dt, reset=False, update_status=False)
@@ -1301,7 +2214,7 @@ def cache_summary(obj: bpy.types.Object) -> str:
     cache = _FRAME_CACHES.get(_state_key(obj))
     if cache is not None:
         return f"Cached {cache.frame_start}-{cache.frame_end}"
-    return str(obj.get(DYNG_CACHE_STATUS_PROP, "No cache") or "No cache")
+    return "No memory cache"
 
 
 def summarize_object(obj: bpy.types.Object) -> str:
