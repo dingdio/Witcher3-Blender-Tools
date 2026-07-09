@@ -732,6 +732,42 @@ class TestExportArmatureSelection(unittest.TestCase):
 
         self.assertEqual(required, ["l_dyng_group_01", "l_01_01", "l_01_02"])
 
+    def test_hard_attachment_socket_detects_constraint_driven_anchor(self):
+        main_arm = self._armature("trajectory_ARM", ["Root", "Trajectory01"])
+        constraint = types.SimpleNamespace(
+            type="COPY_TRANSFORMS",
+            target=main_arm,
+            subtarget="Trajectory01",
+        )
+        anchor = types.SimpleNamespace(
+            name="CHardAttachment.005",
+            parent=main_arm,
+            parent_type="OBJECT",
+            parent_bone="",
+            constraints=[constraint],
+        )
+        mesh = types.SimpleNamespace(parent=anchor)
+
+        self.assertEqual(bundle._hard_attachment_socket([mesh], main_arm), "Trajectory01")
+
+    def test_hard_attachment_socket_ignores_non_attachment_slot_constraint(self):
+        main_arm = self._armature("trajectory_ARM", ["Root", "Trajectory01"])
+        constraint = types.SimpleNamespace(
+            type="COPY_TRANSFORMS",
+            target=main_arm,
+            subtarget="Trajectory01",
+        )
+        slot_empty = types.SimpleNamespace(
+            name="entity_slots:Trajectory01",
+            parent=main_arm,
+            parent_type="OBJECT",
+            parent_bone="",
+            constraints=[constraint],
+        )
+        mesh = types.SimpleNamespace(parent=slot_empty)
+
+        self.assertIsNone(bundle._hard_attachment_socket([mesh], main_arm))
+
     def test_attachment_armature_is_preferred_over_flat_mesh_armature(self):
         group_arm = self._armature("b_01_wa__shani_ARM", ["head", "l_01_02"])
         attachment_arm = self._armature(

@@ -1686,6 +1686,179 @@ def _clear_loaded_cutscene_state(scene):
     if hasattr(scene, "witcher_w2scene_active_cutscene_path"):
         scene.witcher_w2scene_active_cutscene_path = ""
 
+
+def _cutscene_active_collection(context=None):
+    context = context or bpy.context
+    collection = getattr(context, "collection", None)
+    if collection is not None:
+        return collection
+    active_layer = getattr(getattr(context, "view_layer", None), "active_layer_collection", None)
+    collection = getattr(active_layer, "collection", None)
+    if collection is not None:
+        return collection
+    return bpy.context.scene.collection
+
+
+def _cutscene_actor_template_path(cutscene_repo_path, suffix):
+    cutscene_repo_path = str(cutscene_repo_path or "").strip().replace("/", "\\")
+    folder, filename = os.path.split(cutscene_repo_path)
+    stem, _ext = os.path.splitext(filename)
+    if not stem:
+        stem = "new_cutscene"
+    actor_filename = f"{stem}_{suffix}.w2ent"
+    return os.path.join(folder, actor_filename).replace("/", "\\") if folder else actor_filename
+
+
+def _find_cutscene_actor_armature(scene, actor_name):
+    actor_key = str(actor_name or "").strip().lower()
+    if not actor_key:
+        return None
+    for obj in getattr(scene, "objects", []) or []:
+        if getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        if str(obj.get("cutscene_actor_name", "") or "").strip().lower() == actor_key:
+            return obj
+    prefix = f"{actor_key}:"
+    for obj in getattr(scene, "objects", []) or []:
+        if getattr(obj, "type", None) == 'ARMATURE' and str(getattr(obj, "name", "") or "").lower().startswith(prefix):
+            return obj
+    return None
+
+
+def _set_cutscene_actor_armature_name(armature_obj, actor_name):
+    if armature_obj is None:
+        return
+    target_name = f"{actor_name}:CAnimatedComponent2_ARM"
+    try:
+        armature_obj.name = target_name
+    except Exception:
+        pass
+    data = getattr(armature_obj, "data", None)
+    if data is not None:
+        try:
+            data.name = f"{target_name}_DATA"
+        except Exception:
+            pass
+
+
+def _ensure_cutscene_sentinel(scene):
+    if any(int(getattr(item, "source_index", -2)) == -1 for item in getattr(scene, "witcher_cutscene_animation_items", []) or []):
+        return
+    item = scene.witcher_cutscene_animation_items.add()
+    item.source_index = -1
+    item.full_name = "Cutscene"
+    item.display_name = "Cutscene"
+
+
+def _ensure_default_cutscene_camera(context, camera_armature=None):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return None
+    try:
+        from . import ui_anims
+        camera_obj = ui_anims.find_camera_preview_object(camera_armature) if camera_armature is not None else None
+    except Exception:
+        camera_obj = None
+    if camera_obj is None:
+        camera_obj = getattr(scene, "camera", None)
+    if camera_obj is None or getattr(camera_obj, "type", None) != 'CAMERA':
+        cam_data = bpy.data.cameras.new("Camera")
+        camera_obj = bpy.data.objects.new("Camera", cam_data)
+        _cutscene_active_collection(context).objects.link(camera_obj)
+        camera_obj.location = (0.0, -4.0, 1.6)
+        camera_obj.rotation_euler = (math.radians(68.0), 0.0, 0.0)
+    scene.camera = camera_obj
+    return camera_obj
+
+
+def _ensure_default_cutscene_trajectories_actor(context, cutscene_repo_path):
+    scene = getattr(context, "scene", None)
+    existing = _find_cutscene_actor_armature(scene, "trajectories")
+    template_path = _cutscene_actor_template_path(cutscene_repo_path, "trajectories")
+    if existing is not None:
+        _set_cutscene_actor_armature_name(existing, "trajectories")
+        existing["cutscene_actor_name"] = "trajectories"
+        existing["cutscene_actor_template"] = template_path
+        existing["cutscene_generated_actor_template"] = "trajectories"
+        existing["cutscene_actor_type"] = "CAT_Actor"
+        existing["cutscene_component"] = "Root"
+        existing["cutscene_actor_appearance"] = ""
+        existing["cutscene_actor_use_mimic"] = False
+        return existing, False
+    from . import ui_animated_component
+    from ..CR2W import animated_component as ac
+    armature = ui_animated_component.create_animated_component(
+        "trajectories",
+        ac.TRAJECTORY_RIG_PATH,
+        ac.trajectory_bone_names(ac.TRAJECTORY_BONE_COUNT),
+        template_path,
+        "",
+        target_collection=_cutscene_active_collection(context),
+    )
+    armature["cutscene_actor_name"] = "trajectories"
+    armature["cutscene_actor_template"] = template_path
+    armature["cutscene_generated_actor_template"] = "trajectories"
+    armature["cutscene_actor_type"] = "CAT_Actor"
+    armature["cutscene_component"] = "Root"
+    armature["cutscene_actor_appearance"] = ""
+    armature["cutscene_actor_use_mimic"] = False
+    armature[import_cutscene.CUTSCENE_ACTOR_IMPORTED_PROP] = False
+    return armature, True
+
+
+def _ensure_default_cutscene_camera_actor(context):
+    scene = getattr(context, "scene", None)
+    existing = _find_cutscene_actor_armature(scene, "camera")
+    if existing is not None:
+        try:
+            from . import ui_anims
+            _set_cutscene_actor_armature_name(existing, "camera")
+            ui_anims._tag_scratch_cutscene_actor(
+                existing,
+                actor_name="camera",
+                template_path=getattr(scene, "witcher_cutscene_scratch_camera_repo_path", "") or ui_anims.SCRATCH_CAMERA_DEFAULT_REPO_PATH,
+                actor_type="CAT_Camera",
+                appearance="",
+                use_mimic=False,
+                imported_new=bool(existing.get(import_cutscene.CUTSCENE_ACTOR_IMPORTED_PROP, False)),
+            )
+        except Exception:
+            pass
+        return existing, False
+    from . import ui_anims
+    camera_armature = ui_anims._import_cutscene_camera_rig(context)
+    if camera_armature is None:
+        return None, False
+    _set_cutscene_actor_armature_name(camera_armature, "camera")
+    ui_anims._tag_scratch_cutscene_actor(
+        camera_armature,
+        actor_name="camera",
+        template_path=getattr(scene, "witcher_cutscene_scratch_camera_repo_path", "") or ui_anims.SCRATCH_CAMERA_DEFAULT_REPO_PATH,
+        actor_type="CAT_Camera",
+        appearance="",
+        use_mimic=False,
+        imported_new=True,
+    )
+    return camera_armature, True
+
+
+def _setup_new_cutscene_defaults(context, cutscene_repo_path):
+    scene = getattr(context, "scene", None)
+    created = []
+    if scene is None:
+        return created
+    trajectories_armature, created_trajectories = _ensure_default_cutscene_trajectories_actor(context, cutscene_repo_path)
+    if trajectories_armature is not None and created_trajectories:
+        created.append("trajectories")
+    camera_armature, created_camera = _ensure_default_cutscene_camera_actor(context)
+    if camera_armature is not None and created_camera:
+        created.append("camera")
+    _ensure_default_cutscene_camera(context, camera_armature)
+    _sync_actor_items_with_scene(scene)
+    _ensure_cutscene_sentinel(scene)
+    return created
+
+
 def _schedule_deferred_cutscene_state_sync(scene, filepath):
     scene_name = str(getattr(scene, "name", "") or "").strip()
     filepath = str(filepath or "").strip()
@@ -3745,6 +3918,7 @@ def _draw_cutscene_actors_tab(layout, scene, context=None):
     opts_row.operator("witcher.cutscene_scratch_assign_actor", text="Assign Selected", icon='CHECKMARK')
 
 
+
 def _draw_cutscene_anims_tab(layout, scene, context=None):
     anims = list(getattr(scene, "witcher_cutscene_animation_items", []))
     idx = getattr(scene, "witcher_cutscene_loaded_anim_index", 0)
@@ -4125,9 +4299,16 @@ class WITCH_OT_CutsceneCreateNew(Operator):
             candidate = f"{base}_{i:02d}.w2cutscene"
             if candidate.lower() not in existing:
                 break
+        _clear_loaded_cutscene_state(scene)
         scene.witcher_cutscene_export_repo_path = candidate
-        scene.witcher_loaded_w2cutscene_path = ""
-        self.report({'INFO'}, f"New cutscene: {candidate}")
+        created = _setup_new_cutscene_defaults(context, candidate)
+        if hasattr(scene, "witcher_cs_tab"):
+            scene.witcher_cs_tab = 'ACTORS'
+        actor_text = ", ".join(created) if created else "defaults"
+        if _find_cutscene_actor_armature(scene, "camera") is None:
+            self.report({'WARNING'}, f"New cutscene: {candidate}; camera actor rig was not loaded.")
+            return {'FINISHED'}
+        self.report({'INFO'}, f"New cutscene: {candidate} ({actor_text}).")
         return {'FINISHED'}
 
 class WITCHER_PT_cutscene_panel(WITCH_PT_Base, Panel):

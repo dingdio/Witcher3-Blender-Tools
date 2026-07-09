@@ -3,6 +3,7 @@ import bpy
 import sys
 import os
 from . import file_helpers
+from . import get_rig_rot90_enabled
 
 log = logging.getLogger(__name__)
 
@@ -617,12 +618,7 @@ def attach_weapon(p_bone_name = "r_weapon"):
     was_parented = _reparent_keep_world(child, arm_parent)
 
     rig_settings = getattr(getattr(arm_parent, "data", None), "witcherui_RigSettings", None)
-    rot90_active = False
-    if rig_settings is not None:
-        if hasattr(rig_settings, "rot90_imported"):
-            rot90_active = bool(getattr(rig_settings, "rot90_imported", False))
-        elif hasattr(rig_settings, "rot90_compensate"):
-            rot90_active = bool(getattr(rig_settings, "rot90_compensate", False))
+    rot90_active = get_rig_rot90_enabled(rig_settings, default=False)
     use_world_replace = not rot90_active
 
     copy_transform = child.constraints.new('COPY_TRANSFORMS')

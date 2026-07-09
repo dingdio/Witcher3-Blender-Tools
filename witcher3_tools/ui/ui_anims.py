@@ -3871,6 +3871,7 @@ class WITCH_OT_CutsceneScratchValidate(bpy.types.Operator):
         return {'FINISHED'}
 
 
+
 def _anim_get_active_redkit_project(context):
     addon_prefs = get_all_addon_prefs(context)
     projects = getattr(addon_prefs, "redkit_projects", [])
@@ -3885,8 +3886,132 @@ def _anim_get_active_redkit_project(context):
 def _anim_compute_full_export_path(workspace_root, repo_path):
     if not workspace_root or not repo_path:
         return None
-    clean = repo_path.replace("/", os.sep).replace("\\", os.sep).lstrip(os.sep)
-    return os.path.normpath(os.path.join(workspace_root, clean))
+    clean = str(repo_path).replace("/", os.sep).replace("\\", os.sep)
+    drive, _tail = os.path.splitdrive(clean)
+    if drive or os.path.isabs(clean):
+        return None
+    root = os.path.abspath(os.path.normpath(workspace_root))
+    candidate = os.path.abspath(os.path.normpath(os.path.join(root, clean.lstrip(os.sep))))
+    try:
+        if os.path.normcase(os.path.commonpath((root, candidate))) != os.path.normcase(root):
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
+def _cutscene_normalize_repo_path(repo_path):
+    return str(repo_path or "").strip().replace("/", "\\").lstrip("\\")
+
+
+def _cutscene_actor_template_full_path(project_path, repo_path):
+    repo_path = _cutscene_normalize_repo_path(repo_path)
+    if not project_path or not repo_path:
+        return None
+    return _anim_compute_full_export_path(os.path.join(project_path, "workspace"), repo_path)
+
+
+def _cutscene_generated_actor_kind(actor_obj, actor_name, repo_path):
+    actor_name = str(actor_name or "").strip().lower()
+    repo_path = _cutscene_normalize_repo_path(repo_path).lower()
+    generated_prop = str(actor_obj.get("cutscene_generated_actor_template", "") or "").strip().lower()
+    if generated_prop == "trajectories":
+        return "trajectories"
+    if actor_name == "trajectories" and os.path.basename(repo_path).endswith("_trajectories.w2ent"):
+        return "trajectories"
+    return ""
+
+
+def _cutscene_generated_actor_template_entries(context):
+    scene = getattr(context, "scene", None)
+    project_path = _anim_get_active_redkit_project(context)
+    entries = []
+    seen = set()
+    for obj in getattr(scene, "objects", []) or []:
+        if getattr(obj, "type", None) != 'ARMATURE':
+            continue
+        actor_name = str(obj.get("cutscene_actor_name", "") or "").strip()
+        repo_path = _cutscene_normalize_repo_path(obj.get("cutscene_actor_template", ""))
+        if not actor_name or not repo_path:
+            continue
+        kind = _cutscene_generated_actor_kind(obj, actor_name, repo_path)
+        if not kind:
+            continue
+        key = (kind, repo_path.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        full_path = _cutscene_actor_template_full_path(project_path, repo_path)
+        exists = bool(full_path and os.path.isfile(full_path))
+        entries.append({
+            "kind": kind,
+            "object": obj,
+            "actor_name": actor_name,
+            "repo_path": repo_path,
+            "full_path": full_path,
+            "basename": os.path.basename(repo_path),
+            "exists": exists,
+        })
+    return entries
+
+
+def _cutscene_missing_generated_actor_template_entries(context):
+    return [entry for entry in _cutscene_generated_actor_template_entries(context) if not entry.get("exists")]
+
+
+def _cutscene_write_generated_actor_template_entries(context, entries, force=False):
+    targets = list(entries) if force else [entry for entry in entries if not entry.get("exists")]
+    if not targets:
+        return []
+
+    from .. import get_wolvenkit
+    from ..CR2W import animated_component as animated_component_builder
+    from . import ui_animated_component
+
+    wolvenkit_exe = get_wolvenkit(context)
+    written = []
+    for entry in targets:
+        kind = entry.get("kind")
+        repo_path = entry.get("repo_path") or ""
+        full_path = entry.get("full_path")
+        arm_obj = entry.get("object")
+        if not full_path:
+            raise RuntimeError(f"No REDkit project path for generated actor: {repo_path}")
+        if kind != "trajectories":
+            raise RuntimeError(f"Unsupported generated actor type: {kind or 'unknown'}")
+        if os.path.isfile(full_path) and not force:
+            entry["exists"] = True
+            continue
+        if arm_obj is None:
+            raise RuntimeError(f"No Blender actor found for generated actor: {repo_path}")
+        attachments, skipped = ui_animated_component.collect_hard_attachment_export_data(arm_obj)
+        if skipped:
+            skipped_names = ", ".join(skipped[:4])
+            raise RuntimeError(f"Generated actor has CHardAttachment(s) without mesh path: {skipped_names}")
+        skeleton_path = str(
+            arm_obj.get(ui_animated_component.P_PATH, "") or animated_component_builder.TRAJECTORY_RIG_PATH
+        ).strip().replace("/", "\\")
+        behavior_path = str(
+            arm_obj.get(ui_animated_component.P_BEHAVIOR, "") or animated_component_builder.CUTSCENE_BEHAVIOR_PATH
+        ).strip().replace("/", "\\")
+        component_name = str(
+            arm_obj.get(ui_animated_component.P_NAME, "") or animated_component_builder.DEFAULT_COMPONENT_NAME
+        ).strip()
+        animated_component_builder.generate_entity(
+            attachments,
+            full_path,
+            wolvenkit_exe,
+            skeleton_path=skeleton_path,
+            behavior_path=behavior_path or None,
+            entity_name=entry.get("actor_name") or "trajectories",
+            component_name=component_name,
+        )
+        if not os.path.isfile(full_path):
+            raise RuntimeError(f"Generated actor file was not created: {repo_path}")
+        entry["exists"] = True
+        entry["attachment_count"] = len(attachments)
+        written.append(entry)
+    return written
 
 
 class WITCH_OT_AnimExportGotoProjectPath(bpy.types.Operator):
@@ -4104,6 +4229,38 @@ class WITCH_OT_CutsceneSetRepoFromBrowser(bpy.types.Operator):
         for area in context.screen.areas:
             if area.type == 'FILE_BROWSER':
                 area.tag_redraw()
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneCreateGeneratedActorFiles(bpy.types.Operator):
+    """Create or update generated actor templates in the active REDkit project."""
+    bl_idname = "witcher.cutscene_create_generated_actor_files"
+    bl_label = "Create/Update Actor Files"
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_cutscene_generated_actor_template_entries(context))
+
+    def execute(self, context):
+        entries = _cutscene_generated_actor_template_entries(context)
+        if not entries:
+            self.report({'INFO'}, "No generated actor files to create.")
+            return {'FINISHED'}
+        try:
+            written = _cutscene_write_generated_actor_template_entries(context, entries, force=True)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to create generated actor files: {exc}")
+            return {'CANCELLED'}
+        if written:
+            names = ", ".join(
+                f"{entry.get('basename') or entry.get('repo_path') or 'actor'}"
+                f" ({entry.get('attachment_count', 0)} attachment(s))"
+                for entry in written
+            )
+            self.report({'INFO'}, f"Updated generated actor file(s): {names}")
+        else:
+            self.report({'INFO'}, "Generated actor files already exist.")
         return {'FINISHED'}
 
 
@@ -7446,10 +7603,7 @@ class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
                     os.path.join(project_path, "workspace"), repo_path,
                 )
                 if full_path:
-                    col = path_box.column(align=True)
-                    col.scale_y = 0.75
-                    col.label(text=os.path.dirname(full_path))
-                    col.label(text=os.path.basename(full_path))
+                    path_box.label(text=f"Output: {os.path.basename(full_path)}", icon='FILE')
             row = path_box.row(align=True)
             row.operator(WITCH_OT_AnimExportGotoProjectPath.bl_idname, text="Go To Project Path", icon='FILEBROWSER')
             row.operator(WITCH_OT_AnimSetRepoFromBrowser.bl_idname, text="Set from Folder", icon='FILE_FOLDER')
@@ -7533,6 +7687,12 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
+    export_generated_actors: BoolProperty(
+        name="Export Generated Actors",
+        description="Create missing generated actor .w2ent files, such as cutscene trajectories, before exporting",
+        default=True,
+    )
+
     @classmethod
     def poll(cls, context):
         scene = getattr(context, "scene", None)
@@ -7586,6 +7746,23 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
             path_box.label(text="No REDkit project configured", icon='INFO')
             path_box.label(text="Set one in Preferences -> Add-ons -> Witcher 3 Tools")
 
+        generated_entries = _cutscene_generated_actor_template_entries(context)
+        if generated_entries:
+            generated_box = layout.box()
+            generated_box.label(text="Generated Actor Files", icon='ARMATURE_DATA')
+            generated_box.prop(self, "export_generated_actors")
+            missing = [entry for entry in generated_entries if not entry.get("exists")]
+            for entry in generated_entries:
+                row = generated_box.row(align=True)
+                row.alert = not entry.get("exists")
+                icon = 'CHECKMARK' if entry.get("exists") else 'ERROR'
+                status = "Exists" if entry.get("exists") else "Missing"
+                row.label(text=f"{status}: {entry.get('actor_name') or 'actor'}", icon=icon)
+                row.label(text=entry.get("basename") or "")
+            row = generated_box.row(align=True)
+            row.alert = bool(missing)
+            row.operator(WITCH_OT_CutsceneCreateGeneratedActorFiles.bl_idname, icon='ADD')
+
     def execute(self, context):
         if self.export_redkit_re_files or self.export_redkit_csv:
             re_status = get_re_addon_status()
@@ -7594,6 +7771,26 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
                 return {'CANCELLED'}
 
         savepath = _normalize_w2cutscene_export_path(self.filepath)
+        generated_entries = _cutscene_generated_actor_template_entries(context)
+        missing_generated = _cutscene_missing_generated_actor_template_entries(context)
+        if generated_entries:
+            if missing_generated and not self.export_generated_actors:
+                paths = ", ".join(entry.get("repo_path") or entry.get("basename") or "actor" for entry in missing_generated)
+                self.report({'ERROR'}, f"Missing generated actor file(s): {paths}")
+                return {'CANCELLED'}
+            if self.export_generated_actors:
+                try:
+                    written = _cutscene_write_generated_actor_template_entries(context, generated_entries, force=False)
+                except Exception as exc:
+                    self.report({'ERROR'}, f"Failed to create generated actor files: {exc}")
+                    return {'CANCELLED'}
+                if written:
+                    names = ", ".join(
+                        f"{entry.get('basename') or entry.get('repo_path') or 'actor'}"
+                        f" ({entry.get('attachment_count', 0)} attachment(s))"
+                        for entry in written
+                    )
+                    self.report({'INFO'}, f"Updated generated actor file(s): {names}")
         return export_cutscene.export_w3_cutscene(
             context,
             savepath,
@@ -7689,6 +7886,7 @@ classes = [
     WITCH_OT_AnimSetRepoFromBrowser,
     WITCH_OT_CutsceneExportGotoProjectPath,
     WITCH_OT_CutsceneSetRepoFromBrowser,
+    WITCH_OT_CutsceneCreateGeneratedActorFiles,
     WITCH_OT_ExportW2AnimJson,
     WITCH_OT_ExportW2Cutscene,
 ]
@@ -7857,6 +8055,7 @@ def register():
         default="",
         options={'SKIP_SAVE'},
     )
+
 
     bpy.types.Scene.witcher_auto_orient_root = BoolProperty(
         name="Auto Orient Root",

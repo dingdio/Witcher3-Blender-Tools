@@ -324,6 +324,117 @@ class BoneFrameKey:
             str(self.scale),
             )
 
+
+_EULER_ROTATION_MODES = {'XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX'}
+
+
+def _rotation_prop_for_mode(rotation_mode):
+    if rotation_mode == 'QUATERNION':
+        return 'rotation_quaternion'
+    if rotation_mode == 'AXIS_ANGLE':
+        return 'rotation_axis_angle'
+    return 'rotation_euler'
+
+
+def _rotation_mode_for_prop(prop_name, fallback_mode):
+    if prop_name == 'rotation_quaternion':
+        return 'QUATERNION'
+    if prop_name == 'rotation_axis_angle':
+        return 'AXIS_ANGLE'
+    fallback_mode = str(fallback_mode or "").upper()
+    return fallback_mode if fallback_mode in _EULER_ROTATION_MODES else 'XYZ'
+
+
+def _rotation_default_values(bone):
+    mode = getattr(bone, "rotation_mode", "QUATERNION")
+    return _rotation_default_values_for_prop(bone, _rotation_prop_for_mode(mode), mode)
+
+
+def _bone_rotation_quaternion(bone):
+    mode = getattr(bone, "rotation_mode", "QUATERNION")
+    if mode == 'QUATERNION':
+        return Quaternion(tuple(getattr(bone, "rotation_quaternion", (1.0, 0.0, 0.0, 0.0))))
+    if mode == 'AXIS_ANGLE':
+        angle, axis_x, axis_y, axis_z = getattr(bone, "rotation_axis_angle", (0.0, 0.0, 0.0, 1.0))
+        axis = (axis_x, axis_y, axis_z)
+        if abs(axis_x) + abs(axis_y) + abs(axis_z) <= 1e-8:
+            axis = (0.0, 0.0, 1.0)
+        return Quaternion(axis, angle)
+    euler_mode = mode if mode in _EULER_ROTATION_MODES else 'XYZ'
+    return Euler(tuple(getattr(bone, "rotation_euler", (0.0, 0.0, 0.0))), euler_mode).to_quaternion()
+
+
+def _rotation_default_values_for_prop(bone, prop_name, rotation_mode=None):
+    """Return missing-channel defaults in the representation being sampled."""
+
+    active_mode = getattr(bone, "rotation_mode", "QUATERNION")
+    if prop_name == _rotation_prop_for_mode(active_mode):
+        if prop_name == 'rotation_quaternion':
+            return list(getattr(bone, "rotation_quaternion", (1.0, 0.0, 0.0, 0.0)))
+        if prop_name == 'rotation_axis_angle':
+            return list(getattr(bone, "rotation_axis_angle", (0.0, 0.0, 0.0, 1.0)))
+        return [0.0] + list(getattr(bone, "rotation_euler", (0.0, 0.0, 0.0)))
+
+    quaternion = _bone_rotation_quaternion(bone)
+    if prop_name == 'rotation_quaternion':
+        return [quaternion.w, quaternion.x, quaternion.y, quaternion.z]
+    if prop_name == 'rotation_axis_angle':
+        axis, angle = quaternion.to_axis_angle()
+        return [angle, axis.x, axis.y, axis.z]
+    mode = _rotation_mode_for_prop(prop_name, rotation_mode or getattr(bone, "rotation_mode", "XYZ"))
+    euler = quaternion.to_euler(mode)
+    return [0.0, euler.x, euler.y, euler.z]
+
+
+def _select_rotation_prop(rotation_curves, rotation_mode):
+    """Choose one rotation representation before binding any FCurve channels."""
+
+    available = {prop for prop, curves in rotation_curves.items() if curves}
+    if not available:
+        return None
+    preferred = _rotation_prop_for_mode(rotation_mode)
+    if preferred in available:
+        return preferred
+    priority = {'rotation_quaternion': 2, 'rotation_axis_angle': 1, 'rotation_euler': 0}
+    return max(available, key=lambda prop: (len(rotation_curves.get(prop, ())), priority[prop]))
+
+
+def _sample_float(sample, default=0.0):
+    try:
+        value = sample[0]
+    except Exception:
+        value = sample
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _sampled_rotation_to_quaternion(prop_name, rotation_mode, rw, rx, ry, rz):
+    if prop_name == 'rotation_euler':
+        mode = rotation_mode if rotation_mode in _EULER_ROTATION_MODES else 'XYZ'
+        return Euler((
+            _sample_float(rx),
+            _sample_float(ry),
+            _sample_float(rz),
+        ), mode).to_quaternion()
+    if prop_name == 'rotation_axis_angle':
+        axis = (
+            _sample_float(rx, 0.0),
+            _sample_float(ry, 0.0),
+            _sample_float(rz, 1.0),
+        )
+        if abs(axis[0]) + abs(axis[1]) + abs(axis[2]) <= 1e-8:
+            axis = (0.0, 0.0, 1.0)
+        return Quaternion(axis, _sample_float(rw, 0.0))
+    return Quaternion((
+        _sample_float(rw, 1.0),
+        _sample_float(rx, 0.0),
+        _sample_float(ry, 0.0),
+        _sample_float(rz, 0.0),
+    ))
+
+
 class W3AnimationExporter:
     def __init__(self):
         self.__scale = 1
@@ -403,7 +514,10 @@ class W3AnimationExporter:
 
         anim_bones = {}
         rePath = re.compile(r'^pose\.bones\["(.+)"\]\.([a-z_]+)$')
-        prop_rotation_map = {'QUATERNION':'rotation_quaternion', 'AXIS_ANGLE':'rotation_axis_angle'}
+        bone_rotation_props = {}
+        bone_rotation_modes = {}
+        rotation_props = {'rotation_quaternion', 'rotation_axis_angle', 'rotation_euler'}
+        grouped_curves = {}
         for fcurve in iter_action_fcurves(action, target=armObj):
             m = rePath.match(fcurve.data_path)
             if m is None:
@@ -413,27 +527,37 @@ class W3AnimationExporter:
                 logging.warning(' * Bone not found: %s', m.group(1))
                 continue
             prop_name = m.group(2)
-            if prop_name not in {'location', prop_rotation_map.get(bone.rotation_mode, 'rotation_euler')}:
+            if prop_name not in {'location', *rotation_props}:
                 continue
+            bone_group = grouped_curves.setdefault(
+                bone,
+                {"location": [], **{rotation_prop: [] for rotation_prop in rotation_props}},
+            )
+            bone_group[prop_name].append(fcurve)
 
-            if bone not in anim_bones:
-                data = list(bone.location)
-                if bone.rotation_mode == 'QUATERNION':
-                    data += list(bone.rotation_quaternion)
-                elif bone.rotation_mode == 'AXIS_ANGLE':
-                    data += list(bone.rotation_axis_angle)
-                else:
-                    data += ([bone.rotation_mode] + list(bone.rotation_euler))
-                anim_bones[bone] = [_FCurve(i) for i in data] # x, y, z, rw, rx, ry, rz
-            bone_curves = anim_bones[bone]
-            if prop_name == 'location': # x, y, z
-                bone_curves[fcurve.array_index].setFCurve(fcurve)
-            elif prop_name == 'rotation_quaternion': # rw, rx, ry, rz
-                bone_curves[3+fcurve.array_index].setFCurve(fcurve)
-            elif prop_name == 'rotation_axis_angle': # rw, rx, ry, rz
-                bone_curves[3+fcurve.array_index].setFCurve(fcurve)
-            elif prop_name == 'rotation_euler': # mode, rx, ry, rz
-                bone_curves[3+fcurve.array_index+1].setFCurve(fcurve)
+        for bone, bone_group in grouped_curves.items():
+            bone_mode = getattr(bone, "rotation_mode", "QUATERNION")
+            selected_prop = _select_rotation_prop(bone_group, bone_mode)
+            effective_prop = selected_prop or _rotation_prop_for_mode(bone_mode)
+            rotation_mode = _rotation_mode_for_prop(effective_prop, bone_mode)
+            data = list(bone.location)
+            data += _rotation_default_values_for_prop(bone, effective_prop, rotation_mode)
+            bone_curves = [_FCurve(value) for value in data]  # x, y, z, rw, rx, ry, rz
+            anim_bones[bone] = bone_curves
+            bone_rotation_props[bone] = selected_prop
+            bone_rotation_modes[bone] = rotation_mode
+
+            for fcurve in bone_group["location"]:
+                if 0 <= fcurve.array_index < 3:
+                    bone_curves[fcurve.array_index].setFCurve(fcurve)
+            if selected_prop in {'rotation_quaternion', 'rotation_axis_angle'}:
+                for fcurve in bone_group[selected_prop]:
+                    if 0 <= fcurve.array_index < 4:
+                        bone_curves[3 + fcurve.array_index].setFCurve(fcurve)
+            elif selected_prop == 'rotation_euler':
+                for fcurve in bone_group[selected_prop]:
+                    if 0 <= fcurve.array_index < 3:
+                        bone_curves[4 + fcurve.array_index].setFCurve(fcurve)
         # Detect rot90 compensation needed for export
         rig_settings = getattr(armObj.data, "witcherui_RigSettings", None)
         rot90_active = get_rig_rot90_enabled(rig_settings, default=False)
@@ -451,7 +575,14 @@ class W3AnimationExporter:
                 key.frame_number = frame_number - self.__frame_start
 
                 bl_bone = bone
-                quat = Quaternion([ rw[0], rx[0], ry[0], rz[0]])
+                quat = _sampled_rotation_to_quaternion(
+                    bone_rotation_props.get(bone) or _rotation_prop_for_mode(getattr(bone, "rotation_mode", "QUATERNION")),
+                    bone_rotation_modes.get(bone, getattr(bone, "rotation_mode", "QUATERNION")),
+                    rw,
+                    rx,
+                    ry,
+                    rz,
+                )
                 if face_animation:
                     co = Vector([x[0], y[0], z[0]])
                     if rot90_active:

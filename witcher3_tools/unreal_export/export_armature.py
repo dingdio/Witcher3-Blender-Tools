@@ -49,17 +49,33 @@ def _object_prop(obj, name):
         return None
 
 
-def _special_attachment_socket(armature) -> Optional[str]:
-    """Return the rig bone a separate-skeleton hard attachment hangs off, if any.
+def _is_hard_attachment_anchor(obj) -> bool:
+    if obj is None:
+        return False
+    if str(_object_prop(obj, "witcher_type") or "") == "CHardAttachment":
+        return True
+    return str(getattr(obj, "name", "") or "").startswith("CHardAttachment")
 
-    A CAnimatedComponent attachment (e.g. Ciri's scabbard) keeps its OWN
-    skeleton and is linked to the entity rig by anchoring its Root bone to a
-    main-skeleton bone -- ``import_entity.process_special_attachment`` records
-    that bone on the attachment armature as ``w2_special_parent_bone``. Such a
-    part must NOT have its bones grafted onto the shared skeleton; instead it
-    exports on its own skeleton and is attached to this bone in the Unreal
-    blueprint (no offset/scale -- the bones are co-located).
-    """
+
+def _hard_attachment_constraint_socket(anchor, main_armature, main_bones) -> Optional[str]:
+    if not _is_hard_attachment_anchor(anchor):
+        return None
+    for constraint in getattr(anchor, "constraints", []) or []:
+        if getattr(constraint, "type", "") not in {"COPY_TRANSFORMS", "COPY_LOCATION", "COPY_ROTATION"}:
+            continue
+        if getattr(constraint, "target", None) is not main_armature:
+            continue
+        bone = str(getattr(constraint, "subtarget", "") or "")
+        if bone and bone in main_bones:
+            return bone
+    bone = str(_object_prop(anchor, "witcher_parent_slot_name") or "")
+    if bone and bone in main_bones:
+        return bone
+    return None
+
+
+def _special_attachment_socket(armature) -> Optional[str]:
+    """Return the main-rig socket recorded for a separate attachment skeleton."""
     if armature is None:
         return None
     if not _object_prop(armature, "w2_special_attachment"):
@@ -69,17 +85,10 @@ def _special_attachment_socket(armature) -> Optional[str]:
 
 
 def _hard_attachment_socket(group_objects, main_armature) -> Optional[str]:
-    """Return the rig bone a bone-parented "hard attachment" hangs off, if any.
+    """Return the main-rig socket used by a rigid attachment mesh.
 
-    RED hangs rigid items (scabbards, sheathed weapons, quivers) off a skeleton
-    slot with ``CHardAttachment`` rather than skinning them. The entity importer
-    recreates that as a mesh parented to a "CHardAttachment" empty that is
-    bone-parented to the entity rig (see import_entity.process_regular_attachment).
-    These meshes have no armature modifier, so they would otherwise export as
-    loose static meshes that float at the origin in Unreal. Detect them by
-    walking up the parent chain for an ancestor bone-parented to ``main_armature``
-    and return that slot bone (only when the bone actually exists on the rig so a
-    follower can copy its pose).
+    Rigid attachments have no armature modifier, so the socket is read from a
+    CHardAttachment ancestor's constraint or bone parent.
     """
     if main_armature is None:
         return None
@@ -88,7 +97,12 @@ def _hard_attachment_socket(group_objects, main_armature) -> Optional[str]:
         node = obj
         depth = 0
         while node is not None and depth < 16:
+            constraint_bone = _hard_attachment_constraint_socket(node, main_armature, main_bones)
+            if constraint_bone:
+                return constraint_bone
             if (
+                _is_hard_attachment_anchor(node)
+                and
                 getattr(node, "parent_type", "") == "BONE"
                 and getattr(node, "parent", None) is main_armature
             ):

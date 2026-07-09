@@ -383,7 +383,16 @@ def get_rig_rot90_enabled(rig_settings, default=False):
     """Return whether the rig currently has rot90 applied."""
     if rig_settings is None:
         return bool(default)
-    return bool(getattr(rig_settings, "rot90_imported", default))
+    rot90_state = str(getattr(rig_settings, "rot90_state", "") or "").strip().upper()
+    if rot90_state in {"ON", "TRUE", "1", "ENABLED"}:
+        return True
+    if rot90_state in {"OFF", "FALSE", "0", "DISABLED"}:
+        return False
+    if hasattr(rig_settings, "rot90_imported"):
+        return bool(getattr(rig_settings, "rot90_imported", default))
+    if hasattr(rig_settings, "rot90_compensate"):
+        return bool(getattr(rig_settings, "rot90_compensate", default))
+    return bool(default)
 
 def set_rig_rot90_enabled(rig_settings, enabled: bool):
     """Set rot90 state on rig settings."""
@@ -391,6 +400,8 @@ def set_rig_rot90_enabled(rig_settings, enabled: bool):
         return
     rig_settings.rot90_imported = bool(enabled)
     rig_settings.rot90_compensate = bool(enabled)
+    if hasattr(rig_settings, "rot90_state"):
+        rig_settings.rot90_state = "ON" if enabled else "OFF"
 
 
 from . import CR2W
@@ -448,6 +459,7 @@ from .ui import ui_texture_export
 from .ui import ui_import_menu
 from .ui import ui_dialog_language
 from .ui import ui_cutscene
+from .ui import ui_animated_component
 from .ui import ui_scene
 from .ui import ui_physics
 from .ui import armature_context
@@ -4018,7 +4030,7 @@ class WITCH_PT_Utils(WITCH_PT_Base, bpy.types.Panel):
                 armature = obj.parent
             if armature and hasattr(armature.data, 'witcherui_RigSettings'):
                 rig_settings = armature.data.witcherui_RigSettings
-                rot90_on = bool(getattr(rig_settings, "rot90_imported", False))
+                rot90_on = get_rig_rot90_enabled(rig_settings, default=False)
                 col.label(text=f"Rig: {armature.name}  ({'Display Fix ON' if rot90_on else 'Display Fix OFF'})")
                 col.operator(
                     "witcher.toggle_rot90",
@@ -4216,7 +4228,7 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
                     armature = obj.parent
                 if armature and hasattr(armature.data, 'witcherui_RigSettings'):
                     rig_settings = armature.data.witcherui_RigSettings
-                    rot90_on = bool(getattr(rig_settings, "rot90_imported", False))
+                    rot90_on = get_rig_rot90_enabled(rig_settings, default=False)
                     col.label(text=f"Rig: {armature.name}  ({'Display Fix ON' if rot90_on else 'Display Fix OFF'})")
                     col.operator(
                         "witcher.toggle_rot90",
@@ -4574,6 +4586,7 @@ def register():
     ui_speech.register()
     ui_scene.register()
     ui_cutscene.register()
+    ui_animated_component.register()
     bpy.utils.register_class(WITCHER_OT_cache_info)
     bpy.utils.register_class(WITCHER_OT_check_cache)
     bpy.utils.register_class(WITCHER_OT_refresh_cache_checked)
@@ -4659,6 +4672,7 @@ def unregister():
     ui_import_menu.unregister()
     ui_texture_export.unregister()
     ui_cutscene.unregister()
+    ui_animated_component.unregister()
     ui_scene.unregister()
     ui_speech.unregister()
     ui_physics.unregister()

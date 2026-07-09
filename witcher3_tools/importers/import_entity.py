@@ -25,6 +25,7 @@ from .. import (
     get_addon_name,
     get_do_import_redcloth,
     get_import_physics_enabled,
+    get_rig_rot90_enabled,
     set_external_import_dependency_alert,
 )
 from ..external_addon_tools import get_apx_addon_status, resolve_redcloth_apx
@@ -42,6 +43,11 @@ from ..CR2W.dc_entity import is_valid_mesh_path
 from ..CR2W.dc_entity import _resolve_repo_path, _resolve_repo_paths_from_array
 from ..CR2W.CR2W_types import EngineTransform
 from ..camera_tracks import setup_camera_preview_drivers
+from ..attachment_math import (
+    bone_name_from_slot_index,
+    coerce_attachment_flags,
+    normalize_engine_transform,
+)
 from ..importers.import_helpers import set_blender_object_transform
 from ..importers import import_isolation
 from ..duplication import duplicate_object_hierarchy
@@ -4973,16 +4979,171 @@ def process_hard_attachments(HardAttachments, objdict, meshdict):
         meshdict (dict): Dictionary mapping mesh names to Blender mesh objects
     """
     for constraint in HardAttachments:
-        parent_arm_name = constraint['parent_name']
-        p_bone_name = constraint['parentSlotName']
-        child_name = constraint['child_name']
-        relativeTransform = constraint['relativeTransform']
+        parent_arm_name = _get_entry_attr(constraint, 'parent_name', '')
+        child_name = _get_entry_attr(constraint, 'child_name', '')
 
         special_names = ["CAnimated", "CCameraComponent", "CAnimDangleConstraint"]
         if any(substring in child_name for substring in special_names):
             process_special_attachment(constraint, objdict)
         else:
             process_regular_attachment(constraint, objdict, meshdict)
+
+
+def _pose_bone_names(armature_obj):
+    pose_bones = getattr(getattr(armature_obj, "pose", None), "bones", None)
+    if not pose_bones:
+        return []
+    return [str(getattr(bone, "name", "") or "") for bone in pose_bones]
+
+
+def _resolve_hard_attachment_parent_slot_name(constraint, parent_arm):
+    slot_name = str(_get_entry_attr(constraint, "parentSlotName", "") or "").strip()
+    if slot_name and slot_name.lower() not in {"none", "null"}:
+        return slot_name
+    bone_index = _get_entry_attr(constraint, "parentSlotBoneIndex", None)
+    return bone_name_from_slot_index(_pose_bone_names(parent_arm), bone_index, "")
+
+
+def _constraint_attachment_flags(constraint):
+    return coerce_attachment_flags(_get_entry_attr(constraint, "attachmentFlags", 0))
+
+
+_ATTACHMENT_RELATIVE_PROP = "witcher_hard_attachment_relative_transform"
+_ATTACHMENT_FLAGS_WARNING_PROP = "witcher_attachment_flags_warning"
+_WARNED_ATTACHMENT_FLAGS = set()
+
+
+def _warn_unsupported_attachment_flags(flags, parent_name, child_name, target_obj=None):
+    flags = coerce_attachment_flags(flags)
+    if not flags:
+        return
+    message = (
+        f"CHardAttachment {parent_name} -> {child_name} uses unsupported "
+        f"attachmentFlags 0x{flags:02X}; imported as a normal full-transform attachment."
+    )
+    log.warning(message)
+    if target_obj is not None:
+        try:
+            target_obj["witcher_attachment_flags"] = flags
+            target_obj[_ATTACHMENT_FLAGS_WARNING_PROP] = message
+        except Exception:
+            pass
+
+    warning_key = (str(parent_name), str(child_name), int(flags))
+    if warning_key in _WARNED_ATTACHMENT_FLAGS:
+        return
+    _WARNED_ATTACHMENT_FLAGS.add(warning_key)
+    if bool(getattr(bpy.app, "background", False)):
+        return
+    try:
+        def draw_warning(menu, _context):
+            menu.layout.label(text=f"Unsupported attachmentFlags: 0x{flags:02X}", icon='ERROR')
+            menu.layout.label(text="Imported using normal full-transform attachment behavior.")
+            menu.layout.label(text=f"See log/custom properties for {child_name}.")
+
+        bpy.context.window_manager.popup_menu(
+            draw_warning,
+            title="CHardAttachment Warning",
+            icon='ERROR',
+        )
+    except Exception:
+        pass
+
+
+def _configure_hard_attachment_head_constraint(anchor, parent_obj, bone_name):
+    """Bind a parented anchor to a bone transform at the bone head.
+
+    LOCAL/POSE with BEFORE_FULL evaluates the anchor locally as
+    ``bone_pose @ relative_local``; normal object parenting then applies the
+    armature world matrix exactly once.
+    """
+    constraint = anchor.constraints.new(type='COPY_TRANSFORMS')
+    constraint.name = "W3_HARD_ATTACHMENT"
+    constraint.target = parent_obj
+    constraint.subtarget = str(bone_name or "")
+    try:
+        constraint.head_tail = 0.0
+    except Exception:
+        pass
+    try:
+        constraint.owner_space = 'LOCAL'
+        constraint.target_space = 'POSE'
+    except Exception:
+        pass
+    for mix_mode in ('BEFORE_FULL', 'BEFORE'):
+        try:
+            constraint.mix_mode = mix_mode
+            break
+        except Exception:
+            continue
+    return constraint
+
+
+def _link_hard_attachment_anchor(parent_obj, child_obj, bone_name, relative_transform, attachment_flags):
+    """Create an armature-parented anchor for a rigid mesh attachment."""
+    anchor = bpy.data.objects.new("CHardAttachment", None)
+    anchor.empty_display_type = 'PLAIN_AXES'
+    anchor.empty_display_size = 0.3
+    collection = next(iter(getattr(child_obj, "users_collection", []) or []), None)
+    _link_object_to_collection(anchor, collection or _get_import_target_collection(bpy.context))
+    anchor["witcher_type"] = "CHardAttachment"
+    anchor["witcher_child_name"] = str(getattr(child_obj, "name", "") or "")
+    anchor["witcher_parent_name"] = str(getattr(parent_obj, "name", "") or "")
+    flags = coerce_attachment_flags(attachment_flags)
+    anchor["witcher_attachment_flags"] = flags
+    anchor["witcher_parent_slot_name"] = str(bone_name or "")
+    anchor[_ATTACHMENT_RELATIVE_PROP] = json.dumps(
+        normalize_engine_transform(relative_transform),
+        separators=(",", ":"),
+    )
+
+    # Component transforms belong below CHardAttachment. Preserve the existing
+    # local component matrix while replacing its transform parent with the anchor.
+    component_matrix = child_obj.matrix_basis.copy()
+    child_obj.parent = anchor
+    child_obj.parent_type = 'OBJECT'
+    child_obj.parent_bone = ""
+    try:
+        child_obj.matrix_parent_inverse = Matrix.Identity(4)
+    except Exception:
+        pass
+    child_obj.matrix_basis = component_matrix
+
+    has_bone = bool(
+        bone_name
+        and getattr(parent_obj, "type", None) == 'ARMATURE'
+        and getattr(parent_obj, "pose", None)
+        and parent_obj.pose.bones.get(bone_name) is not None
+    )
+    anchor.parent = parent_obj
+    anchor.parent_type = 'OBJECT'
+    anchor.parent_bone = ""
+    try:
+        anchor.matrix_parent_inverse = Matrix.Identity(4)
+    except Exception:
+        pass
+
+    rt = _coerce_engine_transform(relative_transform) if relative_transform else None
+    if rt is not None:
+        set_blender_object_transform(anchor, rt, rotate_180=False)
+    else:
+        anchor.matrix_basis = Matrix.Identity(4)
+
+    if has_bone:
+        rig_settings = getattr(getattr(parent_obj, "data", None), "witcherui_RigSettings", None)
+        if get_rig_rot90_enabled(rig_settings, default=False):
+            anchor.matrix_basis = Matrix.Rotation(radians(90), 4, 'Z') @ anchor.matrix_basis
+
+    if has_bone:
+        _configure_hard_attachment_head_constraint(anchor, parent_obj, bone_name)
+
+    _warn_unsupported_attachment_flags(
+        flags,
+        getattr(parent_obj, "name", "parent"),
+        getattr(child_obj, "name", "child"),
+        anchor,
+    )
+    return anchor
 
 
 def process_special_attachment(constraint, objdict):
@@ -4993,30 +5154,34 @@ def process_special_attachment(constraint, objdict):
         constraint (dict): Constraint information
         objdict (dict): Dictionary mapping object names to Blender objects
     """
-    parent_arm_name = constraint['parent_name']
-    p_bone_name = constraint['parentSlotName']
-    child_name = constraint['child_name']
-    relativeTransform = constraint['relativeTransform']
+    parent_arm_name = _get_entry_attr(constraint, 'parent_name', '')
+    child_name = _get_entry_attr(constraint, 'child_name', '')
+    relativeTransform = _get_entry_attr(constraint, 'relativeTransform', None)
+    attachment_flags = _constraint_attachment_flags(constraint)
 
     if parent_arm_name in objdict and child_name in objdict:
         parent_arm = objdict[parent_arm_name]
         target_object = objdict[child_name]
         if parent_arm is target_object:
             return
-        rig_settings = getattr(parent_arm.data, "witcherui_RigSettings", None)
-        use_rot90 = get_do_fix_tail(bpy.context)
-        if rig_settings is not None:
-            if hasattr(rig_settings, "rot90_compensate"):
-                use_rot90 = bool(rig_settings.rot90_compensate)
-            elif hasattr(rig_settings, "rot90_imported"):
-                use_rot90 = bool(rig_settings.rot90_imported)
+        rig_settings = getattr(getattr(parent_arm, "data", None), "witcherui_RigSettings", None)
+        try:
+            default_rot90 = get_do_fix_tail(bpy.context)
+        except Exception:
+            default_rot90 = False
+        use_rot90 = get_rig_rot90_enabled(rig_settings, default=default_rot90)
 
-        # Determine parent bone.
-        # Prefer full-rig matching only for clear duplicate skeletons; otherwise
-        # only bind when parentSlotName is explicitly set in the CHardAttachment.
+        p_bone_name = _resolve_hard_attachment_parent_slot_name(constraint, parent_arm)
         p_bone = None
-        if p_bone_name:
+        if p_bone_name and getattr(parent_arm, "pose", None):
             p_bone = parent_arm.pose.bones.get(p_bone_name)
+        if p_bone_name and p_bone is None:
+            log.warning(
+                "CHardAttachment '%s' references missing slot bone '%s' on '%s'; binding to parent object.",
+                child_name,
+                p_bone_name,
+                parent_arm_name,
+            )
 
         can_match_full_armature = (
             target_object.type == 'ARMATURE'
@@ -5025,53 +5190,61 @@ def process_special_attachment(constraint, objdict):
 
         if can_match_full_armature:
             _set_parent_keep_world(target_object, parent_arm)
-            target_object["w2_special_attachment"] = True
-            target_object["w2_special_parent_arm"] = parent_arm.name
-            target_object["w2_special_parent_bone"] = p_bone.name if p_bone else ""
             target_object["w2_special_attachment_mode"] = "matched_armature"
             target_object.parent_type = "OBJECT"
             target_object.parent_bone = ""
             constrain_util.CreateConstraints2(parent_arm, target_object)
-
         elif p_bone is not None:
             if target_object.type == 'ARMATURE':
                 _set_parent_keep_world(target_object, parent_arm)
             else:
                 target_object.parent = parent_arm
-            target_object["w2_special_attachment"] = True
-            target_object["w2_special_parent_arm"] = parent_arm.name
-            target_object["w2_special_parent_bone"] = p_bone.name
             target_object["w2_special_attachment_mode"] = "root_copy"
-            # Keep one consistent binding mode for special attachment armatures:
-            # always object parent + root COPY_TRANSFORMS, regardless of Rot90 state.
-            if target_object.pose:
-                tgt_child_bone = target_object.pose.bones[0]
-                for c in list(tgt_child_bone.constraints):
-                    if c.type == 'COPY_TRANSFORMS' and c.target == parent_arm:
-                        tgt_child_bone.constraints.remove(c)
-                copy_transform = tgt_child_bone.constraints.new('COPY_TRANSFORMS')
-                copy_transform.name = f"{p_bone.name} to {tgt_child_bone.name}"
+            if getattr(target_object, "pose", None):
+                target_root = target_object.pose.bones[0]
+                for existing in list(target_root.constraints):
+                    if existing.type == 'COPY_TRANSFORMS' and existing.target == parent_arm:
+                        target_root.constraints.remove(existing)
+                copy_transform = target_root.constraints.new('COPY_TRANSFORMS')
+                copy_transform.name = f"{p_bone.name} to {target_root.name}"
                 copy_transform.target = parent_arm
                 copy_transform.subtarget = p_bone.name
                 target_object.parent_type = "OBJECT"
                 target_object.parent_bone = ""
             else:
-                # Non-armature objects (e.g. camera object) still use bone-parenting.
                 target_object.parent_type = "BONE"
                 target_object.parent_bone = p_bone.name
+        else:
+            _set_parent_keep_world(target_object, parent_arm)
+            target_object["w2_special_attachment_mode"] = "object_fallback"
 
-            if "CCameraComponent" in child_name:
-                create_camera_drivers(parent_arm, target_object, "hctFOV")
+        target_object["w2_special_attachment"] = True
+        target_object["w2_special_parent_arm"] = parent_arm.name
+        target_object["w2_special_parent_bone"] = p_bone.name if p_bone else ""
+        target_object["witcher_attachment_flags"] = attachment_flags
+        target_object[_ATTACHMENT_RELATIVE_PROP] = json.dumps(
+            normalize_engine_transform(relativeTransform),
+            separators=(",", ":"),
+        )
 
-        # Apply relativeTransform if present
+        _warn_unsupported_attachment_flags(
+            attachment_flags,
+            parent_arm_name,
+            child_name,
+            target_object,
+        )
+
         if relativeTransform:
             rt = _coerce_engine_transform(relativeTransform)
             if rt is not None:
                 set_blender_object_transform(target_object, rt, rotate_180=False)
 
-        # Camera components need a rot90-facing offset when the rig is rotated
-        if "CCameraComponent" in child_name and use_rot90:
-            target_object.rotation_euler[2] += math.radians(90)
+        if "CCameraComponent" in child_name:
+            create_camera_drivers(parent_arm, target_object, "hctFOV")
+            if use_rot90:
+                target_object.rotation_euler[2] += math.radians(90)
+    else:
+        log.error("Failed to create special CHardAttachment %s -> %s", child_name, parent_arm_name)
 
 
 def process_regular_attachment(constraint, objdict, meshdict):
@@ -5083,41 +5256,34 @@ def process_regular_attachment(constraint, objdict, meshdict):
         objdict (dict): Dictionary mapping object names to Blender objects
         meshdict (dict): Dictionary mapping mesh names to Blender mesh objects
     """
-    parent_arm_name = constraint['parent_name']
-    p_bone_name = constraint['parentSlotName']
-    child_name = constraint['child_name']
-    relativeTransform = constraint['relativeTransform']
-    rt = _coerce_engine_transform(relativeTransform) if relativeTransform else None
-
-    bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-    target_transform = bpy.context.object
-    target_transform.name = "CHardAttachment"
+    parent_arm_name = _get_entry_attr(constraint, 'parent_name', '')
+    child_name = _get_entry_attr(constraint, 'child_name', '')
+    relativeTransform = _get_entry_attr(constraint, 'relativeTransform', None)
+    attachment_flags = _constraint_attachment_flags(constraint)
 
     target_name = f"{child_name}_lod0"
     target_mesh_obj = meshdict.get(target_name) or meshdict.get(child_name)
     if parent_arm_name in objdict and target_mesh_obj is not None:
-        target_mesh_obj.parent = target_transform
-
         parent_arm = objdict[parent_arm_name]
-        p_bone = parent_arm.pose.bones.get(p_bone_name) if p_bone_name else None
-        if p_bone is not None:
-            target_transform.parent = parent_arm
-            target_transform.parent_type = "BONE"
-            target_transform.parent_bone = p_bone_name
-
-            use_rot90 = get_do_fix_tail(bpy.context)
-            rig_settings = getattr(parent_arm.data, "witcherui_RigSettings", None)
-            if rig_settings is not None:
-                if hasattr(rig_settings, "rot90_compensate"):
-                    use_rot90 = bool(rig_settings.rot90_compensate)
-                elif hasattr(rig_settings, "rot90_imported"):
-                    use_rot90 = bool(rig_settings.rot90_imported)
-            if rt is None and use_rot90:
-                target_transform.rotation_euler[2] += radians(90)
-
-    # Apply relativeTransform if present
-    if rt is not None:
-        set_blender_object_transform(target_transform, rt, rotate_180=False)
+        p_bone_name = _resolve_hard_attachment_parent_slot_name(constraint, parent_arm)
+        p_bone = parent_arm.pose.bones.get(p_bone_name) if p_bone_name and getattr(parent_arm, "pose", None) else None
+        if p_bone_name and p_bone is None:
+            log.warning(
+                "CHardAttachment '%s' references missing slot bone '%s' on '%s'; binding to parent object.",
+                child_name,
+                p_bone_name,
+                parent_arm_name,
+            )
+            p_bone_name = ""
+        _link_hard_attachment_anchor(
+            parent_arm,
+            target_mesh_obj,
+            p_bone_name,
+            relativeTransform,
+            attachment_flags,
+        )
+    else:
+        log.error("Failed to create CHardAttachment %s -> %s", child_name, parent_arm_name)
 
 def join_as_shape_keys(source_meshes, target_meshes, morphComponentId):
     for source, target in zip(source_meshes, target_meshes):
@@ -5253,6 +5419,12 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     return GetChunkNS(chunk['constraint'], chunks, i)
                 return f"{chunk['type']}{i}{chunk_index}"
         return None
+
+    def get_chunk_for_index(chunk_index, chunks):
+        for chunk in chunks:
+            if chunk['chunkIndex'] == chunk_index:
+                return chunk
+        return None
     
     def add_chunk_metadata(obj, chunk, path=None, component_name=None):
         """Add metadata as custom properties to the Blender object"""
@@ -5271,6 +5443,12 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 obj['witcher_source_entity_path'] = source_entity_path
             if source_game:
                 obj['witcher_source_game'] = source_game
+            component_transform = _coerce_engine_transform(chunk.get("transform"))
+            if component_transform is not None:
+                obj["witcher_component_transform"] = json.dumps(
+                    normalize_engine_transform(component_transform),
+                    separators=(",", ":"),
+                )
             if chunk.get('type') == "CAnimDangleConstraint_Dyng":
                 dyng_prop_map = {
                     'dampening': 'witcher_dyng_dampening',
@@ -6184,6 +6362,9 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             if parent_ns and child_ns:
                 chunk['parent_name'] = f"{ent_namespace}{parent_ns}"
                 chunk['child_name'] = f"{ent_namespace}{child_ns}"
+                slot_chunk = get_chunk_for_index(chunk.get('parentSlot'), cur_chunks)
+                if slot_chunk is not None and slot_chunk.get('type') == "CSkeletonBoneSlot":
+                    chunk['parentSlotBoneIndex'] = slot_chunk.get('boneIndex')
                 HardAttachments.append(chunk)
 
     return constrains, objdict, meshdict, HardAttachments, root_skeleton, morphs_todo
@@ -6255,58 +6436,104 @@ def _import_light_component(chunk):
     return light_obj
 
 
-def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_180=False, rotate_90=False, rotate_90_dir=1):
+def _set_constraint_space(constraint, *, owner_space=None, target_space=None):
+    if owner_space:
+        try:
+            constraint.owner_space = owner_space
+        except Exception:
+            pass
+    if target_space:
+        try:
+            constraint.target_space = target_space
+        except Exception:
+            pass
+
+
+def _set_constraint_mix_mode(constraint, *modes):
+    for mode in modes:
+        try:
+            constraint.mix_mode = mode
+            return mode
+        except Exception:
+            continue
+    return ""
+
+
+def _set_constraint_head_tail(constraint, value=0.0):
+    try:
+        constraint.head_tail = float(value)
+    except Exception:
+        pass
+
+
+def _configure_slot_copy_transforms_constraint(empty_obj, armature_obj, bone_name, has_bone, constraint_name):
+    constraint = empty_obj.constraints.new(type='COPY_TRANSFORMS')
+    constraint.name = constraint_name
+    constraint.target = armature_obj
+    constraint.subtarget = bone_name if has_bone else ''
+    _set_constraint_head_tail(constraint, 0.0)
+    if has_bone:
+        _set_constraint_space(constraint, owner_space='LOCAL', target_space='POSE')
+    else:
+        _set_constraint_space(constraint, owner_space='LOCAL', target_space='LOCAL')
+    _set_constraint_mix_mode(constraint, 'BEFORE', 'BEFORE_FULL')
+    return [constraint]
+
+
+def set_empty_bone_offset(
+        empty_obj,
+        armature_obj,
+        bone_name,
+        transform,
+        rotate_180=False,
+        rotate_90=False,
+        rotate_90_dir=1,
+        attachment_flags=0,
+        constraint_name="W2_SLOT"):
+    """Apply an EngineTransform offset and constrain an empty to a bone or armature.
+
+    Rot90 compensation preserves world placement in the rotated bone basis.
     """
-    Sets the relative position of an empty object based on the EngineTransform,
-    offsetting it from the target bone if boneName is provided.
-    If transform is None, the empty is constrained to the bone or component with no offset.
-    If bone_name is None, the empty is constrained to the armature object.
-    
-    Updated to use COPY_TRANSFORMS for consistency with equipment mounting system.
-    Rot90 compensation must preserve the slot's world placement when the bone
-    basis is rotated for Blender display.
-    """
-    # Check if bone exists
+    flags = coerce_attachment_flags(attachment_flags)
+    if flags:
+        _warn_unsupported_attachment_flags(
+            flags,
+            getattr(armature_obj, "name", "parent"),
+            getattr(empty_obj, "name", "attachment"),
+            empty_obj,
+        )
+
     has_bone = bone_name and bone_name in armature_obj.pose.bones
 
     # Remove existing slot constraints to avoid duplicates
     for c in list(empty_obj.constraints):
-        if c.type in {'COPY_TRANSFORMS', 'CHILD_OF'}:
+        if c.type in {'COPY_TRANSFORMS', 'CHILD_OF', 'COPY_LOCATION', 'COPY_ROTATION', 'COPY_SCALE'}:
             empty_obj.constraints.remove(c)
 
-    # Use COPY_TRANSFORMS for consistency with equipment mounting
-    constraint = empty_obj.constraints.new(type='COPY_TRANSFORMS')
-    constraint.name = "W2_SLOT"
-    constraint.target = armature_obj
-    constraint.subtarget = bone_name if has_bone else ''
-    # Keep one consistent slot binding mode regardless of Rot90 state so
-    # toggling Rot90 only changes local orientation compensation, not placement.
-    constraint.owner_space = 'LOCAL'
-    constraint.target_space = 'POSE'
-    constraint.mix_mode = 'BEFORE'
+    _configure_slot_copy_transforms_constraint(empty_obj, armature_obj, bone_name, has_bone, constraint_name)
+
+    try:
+        empty_obj["witcher_attachment_flags"] = flags
+    except Exception:
+        pass
     
-    # Now set the empty's local transform for offset
     if transform is not None:
-        # Create rotation matrix based on yaw, pitch, roll from transform
         x = radians(_coerce_real(transform.get('Yaw', 0.0), 0.0))
         y = radians(_coerce_real(transform.get('Pitch', 0.0), 0.0))
         z = radians(_coerce_real(transform.get('Roll', 0.0), 0.0))
         rotation_matrix = Euler((x, y, z), 'YXZ').to_matrix().to_4x4()
 
-        # Adjust for 180-degree rotation if specified
         if rotate_180:
             rotation_matrix[0][0], rotation_matrix[0][1], rotation_matrix[0][2] = -rotation_matrix[0][0], -rotation_matrix[0][1], rotation_matrix[0][2]
             rotation_matrix[1][0], rotation_matrix[1][1], rotation_matrix[1][2] = -rotation_matrix[1][0], -rotation_matrix[1][1], rotation_matrix[1][2]
             rotation_matrix[2][0], rotation_matrix[2][1], rotation_matrix[2][2] = -rotation_matrix[2][0], -rotation_matrix[2][1], rotation_matrix[2][2]
 
-        # Apply position based on transform data
         location = Matrix.Translation((
             _coerce_real(transform.get('X', 0.0), 0.0),
             _coerce_real(transform.get('Y', 0.0), 0.0),
             _coerce_real(transform.get('Z', 0.0), 0.0),
         ))
 
-        # Apply scale based on transform data
         scale_x = _coerce_real(transform.get('Scale_x', 1.0), 1.0)
         scale_y = _coerce_real(transform.get('Scale_y', 1.0), 1.0)
         scale_z = _coerce_real(transform.get('Scale_z', 1.0), 1.0)
@@ -6314,7 +6541,6 @@ def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_
                        Matrix.Scale(scale_y, 4, (0, 1, 0)) @ \
                        Matrix.Scale(scale_z, 4, (0, 0, 1))
 
-        # Combine and set as local transform
         transform_matrix = location @ rotation_matrix @ scale_matrix
 
         # Convert the authored slot transform into the rotated bone basis.
@@ -6326,7 +6552,6 @@ def set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform, rotate_
 
         empty_obj.matrix_local = transform_matrix
     else:
-        # No offset - place at origin (constraint will position it)
         if rotate_90:
             empty_obj.matrix_local = Matrix.Rotation(radians(90 * rotate_90_dir), 4, 'Z')
         else:
@@ -6499,7 +6724,7 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
             rot90_dir = 1
             if root_skeleton and root_skeleton.type == 'ARMATURE':
                 rig_settings = root_skeleton.data.witcherui_RigSettings
-                use_rot90 = getattr(rig_settings, "rot90_compensate", False)
+                use_rot90 = get_rig_rot90_enabled(rig_settings, default=False)
                 rot90_dir = 1
             set_empty_bone_offset(empty_obj, armature_obj, bone_name, transform,
                                   rotate_90=use_rot90, rotate_90_dir=rot90_dir)
