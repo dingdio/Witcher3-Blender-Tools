@@ -1,4 +1,4 @@
-"""Shared material-chain display helpers."""
+"""Shared material-chain layout and classification helpers."""
 
 CHAIN_NODE_COLORS = [
     (0.62, 0.42, 0.16),
@@ -41,6 +41,31 @@ def coerce_source_index(value) -> int:
         return int(value)
     except Exception:
         return -1
+
+
+def mark_imported_params_as_local(params, imported_param_names, *, material_local) -> int:
+    """Mark embedded material params as exportable ``Local`` overrides.
+
+    Parameters read from an external material instance belong to that instance's
+    material-chain frame.  A user can still explicitly promote those nodes later.
+    """
+    if not bool(material_local):
+        return 0
+
+    imported_param_names = set(imported_param_names)
+    marked_count = 0
+    for param in params:
+        if param.get("name") not in imported_param_names:
+            continue
+        param.set("witcher_include", "true")
+        marked_count += 1
+    return marked_count
+
+
+def material_local_mode_matches(material, requested_local) -> bool:
+    """Return whether a cached material has the requested embed mode."""
+    props = getattr(material, "witcher_props", None)
+    return bool(getattr(props, "local", True)) == bool(requested_local)
 
 
 def chain_color_for_index(source_index: int):

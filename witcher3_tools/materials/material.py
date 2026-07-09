@@ -19,7 +19,12 @@ from xml.etree import ElementTree
 Element = ElementTree.Element
 
 from .constants import *
-from .chain import chain_color_for_index, coerce_source_index
+from .chain import (
+    chain_color_for_index,
+    coerce_source_index,
+    mark_imported_params_as_local,
+    material_local_mode_matches,
+)
 from .vector_param import (
     VECTOR_PARAM_KIND,
     VECTOR_SOURCE_XYZ,
@@ -210,7 +215,7 @@ def ensure_node_group(ng_name, resource_path=RES_PATH):
     return ng
 
 
-MATERIAL_SETUP_VERSION = 4
+MATERIAL_SETUP_VERSION = 5
 _BASE_PATH_NODE_GROUP_CACHE: Dict[Tuple[object, ...], Dict[str, str]] = {}
 _RESOURCE_NODE_GROUP_CACHE: Dict[str, Tuple[Optional[float], Set[str]]] = {}
 
@@ -1296,7 +1301,16 @@ def setup_w3_material(
     # Checking if this material was already imported by comparing some custom properties
     # that we create on imported materials.
     duplicate_started = time.perf_counter()
-    existing_mat = find_material(mat_base, params, expected_ng_name=expected_ng_name)
+    material_props = getattr(material, "witcher_props", None)
+    material_local = bool(getattr(material_props, "local", True))
+    material_source_path = normalize_depot_path(xml_data.get("source_path", ""))
+    existing_mat = find_material(
+        mat_base,
+        params,
+        expected_ng_name=expected_ng_name,
+        material_local=material_local,
+        material_source_path=material_source_path,
+    )
     if existing_mat:
         if overwrite_existing_enabled():
             repair_broken_dds_images_in_material(existing_mat, allow_dds_repair=True)
@@ -1320,6 +1334,7 @@ def setup_w3_material(
     # (See just above)
     material['witcher3_mat_base'] = mat_base
     material['witcher3_mat_params'] = params
+    material['witcher3_mat_source_path'] = material_source_path
     material['witcher3_material_setup_version'] = MATERIAL_SETUP_VERSION
 
     #TODO Create the material instance NodeGroup
@@ -1405,7 +1420,7 @@ def setup_w3_material(
         #     xml_data = new_xml
 
         node_started = time.perf_counter()
-        from .nodes import suspend_witcher_include_updates, refresh_witcher_include_state
+        from .nodes.domain import suspend_witcher_include_updates, refresh_witcher_include_state
         #log.warning(ElementTree.tostring(xml_data, encoding='utf8', method='xml'))
         #all_children2 = list(xml_data.iter())
         # Bulk node setup: each witcher_include write would otherwise trigger a
@@ -1422,10 +1437,11 @@ def setup_w3_material(
             # Purely for neatness of the node noodles.
             ordered_params = order_elements_by_attribute(xml_data, PARAM_ORDER, 'name')
 
-            for name, attrs in params.items():
-                for param1 in ordered_params:
-                    if param1.attrib['name'] == name:
-                        param1.set("witcher_include", True)
+            mark_imported_params_as_local(
+                ordered_params,
+                params,
+                material_local=material_local,
+            )
 
             #links nodes to created output
             #! Missing params will be created by this function
@@ -1461,7 +1477,14 @@ def setup_w3_material(
         )
     return material
 
-def find_material(mat_base, params, expected_ng_name: str = ""):
+def find_material(
+        mat_base,
+        params,
+        expected_ng_name: str = "",
+        *,
+        material_local=None,
+        material_source_path=None,
+        ):
     """Find a material based on the Witcher 3 shader type and shader parameters,
     which we store in custom properties on import.
     This is useful for checking whether a material was already imported.
@@ -1473,6 +1496,12 @@ def find_material(mat_base, params, expected_ng_name: str = ""):
             mat_base == m['witcher3_mat_base'] and \
             params == m['witcher3_mat_params'].to_dict()
         ):
+            if material_local is not None and not material_local_mode_matches(m, material_local):
+                continue
+            if material_source_path is not None:
+                cached_source_path = normalize_depot_path(m.get('witcher3_mat_source_path', ''))
+                if cached_source_path != normalize_depot_path(material_source_path):
+                    continue
             if expected_ng_name:
                 active_group = get_active_witcher_group_node(m)
                 active_tree = getattr(active_group, "node_tree", None) if active_group else None

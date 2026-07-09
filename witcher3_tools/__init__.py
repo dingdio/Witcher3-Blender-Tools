@@ -480,7 +480,6 @@ from .ui.ui_material import WITCH_OT_w2mg, WITCH_OT_w2mi, WITCH_OT_xbm, WITCH_OT
 from .ui.ui_anims import WITCH_OT_ImportW2Rig, WITCH_OT_ExportW2AnimJson, WITCH_OT_ExportW2RigJson
 
 from .materials import nodes as material_nodes
-from .materials import nodes_custom as material_nodes_custom
 from . import w3_asset_browser
 from . import unreal_export
 
@@ -4599,7 +4598,6 @@ def register():
     ui_re_anims.register()
     ui_anims_list.register()
     material_nodes.register()
-    material_nodes_custom.register()
     w3_asset_browser.register()
     unreal_export.register()
     
@@ -4652,7 +4650,6 @@ def unregister():
 
     unreal_export.unregister()
     w3_asset_browser.unregister()
-    material_nodes_custom.unregister()
     unregister_class(WITCH_PT_Quick)
     ui_cache_export.unregister()
     bpy.utils.unregister_class(WITCHER_OT_refresh_cache)

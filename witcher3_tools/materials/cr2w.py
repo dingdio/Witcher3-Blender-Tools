@@ -62,7 +62,7 @@ def setup_w3_material_CR2W(
     if not build_nodes:
         return bl_material
 
-    from .nodes import (
+    from .nodes.domain import (
         auto_load_base_material_snapshot,
         refresh_witcher_include_state,
         suspend_witcher_include_updates,

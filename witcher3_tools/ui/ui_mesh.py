@@ -3063,7 +3063,7 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         return material_preview
 
     def _build_material_preview(self, preview_meshes, repo_path):
-        from ..materials.nodes import get_group_inputs, get_socket_value
+        from ..materials.nodes.domain import get_group_inputs, get_socket_value
         from ..exporters.export_mesh import scan_principled_bsdf
 
         mesh_repo_dir = os.path.dirname(repo_path.replace('/', '\\')) if repo_path else ""
@@ -3454,7 +3454,7 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
             for mat_slot in mesh_ob.material_slots:
                 mat = mat_slot.material
                 if mat and hasattr(mat, 'witcher_props') and mat.witcher_props.local:
-                    from ..materials.nodes import get_group_inputs, get_socket_value, is_path_resolved
+                    from ..materials.nodes.domain import get_group_inputs, get_socket_value, is_path_resolved
                     group_inputs = get_group_inputs(mat)
                     if group_inputs:
                         for input_socket in group_inputs:

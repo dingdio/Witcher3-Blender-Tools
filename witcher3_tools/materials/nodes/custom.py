@@ -3,7 +3,7 @@ from bpy.types import ShaderNodeCustomGroup, ShaderNodeGroup
 import nodeitems_utils
 from nodeitems_utils import NodeCategory, NodeItem
 
-from .constants import RES_PATH
+from ..constants import RES_PATH
 
 def AppendRENodeTree(reShaderName) -> bpy.types.ShaderNodeTree:
     if reShaderName not in bpy.data.node_groups:
