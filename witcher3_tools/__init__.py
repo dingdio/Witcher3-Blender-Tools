@@ -2321,10 +2321,10 @@ class WITCH_OT_ToggleClothSimulation(bpy.types.Operator):
         return "Show all APX ClothSimulation modifiers in the scene" if props.show else "Hide all APX ClothSimulation modifiers in the scene"
 
     def execute(self, context):
-        from .cloth_util import _find_clothsimulation_modifier
+        from .cloth.geometry_nodes import find_clothsimulation_modifier
         count = 0
         for obj in context.scene.objects:
-            mod = _find_clothsimulation_modifier(obj)
+            mod = find_clothsimulation_modifier(obj)
             if mod:
                 mod.show_viewport = self.show
                 mod.show_render = self.show

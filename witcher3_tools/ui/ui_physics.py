@@ -5,6 +5,7 @@ from __future__ import annotations
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty, StringProperty
 
+from ..cloth.geometry_nodes import find_clothsimulation_modifier
 from ..physics import breast_blender
 from ..physics import dyng_blender
 from ..physics.dyng import (
@@ -174,23 +175,9 @@ def _panel_breast_objects(context):
     return _unique_sorted_objects(objects)
 
 
-def _clothsimulation_modifier(obj):
-    if obj is None or getattr(obj, "type", None) != "MESH":
-        return None
-    for mod in getattr(obj, "modifiers", []) or []:
-        if getattr(mod, "type", "") != "NODES":
-            continue
-        if getattr(mod, "name", "") == "ClothSimulation":
-            return mod
-        node_group = getattr(mod, "node_group", None)
-        if node_group is not None and str(getattr(node_group, "name", "")).startswith("ClothSimulation"):
-            return mod
-    return None
-
-
 def _panel_cloth_objects(context):
     scene_objects = getattr(getattr(context, "scene", None), "objects", []) or []
-    return _unique_sorted_objects(obj for obj in scene_objects if _clothsimulation_modifier(obj) is not None)
+    return _unique_sorted_objects(obj for obj in scene_objects if find_clothsimulation_modifier(obj) is not None)
 
 
 _KIND_INDEX_ATTRS = {
@@ -204,7 +191,7 @@ _KIND_OBJECTS = {"DYNG": _panel_dyng_objects, "BREAST": _panel_breast_objects, "
 _KIND_PREDICATES = {
     "DYNG": dyng_blender.is_dyng_armature,
     "BREAST": breast_blender.is_breast_armature,
-    "CLOTH": lambda obj: _clothsimulation_modifier(obj) is not None,
+    "CLOTH": lambda obj: find_clothsimulation_modifier(obj) is not None,
 }
 
 
@@ -1217,7 +1204,7 @@ class WITCH_OT_ClothSelect(bpy.types.Operator):
 
     def execute(self, context):
         obj = bpy.data.objects.get(self.object_name)
-        if obj is None or _clothsimulation_modifier(obj) is None:
+        if obj is None or find_clothsimulation_modifier(obj) is None:
             self.report({"WARNING"}, "Cloth item not found.")
             return {"CANCELLED"}
         _select_object(context, obj)
@@ -1235,7 +1222,7 @@ class WITCH_OT_ClothToggleSimulationObject(bpy.types.Operator):
 
     def execute(self, context):
         obj = bpy.data.objects.get(self.object_name)
-        mod = _clothsimulation_modifier(obj)
+        mod = find_clothsimulation_modifier(obj)
         if mod is None:
             self.report({"WARNING"}, "ClothSimulation modifier not found.")
             return {"CANCELLED"}
@@ -1260,7 +1247,7 @@ class WITCH_OT_ClothToggleScope(bpy.types.Operator):
             return {"CANCELLED"}
         count = 0
         for obj in objects:
-            mod = _clothsimulation_modifier(obj)
+            mod = find_clothsimulation_modifier(obj)
             if mod is None:
                 continue
             mod.show_viewport = bool(self.show)
@@ -1449,7 +1436,7 @@ class _PhysicsTargetListBase(bpy.types.UIList):
             toggle_op.object_name = item.name
             toggle_op.enable = not enabled
         else:
-            mod = _clothsimulation_modifier(item)
+            mod = find_clothsimulation_modifier(item)
             enabled = bool(getattr(mod, "show_viewport", False)) if mod is not None else False
             data_icon = "MOD_CLOTH"
             toggle_slot = row.row(align=True)

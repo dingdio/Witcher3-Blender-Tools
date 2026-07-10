@@ -31,7 +31,8 @@ from .. import (
 from ..external_addon_tools import get_apx_addon_status, resolve_redcloth_apx
 #from io_import_w2l import settings
 from .. import fbx_util
-from .. import cloth_util
+from ..cloth.importer import import_cloth
+from ..cloth.materials import apply_redcloth_materials_to_meshes
 from ..rigging import armature_merge
 from ..rigging import constraints as constrain_util
 from ..CR2W import read_json_w3
@@ -641,7 +642,7 @@ def _refresh_reused_redcloth_materials(cloth_armature, redcloth_resource: str, r
     if not requested_mat or requested_mat == cached_mat:
         return 0.0
     cloth_meshes = _collect_redcloth_meshes(cloth_armature)
-    refresh_stats = cloth_util.apply_redcloth_materials_to_meshes(
+    refresh_stats = apply_redcloth_materials_to_meshes(
         cloth_meshes,
         redcloth_resource,
         redcloth_mat_path,
@@ -784,15 +785,13 @@ def import_or_reuse_redcloth(
                         _activate_target_collection(bpy.context, target_collection)
                         activate_seconds = time.perf_counter() - activate_started
                     import_started = time.perf_counter()
-                    cloth_arma = cloth_util.importCloth(
+                    cloth_arma = import_cloth(
                         False,
                         apx_path,
                         True,
                         False,
                         True,
                         redcloth_mat_path,
-                        str(import_name or "CClothComponent"),
-                        str(entity_name or Path(redcloth_resource.replace("/", "\\")).stem),
                     )
                     import_seconds = time.perf_counter() - import_started
                     imported = cloth_arma is not None

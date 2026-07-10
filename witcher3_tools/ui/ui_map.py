@@ -252,7 +252,7 @@ def _map_import_profile_logger_names():
         f"{root_name}.importers.import_blender_fun",
         f"{root_name}.importers.import_entity",
         f"{root_name}.importers.import_mesh",
-        f"{root_name}.cloth_util",
+        f"{root_name}.cloth",
         f"{root_name}.fbx_util",
         f"{root_name}.materials",
     )

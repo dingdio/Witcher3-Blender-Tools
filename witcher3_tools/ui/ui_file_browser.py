@@ -8999,7 +8999,7 @@ class FileActionOperatorImportToScene(Operator):
                     shape_items = get_collision_shape_items_for_file(abs_file_path)
                     import_nxs.create_from_nxs(abs_file_path, shape_items=shape_items or None)
                 elif ext == ".apb":
-                    from ..cloth_util import importCloth
+                    from ..cloth.importer import import_cloth
 
                     conv = ensure_apx_from_apb(context, abs_file_path, overwrite=False)
                     apx_path = conv.get("apx_path") or (os.path.splitext(abs_file_path)[0] + ".apx")
@@ -9031,7 +9031,7 @@ class FileActionOperatorImportToScene(Operator):
                         )
                         return {'CANCELLED'}
 
-                    cloth_obj = importCloth(
+                    cloth_obj = import_cloth(
                         context,
                         apx_path,
                         True,
@@ -9056,7 +9056,7 @@ class FileActionOperatorImportToScene(Operator):
                 else:
                     log.warning("Unknown collision format %s: %s", ext, abs_file_path)
             elif ext in {".redcloth", ".redapex"}:
-                from ..cloth_util import importCloth
+                from ..cloth.importer import import_cloth
                 from .ui_mesh import import_redapex_resource
 
                 apx_path = _ensure_redcloth_apx_for_asset_import(
@@ -9100,7 +9100,7 @@ class FileActionOperatorImportToScene(Operator):
                         collections_as_empties=True,
                     )
                 else:
-                    imported_obj = importCloth(
+                    imported_obj = import_cloth(
                         context,
                         apx_path,
                         True,

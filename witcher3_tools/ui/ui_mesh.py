@@ -87,7 +87,9 @@ from bpy_extras.io_utils import (
         ImportHelper,
         ExportHelper
         )
-from ..cloth_util import importCloth, apply_redcloth_materials_to_meshes, _sanitize_apx_for_import
+from ..cloth.apx import sanitize_apx_for_import
+from ..cloth.importer import import_cloth
+from ..cloth.materials import apply_redcloth_materials_to_meshes
 
 from .. import file_helpers
 from ..importers import import_mesh, import_rig
@@ -548,7 +550,7 @@ def import_redapex_resource(
             log.warning("Fast redapex base import failed for %s; falling back to io_mesh_apx: %s", redapex_path, exc)
 
     sanitize_started = time.perf_counter()
-    apx_filepath = _sanitize_apx_for_import(apx_filepath)
+    apx_filepath = sanitize_apx_for_import(apx_filepath)
     sanitize_seconds = time.perf_counter() - sanitize_started
 
     _exist, enabled = addon_utils.check("io_mesh_apx")
@@ -738,7 +740,7 @@ class WITCH_OT_apx(bpy.types.Operator, ImportHelper):
                 "Extract collision .apb and convert to .apx (io_mesh_apx + apex_sdk_cli)."
             )
             return {'CANCELLED'}
-        imported_obj = importCloth(context, apx_filepath, self.use_mat, self.rotate_180, self.rm_ph_me, filepath)
+        imported_obj = import_cloth(context, apx_filepath, self.use_mat, self.rotate_180, self.rm_ph_me, filepath)
         if imported_obj is None:
             self.report({'ERROR'}, "Redcloth import failed. Enable io_mesh_apx and check its APX runtime settings.")
             return {'CANCELLED'}
