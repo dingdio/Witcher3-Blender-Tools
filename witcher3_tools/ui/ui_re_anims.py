@@ -12,7 +12,7 @@ import site
 import sys
 import bpy
 import logging
-from ..action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
+from ..animation.action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
 from bpy.props import BoolProperty, StringProperty, FloatProperty
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 

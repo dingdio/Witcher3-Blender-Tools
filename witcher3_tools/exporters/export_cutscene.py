@@ -7,7 +7,7 @@ import bpy
 from typing import Dict, List
 
 from ..CR2W import anims_builder, cr2w_writer
-from ..action_compat import resolve_action_slot
+from ..animation.action_compat import resolve_action_slot
 from ..external_addon_tools import get_re_addon_status
 from . import export_anims
 

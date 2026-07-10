@@ -1,3 +1,5 @@
+"""Blender-version compatibility helpers for animation actions."""
+
 import logging
 
 import bpy

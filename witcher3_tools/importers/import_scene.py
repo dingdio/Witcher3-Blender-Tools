@@ -6,7 +6,7 @@ import importlib
 from collections import deque
 from pathlib import Path
 from .. import dialog_language, get_rig_rot90_enabled
-from .. import pose_key_tools
+from ..animation import pose_keys as pose_key_tools
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.CR2W_types import EngineTransform
@@ -30,14 +30,14 @@ from ..repo_paths import (
     source_root_candidates_from_file,
     version_for_source_game,
 )
-from ..action_compat import assign_action, bind_strip_action_slot, get_action_channelbag, iter_action_fcurves, new_action_fcurve, resolve_action_slot
+from ..animation.action_compat import assign_action, bind_strip_action_slot, get_action_channelbag, iter_action_fcurves, new_action_fcurve, resolve_action_slot
 from .import_cutscene import (
     CUTSCENE_DIALOG_SOURCE_GAME_PROP,
     check_if_actor_already_in_scene,
     _ensure_cutscene_actor_appearance,
     _ensure_cutscene_face_setup,
 )
-from ..camera_tracks import (
+from ..animation.camera_tracks import (
     CAMERA_CONTROL_BONE,
     CAMERA_EDIT_BONE,
     CAMERA_TRACK_DEFAULTS,

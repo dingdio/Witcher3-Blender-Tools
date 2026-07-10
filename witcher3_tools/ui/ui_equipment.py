@@ -33,11 +33,11 @@ from ..importers.import_anims import load_idle_animation_for_armature as _load_i
 from ..CR2W.dc_entity import LoadCEntityTemplateFile  # Import the function as per your setup
 from ..extension_paths import get_cache_root
 from .. import (
-    armature_merge,
     get_all_addon_prefs,
     get_uncook_path,
     get_do_import_redcloth,
 )
+from ..rigging import armature_merge
 from pathlib import Path
 from .. import get_rig_rot90_enabled
 from .armature_context import (
@@ -4459,7 +4459,7 @@ def _constrain_bound_armature_to_target(bound_armature, target_armature):
             bound_armature.select_set(True)
             bpy.context.view_layer.objects.active = target_armature
 
-            from .. import constrain_util
+            from ..rigging import constraints as constrain_util
             constrain_util.CreateConstraints2(target_armature, bound_armature)
             _set_child_of_inverse_for_armature(bound_armature)
             try:

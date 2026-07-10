@@ -19,9 +19,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 import witcher3_tools as addon
-from witcher3_tools import constrain_util
+from witcher3_tools.rigging import constraints as constrain_util
 from witcher3_tools.CR2W.dc_entity import LoadCEntityTemplateFile
-from witcher3_tools.attachment_math import (
+from witcher3_tools.rigging.attachment import (
     HAF_FREE_POSITION_AXIS_X,
     HAF_FREE_ROTATION,
     coerce_attachment_flags,

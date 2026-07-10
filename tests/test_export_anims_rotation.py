@@ -70,6 +70,14 @@ class ExportAnimRotationTests(unittest.TestCase):
         pkg.get_rig_rot90_enabled = lambda *_args, **_kwargs: False
         put("witcher3_tools", pkg)
 
+        animation = types.ModuleType("witcher3_tools.animation")
+        animation.__path__ = [str(REPO_ROOT / "witcher3_tools" / "animation")]
+        put("witcher3_tools.animation", animation)
+
+        rigging = types.ModuleType("witcher3_tools.rigging")
+        rigging.__path__ = [str(REPO_ROOT / "witcher3_tools" / "rigging")]
+        put("witcher3_tools.rigging", rigging)
+
         bpy = types.ModuleType("bpy")
         bpy.types = types.SimpleNamespace(Keyframe=object, FCurve=object)
         put("bpy", bpy)
@@ -81,17 +89,17 @@ class ExportAnimRotationTests(unittest.TestCase):
         mathutils.Matrix = types.SimpleNamespace(Rotation=lambda *_args, **_kwargs: None)
         put("mathutils", mathutils)
 
-        action_compat = types.ModuleType("witcher3_tools.action_compat")
+        action_compat = types.ModuleType("witcher3_tools.animation.action_compat")
         action_compat.iter_action_fcurves = lambda *_args, **_kwargs: []
-        put("witcher3_tools.action_compat", action_compat)
+        put("witcher3_tools.animation.action_compat", action_compat)
 
-        constants = types.ModuleType("witcher3_tools.w3_armature_constants")
+        constants = types.ModuleType("witcher3_tools.rigging.constants")
         constants.human_bone_order = []
-        put("witcher3_tools.w3_armature_constants", constants)
+        put("witcher3_tools.rigging.constants", constants)
 
-        camera_tracks = types.ModuleType("witcher3_tools.camera_tracks")
+        camera_tracks = types.ModuleType("witcher3_tools.animation.camera_tracks")
         camera_tracks.CAMERA_TRACK_NAMES = []
-        put("witcher3_tools.camera_tracks", camera_tracks)
+        put("witcher3_tools.animation.camera_tracks", camera_tracks)
 
         cr2w = types.ModuleType("witcher3_tools.CR2W")
         cr2w.__path__ = []
@@ -106,9 +114,9 @@ class ExportAnimRotationTests(unittest.TestCase):
         motion_tools.cline_from_per_frame = lambda *_args, **_kwargs: None
         put("witcher3_tools.importers.motion_tools", motion_tools)
 
-        ik_rig = types.ModuleType("witcher3_tools.ik_rig")
+        ik_rig = types.ModuleType("witcher3_tools.rigging.ik")
         ik_rig.has_unbaked_ik_controls = lambda *_args, **_kwargs: False
-        put("witcher3_tools.ik_rig", ik_rig)
+        put("witcher3_tools.rigging.ik", ik_rig)
 
         ui = types.ModuleType("witcher3_tools.ui")
         ui.__path__ = []

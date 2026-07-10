@@ -9,7 +9,7 @@ from pathlib import Path
 
 import bpy
 
-from ..action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
+from ..animation.action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
 from ..ui import facs_helper
 
 

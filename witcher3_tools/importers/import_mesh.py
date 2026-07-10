@@ -23,7 +23,6 @@ from .. import file_helpers
 from ..CR2W import w3_types
 from ..CR2W import read_json_w3
 from ..CR2W import CR2W_reader
-from ..w3_armature_constants import *
 from ..importers import data_types
 from ..CR2W import dc_mesh
 from ..CR2W.dc_mesh import MeshData

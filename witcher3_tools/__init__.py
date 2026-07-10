@@ -419,7 +419,7 @@ from .importers import (
 from .exporters import (
                                     export_anims
                                     )
-from . import constrain_util
+from .rigging import constraints as constrain_util
 from . import file_helpers
 
 

@@ -93,8 +93,6 @@ from .. import file_helpers
 from ..importers import import_mesh, import_rig
 from ..mesh_import_settings import MeshImportSettings
 from .. import (
-    armature_merge,
-    constrain_util,
     get_W3_REDCLOTH_PATH,
     get_uncook_path,
     get_mod_directory,
@@ -102,6 +100,8 @@ from .. import (
     get_rig_rot90_enabled,
     set_rig_rot90_enabled,
 )
+from ..rigging import armature_merge
+from ..rigging import constraints as constrain_util
 from ..exporters.export_mesh import do_export_mesh
 
 import addon_utils

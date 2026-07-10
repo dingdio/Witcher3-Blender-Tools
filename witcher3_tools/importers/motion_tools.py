@@ -6,7 +6,7 @@ import json
 import math
 from ..CR2W import w3_types
 from ..CR2W.om import MQuaternion
-from ..action_compat import assign_action, iter_action_fcurves, new_action_fcurve
+from ..animation.action_compat import assign_action, iter_action_fcurves, new_action_fcurve
 import bpy
 from bpy.app.handlers import persistent
 

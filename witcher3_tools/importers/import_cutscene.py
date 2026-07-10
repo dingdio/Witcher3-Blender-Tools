@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from ..CR2W import w3_types
 from ..CR2W.prop_utils import read_enum_prop
 from ..importers import import_entity
-from ..action_compat import iter_action_fcurves, remove_action_fcurve
+from ..animation.action_compat import iter_action_fcurves, remove_action_fcurve
 from ..CR2W.dc_anims import load_bin_cutscene
 from ..CR2W.common_blender import redkit_repo_context, win_path_isfile
 from ..repo_paths import (

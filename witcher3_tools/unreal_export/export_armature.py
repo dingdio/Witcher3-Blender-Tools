@@ -14,7 +14,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Optional
 
-from ..armature_merge import (
+from ..rigging.armature_merge import (
     _armature_bones_by_name,
     _copy_source_bone_to_edit_bones,
     _find_attachment_armature_for_missing_bones,

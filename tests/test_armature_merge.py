@@ -13,7 +13,7 @@ if "witcher3_tools" not in sys.modules:
     _pkg.__package__ = "witcher3_tools"
     sys.modules["witcher3_tools"] = _pkg
 
-from witcher3_tools import armature_merge
+from witcher3_tools.rigging import armature_merge
 from witcher3_tools.CR2W import w3_types
 
 

@@ -25,8 +25,8 @@ from ..repo_paths import (
 )
 from ..importers import import_anims, import_cutscene, import_entity, import_rig, import_scene_animation
 from ..exporters import export_anims, export_cutscene
-from .. import pose_key_tools
-from ..action_compat import (
+from ..animation import pose_keys as pose_key_tools
+from ..animation.action_compat import (
     assign_action,
     bind_strip_action_slot,
     iter_action_fcurves,
@@ -42,7 +42,7 @@ from ..ui.armature_context import (
     get_main_armature,
     set_main_armature,
 )
-from ..camera_tracks import (
+from ..animation.camera_tracks import (
     CAMERA_DOF_TRACK_NAMES,
     CAMERA_CONTROL_BONE,
     CAMERA_EDIT_BONE,

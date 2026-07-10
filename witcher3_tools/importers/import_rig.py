@@ -16,8 +16,8 @@ from ..CR2W.json_convert.CR2WJsonObject import CR2WJsonData, CR2WJsonScalar, get
 from .. import file_helpers
 from ..CR2W import w3_types
 from ..CR2W import read_json_w3
-from ..w3_armature_constants import *
-from ..camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties
+from ..animation.camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties
+from ..rigging.constants import BONE_CONNECT
 from ..ui.ui_morphs import witcherui_add_redmorph
 from .. import get_uncook_path, get_do_fix_tail, get_import_physics_enabled, set_rig_rot90_enabled
 import logging

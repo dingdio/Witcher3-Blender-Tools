@@ -49,7 +49,7 @@ from .ui_cr2w_fields import (
 )
 from . import ui_dialog_language
 from .ui_utils import WITCH_PT_Base
-from ..camera_tracks import (
+from ..animation.camera_tracks import (
     CAMERA_CONTROL_BONE,
 )
 

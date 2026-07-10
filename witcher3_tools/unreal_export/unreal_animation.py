@@ -558,7 +558,7 @@ def _set_pose_to_rest(target_armature):
 
 
 def _linearize_action(action, target_armature):
-    from ..action_compat import iter_action_fcurves
+    from ..animation.action_compat import iter_action_fcurves
 
     for fcurve in iter_action_fcurves(action, target=target_armature):
         for point in getattr(fcurve, "keyframe_points", []) or []:
@@ -625,7 +625,7 @@ def _set_scene_range_from_target(scene, target_armature, fallback_start: float, 
 
 
 def _apply_action_to_nla(target_armature, action, nla_mode: str, at_frame: float, length: float, track_name="anim_import"):
-    from ..action_compat import bind_strip_action_slot, resolve_action_slot
+    from ..animation.action_compat import bind_strip_action_slot, resolve_action_slot
 
     target_armature.animation_data_create()
     anim_data = target_armature.animation_data
@@ -712,7 +712,7 @@ def _mute_nla_tracks(anim_data):
 
 def _apply_basis_tracks_as_action(context, target_armature, basis_tracks_by_bone, payload, stats, nla_mode, at_frame):
     import bpy
-    from ..action_compat import assign_action, new_action_fcurve
+    from ..animation.action_compat import assign_action, new_action_fcurve
 
     name = str(payload.get("name") or "UnrealAnimation")
     action = bpy.data.actions.new(name)

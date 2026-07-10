@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from mathutils import Matrix, Quaternion, Vector
 
-from ..action_compat import (
+from ..animation.action_compat import (
     iter_action_fcurves,
     new_action_fcurve,
     resolve_action_slot,

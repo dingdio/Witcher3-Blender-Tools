@@ -4,7 +4,7 @@ import math
 
 from mathutils import Euler, Quaternion, Vector
 
-from ..action_compat import (
+from ..animation.action_compat import (
     bind_strip_action_slot,
     iter_action_fcurves,
     new_action_fcurve,

@@ -10,17 +10,17 @@ from typing import Dict, List, Optional, Set, Tuple
 import bpy
 import mathutils
 from mathutils import Vector, Quaternion, Euler, Matrix
-from ..action_compat import iter_action_fcurves
+from ..animation.action_compat import iter_action_fcurves
 
 log = logging.getLogger(__name__)
 
-from ..w3_armature_constants import human_bone_order
-from ..camera_tracks import CAMERA_TRACK_NAMES
+from ..animation.camera_tracks import CAMERA_TRACK_NAMES
+from ..rigging.constants import human_bone_order
 from ..CR2W import w3_types
 from ..CR2W import anims_builder, cr2w_writer
 from ..importers.motion_tools import cline_from_per_frame
 from .. import get_rig_rot90_enabled
-from .. import ik_rig
+from ..rigging import ik as ik_rig
 from ..ui.armature_context import get_main_armature
 
 

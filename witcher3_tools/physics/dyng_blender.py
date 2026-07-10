@@ -13,7 +13,7 @@ import bpy
 from bpy.app.handlers import persistent
 from mathutils import Matrix, Vector
 
-from ..action_compat import (
+from ..animation.action_compat import (
     assign_action,
     get_action_channelbag,
     iter_action_fcurves,

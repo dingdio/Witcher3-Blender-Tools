@@ -22,7 +22,7 @@ from .. import get_uncook_path
 from ..CR2W import w3_types
 from ..importers import import_cutscene
 from ..exporters import export_cutscene
-from ..camera_tracks import (
+from ..animation.camera_tracks import (
     CAMERA_TRACK_NAMES,
     ensure_camera_track_properties,
 )

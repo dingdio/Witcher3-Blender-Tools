@@ -1,4 +1,4 @@
-"""RED Engine attachment flag and transform helpers."""
+"""RED Engine rig attachment flag and transform helpers."""
 
 from __future__ import annotations
 

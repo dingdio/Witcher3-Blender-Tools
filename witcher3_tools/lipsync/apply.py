@@ -185,7 +185,7 @@ def apply_lipsyncanim_csv_to_armature(
     track_name="voice_import",
 ):
     import bpy
-    from ..action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
+    from ..animation.action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
 
     metadata, morph_values = read_lipsyncanim_csv(csv_path)
     pose_bone = armature.pose.bones.get("w3_face_poses") if armature and armature.pose else None

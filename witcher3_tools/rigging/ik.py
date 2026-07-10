@@ -8,9 +8,9 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import bpy
 from mathutils import Matrix, Vector
 
-from .action_compat import assign_action, iter_action_fcurves, remove_action_fcurve
-from .w3_armature_constants import human_bone_order
-from . import pose_key_tools
+from ..animation.action_compat import assign_action, iter_action_fcurves, remove_action_fcurve
+from ..animation import pose_keys as pose_key_tools
+from .constants import human_bone_order
 
 log = logging.getLogger(__name__)
 

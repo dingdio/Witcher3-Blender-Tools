@@ -7,7 +7,8 @@ from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatVectorProperty, IntProperty, StringProperty
 from bpy.types import PropertyGroup, UIList
 
-from .. import ik_rig, pose_key_tools
+from ..animation import pose_keys as pose_key_tools
+from ..rigging import ik as ik_rig
 from ..lipsync import redkit_project
 from .armature_context import get_main_armature
 

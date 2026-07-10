@@ -1,9 +1,11 @@
+"""Armature alignment, binding, and constraint helpers."""
+
 import logging
 import bpy
 import sys
 import os
-from . import file_helpers
-from . import get_rig_rot90_enabled
+from .. import file_helpers
+from .. import get_rig_rot90_enabled
 
 log = logging.getLogger(__name__)
 

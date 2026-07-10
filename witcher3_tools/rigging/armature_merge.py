@@ -73,12 +73,12 @@ def _rebuild_skeleton_compat_fields(skeleton_data):
 
 
 def _identity_w3_quat():
-    from .CR2W import w3_types
+    from ..CR2W import w3_types
     return w3_types.Quaternion(0.0, 0.0, 0.0, 1.0)
 
 
 def _copy_skeleton_bone(bone, *, new_id: int, parent_id: int):
-    from .CR2W import w3_types
+    from ..CR2W import w3_types
 
     name = _skeleton_bone_name(bone, str(new_id))
     if isinstance(bone, dict):
@@ -103,7 +103,7 @@ def _copy_skeleton_bone(bone, *, new_id: int, parent_id: int):
 
 
 def clone_skeleton_data(skeleton_data):
-    from .CR2W import w3_types
+    from ..CR2W import w3_types
 
     if skeleton_data is None:
         return w3_types.CSkeleton()
@@ -146,7 +146,7 @@ def _bone_local_matrix(bone):
 
 
 def _set_bone_local_matrix(bone, mat):
-    from .CR2W import w3_types
+    from ..CR2W import w3_types
 
     pos = mat.to_translation()
     quat = mat.to_quaternion()
@@ -272,7 +272,7 @@ def _fill_placeholder_armature_transforms_from_matrices(master_armature, source_
                                                         context=None, tolerance=1e-6) -> int:
     import bpy
     from mathutils import Vector
-    from .unreal_export.scene_utils import _restore_object_state, _snapshot_object_state
+    from ..unreal_export.scene_utils import _restore_object_state, _snapshot_object_state
 
     if master_armature is None or safe_object_type(master_armature) != "ARMATURE":
         return 0
@@ -514,10 +514,10 @@ def load_skeleton_data(file_path: str):
         return None
     lowered = file_path.lower()
     if lowered.endswith((".w2rig", ".w3dyng")):
-        from .CR2W.dc_skeleton import load_bin_skeleton
+        from ..CR2W.dc_skeleton import load_bin_skeleton
         return load_bin_skeleton(file_path)
     if lowered.endswith((".w2rig.json", ".w3dyng.json")):
-        from .CR2W import read_json_w3
+        from ..CR2W import read_json_w3
         return read_json_w3.readCSkeleton(file_path)
     return None
 
@@ -688,7 +688,7 @@ def _required_skeleton_bone_names_for_armature(source_skeleton, target_armature,
 
 def _armature_uses_rot90(armature_obj) -> bool:
     try:
-        from . import get_rig_rot90_enabled
+        from .. import get_rig_rot90_enabled
         return bool(get_rig_rot90_enabled(getattr(armature_obj.data, "witcherui_RigSettings", None), False))
     except Exception:
         return False
@@ -701,7 +701,7 @@ def append_skeleton_data_to_armature(master_armature, source_skeleton, *,
     """Add missing bones from parsed skeleton data to an existing Blender armature."""
     import bpy
     from mathutils import Vector
-    from .unreal_export.scene_utils import _restore_object_state, _snapshot_object_state
+    from ..unreal_export.scene_utils import _restore_object_state, _snapshot_object_state
 
     if master_armature is None or safe_object_type(master_armature) != "ARMATURE" or source_skeleton is None:
         return 0
@@ -1071,7 +1071,7 @@ def should_unify_character_armature(context=None) -> bool:
         if context is None:
             import bpy
             context = bpy.context
-        from . import get_unify_character_armature
+        from .. import get_unify_character_armature
         return bool(get_unify_character_armature(context))
     except Exception:
         return False
@@ -1780,7 +1780,7 @@ def graft_armature_into_master(master_armature, child_armature, *, src_id: str =
         return result
 
     import bpy
-    from .unreal_export.scene_utils import _restore_object_state, _snapshot_object_state
+    from ..unreal_export.scene_utils import _restore_object_state, _snapshot_object_state
 
     src_id = graft_source_id(master_armature, child_armature, src_id)
     source_bones = _armature_bones_by_name(child_armature)
@@ -2023,7 +2023,7 @@ def _bone_depth(bone) -> int:
 
 def remove_grafted_source(master_armature, src_id: str, *, context=None) -> int:
     import bpy
-    from .unreal_export.scene_utils import _restore_object_state, _snapshot_object_state
+    from ..unreal_export.scene_utils import _restore_object_state, _snapshot_object_state
 
     src_id = str(src_id or "").strip()
     if not src_id or master_armature is None or getattr(master_armature, "type", "") != "ARMATURE":

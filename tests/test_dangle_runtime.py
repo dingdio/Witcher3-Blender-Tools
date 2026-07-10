@@ -9,6 +9,7 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "witcher3_tools"
 PHYSICS_ROOT = PACKAGE_ROOT / "physics"
+RIGGING_ROOT = PACKAGE_ROOT / "rigging"
 
 
 def _install_bpy_stub():
@@ -94,6 +95,11 @@ if "witcher3_tools.physics" not in sys.modules:
     physics_package.__path__ = [str(PHYSICS_ROOT)]
     sys.modules["witcher3_tools.physics"] = physics_package
     setattr(sys.modules["witcher3_tools"], "physics", physics_package)
+if "witcher3_tools.rigging" not in sys.modules:
+    rigging_package = types.ModuleType("witcher3_tools.rigging")
+    rigging_package.__path__ = [str(RIGGING_ROOT)]
+    sys.modules["witcher3_tools.rigging"] = rigging_package
+    setattr(sys.modules["witcher3_tools"], "rigging", rigging_package)
 
 bpy = _install_bpy_stub()
 _install_mathutils_stub()
@@ -102,7 +108,10 @@ _load_module("witcher3_tools.physics.presets", PHYSICS_ROOT / "presets.py")
 _load_module("witcher3_tools.physics.breast", PHYSICS_ROOT / "breast.py")
 dyng_blender = _load_module("witcher3_tools.physics.dyng_blender", PHYSICS_ROOT / "dyng_blender.py")
 breast_blender = _load_module("witcher3_tools.physics.breast_blender", PHYSICS_ROOT / "breast_blender.py")
-armature_merge = _load_module("witcher3_tools.armature_merge", PACKAGE_ROOT / "armature_merge.py")
+armature_merge = _load_module(
+    "witcher3_tools.rigging.armature_merge",
+    RIGGING_ROOT / "armature_merge.py",
+)
 
 
 class FakeObject(dict):

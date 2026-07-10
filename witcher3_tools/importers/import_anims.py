@@ -15,7 +15,7 @@ from ..CR2W.dc_w2_havok import W2_MIMIC_FLOATTRACKS_RIG
 from ..CR2W.CR2W_helpers import Enums
 log = logging.getLogger(__name__)
 
-from ..camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties, sanitize_camera_fov_sequence
+from ..animation.camera_tracks import CAMERA_TRACK_NAMES, ensure_camera_track_properties, sanitize_camera_fov_sequence
 from ..importers.import_rig import get_ordered_bones
 from ..importers.motion_tools import MotionExtraction, apply_motion, apply_motion_to_bone, extract_motion_from_bone
 from .. import get_do_fix_tail, get_rig_rot90_enabled
@@ -33,7 +33,7 @@ from typing import Union
 import numpy as np
 
 import bpy
-from ..action_compat import assign_action, bind_strip_action_slot, get_action_channelbag, iter_action_fcurves, new_action_fcurve, resolve_action_slot
+from ..animation.action_compat import assign_action, bind_strip_action_slot, get_action_channelbag, iter_action_fcurves, new_action_fcurve, resolve_action_slot
 matmul = (lambda a, b: a*b) if bpy.app.version < (2, 80, 0) else (lambda a, b: a.__matmul__(b))
 
 W3_MOTION_EXTRACTION_FINAL_LOCATION_PROP = "w3_motion_extraction_final_location"

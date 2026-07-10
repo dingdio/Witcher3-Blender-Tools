@@ -1,3 +1,5 @@
+"""Witcher camera animation track definitions and conversion helpers."""
+
 import math
 
 

@@ -10,7 +10,7 @@ from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 from ..CR2W import animated_component as ac
 from .. import get_wolvenkit
 from .. import get_uncook_path
-from ..attachment_math import coerce_attachment_flags, normalize_engine_transform
+from ..rigging.attachment import coerce_attachment_flags, normalize_engine_transform
 from ..ui.ui_utils import WITCH_PT_Base
 from ..ui.armature_context import set_main_armature
 

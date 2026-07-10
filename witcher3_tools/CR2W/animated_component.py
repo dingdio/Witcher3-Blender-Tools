@@ -11,7 +11,7 @@ import os
 import subprocess
 import tempfile
 
-from ..attachment_math import (
+from ..rigging.attachment import (
     attachment_flags_text,
     coerce_attachment_flags,
     engine_transform_is_identity,

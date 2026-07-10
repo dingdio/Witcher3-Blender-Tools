@@ -1,3 +1,5 @@
+"""Story-scene pose-key creation, editing, preview, and serialization."""
+
 import json
 import logging
 import math
@@ -259,7 +261,7 @@ def _engine_ui_xyz_to_quaternion(x_value, y_value, z_value):
 
 def _armature_uses_rot90(armature_obj):
     try:
-        from . import get_rig_rot90_enabled
+        from .. import get_rig_rot90_enabled
 
         rig_settings = getattr(getattr(armature_obj, "data", None), "witcherui_RigSettings", None)
         return bool(get_rig_rot90_enabled(rig_settings, default=False))
@@ -1418,7 +1420,7 @@ def read_redkit_pose_presets(presets_path):
     if not os.path.isfile(presets_path):
         raise FileNotFoundError(presets_path)
 
-    from .CR2W.CR2W_types import getCR2W
+    from ..CR2W.CR2W_types import getCR2W
 
     with open(presets_path, "rb") as handle:
         cr2w_file = getCR2W(handle)

@@ -1203,7 +1203,7 @@ def _export_animations(context, armature, bundle_root: str, asset_name: str,
 
 
 def export_animation_fbx(context, armature, action, fbx_path: str) -> None:
-    from ..action_compat import resolve_action_slot
+    from ..animation.action_compat import resolve_action_slot
 
     scene = context.scene
     anim_data = armature.animation_data_create()

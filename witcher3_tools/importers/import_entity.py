@@ -32,8 +32,8 @@ from ..external_addon_tools import get_apx_addon_status, resolve_redcloth_apx
 #from io_import_w2l import settings
 from .. import fbx_util
 from .. import cloth_util
-from .. import constrain_util
-from .. import armature_merge
+from ..rigging import armature_merge
+from ..rigging import constraints as constrain_util
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.dc_entity import load_bin_entity
@@ -42,8 +42,8 @@ from ..CR2W.dc_entity import read_entity_template_appearance_metadata as _read_e
 from ..CR2W.dc_entity import is_valid_mesh_path
 from ..CR2W.dc_entity import _resolve_repo_path, _resolve_repo_paths_from_array
 from ..CR2W.CR2W_types import EngineTransform
-from ..camera_tracks import setup_camera_preview_drivers
-from ..attachment_math import (
+from ..animation.camera_tracks import setup_camera_preview_drivers
+from ..rigging.attachment import (
     bone_name_from_slot_index,
     coerce_attachment_flags,
     normalize_engine_transform,

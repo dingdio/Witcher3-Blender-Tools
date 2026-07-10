@@ -2,7 +2,7 @@ import math
 
 from mathutils import Euler, Matrix, Quaternion, Vector
 
-from ..action_compat import iter_action_fcurves, new_action_fcurve
+from ..animation.action_compat import iter_action_fcurves, new_action_fcurve
 from ..file_helpers import rm_ns
 
 

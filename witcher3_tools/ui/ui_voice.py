@@ -4,7 +4,7 @@ from ..importers import import_anims
 log = logging.getLogger(__name__)
 from .. import get_uncook_path, get_w2_unbundle_path, get_W3_VOICE_PATH, get_W3_OGG_PATH, get_vgmstream_path, get_all_addon_prefs
 from ..extension_paths import get_cache_root, get_dev_override, get_dev_override_list
-from ..action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
+from ..animation.action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
 from ..CR2W.witcher_cache.Speech import LoadSpeechManager
 from ..CR2W.witcher_cache.Speech.W3Speech import SpeechEntry
 from ..CR2W.witcher_cache.W3Strings import LoadStringsManager

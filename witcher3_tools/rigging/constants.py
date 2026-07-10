@@ -1,3 +1,5 @@
+"""Witcher armature hierarchy and bone-order constants."""
+
 # Dictionary to help connect the bone tails to specific bone heads
 BONE_CONNECT = {
 	'l_shoulder' 			: 'l_bicep'		,
