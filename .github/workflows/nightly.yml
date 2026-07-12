@@ -21,7 +21,15 @@ jobs:
       - name: Zip addon
         run: |
           cd witcher3_tools
-          zip -r ../witcher3_tools.zip .
+          zip -r ../witcher3_tools.zip . \
+            -x "dev/dev_config.json" \
+               "wheels/certifi-*" \
+               "wheels/charset_normalizer-*" \
+               "wheels/cramjam-*-cp310-*" \
+               "wheels/idna-*" \
+               "wheels/numpy-*" \
+               "wheels/requests-*" \
+               "wheels/urllib3-*"
           cd ..
           echo "--- Zip contents ---"
           unzip -l witcher3_tools.zip | head -30

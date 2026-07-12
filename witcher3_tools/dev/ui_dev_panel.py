@@ -17,15 +17,7 @@ from bpy.types import Panel, Operator
 
 from .. import w3_asset_browser
 from ..extension_paths import get_dev_panel_overrides
-
-
-# =============================================================================
-# Config File Management
-# =============================================================================
-
-def get_config_path():
-    """Get the path to the unified dev_config.json file."""
-    return Path(__file__).parent / "dev_config.json"
+from .dev_config import get_config_path
 
 
 def _load_full_config():

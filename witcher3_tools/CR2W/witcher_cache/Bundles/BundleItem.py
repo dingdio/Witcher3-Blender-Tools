@@ -8,25 +8,48 @@ log = logging.getLogger(__name__)
 
 cramjam_lz4 = None
 cramjam_snappy = None
-try:
-    from cramjam import lz4 as _cramjam_lz4
-    from cramjam import snappy as _cramjam_snappy
-    cramjam_lz4 = _cramjam_lz4
-    cramjam_snappy = _cramjam_snappy
-except Exception as e:
-    log.error("Error loading cramjam: %s", e)
-    
+_cramjam_load_attempted = False
+
+
+def _load_cramjam():
+    """Load native compression bindings only when a bundle needs them."""
+    global cramjam_lz4, cramjam_snappy, _cramjam_load_attempted
+    if _cramjam_load_attempted:
+        return
+    _cramjam_load_attempted = True
+    try:
+        from cramjam import lz4 as _cramjam_lz4
+        from cramjam import snappy as _cramjam_snappy
+        cramjam_lz4 = _cramjam_lz4
+        cramjam_snappy = _cramjam_snappy
+    except Exception as e:
+        log.error("Error loading cramjam: %s", e)
+
+
 import zlib
 
 import ctypes
+
+
 def get_dll_path(dll_name):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     dll_path = os.path.join(script_dir, dll_name)
     return dll_path
-doboz_dll_path = get_dll_path(r'native\Doboz.dll')
-doboz_lib = ctypes.CDLL(doboz_dll_path)
-doboz_lib.Decompress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
-doboz_lib.Decompress.restype = ctypes.c_int
+
+
+doboz_lib = None
+
+
+def _load_doboz():
+    """Load the bundled Doboz DLL only when Doboz data is extracted."""
+    global doboz_lib
+    if doboz_lib is not None:
+        return doboz_lib
+    doboz_dll_path = get_dll_path(r'native\Doboz.dll')
+    doboz_lib = ctypes.CDLL(doboz_dll_path)
+    doboz_lib.Decompress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+    doboz_lib.Decompress.restype = ctypes.c_int
+    return doboz_lib
 
 class MissingCompressionException(Exception):
     def __init__(self, compression, message="Unhandled compression algorithm."):
@@ -67,6 +90,7 @@ class BundleItem:
         if self.compression_type == "None":
             output.write(viewstream)
         elif self.compression_type == "Lz4":
+            _load_cramjam()
             if cramjam_lz4 is None:
                 raise MissingCompressionException(self.compression, "LZ4 decompressor is unavailable.")
             try:
@@ -79,6 +103,7 @@ class BundleItem:
                     raise RuntimeError(f"LZ4 decompression failed: {e}") from e
             output.write(bytes(uncompressed_data))
         elif self.compression_type == "Snappy":
+            _load_cramjam()
             if cramjam_snappy is None:
                 raise MissingCompressionException(self.compression, "Snappy decompressor is unavailable.")
             try:
@@ -91,9 +116,10 @@ class BundleItem:
                     raise RuntimeError(f"Snappy decompression failed: {e}") from e
             output.write(bytes(uncompressed_data))
         elif self.compression_type == "Doboz":
+            doboz = _load_doboz()
             destination_buffer = ctypes.create_string_buffer(self.size)
-            result = doboz_lib.Decompress(ctypes.byref(ctypes.create_string_buffer(viewstream)), self.zsize,
-                                          ctypes.byref(destination_buffer),self.size)
+            result = doboz.Decompress(ctypes.byref(ctypes.create_string_buffer(viewstream)), self.zsize,
+                                      ctypes.byref(destination_buffer),self.size)
             if result == 0:
                 decompressed_data = bytearray(destination_buffer[:self.size])
                 output.write(decompressed_data)
