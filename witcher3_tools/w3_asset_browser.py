@@ -8,6 +8,7 @@ import json
 import hashlib
 import shutil
 import re
+import fnmatch
 from collections import Counter
 from typing import Iterable
 
@@ -21,6 +22,7 @@ from .CR2W.witcher_cache.blender_common import get_game_path
 from .CR2W.witcher_cache import cache_meta
 from . import get_uncook_path, get_all_addon_prefs
 from .extension_paths import get_cache_root
+from .terrain_core import terrain_tile_from_world_position as _grid_tile_from_world_position
 from .CR2W.common_blender import (
     repo_file,
     win_safe_path,
@@ -51,6 +53,10 @@ JOURNAL_BROWSER_CONFIGS = {
     "CHARACTERS": {
         "journal_dir": r"gameplay\journal\characters",
         "image_dir": r"gameplay\gui_new\textures\journal\characters",
+    },
+    "LOCATIONS": {
+        "journal_dir": "",
+        "image_dir": "",
     },
 }
 
@@ -83,10 +89,12 @@ _JOURNAL_METADATA_MEM_CACHE = {}
 _JOURNAL_GROUP_OPTIONS_CACHE = {
     "BESTIARY": [],
     "CHARACTERS": [],
+    "LOCATIONS": [],
 }
 _JOURNAL_BROWSER_REFRESH_SERIAL = {
     "BESTIARY": 0,
     "CHARACTERS": 0,
+    "LOCATIONS": 0,
 }
 _BUILTIN_JOURNAL_ENTITY_MAP_CACHE = {}
 
@@ -704,6 +712,10 @@ def _journal_group_filter_items_characters(self, context):
     return _journal_group_filter_items_for_key("CHARACTERS", self=self, context=context)
 
 
+def _journal_group_filter_items_locations(self, context):
+    return _journal_group_filter_items_for_key("LOCATIONS", self=self, context=context)
+
+
 def _extract_journal_description(journal: W_CLASS) -> str:
     candidate_names = (
         "description",
@@ -732,6 +744,35 @@ def _build_entry_tooltip(entry: dict) -> str:
     name = _safe_text(entry.get("name"))
     if name:
         lines.append(name)
+    if _safe_text(entry.get("browser_key")).upper() == "LOCATIONS":
+        map_name = _safe_text(entry.get("map"))
+        if map_name:
+            lines.append(f"Map: {map_name}")
+        world_path = _safe_text(entry.get("world_path"))
+        if world_path:
+            lines.append(f"World: {world_path}")
+        layer_dir = _safe_text(entry.get("layer_dir"))
+        if layer_dir:
+            lines.append(f"Layers: {layer_dir}")
+        layer_allow = _location_layer_patterns(entry.get("layer_allow"))
+        if layer_allow:
+            lines.append(f"Viewer layers: {len(layer_allow)} curated files")
+        layer_extra = _location_layer_patterns(entry.get("layer_extra"))
+        if layer_extra:
+            lines.append(f"Shared layers: {len(layer_extra)} nearby-filtered files")
+        position = _location_position_from_value(entry.get("position"))
+        if position:
+            radius = float(entry.get("radius") or _LOCATION_DEFAULT_RADIUS)
+            lines.append(f"Position: {position[0]:.0f}, {position[1]:.0f}, {position[2]:.0f} (radius {radius:.0f}m)")
+        description = _safe_text(entry.get("description"))
+        if description:
+            lines.append("")
+            lines.append(_truncate_text(description, 500))
+        lines.append("")
+        lines.append("Click to load one terrain tile and the viewer-ready layers. Foliage streams after the scene appears.")
+        if layer_allow:
+            lines.append("Use the collection button to load every layer, including gameplay/interior layers.")
+        return "\n".join(lines)
     repo_path = _safe_text(entry.get("repo_path"))
     if repo_path:
         lines.append(f"w2ent: {repo_path}")
@@ -1561,6 +1602,8 @@ def _smart_refresh_journal_cache(browser_key: str):
 
 def _load_journal_entries_cached(browser_key: str, force_refresh: bool = False):
     browser_key = browser_key.upper()
+    if browser_key == "LOCATIONS":
+        return _load_location_entries_cached(browser_key, force_refresh)
     base_path = _safe_text(get_game_path() or "")
     uncook_path = _safe_text(get_uncook_path(bpy.context))
     mem_key = (browser_key, base_path, uncook_path)
@@ -1649,6 +1692,1395 @@ def _load_journal_entries_cached(browser_key: str, force_refresh: bool = False):
 
     _JOURNAL_METADATA_MEM_CACHE[mem_key] = entries
     return entries, cache_info
+
+
+_LOCATIONS_DATA_FILE = "locations.json"
+_LOCATION_DEFAULT_RADIUS = 100.0
+_LOCATION_LAYER_PATH_CACHE = {}
+_LOCATION_MAP_ORDER = [
+    "White Orchard", "Velen", "Novigrad", "Skellige",
+    "Kaer Morhen", "Toussaint", "Vizima",
+]
+
+
+def _location_position_from_value(value):
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        try:
+            return (float(value[0]), float(value[1]), float(value[2]))
+        except Exception:
+            return None
+    return None
+
+def _locations_data_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "CR2W", "data", _LOCATIONS_DATA_FILE)
+
+
+def _load_locations_data() -> list[dict]:
+    path = _locations_data_path()
+    if not win_path_exists(path):
+        log.warning("Locations data file not found: %s", path)
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        log.warning("Failed to read locations data: %s", path, exc_info=True)
+        return []
+    locations = data.get("locations") if isinstance(data, dict) else None
+    return locations if isinstance(locations, list) else []
+
+
+def _build_location_entries() -> list[dict]:
+    locations = _load_locations_data()
+    map_order = {name: idx for idx, name in enumerate(_LOCATION_MAP_ORDER)}
+
+    def _map_guid(map_name: str) -> str:
+        return "location_map_" + _safe_text(map_name).lower().replace(" ", "_")
+
+    entries: list[dict] = []
+    maps_present: list[str] = []
+    for loc in locations:
+        map_name = _safe_text(loc.get("map")) or "Unknown"
+        if map_name not in map_order:
+            map_order[map_name] = len(map_order) + len(locations)
+        if map_name not in maps_present:
+            maps_present.append(map_name)
+    maps_present.sort(key=lambda m: (map_order.get(m, 9999), m.lower()))
+
+    for map_name in maps_present:
+        entries.append({
+            "name": map_name,
+            "repo_path": "",
+            "journal_path": "",
+            "image_path": "", "image_depot_path": "", "image_file": "",
+            "description": "", "description_short": "",
+            "source_kind": "", "dlc_name": "", "source_label": map_name,
+            "browser_key": "LOCATIONS",
+            "repo_source": "location",
+            "can_import": False,
+            "entry_kind": "group",
+            "journal_class": "CLocationGroup",
+            "guid": _map_guid(map_name),
+            "parent_guid": "",
+            "journal_order": map_order.get(map_name, 9999),
+            "group_guid": "", "group_name": "", "group_option_id": "",
+        })
+
+    for idx, loc in enumerate(locations):
+        name = _safe_text(loc.get("name")) or "Unnamed Location"
+        map_name = _safe_text(loc.get("map")) or "Unknown"
+        world_path = _normalize_depot_path(loc.get("world_path", ""))
+        layer_dir = _normalize_depot_path(loc.get("layer_dir", ""))
+        description = _safe_text(loc.get("description", ""))
+        position = _location_position_from_value(loc.get("position"))
+        try:
+            radius = float(loc.get("radius") or _LOCATION_DEFAULT_RADIUS)
+        except Exception:
+            radius = _LOCATION_DEFAULT_RADIUS
+        source_kind, dlc_name, _label = _source_info_from_depot_path(world_path or layer_dir)
+        entries.append({
+            "name": name,
+            "repo_path": layer_dir,
+            "journal_path": world_path,
+            "image_path": "", "image_depot_path": "", "image_file": "",
+            "description": description,
+            "description_short": _truncate_text(description, 96),
+            "source_kind": source_kind,
+            "dlc_name": dlc_name,
+            "source_label": map_name,
+            "browser_key": "LOCATIONS",
+            "repo_source": "location",
+            "can_import": bool(world_path and (position or layer_dir)),
+            "entry_kind": "entry",
+            "journal_class": "CLocation",
+            "guid": f"location_{idx}_{name.lower().replace(' ', '_')}",
+            "parent_guid": _map_guid(map_name),
+            "journal_order": idx,
+            "group_guid": "", "group_name": "", "group_option_id": "",
+            "world_path": world_path,
+            "layer_dir": layer_dir,
+            "map": map_name,
+            "position": list(position) if position else [],
+            "radius": radius,
+            "layer_allow": [
+                _normalize_depot_path(value)
+                for value in (loc.get("layer_allow") or [])
+                if _safe_text(value)
+            ],
+            "layer_deny": [
+                _normalize_depot_path(value)
+                for value in (loc.get("layer_deny") or [])
+                if _safe_text(value)
+            ],
+            "layer_extra": [
+                _normalize_depot_path(value)
+                for value in (loc.get("layer_extra") or [])
+                if _safe_text(value)
+            ],
+        })
+
+    _apply_journal_group_metadata(entries)
+    entries.sort(key=lambda e: (
+        0 if _safe_text(e.get("entry_kind")) == "group" else 1,
+        _safe_text(e.get("name")).lower(),
+    ))
+    return entries
+
+
+def _location_browser_signature():
+    base_path = _safe_text(get_game_path() or "")
+    uncook_path = _safe_text(get_uncook_path(bpy.context))
+    data_token = _file_signature_token(_locations_data_path())
+    signature_hash = hashlib.sha1(
+        f"{base_path}|{uncook_path}|{data_token}|{JOURNAL_BROWSER_CACHE_VERSION}".encode("utf-8", "ignore")
+    ).hexdigest()
+    source = {
+        "type": "location_browser",
+        "browser_key": "LOCATIONS",
+        "base_path": base_path,
+        "uncook_path": uncook_path,
+        "data_token": data_token,
+        "version": JOURNAL_BROWSER_CACHE_VERSION,
+    }
+    return {"hash": signature_hash}, source
+
+
+def _store_location_entries_cache(browser_key: str, entries: list[dict], cache_label: str = "rebuilt"):
+    _apply_journal_group_metadata(entries)
+    cache_path, meta_path = _cache_file_paths(browser_key)
+    payload = {"version": JOURNAL_BROWSER_CACHE_VERSION, "entries": entries}
+    signature, source = _location_browser_signature()
+    try:
+        with gzip.open(cache_path, "wb") as f:
+            pickle.dump(payload, f)
+        meta = cache_meta.make_meta(os.path.basename(cache_path), cache_path, signature, source)
+        cache_meta.save_meta(meta_path, meta)
+    except Exception:
+        log.warning("Failed to write locations browser cache %s", cache_path, exc_info=True)
+
+    base_path = _safe_text(source.get("base_path"))
+    uncook_path = _safe_text(source.get("uncook_path"))
+    for mem_key in list(_JOURNAL_METADATA_MEM_CACHE.keys()):
+        if isinstance(mem_key, tuple) and mem_key and mem_key[0] == browser_key.upper():
+            _JOURNAL_METADATA_MEM_CACHE.pop(mem_key, None)
+    _JOURNAL_METADATA_MEM_CACHE[(browser_key.upper(), base_path, uncook_path)] = entries
+    _update_group_filter_options_cache(browser_key, entries)
+    return {"cache": cache_label, "signature": signature}
+
+
+def _load_location_entries_cached(browser_key: str, force_refresh: bool = False):
+    browser_key = "LOCATIONS"
+    base_path = _safe_text(get_game_path() or "")
+    uncook_path = _safe_text(get_uncook_path(bpy.context))
+    mem_key = (browser_key, base_path, uncook_path)
+
+    if force_refresh:
+        _LOCATION_LAYER_PATH_CACHE.clear()
+        entries = _build_location_entries()
+        _store_location_entries_cache(browser_key, entries, cache_label="rebuilt")
+        _JOURNAL_METADATA_MEM_CACHE[mem_key] = entries
+        return entries, {"cache": "rebuilt"}
+
+    if mem_key in _JOURNAL_METADATA_MEM_CACHE:
+        entries = _JOURNAL_METADATA_MEM_CACHE[mem_key]
+        _apply_journal_group_metadata(entries)
+        return entries, {"cache": "memory"}
+
+    if _location_disk_cache_is_fresh(browser_key):
+        entries = _load_journal_entries_from_disk_payload(browser_key)
+        if entries is not None:
+            _JOURNAL_METADATA_MEM_CACHE[mem_key] = entries
+            return entries, {"cache": "disk"}
+
+    entries = _build_location_entries()
+    cache_info = _store_location_entries_cache(browser_key, entries)
+    _JOURNAL_METADATA_MEM_CACHE[mem_key] = entries
+    return entries, cache_info
+
+
+def _location_disk_cache_is_fresh(browser_key: str) -> bool:
+    """Check whether the location cache matches ``locations.json``."""
+    _cache_path, meta_path = _cache_file_paths(browser_key)
+    meta = cache_meta.load_meta(meta_path)
+    current, _source = _location_browser_signature()
+    return cache_meta.signatures_match(meta.get("signature") or {}, current)
+
+
+def _location_path_parts(path: str) -> list[str]:
+    normalized = _normalize_depot_path(path).replace("/", "\\").lower()
+    return [part for part in normalized.split("\\") if part]
+
+
+def _location_layer_patterns(values) -> tuple[str, ...]:
+    """Normalize a location preset's relative layer glob patterns."""
+    if not isinstance(values, (list, tuple)):
+        return ()
+    result = []
+    seen = set()
+    for value in values:
+        pattern = _normalize_depot_path(value).lower()
+        if not pattern or pattern in seen:
+            continue
+        seen.add(pattern)
+        result.append(pattern)
+    return tuple(result)
+
+
+def _location_layer_relative_path(depot_path: str, layer_dir: str) -> str:
+    depot = _normalize_depot_path(depot_path).lower()
+    directory = _normalize_depot_path(layer_dir).lower().rstrip("\\")
+    prefix = directory + "\\" if directory else ""
+    if prefix and depot.startswith(prefix):
+        return depot[len(prefix):]
+    return depot
+
+
+def _location_layer_path_allowed(
+    depot_path: str,
+    layer_dir: str,
+    *,
+    layer_allow=(),
+    layer_deny=(),
+) -> bool:
+    """Apply the location layer policy."""
+    relative = _location_layer_relative_path(depot_path, layer_dir)
+    allow = _location_layer_patterns(layer_allow)
+    deny = _location_layer_patterns(layer_deny)
+    if allow and not any(fnmatch.fnmatchcase(relative, pattern) for pattern in allow):
+        return False
+    if deny and any(fnmatch.fnmatchcase(relative, pattern) for pattern in deny):
+        return False
+    return True
+
+
+def _location_scope_id(layer_dir: str, layer_allow=(), layer_deny=(), layer_extra=()) -> str:
+    policy = {
+        "layer_dir": _normalize_depot_path(layer_dir).lower(),
+        "allow": list(_location_layer_patterns(layer_allow)),
+        "deny": list(_location_layer_patterns(layer_deny)),
+        "extra": list(_location_layer_patterns(layer_extra)),
+    }
+    return hashlib.sha1(json.dumps(policy, sort_keys=True).encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+def _strip_path_prefix(parts: list[str], prefix: list[str]) -> list[str]:
+    if prefix and len(parts) >= len(prefix) and parts[: len(prefix)] == prefix:
+        return parts[len(prefix):]
+    return parts
+
+
+def _collection_pointer(coll) -> int:
+    try:
+        return int(coll.as_pointer())
+    except Exception:
+        return id(coll)
+
+
+def _find_world_root_for_depot(world_abs: str, world_depot: str):
+    """Find an imported world root for this world path."""
+    world_abs_norm = os.path.normcase(os.path.normpath(world_abs))
+    depot_lower = os.path.normcase(_normalize_depot_path(world_depot))
+    tail = os.path.sep + depot_lower
+    lightweight_match = None
+    for coll in bpy.data.collections:
+        if bool(coll.get("witcher_location_scope", False)):
+            continue
+        stored = str(coll.get("world_path", "")).strip()
+        if not stored:
+            continue
+        stored_norm = os.path.normcase(os.path.normpath(stored))
+        if stored_norm == world_abs_norm or stored_norm.endswith(tail):
+            # Prefer a complete world tree.
+            if _world_root_has_complete_layer_tree(coll):
+                return coll
+            if lightweight_match is None:
+                lightweight_match = coll
+    return lightweight_match
+
+
+def _ensure_location_scope_collection(
+    world_root,
+    world_abs: str,
+    layer_dir: str,
+    *,
+    layer_allow=(),
+    layer_deny=(),
+    layer_extra=(),
+):
+    """Return an isolated layer root for a location policy."""
+    scope_id = _location_scope_id(layer_dir, layer_allow, layer_deny, layer_extra)
+    for child in world_root.children:
+        if str(child.get("witcher_location_scope_id", "") or "") == scope_id:
+            return child
+
+    label = os.path.basename(_normalize_depot_path(layer_dir)) or "location"
+    scope = bpy.data.collections.new(f"LocationScope_{label}_{scope_id[:8]}")
+    scope["world_path"] = str(world_abs or "")
+    scope["witcher_location_scope"] = True
+    scope["witcher_location_scope_id"] = scope_id
+    scope["witcher_location_layer_dir"] = _normalize_depot_path(layer_dir)
+    scope["witcher_location_layer_allow"] = json.dumps(list(_location_layer_patterns(layer_allow)))
+    scope["witcher_location_layer_deny"] = json.dumps(list(_location_layer_patterns(layer_deny)))
+    scope["witcher_location_layer_extra"] = json.dumps(list(_location_layer_patterns(layer_extra)))
+    world_root.children.link(scope)
+    return scope
+
+
+def _location_scope_for_full_load(world_root, layer_dir: str):
+    """Return the isolated all-layer scope, never a filtered viewer scope."""
+    marker = _normalize_depot_path(layer_dir).lower()
+    full_scope_id = _location_scope_id(layer_dir)
+    for child in world_root.children:
+        if not bool(child.get("witcher_location_scope", False)):
+            continue
+        if _normalize_depot_path(child.get("witcher_location_layer_dir", "")).lower() != marker:
+            continue
+        if str(child.get("witcher_location_scope_id", "") or "") == full_scope_id:
+            return child
+    return None
+
+
+def _ensure_location_deferred_scope_collection(world_root, layer_dir: str):
+    """Expose non-viewer layers in the Outliner without streaming them."""
+    marker = _normalize_depot_path(layer_dir).lower()
+    scope_id = hashlib.sha1(f"deferred\n{marker}".encode("utf-8", "ignore")).hexdigest()[:12]
+    for child in world_root.children:
+        if str(child.get("witcher_location_deferred_scope_id", "") or "") == scope_id:
+            return child
+    label = os.path.basename(_normalize_depot_path(layer_dir)) or "location"
+    scope = bpy.data.collections.new(f"LocationDeferred_{label}_{scope_id[:8]}")
+    scope["group_type"] = "LayerGroup"
+    scope["witcher_location_deferred"] = True
+    scope["witcher_location_deferred_scope_id"] = scope_id
+    scope["witcher_location_layer_dir"] = _normalize_depot_path(layer_dir)
+    world_root.children.link(scope)
+    return scope
+
+
+def _iter_descendant_collections(root):
+    seen = set()
+    stack = [root]
+    while stack:
+        coll = stack.pop()
+        coll_id = _collection_pointer(coll)
+        if coll_id in seen:
+            continue
+        seen.add(coll_id)
+        yield coll
+        for child in coll.children:
+            if _collection_pointer(child) not in seen:
+                stack.append(child)
+
+
+def _world_root_has_complete_layer_tree(world_root) -> bool:
+    """Distinguish the global world tree from compact/curated subtrees."""
+    if world_root is None:
+        return False
+    for coll in _iter_descendant_collections(world_root):
+        if str(coll.get("group_type", "") or "").strip() != "LayerInfo":
+            continue
+        # Location scopes do not constitute a full world tree.
+        if not str(coll.get("witcher_location_layer_dir", "") or "").strip():
+            return True
+    return False
+
+
+def _collect_location_layer_collections(
+    world_root,
+    world_depot: str,
+    layer_dir: str,
+    *,
+    layer_allow=(),
+    layer_deny=(),
+) -> list:
+    world_dir_parts = _location_path_parts(os.path.dirname(world_depot))
+    loc_rel = _strip_path_prefix(_location_path_parts(layer_dir), world_dir_parts)
+    if not loc_rel:
+        return []
+    matches = []
+    for coll in _iter_descendant_collections(world_root):
+        if str(coll.get("group_type", "")).strip() != "LayerInfo":
+            continue
+        w2layer = _normalize_depot_path(str(coll.get("w2layer_path", "") or coll.get("level_path", "")))
+        if not w2layer:
+            continue
+        if not _location_layer_path_allowed(
+            w2layer,
+            layer_dir,
+            layer_allow=layer_allow,
+            layer_deny=layer_deny,
+        ):
+            continue
+        layer_rel = _strip_path_prefix(_location_path_parts(os.path.dirname(w2layer)), world_dir_parts)
+        if len(layer_rel) >= len(loc_rel) and layer_rel[: len(loc_rel)] == loc_rel:
+            matches.append(coll)
+    return matches
+
+
+def _discover_location_layer_paths(
+    context,
+    layer_dir: str,
+    *,
+    world_abs: str = "",
+    world_depot: str = "",
+) -> list[str]:
+    """Return ``.w2l`` paths below a curated location directory."""
+    layer_dir_n = _normalize_depot_path(layer_dir).rstrip("\\")
+    if not layer_dir_n:
+        return []
+    try:
+        uncook_root = str(get_uncook_path(context) or "")
+    except Exception:
+        uncook_root = ""
+    prefs = get_all_addon_prefs(context)
+    disk_roots = [
+        str(getattr(prefs, "redkit_depot_path", "") or ""),
+        str(getattr(prefs, "redkit_uncooked_path", "") or ""),
+        uncook_root,
+    ]
+    disk_roots = list(dict.fromkeys(
+        os.path.normpath(root) for root in disk_roots if str(root).strip()
+    ))
+    if world_abs and world_depot:
+        # Include the REDkit source root.
+        derived_root = os.path.normpath(str(world_abs))
+        for _part in _location_path_parts(world_depot):
+            derived_root = os.path.dirname(derived_root)
+        if derived_root and all(
+            os.path.normcase(os.path.normpath(derived_root))
+            != os.path.normcase(os.path.normpath(existing))
+            for existing in disk_roots
+        ):
+            disk_roots.append(derived_root)
+    cache_key = (
+        str(get_game_path() or ""),
+        tuple(os.path.normcase(os.path.normpath(root)) for root in disk_roots),
+        layer_dir_n.lower(),
+    )
+    cached = _LOCATION_LAYER_PATH_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
+    paths = {}
+
+    def add_path(value):
+        depot = _normalize_depot_path(value)
+        if depot.lower().endswith(".w2l"):
+            paths.setdefault(depot.lower(), depot)
+
+    if layer_dir_n.lower().endswith(".w2l"):
+        add_path(layer_dir_n)
+    else:
+        prefix = layer_dir_n.lower() + "\\"
+        # Scan depot roots first so source overrides win when paths overlap.
+        for disk_root in disk_roots:
+            disk_dir = os.path.join(disk_root, *layer_dir_n.split("\\"))
+            safe_disk_dir = win_safe_path(disk_dir)
+            if os.path.isdir(safe_disk_dir):
+                try:
+                    for root_dir, _dirs, files in os.walk(safe_disk_dir):
+                        relative_dir = os.path.relpath(root_dir, safe_disk_dir)
+                        depot_dir = layer_dir_n if relative_dir == "." else os.path.join(layer_dir_n, relative_dir)
+                        for filename in files:
+                            if filename.lower().endswith(".w2l"):
+                                add_path(os.path.join(depot_dir, filename))
+                except Exception:
+                    log.warning("Could not inspect uncooked location layers under %s", disk_dir, exc_info=True)
+
+        try:
+            # Merge bundles with disk overrides.
+            from .CR2W.witcher_cache.Bundles import BundleManager
+
+            manager = getattr(BundleManager, "InstanceManager", None)
+            current_game_path = str(get_game_path() or "")
+            manager_game_path = str(getattr(manager, "base_path", "") or "") if manager is not None else ""
+            if manager is not None and current_game_path and manager_game_path and (
+                os.path.normcase(os.path.normpath(current_game_path))
+                != os.path.normcase(os.path.normpath(manager_game_path))
+            ):
+                manager = None
+            if manager is None:
+                manager = LoadBundleManager()
+            for key in manager.Items:
+                depot = _normalize_depot_path(key)
+                depot_lower = depot.lower()
+                if depot_lower.startswith(prefix) and depot_lower.endswith(".w2l"):
+                    add_path(depot)
+        except Exception:
+            log.warning("Could not inspect bundled location layers under %s", layer_dir_n, exc_info=True)
+
+    result = sorted(paths.values(), key=str.lower)
+    _LOCATION_LAYER_PATH_CACHE[cache_key] = tuple(result)
+    return result
+
+
+def _ensure_location_layer_collections(
+    context,
+    world_root,
+    world_depot: str,
+    layer_dir: str,
+    *,
+    layer_allow=(),
+    layer_deny=(),
+) -> list:
+    """Create the minimal LayerGroup/LayerInfo subtree needed by location loading."""
+    existing = _collect_location_layer_collections(
+        world_root,
+        world_depot,
+        layer_dir,
+        layer_allow=layer_allow,
+        layer_deny=layer_deny,
+    )
+
+    layer_dir_n = _normalize_depot_path(layer_dir).rstrip("\\")
+    layer_paths = _discover_location_layer_paths(
+        context,
+        layer_dir_n,
+        world_abs=str(world_root.get("world_path", "") or ""),
+        world_depot=world_depot,
+    )
+    layer_paths = [
+        depot_path for depot_path in layer_paths
+        if _location_layer_path_allowed(
+            depot_path,
+            layer_dir_n,
+            layer_allow=layer_allow,
+            layer_deny=layer_deny,
+        )
+    ]
+    if not layer_paths:
+        return []
+
+    existing_by_path = {
+        _normalize_depot_path(str(coll.get("w2layer_path", "") or coll.get("level_path", ""))).lower(): coll
+        for coll in existing
+    }
+    if len(existing_by_path) == len(layer_paths) and all(
+        _normalize_depot_path(path).lower() in existing_by_path for path in layer_paths
+    ):
+        return [existing_by_path[_normalize_depot_path(path).lower()] for path in layer_paths]
+
+    marker = layer_dir_n.lower()
+    group = next(
+        (
+            coll for coll in _iter_descendant_collections(world_root)
+            if str(coll.get("witcher_location_layer_dir", "") or "").lower() == marker
+        ),
+        None,
+    )
+    if group is None:
+        label = os.path.basename(layer_dir_n) or "location"
+        digest = hashlib.sha1(marker.encode("utf-8", "ignore")).hexdigest()[:8]
+        group = bpy.data.collections.new(f"Location_{label}_{digest}")
+        group["group_type"] = "LayerGroup"
+        group["witcher_visible_on_start"] = True
+        group["witcher_location_layer_dir"] = layer_dir_n
+        world_root.children.link(group)
+
+    by_path = {}
+    for coll in _iter_descendant_collections(world_root):
+        depot = _normalize_depot_path(str(coll.get("w2layer_path", "") or coll.get("level_path", "")))
+        if depot:
+            by_path[depot.lower()] = coll
+
+    layers = []
+    for depot_path in layer_paths:
+        layer = by_path.get(depot_path.lower())
+        if layer is None:
+            layer = bpy.data.collections.new(os.path.basename(depot_path))
+            layer["group_type"] = "LayerInfo"
+            layer["w2layer_path"] = depot_path
+            layer["level_path"] = depot_path
+            layer["witcher_layer_import_state"] = "unloaded"
+            layer["witcher_layer_import_count"] = 0
+            layer["witcher_layer_import_errors"] = 0
+            layer["witcher_location_layer_dir"] = layer_dir_n
+            group.children.link(layer)
+            by_path[depot_path.lower()] = layer
+        layers.append(layer)
+    return layers
+
+
+def _terrain_tile_from_world_position(spec, position):
+    """Map a curated world position to one clamped source terrain tile."""
+    return _grid_tile_from_world_position(
+        position,
+        int(spec.x_tiles),
+        int(spec.y_tiles),
+        float(spec.terrain_size),
+    )
+
+
+def _ensure_location_world_anchor(world_root, world_abs: str):
+    """Ensure layer operators can resolve a lightweight world's root collection."""
+    root_name = str(getattr(world_root, "name", "") or "")
+    for obj in bpy.data.objects:
+        if str(obj.get("world_root_collection", "") or "") == root_name:
+            return obj
+    anchor = bpy.data.objects.new(f"location_{root_name}", None)
+    anchor["witcher_location_world_anchor"] = True
+    anchor["world_path"] = str(world_abs or "")
+    anchor["world_root_collection"] = root_name
+    world_root.objects.link(anchor)
+    return anchor
+
+
+def _first_region(area, region_type):
+    for region in area.regions:
+        if region.type == region_type:
+            return region
+    return area.regions[0]
+
+
+def _frame_location(context, layer_collections):
+    try:
+        scene_objects = context.scene.collection.all_objects
+        objects = []
+        for coll in layer_collections:
+            for obj in coll.all_objects:
+                if obj.name in scene_objects and not obj.hide_viewport:
+                    objects.append(obj)
+        if not objects:
+            return
+        for obj in list(context.selected_objects):
+            try:
+                obj.select_set(False)
+            except Exception:
+                pass
+        for obj in objects:
+            try:
+                obj.select_set(True)
+            except Exception:
+                pass
+        try:
+            context.view_layer.objects.active = objects[0]
+        except Exception:
+            pass
+        screen = getattr(context, "screen", None)
+        if screen is None:
+            return
+        for area in screen.areas:
+            if area.type == 'VIEW_3D':
+                with context.temp_override(area=area, region=_first_region(area, 'WINDOW')):
+                    bpy.ops.view3d.view_frame(center=True)
+                break
+    except Exception:
+        log.debug("Failed to frame location in viewport", exc_info=True)
+
+
+def _find_view3d_area(window):
+    screen = getattr(window, "screen", None)
+    for area in getattr(screen, "areas", []) or []:
+        if area.type == 'VIEW_3D':
+            return area
+    return None
+
+
+def _move_viewport_to_location(area, position, distance):
+    """Aim the viewport at a location and return the eye offset."""
+    import math
+    from mathutils import Euler, Vector
+
+    space = area.spaces.active
+    region_3d = space.region_3d
+    try:
+        space.clip_end = max(float(space.clip_end), 9999.0)
+    except Exception:
+        pass
+    region_3d.view_perspective = 'PERSP'
+    region_3d.view_location = Vector(position)
+    region_3d.view_distance = float(distance)
+    region_3d.view_rotation = Euler((math.radians(60.0), 0.0, math.radians(135.0)), 'XYZ').to_quaternion()
+    try:
+        # Refresh the view matrix before the nearby-layer query.
+        region_3d.update()
+    except Exception:
+        pass
+    eye = region_3d.view_rotation @ Vector((0.0, 0.0, region_3d.view_distance))
+    return math.hypot(eye.x, eye.y)
+
+
+def _activate_world_root(context, world_root):
+    """Activate an object associated with ``world_root``."""
+    root_name = str(getattr(world_root, "name", "") or "")
+    target = None
+    for obj in bpy.data.objects:
+        try:
+            if str(obj.get("world_root_collection", "") or "") == root_name:
+                target = obj
+                break
+        except Exception:
+            continue
+    if target is None:
+        return False
+    try:
+        for obj in list(getattr(context, "selected_objects", []) or []):
+            try:
+                obj.select_set(False)
+            except Exception:
+                pass
+        try:
+            target.select_set(True)
+        except Exception:
+            pass
+        context.view_layer.objects.active = target
+        return True
+    except Exception:
+        log.debug("Failed to activate world root object", exc_info=True)
+        return False
+
+
+def _location_anchor_positions_from_items(items):
+    """Return placement anchors for top-level layer items."""
+    positions = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        parent_id = str(item.get("parent_id", "") or "").strip()
+        if parent_id:
+            continue
+        value = item.get("world_position")
+        if not isinstance(value, (list, tuple)) or len(value) < 2:
+            continue
+        try:
+            positions.append((
+                float(value[0]),
+                float(value[1]),
+                float(value[2]) if len(value) > 2 else 0.0,
+            ))
+        except (TypeError, ValueError):
+            continue
+    return positions
+
+
+def _location_dense_position(positions, terrain_spec=None):
+    """Estimate a location center from its densest placements."""
+    import math
+
+    samples = []
+    for value in positions or []:
+        if not isinstance(value, (list, tuple)) or len(value) < 2:
+            continue
+        try:
+            point = (
+                float(value[0]),
+                float(value[1]),
+                float(value[2]) if len(value) > 2 else 0.0,
+            )
+        except (TypeError, ValueError):
+            continue
+        if all(math.isfinite(component) for component in point):
+            samples.append(point)
+    if not samples:
+        return None
+
+    buckets = {}
+    for point in samples:
+        try:
+            key = (
+                _terrain_tile_from_world_position(terrain_spec, point)
+                if terrain_spec is not None
+                else (math.floor(point[0] / 64.0), math.floor(point[1] / 64.0))
+            )
+        except (TypeError, ValueError, AttributeError):
+            key = (math.floor(point[0] / 64.0), math.floor(point[1] / 64.0))
+        buckets.setdefault(key, []).append(point)
+
+    # Prefer the tile with the most anchors.
+    def bucket_score(item):
+        key, points = item
+        nearby = sum(
+            len(buckets.get((key[0] + dx, key[1] + dy), ()))
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+        )
+        return (len(points), nearby, -abs(key[0]), -abs(key[1]))
+
+    _key, dense_samples = max(buckets.items(), key=bucket_score)
+
+    def median(values):
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) * 0.5
+
+    return (
+        median([point[0] for point in dense_samples]),
+        median([point[1] for point in dense_samples]),
+        median([point[2] for point in dense_samples]),
+    )
+
+
+def _location_position_from_layer_index(index, layer_dir, terrain_spec=None):
+    """Estimate the densest location position from a world-layer scan index."""
+    if not isinstance(index, dict):
+        return None
+    from .ui import ui_map
+
+    prefix = _normalize_depot_path(layer_dir).lower().rstrip("\\") + "\\"
+    matching_entries = [
+        entry for entry in (index.get("entries", []) or [])
+        if str(entry.get("level_key", "") or "").startswith(prefix)
+    ]
+    positions = []
+    cache_path = str(index.get("cache_path", "") or "")
+    conn = ui_map._open_world_layer_cache_db(cache_path) if cache_path else None
+    try:
+        for entry in matching_entries:
+            items = entry.get("items", []) or []
+            if conn is not None:
+                items = ui_map._load_world_layer_cache_items(
+                    conn,
+                    str(entry.get("level_key", "") or ""),
+                )
+            positions.extend(_location_anchor_positions_from_items(items))
+    finally:
+        if conn is not None:
+            ui_map._close_world_layer_cache_db(conn)
+
+    dense_position = _location_dense_position(positions, terrain_spec)
+    if dense_position is not None:
+        return dense_position
+
+    # Weight unresolved bounds conservatively.
+    bounds_samples = []
+    for entry in matching_entries:
+        if "min_x" not in entry:
+            continue
+        center = (
+            (float(entry["min_x"]) + float(entry["max_x"])) * 0.5,
+            (float(entry["min_y"]) + float(entry["max_y"])) * 0.5,
+            20.0,
+        )
+        weight = max(1, min(32, int(entry.get("object_count", 1) or 1)))
+        bounds_samples.extend([center] * weight)
+    return _location_dense_position(bounds_samples, terrain_spec)
+
+
+def _location_position_from_scan_cache(
+    context,
+    world_root,
+    layer_dir,
+    terrain_spec=None,
+    *,
+    build_if_missing=False,
+    progress_title="Locating world layers",
+):
+    """Find a location's densest cached placement area."""
+    if not layer_dir:
+        return None
+    from .ui import ui_map
+
+    try:
+        cache_key = ui_map._world_layer_cache_key(context, world_root)
+        index = ui_map._WORLD_LAYER_INDEX_CACHE.get(cache_key)
+        if index is None:
+            index = ui_map._hydrate_world_layer_index_from_disk(context, world_root)
+        if index is None and build_if_missing:
+            index = ui_map._get_world_layer_index(
+                context,
+                world_root,
+                rebuild=False,
+                show_progress=not bool(getattr(bpy.app, "background", False)),
+                progress_title=progress_title,
+            )
+    except Exception:
+        log.debug("Scan cache lookup failed for location", exc_info=True)
+        return None
+    return _location_position_from_layer_index(index, layer_dir, terrain_spec)
+
+
+def _schedule_location_tile_foliage(
+    world_abs: str,
+    world_root_name: str,
+    *,
+    tile_x: int,
+    tile_y: int,
+    x_tiles: int,
+    y_tiles: int,
+    terrain_size: float,
+    source_mode: str,
+    name: str,
+) -> bool:
+    """Queue selected-tile foliage after viewer layers load."""
+    import time as _time
+    from .ui import ui_map
+
+    scheduled_at = _time.perf_counter()
+
+    def _tick():
+        if ui_map.layer_stream_job_running() or ui_map.foliage_busy():
+            if _time.perf_counter() - scheduled_at > 3600.0:
+                log.warning("Location foliage timed out waiting for another job: %s", name)
+                return None
+            return 0.25
+        world_root = bpy.data.collections.get(world_root_name)
+        if world_root is None:
+            log.warning("Location foliage cancelled for %s: world root was removed", name)
+            return None
+        started = _time.perf_counter()
+        try:
+            from .importers import import_foliage
+
+            foliage_result = import_foliage.load_foliage_for_tile(
+                world_abs,
+                world_root,
+                bpy.context,
+                int(tile_x),
+                int(tile_y),
+                int(x_tiles),
+                int(y_tiles),
+                float(terrain_size),
+                source_mode=str(source_mode or "PROXY"),
+            )
+            log.info(
+                "Location foliage ready for %s in %.2fs (queued %.2fs; tile %d,%d; %d cells / %d instances; %s)",
+                name,
+                _time.perf_counter() - started,
+                started - scheduled_at,
+                int(tile_x),
+                int(tile_y),
+                len(getattr(foliage_result, "loaded_cells", ()) or ()),
+                int(getattr(foliage_result, "instance_count", 0) or 0),
+                str(source_mode or "PROXY"),
+            )
+        except Exception:
+            log.warning("Location tile foliage load failed for %s", name, exc_info=True)
+        return None
+
+    try:
+        bpy.app.timers.register(_tick, first_interval=0.1)
+        return True
+    except Exception:
+        log.warning("Failed to schedule location tile foliage for %s", name, exc_info=True)
+        return False
+
+
+def _start_location_stream(context, world_root, position, radius, name, report):
+    """Move to a location and asynchronously stream nearby layers."""
+    from .ui import ui_map
+
+    # Avoid stale viewport access in background mode.
+    if bool(getattr(bpy.app, "background", False)):
+        return False
+    if ui_map.layer_stream_job_running() or ui_map.foliage_busy():
+        report({'WARNING'}, "A layer/foliage job is already running; try again when it finishes.")
+        return None
+    window = getattr(context, "window", None)
+    area = _find_view3d_area(window) if window is not None else None
+    if area is None:
+        return False
+
+    eye_offset = _move_viewport_to_location(area, position, distance=max(30.0, radius * 0.5))
+    _activate_world_root(context, world_root)
+
+    scene_settings = getattr(context.scene, "witcher_file_browser", None)
+    if scene_settings is not None:
+        try:
+            scene_settings.terrain_layer_load_radius = float(radius + eye_offset)
+            # curated locations: import everything, then hide what the engine hides
+            scene_settings.terrain_layer_hide_default_hidden = True
+            scene_settings.terrain_layer_hide_engine_hidden_meshes = True
+        except Exception:
+            log.debug("Failed to apply location layer settings", exc_info=True)
+
+    region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+    try:
+        with context.temp_override(window=window, area=area, region=region):
+            result = bpy.ops.witcher.load_layers_around_camera()
+    except Exception:
+        log.warning("Location layer stream failed to start for %s", name, exc_info=True)
+        return False
+    if 'CANCELLED' in result:
+        return False
+
+    report({'INFO'}, f"{name}: streaming layers within {radius:.0f}m…")
+    return True
+
+
+def _import_location_layers_sync(
+    context,
+    world_root,
+    world_depot,
+    layer_dir,
+    name,
+    report,
+    *,
+    layer_extra=(),
+):
+    """Import curated layers when no location position is available."""
+    from .ui import ui_map
+    from .ui.ui_map import _import_level_from_collection
+
+    target_layers = _collect_location_layer_collections(world_root, world_depot, layer_dir)
+    extra_paths = {
+        _normalize_depot_path(path).lower()
+        for path in _location_layer_patterns(layer_extra)
+        if _normalize_depot_path(path)
+    }
+    if extra_paths:
+        target_ids = {_collection_pointer(coll) for coll in target_layers}
+        for coll in _iter_descendant_collections(world_root):
+            if str(coll.get("group_type", "") or "").strip() != "LayerInfo":
+                continue
+            depot_path = _normalize_depot_path(
+                str(coll.get("w2layer_path", "") or coll.get("level_path", ""))
+            ).lower()
+            if not depot_path:
+                continue
+            if not any(
+                depot_path == extra_path
+                or (not extra_path.endswith(".w2l") and depot_path.startswith(extra_path.rstrip("\\") + "\\"))
+                for extra_path in extra_paths
+            ):
+                continue
+            coll_id = _collection_pointer(coll)
+            if coll_id not in target_ids:
+                target_ids.add(coll_id)
+                target_layers.append(coll)
+    if not target_layers:
+        report({'WARNING'}, f"World opened, but no layers found under: {layer_dir}")
+        return {'FINISHED'}
+
+    scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+    import_settings = ui_map._layer_import_kwargs_from_scene(scene_settings)
+    mode_signature = ui_map._layer_load_mode_signature_for_scene(scene_settings)
+    if ui_map._is_location_viewer_root(world_root):
+        # Match the location viewer path without a viewport.
+        import_settings["do_import_ProxyMesh"] = False
+        import_settings["keep_proxy_meshes"] = False
+        mode_signature += ";location_viewer=1;location_proxy_mesh=0;location_proxy_lods=0"
+
+    report({'INFO'}, f"Loading {len(target_layers)} layer(s) for {name}…")
+    imported = failed = skipped = 0
+    ui_map._unhide_default_hidden_layer_groups(context)
+    try:
+        for coll in target_layers:
+            if ui_map._collection_has_loaded_content(coll, mode_signature=mode_signature):
+                skipped += 1
+                continue
+            ok, _resolved, _err, cancelled = _import_level_from_collection(
+                context,
+                coll,
+                import_settings=import_settings,
+                mode_signature=mode_signature,
+            )
+            if cancelled:
+                break
+            if ok:
+                imported += 1
+            else:
+                failed += 1
+    finally:
+        ui_map._restore_default_hidden_layer_groups(context)
+        try:
+            ui_map.apply_layer_visibility_settings(context, root_collection=world_root)
+        except Exception:
+            log.debug("apply_layer_visibility_settings failed", exc_info=True)
+
+    _frame_location(context, target_layers)
+    message = f"{name}: {imported} layer(s) loaded"
+    if skipped:
+        message += f", {skipped} already loaded"
+    if failed:
+        message += f", {failed} failed"
+    report({'INFO'}, message)
+    return {'FINISHED'}
+
+
+def _open_location(context, world_path: str, layer_dir: str, name: str, report,
+                   position=None, radius=0.0, *,
+                   layer_allow=(), layer_deny=(), layer_extra=(), load_full_layers=False):
+    import time as _time
+    from . import CR2W
+    from .importers import import_w2w
+    from .ui import ui_map
+
+    started = _time.perf_counter()
+    timings = {}
+
+    def _finish_stage(label, stage_started):
+        timings[label] = _time.perf_counter() - stage_started
+
+    world_depot = _normalize_depot_path(world_path)
+    layer_dir_n = _normalize_depot_path(layer_dir)
+    layer_allow = _location_layer_patterns(layer_allow)
+    layer_deny = _location_layer_patterns(layer_deny)
+    layer_extra = tuple(
+        _normalize_depot_path(path)
+        for path in _location_layer_patterns(layer_extra)
+        if _normalize_depot_path(path)
+    )
+    position = _location_position_from_value(position)
+    radius = float(radius or 0.0) or _LOCATION_DEFAULT_RADIUS
+    if not world_depot or not (layer_dir_n or position):
+        report({'WARNING'}, "This location is missing its world path or position.")
+        return {'CANCELLED'}
+    if ui_map.layer_stream_job_running() or ui_map.foliage_busy():
+        report({'WARNING'}, "A layer/foliage job is already running; try again when it finishes.")
+        return {'CANCELLED'}
+
+    stage_started = _time.perf_counter()
+    world_abs = repo_file(world_depot)
+    _finish_stage("resolve_world", stage_started)
+    if not world_abs or not win_path_exists(world_abs):
+        report({'WARNING'}, f"Could not find world file: {world_depot}")
+        return {'CANCELLED'}
+
+    world_root = _find_world_root_for_depot(world_abs, world_depot)
+    scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
+    selected_tile_mode = True
+    if scene_settings is not None:
+        try:
+            scene_settings.terrain_import_mode = "SELECTED_TILE"
+        except Exception:
+            pass
+    if selected_tile_mode:
+        scope_label = "all layers" if load_full_layers else "viewer layers"
+        report({'INFO'}, f"Opening {name}: selected terrain tile + {scope_label}…")
+        stage_started = _time.perf_counter()
+        try:
+            world_file = CR2W.CR2W_reader.load_w2w(world_abs, include_groups=False)
+            spec = import_w2w.inspect_world_terrain(world_file, world_abs)
+            world_root = import_w2w.ensure_world_terrain_collection(spec, world_root)
+        except Exception as exc:
+            log.warning("Compact location world open failed for %s", world_depot, exc_info=True)
+            report({'ERROR'}, f"World metadata load failed: {exc}")
+            return {'CANCELLED'}
+        _finish_stage("world_metadata", stage_started)
+
+        location_root = (
+            _location_scope_for_full_load(world_root, layer_dir_n)
+            if load_full_layers
+            else None
+        )
+        if location_root is None:
+            location_root = _ensure_location_scope_collection(
+                world_root,
+                world_abs,
+                layer_dir_n,
+                layer_allow=layer_allow,
+                layer_deny=layer_deny,
+                layer_extra=layer_extra,
+            )
+
+        location_layers = []
+        try:
+            if position is not None:
+                tile_x, tile_y = _terrain_tile_from_world_position(spec, position)
+            else:
+                if int(spec.x_tiles) <= 0 or int(spec.y_tiles) <= 0:
+                    raise ValueError("World terrain tile dimensions are unavailable")
+                tile_x = int(getattr(scene_settings, "terrain_tile_x", 0) or 0)
+                tile_y = int(getattr(scene_settings, "terrain_tile_y", 0) or 0)
+                tile_x = max(0, min(int(spec.x_tiles) - 1, tile_x))
+                tile_y = max(0, min(int(spec.y_tiles) - 1, tile_y))
+                report({'INFO'}, f"No cached location position; using selected tile {tile_x}, {tile_y}.")
+        except (TypeError, ValueError, IndexError) as exc:
+            report({'ERROR'}, f"Could not choose a terrain tile: {exc}")
+            return {'CANCELLED'}
+
+        if scene_settings is not None:
+            try:
+                scene_settings.terrain_tile_x = tile_x
+                scene_settings.terrain_tile_y = tile_y
+            except Exception:
+                pass
+
+        detail = int(getattr(scene_settings, "terrain_multires_level", 6) or 6)
+        terrain_result = None
+        stage_started = _time.perf_counter()
+        try:
+            terrain_result = import_w2w.import_world_terrain_tile(
+                world_file,
+                world_abs,
+                tile_x,
+                tile_y,
+                multires_level=detail,
+                world_root_collection=world_root,
+            )
+            if terrain_result is None or not terrain_result.ok:
+                raise FileNotFoundError(
+                    getattr(terrain_result, "error", "")
+                    or f"Terrain tile {tile_x}, {tile_y} was not found"
+                )
+            world_root = terrain_result.world_collection or world_root
+            try:
+                terrain_result.obj.select_set(True)
+                context.view_layer.objects.active = terrain_result.obj
+            except Exception:
+                pass
+        except Exception as exc:
+            log.warning("Location terrain tile import failed for %s", name, exc_info=True)
+            report({'WARNING'}, f"Location layers will continue; terrain tile failed: {exc}")
+        _finish_stage("terrain_tile", stage_started)
+
+        include_foliage = bool(getattr(scene_settings, "terrain_include_foliage", True))
+        foliage_source_mode = str(
+            getattr(scene_settings, "terrain_foliage_mode", "PROXY") or "PROXY"
+        )
+        if not location_layers:
+            stage_started = _time.perf_counter()
+            try:
+                location_layers = _ensure_location_layer_collections(
+                    context,
+                    location_root,
+                    world_depot,
+                    layer_dir_n,
+                    layer_allow=layer_allow,
+                    layer_deny=layer_deny,
+                )
+            except Exception:
+                log.warning("Could not build the curated layer subtree for %s", layer_dir_n, exc_info=True)
+            _finish_stage("layer_discovery", stage_started)
+
+        for extra_layer_path in layer_extra:
+            try:
+                for extra_layer in _ensure_location_layer_collections(
+                    context,
+                    location_root,
+                    world_depot,
+                    extra_layer_path,
+                ):
+                    if extra_layer not in location_layers:
+                        location_layers.append(extra_layer)
+            except Exception:
+                log.warning("Could not add shared location layer %s", extra_layer_path, exc_info=True)
+
+        if not load_full_layers and (layer_allow or layer_deny):
+            stage_started = _time.perf_counter()
+            try:
+                all_paths = _discover_location_layer_paths(
+                    context,
+                    layer_dir_n,
+                    world_abs=world_abs,
+                    world_depot=world_depot,
+                )
+                deferred_patterns = [
+                    _location_layer_relative_path(path, layer_dir_n)
+                    for path in all_paths
+                    if not _location_layer_path_allowed(
+                        path,
+                        layer_dir_n,
+                        layer_allow=layer_allow,
+                        layer_deny=layer_deny,
+                    )
+                ]
+                if deferred_patterns:
+                    deferred_root = _ensure_location_deferred_scope_collection(world_root, layer_dir_n)
+                    _ensure_location_layer_collections(
+                        context,
+                        deferred_root,
+                        world_depot,
+                        layer_dir_n,
+                        layer_allow=deferred_patterns,
+                    )
+            except Exception:
+                log.warning("Could not expose deferred location layers for %s", layer_dir_n, exc_info=True)
+            _finish_stage("deferred_tree", stage_started)
+
+        anchor = _ensure_location_world_anchor(location_root, world_abs)
+        try:
+            anchor.select_set(True)
+            context.view_layer.objects.active = anchor
+        except Exception:
+            pass
+    elif world_root is None or not _world_root_has_complete_layer_tree(world_root):
+        report({'INFO'}, f"Opening world {world_depot} (terrain + layer tree). This may take a while…")
+        started = _time.perf_counter()
+        try:
+            world_file = CR2W.CR2W_reader.load_w2w(world_abs)
+            import_w2w.btn_import_w2w(world_file, world_abs)
+        except Exception as exc:
+            log.warning("Location world import failed for %s", world_depot, exc_info=True)
+            report({'ERROR'}, f"World import failed: {exc}")
+            return {'CANCELLED'}
+        world_root = _find_world_root_for_depot(world_abs, world_depot)
+        log.info("Location world open (terrain + layer tree) took %.1fs", _time.perf_counter() - started)
+
+    if world_root is None:
+        report({'ERROR'}, "World import produced no root collection.")
+        return {'CANCELLED'}
+
+    if position is None:
+        position = _location_position_from_scan_cache(
+            context,
+            location_root,
+            layer_dir_n,
+            spec,
+        )
+
+    stage_started = _time.perf_counter()
+    stream_status = False
+    if position is not None:
+        stream_status = _start_location_stream(
+            context,
+            location_root,
+            position,
+            radius,
+            name,
+            report,
+        )
+    _finish_stage("schedule_layers", stage_started)
+    if stream_status is None:
+        return {'CANCELLED'}
+    stream_started = bool(stream_status)
+
+    foliage_scheduled = False
+    if include_foliage and terrain_result is not None and terrain_result.ok:
+        foliage_scheduled = _schedule_location_tile_foliage(
+            world_abs,
+            world_root.name,
+            tile_x=tile_x,
+            tile_y=tile_y,
+            x_tiles=int(spec.x_tiles),
+            y_tiles=int(spec.y_tiles),
+            terrain_size=float(spec.terrain_size),
+            source_mode=foliage_source_mode,
+            name=name,
+        )
+
+    timings.setdefault("layer_discovery", 0.0)
+    timings["startup_total"] = _time.perf_counter() - started
+    try:
+        location_root["witcher_location_last_startup_seconds"] = float(timings["startup_total"])
+        location_root["witcher_location_last_timing"] = json.dumps(
+            {key: round(value, 4) for key, value in timings.items()},
+            sort_keys=True,
+        )
+        location_root["witcher_location_layer_count"] = int(len(location_layers))
+        location_root["witcher_location_foliage_scheduled"] = bool(foliage_scheduled)
+    except Exception:
+        pass
+    log.info(
+        "Location startup %s: %.2fs (tile %d,%d; %d %s; foliage %s; stages %s)",
+        name,
+        timings["startup_total"],
+        tile_x,
+        tile_y,
+        len(location_layers),
+        scope_label,
+        "scheduled" if foliage_scheduled else "off",
+        ", ".join(
+            f"{key}={value:.2f}s"
+            for key, value in timings.items()
+            if key != "startup_total"
+        ),
+    )
+
+    if stream_started:
+        return {'FINISHED'}
+
+    return _import_location_layers_sync(
+        context,
+        location_root,
+        world_depot,
+        layer_dir_n,
+        name,
+        report,
+        layer_extra=layer_extra,
+    )
 
 
 def _entry_counts(entries: list[dict]):
@@ -1798,6 +3230,8 @@ class _JournalBrowserMixin:
     )
 
     journal_browser_key = "BESTIARY"
+    _action_operator_bl_idname = "witcher.image_browser_action"
+    _show_aux_file_button = True
 
     def _free_previews(self):
         preview_collection = getattr(self, "preview_collection", None)
@@ -2078,17 +3512,61 @@ class _JournalBrowserMixin:
                 row.label(text="", icon='QUESTION')
 
             action_row = box.row(align=True)
-            op = action_row.operator(MyImageActionOperator.bl_idname, text=name)
-            op.image_name = name
-            op.repo_path = repo_path
+            action_op_id = getattr(self, "_action_operator_bl_idname", MyImageActionOperator.bl_idname)
+            op = action_row.operator(action_op_id, text=name)
+            if action_op_id == MyLocationActionOperator.bl_idname:
+                op.location_name = name
+                op.world_path = _safe_text(entry.get("world_path"))
+                op.layer_dir = _safe_text(entry.get("layer_dir"))
+                position = _location_position_from_value(entry.get("position"))
+                op.has_position = position is not None
+                if position is not None:
+                    op.position = position
+                op.radius = float(entry.get("radius") or 0.0)
+                layer_policy = {
+                    "allow": list(_location_layer_patterns(entry.get("layer_allow"))),
+                    "deny": list(_location_layer_patterns(entry.get("layer_deny"))),
+                    "extra": list(_location_layer_patterns(entry.get("layer_extra"))),
+                }
+                op.layer_policy_json = json.dumps(layer_policy, separators=(",", ":"))
+                if layer_policy["allow"] or layer_policy["deny"]:
+                    full_op = action_row.operator(
+                        action_op_id,
+                        text="",
+                        icon='OUTLINER_COLLECTION',
+                    )
+                    full_op.location_name = name
+                    full_op.world_path = op.world_path
+                    full_op.layer_dir = op.layer_dir
+                    full_op.has_position = op.has_position
+                    if position is not None:
+                        full_op.position = position
+                    full_op.radius = op.radius
+                    full_op.load_full_layers = True
+                    full_op.layer_policy_json = op.layer_policy_json
+                    full_op.tooltip_text = (
+                        f"Load all layers for {name}\n"
+                        "Includes interiors, gameplay, collision and hidden layers; this can be slow."
+                    )
+                details = action_row.operator(
+                    MyLocationDetailsOperator.bl_idname,
+                    text="",
+                    icon='INFO',
+                )
+                details.location_name = name
+                details.world_path = op.world_path
+                details.layer_dir = op.layer_dir
+            else:
+                op.image_name = name
+                op.repo_path = repo_path
+                op.open_import_dialog = bool(getattr(self, "open_import_dialog", False))
             op.tooltip_text = _build_entry_tooltip(entry)
-            op.open_import_dialog = bool(getattr(self, "open_import_dialog", False))
 
-            if can_import:
+            if can_import and getattr(self, "_show_aux_file_button", True):
                 aux = action_row.operator(MyJournalEntryFileOperator.bl_idname, text="", icon='FILE_FOLDER' if exported else 'IMPORT')
                 aux.repo_path = repo_path
                 aux.action = "OPEN_FOLDER" if exported else "UNBUNDLE"
-            else:
+            elif not can_import:
                 info_row = action_row.row(align=True)
                 info_row.enabled = False
                 info_row.label(text="", icon='INFO')
@@ -2120,20 +3598,16 @@ class MyCharacterImageOperator(_JournalBrowserMixin, bpy.types.Operator):
     group_filter: bpy.props.EnumProperty(name="Group", items=_journal_group_filter_items_characters)
 
 
-    # def draw(self, context):
-    #     layout = self.layout
-    #     col = layout.column(align=True)
-    #     grid = col.grid_flow(columns=4, even_columns=True, even_rows=True, align=True)
-
-    #     for (name, icon_id, repo_path) in self.preview_collection.my_previews:
-    #         box = grid.box()
-    #         row = box.row()
-    #         row.template_icon(icon_value=icon_id, scale=6.0)
-    #         row = box.row()
-    #         # Pass both name and repo_path to the operator
-    #         op = row.operator(MyImageActionOperator.bl_idname, text=name)
-    #         op.image_name = name
-    #         op.repo_path = repo_path
+class MyLocationImageOperator(_JournalBrowserMixin, bpy.types.Operator):
+    """Browse curated locations."""
+    bl_idname = "witcher.location_image_browser"
+    bl_label = "Locations"
+    bl_description = "Browse curated Witcher 3 locations. Selected-tile mode loads one terrain tile, its foliage and only the location's layers."
+    bl_options = {'REGISTER', 'UNDO'}
+    journal_browser_key = "LOCATIONS"
+    _action_operator_bl_idname = "witcher.location_browser_action"
+    _show_aux_file_button = False
+    group_filter: bpy.props.EnumProperty(name="Group", items=_journal_group_filter_items_locations)
 
 
 class MyJournalBrowserRefreshOperator(bpy.types.Operator):
@@ -2154,6 +3628,13 @@ class MyJournalBrowserRefreshOperator(bpy.types.Operator):
             self.report({'WARNING'}, f"Unknown journal browser key: {key}")
             return {'CANCELLED'}
         key = key or "BESTIARY"
+        if key == "LOCATIONS":
+            entries, _cache_info = _load_location_entries_cached(key, force_refresh=True)
+            _JOURNAL_BROWSER_REFRESH_SERIAL[key] = _JOURNAL_BROWSER_REFRESH_SERIAL.get(key, 0) + 1
+            setattr(context.scene, IMAGE_BROWSER_PAGE_PROP, 0)
+            leaf_count = sum(1 for e in entries if _safe_text(e.get("entry_kind")) != "group")
+            self.report({'INFO'}, f"Locations refreshed: {leaf_count} entries")
+            return {'FINISHED'}
         stats = _smart_refresh_journal_cache(key)
         _JOURNAL_BROWSER_REFRESH_SERIAL[key] = _JOURNAL_BROWSER_REFRESH_SERIAL.get(key, 0) + 1
         setattr(context.scene, IMAGE_BROWSER_PAGE_PROP, 0)
@@ -2271,6 +3752,77 @@ class MyImageActionOperator(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MyLocationActionOperator(bpy.types.Operator):
+    """Open a curated location."""
+    bl_idname = "witcher.location_browser_action"
+    bl_label = "Open Location"
+    bl_options = {'REGISTER', 'UNDO'}
+    location_name: bpy.props.StringProperty()
+    world_path: bpy.props.StringProperty()
+    layer_dir: bpy.props.StringProperty()
+    has_position: bpy.props.BoolProperty(default=False)
+    position: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
+    radius: bpy.props.FloatProperty(default=0.0)
+    layer_policy_json: bpy.props.StringProperty(default="", options={'HIDDEN'})
+    load_full_layers: bpy.props.BoolProperty(default=False, options={'HIDDEN'})
+    tooltip_text: bpy.props.StringProperty(default="")
+
+    @classmethod
+    def description(cls, context, properties):
+        tooltip = _safe_text(getattr(properties, "tooltip_text", ""))
+        if tooltip:
+            return tooltip
+        name = _safe_text(getattr(properties, "location_name", ""))
+        return f"Open location\n{name}" if name else cls.bl_label
+
+    def execute(self, context):
+        name = _safe_text(self.location_name) or "Location"
+        try:
+            layer_policy = json.loads(str(self.layer_policy_json or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            layer_policy = {}
+        if not isinstance(layer_policy, dict):
+            layer_policy = {}
+        layer_allow = () if self.load_full_layers else _location_layer_patterns(layer_policy.get("allow"))
+        layer_deny = () if self.load_full_layers else _location_layer_patterns(layer_policy.get("deny"))
+        layer_extra = _location_layer_patterns(layer_policy.get("extra"))
+        return _open_location(
+            context,
+            self.world_path,
+            self.layer_dir,
+            name,
+            self.report,
+            position=tuple(self.position) if self.has_position else None,
+            radius=float(self.radius),
+            layer_allow=layer_allow,
+            layer_deny=layer_deny,
+            layer_extra=layer_extra,
+            load_full_layers=bool(self.load_full_layers),
+        )
+
+
+class MyLocationDetailsOperator(bpy.types.Operator):
+    """Show location paths."""
+    bl_idname = "witcher.location_browser_details"
+    bl_label = "Location Details"
+
+    location_name: bpy.props.StringProperty(name="Location")
+    world_path: bpy.props.StringProperty(name="World")
+    layer_dir: bpy.props.StringProperty(name="Layer Directory")
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=620)
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.prop(self, "location_name")
+        layout.prop(self, "world_path")
+        layout.prop(self, "layer_dir")
+
+    def execute(self, _context):
+        return {'FINISHED'}
+
+
 class MyJournalBrowserInfoOperator(bpy.types.Operator):
     """Show journal browser details in tooltip"""
     bl_idname = "witcher.journal_browser_info"
@@ -2323,9 +3875,12 @@ def register():
     )
     bpy.utils.register_class(MyImageOperator)
     bpy.utils.register_class(MyCharacterImageOperator)
+    bpy.utils.register_class(MyLocationImageOperator)
     bpy.utils.register_class(MyJournalBrowserRefreshOperator)
     bpy.utils.register_class(MyJournalEntryFileOperator)
     bpy.utils.register_class(MyImageActionOperator)
+    bpy.utils.register_class(MyLocationActionOperator)
+    bpy.utils.register_class(MyLocationDetailsOperator)
     bpy.utils.register_class(MyJournalBrowserInfoOperator)
     bpy.utils.register_class(MyPageOperator)
 
@@ -2334,9 +3889,12 @@ def unregister():
         del bpy.types.Scene.witcher_image_browser_current_page
     bpy.utils.unregister_class(MyPageOperator)
     bpy.utils.unregister_class(MyJournalBrowserInfoOperator)
+    bpy.utils.unregister_class(MyLocationDetailsOperator)
+    bpy.utils.unregister_class(MyLocationActionOperator)
     bpy.utils.unregister_class(MyImageActionOperator)
     bpy.utils.unregister_class(MyJournalEntryFileOperator)
     bpy.utils.unregister_class(MyJournalBrowserRefreshOperator)
+    bpy.utils.unregister_class(MyLocationImageOperator)
     bpy.utils.unregister_class(MyCharacterImageOperator)
     bpy.utils.unregister_class(MyImageOperator)
 

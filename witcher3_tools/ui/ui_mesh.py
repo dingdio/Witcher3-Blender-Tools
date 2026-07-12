@@ -355,6 +355,16 @@ def _import_redapex_base_mesh_fast(context, apx_filepath, redapex_path, target_c
     return obj
 
 
+def _redapex_object_alive(obj) -> bool:
+    if obj is None:
+        return False
+    try:
+        obj.name
+        return True
+    except ReferenceError:
+        return False
+
+
 def _postprocess_redapex_import(
     context,
     redapex_path,
@@ -626,6 +636,9 @@ def import_redapex_resource(
         collections_as_empties=collections_as_empties,
     )
 
+    # Drop references invalidated by postprocessing.
+    imported_objects = [obj for obj in imported_objects if _redapex_object_alive(obj)]
+    imported_meshes = [obj for obj in imported_meshes if _redapex_object_alive(obj)]
     material_targets = [
         obj for obj in imported_objects
         if getattr(obj, "type", None) == 'MESH'

@@ -355,7 +355,7 @@ def _apply_disk_layer_group_visibility(root_group, default_hidden_paths):
     visit(root_group, ())
 
 
-def create_world(file, file_path=None):
+def create_world(file, file_path=None, include_groups: bool = True):
 
     world = WORLD()
     CHUNKS = file.CHUNKS.CHUNKS
@@ -383,6 +383,13 @@ def create_world(file, file_path=None):
     world.terrainSize:float = world.terrainClipMap.GetVariableByName('terrainSize').Value
     world.lowestElevation:float = world.terrainClipMap.GetVariableByName('lowestElevation').Value
     world.highestElevation:float = world.terrainClipMap.GetVariableByName('highestElevation').Value
+
+    if not include_groups:
+        # Keep terrain streaming metadata-only.
+        world_name = os.path.splitext(os.path.basename(file_path))[0] if file_path else "WORLD"
+        world.groups = LayerGroup(world_name)
+        world.worldName = world_name
+        return world
     
     if embedded:
         world.groups = getChildrenGroups(firstLayer, CHUNKS)

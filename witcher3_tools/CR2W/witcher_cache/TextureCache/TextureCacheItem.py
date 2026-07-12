@@ -104,8 +104,7 @@ class TextureCacheItem:
         return "Zlib"
 
     def switch_red_blue_channels(self, ds):
-        for i in range(0, len(ds), 4):
-            ds[i], ds[i+2] = ds[i+2], ds[i]  # Switch red (i) and blue (i+2)
+        ds[0::4], ds[2::4] = ds[2::4], ds[0::4]
         return ds
 
     def _fix_cubemap_face_orientation(self, face_bytes, width, height):
@@ -178,6 +177,9 @@ class TextureCacheItem:
             # output_stream.write(b"DXT1")#new.write(dxt)
             # output_stream.seek(128)
             
+            # Do not channel-swap compressed blocks.
+            switch_red_blue = switch_red_blue and self.Format == EFormat.R8G8B8A8_UNORM
+
             if self.IsCube == 0:
                 offset = self.PageOffset * 4096 + 9
                 viewstream = mmapped_file[offset:offset + self.ZSize]
@@ -192,7 +194,10 @@ class TextureCacheItem:
                     mippageoffset = self.MipMapInfo[i].Offset
                     mipzsize = self.MipMapInfo[i].ZSize
                     viewstream = mmapped_file[mippageoffset:mippageoffset + mipzsize]
-                    output_stream.write(zlib.decompress(viewstream))
+                    if switch_red_blue:
+                        output_stream.write(self.switch_red_blue_channels(bytearray(zlib.decompress(viewstream))))
+                    else:
+                        output_stream.write(zlib.decompress(viewstream))
 
             else:
                 imagestream = BytesIO()

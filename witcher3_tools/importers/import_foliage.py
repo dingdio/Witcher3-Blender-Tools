@@ -1,33 +1,135 @@
-"""
-Foliage loading for .flyr (CFoliageResource) files.
-
-Flat structure — no sub-collections:
-
-    World_Foliage/
-      fi_pine_01        GN instancer mesh (visible) — N vertices = N instances
-      fi_pine_01_src    LOD0 source mesh  (hidden)  — referenced by GN Object Info
-      fi_grass_01       ...
-
-Using Object Info instead of Collection Info means exactly ONE mesh is
-instanced per type regardless of how many LODs/proxies the import produced.
-Blender object count = 2 × number of unique tree types (~40-100 objects total).
-"""
+"""Foliage loading for ``.flyr`` resources."""
 import os
 import json
 import math
 import logging
+from dataclasses import dataclass
+from typing import Iterable, Sequence
+
 import bpy
-from math import radians
-from mathutils import Euler
+
+from ..foliage_core import (
+    Bounds2D,
+    CELL_SIZE,
+    decode_foliage_instance_transform,
+    foliage_cells_for_bounds,
+    point_in_bounds,
+    terrain_tile_bounds,
+)
 
 log = logging.getLogger(__name__)
 
-CELL_SIZE = 64.0
-
-# Session-level accumulator scoped per foliage root collection:
-#   root_key -> {depot_path -> [(x, y, z, ex, ey, ez), ...]}
-# Euler values are pre-converted to XYZ order for the GN attribute.
+# Per-root cache: owner -> depot path -> transforms.
 _type_transforms: dict = {}
+
+_OWNER_KEYS_PROP = "_foliage_owner_keys"
+_LOADED_OWNERS_PROP = "_loaded_foliage_owners"
+_OWNER_ATTRIBUTE = "foliage_owner"
+_ROTATION_ATTRIBUTE = "rot"
+_SCALE_ATTRIBUTE = "scale"
+_LEGACY_OWNER = "__legacy__"
+
+FOLIAGE_SOURCE_MODE_FULL = "FULL"
+FOLIAGE_SOURCE_MODE_PROXY = "PROXY"
+
+_SOURCE_MODE_PROP = "_foliage_source_mode"
+_SOURCE_CONTEXT_PROP = "_foliage_source_context_path"
+_SOURCE_KIND_PROP = "_foliage_source_kind"
+_SOURCE_READY_PROP = "_foliage_source_ready"
+_PROXY_SOURCE_MARKER = "_foliage_shared_proxy_source"
+_PROXY_KIND_PROP = "_foliage_proxy_kind"
+_FALLBACK_HIDDEN_PROP = "_foliage_fallback_hidden"
+_SOURCE_NODE_NAME = "Foliage Source"
+
+_PROXY_KIND_GRASS = "grass"
+_PROXY_KIND_FLOWER = "flower"
+_PROXY_KIND_REED = "reed"
+_PROXY_KIND_SHRUB = "shrub"
+_PROXY_KIND_CONIFER = "conifer"
+_PROXY_KIND_TREE = "tree"
+
+# Viewer mode hydrates only dominant source types.
+FOLIAGE_VIEWER_GROUND_SOURCE_LIMIT = 8
+FOLIAGE_VIEWER_TREE_SOURCE_LIMIT = 6
+
+
+def _normalise_source_mode(source_mode: str) -> str:
+    mode = str(source_mode or FOLIAGE_SOURCE_MODE_FULL).strip().upper()
+    if mode not in {FOLIAGE_SOURCE_MODE_FULL, FOLIAGE_SOURCE_MODE_PROXY}:
+        raise ValueError("Foliage source_mode must be 'FULL' or 'PROXY'")
+    return mode
+
+
+@dataclass(frozen=True)
+class FoliageLoadResult:
+    """Result of a tile/cell-scoped foliage load."""
+
+    requested_cells: tuple[str, ...]
+    loaded_cells: tuple[str, ...]
+    skipped_cells: tuple[str, ...]
+    failed_cells: tuple[str, ...]
+    instance_count: int
+    affected_types: tuple[str, ...]
+    hydrated_types: tuple[str, ...] = ()
+    hidden_fallback_types: tuple[str, ...] = ()
+
+    @property
+    def success(self) -> bool:
+        return bool(self.requested_cells) and not self.failed_cells
+
+
+@dataclass(frozen=True)
+class FoliageHydrationResult:
+    """Result of progressively replacing proxy instances with real sources."""
+
+    requested_types: tuple[str, ...]
+    hydrated_types: tuple[str, ...]
+    failed_types: tuple[str, ...]
+    remaining_types: tuple[str, ...]
+
+    @property
+    def success(self) -> bool:
+        return not self.failed_types and not self.remaining_types
+
+
+def _json_string_list(owner, prop_name: str) -> list[str]:
+    try:
+        raw = json.loads(owner.get(prop_name, "[]"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [str(value) for value in raw]
+
+
+def _set_json_string_list(owner, prop_name: str, values: Iterable[str]) -> None:
+    owner[prop_name] = json.dumps([str(value) for value in values], separators=(",", ":"))
+
+
+def _owner_keys(foliage_root) -> list[str]:
+    return _json_string_list(foliage_root, _OWNER_KEYS_PROP)
+
+
+def _ensure_owner_index(foliage_root, owner_key: str) -> int:
+    return _ensure_owner_indices(foliage_root, (owner_key,))[str(owner_key)]
+
+
+def _ensure_owner_indices(foliage_root, owner_keys: Iterable[str]) -> dict[str, int]:
+    """Resolve persistent owner ids with at most one collection property write."""
+
+    keys = _owner_keys(foliage_root)
+    indices = {key: index for index, key in enumerate(keys)}
+    changed = False
+    for owner_key in owner_keys:
+        owner_key = str(owner_key)
+        if owner_key in indices:
+            continue
+        indices[owner_key] = len(keys)
+        keys.append(owner_key)
+        changed = True
+    if changed:
+        _set_json_string_list(foliage_root, _OWNER_KEYS_PROP, keys)
+    return indices
 
 
 def _foliage_root_state_key(foliage_root) -> str:
@@ -42,7 +144,7 @@ def _get_root_transform_bucket(foliage_root, create: bool = False):
     root_key = _foliage_root_state_key(foliage_root)
     bucket = _type_transforms.get(root_key)
     if bucket is None and create:
-        bucket = {}
+        bucket = _restore_root_transform_bucket(foliage_root)
         _type_transforms[root_key] = bucket
     return bucket
 
@@ -51,12 +153,59 @@ def _get_root_transform_bucket(foliage_root, create: bool = False):
 # Path / grid helpers
 # ---------------------------------------------------------------------------
 
+def _path_is_under_root(path: str, root: str) -> bool:
+    if not path or not root:
+        return False
+    try:
+        path_key = os.path.normcase(os.path.abspath(os.path.normpath(path)))
+        root_key = os.path.normcase(os.path.abspath(os.path.normpath(root)))
+        return os.path.commonpath((path_key, root_key)) == root_key
+    except (OSError, ValueError):
+        return False
+
+
+def _configured_depot_roots(context=None, *, world_path: str = "") -> list[str]:
+    """Return roots for this source, preserving REDkit depot-first priority."""
+
+    context = context or getattr(bpy, "context", None)
+    normal_uncook = ""
+    try:
+        from .. import get_uncook_path
+        normal_uncook = str(get_uncook_path(context) or "").strip()
+    except Exception:
+        pass
+
+    try:
+        from .. import ADDON_NAME
+        prefs = context.preferences.addons[ADDON_NAME].preferences
+    except Exception:
+        prefs = None
+    redkit_depot = str(getattr(prefs, "redkit_depot_path", "") or "").strip() if prefs else ""
+    redkit_uncooked = str(getattr(prefs, "redkit_uncooked_path", "") or "").strip() if prefs else ""
+    redkit_source = bool(
+        world_path
+        and (
+            _path_is_under_root(world_path, redkit_depot)
+            or _path_is_under_root(world_path, redkit_uncooked)
+        )
+    )
+    roots = [redkit_depot, redkit_uncooked, normal_uncook] if redkit_source else [normal_uncook]
+
+    unique = []
+    seen = set()
+    for root in roots:
+        norm = os.path.normcase(os.path.normpath(root))
+        if norm not in seen:
+            seen.add(norm)
+            unique.append(root)
+    return unique
+
+
 def _to_game_rel_path(abs_path: str, context=None) -> str:
-    from .. import get_uncook_path
-    uncook = (get_uncook_path(context or bpy.context) or "").replace("/", "\\").rstrip("\\")
     norm = abs_path.replace("/", "\\")
-    if uncook:
-        prefix = uncook + "\\"
+    for root in _configured_depot_roots(context, world_path=abs_path):
+        root = root.replace("/", "\\").rstrip("\\")
+        prefix = root + "\\"
         if norm.lower().startswith(prefix.lower()):
             return norm[len(prefix):]
     return norm
@@ -114,10 +263,39 @@ def _get_bundle_manager():
         return None
 
 
-def find_all_flyr_keys_in_bundles(foliage_prefix: str) -> dict:
+def find_all_flyr_keys_in_bundles(
+    foliage_prefix: str,
+    context=None,
+    *,
+    world_path: str = "",
+) -> dict:
     """Return {cell_key: game_rel_path} for every .flyr found in bundles + disk."""
     prefix_lower = foliage_prefix.lower().rstrip("\\") + "\\"
     result = {}
+
+    # Prefer project and uncooked files over bundles.
+    disk_dirs = []
+    if os.path.isabs(foliage_prefix) or os.path.splitdrive(foliage_prefix)[0]:
+        disk_dirs.append(foliage_prefix)
+    else:
+        for root in _configured_depot_roots(context, world_path=world_path):
+            disk_dirs.append(os.path.join(root, foliage_prefix))
+    for disk_dir in disk_dirs:
+        if not os.path.isdir(disk_dir):
+            continue
+        try:
+            filenames = os.listdir(disk_dir)
+        except OSError:
+            continue
+        for fname in filenames:
+            if not fname.lower().endswith(".flyr"):
+                continue
+            base = os.path.splitext(fname)[0]
+            if not base.lower().startswith("foliage_"):
+                continue
+            key = base[len("foliage_"):]
+            # Absolute paths preserve which configured depot won.
+            result.setdefault(key, os.path.join(disk_dir, fname))
 
     bm = _get_bundle_manager()
     if bm is not None:
@@ -125,37 +303,66 @@ def find_all_flyr_keys_in_bundles(foliage_prefix: str) -> dict:
             kl = key.lower().replace("/", "\\")
             if kl.startswith(prefix_lower) and kl.endswith(".flyr"):
                 base = os.path.splitext(os.path.basename(key))[0]
-                if base.startswith("foliage_"):
-                    result[base[len("foliage_"):]] = key.replace("/", "\\")
-
-    from .. import get_uncook_path
-    uncook = (get_uncook_path(bpy.context) or "").rstrip("\\/")
-    if uncook:
-        disk_dir = os.path.join(uncook, foliage_prefix)
-        if os.path.isdir(disk_dir):
-            for fname in os.listdir(disk_dir):
-                if fname.lower().endswith(".flyr"):
-                    base = os.path.splitext(fname)[0]
-                    if base.startswith("foliage_"):
-                        ck = base[len("foliage_"):]
-                        if ck not in result:
-                            result[ck] = os.path.join(foliage_prefix, fname).replace("/", "\\")
+                if base.lower().startswith("foliage_"):
+                    result.setdefault(base[len("foliage_"):], key.replace("/", "\\"))
     return result
 
 
-def count_all_foliage_cells(foliage_prefix: str) -> int:
-    return len(find_all_flyr_keys_in_bundles(foliage_prefix))
+def count_all_foliage_cells(foliage_prefix: str, context=None, *, world_path: str = "") -> int:
+    return len(find_all_flyr_keys_in_bundles(foliage_prefix, context, world_path=world_path))
 
 
-def resolve_flyr_abs_path(game_rel_path: str) -> str:
-    from ..CR2W.common_blender import repo_file
+def resolve_flyr_abs_path(game_rel_path: str, context=None, world_path: str = "") -> str:
+    """Resolve one known cell directly, probing disk before bundle extraction."""
+
+    raw = str(game_rel_path or "").strip().strip('"')
+    if not raw:
+        return None
+
+    candidates = []
+    if os.path.isabs(raw) or os.path.splitdrive(raw)[0]:
+        candidates.append(raw)
+    else:
+        rel = raw.replace("/", os.sep).replace("\\", os.sep).lstrip("\\/")
+        if world_path and (os.path.isabs(world_path) or os.path.splitdrive(world_path)[0]):
+            candidates.append(
+                os.path.join(os.path.dirname(world_path), "source_foliage", os.path.basename(rel))
+            )
+        for root in _configured_depot_roots(context, world_path=world_path):
+            candidates.append(os.path.join(root, rel))
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return os.path.normpath(candidate)
+
+    from ..CR2W.common_blender import redkit_repo_context, repo_file
     try:
-        p = repo_file(game_rel_path)
-        if p and os.path.exists(p):
+        with redkit_repo_context(world_path or None):
+            p = repo_file(raw)
+        if p and os.path.isfile(p):
             return p
     except Exception:
-        log.exception("Failed to resolve flyr: %s", game_rel_path)
+        log.exception("Failed to resolve flyr: %s", raw)
     return None
+
+
+def resolve_foliage_cells_for_bounds(
+    foliage_prefix: str,
+    bounds: Bounds2D | Sequence[float],
+    context=None,
+    *,
+    world_path: str = "",
+) -> list[tuple[str, str]]:
+    """Resolve only cells intersecting ``bounds`` without global enumeration."""
+
+    resolved = []
+    for cx, cy in foliage_cells_for_bounds(bounds, CELL_SIZE):
+        key = cell_key(cx, cy)
+        rel_path = game_rel_flyr_path(foliage_prefix, cx, cy)
+        abs_path = resolve_flyr_abs_path(rel_path, context, world_path=world_path)
+        if abs_path:
+            resolved.append((key, abs_path))
+    return resolved
 
 
 def get_terrain_size_for_world(world_root_collection) -> float:
@@ -186,6 +393,8 @@ def get_foliage_root_collection(world_root_collection):
     world_root_collection.children.link(coll)
     coll["_is_foliage_root"] = True
     coll["_loaded_cells"] = "[]"
+    coll[_OWNER_KEYS_PROP] = "[]"
+    coll[_LOADED_OWNERS_PROP] = "[]"
     return coll
 
 
@@ -202,6 +411,10 @@ def mark_cell_loaded(foliage_root, key: str):
     foliage_root["_loaded_cells"] = json.dumps(sorted(cells))
 
 
+def get_loaded_owners(foliage_root) -> set[str]:
+    return set(_json_string_list(foliage_root, _LOADED_OWNERS_PROP))
+
+
 def count_instances(foliage_root) -> int:
     total = 0
     for obj in foliage_root.objects:
@@ -211,7 +424,10 @@ def count_instances(foliage_root) -> int:
 
 
 def count_loaded_cells(foliage_root) -> int:
-    return len(get_loaded_cells(foliage_root))
+    cells = get_loaded_cells(foliage_root)
+    for owner_key in get_loaded_owners(foliage_root):
+        cells.add(owner_key.rsplit("|", 1)[-1])
+    return len(cells)
 
 
 # ---------------------------------------------------------------------------
@@ -240,37 +456,167 @@ def _pick_best_mesh(objects: list):
     return best
 
 
-def _get_or_import_source_mesh(depot_path: str, foliage_root):
-    """Return the single LOD0 source mesh for this depot path, importing if needed."""
+def _is_real_foliage_source(obj) -> bool:
+    """Return whether ``obj`` is usable as a hydrated foliage source."""
+
+    if obj is None or obj.get(_SOURCE_KIND_PROP) == FOLIAGE_SOURCE_MODE_PROXY:
+        return False
+    explicit = obj.get(_SOURCE_READY_PROP)
+    if explicit is not None:
+        return bool(explicit)
+    marker = str(obj.get("_depot_path", "") or "")
+    return bool(
+        marker.startswith("_src_")
+        and obj.type == 'MESH'
+        and obj.data is not None
+        and len(obj.data.vertices) > 0
+    )
+
+
+def _find_real_source_mesh(depot_path: str, foliage_root):
     marker = "_src_" + depot_path
     for obj in foliage_root.objects:
-        if obj.get("_depot_path") == marker:
+        if obj.get("_depot_path") == marker and _is_real_foliage_source(obj):
             return obj
+    return None
+
+
+def _remove_source_object(obj) -> None:
+    data = obj.data if getattr(obj, "type", None) == 'MESH' else None
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if data is not None and data.users == 0:
+        bpy.data.meshes.remove(data)
+
+
+def _foliage_proxy_kind(depot_path: str) -> str:
+    """Classify an SRT path into one of a few cheap visual preview shapes."""
+
+    path = str(depot_path or "").lower().replace("/", "\\")
+    name = os.path.splitext(os.path.basename(path))[0]
+    searchable = f"{path} {name.replace('_', ' ')}"
+
+    if any(word in searchable for word in (
+        "flower", "blossom", "dandelion", "poppy", "buttercup",
+    )):
+        return _PROXY_KIND_FLOWER
+    if any(word in searchable for word in (
+        "reed", "cattail", "bulrush", "water_rush", "water rush",
+    )):
+        return _PROXY_KIND_REED
+    if any(word in searchable for word in (
+        "grass", "fern", "herb", "weed", "nettle", "clover", "heather",
+        "moss", "ivy", "groundplant", "ground_plant", "small_plant",
+    )):
+        return _PROXY_KIND_GRASS
+    if any(word in searchable for word in (
+        "bush", "shrub", "bramble", "thicket", "hedge", "scrub",
+    )):
+        return _PROXY_KIND_SHRUB
+    if any(word in searchable for word in (
+        "pine", "spruce", "fir_", "fir ", "conifer", "larch",
+    )):
+        return _PROXY_KIND_CONIFER
+    if (
+        "\\trees\\" in path
+        or "\\tree\\" in path
+        or any(word in searchable for word in (
+            "tree", "birch", "willow", "oak", "alder", "beech", "elm",
+            "maple", "rowan", "poplar", "sycamore", "ash_tree",
+        ))
+    ):
+        return _PROXY_KIND_TREE
+    # Unknown types default to low vegetation.
+    return _PROXY_KIND_SHRUB
+
+
+def _hide_foliage_source(source) -> None:
+    """Keep source datablocks usable by GN but out of the viewport and render."""
+
+    source.hide_viewport = True
+    source.hide_render = True
+    try:
+        source.hide_select = True
+    except Exception:
+        pass
+    try:
+        source.hide_set(True)
+    except Exception:
+        pass
+
+
+def _get_or_create_proxy_source(foliage_root, depot_path: str = ""):
+    """Return one invisible placeholder used until a real source is hydrated."""
+
+    for obj in foliage_root.objects:
+        if obj.get(_PROXY_SOURCE_MARKER):
+            _hide_foliage_source(obj)
+            return obj
+
+    mesh = bpy.data.meshes.new("W3_foliage_placeholder")
+    mesh.from_pydata(((0.0, 0.0, 0.0),), (), ())
+    mesh.update()
+
+    source = bpy.data.objects.new("W3_foliage_placeholder_source", mesh)
+    source[_PROXY_SOURCE_MARKER] = True
+    source[_PROXY_KIND_PROP] = "hidden"
+    source["_is_foliage_source"] = True
+    source[_SOURCE_KIND_PROP] = FOLIAGE_SOURCE_MODE_PROXY
+    source[_SOURCE_READY_PROP] = False
+    foliage_root.objects.link(source)
+    _hide_foliage_source(source)
+    return source
+
+
+def _get_or_import_source_mesh(
+    depot_path: str,
+    foliage_root,
+    source_context_path: str = "",
+    context=None,
+):
+    """Return the single LOD0 source mesh for this depot path, importing if needed."""
+    marker = "_src_" + depot_path
+    existing = _find_real_source_mesh(depot_path, foliage_root)
+    if existing is not None:
+        _hide_foliage_source(existing)
+        return existing
+
+    # Discard failed legacy sources so hydration can retry.
+    for obj in list(foliage_root.objects):
+        if obj.get("_depot_path") == marker:
+            _remove_source_object(obj)
 
     from ..importers.import_helpers import meshPath
     from ..importers.import_blender_fun import _import_foliage_mesh
+    from .. import get_W3_FOLIAGE_PATH
 
-    mp = meshPath(meshName=depot_path)
+    mp = meshPath(
+        meshName=depot_path,
+        fbx_uncook_path=get_W3_FOLIAGE_PATH(context or getattr(bpy, "context", None)),
+    )
     mp.type = "mesh_foliage"
 
     before = {o.as_pointer() for o in bpy.data.objects}
     try:
-        _import_foliage_mesh(mp)
+        from ..CR2W.common_blender import redkit_repo_context
+        with redkit_repo_context(source_context_path or None):
+            _import_foliage_mesh(mp)
     except Exception:
         log.exception("Failed to import foliage type: %s", depot_path)
 
     new_objects = [o for o in bpy.data.objects if o.as_pointer() not in before]
     source = _pick_best_mesh(new_objects)
 
-    if source is None:
-        # Nothing imported — create a placeholder empty mesh so the instancer still works
-        mesh = bpy.data.meshes.new("foliage_src_empty")
-        source = bpy.data.objects.new("foliage_src_empty", mesh)
+    if source is None or source.data is None or len(source.data.vertices) == 0:
+        # Keep the instancer on the shared proxy and allow a later retry.
+        if source is not None:
+            _remove_source_object(source)
+        return None
 
     source["_depot_path"] = marker
     source["_is_foliage_source"] = True
-    source.hide_viewport = True
-    source.hide_render = True
+    source[_SOURCE_KIND_PROP] = FOLIAGE_SOURCE_MODE_FULL
+    source[_SOURCE_READY_PROP] = True
+    _hide_foliage_source(source)
 
     # Move to foliage root (remove from any scene collection it landed in)
     for c in list(source.users_collection):
@@ -283,6 +629,104 @@ def _get_or_import_source_mesh(depot_path: str, foliage_root):
 # ---------------------------------------------------------------------------
 # GN instancer: build tree + rebuild mesh
 # ---------------------------------------------------------------------------
+
+def _normalise_transform(transform) -> tuple[float, ...]:
+    values = tuple(float(value) for value in transform)
+    if len(values) == 6:
+        return values + (1.0, 1.0, 1.0)
+    if len(values) != 9:
+        raise ValueError("Foliage transforms must have 6 or 9 components")
+    return values
+
+
+def _mesh_vector_attribute(mesh, name: str, count: int, default) -> list[float]:
+    attr = mesh.attributes.get(name)
+    if attr is None or len(attr.data) != count:
+        return list(default) * count
+    values = [0.0] * (count * 3)
+    try:
+        attr.data.foreach_get("vector", values)
+        return values
+    except Exception:
+        result = []
+        for item in attr.data:
+            vector = getattr(item, "vector", default)
+            result.extend((float(vector[0]), float(vector[1]), float(vector[2])))
+        return result
+
+
+def _mesh_owner_attribute(mesh, count: int) -> list[int]:
+    attr = mesh.attributes.get(_OWNER_ATTRIBUTE)
+    if attr is None or len(attr.data) != count:
+        return [-1] * count
+    values = [0] * count
+    try:
+        attr.data.foreach_get("value", values)
+        return [int(value) for value in values]
+    except Exception:
+        return [int(getattr(item, "value", -1)) for item in attr.data]
+
+
+def _restore_root_transform_bucket(foliage_root) -> dict:
+    """Rehydrate tile/cell ownership from persistent instancer attributes."""
+
+    keys = _owner_keys(foliage_root)
+    owners = {key: {} for key in get_loaded_owners(foliage_root)}
+    owners.update({key: {} for key in get_loaded_cells(foliage_root)})
+    legacy_index = None
+
+    for obj in foliage_root.objects:
+        if not obj.get("_is_foliage_instancer") or obj.type != 'MESH' or obj.data is None:
+            continue
+        marker = str(obj.get("_depot_path", "") or "")
+        depot_path = marker[len("_inst_"):] if marker.startswith("_inst_") else marker
+        if not depot_path:
+            continue
+        mesh = obj.data
+        count = len(mesh.vertices)
+        if count == 0:
+            continue
+
+        positions = [0.0] * (count * 3)
+        try:
+            mesh.vertices.foreach_get("co", positions)
+        except Exception:
+            positions = [component for vertex in mesh.vertices for component in vertex.co[:]]
+        rotations = _mesh_vector_attribute(mesh, _ROTATION_ATTRIBUTE, count, (0.0, 0.0, 0.0))
+        scales = _mesh_vector_attribute(mesh, _SCALE_ATTRIBUTE, count, (1.0, 1.0, 1.0))
+        owner_indices = _mesh_owner_attribute(mesh, count)
+
+        for index in range(count):
+            owner_index = owner_indices[index]
+            if not 0 <= owner_index < len(keys):
+                if legacy_index is None:
+                    legacy_index = _ensure_owner_index(foliage_root, _LEGACY_OWNER)
+                    keys = _owner_keys(foliage_root)
+                    owners.setdefault(_LEGACY_OWNER, {})
+                owner_index = legacy_index
+            owner_key = keys[owner_index]
+            transform = tuple(
+                positions[index * 3:index * 3 + 3]
+                + rotations[index * 3:index * 3 + 3]
+                + scales[index * 3:index * 3 + 3]
+            )
+            owners.setdefault(owner_key, {}).setdefault(depot_path, []).append(transform)
+    return owners
+
+
+def _transforms_for_depot(root_transforms: dict, depot_path: str, owner_indices_by_key: dict):
+    combined = []
+    owner_indices = []
+    for owner_key, by_type in root_transforms.items():
+        transforms = by_type.get(depot_path, ())
+        if not transforms:
+            continue
+        owner_index = owner_indices_by_key[owner_key]
+        for transform in transforms:
+            combined.append(transform)
+            owner_indices.append(owner_index)
+    return combined, owner_indices
+
 
 def _build_foliage_gn_tree(ng, source_obj):
     """
@@ -319,9 +763,23 @@ def _build_foliage_gn_tree(ng, source_obj):
         except Exception:
             pass
     try:
-        na.inputs["Name"].default_value = "rot"
+        na.inputs["Name"].default_value = _ROTATION_ATTRIBUTE
     except Exception:
-        na.inputs[0].default_value = "rot"
+        na.inputs[0].default_value = _ROTATION_ATTRIBUTE
+
+    # Preserve packed uniform scale.
+    scale_attr = nodes.new('GeometryNodeInputNamedAttribute')
+    scale_attr.location = (-500, -275)
+    for value in ('FLOAT_VECTOR', 'VECTOR'):
+        try:
+            scale_attr.data_type = value
+            break
+        except Exception:
+            pass
+    try:
+        scale_attr.inputs["Name"].default_value = _SCALE_ATTRIBUTE
+    except Exception:
+        scale_attr.inputs[0].default_value = _SCALE_ATTRIBUTE
 
     # Euler → Rotation
     e2r = None
@@ -335,6 +793,12 @@ def _build_foliage_gn_tree(ng, source_obj):
 
     # Object Info — single LOD0 source mesh
     oi = nodes.new('GeometryNodeObjectInfo')
+    oi.name = _SOURCE_NODE_NAME
+    oi.label = _SOURCE_NODE_NAME
+    try:
+        oi["_is_foliage_source_node"] = True
+    except Exception:
+        pass
     oi.location = (-250, -300)
     try:
         oi.inputs['Object'].default_value = source_obj
@@ -362,43 +826,149 @@ def _build_foliage_gn_tree(ng, source_obj):
             links.new(na.outputs[0], iop.inputs['Rotation'])
         except Exception:
             pass
+    try:
+        links.new(scale_attr.outputs[0], iop.inputs['Scale'])
+    except Exception:
+        pass
     links.new(iop.outputs['Instances'], gout.inputs['Geometry'])
 
 
-def _rebuild_instancer_mesh(instancer_obj, transforms):
+def _instancer_source_nodes(instancer_obj) -> list:
+    tagged = []
+    fallback = []
+    for modifier in instancer_obj.modifiers:
+        if modifier.type != 'NODES' or modifier.node_group is None:
+            continue
+        for node in modifier.node_group.nodes:
+            if getattr(node, "bl_idname", "") != 'GeometryNodeObjectInfo':
+                continue
+            fallback.append(node)
+            try:
+                is_source = bool(node.get("_is_foliage_source_node"))
+            except Exception:
+                is_source = False
+            if is_source or node.name == _SOURCE_NODE_NAME:
+                tagged.append(node)
+    return tagged or fallback
+
+
+def _get_instancer_source(instancer_obj):
+    for node in _instancer_source_nodes(instancer_obj):
+        socket = node.inputs.get('Object')
+        if socket is not None:
+            return socket.default_value
+    return None
+
+
+def _sync_instancer_source_visibility(instancer_obj, source_obj) -> bool:
+    """Show hydrated vegetation and completely hide diagnostic fallback types."""
+
+    hidden = not _is_real_foliage_source(source_obj)
+    instancer_obj.hide_viewport = hidden
+    instancer_obj.hide_render = hidden
+    try:
+        instancer_obj.hide_select = hidden
+    except Exception:
+        pass
+    try:
+        instancer_obj.hide_set(hidden)
+    except Exception:
+        pass
+    instancer_obj[_FALLBACK_HIDDEN_PROP] = hidden
+    return hidden
+
+
+def _set_instancer_source(instancer_obj, source_obj) -> bool:
+    """Swap Object Info in-place so point ownership and meshes stay intact."""
+
+    changed = False
+    for node in _instancer_source_nodes(instancer_obj):
+        socket = node.inputs.get('Object')
+        if socket is None:
+            continue
+        socket.default_value = source_obj
+        changed = True
+        try:
+            node.id_data.update_tag()
+        except Exception:
+            pass
+    if changed:
+        mode = (
+            FOLIAGE_SOURCE_MODE_FULL
+            if _is_real_foliage_source(source_obj)
+            else FOLIAGE_SOURCE_MODE_PROXY
+        )
+        instancer_obj[_SOURCE_MODE_PROP] = mode
+        _sync_instancer_source_visibility(instancer_obj, source_obj)
+        try:
+            instancer_obj.update_tag()
+        except Exception:
+            pass
+    return changed
+
+
+def _rebuild_instancer_mesh(instancer_obj, transforms, owner_indices=None):
     """
     Rebuild the instancer mesh from all accumulated transforms.
-    transforms: list of (x, y, z, ex, ey, ez)  — XYZ euler, radians.
+    transforms: list of (x, y, z, ex, ey, ez, sx, sy, sz), radians + scale.
     """
     mesh = instancer_obj.data
+    transforms = [_normalise_transform(transform) for transform in transforms]
     n = len(transforms)
+    if owner_indices is None:
+        owner_indices = [-1] * n
+    elif len(owner_indices) != n:
+        raise ValueError("Foliage owner id count does not match transform count")
     mesh.clear_geometry()
 
     if n == 0:
+        mesh.update()
         return
 
-    flat_pos = []
-    flat_rot = []
-    for (x, y, z, ex, ey, ez) in transforms:
-        flat_pos += [x, y, z]
-        flat_rot += [ex, ey, ez]
+    flat_pos = [value for transform in transforms for value in transform[0:3]]
+    flat_rot = [value for transform in transforms for value in transform[3:6]]
+    flat_scale = [value for transform in transforms for value in transform[6:9]]
 
     mesh.vertices.add(n)
     mesh.vertices.foreach_set("co", flat_pos)
 
-    existing = mesh.attributes.get("rot")
-    if existing is not None:
-        mesh.attributes.remove(existing)
-    attr = mesh.attributes.new("rot", 'FLOAT_VECTOR', 'POINT')
-    attr.data.foreach_set("vector", flat_rot)
+    for name in (_ROTATION_ATTRIBUTE, _SCALE_ATTRIBUTE, _OWNER_ATTRIBUTE):
+        existing = mesh.attributes.get(name)
+        if existing is not None:
+            mesh.attributes.remove(existing)
+    rotation_attr = mesh.attributes.new(_ROTATION_ATTRIBUTE, 'FLOAT_VECTOR', 'POINT')
+    rotation_attr.data.foreach_set("vector", flat_rot)
+    scale_attr = mesh.attributes.new(_SCALE_ATTRIBUTE, 'FLOAT_VECTOR', 'POINT')
+    scale_attr.data.foreach_set("vector", flat_scale)
+    owner_attr = mesh.attributes.new(_OWNER_ATTRIBUTE, 'INT', 'POINT')
+    owner_attr.data.foreach_set("value", owner_indices)
     mesh.update()
 
 
-def _get_or_create_instancer(depot_path: str, source_obj, foliage_root):
+def _get_or_create_instancer(
+    depot_path: str,
+    source_obj,
+    foliage_root,
+    source_context_path: str = "",
+):
     """Return (or create) the GN instancer object for this depot path."""
     marker = "_inst_" + depot_path
     for obj in foliage_root.objects:
         if obj.get("_depot_path") == marker:
+            if int(obj.get("_foliage_gn_version", 0) or 0) < 2:
+                modifier = next((mod for mod in obj.modifiers if mod.type == 'NODES'), None)
+                old_group = modifier.node_group if modifier is not None else None
+                node_group = bpy.data.node_groups.new(obj.name + "_GN_v2", 'GeometryNodeTree')
+                if modifier is None:
+                    modifier = obj.modifiers.new("FoliageInstancer", 'NODES')
+                modifier.node_group = node_group
+                _build_foliage_gn_tree(node_group, source_obj)
+                if old_group is not None and old_group.users == 0:
+                    bpy.data.node_groups.remove(old_group)
+                obj["_foliage_gn_version"] = 2
+            _set_instancer_source(obj, source_obj)
+            if source_context_path:
+                obj[_SOURCE_CONTEXT_PROP] = str(source_context_path)
             return obj
 
     safe = "fi_" + depot_path.replace("\\", "_").replace("/", "_").replace(":", "_")[-55:]
@@ -406,84 +976,598 @@ def _get_or_create_instancer(depot_path: str, source_obj, foliage_root):
     obj  = bpy.data.objects.new(safe, mesh)
     obj["_depot_path"] = marker
     obj["_is_foliage_instancer"] = True
+    obj["_foliage_gn_version"] = 2
     foliage_root.objects.link(obj)
 
     ng  = bpy.data.node_groups.new(safe + "_GN", 'GeometryNodeTree')
     mod = obj.modifiers.new("FoliageInstancer", 'NODES')
     mod.node_group = ng
     _build_foliage_gn_tree(ng, source_obj)
+    _set_instancer_source(obj, source_obj)
+    if source_context_path:
+        obj[_SOURCE_CONTEXT_PROP] = str(source_context_path)
 
     return obj
 
 
-# ---------------------------------------------------------------------------
-# Load one .flyr cell
-# ---------------------------------------------------------------------------
+def _find_instancer(depot_path: str, foliage_root):
+    marker = "_inst_" + depot_path
+    for obj in foliage_root.objects:
+        if obj.get("_depot_path") == marker:
+            return obj
+    return None
 
-def load_foliage_cell(game_rel_path: str, foliage_root, context):
-    from ..CR2W.CR2W_reader import load_foliage
 
-    abs_path = resolve_flyr_abs_path(game_rel_path)
-    if not abs_path:
-        log.warning("Could not resolve flyr path: %s", game_rel_path)
-        return False, 0
+def _instancer_depot_path(instancer_obj) -> str:
+    marker = str(instancer_obj.get("_depot_path", "") or "")
+    return marker[len("_inst_"):] if marker.startswith("_inst_") else ""
 
+
+def _foliage_type_instance_counts(root_transforms: dict) -> dict[str, int]:
+    counts = {}
+    for by_type in root_transforms.values():
+        for depot_path, transforms in by_type.items():
+            count = len(transforms)
+            if count:
+                counts[depot_path] = counts.get(depot_path, 0) + count
+    return counts
+
+
+def _viewer_source_priority(
+    root_transforms: dict,
+    *,
+    ground_limit: int = FOLIAGE_VIEWER_GROUND_SOURCE_LIMIT,
+    tree_limit: int = FOLIAGE_VIEWER_TREE_SOURCE_LIMIT,
+) -> tuple[str, ...]:
+    """Choose a bounded set of dominant real sources for a fast polished view."""
+
+    counts = _foliage_type_instance_counts(root_transforms)
+    tree_kinds = {_PROXY_KIND_TREE, _PROXY_KIND_CONIFER}
+    trees = []
+    ground = []
+    for depot_path, count in counts.items():
+        item = (-count, depot_path.lower(), depot_path)
+        if _foliage_proxy_kind(depot_path) in tree_kinds:
+            trees.append(item)
+        else:
+            ground.append(item)
+    trees.sort()
+    ground.sort()
+    selected = ground[:max(0, int(ground_limit))] + trees[:max(0, int(tree_limit))]
+    # Prioritize the most common selected types.
+    selected.sort()
+    return tuple(item[2] for item in selected)
+
+
+def _sync_fallback_instancer_visibility(foliage_root) -> tuple[str, ...]:
+    hidden = []
+    for obj in foliage_root.objects:
+        if not obj.get("_is_foliage_instancer"):
+            continue
+        depot_path = _instancer_depot_path(obj)
+        source = _get_instancer_source(obj)
+        if _sync_instancer_source_visibility(obj, source):
+            if obj.type == 'MESH' and obj.data is not None and len(obj.data.vertices):
+                hidden.append(depot_path)
+    return tuple(sorted(path for path in hidden if path))
+
+
+def _rebuild_depot_types(
+    foliage_root,
+    root_transforms: dict,
+    depot_paths: Iterable[str],
+    source_context_by_type: dict | None = None,
+    source_mode: str = FOLIAGE_SOURCE_MODE_FULL,
+    context=None,
+) -> None:
+    """Upload every affected type once after all requested cells were parsed."""
+
+    source_mode = _normalise_source_mode(source_mode)
+    source_context_by_type = source_context_by_type or {}
+    owner_indices_by_key = _ensure_owner_indices(foliage_root, root_transforms)
+    for depot_path in sorted(set(depot_paths)):
+        transforms, owner_indices = _transforms_for_depot(
+            root_transforms,
+            depot_path,
+            owner_indices_by_key,
+        )
+        if not transforms:
+            instancer = _find_instancer(depot_path, foliage_root)
+            if instancer is not None:
+                _rebuild_instancer_mesh(instancer, (), ())
+            continue
+        source_context_path = source_context_by_type.get(depot_path, "")
+        source = _find_real_source_mesh(depot_path, foliage_root)
+        if source is None and source_mode == FOLIAGE_SOURCE_MODE_FULL:
+            source = _get_or_import_source_mesh(
+                depot_path,
+                foliage_root,
+                source_context_path,
+                context,
+            )
+        if source is None:
+            source = _get_or_create_proxy_source(foliage_root, depot_path)
+        instancer = _get_or_create_instancer(
+            depot_path,
+            source,
+            foliage_root,
+            source_context_path,
+        )
+        _rebuild_instancer_mesh(instancer, transforms, owner_indices)
+
+
+def list_missing_foliage_sources(foliage_root) -> tuple[str, ...]:
+    """List placed foliage types whose instancers still use a proxy source."""
+
+    missing = set()
+    for obj in foliage_root.objects:
+        if not obj.get("_is_foliage_instancer"):
+            continue
+        depot_path = _instancer_depot_path(obj)
+        if not depot_path:
+            continue
+        if obj.type == 'MESH' and obj.data is not None and len(obj.data.vertices) == 0:
+            continue
+        if not _is_real_foliage_source(_get_instancer_source(obj)):
+            missing.add(depot_path)
+    return tuple(sorted(missing))
+
+
+def hydrate_missing_foliage_sources(
+    foliage_root,
+    context=None,
+    *,
+    depot_paths: Iterable[str] | None = None,
+    max_sources: int | None = None,
+) -> FoliageHydrationResult:
+    """Replace selected proxy sources without rebuilding points."""
+
+    missing = list_missing_foliage_sources(foliage_root)
+    if depot_paths is None:
+        requested = list(missing)
+    else:
+        if isinstance(depot_paths, str):
+            selected = [depot_paths]
+        else:
+            selected = list(dict.fromkeys(str(value) for value in depot_paths))
+        missing_set = set(missing)
+        requested = [depot_path for depot_path in selected if depot_path in missing_set]
+
+    if max_sources is not None:
+        max_sources = int(max_sources)
+        if max_sources < 0:
+            raise ValueError("max_sources cannot be negative")
+        requested = requested[:max_sources]
+
+    hydrated = []
+    failed = []
+    for depot_path in requested:
+        instancer = _find_instancer(depot_path, foliage_root)
+        if instancer is None:
+            failed.append(depot_path)
+            continue
+        source_context_path = str(instancer.get(_SOURCE_CONTEXT_PROP, "") or "")
+        try:
+            source = _get_or_import_source_mesh(
+                depot_path,
+                foliage_root,
+                source_context_path,
+                context,
+            )
+            if source is None:
+                failed.append(depot_path)
+                continue
+            _get_or_create_instancer(
+                depot_path,
+                source,
+                foliage_root,
+                source_context_path,
+            )
+            hydrated.append(depot_path)
+        except Exception:
+            log.exception("Failed to hydrate foliage type: %s", depot_path)
+            failed.append(depot_path)
+
+    return FoliageHydrationResult(
+        requested_types=tuple(requested),
+        hydrated_types=tuple(hydrated),
+        failed_types=tuple(failed),
+        remaining_types=list_missing_foliage_sources(foliage_root),
+    )
+
+
+def apply_viewer_source_budget(foliage_root, context=None) -> FoliageHydrationResult:
+    """Keep only the root-wide dominant foliage types on real source meshes."""
+
+    root_transforms = _get_root_transform_bucket(foliage_root, create=True)
+    priority = tuple(_viewer_source_priority(root_transforms))
+    priority_set = set(priority)
+    placeholder = None
+    for obj in foliage_root.objects:
+        if not obj.get("_is_foliage_instancer"):
+            continue
+        depot_path = _instancer_depot_path(obj)
+        if not depot_path or depot_path in priority_set:
+            continue
+        if placeholder is None:
+            placeholder = _get_or_create_proxy_source(foliage_root)
+        _set_instancer_source(obj, placeholder)
+
+    return hydrate_missing_foliage_sources(
+        foliage_root,
+        context,
+        depot_paths=priority,
+    )
+
+
+def _rebuild_depot_types_transactionally(
+    foliage_root,
+    previous_transforms: dict,
+    candidate_transforms: dict,
+    affected_types,
+    source_context_by_type=None,
+    *,
+    source_mode: str,
+    context=None,
+) -> None:
+    """Restore previous point geometry if any affected-type rebuild fails."""
+
+    owner_keys_before = str(foliage_root.get(_OWNER_KEYS_PROP, "[]") or "[]")
     try:
-        level = load_foliage(abs_path)
+        _rebuild_depot_types(
+            foliage_root,
+            candidate_transforms,
+            affected_types,
+            source_context_by_type,
+            source_mode=source_mode,
+            context=context,
+        )
     except Exception:
-        log.exception("Failed to load: %s", abs_path)
-        return False, 0
+        foliage_root[_OWNER_KEYS_PROP] = owner_keys_before
+        try:
+            _rebuild_depot_types(
+                foliage_root,
+                previous_transforms,
+                affected_types,
+                source_mode=FOLIAGE_SOURCE_MODE_PROXY,
+                context=context,
+            )
+        except Exception:
+            log.exception("Failed to restore foliage geometry after rebuild error")
+        finally:
+            foliage_root[_OWNER_KEYS_PROP] = owner_keys_before
+        raise
 
-    foliage_chunk = getattr(level, "Foliage", None)
-    if foliage_chunk is None:
-        log.warning("Foliage file has no Foliage chunk: %s", abs_path)
-        return False, 0
 
+def _normalise_cell_entries(cell_paths) -> list[tuple[str, str]]:
+    if isinstance(cell_paths, dict):
+        iterable = cell_paths.items()
+    elif isinstance(cell_paths, (str, os.PathLike)):
+        iterable = (cell_paths,)
+    else:
+        iterable = cell_paths or ()
+
+    result = []
+    for entry in iterable:
+        if isinstance(entry, (str, os.PathLike)):
+            path = os.fspath(entry)
+            key = cell_key_from_path(path)
+        else:
+            try:
+                key, path = entry
+            except (TypeError, ValueError):
+                raise ValueError("Foliage cells must be paths or (cell_key, path) pairs") from None
+            key = str(key)
+            path = os.fspath(path)
+        result.append((str(key), str(path)))
+    return result
+
+
+def _scoped_owner_key(owner_scope: str, key: str) -> str:
+    owner_scope = str(owner_scope or "").strip()
+    return f"{owner_scope}|{key}" if owner_scope else str(key)
+
+
+def _collect_cell_transforms(foliage_chunk, bounds=None) -> dict[str, list[tuple[float, ...]]]:
     all_tree_data = []
     if hasattr(foliage_chunk, "Trees"):
         all_tree_data += list(foliage_chunk.Trees.elements)
     if hasattr(foliage_chunk, "Grasses"):
         all_tree_data += list(foliage_chunk.Grasses.elements)
 
-    # Batch transforms by depot_path
-    new_by_type: dict = {}
+    by_type: dict[str, list[tuple[float, ...]]] = {}
     for tree_data in all_tree_data:
         try:
-            depot_path = tree_data.TreeType.DepotPath
+            depot_path = str(tree_data.TreeType.DepotPath or "").strip()
         except Exception:
             continue
         if not depot_path:
             continue
-
-        instances = []
-        if hasattr(tree_data, "TreeCollection") and hasattr(tree_data.TreeCollection, "elements"):
-            instances = tree_data.TreeCollection.elements
-
-        for inst in instances:
+        collection = getattr(tree_data, "TreeCollection", None)
+        instances = list(getattr(collection, "elements", ()) or ())
+        for instance in instances:
             try:
-                q = Euler((radians(float(inst.Yaw)),
-                           radians(float(inst.Pitch)),
-                           radians(float(inst.Roll))), 'YXZ').to_quaternion()
-                e = q.to_euler('XYZ')
-                new_by_type.setdefault(depot_path, []).append(
-                    (float(inst.X), float(inst.Y), float(inst.Z), e.x, e.y, e.z)
+                decoded = decode_foliage_instance_transform(instance)
+                x, y, z = decoded.location
+                if bounds is not None and not point_in_bounds(x, y, bounds):
+                    continue
+                transform = (
+                    x,
+                    y,
+                    z,
+                    *decoded.rotation_xyz,
+                    *decoded.scale,
                 )
+                if not all(math.isfinite(value) for value in transform):
+                    continue
+                by_type.setdefault(depot_path, []).append(transform)
             except Exception:
                 continue
+    return by_type
 
-    instance_count = sum(len(v) for v in new_by_type.values())
+
+def load_foliage_cells(
+    cell_paths,
+    foliage_root,
+    context=None,
+    *,
+    bounds: Bounds2D | Sequence[float] | None = None,
+    owner_scope: str = "",
+    replace: bool = False,
+    source_mode: str = FOLIAGE_SOURCE_MODE_FULL,
+    hydrate_viewer_sources: bool = True,
+) -> FoliageLoadResult:
+    """Parse cells and upload each affected foliage type once."""
+
+    from ..CR2W.CR2W_reader import load_foliage
+    from ..CR2W.common_blender import redkit_repo_context
+
+    source_mode = _normalise_source_mode(source_mode)
+    entries = _normalise_cell_entries(cell_paths)
+    if bounds is not None and not isinstance(bounds, Bounds2D):
+        bounds = Bounds2D(*(float(value) for value in bounds))
+    requested = tuple(key for key, _path in entries)
+    root_transforms = _get_root_transform_bucket(foliage_root, create=True)
+    candidate_transforms = dict(root_transforms)
+    loaded_cell_keys = get_loaded_cells(foliage_root)
+    loaded_owner_keys = get_loaded_owners(foliage_root)
+
+    loaded = []
+    skipped = []
+    failed = []
+    instance_count = 0
+    affected_types = set()
+    hydrate_types = set()
+    source_context_by_type = {}
+    new_owner_keys = set()
+
+    for key, path in entries:
+        owner_key = _scoped_owner_key(owner_scope, key)
+        if not replace and (
+            owner_key in candidate_transforms
+            or (bounds is None and not owner_scope and key in loaded_cell_keys)
+        ):
+            if source_mode == FOLIAGE_SOURCE_MODE_FULL:
+                hydrate_types.update(candidate_transforms.get(owner_key, {}))
+            else:
+                # Reapply viewer source policy to cached cells.
+                affected_types.update(candidate_transforms.get(owner_key, {}))
+            skipped.append(key)
+            continue
+
+        abs_path = resolve_flyr_abs_path(path, context)
+        if not abs_path:
+            log.warning("Could not resolve flyr path: %s", path)
+            failed.append(key)
+            continue
+        try:
+            with redkit_repo_context(abs_path):
+                level = load_foliage(abs_path)
+        except Exception:
+            log.exception("Failed to load: %s", abs_path)
+            failed.append(key)
+            continue
+
+        foliage_chunk = getattr(level, "Foliage", None)
+        if foliage_chunk is None:
+            log.warning("Foliage file has no Foliage chunk: %s", abs_path)
+            failed.append(key)
+            continue
+
+        by_type = _collect_cell_transforms(foliage_chunk, bounds=bounds)
+        previous = candidate_transforms.get(owner_key, {})
+        affected_types.update(previous)
+        affected_types.update(by_type)
+        candidate_transforms[owner_key] = by_type
+        new_owner_keys.add(owner_key)
+
+        for depot_path, transforms in by_type.items():
+            instance_count += len(transforms)
+            source_context_by_type.setdefault(depot_path, abs_path)
+        loaded.append(key)
+        if bounds is None and not owner_scope:
+            loaded_cell_keys.add(key)
+        else:
+            loaded_owner_keys.add(owner_key)
+
+    if affected_types:
+        _rebuild_depot_types_transactionally(
+            foliage_root,
+            root_transforms,
+            candidate_transforms,
+            affected_types,
+            source_context_by_type,
+            source_mode=source_mode,
+            context=context,
+        )
+    elif new_owner_keys:
+        _ensure_owner_indices(foliage_root, new_owner_keys)
+
+    if new_owner_keys:
+        root_transforms.clear()
+        root_transforms.update(candidate_transforms)
+        _set_json_string_list(foliage_root, "_loaded_cells", sorted(loaded_cell_keys))
+        _set_json_string_list(foliage_root, _LOADED_OWNERS_PROP, sorted(loaded_owner_keys))
+    foliage_root[_SOURCE_MODE_PROP] = source_mode
+
+    hydrated_types = ()
+    if source_mode == FOLIAGE_SOURCE_MODE_PROXY and hydrate_viewer_sources:
+        hydration = apply_viewer_source_budget(foliage_root, context)
+        hydrated_types = hydration.hydrated_types
+    elif source_mode == FOLIAGE_SOURCE_MODE_FULL and hydrate_types:
+        hydration = hydrate_missing_foliage_sources(
+            foliage_root,
+            context,
+            depot_paths=hydrate_types,
+        )
+        hydrated_types = hydration.hydrated_types
+
+    hidden_fallback_types = _sync_fallback_instancer_visibility(foliage_root)
+
+    return FoliageLoadResult(
+        requested_cells=requested,
+        loaded_cells=tuple(loaded),
+        skipped_cells=tuple(skipped),
+        failed_cells=tuple(failed),
+        instance_count=instance_count,
+        affected_types=tuple(sorted(affected_types)),
+        hydrated_types=tuple(hydrated_types),
+        hidden_fallback_types=hidden_fallback_types,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Load one .flyr cell
+# ---------------------------------------------------------------------------
+
+def load_foliage_cell(
+    game_rel_path: str,
+    foliage_root,
+    context,
+    *,
+    source_mode: str = FOLIAGE_SOURCE_MODE_FULL,
+):
+    """Compatibility wrapper for the original single-cell operator API."""
+
+    result = load_foliage_cells(
+        (game_rel_path,),
+        foliage_root,
+        context,
+        source_mode=source_mode,
+    )
+    succeeded = bool(result.loaded_cells or result.skipped_cells) and not result.failed_cells
+    return succeeded, result.instance_count
+
+
+def load_foliage_for_bounds(
+    world_path: str,
+    world_root_collection,
+    context,
+    bounds: Bounds2D | Sequence[float],
+    *,
+    owner_scope: str,
+    replace: bool = False,
+    source_mode: str = FOLIAGE_SOURCE_MODE_FULL,
+) -> FoliageLoadResult:
+    """Directly resolve and batch-load the foliage intersecting world bounds."""
+
+    foliage_prefix = get_game_rel_foliage_prefix(world_path, context)
+    cells = resolve_foliage_cells_for_bounds(
+        foliage_prefix,
+        bounds,
+        context,
+        world_path=world_path,
+    )
+    foliage_root = get_foliage_root_collection(world_root_collection)
+    return load_foliage_cells(
+        cells,
+        foliage_root,
+        context,
+        bounds=bounds,
+        owner_scope=owner_scope,
+        replace=replace,
+        source_mode=source_mode,
+    )
+
+
+def load_foliage_for_tile(
+    world_path: str,
+    world_root_collection,
+    context,
+    tile_x: int,
+    tile_y: int,
+    tiles_x: int,
+    tiles_y: int,
+    terrain_size: float,
+    *,
+    invert_y: bool = False,
+    replace: bool = False,
+    source_mode: str = FOLIAGE_SOURCE_MODE_FULL,
+) -> FoliageLoadResult:
+    """Import only one terrain tile's foliage using deterministic cell paths."""
+
+    bounds = terrain_tile_bounds(
+        tile_x,
+        tile_y,
+        tiles_x,
+        tiles_y,
+        terrain_size,
+        invert_y=invert_y,
+    )
+    return load_foliage_for_bounds(
+        world_path,
+        world_root_collection,
+        context,
+        bounds,
+        owner_scope=f"tile:{int(tile_x)}:{int(tile_y)}",
+        replace=replace,
+        source_mode=source_mode,
+    )
+
+
+def unload_foliage_owners(foliage_root, owner_keys: Iterable[str]) -> int:
+    """Remove tile/cell-owned points and rebuild each affected type once."""
 
     root_transforms = _get_root_transform_bucket(foliage_root, create=True)
+    candidate_transforms = dict(root_transforms)
+    affected_types = set()
+    removed_instances = 0
+    loaded_cells = get_loaded_cells(foliage_root)
+    loaded_owners = get_loaded_owners(foliage_root)
+    for owner_key in {str(value) for value in owner_keys}:
+        by_type = candidate_transforms.pop(owner_key, None)
+        if by_type is None:
+            continue
+        affected_types.update(by_type)
+        removed_instances += sum(len(transforms) for transforms in by_type.values())
+        loaded_owners.discard(owner_key)
+        if "|" not in owner_key:
+            loaded_cells.discard(owner_key)
+    if affected_types:
+        # Keep unloading free of source imports.
+        _rebuild_depot_types_transactionally(
+            foliage_root,
+            root_transforms,
+            candidate_transforms,
+            affected_types,
+            source_mode=FOLIAGE_SOURCE_MODE_PROXY,
+        )
+    root_transforms.clear()
+    root_transforms.update(candidate_transforms)
+    _set_json_string_list(foliage_root, "_loaded_cells", sorted(loaded_cells))
+    _set_json_string_list(foliage_root, _LOADED_OWNERS_PROP, sorted(loaded_owners))
+    return removed_instances
 
-    for depot_path, new_transforms in new_by_type.items():
-        source = _get_or_import_source_mesh(depot_path, foliage_root)
-        instancer = _get_or_create_instancer(depot_path, source, foliage_root)
 
-        combined = root_transforms.get(depot_path, []) + new_transforms
-        root_transforms[depot_path] = combined
-        _rebuild_instancer_mesh(instancer, combined)
+def unload_foliage_tile(foliage_root, tile_x: int, tile_y: int) -> int:
+    """Unload every cell contribution owned by one terrain tile."""
 
-    return True, instance_count
+    prefix = f"tile:{int(tile_x)}:{int(tile_y)}|"
+    root_transforms = _get_root_transform_bucket(foliage_root, create=True)
+    return unload_foliage_owners(
+        foliage_root,
+        (owner_key for owner_key in tuple(root_transforms) if owner_key.startswith(prefix)),
+    )
 
 
 # ---------------------------------------------------------------------------

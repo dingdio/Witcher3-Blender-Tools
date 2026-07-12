@@ -41,7 +41,11 @@ def _read_redcloth_material_payload(redcloth_resource: str, mat_filename: str):
                 continue
             materials_handle = chunk.GetVariableByName("materials")
             if materials_handle and hasattr(materials_handle, "Handles"):
-                materials = [redcloth_material[o.Reference] for o in materials_handle.Handles]
+                # Preserve material-slot alignment.
+                materials = [
+                    redcloth_material[o.Reference] if getattr(o, "Reference", None) is not None else None
+                    for o in materials_handle.Handles
+                ]
             apex_names = chunk.GetVariableByName("apexMaterialNames")
             if apex_names and hasattr(apex_names, "elements"):
                 material_names = []

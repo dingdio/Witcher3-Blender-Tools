@@ -16,7 +16,7 @@ _MESH_IMPORT_TIMING_ENABLED = True
 _MESH_IMPORT_WARN_THRESHOLD = 0.25
 _LAYER_IMPORT_PROFILE_ENABLED = True
 _LAYER_IMPORT_PROFILE_WARN_THRESHOLD = 0.25
-CACHED_LAYER_TRANSFORM_MODE_VERSION = 4
+CACHED_LAYER_TRANSFORM_MODE_VERSION = 7
 
 from .. import fbx_util
 from .. import get_uncook_path
@@ -191,8 +191,12 @@ def _set_layer_import_state(collection, level_file, state, progress_count=0, err
             collection["witcher_layer_load_camera_y"] = float(cam[1])
             collection["witcher_layer_load_camera_z"] = float(cam[2])
             collection["witcher_layer_load_radius"] = float(nearby_filter.get("radius", 0.0) or 0.0)
-            if mode_signature is not None:
-                collection["witcher_layer_load_mode"] = str(mode_signature)
+        except Exception:
+            pass
+    if mode_signature is not None:
+        try:
+            # Persist the mode even without a nearby filter.
+            collection["witcher_layer_load_mode"] = str(mode_signature)
         except Exception:
             pass
     if plan_hash is not None:
@@ -353,7 +357,6 @@ def _log_layer_import_profile_summary(level_file, kwargs):
 
 
 _LAYER_IMPORT_OWNER_PROP = "witcher_layer_owner"
-_LAYER_IMPORT_GENERATION_PROP = "witcher_layer_generation"
 _LAYER_IMPORT_PLAN_ITEM_PROP = "witcher_layer_plan_item_id"
 _LAYER_IMPORT_PLAN_MODE_PROP = "witcher_layer_plan_mode"
 _CACHED_REDCLOTH_ITEM_KINDS = frozenset({"cloth"})
@@ -679,7 +682,7 @@ def _static_mesh_component_paths_from_template_source(
     return meshes
 
 
-def _set_object_local_matrix_direct(obj, local_matrix):
+def _set_object_local_matrix_direct(obj, local_matrix, parent_inverse=None):
     if obj is None or local_matrix is None:
         return
     try:
@@ -687,12 +690,24 @@ def _set_object_local_matrix_direct(obj, local_matrix):
     except Exception:
         return
     identity = Matrix.Identity(4)
+    if parent_inverse is None:
+        parent_inverse = identity
+    else:
+        try:
+            parent_inverse = parent_inverse.copy()
+        except Exception:
+            parent_inverse = identity
     try:
-        obj.matrix_parent_inverse = identity.copy()
+        obj.matrix_parent_inverse = parent_inverse.copy()
     except Exception:
         pass
+    # Write basis last; other matrix setters may recalculate it.
     try:
-        obj.matrix_basis = local_matrix.copy()
+        parent_obj = getattr(obj, "parent", None)
+        obj.matrix_world = (
+            parent_obj.matrix_world @ parent_inverse @ local_matrix
+            if parent_obj is not None else local_matrix.copy()
+        )
     except Exception:
         pass
     try:
@@ -700,8 +715,8 @@ def _set_object_local_matrix_direct(obj, local_matrix):
     except Exception:
         pass
     try:
-        parent_obj = getattr(obj, "parent", None)
-        obj.matrix_world = (parent_obj.matrix_world @ local_matrix) if parent_obj is not None else local_matrix.copy()
+        obj.matrix_parent_inverse = parent_inverse.copy()
+        obj.matrix_basis = local_matrix.copy()
     except Exception:
         pass
 
@@ -840,7 +855,6 @@ def _import_component_mesh_from_mesh(
     _tag_single_object_for_layer(
         component_obj,
         kwargs.get("_layer_import_owner"),
-        kwargs.get("_layer_import_generation"),
     )
     _tag_object_tree_for_plan_item(
         component_obj,
@@ -912,7 +926,6 @@ def _import_meshless_component_empty(component, parent_obj, **kwargs):
     _tag_object_tree_for_layer_and_plan(
         obj,
         kwargs.get("_layer_import_owner"),
-        kwargs.get("_layer_import_generation"),
         kwargs.get("_layer_import_plan_item_id"),
         kwargs.get("_layer_import_plan_mode"),
     )
@@ -1596,16 +1609,13 @@ def _apply_plan_item_transform_for_parent(obj, item, parent_obj):
         _apply_plan_item_transform(obj, item)
 
 
-def _tag_single_object_for_layer(obj, owner_tag=None, generation_tag=None):
+def _tag_single_object_for_layer(obj, owner_tag=None):
     if obj is None:
         return
     owner_tag = str(owner_tag or "").strip()
-    generation_tag = str(generation_tag or "").strip()
     try:
         if owner_tag:
             obj[_LAYER_IMPORT_OWNER_PROP] = owner_tag
-        if generation_tag:
-            obj[_LAYER_IMPORT_GENERATION_PROP] = generation_tag
     except Exception:
         pass
 
@@ -1837,7 +1847,6 @@ def _import_plan_as_dev_empties(plan, target_collection, kwargs):
         target_collection = _get_active_collection()
     created = {}
     owner_tag = kwargs.get("_layer_import_owner")
-    generation_tag = kwargs.get("_layer_import_generation")
 
     for item in plan.get("items", []):
         _raise_if_layer_import_cancelled(kwargs)
@@ -1848,7 +1857,7 @@ def _import_plan_as_dev_empties(plan, target_collection, kwargs):
         if parent_obj is not None:
             obj.parent = parent_obj
         _apply_plan_item_transform_for_parent(obj, item, parent_obj)
-        _tag_single_object_for_layer(obj, owner_tag, generation_tag)
+        _tag_single_object_for_layer(obj, owner_tag)
         try:
             obj["witcher_dev_proxy"] = True
             obj["witcher_dev_kind"] = str(item.get("kind", "") or "")
@@ -1900,7 +1909,6 @@ def _import_cached_plan_redcloth_items(plan, target_collection, kwargs, context=
 
     created = {}
     owner_tag = kwargs.get("_layer_import_owner")
-    generation_tag = kwargs.get("_layer_import_generation")
 
     def ensure_parent_empty(item_id):
         item_id = str(item_id or "").strip()
@@ -1922,7 +1930,7 @@ def _import_cached_plan_redcloth_items(plan, target_collection, kwargs, context=
         if parent_obj is not None:
             obj.parent = parent_obj
         _apply_plan_item_transform_for_parent(obj, item, parent_obj)
-        _tag_single_object_for_layer(obj, owner_tag, generation_tag)
+        _tag_single_object_for_layer(obj, owner_tag)
         _tag_object_tree_for_plan_item(obj, item_id, mode_signature)
         try:
             if kind == "entity":
@@ -1976,6 +1984,7 @@ def _import_cached_plan_redcloth_items(plan, target_collection, kwargs, context=
                     import_name="CClothComponent",
                     entity_name=str(item.get("name", "") or Path(resource.replace("/", "\\")).stem),
                     target_collection=target_collection,
+                    hide_collision_proxies=bool(kwargs.get("hide_proxy_meshes", False)),
                 )
         except Exception as exc:
             resource_label = "redapex" if _is_redapex_resource(resource) else "redcloth"
@@ -1986,6 +1995,7 @@ def _import_cached_plan_redcloth_items(plan, target_collection, kwargs, context=
         if cloth_arma is None:
             continue
         root_obj = cloth_grp if cloth_grp is not None else cloth_arma
+        _apply_requested_proxy_helper_visibility(root_obj, kwargs)
         if parent_obj is not None:
             root_obj.parent = parent_obj
             _apply_plan_item_transform_as_child(root_obj, item)
@@ -1994,7 +2004,6 @@ def _import_cached_plan_redcloth_items(plan, target_collection, kwargs, context=
         _tag_object_tree_for_layer_and_plan(
             root_obj,
             owner_tag,
-            generation_tag,
             item_id,
             mode_signature,
         )
@@ -2010,9 +2019,7 @@ def _cached_plan_mesh_enabled(kind, kwargs, item=None):
     if kind in {"mesh", "component_mesh", "foliage", "grass"}:
         return bool(kwargs.get("do_import_Mesh", True))
     if kind == "sector_instancer":
-        # Synthetic sector_instancer items are only emitted by the grouping helper after
-        # the per-toggle filter, so respecting their original source kind here would just
-        # double-filter. Trust upstream filtering.
+        # Grouped instancers were already filtered upstream.
         source_kind = str((item or {}).get("_source_kind", "") or "").strip().lower()
         if source_kind in {"rigid", "rigid_body"}:
             return bool(kwargs.get("do_import_RigidBody", True))
@@ -2128,7 +2135,6 @@ def _import_cached_plan_light_item(
     target_collection,
     parent_obj,
     owner_tag,
-    generation_tag,
     item_id,
     mode_signature,
 ):
@@ -2158,7 +2164,7 @@ def _import_cached_plan_light_item(
     _apply_plan_item_transform_for_parent(light_obj, item, parent_obj)
     if light_type == "SPOT":
         light_obj.rotation_euler.x += 1.5708
-    _tag_single_object_for_layer(light_obj, owner_tag, generation_tag)
+    _tag_single_object_for_layer(light_obj, owner_tag)
     _tag_object_tree_for_plan_item(light_obj, item_id, mode_signature)
     return light_obj
 
@@ -2168,7 +2174,6 @@ def _import_cached_plan_empty_item(
     target_collection,
     parent_obj,
     owner_tag,
-    generation_tag,
     item_id,
     mode_signature,
 ):
@@ -2178,7 +2183,7 @@ def _import_cached_plan_empty_item(
     if parent_obj is not None:
         obj.parent = parent_obj
     _apply_plan_item_transform_for_parent(obj, item, parent_obj)
-    _tag_single_object_for_layer(obj, owner_tag, generation_tag)
+    _tag_single_object_for_layer(obj, owner_tag)
     _tag_object_tree_for_plan_item(obj, item_id, mode_signature)
     try:
         kind = str(item.get("kind", "") or "")
@@ -2212,12 +2217,7 @@ def _import_cached_plan_empty_item(
 # ---------------------------------------------------------------------------
 
 def _decompose_sector_3x3(mat3_rows):
-    """Return (euler_xyz_radians, scale_xyz) from a CR2W 3x3 rotation matrix.
-
-    The engine stores the basis vectors as rows but Blender expects them as columns,
-    so the matrix has to be transposed before decomposition. import_single_mesh applies
-    the same transpose when placing individual mesh objects.
-    """
+    """Decompose a transposed CR2W 3×3 matrix."""
     try:
         from mathutils import Matrix
         r0 = mat3_rows[0]
@@ -2236,10 +2236,7 @@ def _decompose_sector_3x3(mat3_rows):
 
 
 def _rebuild_sector_instancer_mesh(instancer_obj, transforms):
-    """
-    Rebuild the instancer point-cloud mesh.
-    transforms: list of (x, y, z, ex, ey, ez, sx, sy, sz)
-    """
+    """Rebuild an instancer point cloud from transforms."""
     mesh = instancer_obj.data
     n = len(transforms)
     mesh.clear_geometry()
@@ -2262,12 +2259,7 @@ def _rebuild_sector_instancer_mesh(instancer_obj, transforms):
 
 
 def _build_sector_instancer_gn_tree(ng, source_obj):
-    """
-    Geometry Nodes tree:
-      Named Attribute "rot"   (FLOAT_VECTOR euler XYZ) → Euler→Rotation ─┐
-      Named Attribute "scale" (FLOAT_VECTOR)           ─────────────────────┤ Instance on Points → Output
-      Object Info (source_obj) → Geometry              ─────────────────────┘
-    """
+    """Build the sector Geometry Nodes instancer."""
     nodes = ng.nodes
     links = ng.links
     nodes.clear()
@@ -2286,7 +2278,6 @@ def _build_sector_instancer_gn_tree(ng, source_obj):
     gin  = nodes.new('NodeGroupInput');  gin.location  = (-800, 0)
     gout = nodes.new('NodeGroupOutput'); gout.location = ( 500, 0)
 
-    # Named attribute: rotation
     na_rot = nodes.new('GeometryNodeInputNamedAttribute')
     na_rot.location = (-600, -100)
     for v in ('FLOAT_VECTOR', 'VECTOR'):
@@ -2295,7 +2286,6 @@ def _build_sector_instancer_gn_tree(ng, source_obj):
     try:    na_rot.inputs["Name"].default_value = "rot"
     except Exception: na_rot.inputs[0].default_value = "rot"
 
-    # Named attribute: scale
     na_scale = nodes.new('GeometryNodeInputNamedAttribute')
     na_scale.location = (-600, -250)
     for v in ('FLOAT_VECTOR', 'VECTOR'):
@@ -2304,13 +2294,11 @@ def _build_sector_instancer_gn_tree(ng, source_obj):
     try:    na_scale.inputs["Name"].default_value = "scale"
     except Exception: na_scale.inputs[0].default_value = "scale"
 
-    # Euler → Rotation
     e2r = None
     for bl_id in ('FunctionNodeEulerToRotation', 'FunctionNodeRotationFromEuler'):
         try: e2r = nodes.new(bl_id); e2r.location = (-350, -100); break
         except Exception: pass
 
-    # Object Info
     oi = nodes.new('GeometryNodeObjectInfo')
     oi.location = (-350, -300)
     try:    oi.inputs['Object'].default_value = source_obj
@@ -2318,7 +2306,6 @@ def _build_sector_instancer_gn_tree(ng, source_obj):
     try:    oi.transform_space = 'ORIGINAL'
     except Exception: pass
 
-    # Instance on Points
     iop = nodes.new('GeometryNodeInstanceOnPoints')
     iop.location = (150, 0)
 
@@ -2356,12 +2343,7 @@ def _id_key(data_block):
 
 
 def _get_sector_sources_collection(context=None):
-    """Return a persistent scene-level collection that holds all hidden source meshes.
-
-    This collection lives as a direct child of the scene's master collection, NOT inside
-    any layer collection. That way _capture_previous_layer_object_ids never sees the
-    sources and they are never deleted during a layer reload cycle.
-    """
+    """Return the persistent hidden sector-source collection."""
     existing = bpy.data.collections.get(_SECTOR_SOURCES_COLLECTION_NAME)
     if existing is not None:
         return existing
@@ -2477,7 +2459,6 @@ def _apply_sector_collision_transform_and_tags(wrapper, mesh, parent_transform, 
     _tag_object_tree_for_layer_and_plan(
         wrapper,
         kwargs.get("_layer_import_owner"),
-        kwargs.get("_layer_import_generation"),
         kwargs.get("_layer_import_plan_item_id"),
         kwargs.get("_layer_import_plan_mode"),
     )
@@ -2819,14 +2800,116 @@ def _get_or_import_sector_nxs_source_mesh(repo_path, kwargs, errors, mode_signat
     return source
 
 
-def _pick_best_sector_source_mesh(new_objects, parent_root):
-    """From a freshly-imported mesh hierarchy, keep only the highest-poly mesh as the source.
+def _sector_source_lod_level(obj):
+    settings = getattr(obj, "witcherui_MeshSettings", None)
+    if settings is not None:
+        try:
+            value = settings.get("source_lod_level", None)
+        except Exception:
+            try:
+                value = settings["source_lod_level"]
+            except Exception:
+                value = None
+        if value is not None:
+            try:
+                return int(value)
+            except Exception:
+                pass
+    name = str(getattr(obj, "name", "") or "").lower()
+    match = re.search(r"(?:^|[_.-])lod[_.-]?(\d+)(?:$|[_.-])", name)
+    return int(match.group(1)) if match else None
 
-    parent_root is the empty wrapper from import_single_mesh; it is removed too because
-    the GN Object Info node needs a real mesh, not an empty parent. Returns the kept mesh
-    object or None if no mesh was found.
-    """
+
+def _primary_sector_source_meshes(mesh_objects):
+    candidates = list(mesh_objects or [])
+    known = [(obj, _sector_source_lod_level(obj)) for obj in candidates]
+    levels = [level for _obj, level in known if level is not None]
+    if not levels:
+        return candidates
+    primary_level = min(levels)
+    # Keep unknown chunks with the primary LOD.
+    return [obj for obj, level in known if level is None or level == primary_level]
+
+
+def _object_matrix_relative_to_ancestor(obj, ancestor=None):
+    """Compose authoritative basis transforms without requiring depsgraph evaluation."""
+    current = obj
+    result = Matrix.Identity(4)
+    seen = set()
+    while current is not None and current is not ancestor:
+        key = _object_identity(current)
+        if key in seen:
+            break
+        seen.add(key)
+        try:
+            local = current.matrix_parent_inverse @ current.matrix_basis
+        except Exception:
+            local = current.matrix_basis.copy()
+        result = local @ result
+        current = getattr(current, "parent", None)
+    if ancestor is None or current is ancestor:
+        return result
+    try:
+        return ancestor.matrix_world.inverted_safe() @ obj.matrix_world
+    except Exception:
+        return result
+
+
+def _merge_sector_source_meshes(mesh_objects, name, parent_root=None):
+    """Merge visual mesh chunks into one GN source while preserving materials and UVs."""
+    import bmesh as _bmesh
+
+    combined_mesh = bpy.data.meshes.new(name)
+    combined_obj = bpy.data.objects.new(name, combined_mesh)
+    materials = []
+    material_indices = {}
+    bm = _bmesh.new()
+    try:
+        for obj in mesh_objects:
+            source_mesh = obj.data
+            mesh_copy = source_mesh.copy()
+            try:
+                relative_matrix = _object_matrix_relative_to_ancestor(obj, parent_root)
+                mesh_copy.transform(relative_matrix)
+                slot_remap = {}
+                for slot_index, material in enumerate(getattr(source_mesh, "materials", []) or []):
+                    if material is None:
+                        continue
+                    try:
+                        material_key = int(material.as_pointer())
+                    except Exception:
+                        material_key = id(material)
+                    combined_index = material_indices.get(material_key)
+                    if combined_index is None:
+                        combined_index = len(materials)
+                        materials.append(material)
+                        material_indices[material_key] = combined_index
+                    slot_remap[slot_index] = combined_index
+                for polygon in mesh_copy.polygons:
+                    polygon.material_index = slot_remap.get(int(polygon.material_index), 0)
+                bm.from_mesh(mesh_copy)
+            finally:
+                bpy.data.meshes.remove(mesh_copy)
+        bm.to_mesh(combined_mesh)
+    except Exception:
+        bpy.data.objects.remove(combined_obj, do_unlink=True)
+        if combined_mesh.users == 0:
+            bpy.data.meshes.remove(combined_mesh)
+        raise
+    finally:
+        bm.free()
+
+    for material in materials:
+        combined_mesh.materials.append(material)
+    combined_mesh.update()
+    combined_obj.show_in_front = False
+    return combined_obj
+
+
+def _pick_best_sector_source_mesh(new_objects, parent_root):
+    """Merge a freshly imported LOD0 hierarchy into one GN source mesh."""
     candidates = [o for o in new_objects if o is not None and o.type == 'MESH' and getattr(o, "data", None)]
+    candidates = _primary_sector_source_meshes(candidates)
     if not candidates:
         for o in new_objects:
             if o is None:
@@ -2837,7 +2920,8 @@ def _pick_best_sector_source_mesh(new_objects, parent_root):
                 pass
         return None
 
-    best = max(candidates, key=lambda o: len(o.data.polygons))
+    stem = Path(str(getattr(parent_root, "name", "") or "SectorSource")).stem
+    best = _merge_sector_source_meshes(candidates, f"{stem}_merged", parent_root=parent_root)
     for o in list(new_objects):
         if o is None or o is best:
             continue
@@ -2869,16 +2953,11 @@ def _pick_best_sector_source_mesh(new_objects, parent_root):
 
 
 def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, errors, mode_signature, item_id, cr2w_version=999, mesh_uncook_path=None):
-    """Return the single LOD0 mesh that the GN instancer references for repo_path.
-
-    Reuses an already-imported source within the current scene so multiple instancers
-    of the same mesh share one source mesh object. The source is stored in the dedicated
-    __sector_sources__ scene-level collection so it is invisible in the viewport and
-    immune to layer-reload cleanup (target_collection is unused but kept for API compat).
-    """
-    marker = str(repo_path or "").strip()
-    if not marker:
+    """Return the cached or imported LOD0 GN source for ``repo_path``."""
+    repo_path = str(repo_path or "").strip()
+    if not repo_path:
         return None
+    marker = f"{repo_path}#visual_lod0_v2"
 
     cached_source = _get_cached_sector_source(marker)
     if cached_source is not None:
@@ -2899,11 +2978,6 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
     mesh_kwargs["_layer_import_plan_item_id"] = (item_id or "") + "_src"
     mesh_kwargs["_layer_import_plan_mode"] = mode_signature
 
-    active_collection = _get_active_collection()
-    before_ids = {
-        _id_key(o)
-        for o in list(getattr(active_collection, "all_objects", []) or [])
-    }
     try:
         wrapper = import_single_mesh(
             src_mesh_data,
@@ -2918,13 +2992,8 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
             errors.append(f"sector_instancer source failed {repo_path}: {exc}")
         return None
 
-    new_objects = [
-        o
-        for o in list(getattr(active_collection, "all_objects", []) or [])
-        if _id_key(o) not in before_ids
-    ]
-    if wrapper is not None and wrapper not in new_objects:
-        new_objects.append(wrapper)
+    # Imported LODs are children of the returned wrapper.
+    new_objects = list(_iter_object_tree(wrapper) or [])
 
     source = _pick_best_sector_source_mesh(new_objects, wrapper)
     if source is None:
@@ -2944,9 +3013,7 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
             c.objects.unlink(source)
         except Exception:
             pass
-    # Link source to the dedicated scene-level sources collection, NOT to the
-    # per-layer target_collection. This keeps sources out of layer cleanup sweeps
-    # so they survive reloads and are shared across all layers using the same mesh.
+    # Keep shared sources outside per-layer cleanup.
     sources_coll = _get_sector_sources_collection()
     try:
         sources_coll.objects.link(source)
@@ -2961,19 +3028,13 @@ def _import_cached_plan_sector_instancer_item(
     target_collection,
     parent_obj,
     owner_tag,
-    generation_tag,
     item_id,
     mode_signature,
     kwargs,
     errors,
     context=None,
 ):
-    """Import a sector_instancer plan item: one hidden source mesh + one GN instancer per mesh type.
-
-    The source must be a real MESH object (not an empty wrapper) because the GN Object Info
-    node reads geometry directly from the referenced object — empties have no geometry and
-    produce no instances.
-    """
+    """Import a sector instancer with a hidden source mesh."""
     repo_path = str(item.get("repo_path", "") or "").strip()
     if not repo_path:
         return None
@@ -3001,10 +3062,6 @@ def _import_cached_plan_sector_instancer_item(
         )
     if src_root is None:
         return None
-    # Do NOT tag src_root with owner/generation: sources live in __sector_sources__
-    # (a separate scene-level collection) and are shared across all layers that use
-    # the same mesh. Tagging them would cause them to be captured and deleted by
-    # _finalize_layer_reload_cleanup on subsequent around-camera reloads.
 
     all_t = []
     for t_entry in sector_transforms:
@@ -3046,7 +3103,7 @@ def _import_cached_plan_sector_instancer_item(
             inst_obj["witcher_sector_flags"] = int(item.get("sector_flags"))
         except Exception:
             pass
-    _tag_single_object_for_layer(inst_obj, owner_tag, generation_tag)
+    _tag_single_object_for_layer(inst_obj, owner_tag)
     _tag_object_tree_for_plan_item(inst_obj, item_id, mode_signature)
 
     _rebuild_sector_instancer_mesh(inst_obj, all_t)
@@ -3127,7 +3184,6 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
 
     created = dict(loaded_by_id)
     owner_tag = kwargs.get("_layer_import_owner")
-    generation_tag = kwargs.get("_layer_import_generation")
     parent_seconds = 0.0
     mesh_seconds = 0.0
     cloth_seconds = 0.0
@@ -3136,6 +3192,12 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
     mesh_count = 0
     cloth_count = 0
     light_count = 0
+    visibility_parents = {}
+
+    def queue_parent_visibility(parent_obj):
+        while parent_obj is not None:
+            visibility_parents[_object_identity(parent_obj)] = parent_obj
+            parent_obj = getattr(parent_obj, "parent", None)
 
     def ensure_parent_empty(item_id):
         nonlocal parent_seconds, parent_count
@@ -3159,7 +3221,7 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
         if parent_obj is not None:
             obj.parent = parent_obj
         _apply_plan_item_transform_for_parent(obj, item, parent_obj)
-        _tag_single_object_for_layer(obj, owner_tag, generation_tag)
+        _tag_single_object_for_layer(obj, owner_tag)
         _tag_object_tree_for_plan_item(obj, item_id, mode_signature)
         try:
             if kind == "entity":
@@ -3199,7 +3261,6 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 target_collection,
                 parent_obj,
                 owner_tag,
-                generation_tag,
                 item_id,
                 mode_signature,
                 kwargs,
@@ -3213,7 +3274,7 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 _apply_plan_item_transform_as_child(root_obj, item)
             loaded_by_id[item_id] = root_obj
             created[item_id] = root_obj
-            _tag_entity_empty_engine_visibility_from_children(parent_obj, kwargs)
+            queue_parent_visibility(parent_obj)
             imported_count += 1
             mesh_count += 1
             continue
@@ -3273,7 +3334,7 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 continue
             loaded_by_id[item_id] = root_obj
             created[item_id] = root_obj
-            _tag_entity_empty_engine_visibility_from_children(parent_obj, kwargs)
+            queue_parent_visibility(parent_obj)
             imported_count += 1
             mesh_count += 1
             continue
@@ -3288,7 +3349,6 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 target_collection,
                 parent_obj,
                 owner_tag,
-                generation_tag,
                 item_id,
                 mode_signature,
             )
@@ -3306,7 +3366,6 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 target_collection,
                 parent_obj,
                 owner_tag,
-                generation_tag,
                 item_id,
                 mode_signature,
             )
@@ -3347,6 +3406,7 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                         import_name="CClothComponent",
                         entity_name=str(item.get("name", "") or Path(resource.replace("/", "\\")).stem),
                         target_collection=target_collection,
+                        hide_collision_proxies=bool(kwargs.get("hide_proxy_meshes", False)),
                     )
                 cloth_seconds += time.perf_counter() - cloth_started
             except Exception as exc:
@@ -3357,6 +3417,7 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
             if cloth_arma is None:
                 continue
             root_obj = cloth_grp if cloth_grp is not None else cloth_arma
+            _apply_requested_proxy_helper_visibility(root_obj, kwargs)
             if parent_obj is not None:
                 root_obj.parent = parent_obj
                 _apply_plan_item_transform_as_child(root_obj, item)
@@ -3365,7 +3426,6 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
             _tag_object_tree_for_layer_and_plan(
                 root_obj,
                 owner_tag,
-                generation_tag,
                 item_id,
                 mode_signature,
             )
@@ -3379,7 +3439,15 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
         if not isinstance(item, dict):
             continue
         if str(item.get("kind", "") or "").strip().lower() == "entity":
-            _tag_entity_empty_engine_visibility_from_children(obj, kwargs)
+            queue_parent_visibility(obj)
+
+    # Aggregate visibility after all children are created.
+    for parent_obj in sorted(
+        visibility_parents.values(),
+        key=_object_parent_depth,
+        reverse=True,
+    ):
+        _tag_entity_empty_engine_visibility_from_children(parent_obj, kwargs)
 
     total_seconds = time.perf_counter() - total_started
     if total_seconds >= _LAYER_IMPORT_PROFILE_WARN_THRESHOLD:
@@ -3405,15 +3473,7 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
 
 
 def _filter_cached_plan_items_by_proximity(items, nearby_filter, nearby_stats, item_kinds=None):
-    """Cull cached plan items whose world_position is outside the radius.
-
-    Group items and items without world_position are kept only if a
-    descendant survives the cull, so parent chains stay connected.
-
-    Sector instancer items are kept whole if any of their packed sector_transforms
-    falls within the radius (per-placement culling is intentionally avoided so
-    the instancer's identity stays stable across reloads as the camera moves).
-    """
+    """Cull cached plan items while retaining parent chains and instancers."""
     if nearby_filter is None:
         return list(items)
 
@@ -3478,11 +3538,7 @@ def _stable_sector_instancer_id(repo_path, kind, visibility_key=""):
 
 
 def _maybe_group_cached_items_into_sector_instancers(items, kwargs):
-    """If instanced_sector=True, replace top-level non-proxy mesh and rigid_body items with
-    synthetic sector_instancer items grouped by repo_path. Each instancer holds every
-    placement for that repo_path so subsequent camera-radius reloads of the same layer
-    re-attach to the same instancer instead of duplicating it.
-    """
+    """Group repeated top-level sector meshes into instancer items."""
     if not bool(kwargs and kwargs.get("instanced_sector", False)):
         return list(items or [])
 
@@ -3518,6 +3574,9 @@ def _maybe_group_cached_items_into_sector_instancers(items, kwargs):
 
     new_items = list(survivors)
     for (kind, repo_path, visibility_key), grouped_items in grouped.items():
+        if len(grouped_items) < 2:
+            new_items.extend(grouped_items)
+            continue
         sector_transforms = []
         for it in grouped_items:
             t_src = it.get("translation") or it.get("local_position") or it.get("world_position") or [0.0, 0.0, 0.0]
@@ -3553,12 +3612,7 @@ def _maybe_group_cached_items_into_sector_instancers(items, kwargs):
 
 
 def _ensure_cached_sector_group_hierarchy(items):
-    """Add CSectorData child groups to flat cached sector items.
-
-    Fast scan cache entries record sector meshes/lights as top-level items. Direct
-    W2L import and slow resolved plans already expose them under CSectorData, so
-    normalize the fast path before creating Blender objects.
-    """
+    """Add CSectorData groups to flat cached sector items."""
     source_items = [item for item in items or [] if isinstance(item, dict)]
     if not source_items:
         return []
@@ -4391,22 +4445,18 @@ def _iter_object_tree(root_obj):
 def _tag_object_tree_for_layer_and_plan(
     root_obj,
     owner_tag=None,
-    generation_tag=None,
     item_id="",
     mode_signature="",
 ):
     owner_tag = str(owner_tag or "").strip()
-    generation_tag = str(generation_tag or "").strip()
     item_id = str(item_id or "").strip()
     mode_signature = str(mode_signature or "").strip()
-    if root_obj is None or (not owner_tag and not generation_tag and not item_id):
+    if root_obj is None or (not owner_tag and not item_id):
         return
     for obj in _iter_object_tree(root_obj):
         try:
             if owner_tag:
                 obj[_LAYER_IMPORT_OWNER_PROP] = owner_tag
-            if generation_tag:
-                obj[_LAYER_IMPORT_GENERATION_PROP] = generation_tag
             if item_id:
                 obj[_LAYER_IMPORT_PLAN_ITEM_PROP] = item_id
                 if mode_signature:
@@ -4415,8 +4465,8 @@ def _tag_object_tree_for_layer_and_plan(
             continue
 
 
-def _tag_object_tree_for_layer(root_obj, owner_tag=None, generation_tag=None):
-    _tag_object_tree_for_layer_and_plan(root_obj, owner_tag, generation_tag)
+def _tag_object_tree_for_layer(root_obj, owner_tag=None):
+    _tag_object_tree_for_layer_and_plan(root_obj, owner_tag)
 
 
 def _tag_object_tree_as_proxy_mesh(root_obj):
@@ -4445,6 +4495,20 @@ def _clear_object_tree_proxy_mesh_tags(root_obj):
                 del obj["witcher_layer_engine_visible"]
             obj.hide_viewport = False
             obj.hide_render = False
+        except Exception:
+            continue
+
+
+def _apply_requested_proxy_helper_visibility(root_obj, kwargs=None):
+    if root_obj is None:
+        return
+    hidden = bool((kwargs or {}).get("hide_proxy_meshes", False))
+    for obj in _iter_object_tree(root_obj):
+        try:
+            if not bool(obj.get("witcher_apx_collision_proxy", False)):
+                continue
+            obj.hide_viewport = hidden
+            obj.hide_render = hidden
         except Exception:
             continue
 
@@ -4532,16 +4596,33 @@ def _cleanup_captured_layer_objects(collection, object_ids):
     return removed_count
 
 
+def _layer_reload_signature_changed(collection, kwargs):
+    if collection is None:
+        return False
+    requested_mode = str(kwargs.get("_layer_import_mode_signature", "") or "").strip()
+    previous_mode = str(collection.get("witcher_layer_load_mode", "") or "").strip()
+    if requested_mode and previous_mode and requested_mode != previous_mode:
+        return True
+    requested_hash = str(kwargs.get("_layer_import_plan_hash", "") or "").strip()
+    if requested_hash:
+        previous_hash = str(collection.get("witcher_layer_import_plan_hash", "") or "").strip()
+        if requested_hash != previous_hash:
+            return True
+    return False
+
+
 def _ensure_layer_reload_tracking(collection, level_file, context, nearby_filter, kwargs):
     owner_tag = str(kwargs.get("_layer_import_owner") or _get_layer_import_owner_tag(level_file, context)).strip()
     if owner_tag:
         kwargs["_layer_import_owner"] = owner_tag
-    if "_layer_import_generation" not in kwargs:
-        kwargs["_layer_import_generation"] = f"{owner_tag}|{time.time_ns()}"
     if "_layer_import_previous_ids" in kwargs:
         return
     state = str(collection.get("witcher_layer_import_state", "") or "").strip().lower() if collection is not None else ""
-    cleanup_existing = (nearby_filter is not None or state.startswith("proxy_")) and not bool(kwargs.get("_layer_import_incremental"))
+    cleanup_existing = (
+        nearby_filter is not None
+        or state.startswith("proxy_")
+        or _layer_reload_signature_changed(collection, kwargs)
+    ) and not bool(kwargs.get("_layer_import_incremental"))
     if not cleanup_existing or collection is None:
         kwargs["_layer_import_previous_ids"] = set()
         return
@@ -4951,7 +5032,6 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
 
                             active_coll = getattr(bpy.context, "collection", None) or collection
                             owner_tag = kwargs.get("_layer_import_owner")
-                            gen_tag = kwargs.get("_layer_import_generation")
                             mode_sig = str(kwargs.get("_layer_import_mode_signature", "") or "")
                             instancer_parent_by_kind = {
                                 "mesh": Mesh_transform,
@@ -4973,7 +5053,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                                     synthetic_item,
                                     active_coll,
                                     instancer_parent_by_kind.get(si_kind, Mesh_transform),
-                                    owner_tag, gen_tag,
+                                    owner_tag,
                                     f"si_{si_idx}", mode_sig,
                                     kwargs, errors, context=context,
                                 )
@@ -5012,7 +5092,6 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                         _tag_object_tree_for_layer(
                             empty_transform,
                             kwargs.get("_layer_import_owner"),
-                            kwargs.get("_layer_import_generation"),
                         )
 
                 if do_import_Entity:
@@ -5191,6 +5270,7 @@ def loadLevelFromCachedPlan(level_file, plan_items, context=None, **kwargs):
         mode_signature = _layer_load_mode_signature(dev_empty_only)
     if (
         not dev_empty_only
+        and not _layer_reload_signature_changed(target_collection, kwargs)
         and _cached_plan_loaded_item_ids(target_collection, mode_signature)
     ):
         kwargs["_layer_import_incremental"] = True
@@ -5429,7 +5509,8 @@ def _clone_duplicate_hierarchy(source_root, target_collection=None, *, remap_lin
 
     clone_pairs = []
     clone_by_id = {}
-    source_local_matrices = {}
+    source_basis_matrices = {}
+    source_parent_inverses = {}
     try:
         source_objects = [source_root] + list(getattr(source_root, "children_recursive", []) or [])
     except ReferenceError:
@@ -5437,7 +5518,9 @@ def _clone_duplicate_hierarchy(source_root, target_collection=None, *, remap_lin
     for source_obj in source_objects:
         source_id = _object_identity(source_obj)
         try:
-            source_local_matrices[source_id] = source_obj.matrix_local.copy()
+            # Use basis to avoid same-tick stale local transforms.
+            source_basis_matrices[source_id] = source_obj.matrix_basis.copy()
+            source_parent_inverses[source_id] = source_obj.matrix_parent_inverse.copy()
         except Exception:
             pass
         clone_obj = source_obj.copy()
@@ -5448,9 +5531,13 @@ def _clone_duplicate_hierarchy(source_root, target_collection=None, *, remap_lin
     for source_obj, clone_obj in clone_pairs:
         clone_parent = clone_by_id.get(_object_identity(getattr(source_obj, "parent", None)))
         clone_obj.parent = clone_parent
-        local_matrix = source_local_matrices.get(_object_identity(source_obj))
+        local_matrix = source_basis_matrices.get(_object_identity(source_obj))
         if local_matrix is not None:
-            _set_object_local_matrix_direct(clone_obj, local_matrix)
+            _set_object_local_matrix_direct(
+                clone_obj,
+                local_matrix,
+                source_parent_inverses.get(_object_identity(source_obj)),
+            )
 
     if remap_links:
         for _source_obj, clone_obj in clone_pairs:
@@ -5477,9 +5564,14 @@ def _clone_duplicate_hierarchy(source_root, target_collection=None, *, remap_lin
     for source_obj, clone_obj in clone_pairs:
         if clone_obj == new_root:
             continue
-        local_matrix = source_local_matrices.get(_object_identity(source_obj))
+        source_id = _object_identity(source_obj)
+        local_matrix = source_basis_matrices.get(source_id)
         if local_matrix is not None:
-            _set_object_local_matrix_direct(clone_obj, local_matrix)
+            _set_object_local_matrix_direct(
+                clone_obj,
+                local_matrix,
+                source_parent_inverses.get(source_id),
+            )
     return new_root
 
 
@@ -5492,14 +5584,13 @@ def check_if_empty_already_in_scene(repo_path, *, fast_static_clone=False):
     start_time1 = time.time()
     root_index = _get_duplicate_root_index(scene)
     source_root = root_index.get(repo_path)
-    # Cache misses are expected while importing new assets. Rebuild only when a
-    # cached hit looks stale.
+    # Rebuild only stale cache hits.
     if source_root is not None and not _is_duplicate_root_candidate(source_root, repo_path):
         source_root = _rebuild_duplicate_root_index(scene).get(repo_path)
     if source_root is None:
         return False
 
-    log.info('Check Mesh found in %f seconds.', time.time() - start_time1)
+    log.debug('Check Mesh found in %f seconds.', time.time() - start_time1)
     start_time2 = time.time()
     new_obj = _clone_duplicate_hierarchy(
         source_root,
@@ -5509,7 +5600,7 @@ def check_if_empty_already_in_scene(repo_path, *, fast_static_clone=False):
     if new_obj is None:
         return False
     _touch_duplicate_root_index(scene)
-    log.info('Check Mesh Finished importing in %f seconds.', time.time() - start_time2)
+    log.debug('Check Mesh Finished importing in %f seconds.', time.time() - start_time2)
     return new_obj
 
 def check_if_mesh_already_in_scene(repo_path):
@@ -5790,7 +5881,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
         try:
             #obj = bpy.context.selected_objects[:][0]
             #MATRIX PART
-            log.info(obj.name)
+            log.debug(obj.name)
             mat = Matrix()
 
             rotate_180 = False
@@ -5817,14 +5908,16 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
     _tag_object_tree_for_layer_and_plan(
         obj,
         kwargs.get("_layer_import_owner"),
-        kwargs.get("_layer_import_generation"),
         kwargs.get("_layer_import_plan_item_id"),
         kwargs.get("_layer_import_plan_mode"),
     )
     is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
     if is_proxy_mesh:
         _tag_object_tree_as_proxy_mesh(obj)
-    else:
+    elif (
+        bool(obj.get("witcher_layer_proxy_mesh", False))
+        or str(obj.get("witcher_layer_visibility_kind", "") or "").strip().lower() == "proxy_mesh"
+    ):
         _clear_object_tree_proxy_mesh_tags(obj)
     sector_flags = getattr(mesh, "sector_flags", None)
     if sector_flags is not None:
@@ -6307,6 +6400,7 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
                         import_name="CClothComponent",
                         entity_name=cloth_name,
                         target_collection=target_collection,
+                        hide_collision_proxies=bool(kwargs.get("hide_proxy_meshes", False)),
                     )
                     root_obj = cloth_grp if cloth_grp is not None else cloth_arma
                 if target_collection is not None:
@@ -6433,7 +6527,6 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
             _tag_object_tree_for_layer(
                 empty_transform,
                 kwargs.get("_layer_import_owner"),
-                kwargs.get("_layer_import_generation"),
             )
             _record_layer_entity_profile(
                 kwargs,
@@ -6462,7 +6555,6 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
     _tag_object_tree_for_layer(
         empty_transform,
         kwargs.get("_layer_import_owner"),
-        kwargs.get("_layer_import_generation"),
     )
     _record_layer_entity_profile(
         kwargs,

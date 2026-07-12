@@ -135,7 +135,9 @@ def hash_bundle_paths(filename):
 def create_pathhashes(gamedir=None, outputPath=None):
     if gamedir is None:
         gamedir = get_game_path()
-    with open(outputPath, 'w', newline='') as csvfile:
+    # Replace the CSV atomically for concurrent readers.
+    tmp_path = outputPath + ".tmp"
+    with open(tmp_path, 'w', newline='') as csvfile:
         fieldnames = ["Path", "HashInt"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
@@ -150,6 +152,7 @@ def create_pathhashes(gamedir=None, outputPath=None):
             else:
                 continue
 
-        log.info("created pathhashes.csv!")
+    os.replace(tmp_path, outputPath)
+    log.info("created pathhashes.csv!")
         
 #create_pathhashes(gamedir)

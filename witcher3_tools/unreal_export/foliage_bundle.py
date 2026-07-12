@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import time
-from math import radians, sqrt
 from typing import Any
 
 import numpy as np
@@ -23,6 +22,7 @@ from .bundle import (
     overwrite_policy_from_settings,
 )
 from .manifest import build_manifest, normalize_depot_path, safe_asset_name
+from ..foliage_core import decode_foliage_instance_transform
 
 log = logging.getLogger(__name__)
 
@@ -64,89 +64,14 @@ def _layer_label_and_folder(layer_id: str) -> tuple[str, str]:
     return label, folder
 
 
-def _value(source, key: str, default=None):
-    if isinstance(source, dict):
-        return source.get(key, default)
-    return getattr(source, key, default)
-
-
-def _has_value(source, key: str) -> bool:
-    if isinstance(source, dict):
-        return key in source
-    return hasattr(source, key)
-
-
-def _float_value(source, key: str, default: float = 0.0) -> float:
-    try:
-        return float(_value(source, key, default) or default)
-    except Exception:
-        return default
-
-
-def _is_packed_foliage_instance(inst) -> bool:
-    if _has_value(inst, "Quat_z") and _has_value(inst, "Quat_w"):
-        return True
-    if inst.__class__.__name__ == "SFoliageInstanceData":
-        return True
-    if _has_value(inst, "Scale_x"):
-        return False
-
-    scale = _float_value(inst, "Yaw", 1.0)
-    qz = _float_value(inst, "Pitch", 0.0)
-    qw = _float_value(inst, "Roll", 1.0)
-    quat_len = sqrt(qz * qz + qw * qw)
-    return 0.05 <= scale <= 50.0 and abs(quat_len - 1.0) <= 0.05
-
-
-def _rot_z_from_quat_terms(qz: float, qw: float) -> np.ndarray:
-    quat_len = sqrt(qz * qz + qw * qw)
-    if quat_len > 1.0e-8:
-        qz /= quat_len
-        qw /= quat_len
-    # Quaternion (0, 0, qz, qw), matching RED foliage yaw-only instances.
-    return np.array([
-        [1.0 - 2.0 * qz * qz, -2.0 * qw * qz, 0.0],
-        [2.0 * qw * qz, 1.0 - 2.0 * qz * qz, 0.0],
-        [0.0, 0.0, 1.0],
-    ], dtype=float)
-
-
 def _instance_transform_parts(inst) -> tuple[list[float], np.ndarray, list[float]]:
-    location = [
-        _float_value(inst, "X", 0.0),
-        _float_value(inst, "Y", 0.0),
-        _float_value(inst, "Z", 0.0),
-    ]
-
-    if _is_packed_foliage_instance(inst):
-        uniform_scale = _float_value(
-            inst,
-            "Scale",
-            _float_value(inst, "Scale_x", _float_value(inst, "Yaw", 1.0)),
-        )
-        if abs(uniform_scale) <= 1.0e-8:
-            uniform_scale = 1.0
-        qz = _float_value(inst, "Quat_z", _float_value(inst, "Pitch", 0.0))
-        qw = _float_value(inst, "Quat_w", _float_value(inst, "Roll", 1.0))
-        return location, _rot_z_from_quat_terms(qz, qw), [uniform_scale, uniform_scale, uniform_scale]
-
     from mathutils import Euler
 
-    try:
-        yaw, pitch, roll = (
-            radians(_float_value(inst, "Yaw", 0.0)),
-            radians(_float_value(inst, "Pitch", 0.0)),
-            radians(_float_value(inst, "Roll", 0.0)),
-        )
-    except Exception:
-        yaw = pitch = roll = 0.0
-    rot = np.asarray(Euler((yaw, pitch, roll), "YXZ").to_matrix().to_4x4(), dtype=float)[:3, :3]
-    scale = [
-        _float_value(inst, "Scale_x", 1.0),
-        _float_value(inst, "Scale_y", 1.0),
-        _float_value(inst, "Scale_z", 1.0),
-    ]
-    return location, rot, scale
+    decoded = decode_foliage_instance_transform(inst)
+    rot = np.asarray(Euler(decoded.rotation_xyz, "XYZ").to_matrix(), dtype=float)
+    # Use only the rotation basis from 4×4 adapters.
+    rot = rot[:3, :3]
+    return list(decoded.location), rot, list(decoded.scale)
 
 
 def _instance_world_matrix(inst) -> np.ndarray:

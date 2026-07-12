@@ -4,6 +4,7 @@ import functools
 import os
 import base64
 import struct
+import threading
 import time
 import numpy as np
 from pathlib import Path
@@ -640,6 +641,7 @@ class ELEMENT:
 
 class Cr2wResourceManager:
     resourceManager = None
+    _lock = threading.Lock()
     def __init__(self):
 
         cache_root = get_cache_root(create=True)
@@ -648,16 +650,17 @@ class Cr2wResourceManager:
             bundle.create_pathhashes(outputPath=filename)
             log.info('Creating pathhashes.csv')
         self.pathashespath = filename
-        #self.HashdumpDict = {}
-        reader = csv.DictReader(open(self.pathashespath))
-
-        self.HashdumpDict = {}
-        for row in reader:
-            self.HashdumpDict[row["HashInt"]] = row["Path"]
+        with open(self.pathashespath, newline='') as csvfile:
+            self.HashdumpDict = {}
+            for row in csv.DictReader(csvfile):
+                self.HashdumpDict[row["HashInt"]] = row["Path"]
     @staticmethod
     def Get():
-        if (Cr2wResourceManager.resourceManager == None):
-            Cr2wResourceManager.resourceManager = Cr2wResourceManager()
+        # Serialize concurrent pathhash cache writes.
+        if Cr2wResourceManager.resourceManager is None:
+            with Cr2wResourceManager._lock:
+                if Cr2wResourceManager.resourceManager is None:
+                    Cr2wResourceManager.resourceManager = Cr2wResourceManager()
         return Cr2wResourceManager.resourceManager
 
 class CSectorDataResource:
@@ -676,7 +679,7 @@ class CSectorDataResource:
             if str(self.hashint) in resoruce.HashdumpDict:
                 self.pathHash = resoruce.HashdumpDict[str(self.hashint)]
             else:
-                log.critical("FOUND UNKNOWN PATH")
+                log.critical("FOUND UNKNOWN PATH %s", self.hashint)
                 self.pathHash = self.hashint
         #public CString pathHash;
 class CSectorDataObject:
@@ -2585,7 +2588,7 @@ class W_CLASS:
                         self.Grasses = CBufferVLQInt32(CR2WFILE, SFoliageResourceData)
                         self.Grasses.Read(f, 0)
                     elif self.name == "CSectorData":
-                        dict = Cr2wResourceManager().Get()
+                        Cr2wResourceManager.Get()
                         f.seek(-1,1)
                         ukn1 = readU64(f) #46871095541760
 

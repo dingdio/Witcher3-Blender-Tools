@@ -25,6 +25,7 @@ from ..importers import import_w2l
 from ..importers import import_w2w
 from ..importers import import_isolation
 from ..importers import import_blender_fun
+from ..terrain_core import TERRAIN_FOLIAGE_MODE_ITEMS, TERRAIN_IMPORT_MODE_ITEMS
 from ..CR2W import fast_cache_scan
 from ..CR2W.common_blender import repo_file, redkit_repo_context
 
@@ -35,7 +36,8 @@ _WORLD_LAYER_INDEX_CACHE = {}
 _WORLD_LAYER_RUNTIME_CACHE = {}
 _LAYER_VISIBILITY_CACHE = {}
 _DEFAULT_HIDDEN_GROUP_CACHE = {}
-_WORLD_LAYER_SCAN_CACHE_VERSION = 9
+# 10: invalidate caches built with a partially-read pathhashes.csv (raw hash ints as repo paths)
+_WORLD_LAYER_SCAN_CACHE_VERSION = 10
 _WORLD_LAYER_SPATIAL_CELL_SIZE = 10.0
 _LAYER_SCAN_BATCH_SIZE = 16
 _LAYER_LOAD_BATCH_SIZE = 8
@@ -168,7 +170,7 @@ def _layer_load_mode_signature_for_scene(scene_settings):
     regex = settings.get("do_name_filter_regex", "") if settings.get("do_enable_name_filter") else ""
     return (
         f"dev_empty={int(dev_empty_only)}"
-        f";transform={int(getattr(import_blender_fun, 'CACHED_LAYER_TRANSFORM_MODE_VERSION', 4))}"
+        f";transform={int(getattr(import_blender_fun, 'CACHED_LAYER_TRANSFORM_MODE_VERSION', 7))}"
         f";mesh={int(settings.get('do_import_Mesh', True))}"
         f";proxy_mesh={int(settings.get('do_import_ProxyMesh', False))}"
         f";collision={int(settings.get('do_import_Collision', True))}"
@@ -583,6 +585,47 @@ class WITCH_OT_w2L(bpy.types.Operator, ImportHelper):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
 
+def _select_loaded_terrain_tile(context, obj):
+    try:
+        for selected in list(getattr(context, "selected_objects", ()) or ()):
+            selected.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+    except Exception:
+        pass
+
+
+def _report_world_tile_load(operator, load_result, tile_x, tile_y, elapsed):
+    terrain = load_result.terrain
+    foliage = load_result.foliage
+    if load_result.foliage_error:
+        operator.report({'WARNING'}, f"Terrain loaded; foliage failed: {load_result.foliage_error}")
+    foliage_text = ""
+    if foliage is not None:
+        foliage_text = (
+            f", {len(foliage.loaded_cells)} foliage cells / "
+            f"{foliage.instance_count:,} instances"
+        )
+    action = "Reused" if terrain.reused else "Imported"
+    operator.report({'INFO'}, f"{action} tile {tile_x}, {tile_y}{foliage_text} in {elapsed:.2f}s")
+
+
+def _remove_collection_subtree(collection):
+    if collection is None:
+        return
+    descendants = []
+    stack = [collection]
+    while stack:
+        current = stack.pop()
+        descendants.append(current)
+        stack.extend(list(getattr(current, "children", ()) or ()))
+    for current in reversed(descendants):
+        try:
+            bpy.data.collections.remove(current)
+        except Exception:
+            pass
+
+
 class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
     """Load Witcher 3 Level"""
     bl_idname = "witcher.import_w2w"
@@ -593,19 +636,44 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
     filter_glob: StringProperty(default='*.w2w;*.yml', options={'HIDDEN'})
     terrain_import_mode: EnumProperty(
         name="Terrain Import",
-        description="Choose how terrain is imported",
-        items=[
-            ('FULL_MAP', 'Full Map', 'Import one combined map using Geometry Nodes + Multires'),
-            ('TILES', 'Tiles', 'Import individual terrain tile meshes'),
-        ],
-        default='FULL_MAP',
+        description="Choose the terrain scope to import",
+        items=TERRAIN_IMPORT_MODE_ITEMS,
+        default='SELECTED_TILE',
     )
     terrain_multires_level: IntProperty(
         name="Terrain Multires",
         description="Multires subdivision levels used by terrain import",
-        default=10,
+        default=6,
         min=0,
         max=10,
+    )
+    terrain_tile_x: IntProperty(
+        name="Tile X",
+        description="Terrain tile X coordinate",
+        default=0,
+        min=0,
+    )
+    terrain_tile_y: IntProperty(
+        name="Tile Y",
+        description="Terrain tile Y coordinate",
+        default=0,
+        min=0,
+    )
+    terrain_include_foliage: BoolProperty(
+        name="Include Foliage",
+        description="Load foliage instances owned by the selected terrain tile",
+        default=True,
+    )
+    terrain_foliage_mode: EnumProperty(
+        name="Foliage Detail",
+        description="Choose a fast viewer-ready foliage set or load every source",
+        items=TERRAIN_FOLIAGE_MODE_ITEMS,
+        default='PROXY',
+    )
+    terrain_build_layer_tree: BoolProperty(
+        name="Build Layer Tree",
+        description="Create the complete world layer collection tree during import",
+        default=False,
     )
     terrain_material_roughness: FloatProperty(
         name="Terrain Roughness",
@@ -629,6 +697,11 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         try:
             self.terrain_import_mode = str(getattr(tool, "terrain_import_mode", self.terrain_import_mode))
             self.terrain_multires_level = int(getattr(tool, "terrain_multires_level", self.terrain_multires_level))
+            self.terrain_tile_x = int(getattr(tool, "terrain_tile_x", self.terrain_tile_x))
+            self.terrain_tile_y = int(getattr(tool, "terrain_tile_y", self.terrain_tile_y))
+            self.terrain_include_foliage = bool(getattr(tool, "terrain_include_foliage", self.terrain_include_foliage))
+            self.terrain_foliage_mode = str(getattr(tool, "terrain_foliage_mode", self.terrain_foliage_mode))
+            self.terrain_build_layer_tree = bool(getattr(tool, "terrain_build_layer_tree", self.terrain_build_layer_tree))
             self.terrain_material_roughness = float(getattr(tool, "terrain_material_roughness", self.terrain_material_roughness))
             self.terrain_material_specular = float(getattr(tool, "terrain_material_specular", self.terrain_material_specular))
         except Exception:
@@ -641,6 +714,16 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         try:
             tool.terrain_import_mode = self.terrain_import_mode
             tool.terrain_multires_level = int(self.terrain_multires_level)
+            if hasattr(tool, "terrain_tile_x"):
+                tool.terrain_tile_x = int(self.terrain_tile_x)
+            if hasattr(tool, "terrain_tile_y"):
+                tool.terrain_tile_y = int(self.terrain_tile_y)
+            if hasattr(tool, "terrain_include_foliage"):
+                tool.terrain_include_foliage = bool(self.terrain_include_foliage)
+            if hasattr(tool, "terrain_foliage_mode"):
+                tool.terrain_foliage_mode = str(self.terrain_foliage_mode)
+            if hasattr(tool, "terrain_build_layer_tree"):
+                tool.terrain_build_layer_tree = bool(self.terrain_build_layer_tree)
             if hasattr(tool, "terrain_material_roughness"):
                 tool.terrain_material_roughness = float(self.terrain_material_roughness)
             if hasattr(tool, "terrain_material_specular"):
@@ -653,7 +736,16 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         box = layout.box()
         box.label(text="Terrain Import", icon='GRID')
         box.prop(self, "terrain_import_mode", text="Mode")
-        box.prop(self, "terrain_multires_level", text="Multires")
+        if self.terrain_import_mode == 'SELECTED_TILE':
+            coords = box.row(align=True)
+            coords.prop(self, "terrain_tile_x", text="Tile X")
+            coords.prop(self, "terrain_tile_y", text="Tile Y")
+            box.prop(self, "terrain_include_foliage")
+            foliage_detail = box.row()
+            foliage_detail.enabled = bool(self.terrain_include_foliage)
+            foliage_detail.prop(self, "terrain_foliage_mode", text="Foliage")
+        box.prop(self, "terrain_build_layer_tree")
+        box.prop(self, "terrain_multires_level", text="Detail")
         box.prop(self, "terrain_material_roughness", text="Roughness")
         box.prop(self, "terrain_material_specular", text="Specular")
 
@@ -669,7 +761,45 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         if filePath.endswith('.yml'):
             import_w2w.btn_import_radish(filePath)
         else:
-            worldFile = CR2W.CR2W_reader.load_w2w(filePath)
+            selected_tile = self.terrain_import_mode == 'SELECTED_TILE'
+            worldFile = CR2W.CR2W_reader.load_w2w(
+                filePath,
+                include_groups=bool(self.terrain_build_layer_tree),
+            )
+            if selected_tile:
+                world_collection = None
+                created_world_collection = False
+                if self.terrain_build_layer_tree:
+                    world_collection = import_w2w.AddCLayerGroup(worldFile.groups, False, filePath)
+                    context.scene.collection.children.link(world_collection)
+                    created_world_collection = True
+                started = time.perf_counter()
+                try:
+                    load_result = import_w2w.import_world_tile_with_foliage(
+                        worldFile,
+                        filePath,
+                        int(self.terrain_tile_x),
+                        int(self.terrain_tile_y),
+                        context=context,
+                        multires_level=int(self.terrain_multires_level),
+                        world_root_collection=world_collection,
+                        include_foliage=bool(self.terrain_include_foliage),
+                        foliage_mode=str(self.terrain_foliage_mode),
+                    )
+                except Exception as exc:
+                    if created_world_collection:
+                        _remove_collection_subtree(world_collection)
+                    self.report({'ERROR'}, str(exc))
+                    return {'CANCELLED'}
+                _select_loaded_terrain_tile(context, load_result.terrain.obj)
+                _report_world_tile_load(
+                    self,
+                    load_result,
+                    int(self.terrain_tile_x),
+                    int(self.terrain_tile_y),
+                    time.perf_counter() - started,
+                )
+                return {'FINISHED'}
             import_w2w.btn_import_w2w(worldFile, filePath)
         return {'FINISHED'}
     def invoke(self, context, event):
@@ -678,6 +808,120 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
+
+
+class WITCH_OT_import_world_tile(bpy.types.Operator):
+    """Import one terrain tile from the active world without scanning the map."""
+
+    bl_idname = "witcher.import_world_tile"
+    bl_label = "Import Terrain Tile"
+    bl_description = "Import only the configured terrain tile and its foliage"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    use_view: BoolProperty(
+        name="Use Tile Under View",
+        description="Choose the tile containing the current viewport position",
+        default=False,
+    )
+    action: EnumProperty(
+        name="Action",
+        items=[
+            ('IMPORT', 'Import', 'Import or reuse the selected tile'),
+            ('UNLOAD', 'Unload', 'Unload only the selected tile and its foliage'),
+        ],
+        default='IMPORT',
+        options={'HIDDEN'},
+    )
+
+    def execute(self, context):
+        root_coll = _find_world_root_collection(context)
+        if root_coll is None:
+            self.report({'WARNING'}, "Select terrain or a collection belonging to an imported world")
+            return {'CANCELLED'}
+
+        world_path = str(root_coll.get("world_path", "") or "").strip()
+        if not world_path:
+            self.report({'ERROR'}, "World collection has no world_path")
+            return {'CANCELLED'}
+        resolved_world = world_path
+        if not os.path.isfile(resolved_world):
+            resolved_world = repo_file(world_path)
+        if not resolved_world or not os.path.isfile(resolved_world):
+            self.report({'ERROR'}, f"World file not found: {world_path}")
+            return {'CANCELLED'}
+
+        settings = getattr(context.scene, "witcher_file_browser", None)
+        tile_x = int(getattr(settings, "terrain_tile_x", 0))
+        tile_y = int(getattr(settings, "terrain_tile_y", 0))
+        detail = int(getattr(settings, "terrain_multires_level", 6))
+        include_foliage = bool(getattr(settings, "terrain_include_foliage", True))
+        foliage_mode = str(getattr(settings, "terrain_foliage_mode", "PROXY"))
+
+        try:
+            world_file = CR2W.CR2W_reader.load_w2w(resolved_world, include_groups=False)
+            spec = import_w2w.inspect_world_terrain(world_file, resolved_world)
+            if self.use_view:
+                view_pos = None
+                area = _get_current_view3d_area(context)
+                if area is not None:
+                    try:
+                        view_pos = tuple(area.spaces.active.region_3d.view_location)
+                    except Exception:
+                        view_pos = None
+                if view_pos is None:
+                    view_pos = _get_camera_position(context)
+                if view_pos is None:
+                    self.report({'WARNING'}, "Could not determine viewport position")
+                    return {'CANCELLED'}
+                tile_x, tile_y = import_w2w.terrain_tile_from_world_position(spec, view_pos)
+                if settings is not None:
+                    settings.terrain_tile_x = tile_x
+                    settings.terrain_tile_y = tile_y
+
+            if self.action == 'UNLOAD':
+                terrain_removed = import_w2w.unload_world_terrain_tile(
+                    spec,
+                    tile_x,
+                    tile_y,
+                    world_collection=root_coll,
+                )
+                foliage_removed = 0
+                from ..importers import import_foliage
+
+                for child in root_coll.children:
+                    if child.get("_is_foliage_root"):
+                        foliage_removed = import_foliage.unload_foliage_tile(child, tile_x, tile_y)
+                        break
+                if not terrain_removed and foliage_removed <= 0:
+                    self.report({'INFO'}, f"Tile {tile_x}, {tile_y} is not loaded")
+                else:
+                    self.report(
+                        {'INFO'},
+                        f"Unloaded tile {tile_x}, {tile_y} and {foliage_removed:,} foliage instances",
+                    )
+                return {'FINISHED'}
+
+            started = time.perf_counter()
+            load_result = import_w2w.import_world_tile_with_foliage(
+                world_file,
+                resolved_world,
+                tile_x,
+                tile_y,
+                context=context,
+                multires_level=detail,
+                world_root_collection=root_coll,
+                include_foliage=include_foliage,
+                foliage_mode=foliage_mode,
+            )
+        except Exception as exc:
+            log.exception("Selected terrain tile import failed")
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        _select_loaded_terrain_tile(context, load_result.terrain.obj)
+        _report_world_tile_load(self, load_result, tile_x, tile_y, time.perf_counter() - started)
+        return {'FINISHED'}
+
 
 def _normalize_level_rel_path(level_path: str) -> str:
     if not level_path:
@@ -966,6 +1210,39 @@ def _find_world_root_collection(context):
     return _find_world_root_collection_for_collection(getattr(context, "collection", None))
 
 
+def _is_location_viewer_root(root_collection):
+    """Return whether a root was opened by a location preset."""
+    if root_collection is None:
+        return False
+    for obj in list(getattr(root_collection, "objects", []) or []):
+        try:
+            if bool(obj.get("witcher_location_world_anchor", False)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _location_viewer_import_policy(import_settings):
+    """Return the visible-scene fast path used by compact location presets."""
+    settings = dict(import_settings or {})
+    settings["do_import_ProxyMesh"] = False
+    settings["keep_proxy_meshes"] = False
+    settings["hide_proxy_meshes"] = True
+    # Hide technical collisions and instance repeated scenery.
+    settings["do_import_Collision"] = False
+    settings["instanced_sector"] = True
+    settings["hide_engine_hidden_meshes"] = True
+    return settings
+
+
+def location_viewer_visibility_active(context, root_collection=None):
+    """Public UI helper for the automatic location visibility policy."""
+    if root_collection is None:
+        root_collection = _find_world_root_collection(context)
+    return _is_location_viewer_root(root_collection)
+
+
 def _collection_has_imported_layer_objects(collection):
     if collection is None:
         return False
@@ -1034,9 +1311,12 @@ def _world_layer_cache_dir():
 def _world_layer_cache_key(context, root_collection):
     world_path = str(root_collection.get("world_path", "")).strip()
     world_id = world_path or f"collection:{root_collection.name}"
+    location_scope_id = str(root_collection.get("witcher_location_scope_id", "") or "").strip()
     primary_roots, secondary_roots, prefer_repo_extract = _level_search_roots(context, root_collection)
     roots_id = "\n".join(primary_roots + ["--"] + secondary_roots)
     payload = f"{_WORLD_LAYER_SCAN_CACHE_VERSION}\n{world_id}\n{int(prefer_repo_extract)}\n{roots_id}"
+    if location_scope_id:
+        payload += f"\nlocation_scope:{location_scope_id}"
     return hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest()
 
 
@@ -4253,6 +4533,22 @@ def _object_or_parent_matches(obj, predicate):
     return False
 
 
+def _layer_visibility_is_foliage_object(obj):
+    """Identify foliage objects managed by the foliage importer."""
+
+    def is_foliage_marker(candidate):
+        try:
+            return bool(
+                candidate.get("_is_foliage_instancer", False)
+                or candidate.get("_is_foliage_source", False)
+                or candidate.get("_foliage_shared_proxy_source", False)
+            )
+        except Exception:
+            return False
+
+    return _object_or_parent_matches(obj, is_foliage_marker)
+
+
 def _layer_visibility_is_collision_object(obj):
     def is_collision_marker(candidate):
         try:
@@ -4270,7 +4566,59 @@ def _layer_visibility_is_collision_object(obj):
     return _object_or_parent_matches(obj, is_collision_marker)
 
 
-def _layer_visibility_is_engine_hidden_object(obj):
+def _layer_visibility_object_key(obj):
+    try:
+        return int(obj.as_pointer())
+    except Exception:
+        return id(obj)
+
+
+def _layer_visibility_descendant_engine_states(objects):
+    """Return descendant visibility summaries without Blender's O(scene) child map."""
+    subtree_states = {}
+    visiting = set()
+
+    def direct_value(candidate):
+        try:
+            value = candidate.get("witcher_layer_engine_visible", None)
+            if value is None:
+                value = candidate.get("witcher_drawableFlags_has_DF_IsVisible", None)
+        except Exception:
+            value = None
+        return None if value is None else bool(value)
+
+    def subtree_state(candidate):
+        key = _layer_visibility_object_key(candidate)
+        cached = subtree_states.get(key)
+        if cached is not None:
+            return cached
+        if key in visiting:
+            return False, False
+        visiting.add(key)
+        value = direct_value(candidate)
+        has_value = value is not None
+        any_visible = bool(value) if has_value else False
+        for child in list(getattr(candidate, "children", []) or []):
+            child_has_value, child_any_visible = subtree_state(child)
+            has_value = has_value or child_has_value
+            any_visible = any_visible or child_any_visible
+        visiting.discard(key)
+        subtree_states[key] = (has_value, any_visible)
+        return subtree_states[key]
+
+    descendant_states = {}
+    for obj in objects or []:
+        has_value = False
+        any_visible = False
+        for child in list(getattr(obj, "children", []) or []):
+            child_has_value, child_any_visible = subtree_state(child)
+            has_value = has_value or child_has_value
+            any_visible = any_visible or child_any_visible
+        descendant_states[_layer_visibility_object_key(obj)] = (has_value, any_visible)
+    return descendant_states
+
+
+def _layer_visibility_is_engine_hidden_object(obj, descendant_engine_states=None):
     def is_engine_hidden_marker(candidate):
         try:
             value = candidate.get("witcher_layer_engine_visible", None)
@@ -4285,8 +4633,18 @@ def _layer_visibility_is_engine_hidden_object(obj):
     if getattr(obj, "type", "") != 'EMPTY':
         return False
 
+    if descendant_engine_states is not None:
+        has_value, any_visible = descendant_engine_states.get(
+            _layer_visibility_object_key(obj),
+            (False, False),
+        )
+        return bool(has_value) and not bool(any_visible)
+
     child_values = []
-    for child in list(getattr(obj, "children_recursive", []) or []):
+    pending = list(getattr(obj, "children", []) or [])
+    while pending:
+        child = pending.pop()
+        pending.extend(list(getattr(child, "children", []) or []))
         try:
             value = child.get("witcher_layer_engine_visible", None)
             drawable_visible = child.get("witcher_drawableFlags_has_DF_IsVisible", None)
@@ -4301,6 +4659,9 @@ def _layer_visibility_is_engine_hidden_object(obj):
 
 
 def _layer_visibility_is_proxy_mesh_object(obj):
+    if _layer_visibility_is_foliage_object(obj):
+        return False
+
     def is_proxy_marker(candidate):
         try:
             if bool(candidate.get("witcher_layer_proxy_mesh", False)):
@@ -4357,7 +4718,10 @@ def _layer_visibility_is_imported_layer_object(obj):
     return _object_or_parent_matches(obj, is_layer_marker)
 
 
-def _layer_visibility_reasons(obj):
+def _layer_visibility_reasons(obj, descendant_engine_states=None):
+    if _layer_visibility_is_foliage_object(obj):
+        return set()
+
     reasons = set()
     if getattr(obj, "type", "") == 'MESH':
         if _layer_visibility_is_volume_mesh(obj):
@@ -4370,7 +4734,7 @@ def _layer_visibility_reasons(obj):
         reasons.add("collision")
     if _layer_visibility_is_redapex_object(obj):
         reasons.add("redapex")
-    if _layer_visibility_is_engine_hidden_object(obj):
+    if _layer_visibility_is_engine_hidden_object(obj, descendant_engine_states):
         reasons.add("engine_hidden")
     return reasons
 
@@ -4429,12 +4793,17 @@ def _get_layer_visibility_cache(root_collection):
     if cached and cached.get("signature") == signature:
         return cached
 
+    objects = list(getattr(root_collection, "all_objects", []) or [])
+    descendant_engine_states = _layer_visibility_descendant_engine_states(objects)
     entries = []
-    for obj in list(getattr(root_collection, "all_objects", []) or []):
+    for obj in objects:
         obj_type = getattr(obj, "type", "")
         if obj_type not in {'MESH', 'EMPTY', 'LIGHT'}:
             continue
-        reasons = _layer_visibility_reasons(obj)
+        # Foliage visibility is managed separately.
+        if _layer_visibility_is_foliage_object(obj):
+            continue
+        reasons = _layer_visibility_reasons(obj, descendant_engine_states)
         is_empty = obj_type == 'EMPTY'
         is_layer_object = _layer_visibility_is_imported_layer_object(obj)
         try:
@@ -4557,6 +4926,22 @@ def _apply_layer_object_visibility_rules(
 def _apply_layer_post_import_visibility(job, context):
     root_collection = bpy.data.collections.get(str((job or {}).get("root_collection_name", "") or ""))
     invalidate_layer_visibility_cache(root_collection)
+    if bool((job or {}).get("location_visibility_preapplied")):
+        requires_classification = any(bool((job or {}).get(key)) for key in (
+            "hide_volume_meshes",
+            "hide_shadow_meshes",
+            "hide_collision",
+            "hide_redapex",
+            "solo_volume_meshes",
+            "solo_shadow_meshes",
+            "solo_collision",
+            "solo_engine_hidden_meshes",
+            "solo_proxy_meshes",
+            "solo_redapex",
+        ))
+        if not requires_classification:
+            # Location imports already apply this visibility policy.
+            return 0
     return _apply_layer_object_visibility_rules(
         context,
         hide_volume=bool((job or {}).get("hide_volume_meshes")),
@@ -4581,13 +4966,22 @@ def apply_layer_visibility_settings(context, scene_settings=None, root_collectio
         scene_settings = getattr(scene, "witcher_file_browser", None)
     if scene_settings is None:
         return 0
+    if root_collection is None:
+        root_collection = _resolve_layer_visibility_root_collection(context)
+    location_viewer = _is_location_viewer_root(root_collection)
     return _apply_layer_object_visibility_rules(
         context,
         hide_volume=bool(getattr(scene_settings, "terrain_layer_hide_volume_meshes", False)),
         hide_shadow=bool(getattr(scene_settings, "terrain_layer_hide_shadow_meshes", False)),
         hide_collision=bool(getattr(scene_settings, "terrain_layer_hide_collision", False)),
-        hide_engine_hidden=bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True)),
-        hide_proxy=bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False)),
+        hide_engine_hidden=(
+            location_viewer
+            or bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True))
+        ),
+        hide_proxy=(
+            location_viewer
+            or bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False))
+        ),
         hide_redapex=bool(getattr(scene_settings, "terrain_layer_hide_redapex", False)),
         solo_volume=bool(getattr(scene_settings, "terrain_layer_solo_volume_meshes", False)),
         solo_shadow=bool(getattr(scene_settings, "terrain_layer_solo_shadow_meshes", False)),
@@ -5400,6 +5794,11 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
         write_profile_log = bool(getattr(scene_settings, "terrain_layer_write_profile_log", False))
         import_kwargs = _layer_import_kwargs_from_scene(scene_settings)
         import_filter_active = _layer_import_query_filter_active(scene_settings)
+        location_viewer = _is_location_viewer_root(root_collection)
+        if location_viewer:
+            # Apply the curated location viewer policy.
+            import_kwargs = _location_viewer_import_policy(import_kwargs)
+            import_filter_active = True
 
         _unhide_default_hidden_layer_groups(context)
         job = _start_layer_stream_job(context, "load_nearby", root_collection)
@@ -5408,15 +5807,27 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
         job["skip_complete"] = skip_loaded
         job["camera_position"] = camera_position
         job["mode_signature"] = _layer_load_mode_signature_for_scene(scene_settings)
+        if location_viewer:
+            job["mode_signature"] += (
+                ";location_viewer=1;location_proxy_mesh=0;location_proxy_lods=0"
+                ";location_collision=0;location_instanced=1"
+            )
         job["import_kwargs"] = import_kwargs
         job["import_filter_kwargs"] = import_kwargs
         job["import_filter_active"] = import_filter_active
         job["hide_volume_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_volume_meshes", False))
         job["hide_shadow_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_shadow_meshes", False))
         job["hide_collision"] = bool(getattr(scene_settings, "terrain_layer_hide_collision", False))
-        job["hide_engine_hidden_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True))
-        job["hide_proxy_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False))
+        job["hide_engine_hidden_meshes"] = (
+            location_viewer
+            or bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True))
+        )
+        job["hide_proxy_meshes"] = (
+            location_viewer
+            or bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False))
+        )
         job["hide_redapex"] = bool(getattr(scene_settings, "terrain_layer_hide_redapex", False))
+        job["location_visibility_preapplied"] = bool(location_viewer)
         job["solo_volume_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_volume_meshes", False))
         job["solo_shadow_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_shadow_meshes", False))
         job["solo_collision"] = bool(getattr(scene_settings, "terrain_layer_solo_collision", False))
@@ -5543,17 +5954,33 @@ _FOLIAGE_JOB = {
     "foliage_root_name": None,
     "world_root_name": None,
     "foliage_dir": None,
+    "source_mode": "FULL",
     "wm": None,
     "timer": None,
     "error": None,
 }
+_FOLIAGE_MODAL_BATCH_SIZE = 8
 
 
 def foliage_job_running() -> bool:
     return bool(_FOLIAGE_JOB.get("running"))
 
 
-def _start_foliage_job(pending_cells, foliage_root, world_root, foliage_dir: str):
+def foliage_hydration_running() -> bool:
+    return bool(_FOLIAGE_HYDRATION_RUNNING)
+
+
+def foliage_busy() -> bool:
+    return foliage_job_running() or foliage_hydration_running()
+
+
+def _start_foliage_job(
+    pending_cells,
+    foliage_root,
+    world_root,
+    foliage_dir: str,
+    source_mode: str = "FULL",
+):
     _FOLIAGE_JOB.clear()
     _FOLIAGE_JOB.update({
         "running": True,
@@ -5566,6 +5993,7 @@ def _start_foliage_job(pending_cells, foliage_root, world_root, foliage_dir: str
         "foliage_root_name": foliage_root.name,
         "world_root_name": world_root.name,
         "foliage_dir": foliage_dir,
+        "source_mode": str(source_mode or "FULL"),
         "wm": None,
         "timer": None,
         "error": None,
@@ -5584,6 +6012,20 @@ def _finish_foliage_job(operator, context, cancelled=False, failed=False):
     loaded = int(_FOLIAGE_JOB.get("loaded_count", 0))
     instances = int(_FOLIAGE_JOB.get("instance_count", 0))
     error = _FOLIAGE_JOB.get("error")
+    source_mode = str(_FOLIAGE_JOB.get("source_mode", "FULL") or "FULL")
+    foliage_root_name = str(_FOLIAGE_JOB.get("foliage_root_name", "") or "")
+
+    if source_mode == "PROXY" and not failed and not cancelled:
+        foliage_root = bpy.data.collections.get(foliage_root_name) if foliage_root_name else None
+        if foliage_root is not None:
+            try:
+                from ..importers import import_foliage as _if
+
+                _if.apply_viewer_source_budget(foliage_root, context)
+            except Exception as exc:
+                failed = True
+                error = f"Viewer foliage hydration failed: {exc}"
+                log.exception("Viewer foliage hydration failed")
 
     _FOLIAGE_JOB.clear()
     _FOLIAGE_JOB.update({
@@ -5597,6 +6039,7 @@ def _finish_foliage_job(operator, context, cancelled=False, failed=False):
         "foliage_root_name": None,
         "world_root_name": None,
         "foliage_dir": None,
+        "source_mode": "FULL",
         "wm": None,
         "timer": None,
         "error": None,
@@ -5616,6 +6059,9 @@ def _finish_foliage_job(operator, context, cancelled=False, failed=False):
 
 def draw_foliage_job_ui(layout, context) -> None:
     if not _FOLIAGE_JOB.get("running"):
+        if foliage_hydration_running():
+            box = layout.box()
+            box.label(text="Loading full foliage sources...", icon="IMPORT")
         return
     total = int(_FOLIAGE_JOB.get("total", 0) or 0)
     current = int(_FOLIAGE_JOB.get("cell_idx", 0) or 0)
@@ -5634,18 +6080,18 @@ def get_foliage_info_label(context) -> str:
     world_name = os.path.splitext(os.path.basename(world_path))[0] if world_path else root_coll.name
 
     from ..importers import import_foliage as _if
-    foliage_prefix = _if.get_game_rel_foliage_prefix(world_path, context) if world_path else ""
-
     for child in root_coll.children:
         if child.get("_is_foliage_root"):
             cells = _if.count_loaded_cells(child)
             instances = _if.count_instances(child)
-            total_cells = _if.count_all_foliage_cells(foliage_prefix) if foliage_prefix else 0
-            return f"{world_name}  |  Cells: {cells}/{total_cells}  Instances: {instances:,}"
+            missing_sources = len(_if.list_missing_foliage_sources(child))
+            suffix = f"  Proxies: {missing_sources}" if missing_sources else ""
+            # Avoid bundle scans during panel redraw.
+            total_cells = child.get("_available_cell_count")
+            if total_cells is None:
+                return f"{world_name}  |  Cells: {cells}  Instances: {instances:,}{suffix}"
+            return f"{world_name}  |  Cells: {cells}/{int(total_cells)}  Instances: {instances:,}{suffix}"
 
-    if foliage_prefix:
-        total_cells = _if.count_all_foliage_cells(foliage_prefix)
-        return f"{world_name}  |  {total_cells} foliage cells available (none loaded)"
     return f"{world_name}  |  No foliage loaded"
 
 
@@ -5666,8 +6112,13 @@ class WITCH_OT_load_foliage_around_camera(bpy.types.Operator):
     bl_description = "Load foliage cells within the configured radius of the current viewport camera"
 
     def execute(self, context):
-        if foliage_job_running():
-            self.report({"WARNING"}, "A foliage load job is already running")
+        if foliage_busy():
+            message = (
+                "Full foliage sources are still loading"
+                if foliage_hydration_running()
+                else "A foliage load job is already running"
+            )
+            self.report({"WARNING"}, message)
             return {"CANCELLED"}
         if layer_stream_job_running():
             self.report({"WARNING"}, "A terrain layer stream job is running; wait for it to finish first")
@@ -5698,7 +6149,11 @@ class WITCH_OT_load_foliage_around_camera(bpy.types.Operator):
         radius = max(1.0, float(getattr(scene_settings, "foliage_load_radius", 200.0)))
 
         foliage_prefix = _if.get_game_rel_foliage_prefix(world_path, context)
-        all_cells = _if.find_all_flyr_keys_in_bundles(foliage_prefix)
+        all_cells = _if.find_all_flyr_keys_in_bundles(
+            foliage_prefix,
+            context,
+            world_path=world_path,
+        )
         if not all_cells:
             self.report({"WARNING"}, f"No foliage cells found for: {foliage_prefix}")
             return {"CANCELLED"}
@@ -5707,6 +6162,7 @@ class WITCH_OT_load_foliage_around_camera(bpy.types.Operator):
         cam_x, cam_y, _cam_z = camera_pos
 
         foliage_root = _if.get_foliage_root_collection(root_coll)
+        foliage_root["_available_cell_count"] = len(all_cells)
         loaded_cells = _if.get_loaded_cells(foliage_root)
 
         # Build pending list from cells that are in bundles AND in camera radius
@@ -5723,7 +6179,14 @@ class WITCH_OT_load_foliage_around_camera(bpy.types.Operator):
             self.report({"INFO"}, f"No new foliage cells to load in this area (radius {radius:.0f})")
             return {"FINISHED"}
 
-        _start_foliage_job(pending, foliage_root, root_coll, foliage_prefix)
+        source_mode = str(getattr(scene_settings, "terrain_foliage_mode", "PROXY"))
+        _start_foliage_job(
+            pending,
+            foliage_root,
+            root_coll,
+            foliage_prefix,
+            source_mode=source_mode,
+        )
 
         wm = context.window_manager
         _FOLIAGE_JOB["wm"] = wm
@@ -5749,8 +6212,9 @@ class WITCH_OT_load_foliage_around_camera(bpy.types.Operator):
             if idx >= len(pending):
                 return _finish_foliage_job(self, context)
 
-            key, flyr_path = pending[idx]
-            _FOLIAGE_JOB["cell_idx"] = idx + 1
+            batch = pending[idx:idx + _FOLIAGE_MODAL_BATCH_SIZE]
+            next_idx = idx + len(batch)
+            _FOLIAGE_JOB["cell_idx"] = next_idx
 
             foliage_root_name = _FOLIAGE_JOB.get("foliage_root_name")
             foliage_root = bpy.data.collections.get(foliage_root_name) if foliage_root_name else None
@@ -5759,15 +6223,27 @@ class WITCH_OT_load_foliage_around_camera(bpy.types.Operator):
                 return _finish_foliage_job(self, context, failed=True)
 
             from ..importers import import_foliage as _if
-            success, n = _if.load_foliage_cell(flyr_path, foliage_root, context)
-            if success:
-                _if.mark_cell_loaded(foliage_root, key)
-                _FOLIAGE_JOB["loaded_count"] = int(_FOLIAGE_JOB.get("loaded_count", 0)) + 1
-                _FOLIAGE_JOB["instance_count"] = int(_FOLIAGE_JOB.get("instance_count", 0)) + n
-            else:
-                log.warning("Skipping failed foliage cell without marking loaded: %s", flyr_path)
+            result = _if.load_foliage_cells(
+                batch,
+                foliage_root,
+                context,
+                source_mode=str(_FOLIAGE_JOB.get("source_mode", "FULL")),
+                hydrate_viewer_sources=False,
+            )
+            _FOLIAGE_JOB["loaded_count"] = (
+                int(_FOLIAGE_JOB.get("loaded_count", 0)) + len(result.loaded_cells)
+            )
+            _FOLIAGE_JOB["instance_count"] = (
+                int(_FOLIAGE_JOB.get("instance_count", 0)) + int(result.instance_count)
+            )
+            if result.failed_cells:
+                log.warning(
+                    "Skipping %d failed foliage cell(s) without marking loaded: %s",
+                    len(result.failed_cells),
+                    ", ".join(result.failed_cells),
+                )
 
-            if idx + 1 >= len(pending):
+            if next_idx >= len(pending):
                 return _finish_foliage_job(self, context)
         except Exception as exc:
             log.exception("Foliage load job failed")
@@ -5820,6 +6296,145 @@ class WITCH_OT_unload_foliage(bpy.types.Operator):
                 return {"FINISHED"}
         self.report({"INFO"}, "No foliage to unload")
         return {"CANCELLED"}
+
+
+_FOLIAGE_HYDRATION_RUNNING = False
+
+
+class WITCH_OT_hydrate_foliage_sources(bpy.types.Operator):
+    bl_idname = "witcher.hydrate_foliage_sources"
+    bl_label = "Load Full Foliage Sources"
+    bl_description = "Progressively replace fast foliage proxies with full source meshes"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, _context):
+        return not _FOLIAGE_HYDRATION_RUNNING
+
+    def _finish(self, context, *, cancelled=False):
+        global _FOLIAGE_HYDRATION_RUNNING
+        timer = getattr(self, "_timer", None)
+        if timer is not None:
+            try:
+                context.window_manager.event_timer_remove(timer)
+            except Exception:
+                pass
+            self._timer = None
+        _FOLIAGE_HYDRATION_RUNNING = False
+        _tag_layer_stream_redraw(context)
+
+        hydrated = int(getattr(self, "_hydrated_count", 0))
+        failed = list(getattr(self, "_failed_sources", ()))
+        remaining = 0
+        root_name = str(getattr(self, "_foliage_root_name", "") or "")
+        foliage_root = bpy.data.collections.get(root_name) if root_name else None
+        if foliage_root is not None:
+            from ..importers import import_foliage as _if
+
+            remaining = len(_if.list_missing_foliage_sources(foliage_root))
+
+        if failed:
+            log.warning("Foliage sources still using proxies: %s", ", ".join(failed))
+        if cancelled:
+            self.report(
+                {'INFO'},
+                f"Full-source loading cancelled: {hydrated} loaded, {remaining} proxies remain",
+            )
+            return {'CANCELLED'}
+        if failed or remaining:
+            self.report(
+                {'WARNING'},
+                f"Loaded {hydrated} full sources; {remaining} proxies remain",
+            )
+        else:
+            self.report({'INFO'}, f"Loaded {hydrated} full foliage sources")
+        return {'FINISHED'}
+
+    def execute(self, context):
+        global _FOLIAGE_HYDRATION_RUNNING
+        if foliage_job_running():
+            self.report({'WARNING'}, "Wait for the foliage cell load to finish")
+            return {'CANCELLED'}
+        if getattr(context, "window", None) is None:
+            self.report({'ERROR'}, "This action must be started from a Blender window")
+            return {'CANCELLED'}
+
+        world_root = _find_world_root_collection(context)
+        if world_root is None:
+            self.report({'WARNING'}, "No world collection found")
+            return {'CANCELLED'}
+        foliage_root = next(
+            (child for child in world_root.children if child.get("_is_foliage_root")),
+            None,
+        )
+        if foliage_root is None:
+            self.report({'INFO'}, "No foliage is loaded")
+            return {'CANCELLED'}
+
+        from ..importers import import_foliage as _if
+
+        pending = list(_if.list_missing_foliage_sources(foliage_root))
+        if not pending:
+            self.report({'INFO'}, "All loaded foliage already uses full sources")
+            return {'FINISHED'}
+
+        self._foliage_root_name = foliage_root.name
+        self._pending_sources = pending
+        self._hydrated_count = 0
+        self._failed_sources = []
+        self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
+        _FOLIAGE_HYDRATION_RUNNING = True
+        context.window_manager.modal_handler_add(self)
+        self.report({'INFO'}, f"Loading {len(pending)} full foliage sources; Esc cancels")
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            return self._finish(context, cancelled=True)
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        root_name = str(getattr(self, "_foliage_root_name", "") or "")
+        foliage_root = bpy.data.collections.get(root_name) if root_name else None
+        if foliage_root is None:
+            self._failed_sources.extend(getattr(self, "_pending_sources", ()))
+            self._pending_sources = []
+            return self._finish(context)
+
+        pending = self._pending_sources
+        if not pending:
+            return self._finish(context)
+        depot_path = pending.pop(0)
+        try:
+            from ..importers import import_foliage as _if
+
+            result = _if.hydrate_missing_foliage_sources(
+                foliage_root,
+                context,
+                depot_paths=(depot_path,),
+                max_sources=1,
+            )
+            self._hydrated_count += len(result.hydrated_types)
+            self._failed_sources.extend(result.failed_types)
+        except Exception:
+            log.exception("Failed to hydrate foliage source: %s", depot_path)
+            self._failed_sources.append(depot_path)
+
+        _maybe_tag_layer_stream_redraw(context, wm=getattr(context, "window_manager", None))
+        if not pending:
+            return self._finish(context)
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        global _FOLIAGE_HYDRATION_RUNNING
+        timer = getattr(self, "_timer", None)
+        if timer is not None:
+            try:
+                context.window_manager.event_timer_remove(timer)
+            except Exception:
+                pass
+            self._timer = None
+        _FOLIAGE_HYDRATION_RUNNING = False
 
 
 class WITCH_OT_open_foliage_browser(bpy.types.Operator):

@@ -1248,19 +1248,25 @@ def resolve_motion_controller_armature(obj):
     controller_name = str(getattr(obj, "name", "") or "")
     controller_prefixes = (CONTROLLER_EMPTY_NAME, AUTO_MOTION_CONTROLLER_NAME, MOTION_DIRECTION_CONTROLLER_NAME)
     is_controller_name = any(controller_name.startswith(f"{prefix}_") for prefix in controller_prefixes)
+    armature = _armature_from_controller_prop(obj)
+    if armature is not None:
+        return armature
+
+    # Avoid scene-wide scans for ordinary selections.
+    if not is_controller_name:
+        return None
+
     armature = (
-        _armature_from_controller_prop(obj)
-        or _armature_for_stored_controller('root_motion_controller', controller_name)
+        _armature_for_stored_controller('root_motion_controller', controller_name)
         or _armature_for_stored_controller('auto_motion_controller', controller_name)
         or _armature_for_stored_controller('motion_direction_controller', controller_name)
     )
     if armature is not None:
         return armature
 
-    if is_controller_name:
-        armature = _child_armature_recursive(obj)
-        if armature is not None:
-            return armature
+    armature = _child_armature_recursive(obj)
+    if armature is not None:
+        return armature
 
     for prefix in controller_prefixes:
         expected = f"{prefix}_"

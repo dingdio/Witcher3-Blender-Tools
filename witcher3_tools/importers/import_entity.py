@@ -701,6 +701,7 @@ def import_or_reuse_redcloth(
     import_name: str,
     entity_name: str,
     target_collection=None,
+    hide_collision_proxies=False,
 ):
     total_started = time.perf_counter()
     resolve_seconds = 0.0
@@ -856,6 +857,7 @@ def import_or_reuse_redcloth(
     visible_root = _get_reusable_redcloth_root(cloth_arma, redcloth_resource_key)
     _clear_redcloth_cache_root_flag(visible_root)
     if imported:
+        # Cache the pristine hierarchy before applying per-use visibility.
         _seed_redcloth_cache_root(
             scene,
             visible_root,
@@ -864,6 +866,15 @@ def import_or_reuse_redcloth(
             redcloth_resource,
             redcloth_mat_path,
         )
+    if visible_root is not None:
+        for obj in (visible_root, *_iter_object_descendants(visible_root)):
+            try:
+                if not bool(obj.get("witcher_apx_collision_proxy", False)):
+                    continue
+                obj.hide_viewport = bool(hide_collision_proxies)
+                obj.hide_render = bool(hide_collision_proxies)
+            except Exception:
+                continue
     collect_started = time.perf_counter()
     cloth_meshes = _collect_redcloth_meshes(cloth_arma)
     collect_seconds = time.perf_counter() - collect_started

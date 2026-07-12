@@ -8,6 +8,7 @@ log = logging.getLogger(__name__)
 
 _runtime_armature_name_by_scene = {}
 _runtime_explicit_none_by_scene = {}
+_auto_candidate_cache_by_scene = {}
 
 
 def _armature_poll(_self, obj):
@@ -163,18 +164,83 @@ def _pick_auto_candidate(scene):
     if scene is None:
         return None
 
+    def candidate_fingerprint(armatures):
+        return tuple(sorted(
+            (
+                str(getattr(obj, "name", "") or ""),
+                bool(armature_has_character_data(obj, include_auxiliary=False)),
+            )
+            for obj in armatures
+            if is_armature_object(obj)
+        ))
+
+    try:
+        signature = (
+            len(scene.objects),
+            len(getattr(bpy.data, "objects", [])),
+            len(getattr(bpy.data, "armatures", [])),
+        )
+    except Exception:
+        signature = None
+    scene_key = _scene_key(scene)
+    cached = _auto_candidate_cache_by_scene.get(scene_key)
+    if signature is not None and cached and cached[0] == signature:
+        candidate_name = cached[1]
+        cached_fingerprint = cached[2] if len(cached) > 2 else None
+        fingerprint_matches = cached_fingerprint is None
+        if cached_fingerprint is not None:
+            cached_armatures = []
+            for armature_name, _has_character_data in cached_fingerprint:
+                obj = bpy.data.objects.get(armature_name)
+                if not is_armature_in_scene(scene, obj):
+                    break
+                cached_armatures.append(obj)
+            else:
+                fingerprint_matches = candidate_fingerprint(cached_armatures) == cached_fingerprint
+        if fingerprint_matches:
+            if not candidate_name:
+                return None
+            candidate = bpy.data.objects.get(candidate_name)
+            if is_armature_in_scene(scene, candidate):
+                return candidate
+
+    # Avoid scene scans during panel redraw without armatures.
+    armature_datablocks = getattr(getattr(bpy, "data", None), "armatures", None)
+    if armature_datablocks is not None:
+        try:
+            if len(armature_datablocks) == 0:
+                if signature is not None:
+                    _auto_candidate_cache_by_scene[scene_key] = (signature, "")
+                return None
+        except Exception:
+            pass
+
     armatures = [obj for obj in scene.objects if is_armature_object(obj)]
     if not armatures:
+        if signature is not None:
+            _auto_candidate_cache_by_scene[scene_key] = (signature, "", ())
         return None
+
+    fingerprint = candidate_fingerprint(armatures)
 
     character_armatures = [obj for obj in armatures if armature_has_character_data(obj, include_auxiliary=False)]
     if len(character_armatures) == 1:
-        return character_armatures[0]
+        candidate = character_armatures[0]
+        if signature is not None:
+            _auto_candidate_cache_by_scene[scene_key] = (signature, candidate.name, fingerprint)
+        return candidate
     if len(character_armatures) > 1:
+        if signature is not None:
+            _auto_candidate_cache_by_scene[scene_key] = (signature, "", fingerprint)
         return None
 
     if len(armatures) == 1:
-        return armatures[0]
+        candidate = armatures[0]
+        if signature is not None:
+            _auto_candidate_cache_by_scene[scene_key] = (signature, candidate.name, fingerprint)
+        return candidate
+    if signature is not None:
+        _auto_candidate_cache_by_scene[scene_key] = (signature, "", fingerprint)
     return None
 
 
@@ -388,6 +454,8 @@ def unregister():
         del bpy.types.Scene.witcher_main_armature_explicit_none
     if hasattr(bpy.types.Scene, "witcher_main_armature"):
         del bpy.types.Scene.witcher_main_armature
+
+    _auto_candidate_cache_by_scene.clear()
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

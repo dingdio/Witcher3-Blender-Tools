@@ -1,6 +1,8 @@
 import logging
 import os
 import hashlib
+import math
+from dataclasses import dataclass
 
 import bpy
 
@@ -27,6 +29,10 @@ from .. import get_uncook_path
 from .. import get_fbx_uncook_path
 from .. import get_all_addon_prefs
 from ..extension_paths import get_dev_override, get_redkit_working_root
+from ..terrain_core import (
+    terrain_tile_bounds as _terrain_tile_bounds_2d,
+    terrain_tile_from_world_position as _terrain_tile_from_world_position,
+)
 
 W2W_NODES_PROP = "witcher_w2w_nodes"
 W2W_LIST_PROP = "witcher_w2w_list_tree"
@@ -419,6 +425,7 @@ def btn_import_radish(filename):
         do_import_map_terrain(worldFile, filePath)
 
 _MATERIALIZED_W2TER_BUFFER_CACHE = {}
+_TERRAIN_GRID_TOPOLOGY_CACHE = {}
 
 
 def _path_is_under_root(path, root):
@@ -598,8 +605,127 @@ def _discover_tile_count(terrain_tiles_dir):
 TERRAIN_IMPORT_FULL_MAP = "FULL_MAP"
 TERRAIN_IMPORT_TILES = "TILES"
 
+# Defaults balance preview quality and source resolution.
+TERRAIN_TILE_PREVIEW_LEVEL = 5
+TERRAIN_TILE_MAX_LEVEL = 8
 
-def _resolve_terrain_context(worldFile, filePath):
+@dataclass(frozen=True, order=True)
+class TerrainTileKey:
+    """Stable source-space terrain tile coordinate."""
+
+    x: int
+    y: int
+
+    def __post_init__(self):
+        object.__setattr__(self, "x", int(self.x))
+        object.__setattr__(self, "y", int(self.y))
+
+
+@dataclass(frozen=True)
+class TerrainTileBounds:
+    """Half-open world-space XY bounds for one terrain tile."""
+
+    key: TerrainTileKey
+    world_y: int
+    min_x: float
+    min_y: float
+    max_x: float
+    max_y: float
+    min_z: float
+    max_z: float
+
+    @property
+    def tile_size(self):
+        return self.max_x - self.min_x
+
+    @property
+    def center_x(self):
+        return (self.min_x + self.max_x) * 0.5
+
+    @property
+    def center_y(self):
+        return (self.min_y + self.max_y) * 0.5
+
+    def contains_xy(self, x, y):
+        """Return whether a point belongs to this tile using half-open edges."""
+        return self.min_x <= float(x) < self.max_x and self.min_y <= float(y) < self.max_y
+
+
+@dataclass(frozen=True)
+class TerrainWorldSpec:
+    """Small, serializable description needed for coordinate-scoped imports."""
+
+    hub_name: str
+    world_name: str
+    world_path: str
+    world_key: str
+    terrain_size: float
+    lowest_elevation: float
+    highest_elevation: float
+    tile_res: int
+    x_tiles: int
+    y_tiles: int
+    terrain_tiles_dir: str
+    terrain_tiles_rel: str = ""
+    working_tiles_dir: str = ""
+
+
+@dataclass(frozen=True)
+class TerrainTileSourceRequest:
+    """Explicit declaration of the files allowed to be resolved for a tile."""
+
+    key: TerrainTileKey
+    include_overlay: bool = True
+
+@dataclass(frozen=True)
+class TerrainTileSource:
+    """Resolved source paths for one tile only."""
+
+    request: TerrainTileSourceRequest
+    tile_name: str
+    heightmap_buffer: str = ""
+    texture_buffer: str = ""
+    overlay_path: str = ""
+
+    @property
+    def key(self):
+        return self.request.key
+
+    @property
+    def available(self):
+        return bool(self.heightmap_buffer)
+
+
+@dataclass(frozen=True)
+class TerrainTileImportResult:
+    """Structured result returned to UI and foliage callers."""
+
+    spec: TerrainWorldSpec
+    source: TerrainTileSource
+    bounds: TerrainTileBounds
+    obj: object = None
+    root: object = None
+    world_collection: object = None
+    created: bool = False
+    reused: bool = False
+    error: str = ""
+
+    @property
+    def ok(self):
+        return self.obj is not None and not self.error
+
+
+@dataclass(frozen=True)
+class WorldTileLoadResult:
+    """Combined terrain and optional foliage result shared by every UI entry."""
+
+    spec: TerrainWorldSpec
+    terrain: TerrainTileImportResult
+    foliage: object = None
+    foliage_error: str = ""
+
+
+def _resolve_terrain_context(worldFile, filePath, *, discover_tiles=True):
     fpath = Path(filePath)
     # filePath may be a .w2w file or a directory (radish import)
     if fpath.is_dir():
@@ -638,7 +764,7 @@ def _resolve_terrain_context(worldFile, filePath):
         n_tiles = clipmap // tile_res
 
     # Discover from disk if w2w didn't provide grid size
-    if n_tiles <= 0:
+    if n_tiles <= 0 and discover_tiles:
         n_tiles = _discover_tile_count(terrain_tiles_dir)
 
     return {
@@ -653,11 +779,149 @@ def _resolve_terrain_context(worldFile, filePath):
     }
 
 
+def _terrain_world_key(hub_name, world_path):
+    """Return a stable identifier without requiring the path to exist."""
+    path = str(world_path or "").strip()
+    if path:
+        try:
+            path = os.path.abspath(path)
+        except Exception:
+            pass
+        identity = os.path.normcase(os.path.normpath(path))
+    else:
+        identity = str(hub_name or "terrain").casefold()
+    return hashlib.sha1(identity.encode("utf-8", errors="replace")).hexdigest()
+
+
+def inspect_world_terrain(worldFile, filePath, *, discover_tiles=True):
+    """Read world metadata required by tile tools."""
+    ctx = _resolve_terrain_context(worldFile, filePath, discover_tiles=discover_tiles)
+    world_path = str(filePath or "")
+    hub_name = str(ctx["hub_name"] or "terrain")
+    n_tiles = max(0, int(ctx["n_tiles"] or 0))
+    return TerrainWorldSpec(
+        hub_name=hub_name,
+        world_name=str(getattr(worldFile, "worldName", None) or hub_name),
+        world_path=world_path,
+        world_key=_terrain_world_key(hub_name, world_path),
+        terrain_size=float(getattr(worldFile, "terrainSize", 0.0) or 0.0),
+        lowest_elevation=float(getattr(worldFile, "lowestElevation", 0.0) or 0.0),
+        highest_elevation=float(getattr(worldFile, "highestElevation", 0.0) or 0.0),
+        tile_res=max(1, int(ctx["tile_res"] or 256)),
+        x_tiles=n_tiles,
+        y_tiles=n_tiles,
+        terrain_tiles_dir=str(ctx["terrain_tiles_dir"] or ""),
+        terrain_tiles_rel=str(ctx["terrain_tiles_rel"] or ""),
+        working_tiles_dir=str(ctx["working_tiles_dir"] or ""),
+    )
+
+
+def terrain_tile_bounds(spec, x, y):
+    """Return half-open bounds for a tile without touching Blender or disk."""
+    key = TerrainTileKey(x, y)
+    bounds = _terrain_tile_bounds_2d(
+        key.x,
+        key.y,
+        int(spec.x_tiles),
+        int(spec.y_tiles),
+        float(spec.terrain_size),
+    )
+    world_y = key.y
+    return TerrainTileBounds(
+        key=key,
+        world_y=world_y,
+        min_x=bounds.min_x,
+        min_y=bounds.min_y,
+        max_x=bounds.max_x,
+        max_y=bounds.max_y,
+        min_z=float(spec.lowest_elevation),
+        max_z=float(spec.highest_elevation),
+    )
+
+
+def terrain_tile_from_world_position(spec, position):
+    return _terrain_tile_from_world_position(
+        position,
+        int(spec.x_tiles),
+        int(spec.y_tiles),
+        float(spec.terrain_size),
+    )
+
+
+def terrain_tile_source_request(x, y, *, include_overlay=True):
+    """Construct a source request that can be inspected before any I/O."""
+    return TerrainTileSourceRequest(
+        key=TerrainTileKey(x, y),
+        include_overlay=bool(include_overlay),
+    )
+
+
+def resolve_terrain_tile_source(spec, request):
+    """Resolve only the buffers explicitly named by one tile request."""
+    if not isinstance(request, TerrainTileSourceRequest):
+        raise TypeError("request must be a TerrainTileSourceRequest")
+    terrain_tile_bounds(spec, request.key.x, request.key.y)
+
+    tile_name = f"tile_{request.key.y}_x_{request.key.x}_res{int(spec.tile_res)}"
+    heightmap_name = f"{tile_name}.w2ter.1.buffer"
+    heightmap_path = _resolve_tile_buffer(
+        spec.terrain_tiles_dir,
+        spec.terrain_tiles_rel or None,
+        heightmap_name,
+        working_tiles_dir=spec.working_tiles_dir or None,
+    )
+
+    texture_path = ""
+    overlay_path = ""
+    if request.include_overlay:
+        texture_name = f"{tile_name}.w2ter.2.buffer"
+        texture_path = _resolve_tile_buffer(
+            spec.terrain_tiles_dir,
+            spec.terrain_tiles_rel or None,
+            texture_name,
+            working_tiles_dir=spec.working_tiles_dir or None,
+        ) or ""
+        if texture_path:
+            overlay_path = texture_path + ".overlay.png"
+
+    return TerrainTileSource(
+        request=request,
+        tile_name=tile_name,
+        heightmap_buffer=str(heightmap_path or ""),
+        texture_buffer=str(texture_path or ""),
+        overlay_path=str(overlay_path or ""),
+    )
+
+
+def resolve_world_terrain_tile_source(spec, x, y, *, include_overlay=True):
+    """Convenience wrapper used by Blender UI operators."""
+    return resolve_terrain_tile_source(
+        spec,
+        terrain_tile_source_request(x, y, include_overlay=include_overlay),
+    )
+
+
 def _get_scene_terrain_multires_level():
     try:
         return int(bpy.context.scene.witcher_file_browser.terrain_multires_level)
     except Exception:
-        return 10
+        return TERRAIN_TILE_PREVIEW_LEVEL
+
+
+def _clamp_tile_multires_level(level, tile_res):
+    """Cap mesh density at the resolution supported by the source buffer."""
+    try:
+        level = max(0, int(level))
+    except (TypeError, ValueError):
+        level = TERRAIN_TILE_PREVIEW_LEVEL
+    try:
+        tile_res = max(1, int(tile_res))
+    except (TypeError, ValueError):
+        tile_res = 1
+    if tile_res <= 1:
+        return 0
+    source_cap = int(math.ceil(math.log2(tile_res - 1)))
+    return min(level, source_cap, TERRAIN_TILE_MAX_LEVEL)
 
 
 def _get_scene_terrain_import_mode():
@@ -1499,119 +1763,117 @@ def do_import_map_terrain(worldFile, filePath, world_root_collection=None):
 
     obj = _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection)
     if obj is None:
-        log.info("Falling back to tile terrain import")
-        _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection)
+        # Do not silently fall back to all tiles.
+        log.warning("Full-map terrain import failed; all-tiles fallback was not started")
+
+
+def _terrain_grid_topology(mesh_res):
+    """Return cached loop, polygon, and UV arrays for a square grid."""
+    mesh_res = max(2, int(mesh_res))
+    cached = _TERRAIN_GRID_TOPOLOGY_CACHE.get(mesh_res)
+    if cached is not None:
+        return cached
+
+    face_side = mesh_res - 1
+    lower_left = (
+        np.arange(face_side, dtype=np.int32)[:, None] * mesh_res
+        + np.arange(face_side, dtype=np.int32)[None, :]
+    ).ravel()
+    loop_vertices = np.column_stack((
+        lower_left,
+        lower_left + 1,
+        lower_left + mesh_res + 1,
+        lower_left + mesh_res,
+    )).astype(np.int32, copy=False).ravel()
+    face_count = face_side * face_side
+    loop_starts = np.arange(0, loop_vertices.size, 4, dtype=np.int32)
+    loop_totals = np.full(face_count, 4, dtype=np.int32)
+
+    uv_axis = np.linspace(0.0, 1.0, mesh_res, dtype=np.float32)
+    uv_x, uv_y = np.meshgrid(uv_axis, uv_axis)
+    vertex_uv = np.column_stack((uv_x.ravel(), uv_y.ravel()))
+    loop_uv = vertex_uv[loop_vertices].astype(np.float32, copy=False)
+    cached = (loop_vertices, loop_starts, loop_totals, loop_uv)
+    _TERRAIN_GRID_TOPOLOGY_CACHE[mesh_res] = cached
+    return cached
 
 
 def _create_tile_mesh(name, heightmap_buffer_path, tile_res, mesh_res,
-                      tile_size, elev_range, lowest_elevation):
-    """Create a grid mesh with vertex Z from raw heightmap data.
-
-    Args:
-        name: mesh/object name
-        heightmap_buffer_path: path to raw .w2ter.1.buffer (uint16 LE)
-        tile_res: heightmap resolution (e.g. 256)
-        mesh_res: mesh grid resolution (vertices per side, e.g. 33 for multires 5)
-        tile_size: size of tile in world units
-        elev_range: abs(lowest) + abs(highest) elevation
-        lowest_elevation: world Z offset for the tile
-
-    Returns:
-        bpy.types.Mesh
-    """
-    import bmesh
-
+                      tile_size, elev_range):
+    """Create a terrain grid from a raw heightmap."""
     # Read raw heightmap
-    heightmap = np.fromfile(heightmap_buffer_path, dtype="<u2")
+    heightmap = np.fromfile(win_safe_path(heightmap_buffer_path), dtype="<u2")
     if heightmap.size != tile_res * tile_res:
-        # Fallback: flat mesh
-        heightmap = np.zeros((tile_res, tile_res), dtype=np.uint16)
-    else:
-        heightmap = heightmap.reshape((tile_res, tile_res))
+        raise ValueError(
+            f"Terrain buffer has {heightmap.size} samples; expected {tile_res * tile_res}"
+        )
+    heightmap = heightmap.reshape((tile_res, tile_res))
 
     mesh = bpy.data.meshes.new(name)
-    bm = bmesh.new()
-
     half = tile_size / 2.0
-    step = tile_size / (mesh_res - 1) if mesh_res > 1 else tile_size
+    mesh_res = max(2, int(mesh_res))
 
-    # Create vertices - sample heightmap at each grid point
-    for vy in range(mesh_res):
-        for vx in range(mesh_res):
-            # UV coords [0..1]
-            u = vx / (mesh_res - 1) if mesh_res > 1 else 0.5
-            v = vy / (mesh_res - 1) if mesh_res > 1 else 0.5
+    # Use NumPy and Blender bulk APIs for dense grids.
+    axis = np.linspace(-half, half, mesh_res, dtype=np.float32)
+    sample_axis = np.rint(
+        np.linspace(0, max(0, tile_res - 1), mesh_res, dtype=np.float64)
+    ).astype(np.intp)
+    sampled_height = heightmap[np.ix_(sample_axis, sample_axis)].astype(np.float32)
+    sampled_height *= float(elev_range) / 65535.0
 
-            # Sample heightmap at nearest pixel
-            px = min(int(u * (tile_res - 1) + 0.5), tile_res - 1)
-            py = min(int(v * (tile_res - 1) + 0.5), tile_res - 1)
-            height_norm = heightmap[py, px] / 65535.0
-            z = height_norm * elev_range
+    grid_x, grid_y = np.meshgrid(axis, axis)
+    vertex_count = mesh_res * mesh_res
+    coordinates = np.empty((vertex_count, 3), dtype=np.float32)
+    coordinates[:, 0] = grid_x.ravel()
+    coordinates[:, 1] = grid_y.ravel()
+    coordinates[:, 2] = sampled_height.ravel()
 
-            x_pos = -half + vx * step
-            y_pos = -half + vy * step
-            bm.verts.new((x_pos, y_pos, z))
+    loop_vertices, loop_starts, loop_totals, loop_uv = _terrain_grid_topology(mesh_res)
+    face_count = loop_starts.size
 
-    # Create faces
-    bm.verts.ensure_lookup_table()
-    for vy in range(mesh_res - 1):
-        for vx in range(mesh_res - 1):
-            i = vy * mesh_res + vx
-            v0 = bm.verts[i]
-            v1 = bm.verts[i + 1]
-            v2 = bm.verts[i + mesh_res + 1]
-            v3 = bm.verts[i + mesh_res]
-            bm.faces.new([v0, v1, v2, v3])
+    mesh.vertices.add(vertex_count)
+    mesh.vertices.foreach_set("co", coordinates.ravel())
+    mesh.loops.add(loop_vertices.size)
+    mesh.loops.foreach_set("vertex_index", loop_vertices)
+    mesh.polygons.add(face_count)
+    mesh.polygons.foreach_set("loop_start", loop_starts)
+    mesh.polygons.foreach_set("loop_total", loop_totals)
 
-    # Create UV layer
-    uv_layer = bm.loops.layers.uv.new("UVMap")
-    for face in bm.faces:
-        for loop in face.loops:
-            # Derive UV directly from local XY so UVs are always valid.
-            u = (loop.vert.co.x + half) / tile_size if tile_size else 0.5
-            v = (loop.vert.co.y + half) / tile_size if tile_size else 0.5
-            loop[uv_layer].uv = (max(0.0, min(1.0, u)), max(0.0, min(1.0, v)))
-
-    bm.to_mesh(mesh)
-    bm.free()
-    if mesh.uv_layers:
-        mesh.uv_layers.active = mesh.uv_layers[0]
-    mesh.update()
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    uv_layer.uv.foreach_set("vector", loop_uv.ravel())
+    mesh.uv_layers.active = uv_layer
+    mesh.update(calc_edges=True)
     return mesh
 
 
 def rebuild_tile_mesh(obj, target_level):
-    """Rebuild a terrain tile mesh at a new resolution level.
-
-    Reads tile metadata from custom properties and recreates the mesh
-    from the raw heightmap buffer at the new resolution.
-
-    Args:
-        obj: Blender object with tile custom properties
-        target_level: new multires level (2^level + 1 verts per side)
-
-    Returns:
-        True if successful, False otherwise
-    """
+    """Rebuild a terrain tile at a new resolution."""
     buffer_path = obj.get("tile_buffer_path")
     tile_res = obj.get("tile_res")
     tile_size = obj.get("tile_size")
     elev_range = obj.get("elev_range")
-    lowest_elevation = obj.get("lowest_elevation")
 
-    if not buffer_path or not os.path.isfile(buffer_path):
+    if not buffer_path or not os.path.isfile(win_safe_path(buffer_path)):
         return False
-    if not all(v is not None for v in [tile_res, tile_size, elev_range, lowest_elevation]):
+    if not all(v is not None for v in [tile_res, tile_size, elev_range]):
         return False
 
+    target_level = _clamp_tile_multires_level(target_level, tile_res)
     mesh_res = (1 << target_level) + 1 if target_level > 0 else 2
     old_mesh = obj.data
     new_mesh = _create_tile_mesh(
         obj.name, buffer_path, int(tile_res), mesh_res,
-        float(tile_size), float(elev_range), float(lowest_elevation),
+        float(tile_size), float(elev_range),
     )
+    if old_mesh is not None:
+        for material in old_mesh.materials:
+            if material is not None:
+                new_mesh.materials.append(material)
     obj.data = new_mesh
     obj["terrain_multires"] = target_level
+    # Force reuse validation after a manual mesh rebuild.
+    if "terrain_tile_source_signature" in obj:
+        del obj["terrain_tile_source_signature"]
 
     # Remove old mesh if no other users
     if old_mesh and old_mesh.users == 0:
@@ -1621,42 +1883,513 @@ def rebuild_tile_mesh(obj, target_level):
 
 
 def _apply_tile_overlay_material(obj, overlay_path, mat_name):
-    """Create material with overlay texture as diffuse Base Color."""
-    mat = bpy.data.materials.new(name=mat_name)
+    """Create or update a stable per-tile overlay material."""
+    named = bpy.data.materials.get(mat_name)
+    mat = named if named is not None and named.get("witcher_terrain_material_key") == mat_name else None
+    if mat is None:
+        mat = next(
+            (
+                candidate
+                for candidate in bpy.data.materials
+                if candidate.get("witcher_terrain_material_key") == mat_name
+            ),
+            None,
+        )
+    if mat is None:
+        mat = bpy.data.materials.new(name=mat_name)
     mat.use_nodes = True
     nt = mat.node_tree
     principled = nt.nodes.get("Principled BSDF")
     if principled is None:
         principled = nt.nodes.new("ShaderNodeBsdfPrincipled")
-    tex = nt.nodes.new("ShaderNodeTexImage")
-    uv = nt.nodes.new("ShaderNodeUVMap")
+    tex = nt.nodes.get("Witcher Terrain Overlay")
+    if tex is None or tex.bl_idname != "ShaderNodeTexImage":
+        tex = nt.nodes.new("ShaderNodeTexImage")
+        tex.name = "Witcher Terrain Overlay"
+    uv = nt.nodes.get("Witcher Terrain UV")
+    if uv is None or uv.bl_idname != "ShaderNodeUVMap":
+        uv = nt.nodes.new("ShaderNodeUVMap")
+        uv.name = "Witcher Terrain UV"
     uv.uv_map = "UVMap"
     uv.location = (tex.location[0] - 220, tex.location[1])
-    nt.links.new(uv.outputs["UV"], tex.inputs["Vector"])
+    if not tex.inputs["Vector"].is_linked:
+        nt.links.new(uv.outputs["UV"], tex.inputs["Vector"])
+    for link in tuple(principled.inputs["Base Color"].links):
+        nt.links.remove(link)
     insert_color(mat, principled, tex, None, str(overlay_path))
     _set_principled_terrain_values(principled)
     mat["witcher_terrain_material"] = True
+    mat["witcher_terrain_material_key"] = mat_name
+    mat["witcher_terrain_overlay_path"] = str(overlay_path)
+    obj.data.materials.clear()
     obj.data.materials.append(mat)
+    return mat
 
 
-def _apply_tile_multires(obj, level):
-    """Add multires modifier and subdivide to the given level."""
-    if level <= 0:
+def _iter_collection_tree(root_collection):
+    if root_collection is None:
         return
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-    multires = obj.modifiers.new(type='MULTIRES', name="tileres")
-    for _ in range(level):
-        bpy.ops.object.multires_subdivide(modifier=multires.name, mode='LINEAR')
+    seen = set()
+    stack = [root_collection]
+    while stack:
+        collection = stack.pop()
+        key = id(collection)
+        try:
+            key = int(collection.as_pointer())
+        except Exception:
+            pass
+        if key in seen:
+            continue
+        seen.add(key)
+        yield collection
+        stack.extend(list(getattr(collection, "children", ()) or ()))
 
 
-def _source_tile_y_to_world_row(tile_y, y_tiles):
-    """Convert source tile Y index into Blender world row index.
+def _find_scene_world_collection(spec, scene=None):
+    scene = scene or getattr(bpy.context, "scene", None)
+    root = getattr(scene, "collection", None)
+    for candidate in _iter_collection_tree(root) or ():
+        if (
+            candidate.get("witcher_terrain_world_collection")
+            and candidate.get("witcher_terrain_world_key") == spec.world_key
+        ):
+            return candidate
+    return None
 
-    Keep this aligned with full-map import orientation. Empirically, using the
-    source Y directly matches the full-map result.
-    """
-    return tile_y
+
+def ensure_world_terrain_collection(spec, world_root_collection=None, *, scene=None):
+    """Return a reusable lightweight world collection for terrain consumers."""
+    if world_root_collection is not None:
+        collection = world_root_collection
+    else:
+        scene = scene or getattr(bpy.context, "scene", None)
+        collection = _find_scene_world_collection(spec, scene)
+        if collection is None:
+            collection = bpy.data.collections.new(f"world_{spec.hub_name}")
+            scene.collection.children.link(collection)
+
+    collection["witcher_terrain_world_collection"] = True
+    collection["witcher_terrain_world_key"] = spec.world_key
+    collection["world_path"] = spec.world_path
+    collection["world_name"] = spec.world_name
+    collection["terrainSize"] = spec.terrain_size
+    collection["tileRes"] = spec.tile_res
+    collection["x_tiles"] = spec.x_tiles
+    collection["y_tiles"] = spec.y_tiles
+    return collection
+
+
+def _ensure_terrain_root(spec, multires_level, world_collection):
+    root = None
+    scoped_objects = list(getattr(world_collection, "all_objects", ()) or ())
+    for candidate in scoped_objects:
+        if (
+            candidate.get("witcher_terrain_root")
+            and candidate.get("witcher_terrain_world_key") == spec.world_key
+        ):
+            root = candidate
+            break
+
+    # Reuse an unambiguous legacy terrain root.
+    if root is None:
+        candidate = next(
+            (obj for obj in scoped_objects if obj.name == f"terrain_{spec.hub_name}"),
+            None,
+        )
+        if (
+            candidate is not None
+            and getattr(candidate, "type", None) == 'EMPTY'
+            and "terrainSize" in candidate
+            and "tileRes" in candidate
+        ):
+            candidate_path = str(candidate.get("world_path", "") or "")
+            if not candidate_path or _terrain_world_key(spec.hub_name, candidate_path) == spec.world_key:
+                root = candidate
+
+    if root is None:
+        root = bpy.data.objects.new(f"terrain_{spec.hub_name}", None)
+        root.empty_display_type = 'PLAIN_AXES'
+
+    if world_collection is not None and world_collection not in root.users_collection:
+        world_collection.objects.link(root)
+    elif not root.users_collection:
+        bpy.context.collection.objects.link(root)
+
+    tile_size = spec.terrain_size / max(1, spec.x_tiles, spec.y_tiles)
+    root.empty_display_size = tile_size * 0.5
+    root.location = (0.0, 0.0, 0.0)
+    root["witcher_terrain_root"] = True
+    root["witcher_terrain_world_key"] = spec.world_key
+    root["terrainSize"] = spec.terrain_size
+    root["tileRes"] = spec.tile_res
+    root["lowestElevation"] = spec.lowest_elevation
+    root["highestElevation"] = spec.highest_elevation
+    root["x_tiles"] = spec.x_tiles
+    root["y_tiles"] = spec.y_tiles
+    root["multires_level"] = multires_level
+    root["tile_y_inverted"] = False
+    root["z_offset_applied_to_tiles"] = True
+    _store_world_layer_metadata(root, spec.world_path, world_collection)
+    return root
+
+
+def _find_imported_terrain_tile(root, spec, key, existing_by_key=None):
+    if root is None:
+        return None
+    coordinate = (key.x, key.y)
+    if existing_by_key is not None:
+        return existing_by_key.get(coordinate)
+    for obj in root.children:
+        if (
+            getattr(obj, "type", None) == 'MESH'
+            and obj.get("witcher_terrain_tile")
+            and obj.get("witcher_terrain_world_key") == spec.world_key
+            and int(obj.get("tile_x", -1)) == key.x
+            and int(obj.get("tile_y", -1)) == key.y
+        ):
+            return obj
+
+    # Reuse a matching legacy tile.
+    for obj in root.children:
+        if (
+            getattr(obj, "type", None) == 'MESH'
+            and obj.get("tile_buffer_path")
+            and int(obj.get("tile_x", -1)) == key.x
+            and int(obj.get("tile_y", -1)) == key.y
+        ):
+            return obj
+    return None
+
+
+def find_world_terrain_tile(spec, x, y, *, world_collection=None, root=None):
+    """Find an imported tile by stable world/coordinate metadata."""
+
+    key = TerrainTileKey(x, y)
+    terrain_tile_bounds(spec, key.x, key.y)
+    if root is None:
+        world_collection = world_collection or _find_scene_world_collection(spec)
+        if world_collection is None:
+            return None
+        root = next(
+            (
+                obj for obj in getattr(world_collection, "all_objects", ())
+                if obj.get("witcher_terrain_root")
+                and obj.get("witcher_terrain_world_key") == spec.world_key
+            ),
+            None,
+        )
+    return _find_imported_terrain_tile(root, spec, key)
+
+
+def unload_world_terrain_tile(spec, x, y, *, world_collection=None, root=None):
+    """Remove one imported terrain tile while retaining reusable world caches."""
+
+    obj = find_world_terrain_tile(
+        spec,
+        x,
+        y,
+        world_collection=world_collection,
+        root=root,
+    )
+    if obj is None:
+        return False
+    mesh = obj.data if getattr(obj, "type", None) == 'MESH' else None
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh is not None and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+    return True
+
+
+def _source_file_stamp(path):
+    if not path:
+        return ""
+    try:
+        stat = os.stat(win_safe_path(path))
+        return f"{os.path.normcase(os.path.normpath(path))}:{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        return os.path.normcase(os.path.normpath(path))
+
+
+def _terrain_elevation_range(spec) -> float:
+    return max(0.0, float(spec.highest_elevation) - float(spec.lowest_elevation))
+
+
+def _tile_import_signature(spec, source, bounds, multires_level):
+    values = (
+        spec.world_key,
+        source.key.x,
+        source.key.y,
+        spec.tile_res,
+        spec.terrain_size,
+        spec.x_tiles,
+        spec.y_tiles,
+        spec.lowest_elevation,
+        spec.highest_elevation,
+        bounds.min_x,
+        bounds.min_y,
+        bounds.max_x,
+        bounds.max_y,
+        multires_level,
+        _source_file_stamp(source.heightmap_buffer),
+        _source_file_stamp(source.overlay_path),
+    )
+    return hashlib.sha1(repr(values).encode("utf-8", errors="replace")).hexdigest()
+
+
+def _prepare_tile_overlay(source, tile_res):
+    if not source.request.include_overlay:
+        return ""
+    overlay_path = source.overlay_path or (source.texture_buffer + ".overlay.png")
+    if not source.texture_buffer:
+        return overlay_path if os.path.isfile(win_safe_path(overlay_path)) else ""
+    try:
+        before_stamp = _source_file_stamp(overlay_path)
+    except Exception:
+        before_stamp = ""
+    info = terrain_w2ter.TileInfo(
+        x=source.key.x,
+        y=source.key.y,
+        res=int(tile_res),
+        buffer_index=2,
+    )
+    try:
+        terrain_w2ter._tile_texture_pngs(
+            source.texture_buffer,
+            info,
+            which=("overlay",),
+            skip_existing=True,
+        )
+    except Exception:
+        log.warning("Could not generate terrain tile overlay: %s", source.tile_name, exc_info=True)
+    if not os.path.isfile(win_safe_path(overlay_path)):
+        return ""
+    if _source_file_stamp(overlay_path) != before_stamp:
+        overlay_key = os.path.normcase(os.path.normpath(overlay_path))
+        for image in getattr(bpy.data, "images", ()):
+            image_path = str(getattr(image, "filepath", "") or "")
+            try:
+                image_key = os.path.normcase(os.path.normpath(bpy.path.abspath(image_path)))
+            except Exception:
+                image_key = os.path.normcase(os.path.normpath(image_path))
+            if image_key == overlay_key:
+                try:
+                    image.reload()
+                except Exception:
+                    log.debug("Could not reload refreshed terrain overlay: %s", overlay_path, exc_info=True)
+    return overlay_path
+
+
+def _tile_material_name(spec, key):
+    return f"terrain_{spec.hub_name}_{spec.world_key[:8]}_tile_{key.y}_x_{key.x}_mat"
+
+
+def _link_terrain_object(obj, world_collection):
+    if world_collection is not None and world_collection not in obj.users_collection:
+        world_collection.objects.link(obj)
+    elif not obj.users_collection:
+        bpy.context.collection.objects.link(obj)
+
+
+def _import_resolved_terrain_tile(
+    spec,
+    source,
+    bounds,
+    *,
+    multires_level,
+    world_collection,
+    root=None,
+    existing_by_key=None,
+):
+    if not source.heightmap_buffer or not os.path.isfile(win_safe_path(source.heightmap_buffer)):
+        return TerrainTileImportResult(
+            spec=spec,
+            source=source,
+            bounds=bounds,
+            world_collection=world_collection,
+            error=f"Heightmap buffer not found for {source.tile_name}",
+        )
+
+    level = _clamp_tile_multires_level(multires_level, spec.tile_res)
+    overlay_path = _prepare_tile_overlay(source, spec.tile_res)
+    if overlay_path != source.overlay_path:
+        source = TerrainTileSource(
+            request=source.request,
+            tile_name=source.tile_name,
+            heightmap_buffer=source.heightmap_buffer,
+            texture_buffer=source.texture_buffer,
+            overlay_path=overlay_path,
+        )
+
+    if root is None:
+        root = _ensure_terrain_root(spec, level, world_collection)
+    existing = _find_imported_terrain_tile(root, spec, source.key, existing_by_key)
+    signature = _tile_import_signature(spec, source, bounds, level)
+    if existing is not None and existing.get("terrain_tile_source_signature") == signature:
+        _link_terrain_object(existing, world_collection)
+        existing.parent = root
+        return TerrainTileImportResult(
+            spec=spec,
+            source=source,
+            bounds=bounds,
+            obj=existing,
+            root=root,
+            world_collection=world_collection,
+            reused=True,
+        )
+
+    mesh_res = (1 << level) + 1 if level > 0 else 2
+    mesh = _create_tile_mesh(
+        f"tile_{source.key.y}_x_{source.key.x}",
+        source.heightmap_buffer,
+        spec.tile_res,
+        mesh_res,
+        bounds.tile_size,
+        _terrain_elevation_range(spec),
+    )
+
+    created = existing is None
+    if created:
+        obj = bpy.data.objects.new(f"tile_{source.key.y}_x_{source.key.x}", mesh)
+        _link_terrain_object(obj, world_collection)
+        old_mesh = None
+    else:
+        obj = existing
+        old_mesh = obj.data
+        obj.data = mesh
+
+    obj.location = (bounds.center_x, bounds.center_y, spec.lowest_elevation)
+    obj["witcher_terrain_tile"] = True
+    obj["witcher_terrain_world_key"] = spec.world_key
+    obj["tile_x"] = source.key.x
+    obj["tile_y"] = source.key.y
+    obj["tile_world_y"] = bounds.world_y
+    obj["terrain_multires"] = level
+    obj["tile_buffer_path"] = source.heightmap_buffer
+    obj["tile_res"] = spec.tile_res
+    obj["tile_size"] = bounds.tile_size
+    obj["elev_range"] = _terrain_elevation_range(spec)
+    obj["lowest_elevation"] = spec.lowest_elevation
+    obj["tile_bounds_min_x"] = bounds.min_x
+    obj["tile_bounds_min_y"] = bounds.min_y
+    obj["tile_bounds_max_x"] = bounds.max_x
+    obj["tile_bounds_max_y"] = bounds.max_y
+    obj["terrain_tile_source_signature"] = signature
+    _store_world_layer_metadata(obj, spec.world_path, world_collection)
+
+    if overlay_path:
+        _apply_tile_overlay_material(obj, overlay_path, _tile_material_name(spec, source.key))
+
+    obj.parent = root
+    obj.matrix_parent_inverse = root.matrix_world.inverted()
+    if existing_by_key is not None:
+        existing_by_key[(source.key.x, source.key.y)] = obj
+    if old_mesh is not None and old_mesh.users == 0:
+        bpy.data.meshes.remove(old_mesh)
+
+    return TerrainTileImportResult(
+        spec=spec,
+        source=source,
+        bounds=bounds,
+        obj=obj,
+        root=root,
+        world_collection=world_collection,
+        created=created,
+    )
+
+
+def import_world_terrain_tile(
+    worldFile,
+    filePath,
+    x,
+    y,
+    *,
+    multires_level=TERRAIN_TILE_PREVIEW_LEVEL,
+    world_root_collection=None,
+    include_overlay=True,
+):
+    """Resolve and import one terrain tile."""
+    spec = inspect_world_terrain(worldFile, filePath)
+    bounds = terrain_tile_bounds(spec, x, y)
+    with redkit_repo_context(filePath):
+        source = resolve_world_terrain_tile_source(
+            spec,
+            x,
+            y,
+            include_overlay=include_overlay,
+        )
+    if not source.available:
+        return TerrainTileImportResult(
+            spec=spec,
+            source=source,
+            bounds=bounds,
+            world_collection=world_root_collection,
+            error=f"Heightmap buffer not found for {source.tile_name}",
+        )
+
+    world_collection = ensure_world_terrain_collection(spec, world_root_collection)
+    return _import_resolved_terrain_tile(
+        spec,
+        source,
+        bounds,
+        multires_level=multires_level,
+        world_collection=world_collection,
+    )
+
+
+def import_world_tile_with_foliage(
+    world_file,
+    file_path,
+    x,
+    y,
+    *,
+    context=None,
+    multires_level=TERRAIN_TILE_PREVIEW_LEVEL,
+    world_root_collection=None,
+    include_foliage=True,
+    foliage_mode="PROXY",
+):
+    """Import one terrain tile and treat foliage failure as partial success."""
+
+    spec = inspect_world_terrain(world_file, file_path)
+    terrain = import_world_terrain_tile(
+        world_file,
+        file_path,
+        x,
+        y,
+        multires_level=multires_level,
+        world_root_collection=world_root_collection,
+    )
+    if terrain is None or not terrain.ok:
+        raise FileNotFoundError(
+            getattr(terrain, "error", "") or f"Terrain tile {int(x)}, {int(y)} was not found"
+        )
+
+    foliage = None
+    foliage_error = ""
+    if include_foliage:
+        try:
+            from . import import_foliage
+
+            foliage = import_foliage.load_foliage_for_tile(
+                file_path,
+                terrain.world_collection,
+                context or getattr(bpy, "context", None),
+                int(x),
+                int(y),
+                int(spec.x_tiles),
+                int(spec.y_tiles),
+                float(spec.terrain_size),
+                source_mode=str(foliage_mode or "PROXY"),
+            )
+        except Exception as exc:
+            foliage_error = str(exc)
+            log.exception("Tile foliage import failed")
+    return WorldTileLoadResult(
+        spec=spec,
+        terrain=terrain,
+        foliage=foliage,
+        foliage_error=foliage_error,
+    )
 
 
 def do_import_terrain_tiles(
@@ -1688,30 +2421,35 @@ def do_import_terrain_tiles(
     Returns:
         (parent empty, tile count)
     """
-    tile_size = terrain_size / max(x_tiles, y_tiles)
-    elev_range = abs(lowest_elevation) + abs(highest_elevation)
-    # Mesh resolution: 2^level + 1 vertices per side (matching multires convention)
-    mesh_res = (1 << multires_level) + 1 if multires_level > 0 else 2
-
-    # Parent empty
-    empty = bpy.data.objects.new(f"terrain_{hub_name}", None)
-    empty.empty_display_type = 'PLAIN_AXES'
-    empty.empty_display_size = tile_size / 2
-    empty.location = (0, 0, 0)
-    empty["terrainSize"] = terrain_size
-    empty["tileRes"] = tile_res
-    empty["lowestElevation"] = lowest_elevation
-    empty["highestElevation"] = highest_elevation
-    empty["x_tiles"] = x_tiles
-    empty["y_tiles"] = y_tiles
-    empty["multires_level"] = multires_level
-    empty["tile_y_inverted"] = False
-    empty["z_offset_applied_to_tiles"] = True
-    _store_world_layer_metadata(empty, world_path, world_root_collection)
-    bpy.context.collection.objects.link(empty)
+    level = _clamp_tile_multires_level(multires_level, tile_res)
+    world_path = str(world_path or "")
+    spec = TerrainWorldSpec(
+        hub_name=str(hub_name or "terrain"),
+        world_name=str(hub_name or "terrain"),
+        world_path=world_path,
+        world_key=_terrain_world_key(hub_name, world_path),
+        terrain_size=float(terrain_size),
+        lowest_elevation=float(lowest_elevation),
+        highest_elevation=float(highest_elevation),
+        tile_res=max(1, int(tile_res)),
+        x_tiles=max(0, int(x_tiles)),
+        y_tiles=max(0, int(y_tiles)),
+        terrain_tiles_dir="",
+    )
+    world_collection = ensure_world_terrain_collection(spec, world_root_collection)
+    empty = _ensure_terrain_root(spec, level, world_collection)
+    existing_by_key = {
+        (int(obj.get("tile_x", -1)), int(obj.get("tile_y", -1))): obj
+        for obj in empty.children
+        if getattr(obj, "type", None) == 'MESH'
+        and obj.get("tile_buffer_path")
+        and int(obj.get("tile_x", -1)) >= 0
+        and int(obj.get("tile_y", -1)) >= 0
+    }
 
     # Set viewport clip
-    for a in bpy.context.screen.areas:
+    screen = getattr(bpy.context, "screen", None)
+    for a in getattr(screen, "areas", ()):
         if a.type == 'VIEW_3D':
             for s in a.spaces:
                 if s.type == 'VIEW_3D':
@@ -1722,39 +2460,25 @@ def do_import_terrain_tiles(
         tile_heightmap_buffers.items(),
         key=lambda item: (item[0][1], item[0][0]),
     ):
-        tile_name = f"tile_{y}_x_{x}"
-        world_y = _source_tile_y_to_world_row(y, y_tiles)
-
-        # Create mesh with baked heightmap vertex positions
-        mesh = _create_tile_mesh(
-            tile_name, buffer_path, tile_res, mesh_res,
-            tile_size, elev_range, lowest_elevation,
-        )
-
-        obj = bpy.data.objects.new(tile_name, mesh)
-        loc_x = -terrain_size / 2 + tile_size / 2 + x * tile_size
-        loc_y = -terrain_size / 2 + tile_size / 2 + world_y * tile_size
-        obj.location = (loc_x, loc_y, lowest_elevation)
-        obj["tile_x"] = x
-        obj["tile_y"] = y
-        obj["tile_world_y"] = world_y
-        obj["terrain_multires"] = multires_level
-        obj["tile_buffer_path"] = buffer_path
-        obj["tile_res"] = tile_res
-        obj["tile_size"] = tile_size
-        obj["elev_range"] = elev_range
-        obj["lowest_elevation"] = lowest_elevation
-        _store_world_layer_metadata(obj, world_path, world_root_collection)
-        bpy.context.collection.objects.link(obj)
-
-        # Overlay texture as diffuse material
         overlay_path = tile_overlays.get((x, y))
-        if overlay_path:
-            _apply_tile_overlay_material(obj, overlay_path, f"{tile_name}_mat")
-
-        obj.parent = empty
-        obj.matrix_parent_inverse = empty.matrix_world.inverted()
-        count += 1
+        request = terrain_tile_source_request(x, y, include_overlay=bool(overlay_path))
+        source = TerrainTileSource(
+            request=request,
+            tile_name=f"tile_{y}_x_{x}_res{spec.tile_res}",
+            heightmap_buffer=str(buffer_path or ""),
+            overlay_path=str(overlay_path or ""),
+        )
+        result = _import_resolved_terrain_tile(
+            spec,
+            source,
+            terrain_tile_bounds(spec, x, y),
+            multires_level=level,
+            world_collection=world_collection,
+            root=empty,
+            existing_by_key=existing_by_key,
+        )
+        if result.ok:
+            count += 1
 
     return empty, count
 

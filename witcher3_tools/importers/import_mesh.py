@@ -12,6 +12,7 @@ from ..CR2W.common_blender import repo_file, get_collision_for_mesh, get_collisi
 from ..importers.import_rig import rotate_and_connect_bones
 
 from ..materials.cr2w import setup_w3_material_CR2W
+from ..materials import reader as material_reader
 from .. import (
     get_all_addon_prefs,
     get_mod_directory,
@@ -447,6 +448,24 @@ def _sanitize_mesh_faces_for_import(mesh_data):
     if not faces:
         return 0
 
+    try:
+        arr = np.asarray(faces, dtype=np.int64)
+    except (TypeError, ValueError, OverflowError):
+        arr = None
+    if arr is not None and arr.ndim == 2 and arr.shape[1] == 3:
+        valid = (
+            (arr[:, 0] != arr[:, 1])
+            & (arr[:, 1] != arr[:, 2])
+            & (arr[:, 0] != arr[:, 2])
+            & (arr >= 0).all(axis=1)
+            & (arr < vert_count).all(axis=1)
+        )
+        dropped = int(arr.shape[0] - int(valid.sum()))
+        if dropped:
+            mesh_data.faces = arr[valid].tolist()
+        return dropped
+
+    # ragged/odd face data: keep the tolerant per-face path
     valid_faces = []
     dropped = 0
     for face in faces:
@@ -470,6 +489,17 @@ def _sanitize_mesh_faces_for_import(mesh_data):
 
 def _mesh_vertices_are_importable(mesh_data):
     verts = getattr(mesh_data, "vertex3DCoords", None) or []
+    if not verts:
+        return True
+    try:
+        arr = np.asarray(verts, dtype=np.float64)
+    except (TypeError, ValueError):
+        arr = None
+    if arr is not None and arr.ndim == 2:
+        if arr.shape[1] < 3:
+            return False
+        return bool(np.isfinite(arr[:, :3]).all())
+
     for vert in verts:
         try:
             if len(vert) < 3:
@@ -961,15 +991,16 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
         lod_level = getattr(mesh_info, "lod", 0) #if not bufferInfos.verticesBuffer else bufferInfos.verticesBuffer[idx].lod
         distance = getattr(mesh_info, "distance", 0.0)
 
-        log.debug(
-            "Submesh[%d] '%s': lod=%s distance=%s mat_id=%s %s",
-            idx,
-            meshName,
-            lod_level,
-            distance,
-            mat_id,
-            _mesh_data_debug_summary(meshDataBl),
-        )
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "Submesh[%d] '%s': lod=%s distance=%s mat_id=%s %s",
+                idx,
+                meshName,
+                lod_level,
+                distance,
+                mat_id,
+                _mesh_data_debug_summary(meshDataBl),
+            )
         if not _mesh_vertices_are_importable(meshDataBl):
             log.warning(
                 "Skipping submesh[%d] '%s' because parsed vertex coordinates are invalid.",
@@ -1147,8 +1178,11 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                 len(ordered_materials),
                 meshName,
             )
-        for face in mesh_bl.data.polygons:
-            face.material_index = mat_id
+        poly_count = len(mesh_bl.data.polygons)
+        if poly_count:
+            mesh_bl.data.polygons.foreach_set(
+                "material_index", np.full(poly_count, mat_id, dtype=np.int32)
+            )
         log.debug(
             "Assigned %d material slots to object '%s' and set %d polygons to material index %s",
             len(ordered_materials),
@@ -1223,7 +1257,8 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
     # LODS
     final_bl_meshes = []
     if lod0 or lod1 or lod2 or lod3:
-        bpy.ops.object.mode_set(mode='OBJECT')
+        if bpy.context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
         for idx, lod_meshes in enumerate(lods_to_create):
             if lod_meshes:
                 joinable_meshes = [
@@ -1343,19 +1378,11 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                         slot_name,
                         getattr(o, "DepotPath", None),
                     )
-                    material_file_chunks = CR2W_reader.load_material(repo_file(o.DepotPath, version=meshFile.HEADER.version))
-                    loaded = None
-                    for chunk in material_file_chunks:
-                        if chunk.Type in ("CMaterialInstance", "CMaterialGraph"):
-                            loaded = chunk
-                            if chunk.Type == "CMaterialGraph":
-                                # Attach sibling CMaterialParameter* chunks so the material
-                                # system can read the graph's default parameter values.
-                                loaded._graph_params = [
-                                    c for c in material_file_chunks
-                                    if c.Type.startswith("CMaterialParameter")
-                                ]
-                            break
+                    # Reuse the session material cache.
+                    loaded = material_reader._load_material_root_chunk(
+                        o.DepotPath,
+                        version=meshFile.HEADER.version,
+                    )
                     if loaded is not None:
                         loaded.local = False
                         loaded.DepotPath = o.DepotPath

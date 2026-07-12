@@ -364,22 +364,45 @@ def _apply_imported_scene_weight_to_strip_once(strip, action, data_source):
     _mark_scene_weight_applied((strip, action))
 
 
+def _nla_candidate_object_key(obj):
+    try:
+        return int(obj.as_pointer())
+    except Exception:
+        return id(obj)
+
+
+def _iter_nla_candidate_objects(context, include_scene=True):
+    """Yield animation-bearing context objects once, with cheap identity dedupe."""
+    seen = set()
+
+    def emit(obj):
+        if obj is None or getattr(obj, "animation_data", None) is None:
+            return None
+        key = _nla_candidate_object_key(obj)
+        if key in seen:
+            return None
+        seen.add(key)
+        return obj
+
+    active = emit(getattr(context, "object", None))
+    if active is not None:
+        yield active
+    for candidate in list(getattr(context, "selected_objects", []) or []):
+        candidate = emit(candidate)
+        if candidate is not None:
+            yield candidate
+    if include_scene:
+        scene = getattr(context, "scene", None)
+        for candidate in getattr(scene, "objects", []) or []:
+            candidate = emit(candidate)
+            if candidate is not None:
+                yield candidate
+
+
 def _find_strip_owner(context, strip):
     if strip is None:
         return None, None
-    objects = []
-    for obj in list(getattr(context, "selected_objects", []) or []):
-        if obj not in objects:
-            objects.append(obj)
-    active = getattr(context, "object", None)
-    if active is not None and active not in objects:
-        objects.insert(0, active)
-    scene = getattr(context, "scene", None)
-    if scene is not None:
-        for obj in getattr(scene, "objects", []) or []:
-            if obj not in objects:
-                objects.append(obj)
-    for obj in objects:
+    for obj in _iter_nla_candidate_objects(context):
         for track, candidate in _iter_nla_strips_for_object(obj) or []:
             if candidate == strip:
                 return obj, track
@@ -400,6 +423,14 @@ def _resolve_nla_strip(context, object_name="", track_name="", strip_name=""):
     active_strip = getattr(context, "active_nla_strip", None)
     selected_strips = list(getattr(context, "selected_nla_strips", []) or [])
 
+    # Avoid scanning static scenes with no actions.
+    if active_strip is None and not selected_strips:
+        try:
+            if len(bpy.data.actions) == 0:
+                return None, None, None
+        except Exception:
+            pass
+
     if active_strip is not None:
         obj, track = _find_strip_owner(context, active_strip)
         if obj is not None and track is not None and _strip_looks_like_witcher_scene(track, active_strip):
@@ -410,18 +441,7 @@ def _resolve_nla_strip(context, object_name="", track_name="", strip_name=""):
         if obj is not None and track is not None and _strip_looks_like_witcher_scene(track, selected_strip):
             return obj, track, selected_strip
 
-    objects = []
-    active = getattr(context, "object", None)
-    if active is not None:
-        objects.append(active)
-    for obj in list(getattr(context, "selected_objects", []) or []):
-        if obj not in objects:
-            objects.append(obj)
-    scene = getattr(context, "scene", None)
-    if scene is not None:
-        for obj in getattr(scene, "objects", []) or []:
-            if obj not in objects:
-                objects.append(obj)
+    objects = list(_iter_nla_candidate_objects(context))
     for obj in objects:
         for track, strip in _iter_nla_strips_for_object(obj) or []:
             if bool(getattr(strip, "select", False)) and _strip_looks_like_witcher_scene(track, strip):
@@ -6685,7 +6705,7 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 settings_col.prop(scene, "witcher_voice_load_on_select", text="Load on Select")
 
             # --- Loaded lipsync status ---
-            _arm = _find_character_armature(context)
+            _arm = display_armature
             if _arm and _arm.animation_data:
                 _voice_tracks = []
                 for _trk in _arm.animation_data.nla_tracks:

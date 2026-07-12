@@ -5,6 +5,7 @@ import json
 import shutil
 
 from ..importers import import_mesh
+from ..terrain_core import TERRAIN_FOLIAGE_MODE_ITEMS, TERRAIN_IMPORT_MODE_ITEMS
 
 log = logging.getLogger(__name__)
 from ..importers import terrain_w2ter
@@ -491,18 +492,43 @@ class MySettings(PropertyGroup):
     batch_select_mode: BoolProperty(default=False, description="Enable batch selection mode")
     # Terrain tile import
     terrain_multires_level: IntProperty(
-        name="Terrain Multires",
-        description="Multires subdivision levels for imported terrain tiles",
-        default=10, min=0, max=10,
+        name="Terrain Detail",
+        description="Preview detail for imported terrain. Level 6 is fast; refine selected tiles later if needed",
+        default=6, min=0, max=10,
     )
     terrain_import_mode: bpy.props.EnumProperty(
         name="Terrain Import",
-        description="Choose how terrain is imported from .w2ter tiles",
-        items=[
-            ('FULL_MAP', 'Full Map', 'Import a single combined map using Geometry Nodes + Multires'),
-            ('TILES', 'Tiles', 'Import individual terrain tile meshes'),
-        ],
-        default='FULL_MAP',
+        description="Choose the terrain scope to import",
+        items=TERRAIN_IMPORT_MODE_ITEMS,
+        default='SELECTED_TILE',
+    )
+    terrain_tile_x: IntProperty(
+        name="Tile X",
+        description="Terrain tile X coordinate",
+        default=0,
+        min=0,
+    )
+    terrain_tile_y: IntProperty(
+        name="Tile Y",
+        description="Terrain tile Y coordinate",
+        default=0,
+        min=0,
+    )
+    terrain_include_foliage: BoolProperty(
+        name="Include Foliage",
+        description="Load foliage instances owned by the selected terrain tile",
+        default=True,
+    )
+    terrain_foliage_mode: bpy.props.EnumProperty(
+        name="Foliage Detail",
+        description="Choose a fast viewer-ready foliage set or load every source",
+        items=TERRAIN_FOLIAGE_MODE_ITEMS,
+        default='PROXY',
+    )
+    terrain_build_layer_tree: BoolProperty(
+        name="Build Layer Tree",
+        description="Create the complete world layer collection tree during import",
+        default=False,
     )
     terrain_material_roughness: FloatProperty(
         name="Terrain Roughness",
@@ -1841,7 +1867,8 @@ def get_repo_override_roots_for_item(context, cache_type, item_path):
     elif cache_type == "REDkit Depot":
         roots = workspace_roots + [depot_root, uncooked_root]
     elif cache_type == "REDkit Uncooked":
-        roots = workspace_roots + [uncooked_root, depot_root]
+        # Prefer REDkit source assets.
+        roots = workspace_roots + [depot_root, uncooked_root]
     elif cache_type == "Witcher 2 Data":
         roots = [w2_data_root]
     # Filter empties and de-dup
@@ -2269,6 +2296,35 @@ def _rewrite_srt_json_texture_paths(json_path: str, texture_replacements: dict[s
         return json_path
 
 
+def _srt_texture_name_index(manager):
+    """Build one basename index per live TextureManager instead of rescanning it per texture."""
+
+    item_count = len(getattr(manager, "Items", {}) or {})
+    cached = getattr(manager, "_witcher_srt_name_index", None)
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == item_count:
+        return cached[1]
+
+    index = {}
+    for key, item_list in (getattr(manager, "Items", {}) or {}).items():
+        if not isinstance(key, str):
+            continue
+        item = item_list[-1] if isinstance(item_list, list) else item_list
+        item_name = (getattr(item, "Name", None) or key or "").replace("/", "\\")
+        if not item_name:
+            continue
+        item_base = os.path.basename(item_name).lower()
+        item_stem = os.path.splitext(item_base)[0]
+        candidate = (item, item_name, item_base, item_stem)
+        index.setdefault(item_base, []).append(candidate)
+        if item_stem != item_base:
+            index.setdefault(item_stem, []).append(candidate)
+    try:
+        manager._witcher_srt_name_index = (item_count, index)
+    except Exception:
+        pass
+    return index
+
+
 def _choose_srt_texture_cache_item(manager, tex_name: str, srt_rel_folder: str):
     tex_name = os.path.basename(tex_name or "")
     if not tex_name:
@@ -2279,17 +2335,16 @@ def _choose_srt_texture_cache_item(manager, tex_name: str, srt_rel_folder: str):
 
     best = None
     best_score = -1
-    for key, item_list in manager.Items.items():
-        if not isinstance(key, str):
+    index = _srt_texture_name_index(manager)
+    candidates = list(index.get(tex_base, ()))
+    if tex_stem != tex_base:
+        candidates.extend(index.get(tex_stem, ()))
+    seen = set()
+    for item, item_name, item_base, item_stem in candidates:
+        item_id = id(item)
+        if item_id in seen:
             continue
-        item = item_list[-1] if isinstance(item_list, list) else item_list
-        item_name = (getattr(item, "Name", None) or key or "").replace("/", "\\")
-        if not item_name:
-            continue
-        item_base = os.path.basename(item_name).lower()
-        item_stem = os.path.splitext(item_base)[0]
-        if item_base != tex_base and item_stem != tex_stem:
-            continue
+        seen.add(item_id)
 
         item_dir = os.path.dirname(item_name).lower().strip("\\")
         score = 0
@@ -2367,12 +2422,8 @@ def _export_srt_textures_for_import(context, abs_srt_path: str, rel_srt_path: st
             remember_replacement(original_name, staged_name)
         result[counter] += 1
 
-    try:
-        manager = LoadTextureManager(loadmods=loadmods)
-    except Exception as exc:
-        log.warning("Failed loading TextureCache for SRT texture extraction: %s", exc)
-        result["missing"] = tex_names[:]
-        return result
+    manager = None
+    manager_failed = False
 
     for tex_name in tex_names:
         source_path = tex_name if os.path.isabs(tex_name) else os.path.join(srt_dir, tex_name)
@@ -2385,6 +2436,16 @@ def _export_srt_textures_for_import(context, abs_srt_path: str, rel_srt_path: st
         out_dds = os.path.splitext(out_path)[0] + ".dds"
         if win_path_exists(out_dds):
             mark_texture_ready(out_dds, tex_name, "existing")
+            continue
+
+        if manager is None and not manager_failed:
+            try:
+                manager = LoadTextureManager(loadmods=loadmods)
+            except Exception as exc:
+                manager_failed = True
+                log.warning("Failed loading TextureCache for SRT texture extraction: %s", exc)
+        if manager is None:
+            result["missing"].append(tex_name)
             continue
 
         item = _choose_srt_texture_cache_item(manager, tex_name, srt_rel_folder)
@@ -4772,31 +4833,66 @@ def _infer_tiles_from_w2w(world) -> Tuple[Optional[int], Optional[int]]:
 
 def _resolve_w2w_path(context, cache_type, folder_path, folder_abs, loadmods) -> str:
     """Resolve the .w2w world file path for a terrain_tiles folder."""
+    w2w_virtual = ""
+    if folder_path and os.path.basename(folder_path).lower() == "terrain_tiles":
+        parent_virtual = os.path.dirname(folder_path)
+        hub_name = os.path.basename(parent_virtual)
+        if hub_name:
+            w2w_virtual = os.path.join(parent_virtual, hub_name + ".w2w")
+
     if cache_type == "Bundle":
-        if folder_path and os.path.basename(folder_path).lower() == "terrain_tiles":
-            parent_virtual = os.path.dirname(folder_path)
-            hub_name = os.path.basename(parent_virtual)
-            if hub_name:
-                w2w_virtual = os.path.join(parent_virtual, hub_name + ".w2w")
-                w2w_path = ensure_bundle_item_extracted(context, w2w_virtual, loadmods)
-                if w2w_path:
-                    return w2w_path
-                vanilla = get_vanilla_path(w2w_virtual, loadmods)
-                candidate = repo_file(vanilla)
-                if candidate and win_path_exists(candidate):
-                    return candidate
+        if w2w_virtual:
+            w2w_path = ensure_bundle_item_extracted(context, w2w_virtual, loadmods)
+            if w2w_path:
+                return w2w_path
+            vanilla = get_vanilla_path(w2w_virtual, loadmods)
+            candidate = repo_file(vanilla)
+            if candidate and win_path_exists(candidate):
+                return candidate
     else:
+        if w2w_virtual:
+            prefs = get_all_addon_prefs(context)
+            roots = [
+                getattr(prefs, "redkit_depot_path", ""),
+                getattr(prefs, "redkit_uncooked_path", ""),
+                *get_repo_override_roots_for_item(context, cache_type, folder_path),
+            ]
+            seen = set()
+            for root in roots:
+                root = _normalize_dir(root)
+                key = os.path.normcase(root) if root else ""
+                if not root or key in seen:
+                    continue
+                seen.add(key)
+                candidate = os.path.join(root, w2w_virtual)
+                if win_path_exists(candidate):
+                    return candidate
         return _find_w2w_path(folder_abs)
     return ""
 
+_W2W_TERRAIN_META_CACHE = {}
+
+
 def _get_w2w_world_data(context, cache_type, folder_path, folder_abs, loadmods):
-    """Load and return the full WORLD object from the .w2w file, or None."""
+    """Load compact terrain metadata from the .w2w file, or None."""
     w2w_path = _resolve_w2w_path(context, cache_type, folder_path, folder_abs, loadmods)
     if not w2w_path:
         return None
     try:
         from ..CR2W import CR2W_reader
-        return CR2W_reader.load_w2w(w2w_path)
+        stat = os.stat(win_safe_path(w2w_path))
+        cache_key = (
+            os.path.normcase(os.path.normpath(w2w_path)),
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            int(stat.st_size),
+        )
+        cached = _W2W_TERRAIN_META_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        world = CR2W_reader.load_w2w(w2w_path, include_groups=False)
+        _W2W_TERRAIN_META_CACHE.clear()
+        _W2W_TERRAIN_META_CACHE[cache_key] = world
+        return world
     except Exception as e:
         log.error("Failed to read w2w for terrain tiles: %s", e)
         return None
@@ -4816,7 +4912,14 @@ def _get_w2w_grid_params(
         return res, tiles, tiles
     return res, None, None
 
-def combine_w2ter_folder(context, cache_type, folder_path, loadmods=False) -> Dict[str, object]:
+def combine_w2ter_folder(
+    context,
+    cache_type,
+    folder_path,
+    loadmods=False,
+    *,
+    targets=None,
+) -> Dict[str, object]:
     if not is_disk_cache(cache_type) and cache_type != "Bundle":
         return {"outputs": [], "output_dir": "", "info": {"error": f"Unsupported cache: {cache_type}"}}
     base_paths, buffer_paths = _collect_w2ter_items_in_folder(folder_path)
@@ -4827,8 +4930,22 @@ def combine_w2ter_folder(context, cache_type, folder_path, loadmods=False) -> Di
         for base in base_paths:
             ensure_bundle_item_extracted(context, base, loadmods)
 
+    wanted_buffer_indices = None
+    if targets is not None:
+        target_set = set(targets)
+        if not target_set & {"tint", "per_tile"}:
+            wanted_buffer_indices = set()
+            if "heightmap" in target_set:
+                wanted_buffer_indices.add(1)
+            if target_set & {"overlay", "bkgrnd", "blend"}:
+                wanted_buffer_indices.add(2)
+
     abs_buffer_paths = []
     for buf in buffer_paths:
+        if wanted_buffer_indices is not None:
+            buffer_index = terrain_w2ter.get_w2ter_buffer_index(buf)
+            if buffer_index not in wanted_buffer_indices:
+                continue
         abs_path = resolve_w2ter_buffer_abs_path(context, cache_type, buf, loadmods)
         if abs_path:
             abs_buffer_paths.append(abs_path)
@@ -4858,6 +4975,8 @@ def combine_w2ter_folder(context, cache_type, folder_path, loadmods=False) -> Di
         res_override=res_override,
         x_tiles_override=x_tiles_override,
         y_tiles_override=y_tiles_override,
+        targets=targets,
+        skip_existing=True,
     )
     result["output_dir"] = output_dir
     result["hub_name"] = hub_name
@@ -4869,7 +4988,13 @@ def import_terrain_fullmap_from_folder(
     context, cache_type, folder_path, loadmods, multires_level
 ) -> Dict[str, object]:
     """Import terrain as one full map object using combined PNG outputs + geo nodes."""
-    result = combine_w2ter_folder(context, cache_type, folder_path, loadmods)
+    result = combine_w2ter_folder(
+        context,
+        cache_type,
+        folder_path,
+        loadmods,
+        targets=("heightmap", "overlay"),
+    )
     outputs = result.get("outputs", [])
     output_dir = result.get("output_dir", "")
     hub_name = result.get("hub_name", "")
@@ -4933,9 +5058,11 @@ def import_terrain_tiles_from_folder(
         for base in base_paths:
             ensure_bundle_item_extracted(context, base, loadmods)
 
-    # Resolve all buffer paths to disk
+    # Extract only height and overlay buffers.
     abs_buffer_paths = []
     for buf in buffer_paths:
+        if terrain_w2ter.get_w2ter_buffer_index(buf) not in {1, 2}:
+            continue
         abs_path = resolve_w2ter_buffer_abs_path(context, cache_type, buf, loadmods)
         if abs_path:
             abs_buffer_paths.append(abs_path)
@@ -4993,9 +5120,13 @@ def import_terrain_tiles_from_folder(
             if not info:
                 continue
             overlay_path = path + ".overlay.png"
-            # Always regenerate to avoid stale cached overlays from older orientation logic.
             try:
-                terrain_w2ter._tile_texture_pngs(path, info)
+                terrain_w2ter._tile_texture_pngs(
+                    path,
+                    info,
+                    which=("overlay",),
+                    skip_existing=True,
+                )
             except Exception:
                 pass
             if win_path_exists(overlay_path):
@@ -6409,7 +6540,8 @@ class SimpleFileBrowser(Operator):
         tools_row = col.row(align=True)
         layout_mode = tools_row.row(align=True)
         layout_mode.prop(witcher_file_browser, "file_display_mode", text="", icon_only=True, expand=True)
-        tools_row.separator_spacer()
+        # `separator_spacer()` is not supported by popup layouts.
+        tools_row.separator()
         tools_sub = tools_row.row(align=True)
         tools_sub.prop(witcher_file_browser, "sort_by", text="", icon_only=True)
         asc_icon = 'SORT_ASC' if witcher_file_browser.sort_ascending else 'SORT_DESC'
@@ -7005,13 +7137,25 @@ class SimpleFileBrowser(Operator):
                 op.cache_type = witcher_file_browser.active_cache_type
                 mode_row = terrain_box.row(align=True)
                 mode_row.prop(witcher_file_browser, "terrain_import_mode", text="Mode")
-                op_full = mode_row.operator("witcher.import_terrain_fullmap", text="Import Full Map", icon='NODETREE')
-                op_full.folder_path = witcher_file_browser.current_folder
-                op_full.cache_type = witcher_file_browser.active_cache_type
-                # Import tiles row
                 import_row = terrain_box.row(align=True)
-                import_row.prop(witcher_file_browser, "terrain_multires_level", text="Multires")
-                op_import = import_row.operator("witcher.import_terrain_tiles", text="Import Tiles", icon='IMPORT')
+                import_row.prop(witcher_file_browser, "terrain_multires_level", text="Detail")
+                if witcher_file_browser.terrain_import_mode == 'SELECTED_TILE':
+                    coords = terrain_box.row(align=True)
+                    coords.prop(witcher_file_browser, "terrain_tile_x", text="Tile X")
+                    coords.prop(witcher_file_browser, "terrain_tile_y", text="Tile Y")
+                    terrain_box.prop(witcher_file_browser, "terrain_include_foliage", text="Include Foliage")
+                    foliage_detail = terrain_box.row()
+                    foliage_detail.enabled = bool(witcher_file_browser.terrain_include_foliage)
+                    foliage_detail.prop(witcher_file_browser, "terrain_foliage_mode", text="Foliage")
+                    op_import = import_row.operator(
+                        "witcher.import_terrain_selected_tile",
+                        text="Import Tile + Foliage" if witcher_file_browser.terrain_include_foliage else "Import Tile",
+                        icon='IMPORT',
+                    )
+                elif witcher_file_browser.terrain_import_mode == 'FULL_MAP':
+                    op_import = import_row.operator("witcher.import_terrain_fullmap", text="Import Full Map", icon='NODETREE')
+                else:
+                    op_import = import_row.operator("witcher.import_terrain_tiles", text="Import All Tiles", icon='IMPORT')
                 op_import.folder_path = witcher_file_browser.current_folder
                 op_import.cache_type = witcher_file_browser.active_cache_type
                 mat_row = terrain_box.row(align=True)
@@ -7110,7 +7254,8 @@ class SimpleFileBrowser(Operator):
             layout_row = file_col.row(align=True)
             layout_mode = layout_row.row(align=True)
             layout_mode.prop(witcher_file_browser, "file_display_mode", text="", icon_only=True, expand=True)
-            layout_row.separator_spacer()
+            # `separator_spacer()` is not supported by popup layouts.
+            layout_row.separator()
             tools_sub = layout_row.row(align=True)
             tools_sub.prop(witcher_file_browser, "sort_by", text="", icon_only=True)
             asc_icon = 'SORT_ASC' if witcher_file_browser.sort_ascending else 'SORT_DESC'
@@ -10120,6 +10265,71 @@ class ImportTerrainFullMapOperator(Operator):
         return {'FINISHED'}
 
 
+class ImportTerrainSelectedTileOperator(Operator):
+    """Import one terrain tile without enumerating the terrain folder."""
+
+    bl_idname = "witcher.import_terrain_selected_tile"
+    bl_label = "Import Selected Terrain Tile"
+    bl_description = "Import only the configured tile and its foliage"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    folder_path: StringProperty()
+    cache_type: StringProperty()
+
+    def execute(self, context):
+        browser = context.scene.witcher_file_browser
+        folder_path = self.folder_path or browser.current_folder
+        cache_type = self.cache_type or browser.active_cache_type
+        loadmods = browser.loadmods
+        if not folder_path:
+            self.report({'ERROR'}, "No terrain folder selected")
+            return {'CANCELLED'}
+
+        if is_disk_cache(cache_type):
+            folder_abs = get_disk_abs_path(cache_type, folder_path)
+        else:
+            folder_abs = get_uncook_abs_path(context, folder_path, loadmods)
+        world_path = _resolve_w2w_path(context, cache_type, folder_path, folder_abs, loadmods)
+        if not world_path:
+            self.report({'ERROR'}, "Could not resolve the world .w2w for this terrain folder")
+            return {'CANCELLED'}
+
+        tile_x = int(browser.terrain_tile_x)
+        tile_y = int(browser.terrain_tile_y)
+        started = time.perf_counter()
+        try:
+            from ..CR2W import CR2W_reader
+            from ..importers import import_w2w
+            from . import ui_map
+
+            world = CR2W_reader.load_w2w(world_path, include_groups=False)
+            with mod_loading_context(context):
+                load_result = import_w2w.import_world_tile_with_foliage(
+                    world,
+                    world_path,
+                    tile_x,
+                    tile_y,
+                    context=context,
+                    multires_level=int(browser.terrain_multires_level),
+                    include_foliage=bool(browser.terrain_include_foliage),
+                    foliage_mode=str(browser.terrain_foliage_mode),
+                )
+        except Exception as exc:
+            log.exception("Selected terrain tile import failed")
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        ui_map._select_loaded_terrain_tile(context, load_result.terrain.obj)
+        ui_map._report_world_tile_load(
+            self,
+            load_result,
+            tile_x,
+            tile_y,
+            time.perf_counter() - started,
+        )
+        return {'FINISHED'}
+
+
 class ImportTerrainTilesOperator(Operator):
     """Import terrain tiles as individual Blender objects with heightmap and overlay"""
     bl_idname = "witcher.import_terrain_tiles"
@@ -10475,6 +10685,8 @@ class WITCHER_PT_AssetBrowser(Panel):
         ref_row.operator("witcher.image_browser", text="Bestiary", icon='BOOKMARKS')
         ref_row = char_col.row(align=True)
         ref_row.operator("witcher.character_image_browser", text="Characters", icon='OUTLINER_OB_ARMATURE')
+        ref_row = char_col.row(align=True)
+        ref_row.operator("witcher.location_image_browser", text="Locations", icon='WORLD')
 
 
 def register():
@@ -10515,6 +10727,7 @@ def register():
     bpy.utils.register_class(SelectCacheTypeOperator)
     bpy.utils.register_class(CombineTerrainTilesOperator)
     bpy.utils.register_class(ImportTerrainFullMapOperator)
+    bpy.utils.register_class(ImportTerrainSelectedTileOperator)
     bpy.utils.register_class(ImportTerrainTilesOperator)
     bpy.utils.register_class(AdjustTileMultiresOperator)
     bpy.utils.register_class(FileActionOperator)
@@ -10589,6 +10802,7 @@ def unregister():
     bpy.utils.unregister_class(FileActionOperator)
     bpy.utils.unregister_class(AdjustTileMultiresOperator)
     bpy.utils.unregister_class(ImportTerrainTilesOperator)
+    bpy.utils.unregister_class(ImportTerrainSelectedTileOperator)
     bpy.utils.unregister_class(ImportTerrainFullMapOperator)
     bpy.utils.unregister_class(CombineTerrainTilesOperator)
     bpy.utils.unregister_class(BookmarkItem)

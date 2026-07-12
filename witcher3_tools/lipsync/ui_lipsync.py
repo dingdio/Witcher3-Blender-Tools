@@ -42,6 +42,8 @@ LIPSYNC_TARGET_SPEAKER_HINTS = (
 )
 _EDITOR_SYNCING = False
 _REDKIT_PROJECT_ENUM_CACHE = []
+_SETUP_STATUS_CACHE = {"key": None, "checked_at": 0.0, "value": None}
+_SETUP_STATUS_CACHE_SECONDS = 2.0
 
 
 def _scene_tools_path(scene):
@@ -3186,13 +3188,31 @@ def _section_header(layout, scene, expand_prop, title, icon='NONE', boxed=True):
     return body, header
 
 
+def _cached_setup_status(scene, context):
+    generate_re = bool(getattr(scene, "witcher_lipsync_generate_re", True))
+    tools_path = _radish_tools_path(context)
+    model_path = _scene_stt_model_path(scene)
+    key = (str(tools_path or ""), str(model_path or ""), generate_re)
+    now = time.monotonic()
+    if (
+        _SETUP_STATUS_CACHE.get("key") == key
+        and _SETUP_STATUS_CACHE.get("value") is not None
+        and now - float(_SETUP_STATUS_CACHE.get("checked_at", 0.0) or 0.0) < _SETUP_STATUS_CACHE_SECONDS
+    ):
+        return _SETUP_STATUS_CACHE["value"]
+
+    tools_dir, _missing = radish_runner.get_full_tool_status(
+        tools_path, include_converter=generate_re,
+    )
+    stt_ok, stt_message = stt.is_available(model_path)
+    value = (tools_dir, stt_ok, stt_message, _has_whisper_model_file(scene))
+    _SETUP_STATUS_CACHE.update(key=key, checked_at=now, value=value)
+    return value
+
+
 def _draw_setup_banner(layout, scene, context):
     """Show only setup blockers that affect the main WAV workflow."""
-    generate_re = bool(getattr(scene, "witcher_lipsync_generate_re", True))
-    tools_dir, _missing = radish_runner.get_full_tool_status(
-        _radish_tools_path(context), include_converter=generate_re,
-    )
-    stt_ok, stt_message = stt.is_available(_scene_stt_model_path(scene))
+    tools_dir, stt_ok, stt_message, has_whisper_model = _cached_setup_status(scene, context)
     if tools_dir and stt_ok:
         return
 
@@ -3209,7 +3229,7 @@ def _draw_setup_banner(layout, scene, context):
         row = box.row(align=True)
         row.alert = True
         row.label(text=stt_label, icon=stt_icon)
-        if not _has_whisper_model_file(scene):
+        if not has_whisper_model:
             row.operator(WITCH_OT_download_lipsync_whisper_model.bl_idname, text="Download", icon='IMPORT')
         row.operator(WITCH_OT_lipsync_whisper_info.bl_idname, text="", icon='QUESTION')
 

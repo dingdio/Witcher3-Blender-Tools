@@ -461,6 +461,9 @@ def _get_source_map_path(uncook_path: str) -> str:
 def _load_source_map(uncook_path: str) -> dict:
     global _source_map_cache
     map_path = _get_source_map_path(uncook_path)
+    # Pending writes make the in-memory map authoritative.
+    if _source_map_dirty and _source_map_cache["path"] == map_path:
+        return _source_map_cache["data"]
     try:
         mtime = os.path.getmtime(map_path) if os.path.exists(map_path) else 0
     except Exception:
@@ -480,22 +483,78 @@ def _load_source_map(uncook_path: str) -> dict:
         }
     return _source_map_cache["data"]
 
-def _save_source_map(uncook_path: str, data: dict) -> None:
+def _save_source_map(uncook_path: str, data: dict) -> bool:
     map_path = _get_source_map_path(uncook_path)
+    temp_path = map_path + ".tmp"
     try:
         os.makedirs(os.path.dirname(map_path), exist_ok=True)
-        with open(map_path, "w", encoding="utf-8") as f:
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, separators=(",", ":"), sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, map_path)
         _source_map_cache["path"] = map_path
         _source_map_cache["data"] = data
         _source_map_cache["mtime"] = os.path.getmtime(map_path)
+        return True
+    except Exception:
+        log.exception("Failed to save source map %s", map_path)
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        return False
+
+_source_map_dirty = False
+_source_map_flush_scheduled = False
+_SOURCE_MAP_FLUSH_DELAY = 2.0
+
+def flush_source_map():
+    """Write pending source-map entries to disk. Safe to call any time."""
+    global _source_map_dirty, _source_map_flush_scheduled
+    _source_map_flush_scheduled = False
+    if not _source_map_dirty:
+        return None
+    map_path = str(_source_map_cache.get("path") or "")
+    if map_path and _save_source_map(os.path.dirname(map_path), _source_map_cache.get("data") or {}):
+        _source_map_dirty = False
+        return None
+    # Retain dirty state when deferred flush fails.
+    _source_map_flush_scheduled = True
+    return _SOURCE_MAP_FLUSH_DELAY
+
+def _schedule_source_map_flush() -> None:
+    global _source_map_flush_scheduled
+    if _source_map_flush_scheduled:
+        return
+    try:
+        import bpy
+        if not bpy.app.background and bpy.app.timers is not None:
+            bpy.app.timers.register(flush_source_map, first_interval=_SOURCE_MAP_FLUSH_DELAY)
+            _source_map_flush_scheduled = True
+            return
     except Exception:
         pass
+    import atexit
+    atexit.register(flush_source_map)
+    _source_map_flush_scheduled = True
 
 def set_source_for_path(uncook_path: str, rel_path: str, source_label: str) -> None:
+    global _source_map_dirty
+    map_path = _get_source_map_path(uncook_path)
+    if _source_map_dirty and _source_map_cache["path"] != map_path:
+        if flush_source_map() is not None:
+            raise OSError(f"Could not flush source map {_source_map_cache['path']}")
     data = _load_source_map(uncook_path)
+    if data.get(rel_path) == source_label:
+        return
     data[rel_path] = source_label
-    _save_source_map(uncook_path, data)
+    _source_map_cache["path"] = map_path
+    _source_map_cache["data"] = data
+    # Debounce large source-map writes.
+    _source_map_dirty = True
+    _schedule_source_map_flush()
 
 def get_source_for_path(uncook_path: str, rel_path: str) -> str:
     data = _load_source_map(uncook_path)

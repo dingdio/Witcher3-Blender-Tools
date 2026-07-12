@@ -428,6 +428,7 @@ from .ui import ui_custom_icons
 from .ui import ui_map
 from .ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_w2w,
+                                     WITCH_OT_import_world_tile,
                                      WITCH_OT_w2l_collection_details,
                                      WITCH_OT_load_layer,
                                      WITCH_OT_load_layer_group,
@@ -441,6 +442,7 @@ from .ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_load_foliage_around_camera,
                                      WITCH_OT_toggle_foliage_visibility,
                                      WITCH_OT_unload_foliage,
+                                     WITCH_OT_hydrate_foliage_sources,
                                      WITCH_OT_open_foliage_browser,
                                      WITCH_OT_check_foliage_world)
 from .ui import ui_anims
@@ -2617,6 +2619,12 @@ CACHE_ITEMS = (
         "description": "Characters browser entry cache.",
     },
     {
+        "name": "journal_browser_locations.pkl",
+        "relative_path": os.path.join("JournalBrowser", "journal_browser_locations.pkl"),
+        "label": "journal_browser_locations.pkl",
+        "description": "Curated locations browser entry cache.",
+    },
+    {
         "name": "journal_icons_bestiary",
         "relative_path": os.path.join("JournalBrowser", "icons", "bestiary"),
         "label": "journal icons (bestiary)",
@@ -2748,6 +2756,8 @@ def _get_cache_signature_builder(cache_name: str):
         return lambda: w3_asset_browser._journal_browser_signature("BESTIARY")
     if cache_name == "journal_browser_characters.pkl":
         return lambda: w3_asset_browser._journal_browser_signature("CHARACTERS")
+    if cache_name == "journal_browser_locations.pkl":
+        return w3_asset_browser._location_browser_signature
     return None
 
 def _check_cache_status(cache_name: str):
@@ -2781,6 +2791,13 @@ def _check_cache_status(cache_name: str):
 
 def _refresh_journal_cache(browser_key: str) -> bool:
     key = (browser_key or "").strip().upper()
+    if key == "LOCATIONS":
+        try:
+            w3_asset_browser._load_location_entries_cached(key, force_refresh=True)
+            return True
+        except Exception:
+            log.warning("Failed to refresh locations cache", exc_info=True)
+            return False
     if key not in {"BESTIARY", "CHARACTERS"}:
         return False
     try:
@@ -2881,6 +2898,7 @@ def _refresh_cache_by_name(cache_name: str) -> bool:
         "dlc_definition_cache.pkl": _refresh_dlc_definition_cache,
         "journal_browser_bestiary.pkl": lambda: _refresh_journal_cache("BESTIARY"),
         "journal_browser_characters.pkl": lambda: _refresh_journal_cache("CHARACTERS"),
+        "journal_browser_locations.pkl": lambda: _refresh_journal_cache("LOCATIONS"),
         "journal_icons_bestiary": lambda: _refresh_journal_cache("BESTIARY"),
         "journal_icons_characters": lambda: _refresh_journal_cache("CHARACTERS"),
         "pathhashes.csv": _refresh_pathhashes_cache,
@@ -2897,6 +2915,9 @@ def _delete_cache_by_name(cache_name: str) -> bool:
             return True
         if cache_name == "journal_browser_characters.pkl":
             w3_asset_browser._clear_journal_browser_caches("CHARACTERS")
+            return True
+        if cache_name == "journal_browser_locations.pkl":
+            w3_asset_browser._clear_journal_browser_caches("LOCATIONS")
             return True
 
         file_path = _get_cache_abs_path(cache_name)
@@ -3634,7 +3655,25 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
             if body:
                 col = body.column(align=True)
                 col.prop(scene_settings, "terrain_import_mode", text="")
-                col.prop(scene_settings, "terrain_multires_level", text="Target Multires")
+                col.prop(scene_settings, "terrain_multires_level", text="Preview Detail")
+                if str(getattr(scene_settings, "terrain_import_mode", "")) == "SELECTED_TILE":
+                    coords = col.row(align=True)
+                    coords.prop(scene_settings, "terrain_tile_x", text="Tile X")
+                    coords.prop(scene_settings, "terrain_tile_y", text="Tile Y")
+                    col.prop(scene_settings, "terrain_include_foliage", text="Include Foliage")
+                    foliage_detail = col.row()
+                    foliage_detail.enabled = bool(scene_settings.terrain_include_foliage)
+                    foliage_detail.prop(scene_settings, "terrain_foliage_mode", text="Foliage Detail")
+                    actions = col.row(align=True)
+                    import_op = actions.operator("witcher.import_world_tile", text="Import Tile", icon='IMPORT')
+                    import_op.use_view = False
+                    import_op.action = 'IMPORT'
+                    view_op = actions.operator("witcher.import_world_tile", text="Tile Under View", icon='VIEW_CAMERA')
+                    view_op.use_view = True
+                    view_op.action = 'IMPORT'
+                    unload_op = actions.operator("witcher.import_world_tile", text="", icon='TRASH')
+                    unload_op.use_view = False
+                    unload_op.action = 'UNLOAD'
 
             if hasattr(scene_settings, "terrain_material_roughness") and hasattr(scene_settings, "terrain_material_specular"):
                 body = section("witcher_terrain_material", "Material", 'MATERIAL', default_closed=True)
@@ -3747,6 +3786,8 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
 
                 visibility_box = controls.box()
                 visibility_box.label(text="Visibility After Load")
+                if ui_map.location_viewer_visibility_active(context):
+                    visibility_box.label(text="Location View: Proxies Hidden", icon='HIDE_ON')
                 def visibility_row(label, hide_prop, solo_prop):
                     row = visibility_box.row(align=True)
                     hide_enabled = bool(getattr(scene_settings, hide_prop, False))
@@ -3783,10 +3824,11 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
             col.label(text=ui_map.get_foliage_info_label(context))
             ui_map.draw_foliage_job_ui(col, context)
             controls = col.column(align=True)
-            controls.enabled = not ui_map.foliage_job_running()
+            controls.enabled = not ui_map.foliage_busy()
             if scene_settings and hasattr(scene_settings, "foliage_load_radius"):
                 controls.prop(scene_settings, "foliage_load_radius", text="Radius (World Units)")
             controls.operator("witcher.load_foliage_around_camera", text="Load Foliage Around Camera", icon='PARTICLE_DATA')
+            controls.operator("witcher.hydrate_foliage_sources", text="Load Full Sources", icon='IMPORT')
             row = controls.row(align=True)
             row.operator("witcher.check_foliage_world", text="World Info", icon='INFO')
             row.operator("witcher.open_foliage_browser", text="Browse Folder", icon='FILE_FOLDER')
@@ -4465,6 +4507,7 @@ _classes = [
     WITCH_OT_morphs,
     WITCH_OT_w2L,
     WITCH_OT_w2w,
+    WITCH_OT_import_world_tile,
     # WITCH_OT_w2mi,
     # WITCH_OT_w2mg,
     #WITCH_OT_w2ent,
@@ -4488,6 +4531,7 @@ _classes = [
     WITCH_OT_load_foliage_around_camera,
     WITCH_OT_toggle_foliage_visibility,
     WITCH_OT_unload_foliage,
+    WITCH_OT_hydrate_foliage_sources,
     WITCH_OT_open_foliage_browser,
     WITCH_OT_check_foliage_world,
     WITCH_OT_load_texarray,

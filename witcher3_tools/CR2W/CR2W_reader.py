@@ -13,11 +13,11 @@ def load_w2l(fileName_in = False):
     level = CR2W_file.create_level(CR2WFile, fileName)
     return level
 
-def load_w2w(fileName_in = False):
+def load_w2w(fileName_in = False, include_groups: bool = True):
     if fileName_in:
         fileName = fileName_in
     CR2WFile = CR2W_file.read_CR2W(fileName)
-    world = CR2W_file.create_world(CR2WFile, fileName)
+    world = CR2W_file.create_world(CR2WFile, fileName, include_groups=include_groups)
     #write_yml(world)
     return world
 
