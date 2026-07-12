@@ -447,21 +447,14 @@ def _find_reusable_redcloth_armature(owner_armature, reuse_key: str, *, key_prop
     return None
 
 
-def _find_layer_collection_for_collection(layer_collection, target_collection):
-    if layer_collection is None or target_collection is None:
-        return None
-    if getattr(layer_collection, "collection", None) == target_collection:
-        return layer_collection
-    for child in getattr(layer_collection, "children", []) or []:
-        found = _find_layer_collection_for_collection(child, target_collection)
-        if found is not None:
-            return found
-    return None
-
-
-def _configure_redcloth_cache_collection(scene, cache_collection):
-    if scene is None or cache_collection is None:
+def _configure_redcloth_cache_collection(cache_collection):
+    if cache_collection is None:
         return
+    try:
+        # Keep the unlinked cache collection alive across save/reload.
+        cache_collection.use_fake_user = True
+    except Exception:
+        pass
     try:
         cache_collection.hide_render = True
     except Exception:
@@ -474,14 +467,19 @@ def _configure_redcloth_cache_collection(scene, cache_collection):
         cache_collection["witcher_redcloth_cache"] = True
     except Exception:
         pass
-    for view_layer in getattr(scene, "view_layers", []) or []:
-        layer_collection = _find_layer_collection_for_collection(getattr(view_layer, "layer_collection", None), cache_collection)
-        if layer_collection is None:
-            continue
+
+
+def _unlink_redcloth_cache_from_scenes(cache_collection):
+    # Migration: older versions linked the cache into the scene, polluting the outliner.
+    if cache_collection is None:
+        return
+    for scene in bpy.data.scenes:
         try:
-            layer_collection.hide_viewport = True
+            scene_children = scene.collection.children
+            if cache_collection.name in scene_children.keys():
+                scene_children.unlink(cache_collection)
         except Exception:
-            pass
+            continue
 
 
 def _get_redcloth_cache_collection(scene, create: bool = False):
@@ -492,13 +490,8 @@ def _get_redcloth_cache_collection(scene, create: bool = False):
         return None
     if cache_collection is None:
         cache_collection = bpy.data.collections.new(_REDCLOTH_CACHE_COLLECTION_NAME)
-    try:
-        scene_children = getattr(scene.collection, "children", None)
-        if scene_children is not None and cache_collection.name not in scene_children.keys():
-            scene_children.link(cache_collection)
-    except Exception:
-        pass
-    _configure_redcloth_cache_collection(scene, cache_collection)
+    _unlink_redcloth_cache_from_scenes(cache_collection)
+    _configure_redcloth_cache_collection(cache_collection)
     return cache_collection
 
 
