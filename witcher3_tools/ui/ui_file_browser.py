@@ -30,6 +30,7 @@ from ..CR2W.common_blender import (
     set_source_for_path,
     prepare_extraction_target,
     clear_mod_index_cache,
+    redkit_repo_context,
 )
 
 from .. import (
@@ -493,14 +494,14 @@ class MySettings(PropertyGroup):
     # Terrain tile import
     terrain_multires_level: IntProperty(
         name="Terrain Detail",
-        description="Preview detail for imported terrain. Level 6 is fast; refine selected tiles later if needed",
-        default=6, min=0, max=10,
+        description="Subdivision detail used for imported terrain",
+        default=8, min=0, max=10,
     )
     terrain_import_mode: bpy.props.EnumProperty(
         name="Terrain Import",
         description="Choose the terrain scope to import",
         items=TERRAIN_IMPORT_MODE_ITEMS,
-        default='SELECTED_TILE',
+        default='FULL_MAP',
     )
     terrain_tile_x: IntProperty(
         name="Tile X",
@@ -528,7 +529,7 @@ class MySettings(PropertyGroup):
     terrain_build_layer_tree: BoolProperty(
         name="Build Layer Tree",
         description="Create the complete world layer collection tree during import",
-        default=False,
+        default=True,
     )
     terrain_material_roughness: FloatProperty(
         name="Terrain Roughness",
@@ -543,6 +544,21 @@ class MySettings(PropertyGroup):
         default=0.12,
         min=0.0,
         max=1.0,
+    )
+    terrain_detail_material: BoolProperty(
+        name="Detail Terrain Material",
+        description="Build the full texarray terrain material with detail textures, normal maps, control-map blending, slope, and tint",
+        default=True,
+    )
+    terrain_detail_texture_res: bpy.props.EnumProperty(
+        name="Detail Texture Size",
+        description="Resolution each terrain layer is packed at in the detail texture atlas",
+        items=(
+            ('512', "512 px", "Quarter resolution, lowest memory"),
+            ('1024', "1024 px", "Half resolution, good balance"),
+            ('2048', "2048 px", "Native resolution, highest memory"),
+        ),
+        default='1024',
     )
     terrain_layer_load_radius: FloatProperty(
         name="Layer Load Radius",
@@ -4988,12 +5004,15 @@ def import_terrain_fullmap_from_folder(
     context, cache_type, folder_path, loadmods, multires_level
 ) -> Dict[str, object]:
     """Import terrain as one full map object using combined PNG outputs + geo nodes."""
+    settings = getattr(context.scene, "witcher_file_browser", None)
+    detail_enabled = bool(getattr(settings, "terrain_detail_material", True))
     result = combine_w2ter_folder(
         context,
         cache_type,
         folder_path,
         loadmods,
-        targets=("heightmap", "overlay"),
+        targets=("heightmap", "overlay", "tint") if detail_enabled
+        else ("heightmap", "overlay"),
     )
     outputs = result.get("outputs", [])
     output_dir = result.get("output_dir", "")
@@ -5012,6 +5031,8 @@ def import_terrain_fullmap_from_folder(
         return {"object_name": "", "hub_name": hub_name, "error": f"Missing {hub_name}.overlay.png"}
 
     # Resolve world settings from .w2w when available.
+    world_path = _resolve_w2w_path(
+        context, cache_type, folder_path, folder_abs, loadmods)
     world = _get_w2w_world_data(context, cache_type, folder_path, folder_abs, loadmods)
     if world:
         terrain_size = getattr(world, "terrainSize", 2000.0)
@@ -5035,9 +5056,27 @@ def import_terrain_fullmap_from_folder(
         highest_elevation=highest_elevation,
         multires_level=multires_level,
         world_name=world_name,
+        world_path=world_path or "",
     )
     if not obj:
         return {"object_name": "", "hub_name": hub_name, "error": "Failed to create full-map terrain object"}
+
+    if detail_enabled and world and world_path:
+        try:
+            detail_spec = import_w2w.inspect_world_terrain(world, world_path)
+            with redkit_repo_context(world_path):
+                import_w2w._apply_fullmap_detail_material(
+                    world,
+                    detail_spec,
+                    obj,
+                    (info.get("tiles", {}) or {}).get(2, {}),
+                    output_dir,
+                )
+        except Exception:
+            log.warning(
+                "Full-map texarray material failed; keeping the overlay terrain material",
+                exc_info=True,
+            )
 
     return {"object_name": obj.name, "hub_name": hub_name}
 
@@ -7158,6 +7197,11 @@ class SimpleFileBrowser(Operator):
                     op_import = import_row.operator("witcher.import_terrain_tiles", text="Import All Tiles", icon='IMPORT')
                 op_import.folder_path = witcher_file_browser.current_folder
                 op_import.cache_type = witcher_file_browser.active_cache_type
+                detail_row = terrain_box.row(align=True)
+                detail_row.prop(witcher_file_browser, "terrain_detail_material", text="Detail Material")
+                detail_res = detail_row.row(align=True)
+                detail_res.enabled = bool(witcher_file_browser.terrain_detail_material)
+                detail_res.prop(witcher_file_browser, "terrain_detail_texture_res", text="")
                 mat_row = terrain_box.row(align=True)
                 mat_row.prop(witcher_file_browser, "terrain_material_roughness", text="Rough")
                 mat_row.prop(witcher_file_browser, "terrain_material_specular", text="Spec")

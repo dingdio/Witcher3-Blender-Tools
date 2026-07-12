@@ -606,7 +606,7 @@ TERRAIN_IMPORT_FULL_MAP = "FULL_MAP"
 TERRAIN_IMPORT_TILES = "TILES"
 
 # Defaults balance preview quality and source resolution.
-TERRAIN_TILE_PREVIEW_LEVEL = 5
+TERRAIN_TILE_PREVIEW_LEVEL = 8
 TERRAIN_TILE_MAX_LEVEL = 8
 
 @dataclass(frozen=True, order=True)
@@ -1597,6 +1597,8 @@ def _bake_fullmap_diffuse(worldFile, output_dir, hub_name, tiles, tile_res, n_ti
 
 def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=None):
     ctx = _resolve_terrain_context(worldFile, filePath)
+    detail_enabled = _get_scene_terrain_detail_enabled()
+    detail_spec = inspect_world_terrain(worldFile, filePath) if detail_enabled else None
     hub_name = ctx["hub_name"]
     n_tiles = ctx["n_tiles"]
     tile_res = ctx["tile_res"]
@@ -1622,7 +1624,7 @@ def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=N
     output_dir = str(ctx["output_dir"])
     combine_targets = (
         ("heightmap", "overlay", "bkgrnd", "blend", "tint")
-        if ctx["working_tiles_dir"] else ("heightmap",)
+        if ctx["working_tiles_dir"] or detail_enabled else ("heightmap",)
     )
     combined = terrain_w2ter.combine_w2ter_tiles(
         buffer_paths,
@@ -1676,12 +1678,28 @@ def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=N
         world_root_collection=world_root_collection,
     )
     if obj:
+        if detail_enabled:
+            try:
+                _apply_fullmap_detail_material(
+                    worldFile,
+                    detail_spec,
+                    obj,
+                    tiles.get(2, {}),
+                    output_dir,
+                )
+            except Exception:
+                log.warning(
+                    "Full-map texarray material failed; keeping the baked terrain material",
+                    exc_info=True,
+                )
         log.info("Imported full terrain map: %s", obj.name)
     return obj
 
 
 def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None):
     ctx = _resolve_terrain_context(worldFile, filePath)
+    detail_enabled = _get_scene_terrain_detail_enabled()
+    detail_spec = inspect_world_terrain(worldFile, filePath) if detail_enabled else None
     hub_name = ctx["hub_name"]
     n_tiles = ctx["n_tiles"]
     tile_res = ctx["tile_res"]
@@ -1696,6 +1714,7 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
 
     # Find/extract tile buffers
     tile_heightmap_buffers = {}  # (x,y) -> raw .w2ter.1.buffer path
+    tile_texture_buffers = {}    # (x,y) -> raw .w2ter.2.buffer path
     tile_overlays = {}           # (x,y) -> overlay PNG path
 
     for y in range(n_tiles):
@@ -1722,6 +1741,7 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
                 working_tiles_dir=ctx["working_tiles_dir"],
             )
             if buf2_path:
+                tile_texture_buffers[(x, y)] = str(buf2_path)
                 info = terrain_w2ter.TileInfo(x=x, y=y, res=tile_res, buffer_index=2)
                 overlay_path = buf2_path + ".overlay.png"
                 try:
@@ -1741,6 +1761,7 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
 
     do_import_terrain_tiles(
         tile_heightmap_buffers=tile_heightmap_buffers,
+        tile_texture_buffers=tile_texture_buffers,
         tile_overlays=tile_overlays,
         x_tiles=n_tiles,
         y_tiles=n_tiles,
@@ -1752,6 +1773,9 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
         hub_name=hub_name,
         world_path=filePath,
         world_root_collection=world_root_collection,
+        world_file=worldFile,
+        terrain_spec=detail_spec,
+        detail_material=detail_enabled,
     )
 
 
@@ -1921,6 +1945,8 @@ def _apply_tile_overlay_material(obj, overlay_path, mat_name):
     mat["witcher_terrain_material"] = True
     mat["witcher_terrain_material_key"] = mat_name
     mat["witcher_terrain_overlay_path"] = str(overlay_path)
+    if "witcher_terrain_detail_sig" in mat:
+        del mat["witcher_terrain_detail_sig"]
     obj.data.materials.clear()
     obj.data.materials.append(mat)
     return mat
@@ -2183,6 +2209,125 @@ def _tile_material_name(spec, key):
     return f"terrain_{spec.hub_name}_{spec.world_key[:8]}_tile_{key.y}_x_{key.x}_mat"
 
 
+_TERRAIN_DETAIL_WORLD_CACHE = {}
+
+
+def _get_scene_terrain_detail_enabled():
+    try:
+        return bool(bpy.context.scene.witcher_file_browser.terrain_detail_material)
+    except Exception:
+        return True
+
+
+def _get_scene_terrain_detail_res():
+    try:
+        return int(bpy.context.scene.witcher_file_browser.terrain_detail_texture_res)
+    except Exception:
+        return 1024
+
+
+def _world_colormap_start_mip(worldFile):
+    clip = getattr(worldFile, "terrainClipMap", None)
+    if clip is None:
+        return None
+    try:
+        prop = clip.GetVariableByName("colormapStartingMip")
+        if prop is not None:
+            return int(prop.Value)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_tile_tint_buffer(spec, worldFile, source):
+    mip = _world_colormap_start_mip(worldFile)
+    if mip is None or mip < 0:
+        return ""
+    buf_name = f"{source.tile_name}.w2ter.{mip * 2 + 3}.buffer"
+    path = _resolve_tile_buffer(
+        spec.terrain_tiles_dir,
+        spec.terrain_tiles_rel or None,
+        buf_name,
+        working_tiles_dir=spec.working_tiles_dir or None,
+    )
+    return str(path or "")
+
+
+def _terrain_detail_world_assets(worldFile, spec, slice_px):
+    key = (spec.world_key, int(slice_px))
+    cached = _TERRAIN_DETAIL_WORLD_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    from ..unreal_export import terrain_material as w3_terrain_material
+    from . import terrain_detail
+
+    mat_set = w3_terrain_material.extract_terrain_material_set(worldFile)
+    if not mat_set.layers:
+        raise RuntimeError(
+            "; ".join(mat_set.warnings) or "terrain material has no texture layers")
+
+    out_dir = str(spec.working_tiles_dir or spec.terrain_tiles_dir)
+    atlas = terrain_detail.pack_world_detail_atlases(
+        spec.hub_name, mat_set.layers, out_dir, slice_px=int(slice_px))
+    if atlas is None:
+        raise RuntimeError("could not pack terrain detail atlases")
+
+    param_fields = ("blend_sharpness", "slope_base_dampening", "slope_normal_dampening",
+                    "falloff", "specularity", "specularity_base", "specularity_scale")
+    params_rows = [{f: getattr(layer, f, None) for f in param_fields}
+                   for layer in mat_set.layers]
+    assets = {"atlas": atlas, "params_rows": params_rows,
+              "layer_count": len(mat_set.layers)}
+    _TERRAIN_DETAIL_WORLD_CACHE[key] = assets
+    return assets
+
+
+def _apply_tile_detail_material(worldFile, spec, source, bounds, obj, mat_name):
+    from . import terrain_detail, terrain_detail_nodes
+
+    assets = _terrain_detail_world_assets(worldFile, spec, _get_scene_terrain_detail_res())
+    tint_buffer = _resolve_tile_tint_buffer(spec, worldFile, source)
+    maps = terrain_detail.build_tile_detail_maps(
+        source.texture_buffer,
+        source.heightmap_buffer,
+        int(spec.tile_res),
+        float(bounds.tile_size),
+        _terrain_elevation_range(spec),
+        assets["params_rows"],
+        layer_count=assets["layer_count"],
+        tint_buffer=tint_buffer,
+    )
+    if maps is None:
+        raise RuntimeError(f"tile control buffer unavailable: {source.texture_buffer}")
+    return terrain_detail_nodes.apply_tile_detail_material(
+        obj, mat_name, assets["atlas"], maps)
+
+
+def _apply_fullmap_detail_material(worldFile, spec, obj, texture_buffers, out_dir):
+    from . import terrain_detail, terrain_detail_nodes
+
+    assets = _terrain_detail_world_assets(worldFile, spec, _get_scene_terrain_detail_res())
+    tint_path = os.path.join(str(out_dir), f"{spec.hub_name}.tint.png")
+    maps = terrain_detail.build_fullmap_detail_maps(
+        texture_buffers,
+        int(spec.tile_res),
+        int(spec.x_tiles),
+        int(spec.y_tiles),
+        assets["params_rows"],
+        str(out_dir),
+        spec.hub_name,
+        layer_count=assets["layer_count"],
+        target_res=_get_scene_terrain_bake_res(),
+        tint_path=tint_path,
+    )
+    if maps is None:
+        raise RuntimeError("full-map terrain control buffers are unavailable")
+    mat_name = f"terrain_{spec.hub_name}_{spec.world_key[:8]}_full_mat"
+    return terrain_detail_nodes.apply_tile_detail_material(
+        obj, mat_name, assets["atlas"], maps)
+
+
 def _link_terrain_object(obj, world_collection):
     if world_collection is not None and world_collection not in obj.users_collection:
         world_collection.objects.link(obj)
@@ -2306,6 +2451,7 @@ def import_world_terrain_tile(
     multires_level=TERRAIN_TILE_PREVIEW_LEVEL,
     world_root_collection=None,
     include_overlay=True,
+    detail_material=None,
 ):
     """Resolve and import one terrain tile."""
     spec = inspect_world_terrain(worldFile, filePath)
@@ -2327,13 +2473,25 @@ def import_world_terrain_tile(
         )
 
     world_collection = ensure_world_terrain_collection(spec, world_root_collection)
-    return _import_resolved_terrain_tile(
+    result = _import_resolved_terrain_tile(
         spec,
         source,
         bounds,
         multires_level=multires_level,
         world_collection=world_collection,
     )
+    if detail_material is None:
+        detail_material = _get_scene_terrain_detail_enabled()
+    if result.ok and detail_material:
+        try:
+            with redkit_repo_context(filePath):
+                _apply_tile_detail_material(
+                    worldFile, spec, result.source, result.bounds, result.obj,
+                    _tile_material_name(spec, result.source.key))
+        except Exception:
+            log.warning("Terrain detail material failed for %s; keeping the overlay material",
+                        source.tile_name, exc_info=True)
+    return result
 
 
 def import_world_tile_with_foliage(
@@ -2347,6 +2505,7 @@ def import_world_tile_with_foliage(
     world_root_collection=None,
     include_foliage=True,
     foliage_mode="PROXY",
+    detail_material=None,
 ):
     """Import one terrain tile and treat foliage failure as partial success."""
 
@@ -2358,6 +2517,7 @@ def import_world_tile_with_foliage(
         y,
         multires_level=multires_level,
         world_root_collection=world_root_collection,
+        detail_material=detail_material,
     )
     if terrain is None or not terrain.ok:
         raise FileNotFoundError(
@@ -2405,6 +2565,10 @@ def do_import_terrain_tiles(
     hub_name,
     world_path="",
     world_root_collection=None,
+    tile_texture_buffers=None,
+    world_file=None,
+    terrain_spec=None,
+    detail_material=None,
 ):
     """Import terrain tiles as individual Blender objects with baked heightmap geometry.
 
@@ -2423,7 +2587,7 @@ def do_import_terrain_tiles(
     """
     level = _clamp_tile_multires_level(multires_level, tile_res)
     world_path = str(world_path or "")
-    spec = TerrainWorldSpec(
+    spec = terrain_spec or TerrainWorldSpec(
         hub_name=str(hub_name or "terrain"),
         world_name=str(hub_name or "terrain"),
         world_path=world_path,
@@ -2436,6 +2600,9 @@ def do_import_terrain_tiles(
         y_tiles=max(0, int(y_tiles)),
         terrain_tiles_dir="",
     )
+    tile_texture_buffers = tile_texture_buffers or {}
+    if detail_material is None:
+        detail_material = _get_scene_terrain_detail_enabled()
     world_collection = ensure_world_terrain_collection(spec, world_root_collection)
     empty = _ensure_terrain_root(spec, level, world_collection)
     existing_by_key = {
@@ -2466,6 +2633,7 @@ def do_import_terrain_tiles(
             request=request,
             tile_name=f"tile_{y}_x_{x}_res{spec.tile_res}",
             heightmap_buffer=str(buffer_path or ""),
+            texture_buffer=str(tile_texture_buffers.get((x, y)) or ""),
             overlay_path=str(overlay_path or ""),
         )
         result = _import_resolved_terrain_tile(
@@ -2479,6 +2647,23 @@ def do_import_terrain_tiles(
         )
         if result.ok:
             count += 1
+            if detail_material and world_file is not None and source.texture_buffer:
+                try:
+                    with redkit_repo_context(spec.world_path):
+                        _apply_tile_detail_material(
+                            world_file,
+                            spec,
+                            source,
+                            result.bounds,
+                            result.obj,
+                            _tile_material_name(spec, source.key),
+                        )
+                except Exception:
+                    log.warning(
+                        "Terrain detail material failed for %s; keeping the overlay material",
+                        source.tile_name,
+                        exc_info=True,
+                    )
 
     return empty, count
 

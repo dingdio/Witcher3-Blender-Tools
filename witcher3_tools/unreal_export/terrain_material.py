@@ -113,7 +113,8 @@ def get_terrain_texture_params(world) -> list[dict[str, float]]:
         params = clip.GetVariableByName("textureParams")
     except Exception:
         return []
-    elements = getattr(params, "elements", None) or getattr(params, "PROPS", None) or []
+    elements = (getattr(params, "More", None) or getattr(params, "elements", None)
+                or getattr(params, "PROPS", None) or [])
     result: list[dict[str, float]] = []
     for element in elements:
         try:

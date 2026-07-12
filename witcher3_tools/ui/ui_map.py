@@ -638,12 +638,12 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         name="Terrain Import",
         description="Choose the terrain scope to import",
         items=TERRAIN_IMPORT_MODE_ITEMS,
-        default='SELECTED_TILE',
+        default='FULL_MAP',
     )
     terrain_multires_level: IntProperty(
         name="Terrain Multires",
         description="Multires subdivision levels used by terrain import",
-        default=6,
+        default=8,
         min=0,
         max=10,
     )
@@ -673,7 +673,7 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
     terrain_build_layer_tree: BoolProperty(
         name="Build Layer Tree",
         description="Create the complete world layer collection tree during import",
-        default=False,
+        default=True,
     )
     terrain_material_roughness: FloatProperty(
         name="Terrain Roughness",
@@ -688,6 +688,21 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         default=0.12,
         min=0.0,
         max=1.0,
+    )
+    terrain_detail_material: BoolProperty(
+        name="Full Texarray Material",
+        description="Build the full terrain material from the world texture arrays and control maps",
+        default=True,
+    )
+    terrain_detail_texture_res: EnumProperty(
+        name="Texarray Resolution",
+        description="Resolution used for each layer in the generated texture atlases",
+        items=(
+            ('512', "512 px", "Lowest memory usage"),
+            ('1024', "1024 px", "Balanced quality and memory usage"),
+            ('2048', "2048 px", "Native resolution and highest memory usage"),
+        ),
+        default='1024',
     )
 
     def _copy_settings_from_scene(self, context):
@@ -704,6 +719,8 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
             self.terrain_build_layer_tree = bool(getattr(tool, "terrain_build_layer_tree", self.terrain_build_layer_tree))
             self.terrain_material_roughness = float(getattr(tool, "terrain_material_roughness", self.terrain_material_roughness))
             self.terrain_material_specular = float(getattr(tool, "terrain_material_specular", self.terrain_material_specular))
+            self.terrain_detail_material = bool(getattr(tool, "terrain_detail_material", self.terrain_detail_material))
+            self.terrain_detail_texture_res = str(getattr(tool, "terrain_detail_texture_res", self.terrain_detail_texture_res))
         except Exception:
             pass
 
@@ -728,6 +745,10 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
                 tool.terrain_material_roughness = float(self.terrain_material_roughness)
             if hasattr(tool, "terrain_material_specular"):
                 tool.terrain_material_specular = float(self.terrain_material_specular)
+            if hasattr(tool, "terrain_detail_material"):
+                tool.terrain_detail_material = bool(self.terrain_detail_material)
+            if hasattr(tool, "terrain_detail_texture_res"):
+                tool.terrain_detail_texture_res = str(self.terrain_detail_texture_res)
         except Exception:
             pass
 
@@ -746,6 +767,13 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
             foliage_detail.prop(self, "terrain_foliage_mode", text="Foliage")
         box.prop(self, "terrain_build_layer_tree")
         box.prop(self, "terrain_multires_level", text="Detail")
+        detail_box = box.box()
+        detail_box.label(text="Terrain Material", icon='MATERIAL')
+        detail_row = detail_box.row(align=True)
+        detail_row.prop(self, "terrain_detail_material", text="Full Texarray Material")
+        detail_res = detail_box.row()
+        detail_res.enabled = bool(self.terrain_detail_material)
+        detail_res.prop(self, "terrain_detail_texture_res", text="Atlas")
         box.prop(self, "terrain_material_roughness", text="Roughness")
         box.prop(self, "terrain_material_specular", text="Specular")
 
@@ -785,6 +813,7 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
                         world_root_collection=world_collection,
                         include_foliage=bool(self.terrain_include_foliage),
                         foliage_mode=str(self.terrain_foliage_mode),
+                        detail_material=bool(self.terrain_detail_material),
                     )
                 except Exception as exc:
                     if created_world_collection:

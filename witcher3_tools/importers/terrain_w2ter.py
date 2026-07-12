@@ -93,6 +93,8 @@ def write_png(
         return
     if color_type == 0 and bit_depth == 16:
         bpp = 2
+    elif color_type == 2 and bit_depth == 16:
+        bpp = 6
     elif color_type == 3 and bit_depth == 8:
         bpp = 1
     elif color_type == 6 and bit_depth == 8:
@@ -525,7 +527,13 @@ def _decode_rgb565(value: int) -> Tuple[int, int, int]:
     return r, g, b
 
 
-def decode_bc1_to_rgba(data: bytes, width: int, height: int) -> Optional[np.ndarray]:
+def decode_bc1_to_rgba(
+    data: bytes,
+    width: int,
+    height: int,
+    *,
+    force_four_color: bool = False,
+) -> Optional[np.ndarray]:
     if width <= 0 or height <= 0 or width % 4 != 0 or height % 4 != 0:
         return None
     blocks_x = width // 4
@@ -557,7 +565,7 @@ def decode_bc1_to_rgba(data: bytes, width: int, height: int) -> Optional[np.ndar
     pal[:, 0] = np.stack([r0, g0, b0, np.full_like(r0, 255)], axis=1)
     pal[:, 1] = np.stack([r1, g1, b1, np.full_like(r1, 255)], axis=1)
 
-    opaque = (c0 > c1)[:, None]
+    opaque = ((c0 > c1) | bool(force_four_color))[:, None]
     c2_op = np.stack([(2 * R0 + R1) // 3, (2 * G0 + G1) // 3, (2 * B0 + B1) // 3, full], axis=1).astype(np.uint8)
     c3_op = np.stack([(R0 + 2 * R1) // 3, (G0 + 2 * G1) // 3, (B0 + 2 * B1) // 3, full], axis=1).astype(np.uint8)
     c2_tr = np.stack([(R0 + R1) // 2, (G0 + G1) // 2, (B0 + B1) // 2, full], axis=1).astype(np.uint8)

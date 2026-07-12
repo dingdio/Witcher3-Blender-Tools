@@ -3,6 +3,7 @@ import re
 import sys
 import types
 import unittest
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -324,6 +325,104 @@ class TestTerrainTileUnload(unittest.TestCase):
         self.assertIn(neighbor, store)
         self.assertEqual(store.remove_called, (target, True))
         self.assertEqual(removed_meshes, [target.data])
+
+
+class TestAllTilesDetailMaterial(unittest.TestCase):
+    def test_all_tiles_passes_control_buffer_to_detail_builder(self):
+        spec = _novigrad_spec()
+        root = types.SimpleNamespace(children=[])
+        imported_obj = types.SimpleNamespace(name="tile_3_x_2")
+        imported = types.SimpleNamespace(
+            ok=True,
+            bounds=terrain.terrain_tile_bounds(spec, 2, 3),
+            obj=imported_obj,
+        )
+        world_file = object()
+        height_path = str(Path("test_data") / "tile.1.buffer")
+        texture_path = str(Path("test_data") / "tile.2.buffer")
+        overlay_path = str(Path("test_data") / "tile.overlay.png")
+
+        with (
+            mock.patch.object(terrain, "ensure_world_terrain_collection", return_value=object()),
+            mock.patch.object(terrain, "_ensure_terrain_root", return_value=root),
+            mock.patch.object(terrain, "_import_resolved_terrain_tile", return_value=imported),
+            mock.patch.object(terrain, "_apply_tile_detail_material") as apply_detail,
+            mock.patch.object(terrain, "redkit_repo_context", side_effect=lambda _path: nullcontext()),
+        ):
+            _root, count = terrain.do_import_terrain_tiles(
+                tile_heightmap_buffers={(2, 3): height_path},
+                tile_texture_buffers={(2, 3): texture_path},
+                tile_overlays={(2, 3): overlay_path},
+                x_tiles=spec.x_tiles,
+                y_tiles=spec.y_tiles,
+                tile_res=spec.tile_res,
+                terrain_size=spec.terrain_size,
+                lowest_elevation=spec.lowest_elevation,
+                highest_elevation=spec.highest_elevation,
+                multires_level=6,
+                hub_name=spec.hub_name,
+                world_path=spec.world_path,
+                world_file=world_file,
+                terrain_spec=spec,
+                detail_material=True,
+            )
+
+        self.assertEqual(count, 1)
+        self.assertIs(_root, root)
+        apply_detail.assert_called_once()
+        args = apply_detail.call_args.args
+        self.assertIs(args[0], world_file)
+        self.assertEqual(args[2].texture_buffer, texture_path)
+        self.assertIs(args[4], imported_obj)
+
+
+class TestFullMapDetailMaterial(unittest.TestCase):
+    def test_full_map_applies_combined_detail_material(self):
+        spec = _novigrad_spec()
+        world = types.SimpleNamespace(
+            terrainSize=spec.terrain_size,
+            lowestElevation=spec.lowest_elevation,
+            highestElevation=spec.highest_elevation,
+            worldName=spec.world_name,
+        )
+        output_dir = str(Path("test_output") / "terrain")
+        texture_path = str(Path("test_data") / "tile.2.buffer")
+        ctx = {
+            "hub_name": spec.hub_name,
+            "n_tiles": spec.x_tiles,
+            "tile_res": spec.tile_res,
+            "terrain_tiles_dir": spec.terrain_tiles_dir,
+            "terrain_tiles_rel": spec.terrain_tiles_rel,
+            "working_tiles_dir": spec.working_tiles_dir,
+            "output_dir": output_dir,
+        }
+        texture_tiles = {(0, 0): texture_path}
+        combined = {"info": {"tiles": {2: texture_tiles}}}
+        obj = types.SimpleNamespace(name="Novigrad")
+
+        with (
+            mock.patch.object(terrain, "_resolve_terrain_context", return_value=ctx),
+            mock.patch.object(terrain, "inspect_world_terrain", return_value=spec),
+            mock.patch.object(terrain, "_get_scene_terrain_detail_enabled", return_value=True),
+            mock.patch.object(terrain, "_ensure_world_water_plane"),
+            mock.patch.object(terrain, "_get_scene_terrain_multires_level", return_value=6),
+            mock.patch.object(terrain, "_collect_tile_buffer_paths_for_combine", return_value=["buffer"]),
+            mock.patch.object(terrain.terrain_w2ter, "combine_w2ter_tiles", return_value=combined, create=True),
+            mock.patch.object(
+                terrain,
+                "_bake_fullmap_diffuse",
+                return_value=str(Path(output_dir) / "baked.png"),
+            ),
+            mock.patch.object(terrain.os.path, "isfile", return_value=True),
+            mock.patch.object(terrain, "import_combined_terrain_full_map", return_value=obj),
+            mock.patch.object(terrain, "_apply_fullmap_detail_material") as apply_detail,
+        ):
+            result = terrain._do_import_map_terrain_full_map(
+                world, spec.world_path, world_root_collection="world-root")
+
+        self.assertIs(result, obj)
+        apply_detail.assert_called_once_with(
+            world, spec, obj, texture_tiles, ctx["output_dir"])
 
 
 if __name__ == "__main__":
