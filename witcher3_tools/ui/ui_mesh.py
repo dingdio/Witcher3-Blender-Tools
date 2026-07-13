@@ -905,7 +905,7 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
     bl_options = {'REGISTER', 'UNDO'}
     
     filter_glob: StringProperty(default='*.w2mesh', options={'HIDDEN'})
-    
+
     do_import_mats: BoolProperty(
         name="Apply Materials",
         default=True,
@@ -1074,8 +1074,10 @@ def _collect_extra_stream_requirements(meshes):
     has_vertex_color = False
     for mesh in _sorted_export_meshes(meshes):
         has_uv2 = has_uv2 or len(mesh.data.uv_layers) > 1
-        has_vertex_color = has_vertex_color or (
-            mesh.data.color_attributes.active_color_index != -1 and mesh.data.color_attributes.active
+        has_vertex_color = has_vertex_color or any(
+            attribute.data_type in ('BYTE_COLOR', 'FLOAT_COLOR')
+            and attribute.domain in ('POINT', 'CORNER')
+            for attribute in mesh.data.color_attributes
         )
     return has_uv2, has_vertex_color
 
@@ -2870,6 +2872,25 @@ def _join_meshes_for_export(context, meshes):
     return bpy.context.view_layer.objects.active
 
 
+def _preserve_join_transform_status(meshes):
+    """Check whether joining preserves stored basis attributes."""
+    if len(meshes) < 2:
+        return True, ""
+    active_inverse = meshes[0].matrix_world.inverted_safe()
+    for mesh_obj in meshes[1:]:
+        relative_linear = (active_inverse @ mesh_obj.matrix_world).to_3x3()
+        for row in range(3):
+            for column in range(3):
+                expected = 1.0 if row == column else 0.0
+                if abs(float(relative_linear[row][column]) - expected) > 1.0e-6:
+                    return (
+                        False,
+                        f"'{mesh_obj.name}' has different rotation or scale from "
+                        f"'{meshes[0].name}'",
+                    )
+    return True, ""
+
+
 class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
     """Export Witcher 3 Mesh File"""
     bl_idname = "witcher.export_w2mesh"
@@ -2884,6 +2905,57 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
         return any(ob.type in ('MESH', 'ARMATURE') for ob in context.selected_objects)
 
     filter_glob: StringProperty(default='*.w2mesh', options={'HIDDEN'})
+
+    tangent_space_mode: EnumProperty(
+        name="Tangent Space",
+        description="Choose how normals, tangents and binormals are exported",
+        items=(
+            (
+                'REDENGINE',
+                "TW3 REDkit (Default)",
+                "Use TW3 REDkit style. (Default)",
+            ),
+            (
+                'MIKKTSPACE',
+                "MikkTSpace / Recalculate",
+                "Recalculate with Blender's native MikkTSpace, matching a Blender Tangent Space FBX imported by wcclite/REDkit",
+            ),
+            (
+                'PRESERVE_IMPORTED',
+                "Preserve Imported Basis",
+                "If the mesh is unchanged reuse the valid source basis captured on import.",
+            ),
+            (
+                'NO_MIRROR',
+                "No Mirror (Deprecated)",
+                "REDkit style without the mirrored UV fix",
+            ),
+        ),
+        default='REDENGINE',
+    )
+
+    tangent_handedness_mode: EnumProperty(
+        name="Handedness",
+        description="Control binormal orientation without changing the tangent calculation",
+        items=(
+            (
+                'AUTO',
+                "Auto",
+                "Use the captured TW2/TW3 source version when available; otherwise keep the selected calculation's handedness",
+            ),
+            (
+                'AS_CALCULATED',
+                "As Calculated",
+                "Export the handedness produced by the selected tangent calculation",
+            ),
+            (
+                'FLIPPED',
+                "Flipped",
+                "Invert the calculated binormal and tangent-space handedness",
+            ),
+        ),
+        default='AUTO',
+    )
     
     keep_intermediate_json: BoolProperty(
         name="Keep Intermediate JSON",
@@ -3444,6 +3516,16 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
             # --- Advanced ---
             box = self._draw_section_header(layout, 'show_advanced', "Advanced", 'PREFERENCES')
             if box:
+                box.prop(self, "tangent_space_mode")
+                if self.tangent_space_mode in {'REDENGINE', 'MIKKTSPACE'}:
+                    box.prop(self, "tangent_handedness_mode")
+                if self.tangent_space_mode == 'PRESERVE_IMPORTED':
+                    box.label(text="Requires an unchanged imported mesh", icon='INFO')
+                elif self.tangent_space_mode == 'NO_MIRROR':
+                    row = box.row()
+                    row.alert = True
+                    row.label(text="Debug compatibility only", icon='ERROR')
+                box.separator()
                 box.prop(self, "use_wolvenkit_json")
                 if self.use_wolvenkit_json:
                     box.prop(self, "keep_intermediate_json")
@@ -3519,7 +3601,35 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                         if len(non_lod) == 1:
                             meshes = non_lod
                         else:
+                            if self.tangent_space_mode == 'PRESERVE_IMPORTED':
+                                transform_valid, transform_reason = (
+                                    _preserve_join_transform_status(non_lod))
+                                if not transform_valid:
+                                    self.report(
+                                        {'ERROR'},
+                                        f"Cannot combine meshes while preserving their imported basis: {transform_reason}.",
+                                    )
+                                    return {'CANCELLED'}
+                                for source_mesh in non_lod:
+                                    basis_valid, basis_reason = import_mesh.imported_tangent_basis_status(
+                                        source_mesh.data)
+                                    if not basis_valid:
+                                        self.report(
+                                            {'ERROR'},
+                                            f"Preserve Imported Basis is unavailable for '{source_mesh.name}': {basis_reason}.",
+                                        )
+                                        return {'CANCELLED'}
                             temp_joined = _join_meshes_for_export(context, non_lod)
+                            if (
+                                self.tangent_space_mode == 'PRESERVE_IMPORTED'
+                                and not import_mesh._mark_imported_tangent_basis(temp_joined.data)
+                            ):
+                                self.report({'ERROR'}, "Imported basis data was lost while combining meshes.")
+                                joined_data = temp_joined.data
+                                bpy.data.objects.remove(temp_joined, do_unlink=True)
+                                if joined_data and joined_data.users == 0:
+                                    bpy.data.meshes.remove(joined_data)
+                                return {'CANCELLED'}
                             meshes = [temp_joined]
                     elif lod_named:
                         meshes = lod_named
@@ -3552,13 +3662,18 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                                             export_col_tri = self.export_col_tri,
                                             keep_intermediate_json = self.keep_intermediate_json,
                                             use_native_writer = not self.use_wolvenkit_json,
-                                            strip_material_names = self.strip_material_names)
+                                            strip_material_names = self.strip_material_names,
+                                            tangent_space_mode = self.tangent_space_mode,
+                                            tangent_handedness_mode = self.tangent_handedness_mode)
                     except (RuntimeError, FileNotFoundError, ValueError) as e:
                         self.report({'ERROR'}, str(e))
                         return {'CANCELLED'}
                     finally:
                         if temp_joined and temp_joined.name in bpy.data.objects:
+                            joined_data = temp_joined.data
                             bpy.data.objects.remove(temp_joined, do_unlink=True)
+                            if joined_data and joined_data.users == 0:
+                                bpy.data.meshes.remove(joined_data)
                 if len(selected_armatures) == 0:
                     selected_meshes = [ob for ob in original_selection if ob.type == 'MESH']
                     if not selected_meshes:
@@ -3595,7 +3710,9 @@ class WITCH_OT_w2mesh_export(bpy.types.Operator, ExportHelper):
                                             export_col_tri = self.export_col_tri,
                                             keep_intermediate_json = self.keep_intermediate_json,
                                             use_native_writer = not self.use_wolvenkit_json,
-                                            strip_material_names = self.strip_material_names)
+                                            strip_material_names = self.strip_material_names,
+                                            tangent_space_mode = self.tangent_space_mode,
+                                            tangent_handedness_mode = self.tangent_handedness_mode)
                     except (RuntimeError, FileNotFoundError, ValueError) as e:
                         self.report({'ERROR'}, str(e))
                         return {'CANCELLED'}

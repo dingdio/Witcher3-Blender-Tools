@@ -469,9 +469,20 @@ def read_instance_params(material, final_params):
             )
             final_params[prop.theName] = (prop.theType, the_value)
         elif prop.theType in ("handle:ITexture", "handle:CTextureArray", "handle:CCubeTexture"):
-            if prop.Handles[0].DepotPath:
-                file_path = prop.Handles[0].DepotPath
+            handles = getattr(prop, 'Handles', None) or []
+            if not handles:
+                continue
+            handle = handles[0]
+            depot_path = getattr(handle, 'DepotPath', None)
+            if depot_path:
+                file_path = depot_path
                 final_params[prop.theName] = (prop.theType, file_path)
+            elif (
+                bool(getattr(handle, 'ChunkHandle', False))
+                and getattr(handle, 'Reference', None) is None
+                and getattr(handle, 'val', None) == 0
+            ):
+                final_params[prop.theName] = (prop.theType, 'NULL')
         else:
             log.warning('Unsupported param type in CR2W "%s"', prop.theType)
     return final_params

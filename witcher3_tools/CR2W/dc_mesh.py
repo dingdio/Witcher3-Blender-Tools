@@ -312,11 +312,13 @@ def _read_vertices_uncooked_numpy(fhandle, num_vertices, num_bones_per_vertex,
 
 def _read_vertices_cooked_w2_numpy(fhandle, num_vertices, vertex_size, is_skinned,
                                    num_bones_per_vertex, has_second_uv, cToLin,
-                                   bones_id_map, bone_names, CData, final_meshdata):
+                                   bones_id_map, bone_names, CData, final_meshdata,
+                                   vertex_type_w2=None):
     """Read cooked W2 vertex data in bulk.
 
     Layout: pos(3f) + [skinning(8b) if skinned] + packed_normal(4b) + color(4b)
-    + UV1(2f) + [UV2(2f) if has_second_uv]. Remaining bytes skipped via vertex_size stride.
+    + UV1(2f) + [UV2(2f) if has_second_uv] + unknown padding/streams
+    + packed_tangent(4b) + packed_binormal(4b).
     """
     raw = fhandle.read(vertex_size * num_vertices)
     if len(raw) < vertex_size * num_vertices:
@@ -377,6 +379,62 @@ def _read_vertices_cooked_w2_numpy(fhandle, num_vertices, vertex_size, is_skinne
             uv2 = struct.unpack_from('<2f', raw, off)
             final_meshdata.UV2_vertex3DCoords.append([uv2[0], uv2[1] * -1.0 + 1.0])
 
+        # W2 layouts 5/9 store T/B at 36/40; others use the final eight bytes.
+        if vertex_type_w2 in (5, 9):
+            basis_off = base + 36
+        elif vertex_type_w2 in (0, 1, 6, 7, 11):
+            basis_off = base + vertex_size - 8
+        else:
+            basis_off = None
+        if basis_off is not None and basis_off >= off and basis_off + 8 <= base + vertex_size:
+            tangent_bytes = raw[basis_off:basis_off + 4]
+            binormal_bytes = raw[basis_off + 4:basis_off + 8]
+            final_meshdata.tangent_vector.append([
+                (tangent_bytes[0] - 127) / 127.0,
+                (tangent_bytes[1] - 127) / 127.0,
+                (tangent_bytes[2] - 127) / 127.0,
+            ])
+            final_meshdata.extra_vectors.append([
+                (binormal_bytes[0] - 127) / 127.0,
+                (binormal_bytes[1] - 127) / 127.0,
+                (binormal_bytes[2] - 127) / 127.0,
+            ])
+
+    # Type 11 was absent from the corpus; accept only plausible N/T/B data.
+    if (
+        vertex_type_w2 == 11
+        and num_vertices > 0
+        and len(final_meshdata.tangent_vector) == num_vertices
+    ):
+        normals = np.asarray(final_meshdata.normals, dtype=np.float64)
+        tangents = np.asarray(final_meshdata.tangent_vector, dtype=np.float64)
+        binormals = np.asarray(final_meshdata.extra_vectors, dtype=np.float64)
+        expected_shape = (num_vertices, 3)
+        safe = all(
+            values.shape == expected_shape
+            for values in (normals, tangents, binormals)
+        )
+        if safe:
+            lengths = np.stack((
+                np.linalg.norm(normals, axis=1),
+                np.linalg.norm(tangents, axis=1),
+                np.linalg.norm(binormals, axis=1),
+            ), axis=1)
+            safe = bool(np.all(lengths > 0.25))
+        if safe:
+            n = normals / lengths[:, 0, None]
+            t = tangents / lengths[:, 1, None]
+            b = binormals / lengths[:, 2, None]
+            max_pair_dot = np.maximum.reduce((
+                np.abs(np.sum(n * t, axis=1)),
+                np.abs(np.sum(n * b, axis=1)),
+                np.abs(np.sum(t * b, axis=1)),
+            ))
+            safe = bool(np.all(max_pair_dot < 0.35))
+        if not safe:
+            final_meshdata.tangent_vector = []
+            final_meshdata.extra_vectors = []
+
 
 def _read_vertices_cooked_w3_numpy(fhandle, num_vertices, vertex_size, is_skinned,
                                    num_bones_per_vertex, quant_scale, quant_offset,
@@ -426,7 +484,7 @@ def _read_uvs_halffloat_numpy(fhandle, num_vertices):
 
 
 def _read_normals_packed10bit_numpy(fhandle, num_vertices):
-    """Read packed 10-bit normals+tangents (4+4 bytes per vertex) in bulk."""
+    """Read packed W3 N/T/W data."""
     raw = fhandle.read(num_vertices * 8)
     data = np.frombuffer(raw, dtype='u1').reshape(num_vertices, 8)
     normals_raw = data[:, :4]
@@ -437,11 +495,23 @@ def _read_normals_packed10bit_numpy(fhandle, num_vertices):
         x = (b0 | ((b1 & 0x03) << 8))
         y = ((b1 >> 2) | ((b2 & 0x0F) << 6))
         z = ((b2 >> 4) | ((b3 & 0x3F) << 4))
-        return np.column_stack([(x - 512) / 512.0, (y - 512) / 512.0, (z - 512) / 512.0])
+        return np.column_stack([
+            (2.0 * x / 1023.0) - 1.0,
+            (2.0 * y / 1023.0) - 1.0,
+            (2.0 * z / 1023.0) - 1.0,
+        ])
 
     normals = _unpack_10bit(normals_raw)
     tangents = _unpack_10bit(tangents_raw)
-    return normals, tangents
+    packed_tangents = tangents_raw.copy().view('<u4').reshape(-1)
+    tangent_w = np.where(((packed_tangents >> 30) & 0x03) >= 2, 1.0, -1.0)
+    bitangents = np.cross(normals, tangents)
+    bitangent_lengths = np.linalg.norm(bitangents, axis=1)
+    valid = bitangent_lengths > 1.0e-20
+    bitangents[valid] /= bitangent_lengths[valid, None]
+    bitangents[~valid] = 0.0
+    bitangents *= tangent_w[:, None]
+    return normals, tangents, bitangents
 
 
 def _read_vertex_colors_and_uv2_numpy(fhandle, num_vertices, cToLin):
@@ -903,6 +973,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
     CData:CommonData = CommonData()
     CData.modelPath = meshFile.fileName
     CData.modelName = meshName
+    CData.sourceMeshVersion = int(meshFile.HEADER.version)
     CData.meshDataAllMeshes = []
     bonePositions: List[Vector3D] = []
     bufferInfos:SBufferInfos = SBufferInfos()
@@ -1278,7 +1349,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                         br.fhandle, submesh.verticesCount, vertexSize,
                         isSkinned, 4, hasSecondUVLayer, cToLin,
                         submesh.bonesId, CData.boneData.jointNames,
-                        CData, final_meshdata)
+                        CData, final_meshdata, submesh.vertexType_w2)
                     br.seek(vertex_end)
 
 
@@ -1677,10 +1748,12 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                 final_meshdata.UV_vertex3DCoords = _read_uvs_halffloat_numpy(br.fhandle, meshInfo.numVertices)
 
                 br.seek(vBufferInf.normalsOffset + firstVertexOffset * 8)
-                normals_arr, tangents_arr = _read_normals_packed10bit_numpy(br.fhandle, meshInfo.numVertices)
+                normals_arr, tangents_arr, bitangents_arr = _read_normals_packed10bit_numpy(
+                    br.fhandle, meshInfo.numVertices)
                 final_meshdata.normals = normals_arr.tolist()
                 final_meshdata.normalsAll = normals_arr.ravel().tolist()
                 final_meshdata.tangent_vector = tangents_arr.tolist()
+                final_meshdata.extra_vectors = bitangents_arr.tolist()
 
                 if vBufferInf.vcOffset_and_uv2:
                     br.seek(vBufferInf.vcOffset_and_uv2)

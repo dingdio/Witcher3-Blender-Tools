@@ -1,8 +1,10 @@
 import logging
+import hashlib
 import os
 import math
 import time
 import bpy
+import bmesh
 from bpy.types import Object
 from typing import List, Tuple
 from mathutils import Vector, Matrix
@@ -49,6 +51,38 @@ def _log_mesh_profile_warning(message, *args):
 
 ZERO_WEIGHT_MASK_GROUP_NAME = "_w3_zero_weight_hidden"
 ZERO_WEIGHT_MASK_MODIFIER_NAME = "W3 Zero Weight Mask"
+
+TANGENT_SPACE_REDENGINE = 'REDENGINE'
+TANGENT_SPACE_MIKKTSPACE = 'MIKKTSPACE'
+TANGENT_SPACE_PRESERVE_IMPORTED = 'PRESERVE_IMPORTED'
+TANGENT_SPACE_NO_MIRROR = 'NO_MIRROR'
+TANGENT_SPACE_MODES = {
+    TANGENT_SPACE_REDENGINE,
+    TANGENT_SPACE_MIKKTSPACE,
+    TANGENT_SPACE_PRESERVE_IMPORTED,
+    TANGENT_SPACE_NO_MIRROR,
+}
+
+TANGENT_HANDEDNESS_AUTO = 'AUTO'
+TANGENT_HANDEDNESS_AS_CALCULATED = 'AS_CALCULATED'
+TANGENT_HANDEDNESS_FLIPPED = 'FLIPPED'
+TANGENT_HANDEDNESS_MODES = {
+    TANGENT_HANDEDNESS_AUTO,
+    TANGENT_HANDEDNESS_AS_CALCULATED,
+    TANGENT_HANDEDNESS_FLIPPED,
+}
+
+IMPORTED_NORMAL_ATTRIBUTE = "witcher_imported_normal"
+IMPORTED_TANGENT_ATTRIBUTE = "witcher_imported_tangent"
+IMPORTED_BINORMAL_ATTRIBUTE = "witcher_imported_binormal"
+IMPORTED_BASIS_VALID_ATTRIBUTE = "witcher_imported_basis_valid"
+IMPORTED_BASIS_REPAIRED_ATTRIBUTE = "witcher_imported_basis_repaired"
+IMPORTED_BASIS_SIGNATURE_PROPERTY = "witcher_imported_basis_signature"
+IMPORTED_BASIS_SOURCE_VERSION_PROPERTY = "witcher_imported_basis_source_version"
+IMPORTED_BASIS_REPAIRED_COUNT_PROPERTY = "witcher_imported_basis_repaired_count"
+MIKK_TANGENT_ATTRIBUTE = "_witcher_mikk_tangent"
+MIKK_BINORMAL_ATTRIBUTE = "_witcher_mikk_binormal"
+MIKK_NORMAL_ATTRIBUTE = "_witcher_mikk_normal"
 
 
 def _mesh_has_skinned_chunks(CData):
@@ -524,6 +558,19 @@ def _normalize_vector3(value, fallback, min_length=1e-8):
     return (x / length, y / length, z / length)
 
 
+def _uv_determinant_is_degenerate(delta_u1, delta_v1, delta_u2, delta_v2, determinant):
+    values = (delta_u1, delta_v1, delta_u2, delta_v2, determinant)
+    if not all(math.isfinite(float(value)) for value in values):
+        return True
+    edge_scale_squared = (
+        ((delta_u1 * delta_u1) + (delta_v1 * delta_v1))
+        * ((delta_u2 * delta_u2) + (delta_v2 * delta_v2))
+    )
+    if edge_scale_squared <= 0.0:
+        return True
+    return (determinant * determinant) <= (1.0e-12 * edge_scale_squared)
+
+
 def _fallback_tangent_basis(normal):
     nx, ny, nz = normal
     if abs(nz) < 0.999:
@@ -543,7 +590,538 @@ def _fallback_tangent_basis(normal):
     return tangent, bitangent
 
 
-def _solve_meshdata_tangent_basis(mesh_data: MeshData):
+def _normalize_tangent_space_mode(value):
+    mode = str(value or TANGENT_SPACE_REDENGINE).upper()
+    if mode not in TANGENT_SPACE_MODES:
+        raise ValueError(f"Unknown tangent-space export mode: {value!r}")
+    return mode
+
+
+def _normalize_tangent_handedness_mode(value):
+    mode = str(value or TANGENT_HANDEDNESS_AUTO).upper()
+    if mode not in TANGENT_HANDEDNESS_MODES:
+        raise ValueError(f"Unknown tangent handedness export mode: {value!r}")
+    return mode
+
+
+def resolve_tangent_handedness_mode(
+    tangent_space_mode,
+    tangent_handedness_mode=TANGENT_HANDEDNESS_AUTO,
+    source_mesh=None,
+):
+    """Resolve Auto using the imported game's binormal convention."""
+    tangent_space_mode = _normalize_tangent_space_mode(tangent_space_mode)
+    tangent_handedness_mode = _normalize_tangent_handedness_mode(
+        tangent_handedness_mode)
+
+    if tangent_space_mode not in (
+        TANGENT_SPACE_REDENGINE,
+        TANGENT_SPACE_MIKKTSPACE,
+    ):
+        return TANGENT_HANDEDNESS_AS_CALCULATED
+    if tangent_handedness_mode != TANGENT_HANDEDNESS_AUTO:
+        return tangent_handedness_mode
+
+    try:
+        source_version = int(source_mesh.get(
+            IMPORTED_BASIS_SOURCE_VERSION_PROPERTY, 0) or 0)
+    except (AttributeError, TypeError, ValueError):
+        source_version = 0
+    if source_version <= 0:
+        return TANGENT_HANDEDNESS_AS_CALCULATED
+
+    source_is_witcher_2 = source_version <= 115
+    if tangent_space_mode == TANGENT_SPACE_REDENGINE:
+        return (
+            TANGENT_HANDEDNESS_FLIPPED
+            if source_is_witcher_2
+            else TANGENT_HANDEDNESS_AS_CALCULATED
+        )
+    return (
+        TANGENT_HANDEDNESS_AS_CALCULATED
+        if source_is_witcher_2
+        else TANGENT_HANDEDNESS_FLIPPED
+    )
+
+
+def _get_primary_uv_layer(mesh):
+    uv_layers = mesh.uv_layers
+    uv_layer = uv_layers.get("DiffuseUV") if len(uv_layers) > 0 else None
+    if uv_layer is None and len(uv_layers) > 0:
+        uv_layer = uv_layers[0]
+    return uv_layer
+
+
+def _replace_mesh_attribute(mesh, name, data_type, domain):
+    attributes = getattr(mesh, "attributes", None)
+    if attributes is None:
+        return None
+    attribute = attributes.get(name)
+    if attribute is not None and (
+        attribute.data_type != data_type or attribute.domain != domain
+    ):
+        attributes.remove(attribute)
+        attribute = None
+    if attribute is None:
+        attribute = attributes.new(name=name, type=data_type, domain=domain)
+    return attribute
+
+
+def _write_vector_mesh_attribute(mesh, name, values, domain):
+    values = np.asarray(values, dtype=np.float32)
+    expected_count = len(mesh.vertices) if domain == 'POINT' else len(mesh.loops)
+    if values.shape != (expected_count, 3) or not np.isfinite(values).all():
+        return False
+    attribute = _replace_mesh_attribute(mesh, name, 'FLOAT_VECTOR', domain)
+    if attribute is None or len(attribute.data) != expected_count:
+        return False
+    attribute.data.foreach_set("vector", values.ravel())
+    return True
+
+
+def _read_vector_mesh_attribute(mesh, name, domain):
+    attributes = getattr(mesh, "attributes", None)
+    attribute = attributes.get(name) if attributes is not None else None
+    expected_count = len(mesh.vertices) if domain == 'POINT' else len(mesh.loops)
+    if (
+        attribute is None
+        or attribute.data_type != 'FLOAT_VECTOR'
+        or attribute.domain != domain
+        or len(attribute.data) != expected_count
+    ):
+        return None
+    values = np.empty(expected_count * 3, dtype=np.float32)
+    attribute.data.foreach_get("vector", values)
+    values = values.reshape((-1, 3))
+    return values if np.isfinite(values).all() else None
+
+
+def _store_imported_tangent_basis(mesh, mesh_data, source_version=0):
+    vert_count = len(mesh.vertices)
+    normals = np.asarray(getattr(mesh_data, "normals", []) or [], dtype=np.float32)
+    if normals.shape != (vert_count, 3):
+        normals_all = getattr(mesh_data, "normalsAll", []) or []
+        if len(normals_all) == vert_count * 3:
+            normals = np.asarray(normals_all, dtype=np.float32).reshape((-1, 3))
+
+    tangents = np.asarray(getattr(mesh_data, "tangent_vector", []) or [], dtype=np.float32)
+    extra_vectors = getattr(mesh_data, "extra_vectors", []) or []
+    if len(extra_vectors) == vert_count:
+        binormals = np.asarray([value[:3] for value in extra_vectors], dtype=np.float32)
+    else:
+        binormals = np.empty((0, 3), dtype=np.float32)
+
+    if not (
+        normals.shape == (vert_count, 3)
+        and tangents.shape == (vert_count, 3)
+        and binormals.shape == (vert_count, 3)
+    ):
+        return False
+
+    normals = normals.copy()
+    tangents = tangents.copy()
+    binormals = binormals.copy()
+    repaired = ~(
+        np.isfinite(normals).all(axis=1)
+        & np.isfinite(tangents).all(axis=1)
+        & np.isfinite(binormals).all(axis=1)
+    )
+    if np.any(repaired):
+        solved_tangents = None
+        solved_binormals = None
+        if (
+            len(getattr(mesh_data, "vertex3DCoords", []) or []) == vert_count
+            and len(getattr(mesh_data, "UV_vertex3DCoords", []) or []) == vert_count
+        ):
+            try:
+                solved_tangents, solved_binormals = _solve_meshdata_tangent_basis(
+                    mesh_data, mirror_correction=True)
+                solved_tangents = np.asarray(solved_tangents, dtype=np.float64)
+                solved_binormals = np.asarray(solved_binormals, dtype=np.float64)
+                if (
+                    solved_tangents.shape != (vert_count, 3)
+                    or solved_binormals.shape != (vert_count, 3)
+                ):
+                    solved_tangents = None
+                    solved_binormals = None
+            except (IndexError, TypeError, ValueError):
+                solved_tangents = None
+                solved_binormals = None
+
+        preserve_w2_handedness = 0 < int(source_version or 0) <= 115
+        for vert_idx in np.flatnonzero(repaired):
+            fallback_normal = _normalize_vector3(
+                mesh.vertices[int(vert_idx)].normal,
+                (0.0, 0.0, 1.0),
+            )
+            source_normal_is_finite = bool(np.isfinite(normals[vert_idx]).all())
+            basis_normal = _normalize_vector3(normals[vert_idx], fallback_normal)
+            stored_normal = (
+                tuple(float(value) for value in normals[vert_idx])
+                if source_normal_is_finite
+                else basis_normal
+            )
+            fallback_tangent, fallback_binormal = _fallback_tangent_basis(basis_normal)
+
+            tangent = None
+            binormal = None
+            if solved_tangents is not None and solved_binormals is not None:
+                tangent = _normalize_vector3(solved_tangents[vert_idx], None)
+                binormal = _normalize_vector3(solved_binormals[vert_idx], None)
+            if tangent is None or binormal is None:
+                tangent, binormal = fallback_tangent, fallback_binormal
+
+            tangent_dot_normal = sum(tangent[i] * basis_normal[i] for i in range(3))
+            tangent = _normalize_vector3((
+                tangent[0] - basis_normal[0] * tangent_dot_normal,
+                tangent[1] - basis_normal[1] * tangent_dot_normal,
+                tangent[2] - basis_normal[2] * tangent_dot_normal,
+            ), fallback_tangent)
+            cross_tn = (
+                tangent[1] * basis_normal[2] - tangent[2] * basis_normal[1],
+                tangent[2] * basis_normal[0] - tangent[0] * basis_normal[2],
+                tangent[0] * basis_normal[1] - tangent[1] * basis_normal[0],
+            )
+            solver_sign = -1.0 if sum(
+                cross_tn[i] * binormal[i] for i in range(3)) < 0.0 else 1.0
+            binormal = _normalize_vector3(
+                tuple(solver_sign * value for value in cross_tn),
+                fallback_binormal,
+            )
+            if preserve_w2_handedness:
+                # W2 uses the opposite binormal convention.
+                binormal = (-binormal[0], -binormal[1], -binormal[2])
+
+            normals[vert_idx] = stored_normal
+            tangents[vert_idx] = tangent
+            binormals[vert_idx] = binormal
+
+        log.warning(
+            "Repaired %d non-finite imported tangent-basis vertices on '%s'; "
+            "all other source basis rows remain unchanged.",
+            int(np.count_nonzero(repaired)),
+            mesh.name,
+        )
+
+    if not (
+        np.isfinite(normals).all()
+        and np.isfinite(tangents).all()
+        and np.isfinite(binormals).all()
+    ):
+        return False
+
+    if not all((
+        _write_vector_mesh_attribute(mesh, IMPORTED_NORMAL_ATTRIBUTE, normals, 'POINT'),
+        _write_vector_mesh_attribute(mesh, IMPORTED_TANGENT_ATTRIBUTE, tangents, 'POINT'),
+        _write_vector_mesh_attribute(mesh, IMPORTED_BINORMAL_ATTRIBUTE, binormals, 'POINT'),
+    )):
+        return False
+
+    valid_attribute = _replace_mesh_attribute(
+        mesh, IMPORTED_BASIS_VALID_ATTRIBUTE, 'INT', 'POINT')
+    repaired_attribute = _replace_mesh_attribute(
+        mesh, IMPORTED_BASIS_REPAIRED_ATTRIBUTE, 'INT', 'POINT')
+    if (
+        valid_attribute is None
+        or repaired_attribute is None
+        or len(valid_attribute.data) != vert_count
+        or len(repaired_attribute.data) != vert_count
+    ):
+        return False
+    valid_attribute.data.foreach_set("value", np.ones(vert_count, dtype=np.int32))
+    repaired_attribute.data.foreach_set("value", repaired.astype(np.int32))
+    mesh[IMPORTED_BASIS_SOURCE_VERSION_PROPERTY] = int(source_version or 0)
+    mesh[IMPORTED_BASIS_REPAIRED_COUNT_PROPERTY] = int(np.count_nonzero(repaired))
+    return True
+
+
+def _imported_basis_attributes_status(mesh):
+    if mesh is None:
+        return False, "mesh data is unavailable"
+    for name in (
+        IMPORTED_NORMAL_ATTRIBUTE,
+        IMPORTED_TANGENT_ATTRIBUTE,
+        IMPORTED_BINORMAL_ATTRIBUTE,
+    ):
+        if _read_vector_mesh_attribute(mesh, name, 'POINT') is None:
+            return False, f"missing imported basis attribute '{name}'"
+
+    attributes = getattr(mesh, "attributes", None)
+    valid_attribute = attributes.get(IMPORTED_BASIS_VALID_ATTRIBUTE) if attributes is not None else None
+    if (
+        valid_attribute is None
+        or valid_attribute.data_type != 'INT'
+        or valid_attribute.domain != 'POINT'
+        or len(valid_attribute.data) != len(mesh.vertices)
+    ):
+        return False, "missing imported-basis validity data"
+    validity = np.empty(len(mesh.vertices), dtype=np.int32)
+    valid_attribute.data.foreach_get("value", validity)
+    if not np.all(validity == 1):
+        return False, "mesh contains vertices without an imported basis"
+    return True, ""
+
+
+def _mesh_imported_basis_signature(mesh):
+    mesh.calc_loop_triangles()
+    digest = hashlib.sha256()
+
+    def _update_quantized(values):
+        values = np.asarray(values, dtype=np.float64)
+        digest.update(np.rint(values * 1.0e6).astype('<i8').tobytes())
+
+    digest.update(np.asarray(
+        [len(mesh.vertices), len(mesh.loops), len(mesh.polygons)], dtype='<i8').tobytes())
+
+    positions = np.empty(len(mesh.vertices) * 3, dtype='<f4')
+    mesh.vertices.foreach_get("co", positions)
+    _update_quantized(positions)
+
+    loop_vertices = np.empty(len(mesh.loops), dtype='<i4')
+    mesh.loops.foreach_get("vertex_index", loop_vertices)
+    digest.update(loop_vertices.tobytes())
+
+    polygon_starts = np.empty(len(mesh.polygons), dtype='<i4')
+    polygon_totals = np.empty(len(mesh.polygons), dtype='<i4')
+    mesh.polygons.foreach_get("loop_start", polygon_starts)
+    mesh.polygons.foreach_get("loop_total", polygon_totals)
+    digest.update(polygon_starts.tobytes())
+    digest.update(polygon_totals.tobytes())
+
+    loop_normals = np.empty(len(mesh.loops) * 3, dtype='<f4')
+    mesh.loops.foreach_get("normal", loop_normals)
+    _update_quantized(loop_normals)
+
+    uv_layer = _get_primary_uv_layer(mesh)
+    if uv_layer is None:
+        digest.update(b"NO_UV0")
+    else:
+        uvs = np.empty(len(mesh.loops) * 2, dtype='<f4')
+        uv_layer.data.foreach_get("uv", uvs)
+        _update_quantized(uvs)
+
+    for name in (
+        IMPORTED_NORMAL_ATTRIBUTE,
+        IMPORTED_TANGENT_ATTRIBUTE,
+        IMPORTED_BINORMAL_ATTRIBUTE,
+    ):
+        values = _read_vector_mesh_attribute(mesh, name, 'POINT')
+        if values is None:
+            raise ValueError(f"Missing imported basis attribute '{name}'.")
+        _update_quantized(values)
+    return digest.hexdigest()
+
+
+def _mark_imported_tangent_basis(mesh):
+    valid, _reason = _imported_basis_attributes_status(mesh)
+    if not valid:
+        if IMPORTED_BASIS_SIGNATURE_PROPERTY in mesh:
+            del mesh[IMPORTED_BASIS_SIGNATURE_PROPERTY]
+        return False
+    repaired_count = 0
+    repaired_attribute = mesh.attributes.get(IMPORTED_BASIS_REPAIRED_ATTRIBUTE)
+    if (
+        repaired_attribute is not None
+        and repaired_attribute.data_type == 'INT'
+        and repaired_attribute.domain == 'POINT'
+        and len(repaired_attribute.data) == len(mesh.vertices)
+    ):
+        repaired = np.empty(len(mesh.vertices), dtype=np.int32)
+        repaired_attribute.data.foreach_get("value", repaired)
+        repaired_count = int(np.count_nonzero(repaired))
+    mesh[IMPORTED_BASIS_REPAIRED_COUNT_PROPERTY] = repaired_count
+    mesh[IMPORTED_BASIS_SIGNATURE_PROPERTY] = _mesh_imported_basis_signature(mesh)
+    return True
+
+
+def imported_tangent_basis_status(mesh):
+    valid, reason = _imported_basis_attributes_status(mesh)
+    if not valid:
+        return False, reason
+    stored_signature = str(mesh.get(IMPORTED_BASIS_SIGNATURE_PROPERTY, "") or "")
+    if not stored_signature:
+        return False, "mesh was not imported with tangent-basis preservation data; re-import it"
+    try:
+        current_signature = _mesh_imported_basis_signature(mesh)
+    except (RuntimeError, ValueError) as exc:
+        return False, str(exc)
+    if current_signature != stored_signature:
+        return False, "positions, topology, UVs, normals, or imported basis changed after import"
+    return True, ""
+
+
+def _bake_mikktspace_loop_basis(mesh):
+    """Cache the full-LOD MikkTSpace basis in corner attributes."""
+    uv_layer = _get_primary_uv_layer(mesh)
+    if uv_layer is None:
+        raise ValueError("MikkTSpace export requires a DiffuseUV/first UV layer.")
+
+    mesh.calc_loop_triangles()
+    positions = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", positions)
+    if not np.isfinite(positions).all():
+        raise ValueError("MikkTSpace export cannot process non-finite vertex positions.")
+
+    source_normals = np.empty((len(mesh.loops), 3), dtype=np.float32)
+    tangents = np.empty((len(mesh.loops), 3), dtype=np.float32)
+    binormals = np.empty((len(mesh.loops), 3), dtype=np.float32)
+    for loop_idx, loop in enumerate(mesh.loops):
+        normal = _normalize_vector3(loop.normal, (0.0, 0.0, 1.0))
+        tangent, binormal = _fallback_tangent_basis(normal)
+        source_normals[loop_idx] = normal
+        tangents[loop_idx] = tangent
+        binormals[loop_idx] = binormal
+
+    invalid_polygons = set()
+    for loop_tri in mesh.loop_triangles:
+        loop_indices = tuple(loop_tri.loops)
+        verts = [mesh.vertices[mesh.loops[index].vertex_index].co for index in loop_indices]
+        uvs = [uv_layer.data[index].uv for index in loop_indices]
+        edge1 = verts[1] - verts[0]
+        edge2 = verts[2] - verts[0]
+        determinant = (
+            (float(uvs[1][0]) - float(uvs[0][0]))
+            * (float(uvs[2][1]) - float(uvs[0][1]))
+            - (float(uvs[2][0]) - float(uvs[0][0]))
+            * (float(uvs[1][1]) - float(uvs[0][1]))
+        )
+        delta_u1 = float(uvs[1][0]) - float(uvs[0][0])
+        delta_v1 = float(uvs[1][1]) - float(uvs[0][1])
+        delta_u2 = float(uvs[2][0]) - float(uvs[0][0])
+        delta_v2 = float(uvs[2][1]) - float(uvs[0][1])
+        geometry_scale_squared = edge1.length_squared * edge2.length_squared
+        if (
+            geometry_scale_squared <= 0.0
+            or edge1.cross(edge2).length_squared
+            <= (1.0e-12 * geometry_scale_squared)
+            or _uv_determinant_is_degenerate(
+                delta_u1, delta_v1, delta_u2, delta_v2, determinant)
+        ):
+            invalid_polygons.add(int(loop_tri.polygon_index))
+
+    invalid_loops = {
+        loop_idx
+        for polygon_idx in invalid_polygons
+        for loop_idx in mesh.polygons[polygon_idx].loop_indices
+    }
+
+    calculation_mesh = mesh
+    calculation_mesh_is_copy = False
+    calculated = False
+    try:
+        source_loop_indices = np.arange(len(mesh.loops), dtype=np.int32)
+        if invalid_polygons:
+            # Exclude invalid triangles from Blender's Mikk calculation.
+            calculation_mesh = mesh.copy()
+            calculation_mesh_is_copy = True
+            source_loop_attribute = _replace_mesh_attribute(
+                calculation_mesh,
+                "_witcher_mikk_source_loop",
+                'INT',
+                'CORNER',
+            )
+            source_loop_attribute.data.foreach_set(
+                "value", np.arange(len(calculation_mesh.loops), dtype=np.int32))
+
+            bm = bmesh.new()
+            try:
+                bm.from_mesh(calculation_mesh)
+                bm.faces.ensure_lookup_table()
+                faces_to_delete = [
+                    face for face in bm.faces
+                    if face.index in invalid_polygons
+                ]
+                if faces_to_delete:
+                    bmesh.ops.delete(bm, geom=faces_to_delete, context='FACES')
+                bm.to_mesh(calculation_mesh)
+            finally:
+                bm.free()
+            calculation_mesh.update()
+
+            if len(calculation_mesh.loops):
+                source_loop_attribute = calculation_mesh.attributes.get(
+                    "_witcher_mikk_source_loop")
+                if (
+                    source_loop_attribute is None
+                    or source_loop_attribute.data_type != 'INT'
+                    or source_loop_attribute.domain != 'CORNER'
+                    or len(source_loop_attribute.data) != len(calculation_mesh.loops)
+                ):
+                    raise ValueError("Could not map sanitized MikkTSpace corners for export.")
+                source_loop_indices = np.empty(len(calculation_mesh.loops), dtype=np.int32)
+                source_loop_attribute.data.foreach_get("value", source_loop_indices)
+                calculation_mesh.normals_split_custom_set(
+                    [source_normals[index] for index in source_loop_indices])
+            else:
+                source_loop_indices = np.empty(0, dtype=np.int32)
+
+        if len(calculation_mesh.polygons):
+            calculation_uv_layer = _get_primary_uv_layer(calculation_mesh)
+            calculation_mesh.calc_tangents(uvmap=calculation_uv_layer.name)
+            calculated = True
+
+            candidate_basis = {}
+            for calculation_loop_idx, source_loop_idx in enumerate(source_loop_indices):
+                source_loop_idx = int(source_loop_idx)
+                if source_loop_idx in invalid_loops:
+                    continue
+                loop = calculation_mesh.loops[calculation_loop_idx]
+                normal = tuple(float(value) for value in source_normals[source_loop_idx])
+                tangent = _normalize_vector3(loop.tangent, None)
+                sign = float(loop.bitangent_sign)
+                if tangent is None or not math.isfinite(sign) or abs(sign) < 0.5:
+                    continue
+
+                tangent_dot_normal = sum(tangent[i] * normal[i] for i in range(3))
+                tangent = _normalize_vector3((
+                    tangent[0] - normal[0] * tangent_dot_normal,
+                    tangent[1] - normal[1] * tangent_dot_normal,
+                    tangent[2] - normal[2] * tangent_dot_normal,
+                ), None)
+                if tangent is None:
+                    continue
+
+                blender_sign = -1.0 if sign < 0.0 else 1.0
+                cross_nt = (
+                    normal[1] * tangent[2] - normal[2] * tangent[1],
+                    normal[2] * tangent[0] - normal[0] * tangent[2],
+                    normal[0] * tangent[1] - normal[1] * tangent[0],
+                )
+                # Match the binormal sign used by Blender FBX and REDkit.
+                binormal = _normalize_vector3(
+                    tuple(blender_sign * value for value in cross_nt), None)
+                if binormal is None:
+                    continue
+                candidate_basis[source_loop_idx] = (tangent, binormal)
+
+            # Commit whole polygons to avoid mixed Mikk/fallback handedness.
+            for polygon in mesh.polygons:
+                polygon_loops = tuple(polygon.loop_indices)
+                if all(loop_idx in candidate_basis for loop_idx in polygon_loops):
+                    for source_loop_idx in polygon_loops:
+                        tangent, binormal = candidate_basis[source_loop_idx]
+                        tangents[source_loop_idx] = tangent
+                        binormals[source_loop_idx] = binormal
+                else:
+                    invalid_loops.update(polygon_loops)
+
+        if not (
+            _write_vector_mesh_attribute(mesh, MIKK_NORMAL_ATTRIBUTE, source_normals, 'CORNER')
+            and _write_vector_mesh_attribute(mesh, MIKK_TANGENT_ATTRIBUTE, tangents, 'CORNER')
+            and _write_vector_mesh_attribute(mesh, MIKK_BINORMAL_ATTRIBUTE, binormals, 'CORNER')
+        ):
+            raise ValueError("Could not cache MikkTSpace corner data for export.")
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Blender could not calculate MikkTSpace from UV layer '{uv_layer.name}': {exc}") from exc
+    finally:
+        if calculated:
+            calculation_mesh.free_tangents()
+        if calculation_mesh_is_copy:
+            bpy.data.meshes.remove(calculation_mesh)
+
+
+def _solve_meshdata_tangent_basis(mesh_data: MeshData, mirror_correction=True):
     vert_count = len(mesh_data.vertex3DCoords)
     if vert_count == 0:
         return [], []
@@ -560,6 +1138,8 @@ def _solve_meshdata_tangent_basis(mesh_data: MeshData):
         uvs = np.zeros((vert_count, 2), dtype=np.float64)
         uvs[:, 1] = 1.0
 
+    uv_handedness = np.zeros(vert_count, dtype=np.int8)
+    uv_handedness_conflict = np.zeros(vert_count, dtype=np.bool_)
     group_by_pos_uv = {}
     vertex_groups = np.empty(vert_count, dtype=np.int64)
     for vert_idx in range(vert_count):
@@ -576,13 +1156,12 @@ def _solve_meshdata_tangent_basis(mesh_data: MeshData):
             group_by_pos_uv[key] = group_idx
         vertex_groups[vert_idx] = group_idx
 
+    # Preserve legacy grouping and unorthogonalized tangent accumulation.
     tangent_accum = np.zeros((len(group_by_pos_uv), 3), dtype=np.float64)
     degenerate_uv_faces = 0
-
     for face in mesh_data.faces:
         if len(face) != 3:
             continue
-
         i1, i2, i3 = (int(face[0]), int(face[1]), int(face[2]))
         if (
             i1 < 0 or i2 < 0 or i3 < 0 or
@@ -597,7 +1176,16 @@ def _solve_meshdata_tangent_basis(mesh_data: MeshData):
         delta_v1 = uvs[i2][1] - uvs[i1][1]
         delta_v2 = uvs[i3][1] - uvs[i1][1]
         denom = (delta_u1 * delta_v2) - (delta_u2 * delta_v1)
-        if not math.isfinite(float(denom)) or abs(float(denom)) <= 1e-7:
+        if mirror_correction:
+            uv_is_degenerate = _uv_determinant_is_degenerate(
+                delta_u1, delta_v1, delta_u2, delta_v2, denom)
+        else:
+            # Preserve the legacy debug path.
+            uv_is_degenerate = (
+                not math.isfinite(float(denom))
+                or abs(float(denom)) <= 1e-7
+            )
+        if uv_is_degenerate:
             degenerate_uv_faces += 1
             continue
 
@@ -606,10 +1194,20 @@ def _solve_meshdata_tangent_basis(mesh_data: MeshData):
             degenerate_uv_faces += 1
             continue
 
-        tangent_accum[vertex_groups[i1]] += sdir
-        tangent_accum[vertex_groups[i2]] += sdir
-        tangent_accum[vertex_groups[i3]] += sdir
+        face_handedness = -1 if denom < 0.0 else 1
+        for vert_idx in (i1, i2, i3):
+            tangent_accum[vertex_groups[vert_idx]] += sdir
+            if uv_handedness_conflict[vert_idx]:
+                continue
+            current_handedness = int(uv_handedness[vert_idx])
+            if current_handedness == 0:
+                uv_handedness[vert_idx] = face_handedness
+            elif current_handedness != face_handedness:
+                # Keep the legacy binormal for unsplit orientation conflicts.
+                uv_handedness[vert_idx] = 0
+                uv_handedness_conflict[vert_idx] = True
 
+    vertex_is_mirrored = uv_handedness < 0
     tangents = []
     bitangents = []
     fallback_count = 0
@@ -630,6 +1228,10 @@ def _solve_meshdata_tangent_basis(mesh_data: MeshData):
                 ),
                 fallback_bitangent,
             )
+
+        # Mirrored charts need the opposite binormal for REDengine tangent W=+1.
+        if mirror_correction and vertex_is_mirrored[vert_idx]:
+            bitangent = (-bitangent[0], -bitangent[1], -bitangent[2])
 
         tangents.append([tangent[0], tangent[1], tangent[2]])
         bitangents.append([bitangent[0], bitangent[1], bitangent[2]])
@@ -1312,6 +1914,13 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                         # if bl_mesh != lod_meshes[0]:
                         #     lod_meshes[0].append(bl_mesh)
 
+    for mesh_obj in final_bl_meshes:
+        if not _mark_imported_tangent_basis(mesh_obj.data):
+            log.debug(
+                "Imported tangent basis is unavailable or incomplete on '%s'.",
+                mesh_obj.name,
+            )
+
     is_skinned_mesh = _mesh_has_skinned_chunks(CData)
     if hide_zero_weight_faces and is_skinned_mesh:
         for mesh_obj in final_bl_meshes:
@@ -1628,6 +2237,12 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
                 bpy.ops.object.mode_set(mode='EDIT', toggle=False)
                 merge_normals()
                 bpy.ops.object.mode_set(mode='OBJECT')
+
+        _store_imported_tangent_basis(
+            mesh,
+            meshDataBl,
+            source_version=getattr(CData, "sourceMeshVersion", 0),
+        )
         #=========#
         # Weights #
         #=========#
@@ -1857,8 +2472,24 @@ def get_vertex_weights(mesh_obj, vertex_group_name):
             vertex_weights.append(vertex.groups[vertex_group.index].weight)
     return vertex_weights
 
-def get_mesh_info(me, mesh_ob, meshDataBl = None):
+def get_mesh_info(
+    me,
+    mesh_ob,
+    meshDataBl=None,
+    tangent_space_mode=TANGENT_SPACE_REDENGINE,
+    tangent_handedness_mode=TANGENT_HANDEDNESS_AUTO,
+    basis_source_mesh=None,
+):
     exportMeshdata:MeshData = MeshData()
+    tangent_space_mode = _normalize_tangent_space_mode(tangent_space_mode)
+    handedness_source_mesh = basis_source_mesh if basis_source_mesh is not None else me
+    tangent_handedness_mode = resolve_tangent_handedness_mode(
+        tangent_space_mode,
+        tangent_handedness_mode,
+        handedness_source_mesh,
+    )
+    flip_tangent_handedness = (
+        tangent_handedness_mode == TANGENT_HANDEDNESS_FLIPPED)
 
     if bpy.app.version < (4, 1, 0):
         me.use_auto_smooth = True
@@ -1869,9 +2500,7 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
     # Prefer explicit Witcher UV names when present; otherwise fall back to
     # index order. This keeps round-trips stable if Blender reorders layers.
     uv_layers = me.uv_layers
-    uv1_layer = uv_layers.get("DiffuseUV") if len(uv_layers) > 0 else None
-    if uv1_layer is None and len(uv_layers) > 0:
-        uv1_layer = uv_layers[0]
+    uv1_layer = _get_primary_uv_layer(me)
 
     uv2_layer = uv_layers.get("SecondUV") if len(uv_layers) > 1 else None
     if uv2_layer is None:
@@ -1880,9 +2509,52 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
                 uv2_layer = uv_layer
                 break
 
-    color_attribute = None
-    if me.color_attributes.active_color_index != -1 and me.color_attributes.active:
-        color_attribute = me.color_attributes.active
+    preserved_normals = None
+    preserved_tangents = None
+    preserved_binormals = None
+    mikk_normals = None
+    mikk_tangents = None
+    mikk_binormals = None
+    if tangent_space_mode == TANGENT_SPACE_PRESERVE_IMPORTED:
+        validation_mesh = basis_source_mesh or me
+        basis_valid, basis_reason = imported_tangent_basis_status(validation_mesh)
+        if not basis_valid:
+            raise ValueError(
+                f"Preserve Imported Basis is unavailable for '{mesh_ob.name}': {basis_reason}.")
+        preserved_normals = _read_vector_mesh_attribute(me, IMPORTED_NORMAL_ATTRIBUTE, 'POINT')
+        preserved_tangents = _read_vector_mesh_attribute(me, IMPORTED_TANGENT_ATTRIBUTE, 'POINT')
+        preserved_binormals = _read_vector_mesh_attribute(me, IMPORTED_BINORMAL_ATTRIBUTE, 'POINT')
+        if any(value is None for value in (
+            preserved_normals, preserved_tangents, preserved_binormals
+        )):
+            raise ValueError(
+                f"Preserve Imported Basis data was lost while preparing '{mesh_ob.name}' for export.")
+    elif tangent_space_mode == TANGENT_SPACE_MIKKTSPACE:
+        mikk_normals = _read_vector_mesh_attribute(me, MIKK_NORMAL_ATTRIBUTE, 'CORNER')
+        mikk_tangents = _read_vector_mesh_attribute(me, MIKK_TANGENT_ATTRIBUTE, 'CORNER')
+        mikk_binormals = _read_vector_mesh_attribute(me, MIKK_BINORMAL_ATTRIBUTE, 'CORNER')
+        if mikk_normals is None or mikk_tangents is None or mikk_binormals is None:
+            raise ValueError(
+                f"MikkTSpace corner basis was not prepared for '{mesh_ob.name}'.")
+
+    color_values = None
+    color_domain = None
+    color_attributes = getattr(me, "color_attributes", None)
+    if color_attributes is not None:
+        for candidate in (
+            color_attributes.get("Color"),
+            getattr(color_attributes, "active_color", None),
+            getattr(color_attributes, "active", None),
+        ):
+            if (
+                candidate is not None
+                and candidate.data_type in ('BYTE_COLOR', 'FLOAT_COLOR')
+                and candidate.domain in ('POINT', 'CORNER')
+            ):
+                color_domain = candidate.domain
+                color_values = np.empty((len(candidate.data), 4), dtype=np.float32)
+                candidate.data.foreach_get("color", color_values.ravel())
+                break
 
     vertex_group_names = {
         group.index: group.name
@@ -1899,21 +2571,15 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
         source_vertex_weights[vert.index] = tuple(weights)
 
     def _read_loop_color(loop_idx: int, vert_idx: int):
-        if not color_attribute:
+        if color_values is None:
             return [0.0, 0.0, 0.0, 0.0]
 
-        data_idx = loop_idx if color_attribute.domain == 'CORNER' else vert_idx
-        if data_idx >= len(color_attribute.data):
+        data_idx = loop_idx if color_domain == 'CORNER' else vert_idx
+        if data_idx >= len(color_values):
             return [0.0, 0.0, 0.0, 1.0]
 
-        item = color_attribute.data[data_idx]
-        if color_attribute.data_type in ('BYTE_COLOR', 'FLOAT_COLOR'):
-            color = item.color
-            return [float(color[0]), float(color[1]), float(color[2]), float(color[3])]
-        if color_attribute.data_type == 'FLOAT_VECTOR':
-            vec = item.vector
-            return [float(vec[0]), float(vec[1]), float(vec[2]), 1.0]
-        return [0.0, 0.0, 0.0, 1.0]
+        color = color_values[data_idx]
+        return [float(color[0]), float(color[1]), float(color[2]), float(color[3])]
 
     def _read_loop_uv(uv_layer, loop_idx: int):
         if not uv_layer or loop_idx >= len(uv_layer.data):
@@ -1924,6 +2590,25 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
         if not (math.isfinite(u) and math.isfinite(v)):
             return (0.0, 1.0)
         return (u, v)
+
+
+    def _triangle_uv_handedness(loop_indices):
+        if uv1_layer is None or len(loop_indices) != 3:
+            return 0
+
+        uv_a = _read_loop_uv(uv1_layer, loop_indices[0])
+        uv_b = _read_loop_uv(uv1_layer, loop_indices[1])
+        uv_c = _read_loop_uv(uv1_layer, loop_indices[2])
+        delta_u1 = uv_b[0] - uv_a[0]
+        delta_u2 = uv_c[0] - uv_a[0]
+        delta_v1 = uv_b[1] - uv_a[1]
+        delta_v2 = uv_c[1] - uv_a[1]
+        determinant = (delta_u1 * delta_v2) - (delta_u2 * delta_v1)
+        if _uv_determinant_is_degenerate(
+            delta_u1, delta_v1, delta_u2, delta_v2, determinant
+        ):
+            return 0
+        return -1 if determinant < 0.0 else 1
 
 
     vertex_normal_clusters = {}
@@ -1945,21 +2630,49 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
     loops = me.loops
     for loop_tri in me.loop_triangles:
         tri_indices = []
+        triangle_is_mirrored = (
+            tangent_space_mode == TANGENT_SPACE_REDENGINE
+            and _triangle_uv_handedness(loop_tri.loops) < 0
+        )
         for loop_idx in loop_tri.loops:
             loop = loops[loop_idx]
             src_vert_idx = loop.vertex_index
             src_vert = me.vertices[src_vert_idx]
 
-            normal = _canonical_loop_normal(
-                src_vert_idx,
-                (float(loop.normal[0]), float(loop.normal[1]), float(loop.normal[2])),
-            )
+            tangent = None
+            bitangent = None
+            if tangent_space_mode == TANGENT_SPACE_PRESERVE_IMPORTED:
+                normal = tuple(float(value) for value in preserved_normals[src_vert_idx])
+                tangent = tuple(float(value) for value in preserved_tangents[src_vert_idx])
+                bitangent = tuple(float(value) for value in preserved_binormals[src_vert_idx])
+            elif tangent_space_mode == TANGENT_SPACE_MIKKTSPACE:
+                normal = tuple(float(value) for value in mikk_normals[loop_idx])
+                tangent = tuple(float(value) for value in mikk_tangents[loop_idx])
+                bitangent = tuple(float(value) for value in mikk_binormals[loop_idx])
+                if flip_tangent_handedness:
+                    bitangent = tuple(-value for value in bitangent)
+            else:
+                normal = _canonical_loop_normal(
+                    src_vert_idx,
+                    (float(loop.normal[0]), float(loop.normal[1]), float(loop.normal[2])),
+                )
             uv1 = _read_loop_uv(uv1_layer, loop_idx)
             uv2 = _read_loop_uv(uv2_layer, loop_idx)
 
             color = _read_loop_color(loop_idx, src_vert_idx)
 
-            key = (src_vert_idx, normal, uv1, uv2, tuple(color))
+            if tangent_space_mode in (
+                TANGENT_SPACE_MIKKTSPACE,
+                TANGENT_SPACE_PRESERVE_IMPORTED,
+            ):
+                key = (
+                    src_vert_idx, normal, uv1, uv2,
+                    tangent, bitangent, tuple(color),
+                )
+            elif tangent_space_mode == TANGENT_SPACE_REDENGINE:
+                key = (src_vert_idx, normal, uv1, uv2, triangle_is_mirrored, tuple(color))
+            else:
+                key = (src_vert_idx, normal, uv1, uv2, tuple(color))
             export_vert_idx = vertex_lookup.get(key)
             if export_vert_idx is None:
                 export_vert_idx = len(exportMeshdata.vertex3DCoords)
@@ -1975,6 +2688,11 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
                 exportMeshdata.UV_vertex3DCoords.append([uv1[0], uv1[1]])
                 exportMeshdata.UV2_vertex3DCoords.append([uv2[0], uv2[1]])
                 exportMeshdata.vertexColor.append(color)
+                if tangent is not None and bitangent is not None:
+                    exportMeshdata.tangent_vector.append([
+                        tangent[0], tangent[1], tangent[2]])
+                    exportMeshdata.extra_vectors.append([
+                        bitangent[0], bitangent[1], bitangent[2]])
 
                 for bone_name, weight in source_vertex_weights.get(src_vert_idx, ()):
                     vse = VertexSkinningEntry()
@@ -1991,7 +2709,17 @@ def get_mesh_info(me, mesh_ob, meshDataBl = None):
     exportMeshdata.meshInfo = SMeshInfos()
     exportMeshdata.meshInfo.numIndices = len(exportMeshdata.faces) * 3
     exportMeshdata.meshInfo.numVertices = len(exportMeshdata.vertex3DCoords)
-    exportMeshdata.tangent_vector, exportMeshdata.extra_vectors = _solve_meshdata_tangent_basis(exportMeshdata)
+    if tangent_space_mode == TANGENT_SPACE_REDENGINE:
+        exportMeshdata.tangent_vector, exportMeshdata.extra_vectors = (
+            _solve_meshdata_tangent_basis(exportMeshdata, mirror_correction=True))
+        if flip_tangent_handedness:
+            exportMeshdata.extra_vectors = [
+                [-value for value in binormal]
+                for binormal in exportMeshdata.extra_vectors
+            ]
+    elif tangent_space_mode == TANGENT_SPACE_NO_MIRROR:
+        exportMeshdata.tangent_vector, exportMeshdata.extra_vectors = (
+            _solve_meshdata_tangent_basis(exportMeshdata, mirror_correction=False))
 
     if bpy.app.version < (4, 1, 0):
         me.free_normals_split()

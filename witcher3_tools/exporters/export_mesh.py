@@ -17,7 +17,17 @@ from ..CR2W import cr2w_writer
 from ..CR2W.Types.VariousTypes import CMatrix4x4
 from ..CR2W.Types.SBufferInfos import BoneData
 from ..importers.import_rig import get_ordered_bones
-from ..importers.import_mesh import get_mesh_info, ZERO_WEIGHT_MASK_GROUP_NAME
+from ..importers.import_mesh import (
+    IMPORTED_BASIS_REPAIRED_COUNT_PROPERTY,
+    TANGENT_HANDEDNESS_AUTO,
+    TANGENT_SPACE_MIKKTSPACE,
+    TANGENT_SPACE_PRESERVE_IMPORTED,
+    TANGENT_SPACE_REDENGINE,
+    ZERO_WEIGHT_MASK_GROUP_NAME,
+    _bake_mikktspace_loop_basis,
+    get_mesh_info,
+    imported_tangent_basis_status,
+)
 from ..CR2W.dc_entity import (
     CCollisionShapeConvex, CCollisionShapeTriMesh,
     CCollisionShapeBox, CCollisionShapeSphere, CCollisionShapeCapsule
@@ -29,6 +39,11 @@ COLLISION_SUFFIXES = ("_col", "_tri", "_box", "_sphere", "_capsule")
 DEFAULT_PHYSICAL_MATERIAL = "default"
 SKIN_WEIGHT_EPSILON = 1e-8
 MAX_W2MESH_CHUNK_VERTICES = 65535
+_NULL_TEXTURE_HANDLE_TYPES = {
+    "handle:ITexture",
+    "handle:CTextureArray",
+    "handle:CCubeTexture",
+}
 
 
 def _material_input_props_from_xml_text(xml_text):
@@ -51,6 +66,32 @@ def _material_input_props_from_xml_text(xml_text):
             "value": value,
         })
     return props
+
+
+def _merge_unrepresented_null_material_props(input_props, xml_text):
+    """Restore node-less NULL textures without reviving removed overrides."""
+    merged = list(input_props or [])
+    represented_names = {
+        str(prop.get("name") or "")
+        for prop in merged
+        if isinstance(prop, dict)
+    }
+    for prop in _material_input_props_from_xml_text(xml_text):
+        name = str(prop.get("name") or "")
+        prop_type = str(prop.get("type") or "")
+        value = str(prop.get("value") or "").strip()
+        if (
+            not name
+            or name in represented_names
+            or prop_type not in _NULL_TEXTURE_HANDLE_TYPES
+            or value.upper() != "NULL"
+        ):
+            continue
+        null_prop = dict(prop)
+        null_prop["value"] = "NULL"
+        merged.append(null_prop)
+        represented_names.add(name)
+    return merged
 
 
 def _get_collision_material_name(mesh_obj):
@@ -345,6 +386,11 @@ def get_mesh_material_info(mesh_bl, mesh_obj=None, material_slot_indices=None):
             if not mat_dict['witcher_props']['input_props']:
                 mat_dict['witcher_props']['input_props'] = _material_input_props_from_xml_text(
                     getattr(mat_props, "xml_text", "")
+                )
+            else:
+                mat_dict['witcher_props']['input_props'] = _merge_unrepresented_null_material_props(
+                    mat_dict['witcher_props']['input_props'],
+                    getattr(mat_props, "xml_text", ""),
                 )
 
         material_props.append(mat_dict)
@@ -927,7 +973,15 @@ class MeshExporter(object):
         self.__armature = None
         self.__meshes = None
 
-    def __loadMeshData(self, meshObj, bone_map, original_mesh_obj=None, material_slot_indices=None):
+    def __loadMeshData(
+        self,
+        meshObj,
+        bone_map,
+        original_mesh_obj=None,
+        material_slot_indices=None,
+        tangent_space_mode=TANGENT_SPACE_REDENGINE,
+        tangent_handedness_mode=TANGENT_HANDEDNESS_AUTO,
+    ):
         bl_mesh = meshObj.data
 
         # Export from a temporary mesh copy so export-time calculations never
@@ -941,7 +995,13 @@ class MeshExporter(object):
                     "export keeps the strongest 4 influences per vertex without modifying the source mesh."
                 )
 
-            exportMeshdata = get_mesh_info(mesh_for_work, meshObj)
+            exportMeshdata = get_mesh_info(
+                mesh_for_work,
+                meshObj,
+                tangent_space_mode=tangent_space_mode,
+                tangent_handedness_mode=tangent_handedness_mode,
+                basis_source_mesh=(original_mesh_obj or meshObj).data,
+            )
             exportMaterialdata = get_mesh_material_info(
                 mesh_for_work,
                 mesh_obj=original_mesh_obj or meshObj,
@@ -963,6 +1023,17 @@ class MeshExporter(object):
     def execute(self, filePath, **args):
         self.filePath = filePath
         self.__meshes = sorted(args.get('meshes', []), key=lambda x: x.name)
+        tangent_space_mode = str(
+            args.get('tangent_space_mode', TANGENT_SPACE_REDENGINE)
+            or TANGENT_SPACE_REDENGINE).upper()
+        tangent_handedness_mode = str(
+            args.get('tangent_handedness_mode', TANGENT_HANDEDNESS_AUTO)
+            or TANGENT_HANDEDNESS_AUTO).upper()
+        log.info(
+            "Tangent-space export mode: %s; handedness: %s",
+            tangent_space_mode,
+            tangent_handedness_mode,
+        )
         export_col_tri = args.get('export_col_tri', False)
         self.col_mesh_data = []
         if export_col_tri:
@@ -1078,7 +1149,42 @@ class MeshExporter(object):
         _temp_meshes = []  # Track all temporary mesh objects for cleanup
         try:
             for m in self.__meshes:
-                split_entries = split_mesh_by_material(m)
+                split_source = m
+                prepared_mikk_obj = None
+                try:
+                    if tangent_space_mode == TANGENT_SPACE_PRESERVE_IMPORTED:
+                        basis_valid, basis_reason = imported_tangent_basis_status(m.data)
+                        if not basis_valid:
+                            raise ValueError(
+                                f"Preserve Imported Basis is unavailable for '{m.name}': {basis_reason}.")
+                        repaired_count = int(m.data.get(
+                            IMPORTED_BASIS_REPAIRED_COUNT_PROPERTY, 0) or 0)
+                        if repaired_count:
+                            log.warning(
+                                "Preserve Imported Basis on '%s' retains the source basis and "
+                                "uses import-time repairs for %d undefined source vertices.",
+                                m.name,
+                                repaired_count,
+                            )
+                    elif tangent_space_mode == TANGENT_SPACE_MIKKTSPACE:
+                        prepared_mikk_obj = m.copy()
+                        prepared_mikk_obj.data = m.data.copy()
+                        bpy.context.collection.objects.link(prepared_mikk_obj)
+                        _bake_mikktspace_loop_basis(prepared_mikk_obj.data)
+                        split_source = prepared_mikk_obj
+
+                    split_entries = split_mesh_by_material(split_source)
+                finally:
+                    if prepared_mikk_obj is not None:
+                        prepared_data = prepared_mikk_obj.data
+                        if prepared_mikk_obj.name in bpy.data.objects:
+                            bpy.data.objects.remove(prepared_mikk_obj, do_unlink=True)
+                        if (
+                            prepared_data is not m.data
+                            and prepared_data
+                            and prepared_data.users == 0
+                        ):
+                            bpy.data.meshes.remove(prepared_data)
                 new_meshes = [entry[0] for entry in split_entries]
                 _temp_meshes.extend(new_meshes)
                 mesh_data = []
@@ -1089,6 +1195,8 @@ class MeshExporter(object):
                             nameMap,
                             original_mesh_obj=m,
                             material_slot_indices=material_slot_indices,
+                            tangent_space_mode=tangent_space_mode,
+                            tangent_handedness_mode=tangent_handedness_mode,
                         )
                     )
                 # Data extracted — remove temp meshes for this LOD
