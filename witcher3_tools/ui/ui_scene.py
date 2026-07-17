@@ -46,6 +46,7 @@ from .ui_cr2w_fields import (
     _get_imported_field_type,
     _get_imported_field_value,
     _get_present_imported_fields,
+    _schema_from_field_items,
 )
 from . import ui_dialog_language
 from .ui_utils import WITCH_PT_Base
@@ -897,18 +898,7 @@ def _w2scene_schema_hierarchy_label(schema):
 
 
 def _w2scene_schema_from_field_items(field_items):
-    schema = []
-    class_indexes = {}
-    for item in field_items or []:
-        class_name = str(getattr(item, "class_name", "") or "").strip()
-        field_name = str(getattr(item, "field_name", "") or "").strip()
-        if not class_name or not field_name:
-            continue
-        if class_name not in class_indexes:
-            class_indexes[class_name] = len(schema)
-            schema.append((class_name, []))
-        schema[class_indexes[class_name]][1].append((field_name, None))
-    return tuple((class_name, tuple(fields)) for class_name, fields in schema)
+    return _schema_from_field_items(field_items)
 
 
 def _w2scene_schema_with_field_types(schema):

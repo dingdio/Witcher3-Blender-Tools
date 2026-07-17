@@ -37,6 +37,8 @@ from ..terrain_core import (
 W2W_NODES_PROP = "witcher_w2w_nodes"
 W2W_LIST_PROP = "witcher_w2w_list_tree"
 W2W_LIST_INDEX_PROP = "witcher_w2w_list_tree_index"
+WORLD_WATER_OBJECT_PROP = "witcher_world_water_object"
+WORLD_WATER_MATERIAL_PROP = "witcher_world_water_material"
 
 #
 # This is what I am using to hold a single tree node in my raw example data.
@@ -406,6 +408,13 @@ def btn_import_w2w(worldFile: WORLD, filePath):
 
     with redkit_repo_context(filePath):
         do_import_map_terrain(worldFile, filePath, world_root_collection=collection)
+
+    # Keep world import usable when the optional preview UI is unavailable.
+    try:
+        from ..ui import ui_environment
+        ui_environment.sync_world_import(bpy.context, worldFile, filePath)
+    except Exception:
+        log.warning("Could not sync imported world environment for %s", filePath, exc_info=True)
 
 
 from pathlib import Path
@@ -1164,6 +1173,27 @@ def update_all_terrain_material_values(roughness, specular):
                 seen.add(mat.name_full)
                 updated += 1
     return updated
+
+
+def _world_water_objects(scene=None):
+    scene = scene or getattr(bpy.context, "scene", None)
+    return [
+        obj for obj in getattr(scene, "objects", ())
+        if bool(obj.get(WORLD_WATER_OBJECT_PROP, False))
+    ]
+
+
+def _world_water_materials(scene=None):
+    seen = set()
+    for obj in _world_water_objects(scene):
+        for material in getattr(getattr(obj, "data", None), "materials", ()):
+            if (
+                material is not None
+                and bool(material.get(WORLD_WATER_MATERIAL_PROP, False))
+                and material.as_pointer() not in seen
+            ):
+                seen.add(material.as_pointer())
+                yield material
 
 
 def _create_full_map_material(obj, colormap_path, mat_name):

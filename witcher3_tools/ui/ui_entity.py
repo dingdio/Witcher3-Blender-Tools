@@ -2138,6 +2138,10 @@ class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
         if not (main_arm_obj and rig_settings):
             target_col.label(text="Import a character from Asset Browser, then set/select its armature", icon='INFO')
 
+        from . import ui_environment
+
+        ui_environment.draw_entity_environment_selector(layout, context)
+
         # --- 4-tab local navigator ---
         char_tab = getattr(scene, "witcher_character_tab", "APPEARANCES")
         if char_tab == "BROWSE":

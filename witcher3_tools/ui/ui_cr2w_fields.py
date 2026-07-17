@@ -360,6 +360,21 @@ def _format_imported_field_value(value, depth=0):
 
 
 
+def _schema_from_field_items(field_items):
+    schema = []
+    class_indexes = {}
+    for item in field_items or []:
+        class_name = str(getattr(item, "class_name", "") or "").strip()
+        field_name = str(getattr(item, "field_name", "") or "").strip()
+        if not class_name or not field_name:
+            continue
+        if class_name not in class_indexes:
+            class_indexes[class_name] = len(schema)
+            schema.append((class_name, []))
+        schema[class_indexes[class_name]][1].append((field_name, None))
+    return tuple((class_name, tuple(fields)) for class_name, fields in schema)
+
+
 def _draw_imported_class_sections(layout, field_items, schema, show_unset, empty_label, per_class_show_unset=False):
     visible_any = False
     for class_name, _fields in schema:

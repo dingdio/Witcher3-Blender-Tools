@@ -9451,6 +9451,13 @@ class FileActionOperatorImportToScene(Operator):
                 from ..importers import import_w2w
                 world_file = CR2W_reader.load_w2w(abs_file_path)
                 import_w2w.btn_import_w2w(world_file, abs_file_path)
+            elif ext == ".env":
+                from . import ui_environment
+                result = ui_environment.load_environment_path(context, abs_file_path)
+                if not result.ok:
+                    self.report({'ERROR'}, result.message)
+                    return {'CANCELLED'}
+                self.report({'INFO'}, result.message)
             elif ext == ".w2scene":
                 from ..importers import import_scene
                 from .ui_scene import _w2scene_unload_active_cutscene_section, _w2scene_sync_loaded_state

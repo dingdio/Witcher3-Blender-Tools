@@ -463,6 +463,7 @@ from .ui import ui_cutscene
 from .ui import ui_animated_component
 from .ui import ui_scene
 from .ui import ui_physics
+from .ui import ui_environment
 from .ui import armature_context
 from .ui import ui_cache_export
 from . import lipsync
@@ -4624,6 +4625,7 @@ def register():
     ui_dialog_language.register()
     ui_anims.register()
     ui_physics.register()
+    ui_environment.register()
     ui_speech.register()
     ui_scene.register()
     ui_cutscene.register()
@@ -4714,6 +4716,7 @@ def unregister():
     ui_animated_component.unregister()
     ui_scene.unregister()
     ui_speech.unregister()
+    ui_environment.unregister()
     ui_physics.unregister()
     ui_anims.unregister()
     ui_dialog_language.unregister()
