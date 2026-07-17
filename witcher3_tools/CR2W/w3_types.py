@@ -2364,6 +2364,8 @@ class Entity(base_w3):
                 beh_paths = None,
                 included_template_paths = None,
                 w2_body_part_states = None,
+                cookedEffects = None,
+                isLightOn = None,
                 **kwargs):
         self.name:str = name
         self.MovingPhysicalAgentComponent = MovingPhysicalAgentComponent
@@ -2378,6 +2380,8 @@ class Entity(base_w3):
         self.beh_paths: list = beh_paths if beh_paths is not None else []
         self.included_template_paths: list = included_template_paths if included_template_paths is not None else []
         self.w2_body_part_states: dict = w2_body_part_states if w2_body_part_states is not None else {}
+        self.cookedEffects: list = cookedEffects if cookedEffects is not None else []
+        self.isLightOn = isLightOn
 
     @classmethod
     def from_json(cls, data):

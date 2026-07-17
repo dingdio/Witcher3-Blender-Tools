@@ -212,6 +212,9 @@ def ensure_node_group(ng_name, resource_path=RES_PATH):
         raise KeyError(f"Node group {ng_name} not found in {resource_path}")
     ng.use_fake_user = False
 
+    if _node_group_family_name(ng.name).lower() == 'witcher3_skin':
+        _ensure_witcher3_skin_subsurface(ng)
+
     return ng
 
 
@@ -1727,6 +1730,55 @@ def _find_socket_by_name(sockets, name: str):
 
 def find_group_input_socket(node_ng: Node, par_name: str):
     return _find_socket_by_name(node_ng.inputs, par_name)
+
+
+def _ensure_witcher3_skin_subsurface(node_tree) -> None:
+    group_input = next((node for node in node_tree.nodes if node.type == 'GROUP_INPUT'), None)
+    principled = next((node for node in node_tree.nodes if node.type == 'BSDF_PRINCIPLED'), None)
+    if group_input is None or principled is None:
+        return
+
+    def socket(sockets, *names):
+        for name in names:
+            found = _find_socket_by_name(sockets, name)
+            if found is not None:
+                return found
+        return None
+
+    source = socket(group_input.outputs, 'SubsurfaceScale', 'Subsurface Scale')
+    weight = socket(principled.inputs, 'Subsurface Weight', 'Subsurface')
+    if source is None or weight is None or weight.is_linked:
+        return
+
+    scale = node_tree.nodes.get('W3 Skin Subsurface Weight')
+    if scale is not None and scale.type != 'MATH':
+        return
+    if scale is None:
+        scale = node_tree.nodes.new('ShaderNodeMath')
+        scale.name = 'W3 Skin Subsurface Weight'
+    scale.label = 'Skin Scale to Weight'
+    scale.operation = 'MULTIPLY'
+    scale.use_clamp = True
+    scale.inputs[1].default_value = 0.4
+    scale.location = (principled.location.x - 220, principled.location.y - 140)
+    if not scale.inputs[0].is_linked:
+        node_tree.links.new(source, scale.inputs[0])
+    node_tree.links.new(scale.outputs[0], weight)
+
+    if hasattr(principled, 'subsurface_method'):
+        for method in ('RANDOM_WALK_SKIN', 'RANDOM_WALK'):
+            try:
+                principled.subsurface_method = method
+                break
+            except (TypeError, ValueError):
+                pass
+
+    radius = socket(principled.inputs, 'Subsurface Radius')
+    scale = socket(principled.inputs, 'Subsurface Scale')
+    if radius is not None and not radius.is_linked:
+        radius.default_value = (1.0, 0.35, 0.2) if scale is not None else (0.01, 0.0035, 0.002)
+    if scale is not None and not scale.is_linked:
+        scale.default_value = 0.01
 
 
 def get_active_witcher_group_node(material: Optional[Material]) -> Optional[Node]:

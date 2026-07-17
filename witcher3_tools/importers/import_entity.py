@@ -51,6 +51,7 @@ from ..rigging.attachment import (
 )
 from ..importers.import_helpers import set_blender_object_transform
 from ..importers import import_isolation
+from . import entity_effects
 from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
 from ..CR2W.common_blender import repo_file, redkit_repo_context, win_safe_path
@@ -1717,7 +1718,9 @@ def _should_create_direct_entity_root(entity, parent_transform=None) -> bool:
     if parent_transform is not None or entity is None:
         return False
     component_type = _entity_primary_component_type(entity)
-    return bool(component_type and component_type != "CMovingPhysicalAgentComponent")
+    if component_type:
+        return component_type != "CMovingPhysicalAgentComponent"
+    return bool(getattr(entity, "cookedEffects", None) or getattr(entity, "isLightOn", None) is not None)
 
 
 def _find_layer_collection_for_collection(layer_collection, target_collection):
@@ -6415,6 +6418,12 @@ def _import_light_component(chunk):
 
     brightness = _coerce_real(chunk.get("brightness"), 0.0)
     light_obj.data.energy = brightness * (3.0 if light_kind == 'SPOT' else 10.0)
+    light_obj["witcher_base_energy"] = float(light_obj.data.energy)
+
+    flicker = chunk.get("lightFlickering") or {}
+    if isinstance(flicker, dict):
+        light_obj["witcher_flicker_strength"] = _coerce_real(flicker.get("flickerStrength"), 0.0)
+        light_obj["witcher_flicker_position_offset"] = _coerce_real(flicker.get("positionOffset"), 0.0)
 
     color_value = chunk.get("color")
     light_obj.data.color[0] = _light_color_channel(color_value, "Red") / 255.0
@@ -6758,6 +6767,21 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
         for mesh in list(objdict.values()) + list(meshdict.values()):
             if mesh and getattr(mesh, "parent", None) is None:
                 mesh.parent = parent_transform
+    effect_owner = root_skeleton or parent_transform
+    if effect_owner is not None:
+        try:
+            entity_effects.import_entity_effect_previews(
+                entity,
+                effect_owner,
+                imported_objects=list(objdict.values()) + list(meshdict.values()),
+                target_collection=target_collection,
+            )
+        except Exception:
+            log.warning(
+                "Failed to create cooked effect previews for '%s'.",
+                getattr(entity, "name", "<entity>"),
+                exc_info=True,
+            )
     return root_skeleton
 
 def reset_transforms(new_obj):

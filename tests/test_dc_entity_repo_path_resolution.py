@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -56,6 +57,32 @@ class _Chunk:
         return self._prop if name == "mesh" else None
 
 
+class _EffectProp:
+    def __init__(self, name, value=None, *, path=""):
+        self.theName = name
+        self.Value = value
+        self.Index = types.SimpleNamespace(Path=path) if path else None
+
+    def ToString(self):
+        return str(self.Value) if self.Value is not None else ""
+
+
+class _EffectChunk:
+    def __init__(self, chunk_type, chunk_index, **props):
+        self.Type = chunk_type
+        self.ChunkIndex = chunk_index
+        self.PROPS = []
+        for name, value in props.items():
+            if isinstance(value, tuple):
+                value, path = value
+                self.PROPS.append(_EffectProp(name, value, path=path))
+            else:
+                self.PROPS.append(_EffectProp(name, value))
+
+    def GetVariableByName(self, name):
+        return next((prop for prop in self.PROPS if prop.theName == name), None)
+
+
 class RepoPathResolutionTests(unittest.TestCase):
     def test_path_like_property_index_wins_over_import_table_number(self):
         roof_path = (
@@ -76,6 +103,46 @@ class RepoPathResolutionTests(unittest.TestCase):
         chunk = _Chunk(_MeshProp(_PathLikeIndex(roof_path, numeric_index=1)), cr2w_file)
 
         self.assertEqual(dc_entity._resolve_mesh_path(chunk, None), roof_path)
+
+    def test_cooked_particle_effect_maps_definition_spawner_and_track(self):
+        particle_path = r"fx\light_sources\candles\candle_flame_fx2.w2p"
+        chunks = [
+            _EffectChunk(
+                "CFXDefinition",
+                0,
+                name="fire",
+                length=7.5,
+                loopStart=0.25,
+                loopEnd=7.0,
+                isLooped=True,
+            ),
+            _EffectChunk("CFXSpawnerComponent", 1, componentName="fire"),
+            _EffectChunk(
+                "CFXTrackItemParticles",
+                2,
+                particleSystem=(None, particle_path),
+                spawner=2,
+                timeBegin=0.5,
+                timeDuration=6.5,
+            ),
+        ]
+        effect_file = types.SimpleNamespace(CHUNKS=types.SimpleNamespace(CHUNKS=chunks))
+        buffer_prop = types.SimpleNamespace(Bufferdata=types.SimpleNamespace(Bytes=b"effect"))
+
+        with mock.patch.object(dc_entity, "getCR2W", return_value=effect_file):
+            effect = dc_entity._parse_cooked_effect_buffer(buffer_prop)
+
+        self.assertEqual(effect["name"], "fire")
+        self.assertEqual(effect["length"], 7.5)
+        self.assertEqual(effect["loop_start"], 0.25)
+        self.assertEqual(effect["loop_end"], 7.0)
+        self.assertTrue(effect["is_looped"])
+        self.assertEqual(effect["particle_systems"], [{
+            "path": particle_path,
+            "slot": "fire",
+            "time_begin": 0.5,
+            "duration": 6.5,
+        }])
 
 
 if __name__ == "__main__":

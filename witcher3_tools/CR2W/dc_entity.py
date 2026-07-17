@@ -577,6 +577,27 @@ def _convert_color_value(color_prop):
             color[key] = value
     return color or color_prop
 
+
+def _convert_named_scalar_struct(struct_prop):
+    if not struct_prop:
+        return {}
+    if isinstance(struct_prop, dict):
+        return dict(struct_prop)
+
+    values = {}
+    prop_items = (
+        getattr(struct_prop, "MoreProps", None)
+        or getattr(struct_prop, "More", None)
+        or getattr(struct_prop, "PROPS", None)
+        or []
+    )
+    for item in prop_items:
+        key = getattr(item, "theName", None)
+        value = getattr(item, "Value", None)
+        if key and isinstance(value, (bool, int, float)):
+            values[key] = value
+    return values
+
 def _class_name_from_import(cr2w_file, imp):
     class_name = getattr(imp, "className", None)
     if isinstance(class_name, int):
@@ -1227,12 +1248,14 @@ class CPointLightComponent(JsonChunk):
         self.radius = None
         self.color = None
         self.brightness = None
+        self.lightFlickering = None
         w3_types.loadProps(self, args)
 
     def convert_for_io(self):
         self.transformParent = self.transformParent.Value-1 if self.transformParent else None
         self.transform = self.transform.EngineTransform if self.transform else None
         self.color = _convert_color_value(self.color)
+        self.lightFlickering = _convert_named_scalar_struct(self.lightFlickering)
         return self
 
 class CSpotLightComponent(CPointLightComponent):
@@ -1532,6 +1555,142 @@ def _chunk_prop_bool(container, *prop_names, default=None):
     if lowered in {"false", "0", "no"}:
         return False
     return default
+
+
+def _soft_handle_path(prop) -> str:
+    if prop is None:
+        return ""
+    index_obj = getattr(prop, "Index", None)
+    for attr_name in ("Path", "DepotPath"):
+        path = str(getattr(index_obj, attr_name, "") or "").strip()
+        if path:
+            return path
+    for handle in getattr(prop, "Handles", None) or []:
+        path = str(getattr(handle, "DepotPath", "") or "").strip()
+        if path:
+            return path
+    value = str(_prop_to_string(prop) or "").strip()
+    return value if "\\" in value or "/" in value else ""
+
+
+def _cname_array_values(prop) -> list[str]:
+    values = []
+    index_items = getattr(prop, "Index", None) if prop is not None else None
+    if index_items is not None and not isinstance(index_items, (list, tuple)):
+        index_items = [index_items]
+    for item in index_items or []:
+        value = str(getattr(item, "String", "") or "").strip()
+        if value:
+            values.append(value)
+    for item in getattr(prop, "More", None) or []:
+        value = str(_prop_to_string(item) or "").strip()
+        if value:
+            values.append(value)
+    return values
+
+
+def _fx_spawner_name(track_item, chunks_by_index) -> str:
+    spawner_ptr = _chunk_prop_scalar(track_item, "spawner", default=None)
+    try:
+        spawner_index = int(spawner_ptr) - 1
+    except (TypeError, ValueError):
+        return ""
+    spawner = chunks_by_index.get(spawner_index)
+    if spawner is None:
+        return ""
+    component_name = _chunk_prop_string(spawner, "componentName", default="")
+    if component_name:
+        return component_name
+    slot_names = _find_prop_by_name(spawner, "slotNames")
+    values = _cname_array_values(slot_names)
+    return values[0] if values else ""
+
+
+def _parse_cooked_effect_buffer(buffer_prop, effect_name="") -> dict:
+    buffer_data = getattr(buffer_prop, "Bufferdata", None)
+    buffer_bytes = getattr(buffer_data, "Bytes", None)
+    if not buffer_bytes:
+        return {}
+
+    effect_file = getCR2W(bReadStream(buffer_bytes, name=f"cookedEffect:{effect_name or 'unnamed'}"))
+    chunks = list(getattr(getattr(effect_file, "CHUNKS", None), "CHUNKS", None) or [])
+    chunks_by_index = {getattr(chunk, "ChunkIndex", -1): chunk for chunk in chunks}
+    definition = next((chunk for chunk in chunks if getattr(chunk, "Type", "") == "CFXDefinition"), None)
+
+    parsed_name = _chunk_prop_string(definition, "name", default="") if definition else ""
+    result = {
+        "name": str(effect_name or parsed_name or "").strip(),
+        "length": float(_chunk_prop_scalar(definition, "length", default=0.0) or 0.0) if definition else 0.0,
+        "loop_start": float(_chunk_prop_scalar(definition, "loopStart", default=0.0) or 0.0) if definition else 0.0,
+        "loop_end": float(_chunk_prop_scalar(definition, "loopEnd", default=0.0) or 0.0) if definition else 0.0,
+        "is_looped": bool(_chunk_prop_bool(definition, "isLooped", default=False)) if definition else False,
+        "particle_systems": [],
+    }
+
+    for chunk in chunks:
+        if getattr(chunk, "Type", "") != "CFXTrackItemParticles":
+            continue
+        particle_prop = _find_prop_by_name(chunk, "particleSystem")
+        particle_path = _soft_handle_path(particle_prop)
+        if not particle_path:
+            continue
+        result["particle_systems"].append({
+            "path": particle_path,
+            "slot": _fx_spawner_name(chunk, chunks_by_index),
+            "time_begin": float(_chunk_prop_scalar(chunk, "timeBegin", default=0.0) or 0.0),
+            "duration": float(_chunk_prop_scalar(chunk, "timeDuration", default=0.0) or 0.0),
+        })
+    return result
+
+
+def _extract_cooked_entity_effects(template_chunk) -> list[dict]:
+    cooked_effects = _find_prop_by_name(template_chunk, "cookedEffects")
+    raw_items = list(getattr(cooked_effects, "More", None) or [])
+    if not raw_items:
+        return []
+
+    effect_entries = []
+    flat_props = []
+    for item in raw_items:
+        nested_props = list(getattr(item, "MoreProps", None) or [])
+        if nested_props:
+            effect_entries.append(nested_props)
+        else:
+            flat_props.append(item)
+
+    current = []
+    for prop in flat_props:
+        prop_name = str(getattr(prop, "theName", "") or "")
+        if prop_name == "name" and current:
+            effect_entries.append(current)
+            current = []
+        current.append(prop)
+        if prop_name == "buffer":
+            effect_entries.append(current)
+            current = []
+    if current:
+        effect_entries.append(current)
+
+    results = []
+    for props in effect_entries:
+        name_prop = next((prop for prop in props if getattr(prop, "theName", "") == "name"), None)
+        buffer_prop = next((prop for prop in props if getattr(prop, "theName", "") == "buffer"), None)
+        if buffer_prop is None:
+            continue
+        effect_name = str(_prop_to_string(name_prop) or "").strip()
+        try:
+            effect = _parse_cooked_effect_buffer(buffer_prop, effect_name)
+        except Exception:
+            log.warning(
+                "Failed to parse cooked entity effect '%s' from %s",
+                effect_name or "<unnamed>",
+                getattr(getattr(template_chunk, "_W_CLASS__CR2WFILE", None), "fileName", "<unknown>"),
+                exc_info=True,
+            )
+            continue
+        if effect:
+            results.append(effect)
+    return results
 
 
 def _chunk_prop_float(container, *prop_names, default=None):
@@ -2703,6 +2862,8 @@ def create_CEntity(file, _inherit_visited=None):
     this_Entity.coloringEntries = []
     this_Entity.slots = []
     this_Entity.w2_body_part_states = {}
+    this_Entity.cookedEffects = []
+    this_Entity.isLightOn = None
     new_mesh = ModelEnt("staticMeshes", "staticMeshes")
     added_chunks = set()  # Track chunk indices already added to avoid duplicates
     seen_streamed_mesh_paths = set()  # Track mesh paths already added via streamingDataBuffer to avoid duplicates
@@ -3710,6 +3871,23 @@ def create_CEntity(file, _inherit_visited=None):
                 final_inv_entries.append(inv_entry)
         setattr(inv_def, 'entries', final_inv_entries)
         return inv_def
+
+    seen_effects = set()
+    for chunk in CHUNKS:
+        if chunk.Type == "CGameplayLightComponent" and this_Entity.isLightOn is None:
+            this_Entity.isLightOn = _chunk_prop_bool(chunk, "isLightOn", default=None)
+        if chunk.Type != "CEntityTemplate":
+            continue
+        for effect in _extract_cooked_entity_effects(chunk):
+            particle_paths = tuple(
+                str(item.get("path", "") or "").lower()
+                for item in effect.get("particle_systems", [])
+            )
+            effect_key = (str(effect.get("name", "") or "").lower(), particle_paths)
+            if effect_key in seen_effects:
+                continue
+            seen_effects.add(effect_key)
+            this_Entity.cookedEffects.append(effect)
 
     for chunk in CHUNKS:
         if _w2_should_skip_unselected_graph_chunk(chunk):

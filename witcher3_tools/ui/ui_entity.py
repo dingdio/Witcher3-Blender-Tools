@@ -2272,6 +2272,47 @@ class WITCH_PT_ENTITY_Panel(WITCH_PT_Base, Panel):
             info_col.prop(rig_settings, "main_face_skeleton")
             info_col.prop(rig_settings, "repo_path")
 
+
+def _get_entity_effect_owner(obj):
+    current = obj
+    while current is not None:
+        try:
+            if "witcher_fire_enabled" in current:
+                return current
+        except Exception:
+            pass
+        current = getattr(current, "parent", None)
+    return None
+
+
+class WITCH_PT_ENTITY_EFFECTS_Panel(WITCH_PT_Base, Panel):
+    bl_idname = "WITCH_PT_ENTITY_EFFECTS_Panel"
+    bl_label = "Entity Effects"
+    bl_description = "Control imported Witcher entity effect previews"
+    bl_options = set()
+
+    @classmethod
+    def poll(cls, context):
+        return _get_entity_effect_owner(getattr(context, "object", None)) is not None
+
+    def draw(self, context):
+        owner = _get_entity_effect_owner(getattr(context, "object", None))
+        if owner is None:
+            return
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        state_box = layout.box()
+        state_box.label(text="Fire Preview", icon='LIGHT_POINT')
+        state_box.prop(owner, '["witcher_fire_enabled"]', text="Enabled")
+
+        source_box = layout.box()
+        source_box.label(text="Source", icon='INFO')
+        source_box.prop(owner, "name", text="Entity")
+        source_box.prop(owner, '["witcher_fire_effect"]', text="Effect")
+        source_box.prop(owner, '["witcher_fire_particle"]', text="Particle")
+
 classes = [
     #properties
     #ListItemApp,
@@ -2300,6 +2341,7 @@ classes = [
     WITCH_UL_ENTITY_List,
 
     #panels
+    WITCH_PT_ENTITY_EFFECTS_Panel,
     WITCH_PT_ENTITY_Panel,
     WITCH_PT_ENTITY_ANIMSET_UL_List,
 
