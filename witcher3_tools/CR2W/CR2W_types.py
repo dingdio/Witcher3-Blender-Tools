@@ -639,6 +639,65 @@ class ELEMENT:
             else:
                 f.seek(1,1)#FSkip(1);
 
+
+class _CountedStructElement:
+    """One count-delimited element inside a serialized class array.
+
+    Each element has a leading null byte and its own uint16 name-id terminator.
+    The legacy :class:`ELEMENT` scanner instead infers an
+    element boundary when the first property name repeats, which collapses
+    sparse structs whose first property is omitted.
+    """
+
+    def GetVariableByName(self, name):
+        for item in self.MoreProps:
+            if item.theName == name:
+                return item
+        return None
+
+    def __init__(self, f, CR2WFILE, parent, element_idx, element_type):
+        self.elementName = ""
+        self.ElementIdx = int(element_idx)
+        self.Count = getattr(parent, "Count", 0)
+        self.MoreProps = []
+        self.classEnd = parent.classEnd
+        self.dataEnd = parent.dataEnd
+        self.theType = element_type
+
+        if f.tell() >= parent.dataEnd:
+            return
+
+        marker_pos = f.tell()
+        marker = readSByte(f)
+        if marker != 0:
+            # Keep the parser recoverable for an unexpected older encoding.
+            log.warning(
+                "Expected null class-array marker for %s[%s] at 0x%X, got %s",
+                element_type, element_idx, marker_pos, marker,
+            )
+            f.seek(-1, os.SEEK_CUR)
+
+        while f.tell() + 2 <= parent.dataEnd:
+            if readUShortCheck(f, f.tell()) == 0:
+                f.seek(2, os.SEEK_CUR)
+                return
+            prop_pos = f.tell()
+            prop = PROPERTY(f, CR2WFILE, self)
+            if prop.Type is None or f.tell() <= prop_pos:
+                log.warning(
+                    "Could not advance while reading %s[%s] at 0x%X",
+                    element_type, element_idx, prop_pos,
+                )
+                return
+            self.MoreProps.append(prop)
+
+
+def _read_counted_struct_elements(f, CR2WFILE, parent, count, element_type):
+    return [
+        _CountedStructElement(f, CR2WFILE, parent, index, element_type)
+        for index in range(int(count))
+    ]
+
 class Cr2wResourceManager:
     resourceManager = None
     _lock = threading.Lock()
@@ -1460,6 +1519,22 @@ class PROPERTY:
             self.value = [readFloat(f) for _ in range(count)]
             if f.tell() < dataEnd:
                 f.seek(dataEnd)
+            return
+
+        # STerrainTextureParameters is a fixed 31-slot array with legitimately
+        # sparse/default structs.  Count-driven parsing is essential here:
+        # inferring boundaries from repeated property names compacts omitted
+        # ``val`` entries and assigns slope/specular controls to wrong layers.
+        if arrayDataType == "array" and elementType == "STerrainTextureParameters":
+            self.More = _read_counted_struct_elements(
+                f, CR2WFILE, self, count, elementType)
+            if f.tell() < dataEnd:
+                f.seek(dataEnd)
+            elif f.tell() > dataEnd:
+                log.warning(
+                    "STerrainTextureParameters over-read by %s bytes",
+                    f.tell() - dataEnd,
+                )
             return
 
         #parse data:

@@ -638,12 +638,12 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         name="Terrain Import",
         description="Choose the terrain scope to import",
         items=TERRAIN_IMPORT_MODE_ITEMS,
-        default='FULL_MAP',
+        default='TILES',
     )
     terrain_multires_level: IntProperty(
         name="Terrain Multires",
         description="Multires subdivision levels used by terrain import",
-        default=8,
+        default=6,
         min=0,
         max=10,
     )
@@ -798,9 +798,11 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
                 world_collection = None
                 created_world_collection = False
                 if self.terrain_build_layer_tree:
+                    created_world_collection = import_w2w._find_world_layer_collection(
+                        filePath, context.scene) is None
                     world_collection = import_w2w.AddCLayerGroup(worldFile.groups, False, filePath)
-                    context.scene.collection.children.link(world_collection)
-                    created_world_collection = True
+                    if created_world_collection:
+                        context.scene.collection.children.link(world_collection)
                 started = time.perf_counter()
                 try:
                     load_result = import_w2w.import_world_tile_with_foliage(

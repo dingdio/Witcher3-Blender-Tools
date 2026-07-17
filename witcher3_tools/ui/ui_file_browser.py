@@ -91,6 +91,26 @@ def _update_layer_visibility_settings(self, context):
         pass
 
 
+def _update_terrain_material_controls(self, context):
+    if context is None:
+        return
+    try:
+        from ..importers import import_w2w
+        import_w2w.update_all_terrain_material_controls(self)
+    except Exception:
+        log.debug("Could not update loaded terrain material controls", exc_info=True)
+
+
+def _update_world_water_controls(self, context):
+    if context is None:
+        return
+    try:
+        from ..importers import import_w2w
+        import_w2w.update_world_water_controls(self, scene=context.scene)
+    except Exception:
+        log.debug("Could not update world water controls", exc_info=True)
+
+
 def _geralt_inventory_preset_state(context, target):
     try:
         from . import ui_equipment
@@ -495,13 +515,13 @@ class MySettings(PropertyGroup):
     terrain_multires_level: IntProperty(
         name="Terrain Detail",
         description="Subdivision detail used for imported terrain",
-        default=8, min=0, max=10,
+        default=6, min=0, max=10,
     )
     terrain_import_mode: bpy.props.EnumProperty(
         name="Terrain Import",
         description="Choose the terrain scope to import",
         items=TERRAIN_IMPORT_MODE_ITEMS,
-        default='FULL_MAP',
+        default='TILES',
     )
     terrain_tile_x: IntProperty(
         name="Tile X",
@@ -531,19 +551,142 @@ class MySettings(PropertyGroup):
         description="Create the complete world layer collection tree during import",
         default=True,
     )
+    terrain_material_surface_mode: bpy.props.EnumProperty(
+        name="Terrain Surface",
+        description="Use the authored terrain surface values or override them for debugging",
+        items=(
+            ('SOURCE', "Source", "Use roughness and specular values from the imported material"),
+            ('OVERRIDE', "Override", "Use the roughness and specular controls below"),
+        ),
+        default='SOURCE',
+        update=_update_terrain_material_controls,
+    )
     terrain_material_roughness: FloatProperty(
         name="Terrain Roughness",
-        description="Roughness applied to imported terrain materials",
+        description="Roughness used when the terrain surface mode is Override",
         default=0.82,
         min=0.0,
         max=1.0,
+        update=_update_terrain_material_controls,
     )
     terrain_material_specular: FloatProperty(
         name="Terrain Specular",
-        description="Specular amount applied to imported terrain materials",
+        description="Direct Fresnel F0 used when the terrain surface mode is Override",
         default=0.12,
         min=0.0,
         max=1.0,
+        update=_update_terrain_material_controls,
+    )
+    terrain_material_normal_strength: FloatProperty(
+        name="Normal Strength",
+        description="Strength of the terrain detail normals",
+        default=1.0,
+        min=0.0,
+        max=2.0,
+        update=_update_terrain_material_controls,
+    )
+    terrain_material_tint_strength: FloatProperty(
+        name="Tint Strength",
+        description="Strength of the terrain colormap tint",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        update=_update_terrain_material_controls,
+    )
+    terrain_material_fresnel_strength: FloatProperty(
+        name="Fresnel Strength",
+        description="Strength of the authored terrain Fresnel contribution",
+        default=1.0,
+        min=0.0,
+        max=2.0,
+        update=_update_terrain_material_controls,
+    )
+    terrain_material_slope_mode: bpy.props.EnumProperty(
+        name="Slope",
+        description="Use the calculated slope blend or force one texture branch",
+        items=(
+            ('SOURCE', "Source", "Use the imported terrain slope calculation"),
+            ('HORIZONTAL', "Horizontal", "Force the horizontal texture branch"),
+            ('VERTICAL', "Vertical", "Force the vertical texture branch"),
+        ),
+        default='SOURCE',
+        update=_update_terrain_material_controls,
+    )
+    terrain_material_debug_view: bpy.props.EnumProperty(
+        name="Debug View",
+        description="Display a terrain material channel without scene lighting",
+        items=(
+            ('FINAL', "Final", "Display the normal lit terrain material"),
+            ('BASE_COLOR', "Base Color", "Display the final base color without lighting"),
+            ('SLOPE', "Slope Blend", "Display the horizontal-to-vertical slope blend"),
+            ('ROUGHNESS', "Roughness", "Display calculated terrain roughness"),
+            ('SPECULAR', "Specular", "Display calculated terrain specular level"),
+            ('MACRO_NORMAL', "Macro Normal", "Display the heightfield normal used for slope blending"),
+            ('FINAL_NORMAL', "Final Normal", "Display the combined terrain material normal"),
+        ),
+        default='FINAL',
+        update=_update_terrain_material_controls,
+    )
+    terrain_material_show_debug: BoolProperty(
+        name="Material Debug",
+        description="Show terrain material diagnostic controls",
+        default=False,
+    )
+    water_wind: FloatProperty(
+        name="Wind",
+        description="Weather wind scale used for wave strength and open-water foam",
+        default=0.35,
+        min=0.0,
+        max=1.0,
+        update=_update_world_water_controls,
+    )
+    water_wind_direction: FloatProperty(
+        name="Wind Direction",
+        description="Wind and flow heading in degrees",
+        default=26.57,
+        min=-360.0,
+        max=360.0,
+        update=_update_world_water_controls,
+    )
+    water_flow_speed: FloatProperty(
+        name="Flow Speed",
+        description="Water flow intensity; the .env day-cycle curve overwrites this on environment refresh",
+        default=0.6,
+        min=0.0,
+        max=5.0,
+        update=_update_world_water_controls,
+    )
+    water_foam_intensity: FloatProperty(
+        name="Foam",
+        description="Foam intensity; the .env day-cycle curve overwrites this on environment refresh",
+        default=0.1343882230,
+        min=0.0,
+        max=2.0,
+        update=_update_world_water_controls,
+    )
+    water_reflection: FloatProperty(
+        name="Reflection",
+        description="Sky/sun reflection strength of the water surface",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        update=_update_world_water_controls,
+    )
+    water_clarity: FloatProperty(
+        name="Clarity",
+        description="How transparent very shallow water is (depth opacity floor inverse)",
+        default=0.58,
+        min=0.0,
+        max=1.0,
+        update=_update_world_water_controls,
+    )
+    water_level: FloatProperty(
+        name="Water Level",
+        description="World water plane height in meters",
+        default=0.0,
+        min=-100.0,
+        max=100.0,
+        update=_update_world_water_controls,
     )
     terrain_detail_material: BoolProperty(
         name="Detail Terrain Material",
@@ -7202,12 +7345,58 @@ class SimpleFileBrowser(Operator):
                 detail_res = detail_row.row(align=True)
                 detail_res.enabled = bool(witcher_file_browser.terrain_detail_material)
                 detail_res.prop(witcher_file_browser, "terrain_detail_texture_res", text="")
-                mat_row = terrain_box.row(align=True)
-                mat_row.prop(witcher_file_browser, "terrain_material_roughness", text="Rough")
-                mat_row.prop(witcher_file_browser, "terrain_material_specular", text="Spec")
+                terrain_box.prop(
+                    witcher_file_browser,
+                    "terrain_material_surface_mode",
+                    text="Surface",
+                )
+                if witcher_file_browser.terrain_material_surface_mode == 'OVERRIDE':
+                    mat_row = terrain_box.row(align=True)
+                    mat_row.prop(witcher_file_browser, "terrain_material_roughness", text="Rough")
+                    mat_row.prop(witcher_file_browser, "terrain_material_specular", text="Spec")
+                terrain_box.prop(
+                    witcher_file_browser,
+                    "terrain_material_normal_strength",
+                    text="Normal",
+                )
+                debug_header = terrain_box.row(align=True)
+                debug_header.prop(
+                    witcher_file_browser,
+                    "terrain_material_show_debug",
+                    text="Debug",
+                    icon=(
+                        'TRIA_DOWN'
+                        if witcher_file_browser.terrain_material_show_debug
+                        else 'TRIA_RIGHT'
+                    ),
+                    emboss=False,
+                )
+                if witcher_file_browser.terrain_material_show_debug:
+                    debug_box = terrain_box.box()
+                    debug_box.prop(
+                        witcher_file_browser,
+                        "terrain_material_debug_view",
+                        text="View",
+                    )
+                    debug_box.prop(
+                        witcher_file_browser,
+                        "terrain_material_slope_mode",
+                        text="Slope",
+                    )
+                    debug_row = debug_box.row(align=True)
+                    debug_row.prop(
+                        witcher_file_browser,
+                        "terrain_material_tint_strength",
+                        text="Tint",
+                    )
+                    debug_row.prop(
+                        witcher_file_browser,
+                        "terrain_material_fresnel_strength",
+                        text="Fresnel",
+                    )
                 terrain_box.operator(
                     "witcher.apply_terrain_material_values",
-                    text="Apply Terrain Material To Loaded",
+                    text="Sync Loaded Terrain",
                     icon='SHADING_RENDERED',
                 )
                 layout.separator(factor=0.5)

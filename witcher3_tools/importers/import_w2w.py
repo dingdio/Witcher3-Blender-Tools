@@ -1,8 +1,9 @@
 import logging
 import os
 import hashlib
+import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import bpy
 
@@ -39,6 +40,7 @@ W2W_LIST_PROP = "witcher_w2w_list_tree"
 W2W_LIST_INDEX_PROP = "witcher_w2w_list_tree_index"
 WORLD_WATER_OBJECT_PROP = "witcher_world_water_object"
 WORLD_WATER_MATERIAL_PROP = "witcher_world_water_material"
+WORLD_WATER_KEY_PROP = "witcher_world_water_key"
 
 #
 # This is what I am using to hold a single tree node in my raw example data.
@@ -357,7 +359,26 @@ def _store_world_layer_metadata(target, world_path="", world_root_collection=Non
         target["world_root_collection"] = str(getattr(world_root_collection, "name", ""))
 
 
+def _find_world_layer_collection(world_path, scene=None):
+    scene = scene or getattr(bpy.context, "scene", None)
+    root = getattr(scene, "collection", None)
+    if root is None or not world_path:
+        return None
+    target = os.path.normcase(os.path.abspath(os.path.normpath(str(world_path))))
+    for collection in root.children:
+        if collection.get("group_type") != "LayerGroup":
+            continue
+        stored = str(collection.get("world_path", "") or "")
+        if stored and os.path.normcase(os.path.abspath(os.path.normpath(stored))) == target:
+            return collection
+    return None
+
+
 def AddCLayerGroup(groups, parent_collection, world_path=""):
+    if world_path and not parent_collection:
+        existing = _find_world_layer_collection(world_path)
+        if existing is not None:
+            return existing
     this_collection = bpy.data.collections.new(groups.name)
     this_collection['group_type'] = "LayerGroup"
     this_collection['witcher_visible_on_start'] = bool(getattr(groups, 'isVisibleOnStart', True))
@@ -402,9 +423,11 @@ def AddCLayerGroup(groups, parent_collection, world_path=""):
 
 def btn_import_w2w(worldFile: WORLD, filePath):
     collection = AddCLayerGroup(worldFile.groups, False, filePath)
-    bpy.context.scene.collection.children.link(collection)
-    layer_collection = bpy.context.view_layer.layer_collection.children[collection.name]
-    bpy.context.view_layer.active_layer_collection = layer_collection
+    if collection.name not in bpy.context.scene.collection.children:
+        bpy.context.scene.collection.children.link(collection)
+    layer_collection = bpy.context.view_layer.layer_collection.children.get(collection.name)
+    if layer_collection is not None:
+        bpy.context.view_layer.active_layer_collection = layer_collection
 
     with redkit_repo_context(filePath):
         do_import_map_terrain(worldFile, filePath, world_root_collection=collection)
@@ -472,6 +495,64 @@ def _configured_redkit_roots():
     return roots
 
 
+def _configured_redkit_workspace_roots():
+    roots = []
+    try:
+        prefs = get_all_addon_prefs(bpy.context)
+    except Exception:
+        prefs = None
+    if not prefs:
+        return roots
+
+    for item in getattr(prefs, "redkit_projects", []) or []:
+        value = str(getattr(item, "path", "") or "").strip()
+        if not value:
+            continue
+        try:
+            value = bpy.path.abspath(value)
+        except Exception:
+            pass
+        project_root = os.path.normpath(value)
+        workspace_root = os.path.join(project_root, "workspace")
+        if os.path.isdir(win_safe_path(workspace_root)):
+            roots.append(workspace_root)
+        elif os.path.isdir(win_safe_path(project_root)):
+            # The preference may already point at the workspace directory.
+            roots.append(project_root)
+
+    unique = []
+    seen = set()
+    for root in roots:
+        key = os.path.normcase(os.path.normpath(root))
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def _workspace_ancestor(path):
+    try:
+        current = Path(os.path.abspath(str(path)))
+    except Exception:
+        return ""
+    if current.is_file():
+        current = current.parent
+    for candidate in (current, *current.parents):
+        if candidate.name.casefold() == "workspace":
+            return str(candidate)
+    return ""
+
+
+def _workspace_cache_namespace(workspace_root):
+    try:
+        identity = os.path.normcase(os.path.normpath(
+            os.path.abspath(str(workspace_root))))
+    except Exception:
+        identity = str(workspace_root or "")
+    return hashlib.sha1(
+        identity.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
 def _first_containing_root(path, roots):
     for root in roots or []:
         if _path_is_under_root(path, root):
@@ -480,7 +561,7 @@ def _first_containing_root(path, roots):
 
 
 def _materialize_w2ter_embedded_buffers(tile_path, working_tiles_dir):
-    """Write REDkit/source .w2ter embedded buffers as sidecars in working storage."""
+    """Write embedded .w2ter buffers as sidecars in working storage."""
     if not tile_path or not working_tiles_dir:
         return []
     try:
@@ -491,13 +572,19 @@ def _materialize_w2ter_embedded_buffers(tile_path, working_tiles_dir):
         return []
 
     try:
-        source_mtime = os.path.getmtime(win_safe_path(source_path))
+        source_stat = os.stat(win_safe_path(source_path))
+        source_mtime = source_stat.st_mtime
+        source_mtime_ns = source_stat.st_mtime_ns
+        source_size = source_stat.st_size
     except Exception:
         source_mtime = 0.0
+        source_mtime_ns = 0
+        source_size = 0
     cache_key = (
         os.path.normcase(os.path.normpath(source_path)),
         os.path.normcase(os.path.normpath(str(working_tiles_dir))),
-        source_mtime,
+        source_mtime_ns,
+        source_size,
     )
     cached = _MATERIALIZED_W2TER_BUFFER_CACHE.get(cache_key)
     if cached:
@@ -506,7 +593,7 @@ def _materialize_w2ter_embedded_buffers(tile_path, working_tiles_dir):
     try:
         cr2w_file = read_CR2W(source_path)
     except Exception:
-        log.debug("Failed to read REDkit terrain tile buffers: %s", source_path, exc_info=True)
+        log.debug("Failed to read project terrain tile buffers: %s", source_path, exc_info=True)
         return []
 
     buffers = list(getattr(cr2w_file, "BufferData", None) or [])
@@ -517,7 +604,7 @@ def _materialize_w2ter_embedded_buffers(tile_path, working_tiles_dir):
     try:
         os.makedirs(win_safe_path(str(working_tiles_dir)), exist_ok=True)
     except Exception:
-        log.warning("Could not create REDkit terrain working directory: %s", working_tiles_dir, exc_info=True)
+        log.warning("Could not create terrain working directory: %s", working_tiles_dir, exc_info=True)
         return []
 
     base_name = os.path.basename(source_path)
@@ -537,16 +624,17 @@ def _materialize_w2ter_embedded_buffers(tile_path, working_tiles_dir):
                     os.path.getsize(safe_out) != expected_size
                     or os.path.getmtime(safe_out) < source_mtime
                 )
+                if not write_needed:
+                    with open(safe_out, "rb") as handle:
+                        write_needed = handle.read() != data
             except Exception:
                 write_needed = True
         if write_needed:
             try:
                 with open(safe_out, "wb") as handle:
                     handle.write(data)
-                if source_mtime:
-                    os.utime(safe_out, (source_mtime, source_mtime))
             except Exception:
-                log.warning("Could not materialize REDkit terrain buffer: %s", out_path, exc_info=True)
+                log.warning("Could not materialize terrain buffer: %s", out_path, exc_info=True)
                 continue
         outputs.append(out_path)
 
@@ -570,28 +658,49 @@ def _embedded_tile_source_path(terrain_tiles_dir, terrain_tiles_rel, tile_name):
 
 
 def _resolve_tile_buffer(terrain_tiles_dir, terrain_tiles_rel, buf_name, working_tiles_dir=None):
-    """Find a tile buffer file on disk or extract from bundle via repo_file."""
-    # Check disk first
+    """Resolve a tile buffer, with direct workspace sources taking precedence."""
+    # Loose buffers beside the selected .w2w are the most explicit override.
     disk_path = os.path.join(str(terrain_tiles_dir), buf_name)
     if os.path.isfile(win_safe_path(disk_path)):
         return disk_path
-    if working_tiles_dir:
-        working_path = os.path.join(str(working_tiles_dir), buf_name)
-        if os.path.isfile(win_safe_path(working_path)):
-            return working_path
-    # Try bundle extraction via repo_file
+
+    tile_name = terrain_w2ter.W2TER_BUFFER_RE.sub(".w2ter", buf_name)
+    local_source_tile = os.path.join(str(terrain_tiles_dir), tile_name)
+    if working_tiles_dir and os.path.isfile(win_safe_path(local_source_tile)):
+        # A workspace container shadows every cache/depot copy of this tile.
+        # If it cannot be decoded, fail visibly instead of silently importing
+        # an older terrain buffer from another source.
+        for path in _materialize_w2ter_embedded_buffers(
+            local_source_tile, working_tiles_dir
+        ):
+            if os.path.basename(path).lower() == buf_name.lower():
+                return path
+        return None
+
+    # Resolve an authoritative repo/depot sidecar before considering generated
+    # working files left over from an earlier import.
     if terrain_tiles_rel:
         rel_path = os.path.join(terrain_tiles_rel, buf_name)
         abs_path = repo_file(rel_path)
         if abs_path and os.path.exists(win_safe_path(abs_path)):
             return abs_path
-    if working_tiles_dir:
-        tile_name = terrain_w2ter.W2TER_BUFFER_RE.sub("", buf_name)
-        source_tile = _embedded_tile_source_path(terrain_tiles_dir, terrain_tiles_rel, tile_name)
+
+    # A repo/source .w2ter may also contain its buffers internally.
+    if working_tiles_dir and terrain_tiles_rel:
+        source_tile = _embedded_tile_source_path(
+            terrain_tiles_dir, terrain_tiles_rel, tile_name)
         if source_tile:
-            for path in _materialize_w2ter_embedded_buffers(source_tile, working_tiles_dir):
+            for path in _materialize_w2ter_embedded_buffers(
+                source_tile, working_tiles_dir
+            ):
                 if os.path.basename(path).lower() == buf_name.lower():
                     return path
+
+    # Generated working buffers are only a last-resort offline cache.
+    if working_tiles_dir:
+        working_path = os.path.join(str(working_tiles_dir), buf_name)
+        if os.path.isfile(win_safe_path(working_path)):
+            return working_path
     return None
 
 
@@ -615,8 +724,10 @@ TERRAIN_IMPORT_FULL_MAP = "FULL_MAP"
 TERRAIN_IMPORT_TILES = "TILES"
 
 # Defaults balance preview quality and source resolution.
-TERRAIN_TILE_PREVIEW_LEVEL = 8
+TERRAIN_TILE_PREVIEW_LEVEL = 6
 TERRAIN_TILE_MAX_LEVEL = 8
+TERRAIN_TILE_STITCH_VERSION = 1
+TERRAIN_HEIGHTMAP_CACHE_LIMIT = 64
 
 @dataclass(frozen=True, order=True)
 class TerrainTileKey:
@@ -685,6 +796,7 @@ class TerrainTileSourceRequest:
 
     key: TerrainTileKey
     include_overlay: bool = True
+    include_stitch_neighbors: bool = False
 
 @dataclass(frozen=True)
 class TerrainTileSource:
@@ -695,6 +807,12 @@ class TerrainTileSource:
     heightmap_buffer: str = ""
     texture_buffer: str = ""
     overlay_path: str = ""
+    positive_x_buffer_path: str = ""
+    positive_y_buffer_path: str = ""
+    positive_xy_buffer_path: str = ""
+    positive_x_texture_buffer_path: str = ""
+    positive_y_texture_buffer_path: str = ""
+    positive_xy_texture_buffer_path: str = ""
 
     @property
     def key(self):
@@ -757,12 +875,25 @@ def _resolve_terrain_context(worldFile, filePath, *, discover_tiles=True):
     except Exception:
         pass
 
-    redkit_root = _first_containing_root(str(w2w_dir), _configured_redkit_roots())
+    workspace_root = (
+        _workspace_ancestor(str(w2w_dir))
+        or _first_containing_root(
+            str(w2w_dir), _configured_redkit_workspace_roots())
+    )
+    redkit_root = workspace_root or _first_containing_root(
+        str(w2w_dir), _configured_redkit_roots())
     if redkit_root:
         rel_dir = _relpath_under_root(str(w2w_dir), redkit_root)
         if rel_dir:
             terrain_tiles_rel = os.path.join(rel_dir, "terrain_tiles")
-            output_dir = Path(get_redkit_working_root(create=True)) / rel_dir
+            working_root = Path(get_redkit_working_root(create=True))
+            if workspace_root:
+                working_root = (
+                    working_root
+                    / "workspaces"
+                    / _workspace_cache_namespace(workspace_root)
+                )
+            output_dir = working_root / rel_dir
             working_tiles_dir = output_dir / "terrain_tiles"
 
     # Compute tile grid from WORLD params
@@ -857,12 +988,44 @@ def terrain_tile_from_world_position(spec, position):
     )
 
 
-def terrain_tile_source_request(x, y, *, include_overlay=True):
+def terrain_tile_source_request(
+    x,
+    y,
+    *,
+    include_overlay=True,
+    include_stitch_neighbors=False,
+):
     """Construct a source request that can be inspected before any I/O."""
     return TerrainTileSourceRequest(
         key=TerrainTileKey(x, y),
         include_overlay=bool(include_overlay),
+        include_stitch_neighbors=bool(include_stitch_neighbors),
     )
+
+
+def _terrain_tile_heightmap_name(spec, x, y):
+    return f"tile_{int(y)}_x_{int(x)}_res{int(spec.tile_res)}.w2ter.1.buffer"
+
+
+def _resolve_terrain_tile_heightmap(spec, x, y):
+    return str(_resolve_tile_buffer(
+        spec.terrain_tiles_dir,
+        spec.terrain_tiles_rel or None,
+        _terrain_tile_heightmap_name(spec, x, y),
+        working_tiles_dir=spec.working_tiles_dir or None,
+    ) or "")
+
+
+def _resolve_terrain_tile_texture(spec, x, y):
+    texture_name = (
+        f"tile_{int(y)}_x_{int(x)}_res{int(spec.tile_res)}.w2ter.2.buffer"
+    )
+    return str(_resolve_tile_buffer(
+        spec.terrain_tiles_dir,
+        spec.terrain_tiles_rel or None,
+        texture_name,
+        working_tiles_dir=spec.working_tiles_dir or None,
+    ) or "")
 
 
 def resolve_terrain_tile_source(spec, request):
@@ -872,26 +1035,45 @@ def resolve_terrain_tile_source(spec, request):
     terrain_tile_bounds(spec, request.key.x, request.key.y)
 
     tile_name = f"tile_{request.key.y}_x_{request.key.x}_res{int(spec.tile_res)}"
-    heightmap_name = f"{tile_name}.w2ter.1.buffer"
-    heightmap_path = _resolve_tile_buffer(
-        spec.terrain_tiles_dir,
-        spec.terrain_tiles_rel or None,
-        heightmap_name,
-        working_tiles_dir=spec.working_tiles_dir or None,
-    )
+    heightmap_path = _resolve_terrain_tile_heightmap(
+        spec, request.key.x, request.key.y)
 
     texture_path = ""
     overlay_path = ""
     if request.include_overlay:
-        texture_name = f"{tile_name}.w2ter.2.buffer"
-        texture_path = _resolve_tile_buffer(
-            spec.terrain_tiles_dir,
-            spec.terrain_tiles_rel or None,
-            texture_name,
-            working_tiles_dir=spec.working_tiles_dir or None,
-        ) or ""
+        texture_path = _resolve_terrain_tile_texture(
+            spec, request.key.x, request.key.y)
         if texture_path:
             overlay_path = texture_path + ".overlay.png"
+
+    positive_x_path = ""
+    positive_y_path = ""
+    positive_xy_path = ""
+    positive_x_texture_path = ""
+    positive_y_texture_path = ""
+    positive_xy_texture_path = ""
+    if request.include_stitch_neighbors:
+        if request.key.x + 1 < int(spec.x_tiles):
+            positive_x_path = _resolve_terrain_tile_heightmap(
+                spec, request.key.x + 1, request.key.y)
+            if request.include_overlay:
+                positive_x_texture_path = _resolve_terrain_tile_texture(
+                    spec, request.key.x + 1, request.key.y)
+        if request.key.y + 1 < int(spec.y_tiles):
+            positive_y_path = _resolve_terrain_tile_heightmap(
+                spec, request.key.x, request.key.y + 1)
+            if request.include_overlay:
+                positive_y_texture_path = _resolve_terrain_tile_texture(
+                    spec, request.key.x, request.key.y + 1)
+        if (
+            request.key.x + 1 < int(spec.x_tiles)
+            and request.key.y + 1 < int(spec.y_tiles)
+        ):
+            positive_xy_path = _resolve_terrain_tile_heightmap(
+                spec, request.key.x + 1, request.key.y + 1)
+            if request.include_overlay:
+                positive_xy_texture_path = _resolve_terrain_tile_texture(
+                    spec, request.key.x + 1, request.key.y + 1)
 
     return TerrainTileSource(
         request=request,
@@ -899,14 +1081,32 @@ def resolve_terrain_tile_source(spec, request):
         heightmap_buffer=str(heightmap_path or ""),
         texture_buffer=str(texture_path or ""),
         overlay_path=str(overlay_path or ""),
+        positive_x_buffer_path=positive_x_path,
+        positive_y_buffer_path=positive_y_path,
+        positive_xy_buffer_path=positive_xy_path,
+        positive_x_texture_buffer_path=positive_x_texture_path,
+        positive_y_texture_buffer_path=positive_y_texture_path,
+        positive_xy_texture_buffer_path=positive_xy_texture_path,
     )
 
 
-def resolve_world_terrain_tile_source(spec, x, y, *, include_overlay=True):
+def resolve_world_terrain_tile_source(
+    spec,
+    x,
+    y,
+    *,
+    include_overlay=True,
+    include_stitch_neighbors=False,
+):
     """Convenience wrapper used by Blender UI operators."""
     return resolve_terrain_tile_source(
         spec,
-        terrain_tile_source_request(x, y, include_overlay=include_overlay),
+        terrain_tile_source_request(
+            x,
+            y,
+            include_overlay=include_overlay,
+            include_stitch_neighbors=include_stitch_neighbors,
+        ),
     )
 
 
@@ -929,7 +1129,7 @@ def _clamp_tile_multires_level(level, tile_res):
         tile_res = 1
     if tile_res <= 1:
         return 0
-    source_cap = int(math.ceil(math.log2(tile_res - 1)))
+    source_cap = int(math.floor(math.log2(tile_res)))
     return min(level, source_cap, TERRAIN_TILE_MAX_LEVEL)
 
 
@@ -982,7 +1182,7 @@ def _collect_tile_buffer_paths_for_combine(terrain_tiles_dir, terrain_tiles_rel,
                         buffer_paths.append(apath)
                         seen.add(apath)
         except Exception:
-            log.debug("Failed to materialize REDkit terrain tiles from %s", terrain_tiles_dir, exc_info=True)
+            log.debug("Failed to materialize terrain tiles from %s", terrain_tiles_dir, exc_info=True)
 
     # Ensure required height/texture buffers can be resolved from bundle paths too.
     for y in range(max(0, int(n_tiles))):
@@ -1004,6 +1204,35 @@ def _collect_tile_buffer_paths_for_combine(terrain_tiles_dir, terrain_tiles_rel,
                     seen.add(apath)
 
     return buffer_paths
+
+
+def _load_or_reload_terrain_image(path, colorspace):
+    image = bpy_image_load_safe(str(path), check_existing=True)
+    if image is None:
+        return None
+    try:
+        stat = os.stat(win_safe_path(str(path)))
+        stamp = f"{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        stamp = ""
+    try:
+        previous = str(image.get("witcher_terrain_source_stamp", "") or "")
+    except Exception:
+        previous = ""
+    if previous != stamp:
+        try:
+            image.reload()
+        except Exception:
+            log.debug("Could not reload refreshed terrain image: %s", path, exc_info=True)
+        try:
+            image["witcher_terrain_source_stamp"] = stamp
+        except Exception:
+            pass
+    try:
+        image.colorspace_settings.name = colorspace
+    except Exception:
+        pass
+    return image
 
 
 def _create_full_map_geo_nodes(obj, heightmap_path, lowest_elevation, highest_elevation):
@@ -1035,8 +1264,7 @@ def _create_full_map_geo_nodes(obj, heightmap_path, lowest_elevation, highest_el
     node_img = ngt.nodes.new(type="GeometryNodeImageTexture")
     node_img.width = 300
     node_img.location = (-320, 0)
-    image = bpy_image_load_safe(str(heightmap_path), check_existing=True)
-    image.colorspace_settings.name = 'Non-Color'
+    image = _load_or_reload_terrain_image(heightmap_path, 'Non-Color')
     node_img.inputs['Image'].default_value = image
 
     node_s1 = ngt.nodes.new(type="ShaderNodeVectorMath")
@@ -1112,6 +1340,50 @@ def _get_scene_terrain_material_values():
     return roughness, specular
 
 
+def _get_terrain_material_controls(settings=None):
+    if settings is None:
+        try:
+            settings = bpy.context.scene.witcher_file_browser
+        except Exception:
+            settings = None
+
+    def value(name, default):
+        return getattr(settings, name, default) if settings is not None else default
+
+    def clamp(number, low, high):
+        try:
+            number = float(number)
+        except (TypeError, ValueError):
+            number = low
+        return max(low, min(high, number))
+
+    surface_mode = str(value("terrain_material_surface_mode", "SOURCE")).upper()
+    if surface_mode not in {"SOURCE", "OVERRIDE"}:
+        surface_mode = "SOURCE"
+    slope_mode = str(value("terrain_material_slope_mode", "SOURCE")).upper()
+    if slope_mode not in {"SOURCE", "HORIZONTAL", "VERTICAL"}:
+        slope_mode = "SOURCE"
+    debug_view = str(value("terrain_material_debug_view", "FINAL")).upper()
+    if debug_view not in {
+        "FINAL", "BASE_COLOR", "SLOPE", "ROUGHNESS", "SPECULAR",
+        "MACRO_NORMAL", "FINAL_NORMAL",
+    }:
+        debug_view = "FINAL"
+    return {
+        "surface_mode": surface_mode,
+        "roughness": clamp(value("terrain_material_roughness", 0.82), 0.0, 1.0),
+        "specular": clamp(value("terrain_material_specular", 0.12), 0.0, 1.0),
+        "normal_strength": clamp(
+            value("terrain_material_normal_strength", 1.0), 0.0, 2.0),
+        "tint_strength": clamp(
+            value("terrain_material_tint_strength", 1.0), 0.0, 1.0),
+        "fresnel_strength": clamp(
+            value("terrain_material_fresnel_strength", 1.0), 0.0, 2.0),
+        "slope_mode": slope_mode,
+        "debug_view": debug_view,
+    }
+
+
 def _set_principled_terrain_values(principled, roughness=None, specular=None):
     if principled is None:
         return
@@ -1121,7 +1393,12 @@ def _set_principled_terrain_values(principled, roughness=None, specular=None):
         principled.inputs["Roughness"].default_value = float(roughness)
     if "Metallic" in principled.inputs:
         principled.inputs["Metallic"].default_value = 0.0
-    if "Specular IOR Level" in principled.inputs:
+    if "IOR" in principled.inputs:
+        from .terrain_detail import f0_to_ior
+        principled.inputs["IOR"].default_value = float(f0_to_ior(specular))
+        if "Specular IOR Level" in principled.inputs:
+            principled.inputs["Specular IOR Level"].default_value = 0.5
+    elif "Specular IOR Level" in principled.inputs:
         principled.inputs["Specular IOR Level"].default_value = float(specular)
     elif "Specular" in principled.inputs:
         principled.inputs["Specular"].default_value = float(specular)
@@ -1130,12 +1407,18 @@ def _set_principled_terrain_values(principled, roughness=None, specular=None):
 def _apply_terrain_material_values(mat, roughness, specular):
     if mat is None or not mat.use_nodes or mat.node_tree is None:
         return False
-    principled = mat.node_tree.nodes.get("Principled BSDF")
-    if principled is None:
-        return False
-    _set_principled_terrain_values(principled, roughness, specular)
-    mat["witcher_terrain_material"] = True
-    return True
+    from . import terrain_detail_nodes
+    return terrain_detail_nodes.configure_material_controls(
+        mat,
+        surface_mode="OVERRIDE",
+        roughness=max(0.0, min(1.0, float(roughness))),
+        specular=max(0.0, min(1.0, float(specular))),
+    )
+
+
+def _apply_terrain_material_controls(mat, controls):
+    from . import terrain_detail_nodes
+    return terrain_detail_nodes.configure_material_controls(mat, **controls)
 
 
 def _is_terrain_mesh_object(obj):
@@ -1175,6 +1458,31 @@ def update_all_terrain_material_values(roughness, specular):
     return updated
 
 
+def update_all_terrain_material_controls(settings=None):
+    """Live-sync source/override and debug controls to loaded terrain materials."""
+    controls = _get_terrain_material_controls(settings)
+    updated = 0
+    seen = set()
+
+    for mat in bpy.data.materials:
+        if not mat.get("witcher_terrain_material"):
+            continue
+        if _apply_terrain_material_controls(mat, controls):
+            seen.add(mat.name_full)
+            updated += 1
+
+    for obj in bpy.data.objects:
+        if not _is_terrain_mesh_object(obj) or not hasattr(obj.data, "materials"):
+            continue
+        for mat in obj.data.materials:
+            if mat is None or mat.name_full in seen:
+                continue
+            if _apply_terrain_material_controls(mat, controls):
+                seen.add(mat.name_full)
+                updated += 1
+    return updated
+
+
 def _world_water_objects(scene=None):
     scene = scene or getattr(bpy.context, "scene", None)
     return [
@@ -1196,6 +1504,54 @@ def _world_water_materials(scene=None):
                 yield material
 
 
+def update_world_water_controls(settings=None, *, scene=None):
+    def value(name, default):
+        try:
+            return float(getattr(settings, name))
+        except (AttributeError, TypeError, ValueError):
+            return default
+
+    wind = max(0.0, min(1.0, value("water_wind", 0.35)))
+    direction = math.radians(value("water_wind_direction", 26.57))
+    flow = max(0.0, value("water_flow_speed", 0.6))
+    foam = max(0.0, value("water_foam_intensity", 0.1343882230))
+    reflection = max(0.0, min(1.0, value("water_reflection", 1.0)))
+    clarity = max(0.0, min(1.0, value("water_clarity", 0.58)))
+    level = value("water_level", 0.0)
+
+    # Same magnitude as the authored default drift (4 m/s east, 2 m/s north).
+    speed = 0.002236
+    updated = 0
+    for mat in _world_water_materials(scene):
+        if mat.node_tree is None:
+            continue
+        nodes = mat.node_tree.nodes
+        for name, val in (
+            ("W3 Water Wind", wind),
+            ("W3 Water Flow", flow),
+            ("W3 Water Foam", foam),
+        ):
+            node = nodes.get(name)
+            if node is not None:
+                node.outputs[0].default_value = val
+        node = nodes.get("W3 Water Flow Direction")
+        if node is not None:
+            node.inputs["X"].default_value = speed * math.cos(direction)
+            node.inputs["Y"].default_value = speed * math.sin(direction)
+        node = nodes.get("W3 Water Depth Opacity Scale")
+        if node is not None:
+            node.inputs["To Min"].default_value = 1.0 - clarity
+        surface = nodes.get("W3 Water Surface")
+        if surface is not None and "Specular IOR Level" in surface.inputs:
+            surface.inputs["Specular IOR Level"].default_value = reflection
+        updated += 1
+
+    for obj in _world_water_objects(scene):
+        if obj.type == 'MESH':
+            obj.location.z = level
+    return updated
+
+
 def _create_full_map_material(obj, colormap_path, mat_name):
     """Create simple material using combined overlay image as Base Color."""
     mat = bpy.data.materials.new(name=mat_name)
@@ -1205,6 +1561,7 @@ def _create_full_map_material(obj, colormap_path, mat_name):
         principled = mat.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
     tex = mat.node_tree.nodes.new("ShaderNodeTexImage")
     insert_color(mat, principled, tex, None, str(colormap_path))
+    tex.image = _load_or_reload_terrain_image(colormap_path, 'sRGB')
     _set_principled_terrain_values(principled)
     mat["witcher_terrain_material"] = True
     obj.data.materials.clear()
@@ -1226,11 +1583,51 @@ def _add_multires_modifier(obj, level):
     return multires
 
 
-def _ensure_simple_water_material():
-    mat_name = "water_simple_m"
-    mat = bpy.data.materials.get(mat_name)
+def _load_water_asset_image(rel_path, texarray_slice=0):
+    try:
+        from ..CR2W.common_blender import repo_file
+        from ..CR2W import texture_converters
+        src = repo_file(rel_path)
+        if not src or not os.path.isfile(str(src)):
+            return None
+        if str(src).lower().endswith(".texarray"):
+            slices = texture_converters.convert_texarray_to_dds(str(src))
+            if not slices or texarray_slice >= len(slices):
+                return None
+            dds = str(slices[texarray_slice])
+        else:
+            dds = str(texture_converters.convert_xbm_to_dds(str(src)))
+        if not dds or not os.path.isfile(dds):
+            return None
+        image = bpy.data.images.load(dds, check_existing=True)
+        image.colorspace_settings.name = 'Non-Color'
+        return image
+    except Exception:
+        log.debug("Water asset unavailable: %s", rel_path, exc_info=True)
+        return None
+
+
+def _ensure_simple_water_material(
+    heightmap_path="",
+    lowest_elevation=0.0,
+    highest_elevation=0.0,
+    foam_image=None,
+    medium_normal_image=None,
+    owner_key="",
+):
+    """Build a three-band ocean preview with terrain-depth foam."""
+
+    owner_key = str(owner_key or "")
+    mat = next(
+        (
+            material for material in bpy.data.materials
+            if bool(material.get(WORLD_WATER_MATERIAL_PROP, False))
+            and str(material.get(WORLD_WATER_KEY_PROP, "") or "") == owner_key
+        ),
+        None,
+    )
     if mat is None:
-        mat = bpy.data.materials.new(name=mat_name)
+        mat = bpy.data.materials.new(name="water_simple_m")
     mat.use_nodes = True
 
     nt = mat.node_tree
@@ -1239,46 +1636,543 @@ def _ensure_simple_water_material():
     nodes.clear()
 
     out = nodes.new("ShaderNodeOutputMaterial")
-    out.location = (320, 0)
-    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-    bsdf.location = (60, 0)
-    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    out.name = "W3 Water Output"
+    out.location = (820, 80)
 
-    bsdf.inputs["Base Color"].default_value = (0.02, 0.16, 0.24, 1.0)
-    bsdf.inputs["Roughness"].default_value = 0.05
-    if "Specular IOR Level" in bsdf.inputs:
-        bsdf.inputs["Specular IOR Level"].default_value = 0.7
-    elif "Specular" in bsdf.inputs:
-        bsdf.inputs["Specular"].default_value = 0.7
-    if "Transmission Weight" in bsdf.inputs:
-        bsdf.inputs["Transmission Weight"].default_value = 0.92
-    elif "Transmission" in bsdf.inputs:
-        bsdf.inputs["Transmission"].default_value = 0.92
-    if "IOR" in bsdf.inputs:
-        bsdf.inputs["IOR"].default_value = 1.333
+    # Prologue-noon defaults; .env curves update these named controls in place.
+    tint = nodes.new("ShaderNodeRGB")
+    tint.name = "W3 Water Tint"
+    tint.label = "Water Color"
+    tint.location = (-760, 420)
+    tint.outputs[0].default_value = (
+        31.8886987873 / 255.0,
+        35.8815087077 / 255.0,
+        18.9390292482 / 255.0,
+        1.0,
+    )
 
-    # Small normal breakup for simple water look.
-    noise = nodes.new("ShaderNodeTexNoise")
-    noise.location = (-520, -120)
-    noise.inputs["Scale"].default_value = 18.0
-    noise.inputs["Detail"].default_value = 2.0
+    fresnel_gain = nodes.new("ShaderNodeValue")
+    fresnel_gain.name = "W3 Water Fresnel Gain"
+    fresnel_gain.label = "Water Fresnel Gain"
+    fresnel_gain.location = (-260, 280)
+    fresnel_gain.outputs[0].default_value = 0.0735272020
 
-    bump = nodes.new("ShaderNodeBump")
-    bump.location = (-220, -120)
-    bump.inputs["Strength"].default_value = 0.06
-    links.new(noise.outputs["Fac"], bump.inputs["Height"])
-    links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+    ambient_scale = nodes.new("ShaderNodeValue")
+    ambient_scale.name = "W3 Water Ambient Scale"
+    ambient_scale.location = (-760, 280)
+    ambient_scale.outputs[0].default_value = 0.2953799963
 
-    if hasattr(mat, "blend_method"):
-        mat.blend_method = 'BLEND'
-    if hasattr(mat, "shadow_method"):
-        mat.shadow_method = 'HASHED'
+    diffuse_scale = nodes.new("ShaderNodeValue")
+    diffuse_scale.name = "W3 Water Diffuse Scale"
+    diffuse_scale.location = (-760, 220)
+    diffuse_scale.outputs[0].default_value = 1.0625499487
+
+    flow = nodes.new("ShaderNodeValue")
+    flow.name = "W3 Water Flow"
+    flow.location = (-760, 160)
+    # Default flow used when the environment curve is empty.
+    flow.outputs[0].default_value = 0.6
+
+    foam = nodes.new("ShaderNodeValue")
+    foam.name = "W3 Water Foam"
+    foam.location = (-760, 100)
+    # Default foam intensity after the environment offset and clamp.
+    foam.outputs[0].default_value = 0.1343882230
+
+    # Wind scale drives both wave amplitude and foam.
+    wind = nodes.new("ShaderNodeValue")
+    wind.name = "W3 Water Wind"
+    wind.label = "Wind Scale"
+    wind.location = (-760, 40)
+    wind.outputs[0].default_value = 0.35
+    wind_wave_gain = nodes.new("ShaderNodeMath")
+    wind_wave_gain.name = "W3 Water Wind Wave Gain"
+    wind_wave_gain.operation = "MULTIPLY_ADD"
+    wind_wave_gain.location = (-560, 40)
+    wind_wave_gain.inputs[1].default_value = 1.6
+    wind_wave_gain.inputs[2].default_value = 0.4
+    links.new(wind.outputs[0], wind_wave_gain.inputs[0])
+
+    # Eevee refraction either flickers or turns opaque; blended Principled stays
+    # transparent and retains specular water.
+    surface_color = nodes.new("ShaderNodeMixRGB")
+    surface_color.name = "W3 Water Surface Color"
+    surface_color.location = (-260, 420)
+    surface_color.inputs[0].default_value = 0.15
+    surface_color.inputs[1].default_value = (0.17, 0.27, 0.39, 1.0)
+    links.new(tint.outputs[0], surface_color.inputs[2])
+    surface_lighting = nodes.new("ShaderNodeMixRGB")
+    surface_lighting.name = "W3 Water Surface Lighting"
+    surface_lighting.blend_type = "MULTIPLY"
+    surface_lighting.inputs[0].default_value = 1.0
+    surface_lighting.location = (0, 420)
+    links.new(surface_color.outputs[0], surface_lighting.inputs[1])
+    links.new(diffuse_scale.outputs[0], surface_lighting.inputs[2])
+
+    surface = nodes.new("ShaderNodeBsdfPrincipled")
+    surface.name = "W3 Water Surface"
+    surface.location = (620, 180)
+    surface.inputs["Roughness"].default_value = 0.12
+    if "IOR" in surface.inputs:
+        surface.inputs["IOR"].default_value = 1.333
+    if "Specular IOR Level" in surface.inputs:
+        surface.inputs["Specular IOR Level"].default_value = 1.0
+    elif "Specular" in surface.inputs:
+        surface.inputs["Specular"].default_value = 1.0
+    # Facing controls grazing opacity; terrain depth controls shallow foam.
+    extinction = nodes.new("ShaderNodeValue")
+    extinction.name = "W3 Water Extinction Preview"
+    extinction.label = "Facing/shallow opacity"
+    extinction.location = (300, 500)
+    extinction.outputs[0].default_value = 0.10
+    facing = nodes.new("ShaderNodeLayerWeight")
+    facing.name = "W3 Water Facing"
+    facing.location = (40, 180)
+    grazing_opacity = nodes.new("ShaderNodeMath")
+    grazing_opacity.name = "W3 Water Grazing Opacity"
+    grazing_opacity.operation = "ADD"
+    grazing_opacity.location = (300, 360)
+    grazing_opacity.inputs[1].default_value = 0.78
+    links.new(fresnel_gain.outputs[0], grazing_opacity.inputs[0])
+    opacity = nodes.new("ShaderNodeMapRange")
+    opacity.name = "W3 Water Opacity"
+    opacity.clamp = True
+    opacity.location = (420, 260)
+    opacity.inputs["From Min"].default_value = 0.0
+    opacity.inputs["From Max"].default_value = 1.0
+    links.new(facing.outputs["Facing"], opacity.inputs["Value"])
+    links.new(grazing_opacity.outputs[0], opacity.inputs["To Min"])
+    links.new(extinction.outputs[0], opacity.inputs["To Max"])
+    links.new(surface.outputs["BSDF"], out.inputs["Surface"])
+
+    # Use large, medium, and small world-space wave bands on the 2 km plane.
+    texcoord = nodes.new("ShaderNodeTexCoord")
+    texcoord.name = "W3 Water Coordinates"
+    texcoord.location = (-1260, -260)
+    water_time = nodes.new("ShaderNodeValue")
+    water_time.name = "W3 Water Time"
+    water_time.location = (-1260, -420)
+    scene = bpy.context.scene
+    driver = water_time.outputs[0].driver_add("default_value").driver
+    driver.expression = "frame * fps_base / fps"
+    for name, data_path in (("fps", "render.fps"), ("fps_base", "render.fps_base")):
+        variable = driver.variables.new()
+        variable.name = name
+        variable.type = "SINGLE_PROP"
+        variable.targets[0].id_type = "SCENE"
+        variable.targets[0].id = scene
+        variable.targets[0].data_path = data_path
+
+    flow_direction = nodes.new("ShaderNodeCombineXYZ")
+    flow_direction.name = "W3 Water Flow Direction"
+    flow_direction.location = (-1040, -420)
+    # The 2 km coordinates yield 4 m/s east and 2 m/s north before flow scaling.
+    flow_direction.inputs["X"].default_value = 0.002
+    flow_direction.inputs["Y"].default_value = 0.001
+    time_offset = nodes.new("ShaderNodeVectorMath")
+    time_offset.name = "W3 Water Time Offset"
+    time_offset.operation = "SCALE"
+    time_offset.location = (-820, -420)
+    links.new(flow_direction.outputs[0], time_offset.inputs[0])
+    links.new(water_time.outputs[0], time_offset.inputs["Scale"])
+    flow_offset = nodes.new("ShaderNodeVectorMath")
+    flow_offset.name = "W3 Water Flow Offset"
+    flow_offset.operation = "SCALE"
+    flow_offset.location = (-600, -420)
+    links.new(time_offset.outputs[0], flow_offset.inputs[0])
+    links.new(flow.outputs[0], flow_offset.inputs["Scale"])
+    animated_coordinates = nodes.new("ShaderNodeVectorMath")
+    animated_coordinates.name = "W3 Water Animated Coordinates"
+    animated_coordinates.operation = "ADD"
+    animated_coordinates.location = (-820, -260)
+    links.new(texcoord.outputs["Generated"], animated_coordinates.inputs[0])
+    links.new(flow_offset.outputs[0], animated_coordinates.inputs[1])
+    camera_data = nodes.new("ShaderNodeCameraData")
+    camera_data.name = "W3 Water Camera Distance"
+    camera_data.location = (-1040, -640)
+    def band_fade_gain(label, strength, fade_distance, index):
+        fade = nodes.new("ShaderNodeMapRange")
+        fade.name = f"W3 Water {label} Distance Fade"
+        fade.clamp = True
+        fade.location = (-520 + index * 220, -430 - index * 130)
+        fade.inputs["From Min"].default_value = 0.0
+        fade.inputs["From Max"].default_value = fade_distance
+        fade.inputs["To Min"].default_value = strength
+        fade.inputs["To Max"].default_value = 0.0
+        links.new(camera_data.outputs["View Distance"], fade.inputs["Value"])
+        band_gain = nodes.new("ShaderNodeMath")
+        band_gain.name = f"W3 Water {label} Wind Strength"
+        band_gain.operation = "MULTIPLY"
+        band_gain.location = (-520 + index * 220, -360 - index * 130)
+        links.new(fade.outputs["Result"], band_gain.inputs[0])
+        links.new(wind_wave_gain.outputs[0], band_gain.inputs[1])
+        return band_gain
+
+    normal_out = None
+    small_waves = None
+
+    # wave_med_n must anchor the bump chain because Normal Map has no base input.
+    if medium_normal_image is not None:
+        medium_gain = band_fade_gain("Medium", 0.6, 120.0, 1)
+        med_uv = nodes.new("ShaderNodeVectorMath")
+        med_uv.name = "W3 Water Medium UV"
+        med_uv.operation = "SCALE"
+        med_uv.inputs["Scale"].default_value = 57.8
+        med_uv.location = (-520, -520)
+        links.new(animated_coordinates.outputs[0], med_uv.inputs[0])
+        med_tex = nodes.new("ShaderNodeTexImage")
+        med_tex.name = "W3 Water Medium Wave Texture"
+        med_tex.image = medium_normal_image
+        med_tex.extension = "REPEAT"
+        med_tex.location = (-300, -520)
+        links.new(med_uv.outputs[0], med_tex.inputs["Vector"])
+        med_nm = nodes.new("ShaderNodeNormalMap")
+        med_nm.name = "W3 Water Medium Normal Map"
+        med_nm.location = (-80, -520)
+        links.new(med_tex.outputs["Color"], med_nm.inputs["Color"])
+        links.new(medium_gain.outputs[0], med_nm.inputs["Strength"])
+        normal_out = med_nm.outputs["Normal"]
+    else:
+        medium_gain = band_fade_gain("Medium", 0.055, 120.0, 1)
+        noise = nodes.new("ShaderNodeTexNoise")
+        noise.name = "W3 Water Medium Waves"
+        noise.noise_dimensions = "4D"
+        noise.location = (-580, -390)
+        noise.inputs["Scale"].default_value = 57.8
+        noise.inputs["Detail"].default_value = 0.0
+        noise.inputs["Roughness"].default_value = 0.55
+        noise.inputs["W"].default_value = 11.7
+        links.new(animated_coordinates.outputs[0], noise.inputs["Vector"])
+        bump = nodes.new("ShaderNodeBump")
+        bump.name = "W3 Water Medium Normal"
+        bump.location = (-300, -390)
+        bump.inputs["Distance"].default_value = 0.10
+        links.new(medium_gain.outputs[0], bump.inputs["Strength"])
+        links.new(noise.outputs["Fac"], bump.inputs["Height"])
+        normal_out = bump.outputs["Normal"]
+
+    for index, (label, scale, strength, distance, fade_distance, w_offset) in enumerate((
+        ("Large", 12.4, 0.11, 0.22, 2000.0, 0.0),
+        ("Small", 250.0, 0.018, 0.035, 50.0, 23.1),
+    )):
+        noise = nodes.new("ShaderNodeTexNoise")
+        noise.name = f"W3 Water {label} Waves"
+        noise.noise_dimensions = "4D"
+        noise.location = (-800 + index * 440, -260 - index * 260)
+        noise.inputs["Scale"].default_value = scale
+        noise.inputs["Detail"].default_value = 0.0
+        noise.inputs["Roughness"].default_value = 0.55
+        noise.inputs["W"].default_value = w_offset
+        links.new(animated_coordinates.outputs[0], noise.inputs["Vector"])
+        if label == "Small":
+            small_waves = noise
+        band_gain = band_fade_gain(label, strength, fade_distance, index * 2)
+        bump = nodes.new("ShaderNodeBump")
+        bump.name = f"W3 Water {label} Normal"
+        bump.location = (-520 + index * 440, -260 - index * 260)
+        bump.inputs["Distance"].default_value = distance
+        links.new(band_gain.outputs[0], bump.inputs["Strength"])
+        links.new(noise.outputs["Fac"], bump.inputs["Height"])
+        links.new(normal_out, bump.inputs["Normal"])
+        normal_out = bump.outputs["Normal"]
+
+    if normal_out is not None:
+        links.new(normal_out, surface.inputs["Normal"])
+
+    # Both import modes provide the same heightmap for depth and foam.
+    depth = nodes.new("ShaderNodeMapRange")
+    depth.name = "W3 Water Depth Mask"
+    depth.clamp = True
+    depth.location = (80, -540)
+    # Hide dry land with a soft +/-0.75m band, independent of distance fade.
+    shore = nodes.new("ShaderNodeMapRange")
+    shore.name = "W3 Water Shore Mask"
+    shore.clamp = True
+    shore.location = (80, -420)
+    elevation_range = float(highest_elevation) - float(lowest_elevation)
+    valid_heightmap = bool(heightmap_path) and os.path.isfile(str(heightmap_path))
+    if valid_heightmap and elevation_range > 1e-6:
+        terrain_height = nodes.new("ShaderNodeTexImage")
+        terrain_height.name = "W3 Water Terrain Height"
+        terrain_height.location = (-420, -620)
+        terrain_height.image = _load_or_reload_terrain_image(heightmap_path, 'Non-Color')
+        terrain_height.interpolation = "Linear"
+        terrain_height.extension = "CLIP"
+        links.new(texcoord.outputs["Generated"], terrain_height.inputs["Vector"])
+        links.new(terrain_height.outputs["Color"], depth.inputs["Value"])
+        water_height = max(
+            0.0,
+            min(1.0, -float(lowest_elevation) / elevation_range),
+        )
+        depth.inputs["From Min"].default_value = water_height
+        depth.inputs["From Max"].default_value = water_height - (2.5 / elevation_range)
+        depth.inputs["To Min"].default_value = 0.0
+        depth.inputs["To Max"].default_value = 1.0
+        shore_band = 0.75 / elevation_range
+        links.new(terrain_height.outputs["Color"], shore.inputs["Value"])
+        shore.inputs["From Min"].default_value = water_height + shore_band
+        shore.inputs["From Max"].default_value = water_height - shore_band
+        shore.inputs["To Min"].default_value = 0.0
+        shore.inputs["To Max"].default_value = 1.0
+    else:
+        depth.inputs["From Min"].default_value = 0.0
+        depth.inputs["From Max"].default_value = 1.0
+        depth.inputs["To Min"].default_value = 1.0
+        depth.inputs["To Max"].default_value = 1.0
+        shore.inputs["To Min"].default_value = 1.0
+        shore.inputs["To Max"].default_value = 1.0
+
+    # Foam only hugs the first ~70cm of depth; broad banks stay foam-free.
+    shallow = nodes.new("ShaderNodeValToRGB")
+    shallow.name = "W3 Water Shallow Mask"
+    shallow.location = (280, -520)
+    ramp = shallow.color_ramp
+    ramp.elements[0].position = 0.0
+    ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+    ramp.elements[1].position = 0.28
+    ramp.elements[1].color = (0.0, 0.0, 0.0, 1.0)
+    for position in (0.03, 0.12):
+        element = ramp.elements.new(position)
+        element.color = (1.0, 1.0, 1.0, 1.0)
+    links.new(depth.outputs["Result"], shallow.inputs["Fac"])
+
+    depth_scale = nodes.new("ShaderNodeMapRange")
+    depth_scale.name = "W3 Water Depth Opacity Scale"
+    depth_scale.clamp = True
+    depth_scale.location = (300, -360)
+    depth_scale.inputs["From Min"].default_value = 0.0
+    depth_scale.inputs["From Max"].default_value = 1.0
+    depth_scale.inputs["To Min"].default_value = 0.42
+    depth_scale.inputs["To Max"].default_value = 1.0
+    links.new(depth.outputs["Result"], depth_scale.inputs["Value"])
+    depth_distance = nodes.new("ShaderNodeMapRange")
+    depth_distance.name = "W3 Water Depth Distance Fade"
+    depth_distance.clamp = True
+    depth_distance.location = (300, -440)
+    depth_distance.inputs["From Min"].default_value = 0.0
+    depth_distance.inputs["From Max"].default_value = 200.0
+    depth_distance.inputs["To Min"].default_value = 0.0
+    depth_distance.inputs["To Max"].default_value = 1.0
+    links.new(camera_data.outputs["View Distance"], depth_distance.inputs["Value"])
+    depth_mix = nodes.new("ShaderNodeMixRGB")
+    depth_mix.name = "W3 Water Depth Opacity Mix"
+    depth_mix.location = (500, -380)
+    depth_mix.inputs[2].default_value = (1.0, 1.0, 1.0, 1.0)
+    links.new(depth_distance.outputs["Result"], depth_mix.inputs[0])
+    links.new(depth_scale.outputs["Result"], depth_mix.inputs[1])
+    depth_alpha = nodes.new("ShaderNodeMath")
+    depth_alpha.name = "W3 Water Depth Opacity"
+    depth_alpha.operation = "MULTIPLY"
+    depth_alpha.location = (680, -300)
+    links.new(opacity.outputs["Result"], depth_alpha.inputs[0])
+    links.new(depth_mix.outputs[0], depth_alpha.inputs[1])
+
+    foam_gain = nodes.new("ShaderNodeMath")
+    foam_gain.name = "W3 Water Foam Gain"
+    foam_gain.operation = "ADD"
+    foam_gain.use_clamp = True
+    foam_gain.inputs[1].default_value = 0.5
+    foam_gain.location = (80, -760)
+    links.new(foam.outputs[0], foam_gain.inputs[0])
+    foam_lighting = nodes.new("ShaderNodeMath")
+    foam_lighting.name = "W3 Water Foam Lighting"
+    foam_lighting.operation = "MULTIPLY"
+    foam_lighting.location = (280, -760)
+    links.new(foam_gain.outputs[0], foam_lighting.inputs[0])
+    links.new(diffuse_scale.outputs[0], foam_lighting.inputs[1])
+
+    foam_pattern = nodes.new("ShaderNodeMapRange")
+    foam_pattern.name = "W3 Water Foam Pattern"
+    foam_pattern.clamp = True
+    foam_pattern.location = (80, -900)
+    foam_pattern.inputs["From Min"].default_value = 0.52
+    foam_pattern.inputs["From Max"].default_value = 0.72
+    if small_waves is not None:
+        links.new(small_waves.outputs["Fac"], foam_pattern.inputs["Value"])
+    foam_mask = nodes.new("ShaderNodeMath")
+    foam_mask.name = "W3 Water Shore Foam"
+    foam_mask.operation = "MULTIPLY"
+    foam_mask.location = (480, -660)
+    links.new(shallow.outputs["Color"], foam_mask.inputs[0])
+    links.new(foam_pattern.outputs["Result"], foam_mask.inputs[1])
+    foam_base = nodes.new("ShaderNodeMath")
+    foam_base.name = "W3 Water Foam Base"
+    foam_base.operation = "MULTIPLY"
+    foam_base.location = (680, -700)
+    links.new(foam_mask.outputs[0], foam_base.inputs[0])
+    links.new(foam_lighting.outputs[0], foam_base.inputs[1])
+    foam_strength = nodes.new("ShaderNodeMath")
+    foam_strength.name = "W3 Water Foam Strength"
+    foam_strength.operation = "MULTIPLY"
+    foam_strength.location = (680, -620)
+    # Broad procedural foam needs a restrained gain.
+    foam_strength.inputs[1].default_value = 1.0
+    links.new(foam_base.outputs[0], foam_strength.inputs[0])
+
+    # Multiply two drifting control samples for patches and gate by wind.
+    foam_combined = nodes.new("ShaderNodeMath")
+    foam_combined.name = "W3 Water Foam Combined"
+    foam_combined.operation = "ADD"
+    foam_combined.use_clamp = True
+    foam_combined.location = (840, -560)
+    foam_combined.inputs[1].default_value = 0.0
+    links.new(foam_strength.outputs[0], foam_combined.inputs[0])
+    if foam_image is not None:
+        slow_drift = nodes.new("ShaderNodeVectorMath")
+        slow_drift.name = "W3 Water Foam Slow Drift"
+        slow_drift.operation = "SCALE"
+        slow_drift.inputs["Scale"].default_value = 0.4
+        slow_drift.location = (-420, -1040)
+        links.new(flow_offset.outputs[0], slow_drift.inputs[0])
+        slow_coords = nodes.new("ShaderNodeVectorMath")
+        slow_coords.name = "W3 Water Foam Slow Coordinates"
+        slow_coords.operation = "ADD"
+        slow_coords.location = (-300, -1040)
+        links.new(texcoord.outputs["Generated"], slow_coords.inputs[0])
+        links.new(slow_drift.outputs[0], slow_coords.inputs[1])
+        uv_large = nodes.new("ShaderNodeVectorMath")
+        uv_large.name = "W3 Water Foam UV Large"
+        uv_large.operation = "SCALE"
+        uv_large.inputs["Scale"].default_value = 25.0
+        uv_large.location = (-180, -1040)
+        links.new(slow_coords.outputs[0], uv_large.inputs[0])
+        uv_small = nodes.new("ShaderNodeVectorMath")
+        uv_small.name = "W3 Water Foam UV Small"
+        uv_small.operation = "SCALE"
+        uv_small.inputs["Scale"].default_value = 120.0
+        uv_small.location = (-180, -1300)
+        links.new(animated_coordinates.outputs[0], uv_small.inputs[0])
+        patch_large = nodes.new("ShaderNodeTexImage")
+        patch_large.name = "W3 Water Foam Patch Large"
+        patch_large.image = foam_image
+        patch_large.extension = "REPEAT"
+        patch_large.location = (-20, -1040)
+        links.new(uv_large.outputs[0], patch_large.inputs["Vector"])
+        patch_small = nodes.new("ShaderNodeTexImage")
+        patch_small.name = "W3 Water Foam Patch Small"
+        patch_small.image = foam_image
+        patch_small.extension = "REPEAT"
+        patch_small.location = (-20, -1300)
+        links.new(uv_small.outputs[0], patch_small.inputs["Vector"])
+        patch_product = nodes.new("ShaderNodeMath")
+        patch_product.name = "W3 Water Foam Patch Product"
+        patch_product.operation = "MULTIPLY"
+        patch_product.location = (260, -1100)
+        links.new(patch_large.outputs["Color"], patch_product.inputs[0])
+        links.new(patch_small.outputs["Color"], patch_product.inputs[1])
+        patch_shape = nodes.new("ShaderNodeMapRange")
+        patch_shape.name = "W3 Water Foam Patch Shape"
+        patch_shape.clamp = True
+        patch_shape.location = (440, -1100)
+        patch_shape.inputs["From Min"].default_value = 0.20
+        patch_shape.inputs["From Max"].default_value = 0.55
+        patch_shape.inputs["To Max"].default_value = 1.6
+        links.new(patch_product.outputs[0], patch_shape.inputs["Value"])
+        foam_wind = nodes.new("ShaderNodeMath")
+        foam_wind.name = "W3 Water Foam Wind"
+        foam_wind.operation = "MAXIMUM"
+        foam_wind.inputs[1].default_value = 0.05
+        foam_wind.location = (440, -960)
+        links.new(wind.outputs[0], foam_wind.inputs[0])
+        patch_gain = nodes.new("ShaderNodeMath")
+        patch_gain.name = "W3 Water Foam Patch Gain"
+        patch_gain.operation = "MULTIPLY"
+        patch_gain.location = (620, -1040)
+        links.new(patch_shape.outputs["Result"], patch_gain.inputs[0])
+        links.new(foam_wind.outputs[0], patch_gain.inputs[1])
+        patches = nodes.new("ShaderNodeMath")
+        patches.name = "W3 Water Foam Patches"
+        patches.operation = "MULTIPLY"
+        patches.location = (700, -980)
+        links.new(patch_gain.outputs[0], patches.inputs[0])
+        links.new(foam_lighting.outputs[0], patches.inputs[1])
+        links.new(patches.outputs[0], foam_combined.inputs[1])
+
+    depth_invert = nodes.new("ShaderNodeMath")
+    depth_invert.name = "W3 Water Depth Invert"
+    depth_invert.operation = "SUBTRACT"
+    depth_invert.inputs[0].default_value = 1.0
+    depth_invert.location = (40, 320)
+    links.new(depth.outputs["Result"], depth_invert.inputs[1])
+    shallow_tint = nodes.new("ShaderNodeMixRGB")
+    shallow_tint.name = "W3 Water Shallow Tint"
+    shallow_tint.location = (200, 300)
+    shallow_tint.inputs[2].default_value = (0.27, 0.45, 0.38, 1.0)
+    links.new(depth_invert.outputs[0], shallow_tint.inputs[0])
+    links.new(surface_lighting.outputs[0], shallow_tint.inputs[1])
+
+    foam_color = nodes.new("ShaderNodeMixRGB")
+    foam_color.name = "W3 Water Foam Color"
+    foam_color.location = (420, 420)
+    foam_color.inputs[2].default_value = (0.85, 0.87, 0.88, 1.0)
+    links.new(foam_combined.outputs[0], foam_color.inputs[0])
+    links.new(shallow_tint.outputs[0], foam_color.inputs[1])
+    links.new(foam_color.outputs[0], surface.inputs["Base Color"])
+
+    foam_alpha = nodes.new("ShaderNodeMath")
+    foam_alpha.name = "W3 Water Foam Opacity"
+    foam_alpha.operation = "MULTIPLY"
+    foam_alpha.inputs[1].default_value = 0.30
+    foam_alpha.location = (680, -460)
+    links.new(foam_combined.outputs[0], foam_alpha.inputs[0])
+    final_alpha = nodes.new("ShaderNodeMath")
+    final_alpha.name = "W3 Water Final Opacity"
+    final_alpha.operation = "ADD"
+    final_alpha.use_clamp = True
+    final_alpha.location = (780, -220)
+    links.new(depth_alpha.outputs[0], final_alpha.inputs[0])
+    links.new(foam_alpha.outputs[0], final_alpha.inputs[1])
+    shore_cut = nodes.new("ShaderNodeMath")
+    shore_cut.name = "W3 Water Shore Cut"
+    shore_cut.operation = "MULTIPLY"
+    shore_cut.location = (900, -220)
+    links.new(final_alpha.outputs[0], shore_cut.inputs[0])
+    links.new(shore.outputs["Result"], shore_cut.inputs[1])
+    links.new(shore_cut.outputs[0], surface.inputs["Alpha"])
+
+    for attr, value in (
+        ("surface_render_method", "BLENDED"),
+        ("use_raytrace_refraction", False),
+        ("use_screen_refraction", False),
+        ("use_transparent_shadow", False),
+        ("use_transparency_overlap", False),
+    ):
+        if hasattr(mat, attr):
+            try:
+                setattr(mat, attr, value)
+            except (AttributeError, TypeError, ValueError):
+                pass
+    mat.diffuse_color = surface_color.inputs[1].default_value
+    mat[WORLD_WATER_MATERIAL_PROP] = True
+    mat[WORLD_WATER_KEY_PROP] = owner_key
+    mat["witcher_world_water_version"] = 9
+    mat["witcher_water_extinction_preview"] = 0.10
+    mat["witcher_water_representative_depth_m"] = 0.65
+    mat["witcher_water_heightmap_path"] = str(heightmap_path or "")
+    mat["witcher_water_foam_texture"] = bool(foam_image is not None)
+    mat["witcher_water_medium_normal_texture"] = bool(medium_normal_image is not None)
     return mat
 
 
-def _ensure_world_water_plane(hub_name, terrain_size):
+def _ensure_world_water_plane(
+    hub_name,
+    terrain_size,
+    heightmap_path="",
+    lowest_elevation=0.0,
+    highest_elevation=0.0,
+    world_key="",
+):
+    scene = bpy.context.scene
+    world_key = str(world_key or hub_name or "")
     obj_name = f"water_for_{hub_name}"
-    water_obj = bpy.data.objects.get(obj_name)
+    water_obj = next(
+        (
+            obj for obj in scene.objects
+            if bool(obj.get(WORLD_WATER_OBJECT_PROP, False))
+            and str(obj.get(WORLD_WATER_KEY_PROP, "") or "") == world_key
+        ),
+        None,
+    )
     if water_obj is None:
         bpy.ops.mesh.primitive_plane_add(
             size=float(terrain_size),
@@ -1289,6 +2183,8 @@ def _ensure_world_water_plane(hub_name, terrain_size):
         )
         water_obj = bpy.context.selected_objects[:][0]
         water_obj.name = obj_name
+    water_obj[WORLD_WATER_OBJECT_PROP] = True
+    water_obj[WORLD_WATER_KEY_PROP] = world_key
 
     try:
         water_obj.location = (0.0, 0.0, 0.0)
@@ -1298,7 +2194,17 @@ def _ensure_world_water_plane(hub_name, terrain_size):
         pass
 
     if water_obj.type == 'MESH':
-        mat = _ensure_simple_water_material()
+        material_key = f"{scene.name_full}:{world_key}"
+        mat = _ensure_simple_water_material(
+            heightmap_path,
+            lowest_elevation,
+            highest_elevation,
+            foam_image=_load_water_asset_image(
+                "environment\\water\\global_ocean\\ocean_control.texarray"),
+            medium_normal_image=_load_water_asset_image(
+                "environment\\water\\global_ocean\\wave_med_n.xbm"),
+            owner_key=material_key,
+        )
         water_obj.data.materials.clear()
         water_obj.data.materials.append(mat)
     return water_obj
@@ -1373,7 +2279,7 @@ def import_combined_terrain_full_map(
             continue
         for space in area.spaces:
             if space.type == 'VIEW_3D':
-                space.clip_end = 9999
+                space.clip_end = max(float(space.clip_end), float(terrain_size) * math.sqrt(2.0))
 
     _create_full_map_geo_nodes(obj, heightmap_path, lowest_elevation, highest_elevation)
     _create_full_map_material(obj, colormap_path, f"{hub_name}_terrain_m")
@@ -1632,12 +2538,13 @@ def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=N
     hub_name = ctx["hub_name"]
     n_tiles = ctx["n_tiles"]
     tile_res = ctx["tile_res"]
+    water_key = _terrain_world_key(hub_name, filePath)
 
     if n_tiles <= 0:
         log.warning("Could not determine terrain tile grid for %s", hub_name)
         return None
 
-    _ensure_world_water_plane(hub_name, worldFile.terrainSize)
+    _ensure_world_water_plane(hub_name, worldFile.terrainSize, world_key=water_key)
 
     multires_level = _get_scene_terrain_multires_level()
     buffer_paths = _collect_tile_buffer_paths_for_combine(
@@ -1671,6 +2578,14 @@ def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=N
     if not os.path.isfile(heightmap_path):
         log.warning("Missing combined heightmap PNG: %s", heightmap_path)
         return None
+    _ensure_world_water_plane(
+        hub_name,
+        worldFile.terrainSize,
+        heightmap_path,
+        worldFile.lowestElevation,
+        worldFile.highestElevation,
+        world_key=water_key,
+    )
 
     tiles = (combined or {}).get("info", {}).get("tiles", {}) or {}
     baked_path = _bake_fullmap_diffuse(
@@ -1733,12 +2648,13 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
     hub_name = ctx["hub_name"]
     n_tiles = ctx["n_tiles"]
     tile_res = ctx["tile_res"]
+    water_key = _terrain_world_key(hub_name, filePath)
 
     if n_tiles <= 0:
         log.warning("Could not determine terrain tile grid for %s", hub_name)
         return
 
-    _ensure_world_water_plane(hub_name, worldFile.terrainSize)
+    _ensure_world_water_plane(hub_name, worldFile.terrainSize, world_key=water_key)
 
     multires_level = _get_scene_terrain_multires_level()
 
@@ -1786,6 +2702,30 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
     if not tile_heightmap_buffers:
         log.warning("No terrain tile heightmaps found for %s", hub_name)
         return
+
+    heightmap_path = os.path.join(str(ctx["output_dir"]), f"{hub_name}.heightmap.png")
+    try:
+        terrain_w2ter.combine_w2ter_tiles(
+            list(tile_heightmap_buffers.values()),
+            str(ctx["output_dir"]),
+            hub_name,
+            res_override=tile_res,
+            x_tiles_override=n_tiles,
+            y_tiles_override=n_tiles,
+            targets=("heightmap",),
+            skip_existing=True,
+        )
+    except Exception:
+        log.warning("Water depth heightmap combine failed", exc_info=True)
+    if os.path.isfile(heightmap_path):
+        _ensure_world_water_plane(
+            hub_name,
+            worldFile.terrainSize,
+            heightmap_path,
+            worldFile.lowestElevation,
+            worldFile.highestElevation,
+            world_key=water_key,
+        )
 
     log.info("Importing %d terrain tiles for %s (%dx%d grid)", len(tile_heightmap_buffers), hub_name, n_tiles, n_tiles)
 
@@ -1852,16 +2792,102 @@ def _terrain_grid_topology(mesh_res):
     return cached
 
 
-def _create_tile_mesh(name, heightmap_buffer_path, tile_res, mesh_res,
-                      tile_size, elev_range):
-    """Create a terrain grid from a raw heightmap."""
-    # Read raw heightmap
-    heightmap = np.fromfile(win_safe_path(heightmap_buffer_path), dtype="<u2")
+def _read_tile_heightmap(heightmap_buffer_path, tile_res, cache=None):
+    """Read and validate one row-major uint16 terrain height buffer."""
+    tile_res = max(1, int(tile_res))
+    source_path = str(heightmap_buffer_path)
+    safe_path = win_safe_path(source_path)
+    cache_key = (os.path.normcase(os.path.abspath(source_path)), tile_res)
+    if cache is not None and cache_key in cache:
+        heightmap = cache.pop(cache_key)
+        cache[cache_key] = heightmap
+        return heightmap
+
+    heightmap = np.fromfile(safe_path, dtype="<u2")
     if heightmap.size != tile_res * tile_res:
         raise ValueError(
             f"Terrain buffer has {heightmap.size} samples; expected {tile_res * tile_res}"
         )
     heightmap = heightmap.reshape((tile_res, tile_res))
+    if cache is not None:
+        cache[cache_key] = heightmap
+        while len(cache) > TERRAIN_HEIGHTMAP_CACHE_LIMIT:
+            cache.pop(next(iter(cache)))
+    return heightmap
+
+
+def _read_optional_tile_heightmap(heightmap_buffer_path, tile_res, cache=None):
+    if not heightmap_buffer_path:
+        return None
+    try:
+        return _read_tile_heightmap(heightmap_buffer_path, tile_res, cache=cache)
+    except (OSError, ValueError):
+        log.warning(
+            "Could not read terrain stitch buffer; clamping the tile edge: %s",
+            heightmap_buffer_path,
+            exc_info=True,
+        )
+        return None
+
+
+def _stitch_tile_heightmap(current, right=None, up=None, diagonal=None):
+    """Build a neighbor-padded square tile height lattice."""
+    current = np.asarray(current)
+    if current.ndim != 2 or current.shape[0] != current.shape[1]:
+        raise ValueError("Terrain heightmap must be a square 2D array")
+
+    shape = current.shape
+    for label, neighbor in (("right", right), ("up", up), ("diagonal", diagonal)):
+        if neighbor is not None and np.asarray(neighbor).shape != shape:
+            raise ValueError(f"Terrain {label} heightmap shape does not match the current tile")
+
+    tile_res = shape[0]
+    stitched = np.empty((tile_res + 1, tile_res + 1), dtype=current.dtype)
+    stitched[:tile_res, :tile_res] = current
+    stitched[:tile_res, tile_res] = (
+        np.asarray(right)[:, 0] if right is not None else current[:, -1]
+    )
+    stitched[tile_res, :tile_res] = (
+        np.asarray(up)[0, :] if up is not None else current[-1, :]
+    )
+    stitched[tile_res, tile_res] = (
+        np.asarray(diagonal)[0, 0] if diagonal is not None else current[-1, -1]
+    )
+    return stitched
+
+
+def _terrain_tile_sample_indices(tile_res, mesh_res):
+    """Return inclusive source-lattice indices for a terrain mesh level."""
+    tile_res = max(1, int(tile_res))
+    mesh_res = max(2, int(mesh_res))
+    return np.rint(
+        np.linspace(0, tile_res, mesh_res, dtype=np.float64)
+    ).astype(np.intp)
+
+
+def _create_tile_mesh(
+    name,
+    heightmap_buffer_path,
+    tile_res,
+    mesh_res,
+    tile_size,
+    elev_range,
+    *,
+    positive_x_buffer_path="",
+    positive_y_buffer_path="",
+    positive_xy_buffer_path="",
+    heightmap_cache=None,
+):
+    """Create a terrain grid using neighbor edge samples."""
+    heightmap = _read_tile_heightmap(
+        heightmap_buffer_path, tile_res, cache=heightmap_cache)
+    right = _read_optional_tile_heightmap(
+        positive_x_buffer_path, tile_res, cache=heightmap_cache)
+    up = _read_optional_tile_heightmap(
+        positive_y_buffer_path, tile_res, cache=heightmap_cache)
+    diagonal = _read_optional_tile_heightmap(
+        positive_xy_buffer_path, tile_res, cache=heightmap_cache)
+    stitched_heightmap = _stitch_tile_heightmap(heightmap, right, up, diagonal)
 
     mesh = bpy.data.meshes.new(name)
     half = tile_size / 2.0
@@ -1869,10 +2895,10 @@ def _create_tile_mesh(name, heightmap_buffer_path, tile_res, mesh_res,
 
     # Use NumPy and Blender bulk APIs for dense grids.
     axis = np.linspace(-half, half, mesh_res, dtype=np.float32)
-    sample_axis = np.rint(
-        np.linspace(0, max(0, tile_res - 1), mesh_res, dtype=np.float64)
-    ).astype(np.intp)
-    sampled_height = heightmap[np.ix_(sample_axis, sample_axis)].astype(np.float32)
+    sample_axis = _terrain_tile_sample_indices(tile_res, mesh_res)
+    sampled_height = stitched_heightmap[
+        np.ix_(sample_axis, sample_axis)
+    ].astype(np.float32)
     sampled_height *= float(elev_range) / 65535.0
 
     grid_x, grid_y = np.meshgrid(axis, axis)
@@ -1900,6 +2926,30 @@ def _create_tile_mesh(name, heightmap_buffer_path, tile_res, mesh_res,
     return mesh
 
 
+def _terrain_tile_neighbor_path_from_object(obj, property_name, dx, dy):
+    """Read stored stitch metadata, with a legacy loaded-sibling fallback."""
+    path = str(obj.get(property_name, "") or "")
+    if path:
+        return path
+
+    parent = getattr(obj, "parent", None)
+    x = obj.get("tile_x")
+    y = obj.get("tile_y")
+    if parent is None or x is None or y is None:
+        return ""
+    target_x = int(x) + int(dx)
+    target_y = int(y) + int(dy)
+    for candidate in getattr(parent, "children", ()):
+        if candidate is obj or getattr(candidate, "type", None) != 'MESH':
+            continue
+        if (
+            int(candidate.get("tile_x", -1)) == target_x
+            and int(candidate.get("tile_y", -1)) == target_y
+        ):
+            return str(candidate.get("tile_buffer_path", "") or "")
+    return ""
+
+
 def rebuild_tile_mesh(obj, target_level):
     """Rebuild a terrain tile at a new resolution."""
     buffer_path = obj.get("tile_buffer_path")
@@ -1914,10 +2964,19 @@ def rebuild_tile_mesh(obj, target_level):
 
     target_level = _clamp_tile_multires_level(target_level, tile_res)
     mesh_res = (1 << target_level) + 1 if target_level > 0 else 2
+    positive_x_buffer_path = _terrain_tile_neighbor_path_from_object(
+        obj, "positive_x_buffer_path", 1, 0)
+    positive_y_buffer_path = _terrain_tile_neighbor_path_from_object(
+        obj, "positive_y_buffer_path", 0, 1)
+    positive_xy_buffer_path = _terrain_tile_neighbor_path_from_object(
+        obj, "positive_xy_buffer_path", 1, 1)
     old_mesh = obj.data
     new_mesh = _create_tile_mesh(
         obj.name, buffer_path, int(tile_res), mesh_res,
         float(tile_size), float(elev_range),
+        positive_x_buffer_path=positive_x_buffer_path,
+        positive_y_buffer_path=positive_y_buffer_path,
+        positive_xy_buffer_path=positive_xy_buffer_path,
     )
     if old_mesh is not None:
         for material in old_mesh.materials:
@@ -2172,6 +3231,7 @@ def _terrain_elevation_range(spec) -> float:
 
 def _tile_import_signature(spec, source, bounds, multires_level):
     values = (
+        TERRAIN_TILE_STITCH_VERSION,
         spec.world_key,
         source.key.x,
         source.key.y,
@@ -2187,6 +3247,9 @@ def _tile_import_signature(spec, source, bounds, multires_level):
         bounds.max_y,
         multires_level,
         _source_file_stamp(source.heightmap_buffer),
+        _source_file_stamp(source.positive_x_buffer_path),
+        _source_file_stamp(source.positive_y_buffer_path),
+        _source_file_stamp(source.positive_xy_buffer_path),
         _source_file_stamp(source.overlay_path),
     )
     return hashlib.sha1(repr(values).encode("utf-8", errors="replace")).hexdigest()
@@ -2242,6 +3305,22 @@ def _tile_material_name(spec, key):
 _TERRAIN_DETAIL_WORLD_CACHE = {}
 
 
+def _terrain_detail_cached_assets_available(assets):
+    try:
+        atlas = assets["atlas"]
+        diffuse_path = str(atlas.get("diffuse", "") or "")
+    except (AttributeError, KeyError, TypeError):
+        return False
+    if not diffuse_path:
+        return False
+
+    for field in ("diffuse", "normal", "json"):
+        path = str(atlas.get(field, "") or "")
+        if path and not os.path.isfile(win_safe_path(path)):
+            return False
+    return True
+
+
 def _get_scene_terrain_detail_enabled():
     try:
         return bool(bpy.context.scene.witcher_file_browser.terrain_detail_material)
@@ -2269,11 +3348,11 @@ def _world_colormap_start_mip(worldFile):
     return None
 
 
-def _resolve_tile_tint_buffer(spec, worldFile, source):
-    mip = _world_colormap_start_mip(worldFile)
-    if mip is None or mip < 0:
+def _resolve_tile_tint_buffer_at(spec, mip, x, y):
+    if mip is None or int(mip) < 0:
         return ""
-    buf_name = f"{source.tile_name}.w2ter.{mip * 2 + 3}.buffer"
+    tile_name = f"tile_{int(y)}_x_{int(x)}_res{int(spec.tile_res)}"
+    buf_name = f"{tile_name}.w2ter.{int(mip) * 2 + 3}.buffer"
     path = _resolve_tile_buffer(
         spec.terrain_tiles_dir,
         spec.terrain_tiles_rel or None,
@@ -2283,16 +3362,109 @@ def _resolve_tile_tint_buffer(spec, worldFile, source):
     return str(path or "")
 
 
+def _resolve_tile_tint_buffer(spec, worldFile, source):
+    return _resolve_tile_tint_buffer_at(
+        spec,
+        _world_colormap_start_mip(worldFile),
+        source.key.x,
+        source.key.y,
+    )
+
+
+def _terrain_detail_parameter_world_path(spec):
+    selected_path = os.path.normpath(str(spec.world_path or ""))
+    if not selected_path:
+        return ""
+
+    source_roots = [
+        *_configured_redkit_workspace_roots(),
+        *_configured_redkit_roots(),
+    ]
+    unique_roots = []
+    seen = set()
+    for root in source_roots:
+        key = os.path.normcase(os.path.normpath(str(root)))
+        if key and key not in seen:
+            seen.add(key)
+            unique_roots.append(os.path.normpath(str(root)))
+    if not unique_roots:
+        return selected_path
+
+    relative_path = None
+    try:
+        uncook_root = get_uncook_path(bpy.context)
+    except Exception:
+        uncook_root = ""
+    if uncook_root:
+        relative_path = _relpath_under_root(selected_path, uncook_root)
+    if not relative_path:
+        for root in unique_roots:
+            relative_path = _relpath_under_root(selected_path, root)
+            if relative_path:
+                break
+    if not relative_path:
+        parts = Path(selected_path).parts
+        for index, part in enumerate(parts):
+            if part.casefold() in {"levels", "dlc"}:
+                relative_path = os.path.join(*parts[index:])
+                break
+    if not relative_path:
+        return selected_path
+
+    for root in unique_roots:
+        candidate = os.path.normpath(os.path.join(root, relative_path))
+        if os.path.isfile(win_safe_path(candidate)):
+            return candidate
+    return selected_path
+
+
+def _terrain_detail_parameter_world(worldFile, spec, source_path=None):
+    selected_path = os.path.normpath(str(spec.world_path or ""))
+    source_path = os.path.normpath(str(
+        source_path or _terrain_detail_parameter_world_path(spec) or selected_path))
+    if not source_path or os.path.normcase(source_path) == os.path.normcase(selected_path):
+        return worldFile, selected_path
+    try:
+        source_world = CR2W.CR2W_reader.load_w2w(
+            source_path, include_groups=False)
+    except Exception:
+        log.warning(
+            "Could not read project Texture Pack values: %s",
+            source_path,
+            exc_info=True,
+        )
+        return worldFile, selected_path
+    return (source_world, source_path) if source_world is not None else (worldFile, selected_path)
+
+
 def _terrain_detail_world_assets(worldFile, spec, slice_px):
     key = (spec.world_key, int(slice_px))
+    parameter_world_path = _terrain_detail_parameter_world_path(spec)
+    source_stamp = _source_file_stamp(parameter_world_path)
     cached = _TERRAIN_DETAIL_WORLD_CACHE.get(key)
-    if cached is not None:
+    if (
+        cached is not None
+        and cached.get("source_stamp") == source_stamp
+        and _terrain_detail_cached_assets_available(cached)
+    ):
         return cached
+    if cached is not None:
+        _TERRAIN_DETAIL_WORLD_CACHE.pop(key, None)
+
+    parameter_world, parameter_world_path = _terrain_detail_parameter_world(
+        worldFile, spec, parameter_world_path)
+    source_stamp = _source_file_stamp(parameter_world_path)
 
     from ..unreal_export import terrain_material as w3_terrain_material
     from . import terrain_detail
 
-    mat_set = w3_terrain_material.extract_terrain_material_set(worldFile)
+    # Prefer project material parameters over generated fallback data when both
+    # are available.
+    with redkit_repo_context(
+        parameter_world_path or spec.world_path,
+        roots=_configured_redkit_roots(),
+    ):
+        mat_set = w3_terrain_material.extract_terrain_material_set(parameter_world)
     if not mat_set.layers:
         raise RuntimeError(
             "; ".join(mat_set.warnings) or "terrain material has no texture layers")
@@ -2307,17 +3479,140 @@ def _terrain_detail_world_assets(worldFile, spec, slice_px):
                     "falloff", "specularity", "specularity_base", "specularity_scale")
     params_rows = [{f: getattr(layer, f, None) for f in param_fields}
                    for layer in mat_set.layers]
-    assets = {"atlas": atlas, "params_rows": params_rows,
-              "layer_count": len(mat_set.layers)}
+    assets = {
+        "atlas": atlas,
+        "params_rows": params_rows,
+        "layer_count": len(mat_set.layers),
+        "layer_metadata": terrain_detail.build_terrain_layer_metadata(mat_set.layers),
+        "fresnel_power": float(getattr(mat_set, "fresnel_power", 2.0)),
+        "source_stamp": source_stamp,
+        "parameter_world_path": str(parameter_world_path or spec.world_path),
+    }
     _TERRAIN_DETAIL_WORLD_CACHE[key] = assets
     return assets
+
+
+_TERRAIN_INSPECTOR_PATH_PROPS = {
+    "texture_buffer": "witcher_terrain_texture_buffer",
+    "positive_x_texture_buffer": "witcher_terrain_positive_x_texture_buffer",
+    "positive_y_texture_buffer": "witcher_terrain_positive_y_texture_buffer",
+    "positive_xy_texture_buffer": "witcher_terrain_positive_xy_texture_buffer",
+}
+_TERRAIN_INSPECTOR_LAYERS_PROP = "witcher_terrain_layer_metadata"
+
+
+def _store_terrain_inspector_metadata(obj, source, tile_res, layer_metadata):
+    if obj is None:
+        return
+    values = {
+        "texture_buffer": getattr(source, "texture_buffer", ""),
+        "positive_x_texture_buffer": getattr(source, "positive_x_texture_buffer_path", ""),
+        "positive_y_texture_buffer": getattr(source, "positive_y_texture_buffer_path", ""),
+        "positive_xy_texture_buffer": getattr(source, "positive_xy_texture_buffer_path", ""),
+    }
+    for key, prop_name in _TERRAIN_INSPECTOR_PATH_PROPS.items():
+        obj[prop_name] = str(values[key] or "")
+    obj["witcher_terrain_control_res"] = int(tile_res)
+    obj[_TERRAIN_INSPECTOR_LAYERS_PROP] = json.dumps(
+        list(layer_metadata or []), separators=(",", ":"))
+
+
+def _control_buffer_from_height_buffer(path):
+    path = str(path or "")
+    suffix = ".1.buffer"
+    if path.lower().endswith(suffix):
+        return path[:-len(suffix)] + ".2.buffer"
+    return ""
+
+
+def ensure_terrain_inspector_metadata(obj):
+    if obj is None:
+        raise RuntimeError("No terrain tile is active")
+
+    result = {
+        key: str(obj.get(prop_name, "") or "")
+        for key, prop_name in _TERRAIN_INSPECTOR_PATH_PROPS.items()
+    }
+    legacy_height_props = {
+        "texture_buffer": "tile_buffer_path",
+        "positive_x_texture_buffer": "positive_x_buffer_path",
+        "positive_y_texture_buffer": "positive_y_buffer_path",
+        "positive_xy_texture_buffer": "positive_xy_buffer_path",
+    }
+    for key, height_prop in legacy_height_props.items():
+        if not result[key]:
+            result[key] = _control_buffer_from_height_buffer(obj.get(height_prop, ""))
+            if result[key]:
+                obj[_TERRAIN_INSPECTOR_PATH_PROPS[key]] = result[key]
+
+    try:
+        result["res"] = int(obj.get("witcher_terrain_control_res", obj.get("tile_res", 0)) or 0)
+    except (TypeError, ValueError):
+        result["res"] = 0
+    if result["res"] <= 0:
+        raise RuntimeError("The terrain tile has no control-map resolution metadata")
+    if not result["texture_buffer"] or not os.path.isfile(win_safe_path(result["texture_buffer"])):
+        raise RuntimeError(f"Terrain control buffer not found: {result['texture_buffer'] or '<unset>'}")
+
+    layer_metadata = []
+    encoded = str(obj.get(_TERRAIN_INSPECTOR_LAYERS_PROP, "") or "")
+    if encoded:
+        try:
+            decoded = json.loads(encoded)
+            if isinstance(decoded, list):
+                layer_metadata = decoded
+        except (TypeError, ValueError, json.JSONDecodeError):
+            layer_metadata = []
+
+    if not layer_metadata:
+        world_path = str(obj.get("world_path", "") or "")
+        if not world_path:
+            parent = getattr(obj, "parent", None)
+            world_path = str(parent.get("world_path", "") or "") if parent is not None else ""
+        if not world_path or not os.path.isfile(win_safe_path(world_path)):
+            raise RuntimeError("Layer names are unavailable; reimport this tile with the updated importer")
+
+        from ..CR2W import CR2W_reader
+        from ..unreal_export import terrain_material as w3_terrain_material
+        from . import terrain_detail
+
+        world_file = CR2W_reader.load_w2w(world_path)
+        with redkit_repo_context(world_path, roots=_configured_redkit_roots()):
+            mat_set = w3_terrain_material.extract_terrain_material_set(world_file)
+        layer_metadata = terrain_detail.build_terrain_layer_metadata(mat_set.layers)
+        if not layer_metadata:
+            raise RuntimeError(
+                "; ".join(getattr(mat_set, "warnings", []) or [])
+                or "The terrain material contains no atlas layers")
+        obj[_TERRAIN_INSPECTOR_LAYERS_PROP] = json.dumps(
+            layer_metadata, separators=(",", ":"))
+
+    result["layers"] = layer_metadata
+    return result
 
 
 def _apply_tile_detail_material(worldFile, spec, source, bounds, obj, mat_name):
     from . import terrain_detail, terrain_detail_nodes
 
     assets = _terrain_detail_world_assets(worldFile, spec, _get_scene_terrain_detail_res())
-    tint_buffer = _resolve_tile_tint_buffer(spec, worldFile, source)
+    tint_mip = _world_colormap_start_mip(worldFile)
+    tint_buffer = _resolve_tile_tint_buffer_at(
+        spec, tint_mip, source.key.x, source.key.y)
+    positive_x_tint_buffer = ""
+    positive_y_tint_buffer = ""
+    positive_xy_tint_buffer = ""
+    if source.key.x + 1 < int(spec.x_tiles):
+        positive_x_tint_buffer = _resolve_tile_tint_buffer_at(
+            spec, tint_mip, source.key.x + 1, source.key.y)
+    if source.key.y + 1 < int(spec.y_tiles):
+        positive_y_tint_buffer = _resolve_tile_tint_buffer_at(
+            spec, tint_mip, source.key.x, source.key.y + 1)
+    if (
+        source.key.x + 1 < int(spec.x_tiles)
+        and source.key.y + 1 < int(spec.y_tiles)
+    ):
+        positive_xy_tint_buffer = _resolve_tile_tint_buffer_at(
+            spec, tint_mip, source.key.x + 1, source.key.y + 1)
     maps = terrain_detail.build_tile_detail_maps(
         source.texture_buffer,
         source.heightmap_buffer,
@@ -2327,11 +3622,32 @@ def _apply_tile_detail_material(worldFile, spec, source, bounds, obj, mat_name):
         assets["params_rows"],
         layer_count=assets["layer_count"],
         tint_buffer=tint_buffer,
+        positive_x_texture_buffer=source.positive_x_texture_buffer_path,
+        positive_y_texture_buffer=source.positive_y_texture_buffer_path,
+        positive_xy_texture_buffer=source.positive_xy_texture_buffer_path,
+        positive_x_heightmap_buffer=source.positive_x_buffer_path,
+        positive_y_heightmap_buffer=source.positive_y_buffer_path,
+        positive_xy_heightmap_buffer=source.positive_xy_buffer_path,
+        positive_x_tint_buffer=positive_x_tint_buffer,
+        positive_y_tint_buffer=positive_y_tint_buffer,
+        positive_xy_tint_buffer=positive_xy_tint_buffer,
     )
     if maps is None:
         raise RuntimeError(f"tile control buffer unavailable: {source.texture_buffer}")
-    return terrain_detail_nodes.apply_tile_detail_material(
-        obj, mat_name, assets["atlas"], maps)
+    _store_terrain_inspector_metadata(
+        obj, source, int(spec.tile_res), assets.get("layer_metadata") or [])
+    mat = terrain_detail_nodes.apply_tile_detail_material(
+        obj,
+        mat_name,
+        assets["atlas"],
+        maps,
+        fresnel_power=assets["fresnel_power"],
+        texture_pack_key=spec.world_key,
+        layer_metadata=assets.get("layer_metadata") or [],
+    )
+    if mat is not None:
+        _apply_terrain_material_controls(mat, _get_terrain_material_controls())
+    return mat
 
 
 def _apply_fullmap_detail_material(worldFile, spec, obj, texture_buffers, out_dir):
@@ -2354,8 +3670,18 @@ def _apply_fullmap_detail_material(worldFile, spec, obj, texture_buffers, out_di
     if maps is None:
         raise RuntimeError("full-map terrain control buffers are unavailable")
     mat_name = f"terrain_{spec.hub_name}_{spec.world_key[:8]}_full_mat"
-    return terrain_detail_nodes.apply_tile_detail_material(
-        obj, mat_name, assets["atlas"], maps)
+    mat = terrain_detail_nodes.apply_tile_detail_material(
+        obj,
+        mat_name,
+        assets["atlas"],
+        maps,
+        fresnel_power=assets["fresnel_power"],
+        texture_pack_key=spec.world_key,
+        layer_metadata=assets.get("layer_metadata") or [],
+    )
+    if mat is not None:
+        _apply_terrain_material_controls(mat, _get_terrain_material_controls())
+    return mat
 
 
 def _link_terrain_object(obj, world_collection):
@@ -2374,6 +3700,7 @@ def _import_resolved_terrain_tile(
     world_collection,
     root=None,
     existing_by_key=None,
+    heightmap_cache=None,
 ):
     if not source.heightmap_buffer or not os.path.isfile(win_safe_path(source.heightmap_buffer)):
         return TerrainTileImportResult(
@@ -2387,13 +3714,7 @@ def _import_resolved_terrain_tile(
     level = _clamp_tile_multires_level(multires_level, spec.tile_res)
     overlay_path = _prepare_tile_overlay(source, spec.tile_res)
     if overlay_path != source.overlay_path:
-        source = TerrainTileSource(
-            request=source.request,
-            tile_name=source.tile_name,
-            heightmap_buffer=source.heightmap_buffer,
-            texture_buffer=source.texture_buffer,
-            overlay_path=overlay_path,
-        )
+        source = replace(source, overlay_path=overlay_path)
 
     if root is None:
         root = _ensure_terrain_root(spec, level, world_collection)
@@ -2420,6 +3741,10 @@ def _import_resolved_terrain_tile(
         mesh_res,
         bounds.tile_size,
         _terrain_elevation_range(spec),
+        positive_x_buffer_path=source.positive_x_buffer_path,
+        positive_y_buffer_path=source.positive_y_buffer_path,
+        positive_xy_buffer_path=source.positive_xy_buffer_path,
+        heightmap_cache=heightmap_cache,
     )
 
     created = existing is None
@@ -2440,6 +3765,9 @@ def _import_resolved_terrain_tile(
     obj["tile_world_y"] = bounds.world_y
     obj["terrain_multires"] = level
     obj["tile_buffer_path"] = source.heightmap_buffer
+    obj["positive_x_buffer_path"] = source.positive_x_buffer_path
+    obj["positive_y_buffer_path"] = source.positive_y_buffer_path
+    obj["positive_xy_buffer_path"] = source.positive_xy_buffer_path
     obj["tile_res"] = spec.tile_res
     obj["tile_size"] = bounds.tile_size
     obj["elev_range"] = _terrain_elevation_range(spec)
@@ -2492,6 +3820,7 @@ def import_world_terrain_tile(
             x,
             y,
             include_overlay=include_overlay,
+            include_stitch_neighbors=True,
         )
     if not source.available:
         return TerrainTileImportResult(
@@ -2650,21 +3979,39 @@ def do_import_terrain_tiles(
         if a.type == 'VIEW_3D':
             for s in a.spaces:
                 if s.type == 'VIEW_3D':
-                    s.clip_end = 9999
+                    s.clip_end = max(float(s.clip_end), float(spec.terrain_size) * math.sqrt(2.0))
 
     count = 0
+    heightmap_cache = {}
     for (x, y), buffer_path in sorted(
         tile_heightmap_buffers.items(),
         key=lambda item: (item[0][1], item[0][0]),
     ):
         overlay_path = tile_overlays.get((x, y))
-        request = terrain_tile_source_request(x, y, include_overlay=bool(overlay_path))
+        request = terrain_tile_source_request(
+            x,
+            y,
+            include_overlay=bool(overlay_path),
+            include_stitch_neighbors=True,
+        )
         source = TerrainTileSource(
             request=request,
             tile_name=f"tile_{y}_x_{x}_res{spec.tile_res}",
             heightmap_buffer=str(buffer_path or ""),
             texture_buffer=str(tile_texture_buffers.get((x, y)) or ""),
             overlay_path=str(overlay_path or ""),
+            positive_x_buffer_path=str(
+                tile_heightmap_buffers.get((x + 1, y)) or ""),
+            positive_y_buffer_path=str(
+                tile_heightmap_buffers.get((x, y + 1)) or ""),
+            positive_xy_buffer_path=str(
+                tile_heightmap_buffers.get((x + 1, y + 1)) or ""),
+            positive_x_texture_buffer_path=str(
+                tile_texture_buffers.get((x + 1, y)) or ""),
+            positive_y_texture_buffer_path=str(
+                tile_texture_buffers.get((x, y + 1)) or ""),
+            positive_xy_texture_buffer_path=str(
+                tile_texture_buffers.get((x + 1, y + 1)) or ""),
         )
         result = _import_resolved_terrain_tile(
             spec,
@@ -2674,6 +4021,7 @@ def do_import_terrain_tiles(
             world_collection=world_collection,
             root=empty,
             existing_by_key=existing_by_key,
+            heightmap_cache=heightmap_cache,
         )
         if result.ok:
             count += 1

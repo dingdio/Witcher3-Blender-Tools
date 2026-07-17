@@ -1,4 +1,5 @@
 import sys as _sys
+import json
 import os
 import re
 import shutil
@@ -492,7 +493,10 @@ from .ui import lists as unified_lists
 
 import bpy
 from bpy.types import (Panel, Operator)
-from bpy.props import StringProperty, BoolProperty, CollectionProperty, IntProperty, EnumProperty
+from bpy.props import (
+    StringProperty, BoolProperty, CollectionProperty, IntProperty, EnumProperty,
+    FloatProperty,
+)
 from mathutils import Vector
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 import addon_utils
@@ -3573,10 +3577,194 @@ class WITCHER_OT_apply_fullmap_multires(bpy.types.Operator):
         return {'FINISHED'}
 
 
+_TERRAIN_TEXTURE_PACK_UI_LOADING = False
+
+
+def _terrain_texture_pack_update(item, context):
+    if _TERRAIN_TEXTURE_PACK_UI_LOADING:
+        return
+    key = str(getattr(item, "texture_pack_key", "") or "")
+    layer_id = int(getattr(item, "layer_id", 0) or 0)
+    if not key or layer_id <= 0:
+        return
+    from .importers import terrain_detail_nodes
+    terrain_detail_nodes.update_terrain_texture_pack_layer(
+        key,
+        layer_id,
+        blend_sharpness=item.blend_sharpness,
+        slope_base_dampening=item.slope_base_dampening,
+        # The stored range is [0, 1]; the editor exposes [-1, 1].
+        slope_normal_dampening=item.slope_normal_dampening * 0.5 + 0.5,
+        falloff=item.falloff,
+        specularity=item.specularity,
+        specularity_base=item.specularity_base,
+        specularity_scale=item.specularity_scale,
+    )
+
+
+class WITCHER_PG_terrain_texture_layer(bpy.types.PropertyGroup):
+    layer_id: IntProperty(name="Layer ID", min=1, max=32, options={'SKIP_SAVE'})
+    texture_pack_key: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    diffuse_path: StringProperty(
+        name="Diffuse", description="Source diffuse texture", options={'SKIP_SAVE'})
+    normal_path: StringProperty(
+        name="Normal", description="Source normal/roughness texture", options={'SKIP_SAVE'})
+    blend_sharpness: FloatProperty(
+        name="Blend Sharpness", min=0.0, max=1.0,
+        description="Texture blend sharpness stored in val.X",
+        update=_terrain_texture_pack_update)
+    slope_base_dampening: FloatProperty(
+        name="Slope Base Damp", min=0.0, max=1.0,
+        description="Slope base dampening stored in val.Y",
+        update=_terrain_texture_pack_update)
+    slope_normal_dampening: FloatProperty(
+        name="Slope Normal Damp", min=-1.0, max=1.0,
+        description="Unpacked slope normal dampening stored in val.Z",
+        update=_terrain_texture_pack_update)
+    falloff: FloatProperty(
+        name="Falloff", min=0.0, max=1.0,
+        description=(
+            "Runtime falloff stored in val.W; some editors label the slot "
+            "RSpec_Scale"),
+        update=_terrain_texture_pack_update)
+    specularity: FloatProperty(
+        name="Specularity", min=0.0, max=1.0,
+        description="Direct specularity input stored in val2.X",
+        update=_terrain_texture_pack_update)
+    specularity_base: FloatProperty(
+        name="RSpec Base", min=0.0, max=1.0,
+        description="Roughness-dependent specular base stored in val2.Y",
+        update=_terrain_texture_pack_update)
+    specularity_scale: FloatProperty(
+        name="RSpec Scale", min=0.0, max=1.0,
+        description=(
+            "Runtime RSpec_Scale stored in val2.Z; some editors label the slot "
+            "Fallof"),
+        update=_terrain_texture_pack_update)
+
+
+class WITCHER_UL_terrain_texture_layers(bpy.types.UIList):
+    def draw_item(
+        self, _context, layout, _data, item, _icon, _active_data,
+        _active_propname, _index,
+    ):
+        row = layout.row(align=True)
+        row.label(text="", icon='MATERIAL')
+        row.label(text=f"{int(item.layer_id)}: {item.name}")
+
+
+def _active_terrain_texture_pack(context):
+    obj = getattr(context, "active_object", None)
+    mat = getattr(obj, "active_material", None) if obj is not None else None
+    if mat is None and obj is not None and getattr(obj, "data", None) is not None:
+        materials = getattr(obj.data, "materials", None)
+        if materials:
+            mat = materials[0]
+    if mat is None or not bool(mat.get("witcher_terrain_detail")):
+        raise RuntimeError("Make an imported detail-terrain object active")
+    key = str(mat.get("witcher_terrain_texture_pack_key", "") or "")
+    if not key:
+        raise RuntimeError("Reimport this terrain to enable live Texture Pack controls")
+    metadata_text = str(mat.get("witcher_terrain_layer_metadata", "") or "")
+    if not metadata_text and obj is not None:
+        metadata_text = str(obj.get("witcher_terrain_layer_metadata", "") or "")
+    try:
+        metadata = json.loads(metadata_text) if metadata_text else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        metadata = []
+    if not isinstance(metadata, list) or not metadata:
+        raise RuntimeError("Terrain Texture Pack metadata is unavailable; reimport the terrain")
+    return obj, mat, key, metadata
+
+
+def _populate_terrain_texture_pack_ui(scene, key, metadata, source_name=""):
+    from .importers import terrain_detail_nodes
+    rows = terrain_detail_nodes.terrain_texture_pack_values(key, metadata)
+    global _TERRAIN_TEXTURE_PACK_UI_LOADING
+    _TERRAIN_TEXTURE_PACK_UI_LOADING = True
+    try:
+        scene.witcher_terrain_texture_layers.clear()
+        for row in rows:
+            item = scene.witcher_terrain_texture_layers.add()
+            item.name = str(row.get("name") or f"Layer {row.get('id', 0)}")
+            item.layer_id = int(row.get("id", 0))
+            item.texture_pack_key = str(key)
+            item.diffuse_path = str(
+                row.get("diffuse_source") or row.get("diffuse_dds") or "")
+            item.normal_path = str(
+                row.get("normal_source") or row.get("normal_dds") or "")
+            item.blend_sharpness = float(row.get("blend_sharpness", 0.0))
+            item.slope_base_dampening = float(row.get("slope_base_dampening", 0.0))
+            item.slope_normal_dampening = (
+                float(row.get("slope_normal_dampening", 0.5)) * 2.0 - 1.0)
+            item.falloff = float(row.get("falloff", 0.0))
+            item.specularity = float(row.get("specularity", 0.0))
+            item.specularity_base = float(row.get("specularity_base", 0.0))
+            item.specularity_scale = float(row.get("specularity_scale", 0.0))
+        scene.witcher_terrain_texture_pack_key = str(key)
+        scene.witcher_terrain_texture_pack_source = str(source_name)
+        scene.witcher_terrain_texture_pack_metadata = json.dumps(
+            metadata, separators=(",", ":"))
+        if rows:
+            scene.witcher_terrain_texture_layer_index = min(
+                max(0, int(scene.witcher_terrain_texture_layer_index)),
+                len(rows) - 1,
+            )
+        else:
+            scene.witcher_terrain_texture_layer_index = 0
+    finally:
+        _TERRAIN_TEXTURE_PACK_UI_LOADING = False
+    return len(rows)
+
+
+class WITCHER_OT_load_terrain_texture_pack(bpy.types.Operator):
+    bl_idname = "witcher.load_terrain_texture_pack"
+    bl_label = "Load Terrain Texture Pack"
+    bl_description = "Load live per-layer parameters from the active terrain material"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        try:
+            _obj, mat, key, metadata = _active_terrain_texture_pack(context)
+            count = _populate_terrain_texture_pack_ui(
+                context.scene, key, metadata, source_name=mat.name)
+        except RuntimeError as exc:
+            self.report({'WARNING'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Loaded {count} terrain Texture Pack layers")
+        return {'FINISHED'}
+
+
+class WITCHER_OT_reset_terrain_texture_pack(bpy.types.Operator):
+    bl_idname = "witcher.reset_terrain_texture_pack"
+    bl_label = "Reset Texture Pack Parameters"
+    bl_description = "Restore every live layer parameter to the imported terrain material values"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        scene = context.scene
+        key = str(getattr(scene, "witcher_terrain_texture_pack_key", "") or "")
+        try:
+            metadata = json.loads(str(
+                getattr(scene, "witcher_terrain_texture_pack_metadata", "") or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = []
+        if not key or not metadata:
+            self.report({'WARNING'}, "Load an active terrain Texture Pack first")
+            return {'CANCELLED'}
+        from .importers import terrain_detail_nodes
+        terrain_detail_nodes.reset_terrain_texture_pack(key, metadata)
+        count = _populate_terrain_texture_pack_ui(
+            scene, key, metadata,
+            source_name=getattr(scene, "witcher_terrain_texture_pack_source", ""))
+        self.report({'INFO'}, f"Reset {count} terrain Texture Pack layers")
+        return {'FINISHED'}
+
+
 class WITCHER_OT_apply_terrain_material_values(bpy.types.Operator):
     bl_idname = "witcher.apply_terrain_material_values"
-    bl_label = "Apply Terrain Material Values"
-    bl_description = "Apply terrain roughness/specular to all imported terrain materials"
+    bl_label = "Sync Terrain Material Controls"
+    bl_description = "Sync the live terrain material controls to all loaded terrain materials"
 
     def execute(self, context):
         scene_settings = getattr(context.scene, "witcher_file_browser", None)
@@ -3584,15 +3772,186 @@ class WITCHER_OT_apply_terrain_material_values(bpy.types.Operator):
             self.report({'ERROR'}, "Terrain settings are not available")
             return {'CANCELLED'}
 
-        roughness = max(0.0, min(1.0, float(getattr(scene_settings, "terrain_material_roughness", 0.82))))
-        specular = max(0.0, min(1.0, float(getattr(scene_settings, "terrain_material_specular", 0.12))))
-
         from .importers import import_w2w
-        updated = import_w2w.update_all_terrain_material_values(roughness, specular)
+        updated = import_w2w.update_all_terrain_material_controls(scene_settings)
         if updated <= 0:
-            self.report({'WARNING'}, "No imported terrain materials found to update")
+            self.report({'WARNING'}, "No compatible loaded terrain materials found")
         else:
-            self.report({'INFO'}, f"Updated {updated} terrain materials")
+            self.report({'INFO'}, f"Synced {updated} terrain materials")
+        return {'FINISHED'}
+
+
+class WITCHER_OT_inspect_terrain_face_materials(bpy.types.Operator):
+    bl_idname = "witcher.inspect_terrain_face_materials"
+    bl_label = "Inspect Terrain Face Materials"
+    bl_description = (
+        "Show the horizontal and vertical atlas layers used at the center of "
+        "the single selected terrain face"
+    )
+    bl_options = {'INTERNAL'}
+
+    face_info: StringProperty(name="Selected Face", options={'SKIP_SAVE'})
+    control_location: StringProperty(name="Control Location", options={'SKIP_SAVE'})
+    horizontal_layers: StringProperty(name="Horizontal", options={'SKIP_SAVE'})
+    vertical_layers: StringProperty(name="Vertical", options={'SKIP_SAVE'})
+    slope_parameters: StringProperty(name="Slope Parameters", options={'SKIP_SAVE'})
+    vertical_scales: StringProperty(name="Vertical Scale", options={'SKIP_SAVE'})
+    corner_samples: StringProperty(name="Four Control Taps", options={'SKIP_SAVE'})
+    horizontal_paths: StringProperty(name="Horizontal Paths", options={'SKIP_SAVE'})
+    vertical_paths: StringProperty(name="Vertical Paths", options={'SKIP_SAVE'})
+    control_buffer: StringProperty(
+        name="Control Buffer", subtype='FILE_PATH', options={'SKIP_SAVE'})
+
+    @staticmethod
+    def _layer_summary(entries):
+        parts = []
+        for entry in entries:
+            layer = entry["layer"]
+            layer_id = int(layer["id"])
+            if layer_id <= 0:
+                parts.append(f"None / Hole ({float(entry['weight']) * 100.0:.1f}%)")
+                continue
+            parts.append(
+                f"{layer_id}: {layer['name']} "
+                f"[atlas {int(layer['atlas_index'])}] "
+                f"({float(entry['weight']) * 100.0:.1f}%)")
+        return " | ".join(parts) or "None"
+
+    @staticmethod
+    def _layer_paths(entries):
+        parts = []
+        for entry in entries:
+            layer = entry["layer"]
+            if int(layer["id"]) <= 0:
+                continue
+            path = str(layer.get("diffuse_source") or layer.get("diffuse_dds") or "")
+            if path:
+                parts.append(f"{int(layer['id'])}: {path}")
+        return " | ".join(parts) or "No source path available"
+
+    def _read_selection(self, context):
+        obj = getattr(context, "active_object", None)
+        if not _is_terrain_tile(obj):
+            raise RuntimeError("Make a terrain tile the active object")
+        if context.mode != 'EDIT_MESH':
+            raise RuntimeError("Enter Edit Mode and select exactly one terrain face")
+
+        import bmesh
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
+        selected = [face for face in bm.faces if face.select]
+        if len(selected) != 1:
+            raise RuntimeError(
+                f"Select exactly one terrain face (currently selected: {len(selected)})")
+        face = selected[0]
+        uv_layer = bm.loops.layers.uv.active
+        if uv_layer is None:
+            raise RuntimeError("The terrain tile has no active UV map")
+        uvs = [loop[uv_layer].uv.copy() for loop in face.loops]
+        if not uvs:
+            raise RuntimeError("The selected terrain face has no UV coordinates")
+        u = sum(float(uv.x) for uv in uvs) / len(uvs)
+        v = sum(float(uv.y) for uv in uvs) / len(uvs)
+        return obj, int(face.index), uvs, u, v
+
+    def _inspect(self, context):
+        from .importers import import_w2w, terrain_detail
+
+        obj, face_index, uvs, u, v = self._read_selection(context)
+        metadata = import_w2w.ensure_terrain_inspector_metadata(obj)
+        lattice = terrain_detail.load_tile_control_lattice(
+            metadata["texture_buffer"],
+            metadata["res"],
+            positive_x_texture_buffer=metadata["positive_x_texture_buffer"],
+            positive_y_texture_buffer=metadata["positive_y_texture_buffer"],
+            positive_xy_texture_buffer=metadata["positive_xy_texture_buffer"],
+        )
+        if lattice is None:
+            raise RuntimeError(f"Could not read terrain control buffer: {metadata['texture_buffer']}")
+        result = terrain_detail.inspect_terrain_control_lattice(
+            lattice, u, v, metadata["layers"])
+
+        res = int(result["resolution"])
+        min_u = min(float(uv.x) for uv in uvs)
+        max_u = max(float(uv.x) for uv in uvs)
+        min_v = min(float(uv.y) for uv in uvs)
+        max_v = max(float(uv.y) for uv in uvs)
+        grid_x, grid_y = result["grid"]
+        cell_x, cell_y = result["cell"]
+        self.face_info = (
+            f"{obj.name} | face {face_index} | "
+            f"UV center ({u:.6f}, {v:.6f})")
+        self.control_location = (
+            f"cell ({cell_x}, {cell_y}) | lattice ({grid_x:.3f}, {grid_y:.3f}) | "
+            f"face span X {min_u * res:.3f}..{max_u * res:.3f}, "
+            f"Y {min_v * res:.3f}..{max_v * res:.3f}")
+        self.horizontal_layers = self._layer_summary(result["horizontal_layers"])
+        self.vertical_layers = self._layer_summary(result["vertical_layers"])
+
+        effective = result["effective"]
+        self.slope_parameters = (
+            f"threshold {float(effective['slope_threshold']):.6g} | "
+            f"H sharpness {float(effective['blend_sharpness']):.6g} | "
+            f"V base damp {float(effective['slope_base_dampening']):.6g} | "
+            f"V normal damp {float(effective['slope_normal_dampening']):.6g} | "
+            f"hole {float(effective['hole_weight']) * 100.0:.1f}%")
+
+        scales = {}
+        corner_parts = []
+        for tap in result["taps"]:
+            weight = float(tap["weight"])
+            if weight > 1e-8:
+                key = (int(tap["scale_index"]), float(tap["vertical_uv_scale"]))
+                scales[key] = scales.get(key, 0.0) + weight
+            corner_parts.append(
+                f"{tap['corner']} {weight * 100.0:.1f}%: "
+                f"H{int(tap['horizontal_id'])}/V{int(tap['vertical_id'])} "
+                f"S{int(tap['slope_index'])}={float(tap['slope_threshold']):.3g} "
+                f"UV{int(tap['scale_index'])}={float(tap['vertical_uv_scale']):.4g} "
+                f"0x{int(tap['control']):04X}")
+        self.vertical_scales = " | ".join(
+            f"index {index}: {scale:.6g} ({weight * 100.0:.1f}%)"
+            for (index, scale), weight in sorted(scales.items())
+        ) or "None"
+        self.corner_samples = " | ".join(corner_parts)
+        self.horizontal_paths = self._layer_paths(result["horizontal_layers"])
+        self.vertical_paths = self._layer_paths(result["vertical_layers"])
+        self.control_buffer = metadata["texture_buffer"]
+
+    def invoke(self, context, event):
+        try:
+            self._inspect(context)
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=780)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        selection = layout.box()
+        selection.label(text="Selected Face", icon='FACESEL')
+        selection.prop(self, "face_info")
+        selection.prop(self, "control_location")
+
+        layers = layout.box()
+        layers.label(text="Atlas Layers at Face Center", icon='MATERIAL')
+        layers.prop(self, "horizontal_layers")
+        layers.prop(self, "vertical_layers")
+        layers.prop(self, "horizontal_paths")
+        layers.prop(self, "vertical_paths")
+
+        controls = layout.box()
+        controls.label(text="Control Blend", icon='NODE_MATERIAL')
+        controls.prop(self, "slope_parameters")
+        controls.prop(self, "vertical_scales")
+        controls.prop(self, "corner_samples")
+        controls.prop(self, "control_buffer")
+
+    def execute(self, context):
         return {'FINISHED'}
 
 
@@ -3676,18 +4035,118 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                     unload_op.use_view = False
                     unload_op.action = 'UNLOAD'
 
-            if hasattr(scene_settings, "terrain_material_roughness") and hasattr(scene_settings, "terrain_material_specular"):
+            if hasattr(scene_settings, "terrain_material_surface_mode"):
                 body = section("witcher_terrain_material", "Material", 'MATERIAL', default_closed=True)
                 if body:
                     col = body.column(align=True)
-                    row = col.row(align=True)
-                    row.prop(scene_settings, "terrain_material_roughness", text="Roughness")
-                    row.prop(scene_settings, "terrain_material_specular", text="Specular")
+                    col.prop(scene_settings, "terrain_material_surface_mode", text="Surface")
+                    if scene_settings.terrain_material_surface_mode == 'OVERRIDE':
+                        row = col.row(align=True)
+                        row.prop(scene_settings, "terrain_material_roughness", text="Roughness")
+                        row.prop(scene_settings, "terrain_material_specular", text="Specular")
+                    col.prop(scene_settings, "terrain_material_normal_strength", text="Normal Strength")
+                    debug_header = col.row(align=True)
+                    debug_header.prop(
+                        scene_settings,
+                        "terrain_material_show_debug",
+                        text="Debug",
+                        icon=(
+                            'TRIA_DOWN'
+                            if scene_settings.terrain_material_show_debug
+                            else 'TRIA_RIGHT'
+                        ),
+                        emboss=False,
+                    )
+                    if scene_settings.terrain_material_show_debug:
+                        debug_box = col.box()
+                        debug_box.prop(scene_settings, "terrain_material_debug_view", text="View")
+                        debug_box.prop(scene_settings, "terrain_material_slope_mode", text="Slope")
+                        debug_box.prop(scene_settings, "terrain_material_tint_strength", text="Tint")
+                        debug_box.prop(scene_settings, "terrain_material_fresnel_strength", text="Fresnel")
                     col.operator(
                         "witcher.apply_terrain_material_values",
-                        text="Apply Material To Loaded Terrain",
+                        text="Sync Loaded Terrain",
                         icon='SHADING_RENDERED',
                     )
+
+            if hasattr(scene_settings, "water_wind"):
+                body = section("witcher_terrain_water", "Water", 'MOD_FLUIDSIM', default_closed=True)
+                if body:
+                    col = body.column(align=True)
+                    has_water = any(
+                        m.get("witcher_world_water_material") for m in bpy.data.materials
+                    )
+                    if not has_water:
+                        col.label(text="No world water loaded", icon='INFO')
+                    col.prop(scene_settings, "water_wind", text="Wind", slider=True)
+                    col.prop(scene_settings, "water_wind_direction", text="Direction")
+                    col.prop(scene_settings, "water_flow_speed", text="Flow Speed")
+                    col.prop(scene_settings, "water_foam_intensity", text="Foam")
+                    col.prop(scene_settings, "water_reflection", text="Reflection", slider=True)
+                    col.prop(scene_settings, "water_clarity", text="Clarity", slider=True)
+                    col.prop(scene_settings, "water_level", text="Level")
+
+            if hasattr(context.scene, "witcher_terrain_texture_layers"):
+                body = section(
+                    "witcher_terrain_texture_pack",
+                    "Texture Pack Parameters",
+                    'TEXTURE',
+                    default_closed=True,
+                )
+                if body:
+                    col = body.column(align=True)
+                    col.operator(
+                        "witcher.load_terrain_texture_pack",
+                        text="Load Active Terrain Pack",
+                        icon='FILE_REFRESH',
+                    )
+                    layers = context.scene.witcher_terrain_texture_layers
+                    if layers:
+                        col.prop(
+                            context.scene,
+                            "witcher_terrain_texture_pack_source",
+                            text="Material",
+                        )
+                        col.template_list(
+                            "WITCHER_UL_terrain_texture_layers",
+                            "terrain_texture_pack",
+                            context.scene,
+                            "witcher_terrain_texture_layers",
+                            context.scene,
+                            "witcher_terrain_texture_layer_index",
+                            rows=5,
+                        )
+                        index = min(
+                            max(0, int(context.scene.witcher_terrain_texture_layer_index)),
+                            len(layers) - 1,
+                        )
+                        item = layers[index]
+                        params = col.box()
+                        params.label(
+                            text=f"Layer {int(item.layer_id)}: {item.name}",
+                            icon='MATERIAL',
+                        )
+                        spec_row = params.row(align=True)
+                        spec_row.prop(item, "specularity", text="Specularity")
+                        spec_row.prop(item, "specularity_base", text="RSpec Base")
+                        params.prop(item, "blend_sharpness", text="Blend Sharpness")
+                        params.prop(item, "slope_base_dampening", text="Slope Base Damp")
+                        params.prop(item, "slope_normal_dampening", text="Slope Normal Damp")
+                        params.prop(item, "falloff", text="Falloff")
+                        params.prop(item, "specularity_scale", text="RSpec Scale")
+                        params.label(
+                            text="Some editors swap the last two labels",
+                            icon='INFO',
+                        )
+                        paths = params.box()
+                        paths.label(text="Texture Sources", icon='FILE_IMAGE')
+                        paths.prop(item, "diffuse_path", text="Diffuse")
+                        paths.prop(item, "normal_path", text="Normal")
+                        col.operator(
+                            "witcher.reset_terrain_texture_pack",
+                            text="Reset Imported Values",
+                            icon='LOOP_BACK',
+                        )
 
         body = section("witcher_terrain_collection", "Layer Collection", 'OUTLINER_COLLECTION', default_closed=True)
         coll = context.collection
@@ -3887,6 +4346,24 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
             col.label(text=f"Loaded Tiles: {len(tiles)}")
             col.label(text=f"Terrain Size: {float(root.get('terrainSize', 0.0)):.2f}")
             col.label(text=f"Elevation: {float(root.get('lowestElevation', 0.0)):.2f} .. {float(root.get('highestElevation', 0.0)):.2f}")
+
+        active_tile = context.active_object if _is_terrain_tile(context.active_object) else None
+        body = section("witcher_terrain_face_materials", "Face Materials", 'MATERIAL')
+        if body:
+            col = body.column(align=True)
+            if active_tile is None:
+                col.label(text="Make a terrain tile active", icon='INFO')
+            elif context.mode != 'EDIT_MESH':
+                col.label(text="Edit Mode: select one face", icon='FACESEL')
+            else:
+                col.label(text="Uses the selected face center", icon='FACESEL')
+            action = col.row()
+            action.enabled = active_tile is not None
+            action.operator(
+                "witcher.inspect_terrain_face_materials",
+                text="Inspect Selected Face",
+                icon='VIEWZOOM',
+            )
 
         body = section("witcher_terrain_tile_controls", "Tile Controls", 'MOD_MULTIRES')
         if body:
@@ -4541,7 +5018,12 @@ _classes = [
     WITCHER_OT_dismiss_external_import_alert,
     WITCHER_OT_select_terrain_tiles,
     WITCHER_OT_apply_fullmap_multires,
+    WITCHER_PG_terrain_texture_layer,
+    WITCHER_UL_terrain_texture_layers,
+    WITCHER_OT_load_terrain_texture_pack,
+    WITCHER_OT_reset_terrain_texture_pack,
     WITCHER_OT_apply_terrain_material_values,
+    WITCHER_OT_inspect_terrain_face_materials,
     WITCH_OT_toggle_rot90,
     WITCH_OT_merge_armature_hierarchy,
 
@@ -4615,6 +5097,16 @@ def register():
     armature_context.register()
     for cls in _classes:
         register_class(cls)
+    bpy.types.Scene.witcher_terrain_texture_layers = CollectionProperty(
+        type=WITCHER_PG_terrain_texture_layer)
+    bpy.types.Scene.witcher_terrain_texture_layer_index = IntProperty(
+        name="Texture Pack Layer", default=0, min=0)
+    bpy.types.Scene.witcher_terrain_texture_pack_key = StringProperty(
+        name="Texture Pack Key", options={'HIDDEN'})
+    bpy.types.Scene.witcher_terrain_texture_pack_source = StringProperty(
+        name="Terrain Material", description="Loaded terrain material data-block")
+    bpy.types.Scene.witcher_terrain_texture_pack_metadata = StringProperty(
+        name="Texture Pack Source Data", options={'HIDDEN'})
     ui_custom_icons.register()
     ui_entity.register()
     ui_material.register()
@@ -4707,6 +5199,15 @@ def unregister():
     del bpy.types.Scene.witcher_tools_tab
     if hasattr(bpy.types.Collection, "witcher_visible_on_start"):
         del bpy.types.Collection.witcher_visible_on_start
+    for prop_name in (
+        "witcher_terrain_texture_layers",
+        "witcher_terrain_texture_layer_index",
+        "witcher_terrain_texture_pack_key",
+        "witcher_terrain_texture_pack_source",
+        "witcher_terrain_texture_pack_metadata",
+    ):
+        if hasattr(bpy.types.Scene, prop_name):
+            delattr(bpy.types.Scene, prop_name)
     armature_context.unregister()
     for cls in _classes:
         unregister_class(cls)
