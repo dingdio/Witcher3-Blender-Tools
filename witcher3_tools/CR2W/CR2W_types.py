@@ -1454,6 +1454,14 @@ class PROPERTY:
             ):
                 f.seek(4, os.SEEK_CUR)
 
+        # Variant-prefixed Float arrays bypass the exact-type branch above.
+        # Read them before the generic scalar-size heuristics.
+        if arrayDataType == "array" and elementType == "Float":
+            self.value = [readFloat(f) for _ in range(count)]
+            if f.tell() < dataEnd:
+                f.seek(dataEnd)
+            return
+
         #parse data:
         if ("curveData" in arrayDataType):
             pass

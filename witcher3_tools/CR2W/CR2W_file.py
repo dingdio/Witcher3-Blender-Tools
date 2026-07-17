@@ -210,6 +210,9 @@ class CLayerInfo(object):
 class WORLD:
     def __init__(self):
         self.worldName = "WORLD_NAME"
+        # Keep both the raw properties and compact decoded environment.
+        self.environmentParameters = None
+        self.environment = None
         self.terrainClipMap = None
         self.tileRes:int = 256
         self.clipSize:int = 0
@@ -363,6 +366,16 @@ def create_world(file, file_path=None, include_groups: bool = True):
     for chunk in CHUNKS:
         if chunk.name == "CGameWorld":
             CGameWorld:W_CLASS = chunk
+
+    world.environmentParameters = (
+        CGameWorld.GetVariableByName('environmentParameters') if CGameWorld is not None else None
+    )
+    if world.environmentParameters is not None:
+        try:
+            from .dc_environment import decode_world_environment
+            world.environment = decode_world_environment(file)
+        except Exception:
+            log.warning("Could not decode world environment parameters for %s", file_path, exc_info=True)
 
     fl = getattr(CGameWorld, 'Firstlayer', None)
     fl_ref = getattr(fl, 'Reference', None) if fl is not None else None
