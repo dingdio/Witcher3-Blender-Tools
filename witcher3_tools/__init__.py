@@ -448,7 +448,9 @@ from .ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_check_foliage_world)
 from .ui import ui_anims
 from .ui import ui_speech
+from .ui import ui_file_browser
 from .ui import ui_entity
+from .ui import ui_equipment
 from .ui import ui_morphs
 from .ui import ui_material
 from .ui.ui_morphs import (WITCH_OT_morphs)
@@ -486,10 +488,6 @@ from .ui.ui_anims import WITCH_OT_ImportW2Rig, WITCH_OT_ExportW2AnimJson, WITCH_
 from .materials import nodes as material_nodes
 from . import w3_asset_browser
 from . import unreal_export
-
-# New unified panel system
-from .ui import panels as unified_panels
-from .ui import lists as unified_lists
 
 import bpy
 from bpy.types import (Panel, Operator)
@@ -5108,7 +5106,9 @@ def register():
     bpy.types.Scene.witcher_terrain_texture_pack_metadata = StringProperty(
         name="Texture Pack Source Data", options={'HIDDEN'})
     ui_custom_icons.register()
+    ui_file_browser.register()
     ui_entity.register()
+    ui_equipment.register()
     ui_material.register()
     ui_morphs.register()
     livelink_face.register()
@@ -5139,10 +5139,6 @@ def register():
     w3_asset_browser.register()
     unreal_export.register()
     
-    # Register new unified panel system
-    unified_lists.register()
-    unified_panels.register()
-    
     # Register dev features only when the dev folder exists and dev_mode_enabled is true.
     try:
         from . import dev
@@ -5158,10 +5154,6 @@ def unregister():
         dev.unregister()
     except ImportError:
         pass
-    
-    # Unregister new unified panel system
-    unified_panels.unregister()
-    unified_lists.unregister()
     
     #PATH LIST
     bpy.utils.unregister_class(WITCHER_OT_refresh_dlc_mounter_sources)
@@ -5222,7 +5214,9 @@ def unregister():
     ui_anims.unregister()
     ui_dialog_language.unregister()
     ui_material.unregister()
+    ui_equipment.unregister()
     ui_entity.unregister()
+    ui_file_browser.unregister()
     livelink_face.unregister()
     ui_morphs.unregister()
     lipsync.unregister()

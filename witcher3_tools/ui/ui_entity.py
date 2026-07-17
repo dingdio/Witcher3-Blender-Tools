@@ -56,8 +56,6 @@ from ..repo_paths import (
 )
 from ..duplication import duplicate_character_hierarchy as _duplicate_character_hierarchy
 
-from . import ui_file_browser
-
 from bpy_extras.io_utils import (
         ImportHelper
         )
@@ -2372,7 +2370,6 @@ def register():
         ],
         default='APPEARANCES',
     )
-    ui_file_browser.register()
     # bpy.utils.register_class(BundleItemPropertyGroup)
     # bpy.types.Scene.bundle_items = CollectionProperty(type=BundleItemPropertyGroup)
     #bpy.types.Scene.bundle_item_index = bpy.props.IntProperty()
@@ -2384,11 +2381,8 @@ def register():
         )
     for c in classes:
         bpy.utils.register_class(c)
-    ui_equipment.register()
     
 def unregister():
-    ui_equipment.unregister()
-    ui_file_browser.unregister()
     _unregister_coloring_proxy_properties()
     for prop_name in ("witcher_character_tab",):
         if hasattr(bpy.types.Scene, prop_name):
