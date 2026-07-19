@@ -20,6 +20,7 @@ __all__ = [
     "ImportIsolationBatchSession",
     "ImportIsolationSession",
     "collect_related_hierarchy_objects",
+    "global_undo_disabled",
     "import_isolation_enabled",
     "isolated_batch_import_target",
     "isolated_import_batch_session",
@@ -58,6 +59,18 @@ def import_isolation_enabled(enabled: bool = True) -> bool:
     if not ENABLE_ISOLATED_IMPORTS:
         return False
     return _DISABLE_DEPTH == 0
+
+
+@contextmanager
+def global_undo_disabled():
+    """Disable Blender's global undo inside the context."""
+    edit_prefs = bpy.context.preferences.edit
+    previous = edit_prefs.use_global_undo
+    edit_prefs.use_global_undo = False
+    try:
+        yield
+    finally:
+        edit_prefs.use_global_undo = previous
 
 
 @contextmanager

@@ -8,9 +8,15 @@ from typing import Sequence
 
 
 TERRAIN_IMPORT_MODE_ITEMS = (
-    ('SELECTED_TILE', 'Selected Tile', 'Import only the chosen terrain tile'),
-    ('FULL_MAP', 'Full Map', 'Import one combined map using Geometry Nodes + Multires'),
-    ('TILES', 'All Tiles', 'Import every terrain tile (advanced and potentially expensive)'),
+    (
+        'VIEW_LOD',
+        'Native View LOD',
+        'Import native terrain detail around the view and a lightweight overview elsewhere',
+        3,
+    ),
+    ('SELECTED_TILE', 'Selected Tile', 'Import only the chosen terrain tile', 0),
+    ('FULL_MAP', 'Full Map', 'Import one combined map using Geometry Nodes + Multires', 1),
+    ('TILES', 'All Tiles', 'Import every terrain tile (advanced and potentially expensive)', 2),
 )
 
 TERRAIN_FOLIAGE_MODE_ITEMS = (
@@ -115,6 +121,34 @@ def terrain_tile_from_world_position(
     return int(tile_x), int(tile_y)
 
 
+def terrain_native_level(tile_res: int) -> int:
+    tile_res = int(tile_res)
+    if tile_res <= 0:
+        raise ValueError("Terrain tile resolution must be positive")
+    return max(0, tile_res.bit_length() - 1)
+
+
+def terrain_view_lod_tiles(
+    tiles_x: int,
+    tiles_y: int,
+    center_x: int,
+    center_y: int,
+    radius: int = 3,
+) -> frozenset[tuple[int, int]]:
+    tiles_x = int(tiles_x)
+    tiles_y = int(tiles_y)
+    if tiles_x <= 0 or tiles_y <= 0:
+        raise ValueError("Terrain tile counts must be positive")
+    center_x = max(0, min(tiles_x - 1, int(center_x)))
+    center_y = max(0, min(tiles_y - 1, int(center_y)))
+    radius = max(0, int(radius))
+    return frozenset(
+        (x, y)
+        for y in range(max(0, center_y - radius), min(tiles_y, center_y + radius + 1))
+        for x in range(max(0, center_x - radius), min(tiles_x, center_x + radius + 1))
+    )
+
+
 def point_in_bounds(
     x: float,
     y: float,
@@ -136,6 +170,8 @@ __all__ = (
     "TERRAIN_IMPORT_MODE_ITEMS",
     "coerce_bounds",
     "point_in_bounds",
+    "terrain_native_level",
     "terrain_tile_bounds",
     "terrain_tile_from_world_position",
+    "terrain_view_lod_tiles",
 )

@@ -9,6 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import bpy
 import numpy as np
@@ -28,17 +29,48 @@ def _rgba(path: str, pixels: np.ndarray) -> None:
 
 
 def main() -> None:
-    assert terrain_detail_nodes.NODE_VERSION == 13
+    assert terrain_detail_nodes.NODE_VERSION == 14
+    class FakeImage(dict):
+        def __init__(self):
+            super().__init__()
+            self.alpha_mode = "STRAIGHT"
+            self.colorspace_settings = SimpleNamespace(name="sRGB")
+            self.reload_count = 0
+
+        def reload(self):
+            self.reload_count += 1
+
+    image = FakeImage()
+    class FakeImages:
+        def __init__(self):
+            self.count = 0
+
+        def __len__(self):
+            return self.count
+
+        def load(self, *_args, **_kwargs):
+            self.count = 1
+            return image
+
+    fake_bpy = SimpleNamespace(data=SimpleNamespace(images=FakeImages()))
+    with mock.patch.object(terrain_detail_nodes, "bpy", fake_bpy):
+        assert terrain_detail_nodes._image_for(__file__, "Non-Color") is image
+        assert image.reload_count == 0
+        image["w3_detail_stamp"] = "stale"
+        terrain_detail_nodes._image_for(__file__, "Non-Color")
+        assert image.reload_count == 1
+
     ui_map = importlib.import_module("witcher3_tools.ui.ui_map")
     operator_class = ui_map.WITCH_OT_w2w
     bpy.utils.register_class(operator_class)
     try:
         properties = bpy.ops.witcher.import_w2w.get_rna_type().properties
-        assert properties["terrain_import_mode"].default == "TILES"
-        assert properties["terrain_multires_level"].default == 6
+        assert properties["terrain_import_mode"].default == "VIEW_LOD"
+        assert properties["terrain_multires_level"].default == 8
+        assert properties["terrain_lod_radius"].default == 3
         assert properties["terrain_build_layer_tree"].default is True
         assert properties["terrain_detail_material"].default is True
-        assert properties["terrain_detail_texture_res"].default == "1024"
+        assert properties["terrain_detail_texture_res"].default == "2048"
     finally:
         bpy.utils.unregister_class(operator_class)
 
@@ -51,6 +83,32 @@ def main() -> None:
         assert import_w2w.AddCLayerGroup(group, False, world_path.upper()) is first
     finally:
         bpy.data.collections.remove(first)
+
+    overview_material = bpy.data.materials.new("TerrainLodOverviewSmoke")
+    overview_spec = SimpleNamespace(x_tiles=2, y_tiles=2)
+    overview_key = SimpleNamespace(x=1, y=1)
+    overview_objects = []
+    try:
+        for _index in range(2):
+            bpy.ops.mesh.primitive_plane_add(size=2.0)
+            overview_obj = bpy.context.object
+            overview_objects.append(overview_obj)
+            import_w2w._apply_terrain_lod_overview_material(
+                overview_obj, overview_material, overview_spec, overview_key)
+            assert overview_obj.data.materials[0] is overview_material
+            world_uv = overview_obj.data.uv_layers.get("WorldUV")
+            assert world_uv is not None
+            uv_values = np.empty(len(world_uv.uv) * 2, dtype=np.float32)
+            world_uv.uv.foreach_get("vector", uv_values)
+            assert np.min(uv_values) >= 0.5 - 1e-6
+            assert np.max(uv_values) <= 1.0 + 1e-6
+    finally:
+        for overview_obj in overview_objects:
+            mesh = overview_obj.data
+            bpy.data.objects.remove(overview_obj, do_unlink=True)
+            if mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+        bpy.data.materials.remove(overview_material)
 
     with tempfile.TemporaryDirectory() as tmp:
         atlas_d_path = os.path.join(tmp, "atlas_d.png")
@@ -169,6 +227,12 @@ def main() -> None:
             if node.bl_idname == "ShaderNodeGroup"
         )
         material_group = material_group_node.node_tree
+        compute_node = next(
+            node for node in material_group.nodes
+            if node.bl_idname == "ShaderNodeGroup"
+            and node.node_tree.name.startswith(".W3TerrainCompute ")
+        )
+        compute_group = compute_node.node_tree
         assert material_group_node.name == terrain_detail_nodes.DETAIL_GROUP_NODE_NAME
         assert {
             "Normal Strength", "Tint Strength", "Fresnel Strength", "Slope Override",
@@ -181,8 +245,26 @@ def main() -> None:
         assert lut is not None
         assert any(
             node.bl_idname == "ShaderNodeTexImage" and node.image is lut
-            for node in material_group.nodes
+            for node in compute_group.nodes
         )
+        second_material = terrain_detail_nodes.apply_tile_detail_material(
+            None, "TerrainDetailNativeSmoke2", atlas, maps,
+            fresnel_power=16.0,
+            texture_pack_key="native_test_world",
+            layer_metadata=layer_metadata)
+        second_wrapper = next(
+            node.node_tree for node in second_material.node_tree.nodes
+            if node.bl_idname == "ShaderNodeGroup"
+        )
+        second_compute = next(
+            node.node_tree for node in second_wrapper.nodes
+            if node.bl_idname == "ShaderNodeGroup"
+            and node.node_tree.name.startswith(".W3TerrainCompute ")
+        )
+        assert second_wrapper is not material_group
+        assert second_compute is compute_group
+        bpy.data.materials.remove(second_material)
+        terrain_detail_nodes._purge_unused_detail_groups()
         terrain_detail_nodes.update_terrain_texture_pack_layer(
             "native_test_world", 19, specularity=1.0, specularity_base=1.0)
         live_rows = terrain_detail_nodes.terrain_texture_pack_values(
@@ -258,19 +340,19 @@ def main() -> None:
         assert not unmatched_material_offsets
         assert not any(
             node.bl_idname == "ShaderNodeMath" and node.operation == "ARCCOSINE"
-            for node in material_group.nodes
+            for node in compute_group.nodes
         )
         # Positive Z and geometric slope each require one square root.
         assert sum(
             node.bl_idname == "ShaderNodeMath" and node.operation == "SQRT"
-            for node in material_group.nodes
+            for node in compute_group.nodes
         ) == 2
         assert sum(
             node.bl_idname == "ShaderNodeVectorMath" and node.operation == "CROSS_PRODUCT"
-            for node in material_group.nodes
+            for node in compute_group.nodes
         ) == 1
         power_nodes = [
-            node for node in material_group.nodes
+            node for node in compute_group.nodes
             if node.bl_idname == "ShaderNodeMath" and node.operation == "POWER"
         ]
         # Specularity and the three final color channels each use one 2.2 power.
@@ -285,7 +367,7 @@ def main() -> None:
             if group.name.startswith(".W3TerrainTap ")
         )
         tap_nodes = [
-            node for node in material_group.nodes
+            node for node in compute_group.nodes
             if node.bl_idname == "ShaderNodeGroup" and node.node_tree is tap_group
         ]
         assert len(tap_nodes) == 4
@@ -334,20 +416,25 @@ def main() -> None:
             node for node in material.node_tree.nodes
             if node.bl_idname == "ShaderNodeGroup"
         ).node_tree
+        compute_group = next(
+            node.node_tree for node in material_group.nodes
+            if node.bl_idname == "ShaderNodeGroup"
+            and node.node_tree.name.startswith(".W3TerrainCompute ")
+        )
         assert sum(
             node.bl_idname == "ShaderNodeMath"
             and node.operation == "POWER"
             and abs(node.inputs[1].default_value - 8.0) < 1e-6
-            for node in material_group.nodes
+            for node in compute_group.nodes
         ) == 1
         detail_groups = [
             group for group in bpy.data.node_groups
             if group.name.startswith((".W3AtlasUV ", ".W3TerrainTap ",
-                                      ".W3TerrainDetail "))
+                                      ".W3TerrainCompute ", ".W3TerrainDetail "))
         ]
-        assert len(detail_groups) == 3, [group.name for group in detail_groups]
+        assert len(detail_groups) == 4, [group.name for group in detail_groups]
 
-        bpy.context.scene.render.engine = "BLENDER_EEVEE"
+        bpy.context.scene.render.engine = "BLENDER_EEVEE_NEXT"
         bpy.context.scene.render.resolution_x = 16
         bpy.context.scene.render.resolution_y = 16
         bpy.context.scene.render.resolution_percentage = 100
@@ -356,6 +443,19 @@ def main() -> None:
         camera.rotation_euler = (0.0, 0.0, 0.0)
         bpy.context.scene.camera = camera
         bpy.ops.render.render()
+
+        overlay_material = import_w2w._apply_tile_overlay_material(
+            obj, atlas_d_path, "TerrainDetailNativeSmoke")
+        assert overlay_material is material
+        assert overlay_material.get("witcher_terrain_overlay") is True
+        assert overlay_material.get("witcher_terrain_detail") is None
+        assert overlay_material.get("witcher_terrain_detail_sig") is None
+        assert overlay_material.get("witcher_terrain_layer_metadata") is None
+        assert overlay_material.get("witcher_terrain_texture_pack_key") is None
+        assert len(overlay_material.node_tree.nodes) == 4
+        assert overlay_material.node_tree.nodes.get(
+            terrain_detail_nodes.DETAIL_GROUP_NODE_NAME) is None
+        import_w2w._purge_unused_terrain_detail_data()
 
         print("TERRAIN_DETAIL_NATIVE_OK", len(bpy.data.node_groups))
 

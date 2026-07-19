@@ -25,7 +25,13 @@ from ..importers import import_w2l
 from ..importers import import_w2w
 from ..importers import import_isolation
 from ..importers import import_blender_fun
-from ..terrain_core import TERRAIN_FOLIAGE_MODE_ITEMS, TERRAIN_IMPORT_MODE_ITEMS
+from ..terrain_core import (
+    TERRAIN_FOLIAGE_MODE_ITEMS,
+    TERRAIN_IMPORT_MODE_ITEMS,
+    terrain_native_level,
+    terrain_tile_from_world_position,
+    terrain_view_lod_tiles,
+)
 from ..CR2W import fast_cache_scan
 from ..CR2W.common_blender import repo_file, redkit_repo_context
 
@@ -626,6 +632,87 @@ def _remove_collection_subtree(collection):
             pass
 
 
+def _update_w2w_lod_summary(operator, _context=None):
+    x_tiles = int(getattr(operator, "terrain_detected_x_tiles", 0) or 0)
+    y_tiles = int(getattr(operator, "terrain_detected_y_tiles", 0) or 0)
+    native = int(getattr(operator, "terrain_detected_native_level", 0) or 0)
+    if x_tiles <= 0 or y_tiles <= 0:
+        return
+    radius = max(0, int(getattr(operator, "terrain_lod_radius", 3)))
+    center_x = x_tiles // 2
+    center_y = y_tiles // 2
+    detailed = len(terrain_view_lod_tiles(
+        x_tiles, y_tiles, center_x, center_y, radius))
+    overview = max(0, x_tiles * y_tiles - detailed)
+    far_level = min(5, native)
+    operator.terrain_lod_info = (
+        f"{detailed:,} native L{native} + {overview:,} overview L{far_level} "
+        f"(focus {center_x}, {center_y})"
+    )
+
+
+def _clear_w2w_preflight(operator, source_info="Select a .w2w to inspect", key=""):
+    changed = bool(
+        getattr(operator, "terrain_preflight_key", "")
+        or getattr(operator, "terrain_detected_x_tiles", 0)
+        or getattr(operator, "terrain_source_info", "") != source_info
+    )
+    operator.terrain_detected_x_tiles = 0
+    operator.terrain_detected_y_tiles = 0
+    operator.terrain_detected_tile_res = 0
+    operator.terrain_detected_native_level = 0
+    operator.terrain_source_info = source_info
+    operator.terrain_grid_info = ""
+    operator.terrain_native_info = ""
+    operator.terrain_lod_info = ""
+    operator.terrain_preflight_key = key
+    return changed
+
+
+def _update_w2w_preflight(operator):
+    path = os.path.abspath(str(getattr(operator, "filepath", "") or ""))
+    if not path.lower().endswith(".w2w") or not os.path.isfile(path):
+        return _clear_w2w_preflight(operator)
+    key = ""
+    try:
+        stat = os.stat(path)
+        key = (
+            f"{os.path.normcase(os.path.normpath(path))}|"
+            f"{getattr(stat, 'st_mtime_ns', int(stat.st_mtime * 1_000_000_000))}|"
+            f"{stat.st_size}"
+        )
+        if key == str(getattr(operator, "terrain_preflight_key", "") or ""):
+            return False
+        spec = import_w2w.preflight_world_terrain(path)
+        native = terrain_native_level(spec.tile_res)
+        total_res_x = int(spec.tile_res) * int(spec.x_tiles)
+        total_res_y = int(spec.tile_res) * int(spec.y_tiles)
+        operator.terrain_detected_x_tiles = int(spec.x_tiles)
+        operator.terrain_detected_y_tiles = int(spec.y_tiles)
+        operator.terrain_detected_tile_res = int(spec.tile_res)
+        operator.terrain_detected_native_level = native
+        operator.terrain_tile_x = int(spec.x_tiles) // 2
+        operator.terrain_tile_y = int(spec.y_tiles) // 2
+        operator.terrain_source_info = (
+            f"{total_res_x:,} × {total_res_y:,} samples "
+            f"({int(spec.tile_res):,} per tile)"
+        )
+        operator.terrain_grid_info = (
+            f"{int(spec.x_tiles):,} × {int(spec.y_tiles):,} = "
+            f"{int(spec.x_tiles) * int(spec.y_tiles):,} grid tiles"
+        )
+        operator.terrain_native_info = (
+            f"Level {native} = {(1 << native) + 1:,} × "
+            f"{(1 << native) + 1:,} vertices per tile"
+        )
+        operator.terrain_preflight_key = key
+        _update_w2w_lod_summary(operator)
+        return True
+    except Exception as exc:
+        return _clear_w2w_preflight(
+            operator, f"Could not inspect W2W: {exc}", key=key)
+
+
 class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
     """Load Witcher 3 Level"""
     bl_idname = "witcher.import_w2w"
@@ -638,12 +725,12 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         name="Terrain Import",
         description="Choose the terrain scope to import",
         items=TERRAIN_IMPORT_MODE_ITEMS,
-        default='TILES',
+        default='VIEW_LOD',
     )
     terrain_multires_level: IntProperty(
         name="Terrain Multires",
-        description="Multires subdivision levels used by terrain import",
-        default=6,
+        description="Manual terrain level; the W2W preview shows its native level",
+        default=8,
         min=0,
         max=10,
     )
@@ -652,6 +739,14 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         description="Terrain tile X coordinate",
         default=0,
         min=0,
+    )
+    terrain_lod_radius: IntProperty(
+        name="Native Radius",
+        description="Native-detail tile radius around the View LOD focus (3 means up to 7 × 7 tiles)",
+        default=3,
+        min=0,
+        max=8,
+        update=_update_w2w_lod_summary,
     )
     terrain_tile_y: IntProperty(
         name="Tile Y",
@@ -702,8 +797,17 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
             ('1024', "1024 px", "Balanced quality and memory usage"),
             ('2048', "2048 px", "Native resolution and highest memory usage"),
         ),
-        default='1024',
+        default='2048',
     )
+    terrain_source_info: StringProperty(default="Select a .w2w to inspect", options={'SKIP_SAVE'})
+    terrain_grid_info: StringProperty(default="", options={'SKIP_SAVE'})
+    terrain_native_info: StringProperty(default="", options={'SKIP_SAVE'})
+    terrain_lod_info: StringProperty(default="", options={'SKIP_SAVE'})
+    terrain_preflight_key: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    terrain_detected_x_tiles: IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    terrain_detected_y_tiles: IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    terrain_detected_tile_res: IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    terrain_detected_native_level: IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
 
     def _copy_settings_from_scene(self, context):
         tool = getattr(context.scene, "witcher_file_browser", None)
@@ -714,6 +818,7 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
             self.terrain_multires_level = int(getattr(tool, "terrain_multires_level", self.terrain_multires_level))
             self.terrain_tile_x = int(getattr(tool, "terrain_tile_x", self.terrain_tile_x))
             self.terrain_tile_y = int(getattr(tool, "terrain_tile_y", self.terrain_tile_y))
+            self.terrain_lod_radius = int(getattr(tool, "terrain_lod_radius", self.terrain_lod_radius))
             self.terrain_include_foliage = bool(getattr(tool, "terrain_include_foliage", self.terrain_include_foliage))
             self.terrain_foliage_mode = str(getattr(tool, "terrain_foliage_mode", self.terrain_foliage_mode))
             self.terrain_build_layer_tree = bool(getattr(tool, "terrain_build_layer_tree", self.terrain_build_layer_tree))
@@ -735,6 +840,8 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
                 tool.terrain_tile_x = int(self.terrain_tile_x)
             if hasattr(tool, "terrain_tile_y"):
                 tool.terrain_tile_y = int(self.terrain_tile_y)
+            if hasattr(tool, "terrain_lod_radius"):
+                tool.terrain_lod_radius = int(self.terrain_lod_radius)
             if hasattr(tool, "terrain_include_foliage"):
                 tool.terrain_include_foliage = bool(self.terrain_include_foliage)
             if hasattr(tool, "terrain_foliage_mode"):
@@ -754,10 +861,22 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
 
     def draw(self, context):
         layout = self.layout
+        info = layout.box()
+        info.label(text="W2W Terrain", icon='INFO')
+        info.prop(self, "terrain_source_info", text="Height Source")
+        if self.terrain_grid_info:
+            info.prop(self, "terrain_grid_info", text="Grid")
+        if self.terrain_native_info:
+            info.prop(self, "terrain_native_info", text="Native Mesh")
+        if self.terrain_lod_info:
+            info.prop(self, "terrain_lod_info", text="View LOD")
+
         box = layout.box()
         box.label(text="Terrain Import", icon='GRID')
         box.prop(self, "terrain_import_mode", text="Mode")
-        if self.terrain_import_mode == 'SELECTED_TILE':
+        if self.terrain_import_mode == 'VIEW_LOD':
+            box.prop(self, "terrain_lod_radius", text="Native Radius")
+        elif self.terrain_import_mode == 'SELECTED_TILE':
             coords = box.row(align=True)
             coords.prop(self, "terrain_tile_x", text="Tile X")
             coords.prop(self, "terrain_tile_y", text="Tile Y")
@@ -765,21 +884,33 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
             foliage_detail = box.row()
             foliage_detail.enabled = bool(self.terrain_include_foliage)
             foliage_detail.prop(self, "terrain_foliage_mode", text="Foliage")
+        elif self.terrain_import_mode == 'TILES':
+            box.label(text="Advanced: loads every tile at one level", icon='ERROR')
         box.prop(self, "terrain_build_layer_tree")
-        box.prop(self, "terrain_multires_level", text="Detail")
+        if self.terrain_import_mode != 'VIEW_LOD':
+            box.prop(self, "terrain_multires_level", text="Detail")
         detail_box = box.box()
         detail_box.label(text="Terrain Material", icon='MATERIAL')
         detail_row = detail_box.row(align=True)
-        detail_row.prop(self, "terrain_detail_material", text="Full Texarray Material")
+        detail_label = (
+            "Full Texarray on Native Tiles"
+            if self.terrain_import_mode == 'VIEW_LOD'
+            else "Full Texarray Material"
+        )
+        detail_row.prop(self, "terrain_detail_material", text=detail_label)
         detail_res = detail_box.row()
         detail_res.enabled = bool(self.terrain_detail_material)
-        detail_res.prop(self, "terrain_detail_texture_res", text="Atlas")
+        detail_res.prop(self, "terrain_detail_texture_res", text="Texarray Atlas")
         box.prop(self, "terrain_material_roughness", text="Roughness")
         box.prop(self, "terrain_material_specular", text="Specular")
+
+    def check(self, context):
+        return _update_w2w_preflight(self)
 
     def execute(self, context):
         log.info("Importing world")
         filePath = self.filepath
+        _update_w2w_preflight(self)
         self._apply_settings_to_scene(context)
 
         if os.path.isdir(filePath):
@@ -831,13 +962,14 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
                     time.perf_counter() - started,
                 )
                 return {'FINISHED'}
-            import_w2w.btn_import_w2w(worldFile, filePath)
+            import_w2w.btn_import_w2w(worldFile, filePath, report=self.report)
         return {'FINISHED'}
     def invoke(self, context, event):
         self._copy_settings_from_scene(context)
         UNCOOK_PATH = os.path.join(get_uncook_path(context),"levels\\")
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        _update_w2w_preflight(self)
         return ImportHelper.invoke(self, context, event)
 
 
@@ -884,7 +1016,7 @@ class WITCH_OT_import_world_tile(bpy.types.Operator):
         settings = getattr(context.scene, "witcher_file_browser", None)
         tile_x = int(getattr(settings, "terrain_tile_x", 0))
         tile_y = int(getattr(settings, "terrain_tile_y", 0))
-        detail = int(getattr(settings, "terrain_multires_level", 6))
+        detail = int(getattr(settings, "terrain_multires_level", 8))
         include_foliage = bool(getattr(settings, "terrain_include_foliage", True))
         foliage_mode = str(getattr(settings, "terrain_foliage_mode", "PROXY"))
 
@@ -952,6 +1084,206 @@ class WITCH_OT_import_world_tile(bpy.types.Operator):
         _select_loaded_terrain_tile(context, load_result.terrain.obj)
         _report_world_tile_load(self, load_result, tile_x, tile_y, time.perf_counter() - started)
         return {'FINISHED'}
+
+
+def _find_view_lod_world_collections():
+    found = []
+    for coll in bpy.data.collections:
+        if not str(coll.get("world_path", "") or "").strip():
+            continue
+        for obj in getattr(coll, "all_objects", ()):
+            if (
+                obj.get("witcher_terrain_root")
+                and obj.get("terrain_import_mode") == import_w2w.TERRAIN_IMPORT_VIEW_LOD
+            ):
+                found.append(coll)
+                break
+    return found
+
+
+def _run_terrain_view_lod_update(scene, root_coll, view_pos, max_tiles=None):
+    world_path = str(root_coll.get("world_path", "") or "").strip()
+    resolved_world = world_path if os.path.isfile(world_path) else repo_file(world_path)
+    if not resolved_world or not os.path.isfile(resolved_world):
+        raise RuntimeError(f"World file not found: {world_path}")
+
+    settings = getattr(scene, "witcher_file_browser", None)
+    radius = int(getattr(settings, "terrain_lod_radius", 3))
+    detail_material = bool(getattr(settings, "terrain_detail_material", True))
+    started = time.perf_counter()
+    result = import_w2w.update_terrain_view_lod(
+        None,
+        resolved_world,
+        view_pos,
+        radius=radius,
+        world_root_collection=root_coll,
+        detail_material=detail_material,
+        max_tiles=max_tiles,
+    )
+    if settings is not None:
+        settings.terrain_tile_x = int(result["center_x"])
+        settings.terrain_tile_y = int(result["center_y"])
+    changes = f"{result['promoted']} promoted, {result['lowered']} lowered"
+    if result.get("refreshed"):
+        changes += f", {result['refreshed']} materials refreshed"
+    if result.get("pending"):
+        changes += f", {result['pending']} pending"
+    message = (
+        f"LOD tile {result['center_x']}, {result['center_y']}: "
+        f"{changes} in {time.perf_counter() - started:.2f}s"
+    )
+    result["message"] = message
+    print(f"[Witcher 3 Tools] {message}")
+    return result
+
+
+class WITCH_OT_update_terrain_view_lod(bpy.types.Operator):
+    bl_idname = "witcher.update_terrain_view_lod"
+    bl_label = "Update LOD Around View"
+    bl_description = "Move native terrain detail to the current viewport focus"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        root_coll = _find_world_root_collection(context)
+        if root_coll is None or not str(root_coll.get("world_path", "") or "").strip():
+            candidates = _find_view_lod_world_collections()
+            root_coll = candidates[0] if len(candidates) == 1 else None
+            if root_coll is None:
+                self.report({'WARNING'}, "Select terrain belonging to an imported world")
+                return {'CANCELLED'}
+
+        view_pos = None
+        area = _get_current_view3d_area(context)
+        if area is not None:
+            try:
+                view_pos = tuple(area.spaces.active.region_3d.view_location)
+            except Exception:
+                pass
+        if view_pos is None:
+            view_pos = _get_camera_position(context)
+        if view_pos is None:
+            view_pos = tuple(context.scene.cursor.location)
+
+        try:
+            result = _run_terrain_view_lod_update(context.scene, root_coll, view_pos)
+        except Exception as exc:
+            log.exception("Terrain View LOD update failed")
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, result["message"])
+        return {'FINISHED'}
+
+
+_VIEW_LOD_AUTO_STATE = {"pos": None, "pending": 0}
+
+
+def _viewport_view_signature():
+    wm = getattr(bpy.context, "window_manager", None)
+    for window in getattr(wm, "windows", ()) or ():
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                try:
+                    region_3d = area.spaces.active.region_3d
+                    return (
+                        tuple(region_3d.view_location),
+                        tuple(region_3d.view_rotation),
+                        float(region_3d.view_distance),
+                    )
+                except Exception:
+                    return None
+    return None
+
+
+def _view_signature_moving(previous, current):
+    if previous is None or current is None:
+        return True
+    if any(abs(a - b) > 0.5 for a, b in zip(previous[0], current[0])):
+        return True
+    if any(abs(a - b) > 0.002 for a, b in zip(previous[1], current[1])):
+        return True
+    return abs(previous[2] - current[2]) > max(0.01 * abs(previous[2]), 0.01)
+
+
+def _terrain_view_lod_auto_tick():
+    try:
+        scene = getattr(bpy.context, "scene", None)
+        settings = getattr(scene, "witcher_file_browser", None)
+        if settings is None or not getattr(settings, "terrain_lod_auto_update", False):
+            _VIEW_LOD_AUTO_STATE["pos"] = None
+            _VIEW_LOD_AUTO_STATE["pending"] = 0
+            return 2.0
+        candidates = _find_view_lod_world_collections()
+        if len(candidates) != 1:
+            _VIEW_LOD_AUTO_STATE["pos"] = None
+            _VIEW_LOD_AUTO_STATE["pending"] = 0
+            return 2.0
+        root_coll = candidates[0]
+        root = next(
+            (
+                obj for obj in root_coll.all_objects
+                if obj.get("witcher_terrain_root")
+                and obj.get("terrain_import_mode") == import_w2w.TERRAIN_IMPORT_VIEW_LOD
+            ),
+            None,
+        )
+        x_tiles = int(root.get("x_tiles", 0) or 0) if root is not None else 0
+        y_tiles = int(root.get("y_tiles", 0) or 0) if root is not None else 0
+        terrain_size = float(root.get("terrainSize", 0.0) or 0.0) if root is not None else 0.0
+        if x_tiles <= 0 or y_tiles <= 0 or terrain_size <= 0.0:
+            return 2.0
+        signature = _viewport_view_signature()
+        if signature is None:
+            return 2.0
+        pos = signature[0]
+        focus = terrain_tile_from_world_position(pos, x_tiles, y_tiles, terrain_size)
+        center = (
+            int(root.get("terrain_lod_center_x", -1)),
+            int(root.get("terrain_lod_center_y", -1)),
+        )
+        previous = _VIEW_LOD_AUTO_STATE["pos"]
+        _VIEW_LOD_AUTO_STATE["pos"] = signature
+        # Defer while the user navigates (moves, orbits or zooms); stream
+        # only once the view settles so hitches never overlap navigation.
+        moving = _view_signature_moving(previous, signature)
+        if focus == center and not _VIEW_LOD_AUTO_STATE.get("pending"):
+            if moving:
+                return 0.5
+            # Clean up, refresh materials, then prefetch while idle.
+            import_w2w.flush_tile_mesh_garbage()
+            detail_wanted = bool(getattr(settings, "terrain_detail_material", True))
+            detail_current = bool(root.get("terrain_lod_detail_material", detail_wanted))
+            detail_res = int(getattr(settings, "terrain_detail_texture_res", 2048))
+            current_res = int(root.get("terrain_lod_detail_texture_res", detail_res))
+            if detail_current != detail_wanted or current_res != detail_res:
+                result = _run_terrain_view_lod_update(scene, root_coll, pos, max_tiles=1)
+                _VIEW_LOD_AUTO_STATE["pending"] = int(result.get("pending", 0) or 0)
+                return 0.05 if _VIEW_LOD_AUTO_STATE["pending"] else 1.0
+            world_path = str(root_coll.get("world_path", "") or "")
+            resolved = world_path if os.path.isfile(world_path) else repo_file(world_path)
+            if not resolved or not os.path.isfile(resolved):
+                return 2.0
+            remaining = import_w2w.prefetch_terrain_view_lod_meshes(
+                resolved, root_coll, max_tiles=1)
+            return 0.25 if remaining else 1.0
+        if moving:
+            return 0.5
+        # One tile per tick keeps hitches short.
+        result = _run_terrain_view_lod_update(scene, root_coll, pos, max_tiles=1)
+        _VIEW_LOD_AUTO_STATE["pending"] = int(result.get("pending", 0) or 0)
+        return 0.05 if _VIEW_LOD_AUTO_STATE["pending"] else 1.0
+    except Exception:
+        log.exception("Terrain View LOD auto update failed")
+        return 5.0
+
+
+def register_view_lod_timer():
+    if not bpy.app.timers.is_registered(_terrain_view_lod_auto_tick):
+        bpy.app.timers.register(_terrain_view_lod_auto_tick, first_interval=2.0)
+
+
+def unregister_view_lod_timer():
+    if bpy.app.timers.is_registered(_terrain_view_lod_auto_tick):
+        bpy.app.timers.unregister(_terrain_view_lod_auto_tick)
 
 
 def _normalize_level_rel_path(level_path: str) -> str:
@@ -3307,6 +3639,12 @@ def draw_layer_stream_job_ui(layout, context) -> None:
 
 def _start_layer_stream_job(context, mode, root_collection):
     _reset_layer_stream_job()
+    # Retry failed cloth resources once per job.
+    try:
+        from ..importers import import_entity
+        import_entity.clear_redcloth_failure_cache()
+    except Exception:
+        pass
     job = _LAYER_STREAM_JOB
     job["running"] = True
     job["mode"] = str(mode or "").strip()
@@ -5503,7 +5841,7 @@ def _import_level_from_collection(
             and getattr(isolation_batch_session, "isolated", False)
         )
 
-        with redkit_repo_context(resolved):
+        with import_isolation.global_undo_disabled(), redkit_repo_context(resolved):
             if use_fast_path:
                 if use_isolation_scope:
                     with import_isolation.isolated_batch_import_target(

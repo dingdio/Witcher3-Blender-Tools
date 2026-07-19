@@ -687,6 +687,13 @@ def _seed_redcloth_cache_root(scene, source_root, reuse_key: str, resource_key: 
     return cache_root
 
 
+_REDCLOTH_FAILED_IMPORTS = set()
+
+
+def clear_redcloth_failure_cache():
+    _REDCLOTH_FAILED_IMPORTS.clear()
+
+
 def import_or_reuse_redcloth(
     owner_armature,
     redcloth_resource: str,
@@ -712,6 +719,9 @@ def import_or_reuse_redcloth(
 
     redcloth_resource_key = _make_redcloth_resource_key(redcloth_resource)
     redcloth_reuse_key = _make_redcloth_reuse_key(redcloth_resource, redcloth_mat_path)
+    if redcloth_reuse_key in _REDCLOTH_FAILED_IMPORTS:
+        log.debug("Skipping redcloth %s: import failed earlier this session", redcloth_resource)
+        return None, None, []
     scene = getattr(bpy.context, "scene", None)
     cloth_arma = _find_reusable_redcloth_armature(owner_armature, redcloth_reuse_key)
     if cloth_arma is not None:
@@ -817,6 +827,7 @@ def import_or_reuse_redcloth(
                     cloth_arma = None
 
     if cloth_arma is None:
+        _REDCLOTH_FAILED_IMPORTS.add(redcloth_reuse_key)
         total_seconds = time.perf_counter() - total_started
         if total_seconds >= _REDCLOTH_PROFILE_WARN_THRESHOLD:
             _log_redcloth_profile_warning(

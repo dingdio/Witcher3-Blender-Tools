@@ -126,6 +126,56 @@ def write_png(
             f.write(chunk)
 
 
+def bake_terrain_lod_overview(
+    tile_paths: Dict[Tuple[int, int], str],
+    res: int,
+    x_tiles: int,
+    y_tiles: int,
+    output_path: str,
+    *,
+    out_res: int = 2048,
+    skip_existing: bool = True,
+) -> Optional[str]:
+    if not tile_paths or res <= 0 or x_tiles <= 0 or y_tiles <= 0:
+        return None
+    src_mtime = _max_source_mtime(tile_paths.values())
+    if skip_existing and _is_fresh(output_path, src_mtime):
+        return output_path
+
+    tile_px = max(1, min(int(res), int(out_res) // max(int(x_tiles), int(y_tiles))))
+    sample_axis = np.rint(np.linspace(0, int(res) - 1, tile_px)).astype(np.intp)
+    palette = np.asarray(TEXTURING_PALETTE, dtype=np.uint8).reshape(-1, 3)
+    rgb = np.zeros((int(y_tiles) * tile_px, int(x_tiles) * tile_px, 3), dtype=np.uint8)
+    alpha = np.zeros(rgb.shape[:2], dtype=np.uint8)
+
+    for (x, y), path in tile_paths.items():
+        if not 0 <= int(x) < int(x_tiles) or not 0 <= int(y) < int(y_tiles):
+            continue
+        try:
+            tile = np.memmap(path, dtype="<u2", mode="r", shape=(int(res), int(res)))
+            sampled = tile[np.ix_(sample_axis, sample_axis)]
+            overlay = sampled & 0x1F
+            background = (sampled >> 5) & 0x1F
+            layer = np.where(overlay > 0, overlay, background).astype(np.intp)
+            block = palette[np.clip(layer, 0, len(palette) - 1)]
+            block_alpha = np.where(sampled == 0, 0, 255).astype(np.uint8)
+        except (OSError, ValueError):
+            continue
+        y0 = int(y) * tile_px
+        x0 = int(x) * tile_px
+        rgb[y0:y0 + tile_px, x0:x0 + tile_px] = block
+        alpha[y0:y0 + tile_px, x0:x0 + tile_px] = block_alpha
+
+    rgb = np.flipud(rgb)
+    alpha = np.flipud(alpha)
+    rgba = np.empty((*rgb.shape[:2], 4), dtype=np.uint8)
+    rgba[..., :3] = rgb
+    rgba[..., 3] = alpha
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    write_png(output_path, rgba.shape[1], rgba.shape[0], 6, 8, rgba.tobytes())
+    return output_path
+
+
 @dataclass(frozen=True)
 class TileInfo:
     x: int

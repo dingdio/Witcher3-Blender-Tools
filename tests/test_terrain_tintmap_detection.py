@@ -2,7 +2,10 @@ import sys
 import tempfile
 import types
 import unittest
+import zlib
 from pathlib import Path
+
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -69,6 +72,43 @@ class TestTerrainTintmapDetection(unittest.TestCase):
 
             self.assertIsNone(terrain_w2ter.detect_colormap_start_mip(tiles, 512))
             self.assertIsNone(terrain_w2ter.select_tintmap_buffer_index(tiles, 512))
+
+    def test_lod_overview_streams_one_capped_shared_png(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            tiles = {}
+            for y in range(2):
+                for x in range(2):
+                    path = folder / f"tile_{y}_x_{x}_res4.w2ter.2.buffer"
+                    control = np.full((4, 4), 1 + x + y * 2, dtype="<u2")
+                    if x == 0 and y == 0:
+                        control[0, 0] = 0
+                    control.tofile(path)
+                    tiles[(x, y)] = str(path)
+            output = folder / "overview.png"
+
+            result = terrain_w2ter.bake_terrain_lod_overview(
+                tiles, 4, 2, 2, str(output), out_res=8)
+
+            self.assertEqual(result, str(output))
+            encoded = output.read_bytes()
+            self.assertEqual(encoded[:8], b"\x89PNG\r\n\x1a\n")
+            self.assertEqual(
+                (int.from_bytes(encoded[16:20], "big"), int.from_bytes(encoded[20:24], "big")),
+                (8, 8),
+            )
+            offset = 8
+            idat = b""
+            while offset < len(encoded):
+                size = int.from_bytes(encoded[offset:offset + 4], "big")
+                kind = encoded[offset + 4:offset + 8]
+                if kind == b"IDAT":
+                    idat += encoded[offset + 8:offset + 8 + size]
+                offset += 12 + size
+            rows = np.frombuffer(zlib.decompress(idat), dtype=np.uint8).reshape(8, 33)
+            rgba = rows[:, 1:].reshape(8, 8, 4)
+            self.assertIn(0, rgba[..., 3])
+            self.assertIn(255, rgba[..., 3])
 
 
 if __name__ == "__main__":

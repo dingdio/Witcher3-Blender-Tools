@@ -138,6 +138,52 @@ def _novigrad_spec():
     )
 
 
+class TestTerrainLodPolicy(unittest.TestCase):
+    def test_native_level_and_window_follow_w2w_resolution(self):
+        self.assertEqual(terrain.terrain_native_level(256), 8)
+        self.assertEqual(terrain.terrain_native_level(512), 9)
+        self.assertEqual(terrain._clamp_tile_multires_level(9, 512), 9)
+
+        center = terrain.terrain_view_lod_tiles(46, 46, 23, 23, 3)
+        edge = terrain.terrain_view_lod_tiles(46, 46, 0, 0, 3)
+        moved = terrain.terrain_view_lod_tiles(46, 46, 24, 23, 3)
+        self.assertEqual(len(center), 49)
+        self.assertEqual(
+            (min(x for x, _y in center), max(x for x, _y in center)),
+            (20, 26),
+        )
+        self.assertEqual(len(edge), 16)
+        self.assertEqual((len(moved - center), len(center - moved)), (7, 7))
+
+    def test_novigrad_lod_budget_is_below_three_percent_of_all_native(self):
+        native = terrain.terrain_native_level(512)
+        overview = min(5, native)
+        lod_vertices = 49 * ((1 << native) + 1) ** 2
+        lod_vertices += (46 * 46 - 49) * ((1 << overview) + 1) ** 2
+        lod_vertices += 49 * 4 * ((1 << native) + 1)
+        lod_vertices += (46 * 46 - 49) * 4 * ((1 << overview) + 1)
+        all_native = 46 * 46 * ((1 << native) + 1) ** 2
+        self.assertEqual(lod_vertices, 15_519_636)
+        self.assertLess(lod_vertices / all_native, 0.03)
+
+    def test_w2w_clipmap_declares_grid_without_scanning_tiles(self):
+        world = types.SimpleNamespace(tileRes=512, clipmapSize=23552, clipSize=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            world_path = Path(tmp) / "novigrad.w2w"
+            world_path.write_bytes(b"w2w")
+            with (
+                mock.patch.object(terrain, "get_uncook_path", return_value=""),
+                mock.patch.object(terrain, "_configured_redkit_workspace_roots", return_value=[]),
+                mock.patch.object(terrain, "_configured_redkit_roots", return_value=[]),
+                mock.patch.object(terrain, "_discover_tile_count") as discover,
+            ):
+                context = terrain._resolve_terrain_context(
+                    world, str(world_path), discover_tiles=False)
+
+        self.assertEqual((context["tile_res"], context["n_tiles"]), (512, 46))
+        discover.assert_not_called()
+
+
 class TestSelectedTerrainTileBounds(unittest.TestCase):
     def test_corner_tile_has_centered_half_open_bounds_and_elevation(self):
         bounds = terrain.terrain_tile_bounds(_novigrad_spec(), 0, 0)
@@ -659,6 +705,7 @@ class TestTerrainTileHeightmapStitching(unittest.TestCase):
                 positive_x_buffer_path="right",
                 positive_y_buffer_path="up",
                 positive_xy_buffer_path="diagonal",
+                skirt_depth=10.0,
             )
 
         self.assertIs(result, mesh)
@@ -669,9 +716,23 @@ class TestTerrainTileHeightmapStitching(unittest.TestCase):
         # The elevation scale is deliberately factored out: this regression is
         # about selecting all inclusive source samples, including neighbor edges.
         np.testing.assert_allclose(
-            coordinates[:, 2] / coordinates[0, 2],
+            coordinates[:9, 2] / coordinates[0, 2],
             expected_samples,
             rtol=1e-6,
+        )
+        edge_vertices = np.array(
+            [0, 1, 2, 2, 5, 8, 8, 7, 6, 6, 3, 0], dtype=np.intp
+        )
+        self.assertEqual((mesh.vertices.count, mesh.polygons.count), (21, 12))
+        np.testing.assert_allclose(
+            coordinates[9:, :2], coordinates[edge_vertices, :2]
+        )
+        np.testing.assert_allclose(
+            coordinates[9:, 2], coordinates[edge_vertices, 2] - 10.0
+        )
+        np.testing.assert_array_equal(
+            mesh.loops.values["vertex_index"][16:20],
+            np.array([0, 9, 10, 1], dtype=np.int32),
         )
 
 
@@ -683,7 +744,12 @@ class TestTerrainTileRebuild(unittest.TestCase):
         class MaterialSlots(list):
             pass
 
-        new_mesh = types.SimpleNamespace(materials=MaterialSlots())
+        class NewMesh(dict):
+            def __init__(self):
+                super().__init__()
+                self.materials = MaterialSlots()
+
+        new_mesh = NewMesh()
 
         class TileObject(dict):
             def __init__(self):
@@ -696,30 +762,26 @@ class TestTerrainTileRebuild(unittest.TestCase):
                     positive_x_buffer_path=r"C:\resolved\right.buffer",
                     positive_y_buffer_path=r"C:\resolved\up.buffer",
                     positive_xy_buffer_path=r"C:\resolved\diagonal.buffer",
+                    terrain_lod_skirt_depth=400.0,
                     terrain_tile_source_signature="old-signature",
                 )
                 self.name = "tile_0_x_0"
                 self.data = old_mesh
 
         obj = TileObject()
-        meshes = types.SimpleNamespace(remove=mock.Mock())
         create_mesh = mock.Mock(return_value=new_mesh)
         with (
             mock.patch.object(terrain.os.path, "isfile", return_value=True),
             mock.patch.object(terrain, "_create_tile_mesh", create_mesh),
-            mock.patch.object(
-                terrain.bpy,
-                "data",
-                types.SimpleNamespace(meshes=meshes),
-                create=True,
-            ),
+            mock.patch.object(terrain, "_take_cached_tile_mesh", return_value=None),
+            mock.patch.object(terrain, "_store_cached_tile_mesh") as store_mesh,
         ):
             self.assertTrue(terrain.rebuild_tile_mesh(obj, 5))
 
         self.assertEqual(new_mesh.materials, [material])
         self.assertNotIn("terrain_tile_source_signature", obj)
         self.assertEqual(obj["terrain_multires"], 5)
-        meshes.remove.assert_called_once_with(old_mesh)
+        store_mesh.assert_called_once_with(old_mesh)
         create_mesh.assert_called_once_with(
             obj.name,
             obj["tile_buffer_path"],
@@ -730,6 +792,8 @@ class TestTerrainTileRebuild(unittest.TestCase):
             positive_x_buffer_path=obj["positive_x_buffer_path"],
             positive_y_buffer_path=obj["positive_y_buffer_path"],
             positive_xy_buffer_path=obj["positive_xy_buffer_path"],
+            heightmap_cache=terrain._REBUILD_HEIGHTMAP_CACHE,
+            skirt_depth=400.0,
         )
 
 
@@ -783,7 +847,12 @@ class TestAllTilesHeightmapStitching(unittest.TestCase):
             x_tiles=2,
             y_tiles=2,
         )
-        root = types.SimpleNamespace(children=[])
+        class Root(dict):
+            def __init__(self):
+                super().__init__()
+                self.children = []
+
+        root = Root()
         buffers = {
             (0, 0): "tile_0_0.buffer",
             (1, 0): "tile_1_0.buffer",
@@ -845,6 +914,8 @@ class TestAllTilesHeightmapStitching(unittest.TestCase):
             ),
             (textures[(1, 0)], textures[(0, 1)], textures[(1, 1)]),
         )
+        self.assertNotIn("terrain_import_seconds", root)
+        self.assertNotIn("terrain_import_timing", root)
 
 
 class TestAllTilesDetailMaterial(unittest.TestCase):
@@ -865,8 +936,11 @@ class TestAllTilesDetailMaterial(unittest.TestCase):
         with (
             mock.patch.object(terrain, "ensure_world_terrain_collection", return_value=object()),
             mock.patch.object(terrain, "_ensure_terrain_root", return_value=root),
-            mock.patch.object(terrain, "_import_resolved_terrain_tile", return_value=imported),
+            mock.patch.object(
+                terrain, "_import_resolved_terrain_tile", return_value=imported
+            ) as import_tile,
             mock.patch.object(terrain, "_apply_tile_detail_material") as apply_detail,
+            mock.patch.object(terrain, "_purge_unused_terrain_detail_groups") as purge_detail,
             mock.patch.object(terrain, "redkit_repo_context", side_effect=lambda _path: nullcontext()),
         ):
             _root, count = terrain.do_import_terrain_tiles(
@@ -889,11 +963,525 @@ class TestAllTilesDetailMaterial(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertIs(_root, root)
+        self.assertFalse(import_tile.call_args.kwargs["apply_overlay"])
         apply_detail.assert_called_once()
         args = apply_detail.call_args.args
         self.assertIs(args[0], world_file)
         self.assertEqual(args[2].texture_buffer, texture_path)
         self.assertIs(args[4], imported_obj)
+        self.assertFalse(apply_detail.call_args.kwargs["purge_unused"])
+        purge_detail.assert_called_once_with()
+
+
+class TestViewLodRouting(unittest.TestCase):
+    def test_view_lod_mode_dispatches_only_to_view_lod_import(self):
+        marker = object()
+        with (
+            mock.patch.object(
+                terrain, "_get_scene_terrain_import_mode",
+                return_value=terrain.TERRAIN_IMPORT_VIEW_LOD,
+            ),
+            mock.patch.object(
+                terrain, "_do_import_map_terrain_view_lod", return_value=marker
+            ) as view_lod,
+            mock.patch.object(terrain, "_do_import_map_terrain_tiles") as all_tiles,
+            mock.patch.object(terrain, "_do_import_map_terrain_full_map") as full_map,
+        ):
+            result = terrain.do_import_map_terrain(
+                "world", "novigrad.w2w", world_root_collection="collection")
+
+        self.assertIs(result, marker)
+        view_lod.assert_called_once_with("world", "novigrad.w2w", "collection")
+        all_tiles.assert_not_called()
+        full_map.assert_not_called()
+
+    def test_only_focus_window_gets_native_geometry_and_detail_materials(self):
+        spec = replace(_novigrad_spec(), x_tiles=46, y_tiles=46)
+        focus = terrain.terrain_view_lod_tiles(46, 46, 23, 23, 3)
+        buffers = {(x, y): f"height_{x}_{y}" for y in range(46) for x in range(46)}
+        textures = {(x, y): f"control_{x}_{y}" for y in range(46) for x in range(46)}
+        levels = {key: 9 for key in focus}
+        imported_levels = {}
+        overlay_flags = {}
+        skirt_depths = {}
+
+        class Root(dict):
+            children = []
+
+        class TileObject(dict):
+            pass
+
+        root = Root()
+
+        def import_tile(_spec, source, bounds, **kwargs):
+            key = (source.key.x, source.key.y)
+            imported_levels[key] = kwargs["multires_level"]
+            overlay_flags[key] = kwargs["apply_overlay"]
+            skirt_depths[key] = kwargs["skirt_depth"]
+            return types.SimpleNamespace(ok=True, bounds=bounds, obj=TileObject())
+
+        def apply_overview(obj, _material, _spec, _key):
+            obj["terrain_lod_role"] = "overview"
+
+        with (
+            mock.patch.object(terrain, "ensure_world_terrain_collection", return_value=object()),
+            mock.patch.object(terrain, "_ensure_terrain_root", return_value=root),
+            mock.patch.object(terrain, "_import_resolved_terrain_tile", side_effect=import_tile),
+            mock.patch.object(terrain, "_apply_tile_detail_material", return_value=object()) as detail,
+            mock.patch.object(
+                terrain, "_apply_terrain_lod_overview_material", side_effect=apply_overview
+            ) as overview,
+            mock.patch.object(terrain, "_purge_unused_terrain_detail_groups"),
+            mock.patch.object(terrain, "_purge_unused_terrain_detail_data"),
+            mock.patch.object(terrain, "redkit_repo_context", side_effect=lambda _path: nullcontext()),
+        ):
+            _root, count = terrain.do_import_terrain_tiles(
+                tile_heightmap_buffers=buffers,
+                tile_texture_buffers=textures,
+                tile_overlays={},
+                x_tiles=46,
+                y_tiles=46,
+                tile_res=512,
+                terrain_size=spec.terrain_size,
+                lowest_elevation=spec.lowest_elevation,
+                highest_elevation=spec.highest_elevation,
+                multires_level=5,
+                hub_name=spec.hub_name,
+                world_path=spec.world_path,
+                world_file=object(),
+                terrain_spec=spec,
+                detail_material=True,
+                tile_levels=levels,
+                detail_tiles=focus,
+                overview_material=object(),
+            )
+
+        self.assertIs(_root, root)
+        self.assertEqual(count, 2116)
+        self.assertEqual(
+            {key for key, level in imported_levels.items() if level == 9},
+            set(focus),
+        )
+        self.assertEqual(
+            {key for key, level in imported_levels.items() if level == 5},
+            set(buffers) - set(focus),
+        )
+        self.assertFalse(any(overlay_flags.values()))
+        self.assertEqual(
+            set(skirt_depths.values()), {terrain.TERRAIN_VIEW_LOD_SKIRT_AUTO})
+        self.assertEqual(detail.call_count, 49)
+        self.assertEqual(overview.call_count, 2067)
+        self.assertEqual(
+            {(call.args[2].key.x, call.args[2].key.y) for call in detail.call_args_list},
+            set(focus),
+        )
+        self.assertEqual(
+            {(call.args[3].x, call.args[3].y) for call in overview.call_args_list},
+            set(buffers) - set(focus),
+        )
+
+    def test_update_moves_only_set_difference_and_same_center_is_idempotent(self):
+        spec = replace(_novigrad_spec(), x_tiles=46, y_tiles=46)
+        old_focus = terrain.terrain_view_lod_tiles(46, 46, 23, 23, 3)
+        new_focus = terrain.terrain_view_lod_tiles(46, 46, 24, 23, 3)
+        leaving = set(old_focus - new_focus)
+        entering = set(new_focus - old_focus)
+
+        class Root(dict):
+            pass
+
+        class TileObject(dict):
+            type = "MESH"
+
+        tiles = {}
+        for key in old_focus | new_focus:
+            role = "native" if key in old_focus else "overview"
+            level = 9 if role == "native" else 5
+            tiles[key] = TileObject(
+                tile_x=key[0],
+                tile_y=key[1],
+                terrain_lod_role=role,
+                terrain_multires=level,
+            )
+        root = Root(
+            witcher_terrain_root=True,
+            witcher_terrain_world_key=spec.world_key,
+            terrain_import_mode=terrain.TERRAIN_IMPORT_VIEW_LOD,
+            terrain_lod_radius=3,
+            terrain_lod_detail_material=True,
+            terrain_lod_detail_texture_res=2048,
+            terrain_lod_overview_material="overview",
+        )
+        root.children = list(tiles.values())
+        world_collection = types.SimpleNamespace(all_objects=[root])
+        overview_material = types.SimpleNamespace(name="overview")
+
+        def resolve_source(_spec, x, y, **kwargs):
+            request = terrain.terrain_tile_source_request(
+                x,
+                y,
+                include_overlay=kwargs.get("include_overlay", True),
+                include_stitch_neighbors=kwargs.get("include_stitch_neighbors", False),
+            )
+            return terrain.TerrainTileSource(
+                request=request,
+                tile_name=f"tile_{y}_x_{x}",
+                heightmap_buffer=f"height_{x}_{y}",
+                texture_buffer=f"control_{x}_{y}" if request.include_overlay else "",
+            )
+
+        def rebuild(obj, level, **kwargs):
+            obj["terrain_multires"] = level
+            return True
+
+        def apply_overview(obj, _material, _spec, _key):
+            obj["terrain_lod_role"] = "overview"
+
+        target = terrain.terrain_tile_bounds(spec, 24, 23)
+        position = (target.center_x, target.center_y, 0.0)
+        with (
+            mock.patch.object(terrain, "inspect_world_terrain", return_value=spec),
+            mock.patch.object(
+                terrain.bpy,
+                "data",
+                types.SimpleNamespace(
+                    materials=types.SimpleNamespace(get=lambda _name: overview_material)
+                ),
+                create=True,
+            ),
+            mock.patch.object(
+                terrain, "resolve_world_terrain_tile_source", side_effect=resolve_source
+            ) as resolve,
+            mock.patch.object(terrain, "rebuild_tile_mesh", side_effect=rebuild) as rebuild_mesh,
+            mock.patch.object(
+                terrain, "_apply_tile_detail_material", return_value=object()
+            ) as detail,
+            mock.patch.object(
+                terrain, "_apply_terrain_lod_overview_material", side_effect=apply_overview
+            ) as overview,
+            mock.patch.object(terrain, "_tile_import_signature", return_value="signature"),
+            mock.patch.object(terrain, "_get_scene_terrain_detail_res", return_value=2048),
+            mock.patch.object(terrain, "_purge_unused_terrain_detail_data") as purge,
+            mock.patch.object(
+                terrain, "redkit_repo_context", side_effect=lambda _path: nullcontext()
+            ),
+        ):
+            result = terrain.update_terrain_view_lod(
+                object(),
+                spec.world_path,
+                position,
+                radius=3,
+                world_root_collection=world_collection,
+                detail_material=True,
+            )
+
+            self.assertEqual((result["promoted"], result["lowered"]), (7, 7))
+            self.assertEqual(rebuild_mesh.call_count, 14)
+            self.assertEqual(
+                {(call.args[1], call.args[2]) for call in resolve.call_args_list},
+                entering | leaving,
+            )
+            self.assertEqual(
+                {(call.args[2].key.x, call.args[2].key.y) for call in detail.call_args_list},
+                entering,
+            )
+            self.assertEqual(
+                {(call.args[3].x, call.args[3].y) for call in overview.call_args_list},
+                leaving,
+            )
+            purge.assert_called_once_with()
+
+            resolve.reset_mock()
+            rebuild_mesh.reset_mock()
+            detail.reset_mock()
+            overview.reset_mock()
+            purge.reset_mock()
+            repeated = terrain.update_terrain_view_lod(
+                object(),
+                spec.world_path,
+                position,
+                radius=3,
+                world_root_collection=world_collection,
+                detail_material=True,
+            )
+
+        self.assertEqual(
+            (repeated["promoted"], repeated["lowered"], repeated["refreshed"]),
+            (0, 0, 0),
+        )
+        resolve.assert_not_called()
+        rebuild_mesh.assert_not_called()
+        detail.assert_not_called()
+        overview.assert_not_called()
+        purge.assert_called_once_with()
+
+    def test_auto_skirt_depth_tracks_border_deviation_not_elevation_range(self):
+        tile_res = 512
+        stitched = np.zeros((tile_res + 1, tile_res + 1), dtype=np.uint16)
+        stitched[0, 8] = 6553
+        depth = terrain._auto_skirt_depth(stitched, tile_res, 400.0)
+        self.assertAlmostEqual(depth, 6553 * 400.0 / 65535.0 + 1.0, places=4)
+        self.assertLess(depth, 45.0)
+
+        flat = np.zeros((tile_res + 1, tile_res + 1), dtype=np.uint16)
+        self.assertAlmostEqual(
+            terrain._auto_skirt_depth(flat, tile_res, 400.0), 1.0)
+
+        anchored = np.zeros((17, 17), dtype=np.uint16)
+        anchored[0, :] = np.arange(17, dtype=np.uint16) * 1000
+        self.assertAlmostEqual(terrain._auto_skirt_depth(anchored, 16, 400.0), 1.0)
+
+    def test_update_streams_with_max_tiles_demotes_first_and_reports_pending(self):
+        spec = replace(_novigrad_spec(), x_tiles=46, y_tiles=46)
+        old_focus = terrain.terrain_view_lod_tiles(46, 46, 23, 23, 3)
+        new_focus = terrain.terrain_view_lod_tiles(46, 46, 24, 23, 3)
+
+        class Root(dict):
+            pass
+
+        class TileObject(dict):
+            type = "MESH"
+
+        tiles = {}
+        for key in old_focus | new_focus:
+            role = "native" if key in old_focus else "overview"
+            tiles[key] = TileObject(
+                tile_x=key[0],
+                tile_y=key[1],
+                terrain_lod_role=role,
+                terrain_multires=9 if role == "native" else 5,
+            )
+        root = Root(
+            witcher_terrain_root=True,
+            witcher_terrain_world_key=spec.world_key,
+            terrain_import_mode=terrain.TERRAIN_IMPORT_VIEW_LOD,
+            terrain_lod_radius=3,
+            terrain_lod_detail_material=True,
+            terrain_lod_detail_texture_res=2048,
+            terrain_lod_overview_material="overview",
+        )
+        root.children = list(tiles.values())
+        world_collection = types.SimpleNamespace(all_objects=[root])
+        overview_material = types.SimpleNamespace(name="overview")
+
+        def resolve_source(_spec, x, y, **kwargs):
+            request = terrain.terrain_tile_source_request(
+                x,
+                y,
+                include_overlay=kwargs.get("include_overlay", True),
+                include_stitch_neighbors=kwargs.get("include_stitch_neighbors", False),
+            )
+            return terrain.TerrainTileSource(
+                request=request,
+                tile_name=f"tile_{y}_x_{x}",
+                heightmap_buffer=f"height_{x}_{y}",
+                texture_buffer=f"control_{x}_{y}" if request.include_overlay else "",
+            )
+
+        def rebuild(obj, level, **kwargs):
+            obj["terrain_multires"] = level
+            return True
+
+        def apply_overview(obj, _material, _spec, _key):
+            obj["terrain_lod_role"] = "overview"
+
+        target = terrain.terrain_tile_bounds(spec, 24, 23)
+        position = (target.center_x, target.center_y, 0.0)
+        with (
+            mock.patch.object(terrain, "inspect_world_terrain", return_value=spec),
+            mock.patch.object(
+                terrain.bpy,
+                "data",
+                types.SimpleNamespace(
+                    materials=types.SimpleNamespace(get=lambda _name: overview_material)
+                ),
+                create=True,
+            ),
+            mock.patch.object(
+                terrain, "resolve_world_terrain_tile_source", side_effect=resolve_source
+            ),
+            mock.patch.object(terrain, "rebuild_tile_mesh", side_effect=rebuild),
+            mock.patch.object(terrain, "_apply_tile_detail_material", return_value=object()),
+            mock.patch.object(
+                terrain, "_apply_terrain_lod_overview_material", side_effect=apply_overview
+            ),
+            mock.patch.object(terrain, "_tile_import_signature", return_value="signature"),
+            mock.patch.object(terrain, "_get_scene_terrain_detail_res", return_value=2048),
+            mock.patch.object(terrain, "_purge_unused_terrain_detail_data") as purge,
+            mock.patch.object(
+                terrain, "redkit_repo_context", side_effect=lambda _path: nullcontext()
+            ),
+        ):
+            first = terrain.update_terrain_view_lod(
+                object(),
+                spec.world_path,
+                position,
+                radius=3,
+                world_root_collection=world_collection,
+                detail_material=True,
+                max_tiles=3,
+            )
+            self.assertEqual(
+                (first["lowered"], first["promoted"], first["pending"]), (3, 0, 11))
+            purge.assert_not_called()
+
+            lowered = first["lowered"]
+            promoted = first["promoted"]
+            calls = 1
+            while True:
+                step = terrain.update_terrain_view_lod(
+                    object(),
+                    spec.world_path,
+                    position,
+                    radius=3,
+                    world_root_collection=world_collection,
+                    detail_material=True,
+                    max_tiles=3,
+                )
+                lowered += step["lowered"]
+                promoted += step["promoted"]
+                calls += 1
+                if not step["pending"]:
+                    break
+
+        self.assertEqual((lowered, promoted), (7, 7))
+        self.assertEqual(calls, 5)
+        purge.assert_called_once_with()
+
+    def test_promote_reuses_cached_detail_material_and_demote_retains_it(self):
+        terrain._DETAIL_MATERIAL_LRU.clear()
+        spec = replace(_novigrad_spec(), x_tiles=46, y_tiles=46)
+        old_focus = terrain.terrain_view_lod_tiles(46, 46, 23, 23, 3)
+        new_focus = terrain.terrain_view_lod_tiles(46, 46, 26, 23, 3)
+        leaving = set(old_focus - new_focus)
+        entering = set(new_focus - old_focus)
+
+        class Root(dict):
+            pass
+
+        class FakeMat(dict):
+            def __init__(self, name, **kwargs):
+                super().__init__(**kwargs)
+                self.name = name
+                self.use_fake_user = False
+
+        class TileObject(dict):
+            type = "MESH"
+
+        def mat_name(key):
+            return terrain._tile_material_name(
+                spec, types.SimpleNamespace(x=key[0], y=key[1]))
+
+        tiles = {}
+        for key in old_focus | new_focus:
+            role = "native" if key in old_focus else "overview"
+            obj = TileObject(
+                tile_x=key[0],
+                tile_y=key[1],
+                terrain_lod_role=role,
+                terrain_multires=9 if role == "native" else 5,
+            )
+            obj.data = types.SimpleNamespace(materials=[])
+            tiles[key] = obj
+
+        cached_mats = {}
+        for key in entering:
+            mat = FakeMat(
+                mat_name(key),
+                witcher_terrain_detail=True,
+                witcher_terrain_lod_sig="signature:2048",
+            )
+            mat.use_fake_user = True
+            cached_mats[mat.name] = mat
+            terrain._DETAIL_MATERIAL_LRU[mat.name] = None
+        live_mats = {}
+        for key in leaving:
+            mat = FakeMat(mat_name(key), witcher_terrain_detail=True)
+            tiles[key].data.materials.append(mat)
+            live_mats[key] = mat
+
+        root = Root(
+            witcher_terrain_root=True,
+            witcher_terrain_world_key=spec.world_key,
+            terrain_import_mode=terrain.TERRAIN_IMPORT_VIEW_LOD,
+            terrain_lod_radius=3,
+            terrain_lod_detail_material=True,
+            terrain_lod_detail_texture_res=2048,
+            terrain_lod_overview_material="overview",
+        )
+        root.children = list(tiles.values())
+        world_collection = types.SimpleNamespace(all_objects=[root])
+        overview_material = types.SimpleNamespace(name="overview")
+
+        def resolve_source(_spec, x, y, **kwargs):
+            request = terrain.terrain_tile_source_request(
+                x,
+                y,
+                include_overlay=kwargs.get("include_overlay", True),
+                include_stitch_neighbors=kwargs.get("include_stitch_neighbors", False),
+            )
+            return terrain.TerrainTileSource(
+                request=request,
+                tile_name=f"tile_{y}_x_{x}",
+                heightmap_buffer=f"height_{x}_{y}",
+                texture_buffer=f"control_{x}_{y}" if request.include_overlay else "",
+            )
+
+        def rebuild(obj, level, **kwargs):
+            obj["terrain_multires"] = level
+            return True
+
+        def apply_overview(obj, _material, _spec, _key):
+            obj["terrain_lod_role"] = "overview"
+
+        target = terrain.terrain_tile_bounds(spec, 26, 23)
+        position = (target.center_x, target.center_y, 0.0)
+        with (
+            mock.patch.object(terrain, "inspect_world_terrain", return_value=spec),
+            mock.patch.object(
+                terrain.bpy,
+                "data",
+                types.SimpleNamespace(
+                    materials=types.SimpleNamespace(
+                        get=lambda name: cached_mats.get(name, overview_material))
+                ),
+                create=True,
+            ),
+            mock.patch.object(
+                terrain, "resolve_world_terrain_tile_source", side_effect=resolve_source
+            ),
+            mock.patch.object(terrain, "rebuild_tile_mesh", side_effect=rebuild),
+            mock.patch.object(terrain, "_apply_tile_detail_material") as detail,
+            mock.patch.object(
+                terrain, "_apply_terrain_lod_overview_material", side_effect=apply_overview
+            ),
+            mock.patch.object(terrain, "_tile_import_signature", return_value="signature"),
+            mock.patch.object(terrain, "_get_scene_terrain_detail_res", return_value=2048),
+            mock.patch.object(terrain, "_purge_unused_terrain_detail_data"),
+            mock.patch.object(
+                terrain, "redkit_repo_context", side_effect=lambda _path: nullcontext()
+            ),
+        ):
+            result = terrain.update_terrain_view_lod(
+                object(),
+                spec.world_path,
+                position,
+                radius=3,
+                world_root_collection=world_collection,
+                detail_material=True,
+            )
+
+        self.assertEqual((result["promoted"], result["lowered"]), (21, 21))
+        detail.assert_not_called()
+        for key in entering:
+            mat = cached_mats[mat_name(key)]
+            self.assertEqual(tiles[key].data.materials, [mat])
+            self.assertFalse(mat.use_fake_user)
+            self.assertNotIn(mat.name, terrain._DETAIL_MATERIAL_LRU)
+        for key in leaving:
+            self.assertTrue(live_mats[key].use_fake_user)
+            self.assertIn(live_mats[key].name, terrain._DETAIL_MATERIAL_LRU)
+        terrain._DETAIL_MATERIAL_LRU.clear()
 
 
 class TestTerrainDetailWorldAssets(unittest.TestCase):

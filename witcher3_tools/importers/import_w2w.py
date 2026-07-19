@@ -3,7 +3,10 @@ import os
 import hashlib
 import json
 import math
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, replace
+from functools import lru_cache
 
 import bpy
 
@@ -31,8 +34,10 @@ from .. import get_fbx_uncook_path
 from .. import get_all_addon_prefs
 from ..extension_paths import get_dev_override, get_redkit_working_root
 from ..terrain_core import (
+    terrain_native_level,
     terrain_tile_bounds as _terrain_tile_bounds_2d,
     terrain_tile_from_world_position as _terrain_tile_from_world_position,
+    terrain_view_lod_tiles,
 )
 
 W2W_NODES_PROP = "witcher_w2w_nodes"
@@ -421,7 +426,7 @@ def AddCLayerGroup(groups, parent_collection, world_path=""):
 
 
 
-def btn_import_w2w(worldFile: WORLD, filePath):
+def btn_import_w2w(worldFile: WORLD, filePath, report=None):
     collection = AddCLayerGroup(worldFile.groups, False, filePath)
     if collection.name not in bpy.context.scene.collection.children:
         bpy.context.scene.collection.children.link(collection)
@@ -429,8 +434,15 @@ def btn_import_w2w(worldFile: WORLD, filePath):
     if layer_collection is not None:
         bpy.context.view_layer.active_layer_collection = layer_collection
 
+    started = time.perf_counter()
     with redkit_repo_context(filePath):
-        do_import_map_terrain(worldFile, filePath, world_root_collection=collection)
+        terrain_result = do_import_map_terrain(
+            worldFile, filePath, world_root_collection=collection)
+    elapsed = time.perf_counter() - started
+    message = f"Terrain imported in {elapsed:.2f} seconds"
+    print(f"[Witcher 3 Tools] {message}")
+    if report is not None:
+        report({'INFO'}, message)
 
     # Keep world import usable when the optional preview UI is unavailable.
     try:
@@ -438,6 +450,7 @@ def btn_import_w2w(worldFile: WORLD, filePath):
         ui_environment.sync_world_import(bpy.context, worldFile, filePath)
     except Exception:
         log.warning("Could not sync imported world environment for %s", filePath, exc_info=True)
+    return terrain_result
 
 
 from pathlib import Path
@@ -722,12 +735,28 @@ def _discover_tile_count(terrain_tiles_dir):
 
 TERRAIN_IMPORT_FULL_MAP = "FULL_MAP"
 TERRAIN_IMPORT_TILES = "TILES"
+TERRAIN_IMPORT_VIEW_LOD = "VIEW_LOD"
 
-# Defaults balance preview quality and source resolution.
-TERRAIN_TILE_PREVIEW_LEVEL = 6
-TERRAIN_TILE_MAX_LEVEL = 8
+TERRAIN_TILE_PREVIEW_LEVEL = 8
+TERRAIN_TILE_MAX_LEVEL = 10
+TERRAIN_VIEW_LOD_RADIUS = 3
+TERRAIN_VIEW_LOD_OVERVIEW_LEVEL = 5
+TERRAIN_VIEW_LOD_OVERVIEW_RES = 2048
+TERRAIN_VIEW_LOD_SKIRT_AUTO = -1.0
+TERRAIN_VIEW_LOD_MATERIAL_CACHE = 96
+_DETAIL_MATERIAL_LRU = OrderedDict()
+_REBUILD_HEIGHTMAP_CACHE = {}
 TERRAIN_TILE_STITCH_VERSION = 1
 TERRAIN_HEIGHTMAP_CACHE_LIMIT = 64
+_TILE_MESH_LRU = OrderedDict()
+_TILE_MESH_KEY_PROP = "witcher_tile_mesh_key"
+_TILE_MESH_CACHE_MIN_VERTS = 10_000
+# About 41 MB per 513x513 skirted tile.
+_TILE_MESH_BYTES_PER_VERT = 155
+_TILE_MESH_CACHE_DEFAULT_MB = 2048
+# Queue removals to avoid a depsgraph sync on every streaming tick.
+_TILE_MESH_DOOMED = []
+_TILE_MESH_DOOMED_HARD_CAP = 64
 
 @dataclass(frozen=True, order=True)
 class TerrainTileKey:
@@ -956,6 +985,56 @@ def inspect_world_terrain(worldFile, filePath, *, discover_tiles=True):
     )
 
 
+@lru_cache(maxsize=1)
+def _cached_world_terrain_preflight(path, mtime_ns, size):
+    del mtime_ns, size
+    world_file = CR2W.CR2W_reader.load_w2w(path, include_groups=False)
+    return inspect_world_terrain(world_file, path, discover_tiles=False)
+
+
+def preflight_world_terrain(file_path):
+    path = os.path.abspath(str(file_path or ""))
+    stat = os.stat(win_safe_path(path))
+    return _cached_world_terrain_preflight(
+        path,
+        int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+        int(stat.st_size),
+    )
+
+
+_WORLD_LOD_CACHE = {}
+
+
+def _world_lod_cache_key(file_path):
+    path = os.path.abspath(str(file_path or ""))
+    stat = os.stat(win_safe_path(path))
+    return (
+        path,
+        int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+        int(stat.st_size),
+    )
+
+
+def cached_world_terrain_lod(file_path):
+    key = _world_lod_cache_key(file_path)
+    hit = _WORLD_LOD_CACHE.get(key)
+    if hit is None:
+        world_file = CR2W.CR2W_reader.load_w2w(key[0], include_groups=False)
+        hit = (world_file, inspect_world_terrain(world_file, key[0]))
+        _WORLD_LOD_CACHE.clear()
+        _WORLD_LOD_CACHE[key] = hit
+    return hit
+
+
+def _seed_world_terrain_lod_cache(file_path, world_file, spec):
+    try:
+        key = _world_lod_cache_key(file_path)
+    except OSError:
+        return
+    _WORLD_LOD_CACHE.clear()
+    _WORLD_LOD_CACHE[key] = (world_file, spec)
+
+
 def terrain_tile_bounds(spec, x, y):
     """Return half-open bounds for a tile without touching Blender or disk."""
     key = TerrainTileKey(x, y)
@@ -1117,6 +1196,13 @@ def _get_scene_terrain_multires_level():
         return TERRAIN_TILE_PREVIEW_LEVEL
 
 
+def _get_scene_terrain_lod_radius():
+    try:
+        return max(0, int(bpy.context.scene.witcher_file_browser.terrain_lod_radius))
+    except Exception:
+        return TERRAIN_VIEW_LOD_RADIUS
+
+
 def _clamp_tile_multires_level(level, tile_res):
     """Cap mesh density at the resolution supported by the source buffer."""
     try:
@@ -1136,7 +1222,7 @@ def _clamp_tile_multires_level(level, tile_res):
 def _get_scene_terrain_import_mode():
     try:
         mode = str(bpy.context.scene.witcher_file_browser.terrain_import_mode)
-        if mode in {TERRAIN_IMPORT_FULL_MAP, TERRAIN_IMPORT_TILES}:
+        if mode in {TERRAIN_IMPORT_FULL_MAP, TERRAIN_IMPORT_TILES, TERRAIN_IMPORT_VIEW_LOD}:
             return mode
     except Exception:
         pass
@@ -2279,6 +2365,7 @@ def import_combined_terrain_full_map(
             continue
         for space in area.spaces:
             if space.type == 'VIEW_3D':
+                space.clip_start = max(float(space.clip_start), 1.0)
                 space.clip_end = max(float(space.clip_end), float(terrain_size) * math.sqrt(2.0))
 
     _create_full_map_geo_nodes(obj, heightmap_path, lowest_elevation, highest_elevation)
@@ -2641,27 +2728,11 @@ def _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection=N
     return obj
 
 
-def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None):
-    ctx = _resolve_terrain_context(worldFile, filePath)
-    detail_enabled = _get_scene_terrain_detail_enabled()
-    detail_spec = inspect_world_terrain(worldFile, filePath) if detail_enabled else None
-    hub_name = ctx["hub_name"]
-    n_tiles = ctx["n_tiles"]
-    tile_res = ctx["tile_res"]
-    water_key = _terrain_world_key(hub_name, filePath)
-
-    if n_tiles <= 0:
-        log.warning("Could not determine terrain tile grid for %s", hub_name)
-        return
-
-    _ensure_world_water_plane(hub_name, worldFile.terrainSize, world_key=water_key)
-
-    multires_level = _get_scene_terrain_multires_level()
-
-    # Find/extract tile buffers
+def _collect_map_terrain_tile_buffers(ctx, n_tiles, tile_res, detail_enabled, overlay_keys=None):
     tile_heightmap_buffers = {}  # (x,y) -> raw .w2ter.1.buffer path
     tile_texture_buffers = {}    # (x,y) -> raw .w2ter.2.buffer path
     tile_overlays = {}           # (x,y) -> overlay PNG path
+    overlay_keys = None if overlay_keys is None else set(overlay_keys)
 
     for y in range(n_tiles):
         for x in range(n_tiles):
@@ -2688,16 +2759,44 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
             )
             if buf2_path:
                 tile_texture_buffers[(x, y)] = str(buf2_path)
-                info = terrain_w2ter.TileInfo(x=x, y=y, res=tile_res, buffer_index=2)
+                if overlay_keys is not None and (x, y) not in overlay_keys:
+                    continue
                 overlay_path = buf2_path + ".overlay.png"
-                try:
-                    terrain_w2ter._tile_texture_pngs(
-                        buf2_path, info, which=("overlay",), skip_existing=True
-                    )
-                except Exception:
-                    pass
-                if os.path.exists(overlay_path):
+                if detail_enabled:
                     tile_overlays[(x, y)] = overlay_path
+                else:
+                    info = terrain_w2ter.TileInfo(
+                        x=x, y=y, res=tile_res, buffer_index=2)
+                    try:
+                        terrain_w2ter._tile_texture_pngs(
+                            buf2_path, info, which=("overlay",), skip_existing=True
+                        )
+                    except Exception:
+                        pass
+                    if os.path.exists(overlay_path):
+                        tile_overlays[(x, y)] = overlay_path
+
+    return tile_heightmap_buffers, tile_texture_buffers, tile_overlays
+
+
+def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None):
+    ctx = _resolve_terrain_context(worldFile, filePath)
+    detail_enabled = _get_scene_terrain_detail_enabled()
+    detail_spec = inspect_world_terrain(worldFile, filePath) if detail_enabled else None
+    hub_name = ctx["hub_name"]
+    n_tiles = ctx["n_tiles"]
+    tile_res = ctx["tile_res"]
+    water_key = _terrain_world_key(hub_name, filePath)
+
+    if n_tiles <= 0:
+        log.warning("Could not determine terrain tile grid for %s", hub_name)
+        return
+
+    multires_level = _get_scene_terrain_multires_level()
+    tile_heightmap_buffers, tile_texture_buffers, tile_overlays = (
+        _collect_map_terrain_tile_buffers(
+            ctx, n_tiles, tile_res, detail_enabled)
+    )
 
     if not tile_heightmap_buffers:
         log.warning("No terrain tile heightmaps found for %s", hub_name)
@@ -2726,10 +2825,13 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
             worldFile.highestElevation,
             world_key=water_key,
         )
+    else:
+        _ensure_world_water_plane(
+            hub_name, worldFile.terrainSize, world_key=water_key)
 
     log.info("Importing %d terrain tiles for %s (%dx%d grid)", len(tile_heightmap_buffers), hub_name, n_tiles, n_tiles)
 
-    do_import_terrain_tiles(
+    empty, count = do_import_terrain_tiles(
         tile_heightmap_buffers=tile_heightmap_buffers,
         tile_texture_buffers=tile_texture_buffers,
         tile_overlays=tile_overlays,
@@ -2747,18 +2849,144 @@ def _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection=None
         terrain_spec=detail_spec,
         detail_material=detail_enabled,
     )
+    return empty, count
+
+
+def _do_import_map_terrain_view_lod(worldFile, filePath, world_root_collection=None):
+    ctx = _resolve_terrain_context(worldFile, filePath)
+    spec = inspect_world_terrain(worldFile, filePath)
+    n_tiles = int(ctx["n_tiles"] or 0)
+    tile_res = int(ctx["tile_res"] or 0)
+    if n_tiles <= 0 or tile_res <= 0:
+        log.warning("Could not determine terrain tile grid for %s", spec.hub_name)
+        return None
+
+    native_level = _clamp_tile_multires_level(
+        terrain_native_level(tile_res), tile_res)
+    overview_level = min(TERRAIN_VIEW_LOD_OVERVIEW_LEVEL, native_level)
+    radius = _get_scene_terrain_lod_radius()
+    center_x = n_tiles // 2
+    center_y = n_tiles // 2
+    try:
+        settings = bpy.context.scene.witcher_file_browser
+        settings.terrain_tile_x = center_x
+        settings.terrain_tile_y = center_y
+    except Exception:
+        pass
+    detail_tiles = terrain_view_lod_tiles(
+        n_tiles, n_tiles, center_x, center_y, radius)
+    detail_enabled = _get_scene_terrain_detail_enabled()
+
+    collect_started = time.perf_counter()
+    tile_heightmaps, tile_textures, tile_overlays = _collect_map_terrain_tile_buffers(
+        ctx,
+        n_tiles,
+        tile_res,
+        detail_enabled,
+        overlay_keys=detail_tiles,
+    )
+    collect_seconds = time.perf_counter() - collect_started
+    if not tile_heightmaps:
+        log.warning("No terrain tile heightmaps found for %s", spec.hub_name)
+        return None
+
+    bake_started = time.perf_counter()
+    overview_path = os.path.join(
+        str(ctx["output_dir"]), f"{spec.hub_name}.lod_overview.png")
+    try:
+        overview_path = terrain_w2ter.bake_terrain_lod_overview(
+            tile_textures,
+            tile_res,
+            n_tiles,
+            n_tiles,
+            overview_path,
+            out_res=TERRAIN_VIEW_LOD_OVERVIEW_RES,
+            skip_existing=True,
+        ) or ""
+    except Exception:
+        overview_path = ""
+        log.warning("Terrain LOD overview bake failed; using a flat overview", exc_info=True)
+    bake_seconds = time.perf_counter() - bake_started
+
+    _ensure_world_water_plane(
+        spec.hub_name,
+        spec.terrain_size,
+        world_key=spec.world_key,
+    )
+    overview_material = _terrain_lod_overview_material(spec, overview_path)
+    tile_levels = {key: native_level for key in detail_tiles}
+    log.info(
+        "Importing View LOD for %s: %d native L%d tiles, %d overview L%d tiles",
+        spec.hub_name,
+        len(detail_tiles),
+        native_level,
+        max(0, len(tile_heightmaps) - len(detail_tiles)),
+        overview_level,
+    )
+    tiles_started = time.perf_counter()
+    # Defer expensive detail materials to the idle view-follow timer.
+    root, count = do_import_terrain_tiles(
+        tile_heightmap_buffers=tile_heightmaps,
+        tile_texture_buffers=tile_textures,
+        tile_overlays=tile_overlays,
+        x_tiles=n_tiles,
+        y_tiles=n_tiles,
+        tile_res=tile_res,
+        terrain_size=spec.terrain_size,
+        lowest_elevation=spec.lowest_elevation,
+        highest_elevation=spec.highest_elevation,
+        multires_level=overview_level,
+        hub_name=spec.hub_name,
+        world_path=filePath,
+        world_root_collection=world_root_collection,
+        world_file=worldFile,
+        terrain_spec=spec,
+        detail_material=False,
+        tile_levels=tile_levels,
+        detail_tiles=detail_tiles,
+        overview_material=overview_material,
+    )
+    tiles_seconds = time.perf_counter() - tiles_started
+    root["terrain_import_mode"] = TERRAIN_IMPORT_VIEW_LOD
+    root["terrain_lod_center_x"] = center_x
+    root["terrain_lod_center_y"] = center_y
+    root["terrain_lod_radius"] = radius
+    root["terrain_lod_native_level"] = native_level
+    root["terrain_lod_overview_level"] = overview_level
+    root["terrain_lod_detail_tiles"] = len(detail_tiles)
+    root["terrain_lod_grid_tiles"] = n_tiles * n_tiles
+    root["terrain_lod_overview_path"] = str(overview_path or "")
+    root["terrain_lod_overview_material"] = overview_material.name
+    # Mark detail materials pending for the auto-update timer.
+    root["terrain_lod_detail_material"] = False
+    root["terrain_lod_detail_texture_res"] = _get_scene_terrain_detail_res()
+    _seed_world_terrain_lod_cache(filePath, worldFile, spec)
+    log.warning(
+        "View LOD import phases for %s: collect %.1fs, overview bake %.1fs, "
+        "tile grid %.1fs (%d tiles); detail materials deferred to idle streaming",
+        spec.hub_name,
+        collect_seconds,
+        bake_seconds,
+        tiles_seconds,
+        count,
+    )
+    return root, count
 
 
 def do_import_map_terrain(worldFile, filePath, world_root_collection=None):
     mode = _get_scene_terrain_import_mode()
+    if mode == TERRAIN_IMPORT_VIEW_LOD:
+        return _do_import_map_terrain_view_lod(
+            worldFile, filePath, world_root_collection)
     if mode == TERRAIN_IMPORT_TILES:
-        _do_import_map_terrain_tiles(worldFile, filePath, world_root_collection)
-        return
+        return _do_import_map_terrain_tiles(
+            worldFile, filePath, world_root_collection)
 
     obj = _do_import_map_terrain_full_map(worldFile, filePath, world_root_collection)
     if obj is None:
         # Do not silently fall back to all tiles.
         log.warning("Full-map terrain import failed; all-tiles fallback was not started")
+    return obj
 
 
 def _terrain_grid_topology(mesh_res):
@@ -2797,7 +3025,15 @@ def _read_tile_heightmap(heightmap_buffer_path, tile_res, cache=None):
     tile_res = max(1, int(tile_res))
     source_path = str(heightmap_buffer_path)
     safe_path = win_safe_path(source_path)
-    cache_key = (os.path.normcase(os.path.abspath(source_path)), tile_res)
+    try:
+        stat = os.stat(safe_path)
+        stamp = (
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            int(stat.st_size),
+        )
+    except OSError:
+        stamp = (0, 0)
+    cache_key = (os.path.normcase(os.path.abspath(source_path)), tile_res, *stamp)
     if cache is not None and cache_key in cache:
         heightmap = cache.pop(cache_key)
         cache[cache_key] = heightmap
@@ -2865,6 +3101,24 @@ def _terrain_tile_sample_indices(tile_res, mesh_res):
     ).astype(np.intp)
 
 
+def _auto_skirt_depth(stitched_heightmap, tile_res, elev_range):
+    """Bound skirt depth by border deviation from overview interpolation."""
+    overview_res = min((1 << TERRAIN_VIEW_LOD_OVERVIEW_LEVEL) + 1, int(tile_res) + 1)
+    anchors = _terrain_tile_sample_indices(tile_res, overview_res)
+    positions = np.arange(stitched_heightmap.shape[0], dtype=np.float64)
+    deviation = 0.0
+    for border in (
+        stitched_heightmap[0, :],
+        stitched_heightmap[-1, :],
+        stitched_heightmap[:, 0],
+        stitched_heightmap[:, -1],
+    ):
+        border = border.astype(np.float64)
+        interp = np.interp(positions, anchors.astype(np.float64), border[anchors])
+        deviation = max(deviation, float(np.abs(border - interp).max()))
+    return deviation * float(elev_range) / 65535.0 + 1.0
+
+
 def _create_tile_mesh(
     name,
     heightmap_buffer_path,
@@ -2877,8 +3131,8 @@ def _create_tile_mesh(
     positive_y_buffer_path="",
     positive_xy_buffer_path="",
     heightmap_cache=None,
+    skirt_depth=0.0,
 ):
-    """Create a terrain grid using neighbor edge samples."""
     heightmap = _read_tile_heightmap(
         heightmap_buffer_path, tile_res, cache=heightmap_cache)
     right = _read_optional_tile_heightmap(
@@ -2909,6 +3163,64 @@ def _create_tile_mesh(
     coordinates[:, 2] = sampled_height.ravel()
 
     loop_vertices, loop_starts, loop_totals, loop_uv = _terrain_grid_topology(mesh_res)
+    skirt_depth = float(skirt_depth or 0.0)
+    if skirt_depth < 0.0:
+        skirt_depth = _auto_skirt_depth(stitched_heightmap, tile_res, elev_range)
+    if skirt_depth:
+        # Skirt every edge because either side of an LOD boundary may be higher.
+        base_vertex_count = coordinates.shape[0]
+        edge_vertices = (
+            np.arange(mesh_res, dtype=np.int32),
+            np.arange(mesh_res, dtype=np.int32) * mesh_res + mesh_res - 1,
+            np.arange(
+                base_vertex_count - 1,
+                base_vertex_count - mesh_res - 1,
+                -1,
+                dtype=np.int32,
+            ),
+            np.arange(mesh_res - 1, -1, -1, dtype=np.int32) * mesh_res,
+        )
+        uv_axis = np.linspace(0.0, 1.0, mesh_res, dtype=np.float32)
+        zeros = np.zeros(mesh_res, dtype=np.float32)
+        ones = np.ones(mesh_res, dtype=np.float32)
+        edge_uvs = (
+            np.column_stack((uv_axis, zeros)),
+            np.column_stack((ones, uv_axis)),
+            np.column_stack((uv_axis[::-1], ones)),
+            np.column_stack((zeros, uv_axis[::-1])),
+        )
+        coordinate_chunks = [coordinates]
+        loop_chunks = [loop_vertices]
+        uv_chunks = [loop_uv]
+        next_vertex = base_vertex_count
+        for edge, edge_uv in zip(edge_vertices, edge_uvs):
+            bottoms = coordinates[edge].copy()
+            bottoms[:, 2] -= skirt_depth
+            bottom_vertices = np.arange(
+                next_vertex, next_vertex + mesh_res, dtype=np.int32)
+            side_loops = np.column_stack((
+                edge[:-1],
+                bottom_vertices[:-1],
+                bottom_vertices[1:],
+                edge[1:],
+            )).astype(np.int32, copy=False)
+            side_uv = np.empty((mesh_res - 1, 4, 2), dtype=np.float32)
+            side_uv[:, 0] = edge_uv[:-1]
+            side_uv[:, 1] = edge_uv[:-1]
+            side_uv[:, 2] = edge_uv[1:]
+            side_uv[:, 3] = edge_uv[1:]
+            coordinate_chunks.append(bottoms)
+            loop_chunks.append(side_loops.ravel())
+            uv_chunks.append(side_uv.reshape((-1, 2)))
+            next_vertex += mesh_res
+
+        coordinates = np.concatenate(coordinate_chunks)
+        loop_vertices = np.concatenate(loop_chunks)
+        loop_uv = np.concatenate(uv_chunks)
+        loop_starts = np.arange(0, loop_vertices.size, 4, dtype=np.int32)
+        loop_totals = np.full(loop_starts.size, 4, dtype=np.int32)
+
+    vertex_count = coordinates.shape[0]
     face_count = loop_starts.size
 
     mesh.vertices.add(vertex_count)
@@ -2950,7 +3262,7 @@ def _terrain_tile_neighbor_path_from_object(obj, property_name, dx, dy):
     return ""
 
 
-def rebuild_tile_mesh(obj, target_level):
+def rebuild_tile_mesh(obj, target_level, *, skirt_depth=None):
     """Rebuild a terrain tile at a new resolution."""
     buffer_path = obj.get("tile_buffer_path")
     tile_res = obj.get("tile_res")
@@ -2964,6 +3276,9 @@ def rebuild_tile_mesh(obj, target_level):
 
     target_level = _clamp_tile_multires_level(target_level, tile_res)
     mesh_res = (1 << target_level) + 1 if target_level > 0 else 2
+    if skirt_depth is None:
+        skirt_depth = obj.get("terrain_lod_skirt_depth", 0.0)
+    skirt_depth = float(skirt_depth or 0.0)
     positive_x_buffer_path = _terrain_tile_neighbor_path_from_object(
         obj, "positive_x_buffer_path", 1, 0)
     positive_y_buffer_path = _terrain_tile_neighbor_path_from_object(
@@ -2971,26 +3286,33 @@ def rebuild_tile_mesh(obj, target_level):
     positive_xy_buffer_path = _terrain_tile_neighbor_path_from_object(
         obj, "positive_xy_buffer_path", 1, 1)
     old_mesh = obj.data
-    new_mesh = _create_tile_mesh(
-        obj.name, buffer_path, int(tile_res), mesh_res,
-        float(tile_size), float(elev_range),
-        positive_x_buffer_path=positive_x_buffer_path,
-        positive_y_buffer_path=positive_y_buffer_path,
-        positive_xy_buffer_path=positive_xy_buffer_path,
-    )
+    cache_key = _tile_mesh_cache_key(
+        buffer_path, tile_res, target_level, skirt_depth,
+        positive_x_buffer_path, positive_y_buffer_path, positive_xy_buffer_path)
+    new_mesh = _take_cached_tile_mesh(cache_key)
+    if new_mesh is None:
+        new_mesh = _create_tile_mesh(
+            obj.name, buffer_path, int(tile_res), mesh_res,
+            float(tile_size), float(elev_range),
+            positive_x_buffer_path=positive_x_buffer_path,
+            positive_y_buffer_path=positive_y_buffer_path,
+            positive_xy_buffer_path=positive_xy_buffer_path,
+            heightmap_cache=_REBUILD_HEIGHTMAP_CACHE,
+            skirt_depth=skirt_depth,
+        )
+        new_mesh[_TILE_MESH_KEY_PROP] = cache_key
     if old_mesh is not None:
         for material in old_mesh.materials:
             if material is not None:
                 new_mesh.materials.append(material)
     obj.data = new_mesh
     obj["terrain_multires"] = target_level
+    obj["terrain_lod_skirt_depth"] = skirt_depth
     # Force reuse validation after a manual mesh rebuild.
     if "terrain_tile_source_signature" in obj:
         del obj["terrain_tile_source_signature"]
 
-    # Remove old mesh if no other users
-    if old_mesh and old_mesh.users == 0:
-        bpy.data.meshes.remove(old_mesh)
+    _store_cached_tile_mesh(old_mesh)
 
     return True
 
@@ -3012,33 +3334,249 @@ def _apply_tile_overlay_material(obj, overlay_path, mat_name):
         mat = bpy.data.materials.new(name=mat_name)
     mat.use_nodes = True
     nt = mat.node_tree
-    principled = nt.nodes.get("Principled BSDF")
-    if principled is None:
-        principled = nt.nodes.new("ShaderNodeBsdfPrincipled")
-    tex = nt.nodes.get("Witcher Terrain Overlay")
-    if tex is None or tex.bl_idname != "ShaderNodeTexImage":
-        tex = nt.nodes.new("ShaderNodeTexImage")
-        tex.name = "Witcher Terrain Overlay"
-    uv = nt.nodes.get("Witcher Terrain UV")
-    if uv is None or uv.bl_idname != "ShaderNodeUVMap":
-        uv = nt.nodes.new("ShaderNodeUVMap")
-        uv.name = "Witcher Terrain UV"
+    # Replace any previous texarray graph.
+    nt.nodes.clear()
+    principled = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    output = nt.nodes.new("ShaderNodeOutputMaterial")
+    tex = nt.nodes.new("ShaderNodeTexImage")
+    tex.name = "Witcher Terrain Overlay"
+    uv = nt.nodes.new("ShaderNodeUVMap")
+    uv.name = "Witcher Terrain UV"
     uv.uv_map = "UVMap"
     uv.location = (tex.location[0] - 220, tex.location[1])
-    if not tex.inputs["Vector"].is_linked:
-        nt.links.new(uv.outputs["UV"], tex.inputs["Vector"])
-    for link in tuple(principled.inputs["Base Color"].links):
-        nt.links.remove(link)
-    insert_color(mat, principled, tex, None, str(overlay_path))
+    nt.links.new(uv.outputs["UV"], tex.inputs["Vector"])
+    nt.links.new(tex.outputs["Color"], principled.inputs["Base Color"])
+    nt.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
+    tex.image = _load_or_reload_terrain_image(overlay_path, "sRGB")
     _set_principled_terrain_values(principled)
+    # Cull undersides so being below the terrain shows sky, not skirt walls.
+    mat.use_backface_culling = True
     mat["witcher_terrain_material"] = True
     mat["witcher_terrain_material_key"] = mat_name
     mat["witcher_terrain_overlay_path"] = str(overlay_path)
-    if "witcher_terrain_detail_sig" in mat:
-        del mat["witcher_terrain_detail_sig"]
+    mat["witcher_terrain_overlay"] = True
+    for prop in (
+        "witcher_terrain_detail",
+        "witcher_terrain_detail_sig",
+        "witcher_terrain_layer_metadata",
+        "witcher_terrain_texture_pack_key",
+    ):
+        if prop in mat:
+            del mat[prop]
     obj.data.materials.clear()
     obj.data.materials.append(mat)
     return mat
+
+
+def _terrain_lod_overview_material(spec, overview_path):
+    mat_name = f"terrain_{spec.hub_name}_{spec.world_key[:8]}_lod_overview"
+    mat = bpy.data.materials.get(mat_name)
+    if mat is None:
+        mat = bpy.data.materials.new(name=mat_name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    principled = nt.nodes.get("Principled BSDF")
+    if principled is None:
+        principled = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    output = nt.nodes.get("Material Output")
+    if output is None:
+        output = nt.nodes.new("ShaderNodeOutputMaterial")
+    if not output.inputs["Surface"].is_linked:
+        nt.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
+
+    tex = nt.nodes.get("Witcher Terrain LOD Overview")
+    uv = nt.nodes.get("Witcher Terrain World UV")
+    image = None
+    if overview_path and os.path.isfile(win_safe_path(overview_path)):
+        image = _load_or_reload_terrain_image(overview_path, "sRGB")
+    if image is not None:
+        if tex is None or tex.bl_idname != "ShaderNodeTexImage":
+            tex = nt.nodes.new("ShaderNodeTexImage")
+            tex.name = "Witcher Terrain LOD Overview"
+        if uv is None or uv.bl_idname != "ShaderNodeUVMap":
+            uv = nt.nodes.new("ShaderNodeUVMap")
+            uv.name = "Witcher Terrain World UV"
+        uv.uv_map = "WorldUV"
+        tex.image = image
+        tex.interpolation = 'Linear'
+        for link in tuple(principled.inputs["Base Color"].links):
+            nt.links.remove(link)
+        for link in tuple(principled.inputs["Alpha"].links):
+            nt.links.remove(link)
+        if not tex.inputs["Vector"].is_linked:
+            nt.links.new(uv.outputs["UV"], tex.inputs["Vector"])
+        nt.links.new(tex.outputs["Color"], principled.inputs["Base Color"])
+        nt.links.new(tex.outputs["Alpha"], principled.inputs["Alpha"])
+    elif not principled.inputs["Base Color"].is_linked:
+        principled.inputs["Base Color"].default_value = (0.18, 0.24, 0.14, 1.0)
+
+    _set_principled_terrain_values(principled)
+    mat.use_backface_culling = True
+    for attr, value in (("surface_render_method", "DITHERED"), ("blend_method", "HASHED")):
+        if hasattr(mat, attr):
+            try:
+                setattr(mat, attr, value)
+            except (AttributeError, TypeError, ValueError):
+                pass
+    mat["witcher_terrain_material"] = True
+    mat["witcher_terrain_lod_overview"] = True
+    mat["witcher_terrain_world_key"] = spec.world_key
+    mat["witcher_terrain_overview_path"] = str(overview_path or "")
+    return mat
+
+
+def _apply_terrain_lod_overview_material(obj, material, spec, key):
+    local_uv = obj.data.uv_layers.get("UVMap")
+    if local_uv is not None:
+        world_uv = obj.data.uv_layers.get("WorldUV") or obj.data.uv_layers.new(name="WorldUV")
+        values = np.empty(len(local_uv.uv) * 2, dtype=np.float32)
+        local_uv.uv.foreach_get("vector", values)
+        values[0::2] = (values[0::2] + int(key.x)) / max(1, int(spec.x_tiles))
+        values[1::2] = (values[1::2] + int(key.y)) / max(1, int(spec.y_tiles))
+        world_uv.uv.foreach_set("vector", values)
+    obj.data.materials.clear()
+    obj.data.materials.append(material)
+    obj["terrain_lod_role"] = "overview"
+
+
+def _cache_demoted_detail_material(obj):
+    data = getattr(obj, "data", None)
+    materials = getattr(data, "materials", None)
+    mat = materials[0] if materials else None
+    if mat is None or not mat.get("witcher_terrain_detail"):
+        return
+    mat.use_fake_user = True
+    _DETAIL_MATERIAL_LRU[mat.name] = None
+    _DETAIL_MATERIAL_LRU.move_to_end(mat.name)
+
+
+def _assign_cached_detail_material(obj, mat):
+    mat.use_fake_user = False
+    _DETAIL_MATERIAL_LRU.pop(mat.name, None)
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
+
+
+def _cached_detail_material(mat_name, lod_sig):
+    mat = bpy.data.materials.get(mat_name)
+    getter = getattr(mat, "get", None)
+    if (
+        mat is not None
+        and callable(getter)
+        and getter("witcher_terrain_detail")
+        and getter("witcher_terrain_lod_sig") == lod_sig
+    ):
+        return mat
+    return None
+
+
+def _tile_mesh_cache_budget_bytes():
+    try:
+        budget_mb = int(bpy.context.scene.witcher_file_browser.terrain_lod_cache_mb)
+    except (AttributeError, TypeError, ValueError):
+        budget_mb = _TILE_MESH_CACHE_DEFAULT_MB
+    return max(0, budget_mb) * 1024 * 1024
+
+
+def _tile_mesh_cache_key(buffer_path, tile_res, target_level, skirt_depth,
+                         positive_x, positive_y, positive_xy):
+    return "|".join((
+        _source_file_stamp(buffer_path),
+        str(int(tile_res)),
+        str(int(target_level)),
+        f"{float(skirt_depth):.4f}",
+        _source_file_stamp(positive_x),
+        _source_file_stamp(positive_y),
+        _source_file_stamp(positive_xy),
+    ))
+
+
+def _cached_tile_mesh_alive(mesh):
+    try:
+        return bpy.data.meshes.get(mesh.name) == mesh
+    except ReferenceError:
+        return False
+
+
+def _take_cached_tile_mesh(cache_key):
+    mesh = _TILE_MESH_LRU.pop(cache_key, None)
+    if mesh is None or not _cached_tile_mesh_alive(mesh):
+        return None
+    return mesh
+
+
+def _store_cached_tile_mesh(mesh):
+    if mesh is None or mesh.users > 0:
+        return
+    cache_key = str(mesh.get(_TILE_MESH_KEY_PROP, "") or "")
+    if (
+        not cache_key
+        or len(mesh.vertices) < _TILE_MESH_CACHE_MIN_VERTS
+        or _tile_mesh_cache_budget_bytes() <= 0
+    ):
+        _TILE_MESH_DOOMED.append(mesh)
+        if len(_TILE_MESH_DOOMED) > _TILE_MESH_DOOMED_HARD_CAP:
+            flush_tile_mesh_garbage()
+        return
+    mesh.materials.clear()
+    replaced = _TILE_MESH_LRU.pop(cache_key, None)
+    if replaced is not None and replaced is not mesh:
+        _TILE_MESH_DOOMED.append(replaced)
+    _TILE_MESH_LRU[cache_key] = mesh
+    _trim_tile_mesh_cache()
+
+
+def _trim_tile_mesh_cache():
+    budget = _tile_mesh_cache_budget_bytes()
+    total = 0
+    for cache_key, mesh in reversed(list(_TILE_MESH_LRU.items())):
+        if not _cached_tile_mesh_alive(mesh):
+            _TILE_MESH_LRU.pop(cache_key, None)
+            continue
+        total += len(mesh.vertices) * _TILE_MESH_BYTES_PER_VERT
+        if total > budget:
+            _TILE_MESH_LRU.pop(cache_key, None)
+            _TILE_MESH_DOOMED.append(mesh)
+    if len(_TILE_MESH_DOOMED) > _TILE_MESH_DOOMED_HARD_CAP:
+        flush_tile_mesh_garbage()
+
+
+def flush_tile_mesh_garbage():
+    if not _TILE_MESH_DOOMED:
+        return
+    doomed = [m for m in _TILE_MESH_DOOMED if _cached_tile_mesh_alive(m)]
+    _TILE_MESH_DOOMED.clear()
+    if doomed:
+        bpy.data.batch_remove(doomed)
+
+
+def _purge_unused_terrain_detail_data():
+    while len(_DETAIL_MATERIAL_LRU) > TERRAIN_VIEW_LOD_MATERIAL_CACHE:
+        name, _ = _DETAIL_MATERIAL_LRU.popitem(last=False)
+        mat = bpy.data.materials.get(name)
+        if mat is not None and mat.get("witcher_terrain_detail"):
+            mat.use_fake_user = False
+    # batch_remove: per-datablock remove() re-syncs the depsgraph each call,
+    # which turned a ~50-material purge into an 11s stall.
+    doomed = [
+        material for material in bpy.data.materials
+        if material.users == 0 and (
+            material.get("witcher_terrain_detail")
+            or material.get("witcher_terrain_overlay")
+        )
+    ]
+    if doomed:
+        bpy.data.batch_remove(doomed)
+    _purge_unused_terrain_detail_groups()
+    doomed = [
+        image for image in bpy.data.images
+        if image.users == 0 and (
+            image.get("w3_detail_stamp") is not None
+            or image.get("witcher_terrain_source_stamp") is not None
+        )
+    ]
+    if doomed:
+        bpy.data.batch_remove(doomed)
 
 
 def _iter_collection_tree(root_collection):
@@ -3332,7 +3870,7 @@ def _get_scene_terrain_detail_res():
     try:
         return int(bpy.context.scene.witcher_file_browser.terrain_detail_texture_res)
     except Exception:
-        return 1024
+        return 2048
 
 
 def _world_colormap_start_mip(worldFile):
@@ -3591,7 +4129,9 @@ def ensure_terrain_inspector_metadata(obj):
     return result
 
 
-def _apply_tile_detail_material(worldFile, spec, source, bounds, obj, mat_name):
+def _apply_tile_detail_material(
+    worldFile, spec, source, bounds, obj, mat_name, *, purge_unused=True,
+):
     from . import terrain_detail, terrain_detail_nodes
 
     assets = _terrain_detail_world_assets(worldFile, spec, _get_scene_terrain_detail_res())
@@ -3644,10 +4184,20 @@ def _apply_tile_detail_material(worldFile, spec, source, bounds, obj, mat_name):
         fresnel_power=assets["fresnel_power"],
         texture_pack_key=spec.world_key,
         layer_metadata=assets.get("layer_metadata") or [],
+        purge_unused=purge_unused,
     )
     if mat is not None:
+        for prop in ("witcher_terrain_overlay", "witcher_terrain_overlay_path"):
+            if prop in mat:
+                del mat[prop]
+        mat.use_backface_culling = True
         _apply_terrain_material_controls(mat, _get_terrain_material_controls())
     return mat
+
+
+def _purge_unused_terrain_detail_groups():
+    from . import terrain_detail_nodes
+    terrain_detail_nodes._purge_unused_detail_groups()
 
 
 def _apply_fullmap_detail_material(worldFile, spec, obj, texture_buffers, out_dir):
@@ -3701,6 +4251,8 @@ def _import_resolved_terrain_tile(
     root=None,
     existing_by_key=None,
     heightmap_cache=None,
+    apply_overlay=True,
+    skirt_depth=0.0,
 ):
     if not source.heightmap_buffer or not os.path.isfile(win_safe_path(source.heightmap_buffer)):
         return TerrainTileImportResult(
@@ -3712,7 +4264,10 @@ def _import_resolved_terrain_tile(
         )
 
     level = _clamp_tile_multires_level(multires_level, spec.tile_res)
-    overlay_path = _prepare_tile_overlay(source, spec.tile_res)
+    overlay_path = (
+        _prepare_tile_overlay(source, spec.tile_res)
+        if apply_overlay else source.overlay_path
+    )
     if overlay_path != source.overlay_path:
         source = replace(source, overlay_path=overlay_path)
 
@@ -3720,7 +4275,16 @@ def _import_resolved_terrain_tile(
         root = _ensure_terrain_root(spec, level, world_collection)
     existing = _find_imported_terrain_tile(root, spec, source.key, existing_by_key)
     signature = _tile_import_signature(spec, source, bounds, level)
-    if existing is not None and existing.get("terrain_tile_source_signature") == signature:
+    skirt_depth = float(skirt_depth or 0.0)
+    if (
+        existing is not None
+        and existing.get("terrain_tile_source_signature") == signature
+        and math.isclose(
+            float(existing.get("terrain_lod_skirt_depth", 0.0) or 0.0),
+            skirt_depth,
+            abs_tol=1e-6,
+        )
+    ):
         _link_terrain_object(existing, world_collection)
         existing.parent = root
         return TerrainTileImportResult(
@@ -3745,7 +4309,12 @@ def _import_resolved_terrain_tile(
         positive_y_buffer_path=source.positive_y_buffer_path,
         positive_xy_buffer_path=source.positive_xy_buffer_path,
         heightmap_cache=heightmap_cache,
+        skirt_depth=skirt_depth,
     )
+    mesh[_TILE_MESH_KEY_PROP] = _tile_mesh_cache_key(
+        source.heightmap_buffer, spec.tile_res, level, skirt_depth,
+        source.positive_x_buffer_path, source.positive_y_buffer_path,
+        source.positive_xy_buffer_path)
 
     created = existing is None
     if created:
@@ -3771,6 +4340,7 @@ def _import_resolved_terrain_tile(
     obj["tile_res"] = spec.tile_res
     obj["tile_size"] = bounds.tile_size
     obj["elev_range"] = _terrain_elevation_range(spec)
+    obj["terrain_lod_skirt_depth"] = skirt_depth
     obj["lowest_elevation"] = spec.lowest_elevation
     obj["tile_bounds_min_x"] = bounds.min_x
     obj["tile_bounds_min_y"] = bounds.min_y
@@ -3779,7 +4349,7 @@ def _import_resolved_terrain_tile(
     obj["terrain_tile_source_signature"] = signature
     _store_world_layer_metadata(obj, spec.world_path, world_collection)
 
-    if overlay_path:
+    if apply_overlay and overlay_path:
         _apply_tile_overlay_material(obj, overlay_path, _tile_material_name(spec, source.key))
 
     obj.parent = root
@@ -3928,6 +4498,9 @@ def do_import_terrain_tiles(
     world_file=None,
     terrain_spec=None,
     detail_material=None,
+    tile_levels=None,
+    detail_tiles=None,
+    overview_material=None,
 ):
     """Import terrain tiles as individual Blender objects with baked heightmap geometry.
 
@@ -3960,8 +4533,13 @@ def do_import_terrain_tiles(
         terrain_tiles_dir="",
     )
     tile_texture_buffers = tile_texture_buffers or {}
+    tile_levels = tile_levels or {}
+    lod_enabled = detail_tiles is not None or overview_material is not None
+    lod_skirt_depth = TERRAIN_VIEW_LOD_SKIRT_AUTO if lod_enabled else 0.0
+    detail_tiles = None if detail_tiles is None else set(detail_tiles)
     if detail_material is None:
         detail_material = _get_scene_terrain_detail_enabled()
+    use_detail = bool(detail_material and world_file is not None)
     world_collection = ensure_world_terrain_collection(spec, world_root_collection)
     empty = _ensure_terrain_root(spec, level, world_collection)
     existing_by_key = {
@@ -3973,12 +4551,14 @@ def do_import_terrain_tiles(
         and int(obj.get("tile_y", -1)) >= 0
     }
 
-    # Set viewport clip
+    # Set viewport clip. A default 0.01 near plane collapses depth precision on
+    # multi-km worlds and z-fights distant terrain against the water plane.
     screen = getattr(bpy.context, "screen", None)
     for a in getattr(screen, "areas", ()):
         if a.type == 'VIEW_3D':
             for s in a.spaces:
                 if s.type == 'VIEW_3D':
+                    s.clip_start = max(float(s.clip_start), 1.0)
                     s.clip_end = max(float(s.clip_end), float(spec.terrain_size) * math.sqrt(2.0))
 
     count = 0
@@ -4013,37 +4593,369 @@ def do_import_terrain_tiles(
             positive_xy_texture_buffer_path=str(
                 tile_texture_buffers.get((x + 1, y + 1)) or ""),
         )
+        key = (int(x), int(y))
+        tile_level = _clamp_tile_multires_level(tile_levels.get(key, level), tile_res)
+        is_detail_tile = detail_tiles is None or key in detail_tiles
+        defer_overlay = bool(use_detail and is_detail_tile and source.texture_buffer)
+        apply_overlay = bool(
+            not defer_overlay
+            and (overview_material is None or is_detail_tile)
+        )
         result = _import_resolved_terrain_tile(
             spec,
             source,
             terrain_tile_bounds(spec, x, y),
-            multires_level=level,
+            multires_level=tile_level,
             world_collection=world_collection,
             root=empty,
             existing_by_key=existing_by_key,
             heightmap_cache=heightmap_cache,
+            apply_overlay=apply_overlay,
+            skirt_depth=lod_skirt_depth,
         )
         if result.ok:
             count += 1
-            if detail_material and world_file is not None and source.texture_buffer:
+            if defer_overlay:
+                material = None
                 try:
                     with redkit_repo_context(spec.world_path):
-                        _apply_tile_detail_material(
+                        material = _apply_tile_detail_material(
                             world_file,
                             spec,
                             source,
                             result.bounds,
                             result.obj,
                             _tile_material_name(spec, source.key),
+                            purge_unused=False,
                         )
                 except Exception:
                     log.warning(
-                        "Terrain detail material failed for %s; keeping the overlay material",
+                        "Terrain detail material failed for %s; using the overlay material",
                         source.tile_name,
                         exc_info=True,
                     )
+                obj_get = getattr(result.obj, "get", None)
+                if material is not None and callable(obj_get):
+                    try:
+                        material["witcher_terrain_lod_sig"] = (
+                            f"{obj_get('terrain_tile_source_signature')}:"
+                            f"{_get_scene_terrain_detail_res()}"
+                        )
+                    except TypeError:
+                        pass
+                if material is None:
+                    overlay_path = _prepare_tile_overlay(source, spec.tile_res)
+                    if overlay_path:
+                        material = _apply_tile_overlay_material(
+                            result.obj, overlay_path,
+                            _tile_material_name(spec, source.key))
+                if material is None and overview_material is not None:
+                    _apply_terrain_lod_overview_material(
+                        result.obj, overview_material, spec, source.key)
+                if lod_enabled:
+                    result.obj["terrain_lod_role"] = "native"
+            elif overview_material is not None and not is_detail_tile:
+                _apply_terrain_lod_overview_material(
+                    result.obj, overview_material, spec, source.key)
+            elif lod_enabled and is_detail_tile:
+                if overview_material is not None and not result.obj.data.materials:
+                    _apply_terrain_lod_overview_material(
+                        result.obj, overview_material, spec, source.key)
+                result.obj["terrain_lod_role"] = "native"
+
+    if use_detail:
+        _purge_unused_terrain_detail_groups()
+    if overview_material is not None:
+        _purge_unused_terrain_detail_data()
 
     return empty, count
+
+
+def update_terrain_view_lod(
+    world_file,
+    file_path,
+    position,
+    *,
+    radius=None,
+    world_root_collection=None,
+    detail_material=None,
+    max_tiles=None,
+):
+    """Move the LOD window, optionally processing at most ``max_tiles`` tiles."""
+
+    if world_file is None:
+        world_file, spec = cached_world_terrain_lod(file_path)
+    else:
+        spec = inspect_world_terrain(world_file, file_path)
+    center_x, center_y = terrain_tile_from_world_position(spec, position)
+    world_collection = world_root_collection or _find_scene_world_collection(spec)
+    if world_collection is None:
+        raise RuntimeError("No imported terrain collection was found for this world")
+    root = next(
+        (
+            obj for obj in getattr(world_collection, "all_objects", ())
+            if obj.get("witcher_terrain_root")
+            and obj.get("witcher_terrain_world_key") == spec.world_key
+        ),
+        None,
+    )
+    if root is None or root.get("terrain_import_mode") != TERRAIN_IMPORT_VIEW_LOD:
+        raise RuntimeError("The imported terrain is not using Native View LOD")
+
+    radius = max(0, int(
+        root.get("terrain_lod_radius", TERRAIN_VIEW_LOD_RADIUS)
+        if radius is None else radius
+    ))
+    native_level = _clamp_tile_multires_level(
+        terrain_native_level(spec.tile_res), spec.tile_res)
+    overview_level = min(TERRAIN_VIEW_LOD_OVERVIEW_LEVEL, native_level)
+    wanted_detail = terrain_view_lod_tiles(
+        spec.x_tiles, spec.y_tiles, center_x, center_y, radius)
+    existing_by_key = {
+        (int(obj.get("tile_x", -1)), int(obj.get("tile_y", -1))): obj
+        for obj in root.children
+        if getattr(obj, "type", None) == 'MESH'
+        and int(obj.get("tile_x", -1)) >= 0
+        and int(obj.get("tile_y", -1)) >= 0
+    }
+    current_detail = {
+        key for key, obj in existing_by_key.items()
+        if obj.get("terrain_lod_role") == "native"
+    }
+    leaving = sorted(current_detail - wanted_detail, key=lambda key: (key[1], key[0]))
+    # Nearest-first so the terrain under the view sharpens before the fringe.
+    entering = sorted(
+        wanted_detail - current_detail,
+        key=lambda key: (
+            max(abs(key[0] - center_x), abs(key[1] - center_y)), key[1], key[0]),
+    )
+
+    overview_name = str(root.get("terrain_lod_overview_material", "") or "")
+    overview_material = bpy.data.materials.get(overview_name)
+    if overview_material is None:
+        overview_material = _terrain_lod_overview_material(
+            spec, str(root.get("terrain_lod_overview_path", "") or ""))
+    if detail_material is None:
+        detail_material = _get_scene_terrain_detail_enabled()
+    detail_res = _get_scene_terrain_detail_res()
+    refresh_materials = (
+        bool(root.get("terrain_lod_detail_material", True)) != bool(detail_material)
+        or int(root.get("terrain_lod_detail_texture_res", detail_res)) != detail_res
+    )
+
+    def _needs_material_refresh(key):
+        # Check each tile so capped streams do not repeat completed work.
+        tile_obj = existing_by_key.get(key)
+        data = getattr(tile_obj, "data", None)
+        materials = getattr(data, "materials", None)
+        mat = materials[0] if materials else None
+        getter = getattr(mat, "get", None) if mat is not None else None
+        is_detail = bool(callable(getter) and getter("witcher_terrain_detail"))
+        if not detail_material:
+            return is_detail
+        if not is_detail:
+            return True
+        return not str(getter("witcher_terrain_lod_sig") or "").endswith(f":{detail_res}")
+
+    refreshing = sorted(
+        (
+            key for key in (wanted_detail & current_detail)
+            if _needs_material_refresh(key)
+        ) if refresh_materials else (),
+        key=lambda key: (key[1], key[0]),
+    )
+
+    # Demotes first: they are cheap and free VRAM before the expensive promotes.
+    queue = (
+        [("lower", key) for key in leaving]
+        + [("promote", key) for key in entering]
+        + [("refresh", key) for key in refreshing]
+    )
+    pending = 0
+    if max_tiles is not None and len(queue) > int(max_tiles):
+        pending = len(queue) - int(max_tiles)
+        queue = queue[: int(max_tiles)]
+
+    lowered = 0
+    promoted = 0
+    refreshed = 0
+    with redkit_repo_context(file_path):
+        for action, key in queue:
+            obj = existing_by_key.get(key)
+            if obj is None:
+                continue
+            if action == "lower":
+                source = resolve_world_terrain_tile_source(
+                    spec, key[0], key[1], include_overlay=False,
+                    include_stitch_neighbors=True)
+                if int(obj.get("terrain_multires", -1)) != overview_level:
+                    rebuild_tile_mesh(
+                        obj, overview_level,
+                        skirt_depth=TERRAIN_VIEW_LOD_SKIRT_AUTO)
+                _cache_demoted_detail_material(obj)
+                _apply_terrain_lod_overview_material(
+                    obj, overview_material, spec, source.key)
+                obj["terrain_tile_source_signature"] = _tile_import_signature(
+                    spec, source, terrain_tile_bounds(spec, *key), overview_level)
+                lowered += 1
+                continue
+
+            source = resolve_world_terrain_tile_source(
+                spec, key[0], key[1], include_overlay=True,
+                include_stitch_neighbors=True)
+            bounds = terrain_tile_bounds(spec, *key)
+            if int(obj.get("terrain_multires", -1)) != native_level:
+                rebuild_tile_mesh(
+                    obj, native_level, skirt_depth=TERRAIN_VIEW_LOD_SKIRT_AUTO)
+            mat_name = _tile_material_name(spec, source.key)
+            signature = _tile_import_signature(spec, source, bounds, native_level)
+            lod_sig = f"{signature}:{detail_res}"
+            material = None
+            if detail_material:
+                cached = _cached_detail_material(mat_name, lod_sig)
+                if cached is not None:
+                    _assign_cached_detail_material(obj, cached)
+                    material = cached
+            if material is None and detail_material and source.texture_buffer:
+                try:
+                    material = _apply_tile_detail_material(
+                        world_file,
+                        spec,
+                        source,
+                        bounds,
+                        obj,
+                        mat_name,
+                        purge_unused=False,
+                    )
+                except Exception:
+                    log.warning(
+                        "Terrain detail material failed for %s; using the overlay material",
+                        source.tile_name,
+                        exc_info=True,
+                    )
+                if material is not None:
+                    try:
+                        material["witcher_terrain_lod_sig"] = lod_sig
+                    except TypeError:
+                        pass
+            if material is None:
+                overlay_path = _prepare_tile_overlay(source, spec.tile_res)
+                if overlay_path:
+                    material = _apply_tile_overlay_material(obj, overlay_path, mat_name)
+            if material is None:
+                _apply_terrain_lod_overview_material(
+                    obj, overview_material, spec, source.key)
+            obj["terrain_lod_role"] = "native"
+            obj["terrain_tile_source_signature"] = signature
+            if action == "refresh":
+                refreshed += 1
+            else:
+                promoted += 1
+
+    root["terrain_lod_center_x"] = center_x
+    root["terrain_lod_center_y"] = center_y
+    root["terrain_lod_radius"] = radius
+    root["terrain_lod_native_level"] = native_level
+    root["terrain_lod_overview_level"] = overview_level
+    root["terrain_lod_detail_tiles"] = len(wanted_detail)
+    root["terrain_lod_overview_material"] = overview_material.name
+    if pending == 0:
+        root["terrain_lod_detail_material"] = bool(detail_material)
+        root["terrain_lod_detail_texture_res"] = detail_res
+        _purge_unused_terrain_detail_data()
+    return {
+        "root": root,
+        "center_x": center_x,
+        "center_y": center_y,
+        "radius": radius,
+        "native_level": native_level,
+        "overview_level": overview_level,
+        "detail_tiles": len(wanted_detail),
+        "promoted": promoted,
+        "lowered": lowered,
+        "refreshed": refreshed,
+        "pending": pending,
+    }
+
+
+def prefetch_terrain_view_lod_meshes(file_path, world_root_collection, max_tiles=1):
+    """Prebuild the next LOD ring and return the remaining tile count."""
+    if _tile_mesh_cache_budget_bytes() <= 0:
+        return 0
+    world_file, spec = cached_world_terrain_lod(file_path)
+    root = next(
+        (
+            obj for obj in getattr(world_root_collection, "all_objects", ())
+            if obj.get("witcher_terrain_root")
+            and obj.get("witcher_terrain_world_key") == spec.world_key
+        ),
+        None,
+    )
+    if root is None or root.get("terrain_import_mode") != TERRAIN_IMPORT_VIEW_LOD:
+        return 0
+    center_x = int(root.get("terrain_lod_center_x", -1))
+    center_y = int(root.get("terrain_lod_center_y", -1))
+    if center_x < 0 or center_y < 0:
+        return 0
+    radius = max(0, int(root.get("terrain_lod_radius", TERRAIN_VIEW_LOD_RADIUS)))
+    native_level = _clamp_tile_multires_level(
+        terrain_native_level(spec.tile_res), spec.tile_res)
+    mesh_res = (1 << native_level) + 1 if native_level > 0 else 2
+    window = terrain_view_lod_tiles(
+        spec.x_tiles, spec.y_tiles, center_x, center_y, radius)
+    ring = terrain_view_lod_tiles(
+        spec.x_tiles, spec.y_tiles, center_x, center_y, radius + 1) - window
+    tiles_by_key = {
+        (int(obj.get("tile_x", -1)), int(obj.get("tile_y", -1))): obj
+        for obj in root.children
+        if getattr(obj, "type", None) == 'MESH' and int(obj.get("tile_x", -1)) >= 0
+    }
+    built = 0
+    missing = 0
+    with redkit_repo_context(file_path):
+        for key in sorted(ring, key=lambda k: (k[1], k[0])):
+            obj = tiles_by_key.get(key)
+            if obj is None or obj.get("terrain_lod_role") == "native":
+                continue
+            buffer_path = obj.get("tile_buffer_path")
+            tile_res = obj.get("tile_res")
+            tile_size = obj.get("tile_size")
+            elev_range = obj.get("elev_range")
+            if not buffer_path or not os.path.isfile(win_safe_path(buffer_path)):
+                continue
+            if not all(v is not None for v in [tile_res, tile_size, elev_range]):
+                continue
+            positive_x = _terrain_tile_neighbor_path_from_object(
+                obj, "positive_x_buffer_path", 1, 0)
+            positive_y = _terrain_tile_neighbor_path_from_object(
+                obj, "positive_y_buffer_path", 0, 1)
+            positive_xy = _terrain_tile_neighbor_path_from_object(
+                obj, "positive_xy_buffer_path", 1, 1)
+            cache_key = _tile_mesh_cache_key(
+                buffer_path, tile_res, native_level, TERRAIN_VIEW_LOD_SKIRT_AUTO,
+                positive_x, positive_y, positive_xy)
+            cached = _TILE_MESH_LRU.get(cache_key)
+            if cached is not None and _cached_tile_mesh_alive(cached):
+                continue
+            missing += 1
+            if built >= int(max_tiles):
+                continue
+            mesh = _create_tile_mesh(
+                obj.name, buffer_path, int(tile_res), mesh_res,
+                float(tile_size), float(elev_range),
+                positive_x_buffer_path=positive_x,
+                positive_y_buffer_path=positive_y,
+                positive_xy_buffer_path=positive_xy,
+                heightmap_cache=_REBUILD_HEIGHTMAP_CACHE,
+                skirt_depth=TERRAIN_VIEW_LOD_SKIRT_AUTO,
+            )
+            mesh[_TILE_MESH_KEY_PROP] = cache_key
+            _TILE_MESH_LRU.pop(cache_key, None)
+            _TILE_MESH_LRU[cache_key] = mesh
+            built += 1
+    if built:
+        _trim_tile_mesh_cache()
+    return missing - built
 
 
 classes = (

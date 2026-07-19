@@ -514,7 +514,7 @@ def pack_world_detail_atlases(
     hub_name: str,
     layers,
     out_dir: str,
-    slice_px: int = 1024,
+    slice_px: int = 2048,
     skip_existing: bool = True,
 ) -> Optional[Dict]:
     """Pack terrain-layer DDS files into diffuse and normal atlases."""

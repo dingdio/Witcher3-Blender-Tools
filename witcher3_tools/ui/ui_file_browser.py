@@ -514,14 +514,37 @@ class MySettings(PropertyGroup):
     # Terrain tile import
     terrain_multires_level: IntProperty(
         name="Terrain Detail",
-        description="Subdivision detail used for imported terrain",
-        default=6, min=0, max=10,
+        description="Manual terrain level; the W2W preview shows its native level",
+        default=8, min=0, max=10,
     )
     terrain_import_mode: bpy.props.EnumProperty(
         name="Terrain Import",
         description="Choose the terrain scope to import",
         items=TERRAIN_IMPORT_MODE_ITEMS,
-        default='TILES',
+        default='VIEW_LOD',
+    )
+    terrain_lod_radius: IntProperty(
+        name="Native Radius",
+        description="Native-detail tile radius around the View LOD focus (3 means up to 7 × 7 tiles)",
+        default=3,
+        min=0,
+        max=8,
+    )
+    terrain_lod_auto_update: BoolProperty(
+        name="Follow View",
+        description="Automatically move native terrain detail to the viewport focus when navigation settles on a new tile",
+        default=True,
+    )
+    terrain_lod_cache_mb: IntProperty(
+        name="Mesh Cache (MB)",
+        description=(
+            "Approximate RAM budget for keeping demoted and prefetched native tile"
+            " meshes so View LOD promotes are instant datablock swaps; 0 disables"
+            " the cache and idle prefetching"
+        ),
+        default=2048,
+        min=0,
+        max=16384,
     )
     terrain_tile_x: IntProperty(
         name="Tile X",
@@ -701,12 +724,12 @@ class MySettings(PropertyGroup):
             ('1024', "1024 px", "Half resolution, good balance"),
             ('2048', "2048 px", "Native resolution, highest memory"),
         ),
-        default='1024',
+        default='2048',
     )
     terrain_layer_load_radius: FloatProperty(
         name="Layer Load Radius",
         description="Load world layers whose cached bounds intersect this distance around the current viewport camera, measured in imported world/Blender units",
-        default=100.0,
+        default=50.0,
         min=1.0,
         soft_max=5000.0,
     )
@@ -742,7 +765,7 @@ class MySettings(PropertyGroup):
     terrain_layer_do_import_collision: BoolProperty(
         name="Collision",
         description="Import collision mesh items from nearby layers",
-        default=True,
+        default=False,
     )
     terrain_layer_do_import_rigidbody: BoolProperty(
         name="Rigid Body",
@@ -792,7 +815,7 @@ class MySettings(PropertyGroup):
     terrain_layer_instanced_sector: BoolProperty(
         name="Instance Repeated Meshes",
         description="Group identical CSectorData mesh placements into a single instancer object instead of one object per placement. Greatly reduces object count for dense static layers (rocks, cliffs, debris). Individual selection is not possible for instanced meshes.",
-        default=False,
+        default=True,
     )
     terrain_layer_keep_lod_meshes: BoolProperty(
         name="Keep LODs",
@@ -899,7 +922,7 @@ class MySettings(PropertyGroup):
     terrain_layer_hide_default_hidden: BoolProperty(
         name="Hide Default-Hidden Layer Groups",
         description="Hide layer group collections whose isVisibleOnStart flag is off in the game data. Layers are always temporarily shown during any import operation, then this state is restored",
-        default=False,
+        default=True,
         update=lambda self, context: _update_hide_default_hidden(self, context),
     )
     terrain_layer_solo_default_hidden: BoolProperty(
@@ -7320,7 +7343,15 @@ class SimpleFileBrowser(Operator):
                 mode_row = terrain_box.row(align=True)
                 mode_row.prop(witcher_file_browser, "terrain_import_mode", text="Mode")
                 import_row = terrain_box.row(align=True)
-                import_row.prop(witcher_file_browser, "terrain_multires_level", text="Detail")
+                if witcher_file_browser.terrain_import_mode == 'VIEW_LOD':
+                    import_row.prop(witcher_file_browser, "terrain_lod_radius", text="Native Radius")
+                    op_import = import_row.operator(
+                        "witcher.import_terrain_view_lod",
+                        text="Import View LOD",
+                        icon='VIEW_CAMERA',
+                    )
+                else:
+                    import_row.prop(witcher_file_browser, "terrain_multires_level", text="Detail")
                 if witcher_file_browser.terrain_import_mode == 'SELECTED_TILE':
                     coords = terrain_box.row(align=True)
                     coords.prop(witcher_file_browser, "terrain_tile_x", text="Tile X")
@@ -7336,7 +7367,7 @@ class SimpleFileBrowser(Operator):
                     )
                 elif witcher_file_browser.terrain_import_mode == 'FULL_MAP':
                     op_import = import_row.operator("witcher.import_terrain_fullmap", text="Import Full Map", icon='NODETREE')
-                else:
+                elif witcher_file_browser.terrain_import_mode == 'TILES':
                     op_import = import_row.operator("witcher.import_terrain_tiles", text="Import All Tiles", icon='IMPORT')
                 op_import.folder_path = witcher_file_browser.current_folder
                 op_import.cache_type = witcher_file_browser.active_cache_type
@@ -8213,7 +8244,14 @@ class ImportRecentOperator(Operator):
         witcher_file_browser = context.scene.witcher_file_browser
         original_cache_type = witcher_file_browser.active_cache_type
         witcher_file_browser.active_cache_type = self.cache_type
-        invoke_mode = 'INVOKE_DEFAULT' if getattr(witcher_file_browser, "open_import_dialog", False) else 'EXEC_DEFAULT'
+        invoke_mode = (
+            'INVOKE_DEFAULT'
+            if (
+                getattr(witcher_file_browser, "open_import_dialog", False)
+                or str(self.path or "").lower().endswith(".w2w")
+            )
+            else 'EXEC_DEFAULT'
+        )
 
         if is_external_cache(self.cache_type) and not _has_matching_external_archive_session(self.cache_type, self.archive_path):
             if not self.archive_path:
@@ -8959,7 +8997,14 @@ class FileActionOperatorImportToScene(Operator):
 
     def invoke(self, context, event):
         witcher_file_browser = getattr(context.scene, "witcher_file_browser", None)
-        if not witcher_file_browser or not getattr(witcher_file_browser, "open_import_dialog", False):
+        force_w2w_dialog = str(self.file_path or "").lower().endswith(".w2w")
+        if (
+            not witcher_file_browser
+            or not (
+                getattr(witcher_file_browser, "open_import_dialog", False)
+                or force_w2w_dialog
+            )
+        ):
             return self.execute(context)
         if self._build_import_state(context)["effective_cache_type"] == "Sound":
             return self.execute(context)
@@ -9639,7 +9684,8 @@ class FileActionOperatorImportToScene(Operator):
                 from ..CR2W import CR2W_reader
                 from ..importers import import_w2w
                 world_file = CR2W_reader.load_w2w(abs_file_path)
-                import_w2w.btn_import_w2w(world_file, abs_file_path)
+                import_w2w.btn_import_w2w(
+                    world_file, abs_file_path, report=self.report)
             elif ext == ".env":
                 from . import ui_environment
                 result = ui_environment.load_environment_path(context, abs_file_path)
@@ -9962,7 +10008,14 @@ class GlobalImportOperator(Operator):
         witcher_file_browser = context.scene.witcher_file_browser
         original_cache_type = witcher_file_browser.active_cache_type
         witcher_file_browser.active_cache_type = self.cache_type
-        invoke_mode = 'INVOKE_DEFAULT' if getattr(witcher_file_browser, "open_import_dialog", False) else 'EXEC_DEFAULT'
+        invoke_mode = (
+            'INVOKE_DEFAULT'
+            if (
+                getattr(witcher_file_browser, "open_import_dialog", False)
+                or str(self.file_path or "").lower().endswith(".w2w")
+            )
+            else 'EXEC_DEFAULT'
+        )
 
         try:
             return bpy.ops.witcher.file_action_import_to_scene(invoke_mode, file_path=self.file_path)
@@ -10471,6 +10524,49 @@ class CombineTerrainTilesOperator(Operator):
         return {'FINISHED'}
 
 
+class ImportTerrainViewLodOperator(Operator):
+    bl_idname = "witcher.import_terrain_view_lod"
+    bl_label = "Import Native View LOD"
+    bl_description = "Import native terrain around the view and a lightweight full-map overview"
+
+    folder_path: StringProperty()
+    cache_type: StringProperty()
+
+    def execute(self, context):
+        browser = context.scene.witcher_file_browser
+        folder_path = self.folder_path or browser.current_folder
+        cache_type = self.cache_type or browser.active_cache_type
+        if not folder_path:
+            self.report({'ERROR'}, "No terrain folder selected")
+            return {'CANCELLED'}
+        folder_abs = (
+            get_disk_abs_path(cache_type, folder_path)
+            if is_disk_cache(cache_type)
+            else get_uncook_abs_path(context, folder_path, browser.loadmods)
+        )
+        world_path = _resolve_w2w_path(
+            context, cache_type, folder_path, folder_abs, browser.loadmods)
+        if not world_path:
+            self.report({'ERROR'}, "Could not resolve the world .w2w for this terrain folder")
+            return {'CANCELLED'}
+        try:
+            from ..CR2W import CR2W_reader
+            from ..importers import import_w2w
+
+            browser.terrain_import_mode = 'VIEW_LOD'
+            world = CR2W_reader.load_w2w(
+                world_path,
+                include_groups=bool(browser.terrain_build_layer_tree),
+            )
+            with mod_loading_context(context):
+                import_w2w.btn_import_w2w(world, world_path, report=self.report)
+        except Exception as exc:
+            log.exception("Terrain View LOD import failed")
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 class ImportTerrainFullMapOperator(Operator):
     """Import terrain as one combined map object with Geometry Nodes + Multires"""
     bl_idname = "witcher.import_terrain_fullmap"
@@ -10966,6 +11062,7 @@ def register():
     bpy.utils.register_class(NavigateFolderOperator)
     bpy.utils.register_class(SelectCacheTypeOperator)
     bpy.utils.register_class(CombineTerrainTilesOperator)
+    bpy.utils.register_class(ImportTerrainViewLodOperator)
     bpy.utils.register_class(ImportTerrainFullMapOperator)
     bpy.utils.register_class(ImportTerrainSelectedTileOperator)
     bpy.utils.register_class(ImportTerrainTilesOperator)
@@ -11044,6 +11141,7 @@ def unregister():
     bpy.utils.unregister_class(ImportTerrainTilesOperator)
     bpy.utils.unregister_class(ImportTerrainSelectedTileOperator)
     bpy.utils.unregister_class(ImportTerrainFullMapOperator)
+    bpy.utils.unregister_class(ImportTerrainViewLodOperator)
     bpy.utils.unregister_class(CombineTerrainTilesOperator)
     bpy.utils.unregister_class(BookmarkItem)
     bpy.utils.unregister_class(RecentItem)

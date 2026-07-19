@@ -2888,7 +2888,7 @@ def _open_location(context, world_path: str, layer_dir: str, name: str, report,
             except Exception:
                 pass
 
-        detail = int(getattr(scene_settings, "terrain_multires_level", 6) or 6)
+        detail = int(getattr(scene_settings, "terrain_multires_level", 8) or 8)
         terrain_result = None
         stage_started = _time.perf_counter()
         try:
@@ -2991,7 +2991,7 @@ def _open_location(context, world_path: str, layer_dir: str, name: str, report,
         started = _time.perf_counter()
         try:
             world_file = CR2W.CR2W_reader.load_w2w(world_abs)
-            import_w2w.btn_import_w2w(world_file, world_abs)
+            import_w2w.btn_import_w2w(world_file, world_abs, report=report)
         except Exception as exc:
             log.warning("Location world import failed for %s", world_depot, exc_info=True)
             report({'ERROR'}, f"World import failed: {exc}")

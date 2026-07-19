@@ -430,6 +430,7 @@ from .ui import ui_map
 from .ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_w2w,
                                      WITCH_OT_import_world_tile,
+                                     WITCH_OT_update_terrain_view_lod,
                                      WITCH_OT_w2l_collection_details,
                                      WITCH_OT_load_layer,
                                      WITCH_OT_load_layer_group,
@@ -4000,7 +4001,7 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
         scene_settings = getattr(context.scene, "witcher_file_browser", None)
-        target_level = int(getattr(scene_settings, "terrain_multires_level", 5))
+        target_level = int(getattr(scene_settings, "terrain_multires_level", 8))
 
         def section(section_id, label, icon, default_closed=False):
             container = layout.box()
@@ -4013,8 +4014,42 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
             if body:
                 col = body.column(align=True)
                 col.prop(scene_settings, "terrain_import_mode", text="")
-                col.prop(scene_settings, "terrain_multires_level", text="Preview Detail")
-                if str(getattr(scene_settings, "terrain_import_mode", "")) == "SELECTED_TILE":
+                import_mode = str(getattr(scene_settings, "terrain_import_mode", ""))
+                if import_mode == "VIEW_LOD":
+                    col.prop(scene_settings, "terrain_lod_radius", text="Native Radius")
+                    root_collection = ui_map._find_world_root_collection(context)
+                    terrain_root = next((
+                        obj for obj in getattr(root_collection, "all_objects", ())
+                        if obj.get("witcher_terrain_root")
+                        and obj.get("terrain_import_mode") == "VIEW_LOD"
+                    ), None) if root_collection is not None else None
+                    if terrain_root is None:
+                        lod_collections = ui_map._find_view_lod_world_collections()
+                        if len(lod_collections) == 1:
+                            terrain_root = next((
+                                obj for obj in lod_collections[0].all_objects
+                                if obj.get("witcher_terrain_root")
+                                and obj.get("terrain_import_mode") == "VIEW_LOD"
+                            ), None)
+                    if terrain_root is not None:
+                        stats = col.box()
+                        stats.enabled = False
+                        stats.prop(terrain_root, '["tileRes"]', text="Samples / Tile")
+                        stats.prop(terrain_root, '["terrain_lod_native_level"]', text="Native Level")
+                        stats.prop(terrain_root, '["terrain_lod_grid_tiles"]', text="Grid Tiles")
+                        stats.prop(terrain_root, '["terrain_lod_detail_tiles"]', text="Native Tiles")
+                        col.prop(scene_settings, "terrain_lod_auto_update", text="Follow View")
+                        col.prop(scene_settings, "terrain_lod_cache_mb", text="Mesh Cache (MB)")
+                        col.operator(
+                            "witcher.update_terrain_view_lod",
+                            text="Update Around View",
+                            icon='VIEW_CAMERA',
+                        )
+                    else:
+                        col.label(text="Import a W2W to create View LOD", icon='INFO')
+                else:
+                    col.prop(scene_settings, "terrain_multires_level", text="Preview Detail")
+                if import_mode == "SELECTED_TILE":
                     coords = col.row(align=True)
                     coords.prop(scene_settings, "terrain_tile_x", text="Tile X")
                     coords.prop(scene_settings, "terrain_tile_y", text="Tile Y")
@@ -4196,6 +4231,18 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 ui_map.draw_layer_stream_job_ui(col, context)
                 controls = col.column(align=True)
                 controls.enabled = not ui_map.layer_stream_job_running()
+                controls.label(text=ui_map.get_camera_position_label(context))
+                scan_row = controls.row(align=True)
+                scan_row.label(text=ui_map.get_nearby_cache_summary_label(context))
+                scan_row.operator("witcher.scan_layers_nearby", text="", icon='VIEWZOOM')
+                row = controls.row(align=True)
+                row.operator("witcher.load_layers_around_camera", text="Load Layers Around Camera", icon='VIEW_CAMERA')
+                row.operator("witcher.rebuild_layer_scan_cache", text="", icon='FILE_REFRESH')
+                controls.operator(
+                    "witcher.send_unreal_layers_around_camera",
+                    text="Send Nearby Layers to Unreal", icon='URL',
+                ).action = "SEND"
+
                 range_box = controls.box()
                 range_box.label(text="Range")
                 range_box.prop(scene_settings, "terrain_layer_load_radius", text="Radius (World Units)")
@@ -4264,17 +4311,6 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 debug_box = controls.box()
                 debug_box.label(text="Debug")
                 debug_box.prop(scene_settings, "terrain_layer_write_profile_log", text="Write Profile Log")
-                controls.label(text=ui_map.get_camera_position_label(context))
-                scan_row = controls.row(align=True)
-                scan_row.label(text=ui_map.get_nearby_cache_summary_label(context))
-                scan_row.operator("witcher.scan_layers_nearby", text="", icon='VIEWZOOM')
-                row = controls.row(align=True)
-                row.operator("witcher.load_layers_around_camera", text="Load Layers Around Camera", icon='VIEW_CAMERA')
-                row.operator("witcher.rebuild_layer_scan_cache", text="", icon='FILE_REFRESH')
-                controls.operator(
-                    "witcher.send_unreal_layers_around_camera",
-                    text="Send Nearby Layers to Unreal", icon='URL',
-                ).action = "SEND"
 
         body = section("witcher_terrain_foliage", "Foliage", 'PARTICLE_DATA', default_closed=True)
         if body:
@@ -4984,6 +5020,7 @@ _classes = [
     WITCH_OT_w2L,
     WITCH_OT_w2w,
     WITCH_OT_import_world_tile,
+    WITCH_OT_update_terrain_view_lod,
     # WITCH_OT_w2mi,
     # WITCH_OT_w2mg,
     #WITCH_OT_w2ent,
@@ -5138,7 +5175,8 @@ def register():
     material_nodes.register()
     w3_asset_browser.register()
     unreal_export.register()
-    
+    ui_map.register_view_lod_timer()
+
     # Register dev features only when the dev folder exists and dev_mode_enabled is true.
     try:
         from . import dev
@@ -5148,6 +5186,7 @@ def register():
 
 
 def unregister():
+    ui_map.unregister_view_lod_timer()
     # Safe no-op when dev features were never registered.
     try:
         from . import dev

@@ -18,7 +18,7 @@ from .terrain_detail import (
     f0_to_ior,
 )
 
-NODE_VERSION = 13
+NODE_VERSION = 14
 _EPS = 1e-3
 _UP = (0.0, 0.0, 1.0)
 
@@ -66,19 +66,25 @@ def _stamp(path: str) -> str:
 def _image_for(path: str, colorspace: str, alpha_mode: str = "CHANNEL_PACKED"):
     if not path or not os.path.isfile(path):
         return None
+    image_count = len(bpy.data.images)
     image = bpy.data.images.load(path, check_existing=True)
+    is_new = len(bpy.data.images) > image_count
     try:
         stamp = str(os.path.getmtime(path))
     except OSError:
         stamp = ""
-    if image.get("w3_detail_stamp") != stamp:
+    previous_stamp = str(image.get("w3_detail_stamp", "") or "")
+    if not is_new and stamp and previous_stamp != stamp:
         try:
             image.reload()
         except Exception:
             pass
+    if previous_stamp != stamp:
         image["w3_detail_stamp"] = stamp
-    image.colorspace_settings.name = colorspace
-    image.alpha_mode = alpha_mode
+    if image.colorspace_settings.name != colorspace:
+        image.colorspace_settings.name = colorspace
+    if image.alpha_mode != alpha_mode:
+        image.alpha_mode = alpha_mode
     return image
 
 
@@ -383,14 +389,17 @@ def _ensure_group(name: str, content_sig: str, builder):
 
 
 def _purge_unused_detail_groups():
-    prefixes = (".W3AtlasUV ", ".W3TerrainTap ", ".W3TerrainDetail ")
-    removed = True
-    while removed:
-        removed = False
-        for tree in list(bpy.data.node_groups):
-            if tree.users == 0 and tree.name.startswith(prefixes):
-                bpy.data.node_groups.remove(tree)
-                removed = True
+    prefixes = (".W3AtlasUV ", ".W3TerrainTap ", ".W3TerrainCompute ",
+                ".W3TerrainDetail ")
+    # batch_remove: per-datablock remove() re-syncs the depsgraph each call.
+    while True:
+        doomed = [
+            tree for tree in bpy.data.node_groups
+            if tree.users == 0 and tree.name.startswith(prefixes)
+        ]
+        if not doomed:
+            return
+        bpy.data.batch_remove(doomed)
 
 
 def _atlas_uv_builder(layout):
@@ -557,25 +566,15 @@ def _tap_builder(layout, atlas_d, atlas_n, atlas_uv_tree):
     return build
 
 
-def _main_builder(
-    res,
-    map_res,
+def _compute_builder(
     tap_tree,
-    images,
+    param_lut_img,
     has_holes,
     *,
-    tint_res=0,
-    tint_map_res=0,
+    has_normal=False,
+    has_tint=False,
     fresnel_power=2.0,
 ):
-    control_img = images["control"]
-    params_img = images["params"]
-    params2_img = images["params2"]
-    params3_img = images["params3"]
-    param_lut_img = images.get("param_lut")
-    normal_img = images.get("normal")
-    tint_img = images.get("tint")
-
     def build(tree):
         tree.interface.new_socket("Normal Strength", in_out="INPUT",
                                   socket_type="NodeSocketFloat").default_value = 1.0
@@ -585,6 +584,23 @@ def _main_builder(
                                   socket_type="NodeSocketFloat").default_value = 1.0
         tree.interface.new_socket("Slope Override", in_out="INPUT",
                                   socket_type="NodeSocketFloat").default_value = -1.0
+        for name, socket_type in (
+            ("Tile Fraction", "NodeSocketVector"),
+            ("Params", "NodeSocketColor"),
+            ("Params Alpha", "NodeSocketFloat"),
+            ("Params2", "NodeSocketColor"),
+            ("Params2 Alpha", "NodeSocketFloat"),
+            ("Params3", "NodeSocketColor"),
+            ("Params3 Alpha", "NodeSocketFloat"),
+            ("Macro Normal Sample", "NodeSocketColor"),
+            ("Tint Sample", "NodeSocketColor"),
+        ):
+            tree.interface.new_socket(name, in_out="INPUT", socket_type=socket_type)
+        for index in range(4):
+            tree.interface.new_socket(
+                f"Control {index}", in_out="INPUT", socket_type="NodeSocketColor")
+            tree.interface.new_socket(
+                f"Control {index} Alpha", in_out="INPUT", socket_type="NodeSocketFloat")
         for name, stype in (
             ("BaseColor", "NodeSocketColor"), ("Normal", "NodeSocketVector"),
             ("Roughness", "NodeSocketFloat"), ("Specular", "NodeSocketFloat"),
@@ -597,23 +613,14 @@ def _main_builder(
 
         g = _G(tree)
         n_in = g.node("NodeGroupInput", x=-560)
-        uv_node = g.node("ShaderNodeUVMap", x=-560, uv_map="UVMap")
         geo = g.node("ShaderNodeNewGeometry", x=-560)
         g.x = 0
-        uv = uv_node.outputs["UV"]
         strength = n_in.outputs["Normal Strength"]
         tint_strength = n_in.outputs["Tint Strength"]
         fresnel_strength = n_in.outputs["Fresnel Strength"]
         slope_override = n_in.outputs["Slope Override"]
 
-        inv_map_res = 1.0 / float(map_res)
-        grid_p = g.vmath("MULTIPLY", uv, (float(res), float(res), 1.0))
-        # Paired half-texel offsets cancel, so tile UV maps directly to the
-        # control lattice.
-        p = grid_p
-        c = g.vmath("FLOOR", p)
-        f = g.vmath("SUBTRACT", p, c)
-        fx, fy, _ = g.sep(f)
+        fx, fy, _ = g.sep(n_in.outputs["Tile Fraction"])
         ix = g.math("SUBTRACT", 1.0, fx)
         iy = g.math("SUBTRACT", 1.0, fy)
         weights = (
@@ -622,15 +629,8 @@ def _main_builder(
             g.math("MULTIPLY", ix, fy),  # (0,1)
             g.math("MULTIPLY", fx, fy),  # (1,1)
         )
-        offsets = ((0.5, 0.5), (1.5, 0.5), (0.5, 1.5), (1.5, 1.5))
-
-        if normal_img is not None:
-            uv_n = g.vmath(
-                "MULTIPLY",
-                g.vmath("ADD", grid_p, (0.5, 0.5, 0.0)),
-                (inv_map_res, inv_map_res, 1.0),
-            )
-            n_col, _ = g.image(normal_img, uv_n, extension="EXTEND")
+        if has_normal:
+            n_col = n_in.outputs["Macro Normal Sample"]
             # Reconstruct positive Z from filtered signed XY. Interpolating a
             # stored Z channel would shift steep slope thresholds.
             macro_signed = g.vmath(
@@ -655,20 +655,18 @@ def _main_builder(
         tri_sum = g.math("MAXIMUM", g.vmath("DOT_PRODUCT", tri_raw, (1.0, 1.0, 1.0)), 1e-4)
         tri_w = g.vmath("DIVIDE", tri_raw, g.comb(x=tri_sum, y=tri_sum, z=tri_sum))
 
-        uv_p = g.vmath(
-            "MULTIPLY",
-            g.vmath("ADD", p, (0.5, 0.5, 0.0)),
-            (inv_map_res, inv_map_res, 1.0),
-        )
-        p_col, p_alpha = g.image(params_img, uv_p, extension="EXTEND")
+        p_col = n_in.outputs["Params"]
+        p_alpha = n_in.outputs["Params Alpha"]
         thr, baked_sharp_n, baked_base_damp = g.sep_color(p_col)
         if param_lut_img is None:
             sharp = g.math("MULTIPLY", baked_sharp_n, PARAMS_SHARPNESS_SCALE)
             base_damp = baked_base_damp
             norm_damp = p_alpha
-            p2_col, base_bg = g.image(params2_img, uv_p, extension="EXTEND")
+            p2_col = n_in.outputs["Params2"]
+            base_bg = n_in.outputs["Params2 Alpha"]
             spec_ov, spec_bg, base_ov = g.sep_color(p2_col)
-            p3_col, scale_bg = g.image(params3_img, uv_p, extension="EXTEND")
+            p3_col = n_in.outputs["Params3"]
+            scale_bg = n_in.outputs["Params3 Alpha"]
             falloff_ov, falloff_bg, scale_ov = g.sep_color(p3_col)
         else:
             sharp = base_damp = norm_damp = None
@@ -677,11 +675,9 @@ def _main_builder(
 
         acc = None
         param_acc = None
-        for (ox, oy), w in zip(offsets, weights):
-            uv_t = g.vmath("MULTIPLY", g.vmath("ADD", c, (ox, oy, 0.0)),
-                           (inv_map_res, inv_map_res, 1.0))
-            ctrl_col, ctrl_a = g.image(control_img, uv_t, interpolation="Closest",
-                                       extension="EXTEND")
+        for index, w in enumerate(weights):
+            ctrl_col = n_in.outputs[f"Control {index}"]
+            ctrl_a = n_in.outputs[f"Control {index} Alpha"]
             cr, cg, cb = g.sep_color(ctrl_col)
             if param_lut_img is not None:
                 def lut_uv(channel, row):
@@ -909,19 +905,8 @@ def _main_builder(
         ))
         final_n = g.vmath("NORMALIZE", g.mix_v(blend, full_n, combined_bg))
 
-        if tint_img is not None:
-            tint_uv = uv
-            if tint_res > 0 and tint_map_res > 0:
-                tint_uv = g.vmath(
-                    "MULTIPLY",
-                    g.vmath(
-                        "ADD",
-                        g.vmath("MULTIPLY", uv, (float(tint_res), float(tint_res), 1.0)),
-                        (0.5, 0.5, 0.0),
-                    ),
-                    (1.0 / float(tint_map_res), 1.0 / float(tint_map_res), 1.0),
-                )
-            t_col, _ = g.image(tint_img, tint_uv, extension="EXTEND")
+        if has_tint:
+            t_col = n_in.outputs["Tint Sample"]
             darken = g.vmath("SCALE", g.vmath("MULTIPLY", t_col, diff), scale=2.0)
             one = (1.0, 1.0, 1.0)
             screen = g.vmath("SUBTRACT", one,
@@ -991,6 +976,122 @@ def _main_builder(
     return build
 
 
+def _main_builder(
+    res,
+    map_res,
+    compute_tree,
+    images,
+    *,
+    tint_res=0,
+    tint_map_res=0,
+):
+    control_img = images["control"]
+    params_img = images["params"]
+    params2_img = images["params2"]
+    params3_img = images["params3"]
+    param_lut_img = images.get("param_lut")
+    normal_img = images.get("normal")
+    tint_img = images.get("tint")
+
+    def build(tree):
+        tree.interface.new_socket("Normal Strength", in_out="INPUT",
+                                  socket_type="NodeSocketFloat").default_value = 1.0
+        tree.interface.new_socket("Tint Strength", in_out="INPUT",
+                                  socket_type="NodeSocketFloat").default_value = 1.0
+        tree.interface.new_socket("Fresnel Strength", in_out="INPUT",
+                                  socket_type="NodeSocketFloat").default_value = 1.0
+        tree.interface.new_socket("Slope Override", in_out="INPUT",
+                                  socket_type="NodeSocketFloat").default_value = -1.0
+        output_names = (
+            ("BaseColor", "NodeSocketColor"), ("Normal", "NodeSocketVector"),
+            ("Roughness", "NodeSocketFloat"), ("Specular", "NodeSocketFloat"),
+            ("IOR", "NodeSocketFloat"), ("Alpha", "NodeSocketFloat"),
+            ("Slope", "NodeSocketFloat"),
+            ("MacroNormalDebug", "NodeSocketColor"),
+            ("FinalNormalDebug", "NodeSocketColor"),
+        )
+        for name, socket_type in output_names:
+            tree.interface.new_socket(name, in_out="OUTPUT", socket_type=socket_type)
+
+        g = _G(tree)
+        n_in = g.node("NodeGroupInput", x=-560)
+        uv = g.node("ShaderNodeUVMap", x=-560, uv_map="UVMap").outputs["UV"]
+        g.x = 0
+
+        compute = g.group(compute_tree)
+        for name in ("Normal Strength", "Tint Strength", "Fresnel Strength",
+                     "Slope Override"):
+            g.link(n_in.outputs[name], compute.inputs[name])
+
+        grid_p = g.vmath("MULTIPLY", uv, (float(res), float(res), 1.0))
+        # Paired half-texel offsets cancel, so tile UV maps directly to the
+        # control lattice.
+        c = g.vmath("FLOOR", grid_p)
+        fraction = g.vmath("SUBTRACT", grid_p, c)
+        g.link(fraction, compute.inputs["Tile Fraction"])
+
+        inv_map_res = 1.0 / float(map_res)
+        if normal_img is not None:
+            uv_n = g.vmath(
+                "MULTIPLY",
+                g.vmath("ADD", grid_p, (0.5, 0.5, 0.0)),
+                (inv_map_res, inv_map_res, 1.0),
+            )
+            normal_col, _ = g.image(normal_img, uv_n, extension="EXTEND")
+            g.link(normal_col, compute.inputs["Macro Normal Sample"])
+
+        uv_p = g.vmath(
+            "MULTIPLY",
+            g.vmath("ADD", grid_p, (0.5, 0.5, 0.0)),
+            (inv_map_res, inv_map_res, 1.0),
+        )
+        params_col, params_alpha = g.image(params_img, uv_p, extension="EXTEND")
+        g.link(params_col, compute.inputs["Params"])
+        g.link(params_alpha, compute.inputs["Params Alpha"])
+        if param_lut_img is None:
+            params2_col, params2_alpha = g.image(params2_img, uv_p, extension="EXTEND")
+            params3_col, params3_alpha = g.image(params3_img, uv_p, extension="EXTEND")
+            g.link(params2_col, compute.inputs["Params2"])
+            g.link(params2_alpha, compute.inputs["Params2 Alpha"])
+            g.link(params3_col, compute.inputs["Params3"])
+            g.link(params3_alpha, compute.inputs["Params3 Alpha"])
+
+        offsets = ((0.5, 0.5), (1.5, 0.5), (0.5, 1.5), (1.5, 1.5))
+        for index, (ox, oy) in enumerate(offsets):
+            uv_t = g.vmath(
+                "MULTIPLY",
+                g.vmath("ADD", c, (ox, oy, 0.0)),
+                (inv_map_res, inv_map_res, 1.0),
+            )
+            control_col, control_alpha = g.image(
+                control_img, uv_t, interpolation="Closest", extension="EXTEND")
+            g.link(control_col, compute.inputs[f"Control {index}"])
+            g.link(control_alpha, compute.inputs[f"Control {index} Alpha"])
+
+        if tint_img is not None:
+            tint_uv = uv
+            if tint_res > 0 and tint_map_res > 0:
+                tint_uv = g.vmath(
+                    "MULTIPLY",
+                    g.vmath(
+                        "ADD",
+                        g.vmath(
+                            "MULTIPLY", uv,
+                            (float(tint_res), float(tint_res), 1.0)),
+                        (0.5, 0.5, 0.0),
+                    ),
+                    (1.0 / float(tint_map_res),
+                     1.0 / float(tint_map_res), 1.0),
+                )
+            tint_col, _ = g.image(tint_img, tint_uv, extension="EXTEND")
+            g.link(tint_col, compute.inputs["Tint Sample"])
+
+        n_out = g.node("NodeGroupOutput", x=g.x + 900)
+        for name, _socket_type in output_names:
+            g.link(compute.outputs[name], n_out.inputs[name])
+    return build
+
+
 def apply_tile_detail_material(
     obj,
     mat_name,
@@ -1001,6 +1102,7 @@ def apply_tile_detail_material(
     fresnel_power=2.0,
     texture_pack_key="",
     layer_metadata=None,
+    purge_unused=True,
 ):
     layout = atlas["layout"]
     res = int(maps.get("res") or 0)
@@ -1019,26 +1121,30 @@ def apply_tile_detail_material(
     atlas_n = _image_for(atlas.get("normal") or "", "Non-Color") if layout.get("has_normals") else None
     control = _image_for(maps["control"], "Non-Color")
     params = _image_for(maps["params"], "Non-Color")
-    params2 = _image_for(maps["params2"], "Non-Color")
-    params3 = _image_for(maps["params3"], "Non-Color")
     normal = _image_for(maps.get("normal") or "", "Non-Color")
     tint = _image_for(maps.get("tint") or "", "Non-Color", alpha_mode="STRAIGHT")
     param_lut = None
     if texture_pack_key and layer_metadata:
         param_lut = ensure_terrain_texture_pack_image(
             texture_pack_key, layer_metadata)
+    params2 = _image_for(maps["params2"], "Non-Color") if param_lut is None else None
+    params3 = _image_for(maps["params3"], "Non-Color") if param_lut is None else None
     if (atlas_d is None or control is None or params is None
-            or params2 is None or params3 is None):
+            or (param_lut is None and (params2 is None or params3 is None))):
         return None
 
     has_holes = bool(maps.get("has_holes"))
     layout_sig = _sig((NODE_VERSION, DETAIL_VERSION, sorted(layout.items())))
     tap_sig = _sig((layout_sig, _stamp(atlas["diffuse"]), _stamp(atlas.get("normal") or "")))
+    compute_sig = _sig((tap_sig, bool(param_lut), str(texture_pack_key or ""),
+                        bool(normal), bool(tint), has_holes, fresnel_power))
+    map_keys = ["control", "params", "normal", "tint"]
+    if param_lut is None:
+        map_keys.extend(("params2", "params3"))
     full_sig = _sig((tap_sig, res, map_res, tint_res, tint_map_res,
                       has_holes, normal_strength, fresnel_power,
                       str(texture_pack_key or ""),
-                      [_stamp(maps.get(k) or "") for k in
-                      ("control", "params", "params2", "params3", "normal", "tint")]))
+                      [_stamp(maps.get(key) or "") for key in map_keys]))
 
     mat = bpy.data.materials.get(mat_name)
     if mat is not None and mat.get("witcher_terrain_material_key") != mat_name:
@@ -1052,21 +1158,31 @@ def apply_tile_detail_material(
                                       _atlas_uv_builder(layout))
         tap_tree = _ensure_group(f".W3TerrainTap {tap_sig[:10]}", tap_sig,
                                  _tap_builder(layout, atlas_d, atlas_n, atlas_uv_tree))
+        compute_tree = _ensure_group(
+            f".W3TerrainCompute {compute_sig[:10]}",
+            compute_sig,
+            _compute_builder(
+                tap_tree,
+                param_lut,
+                has_holes,
+                has_normal=normal is not None,
+                has_tint=tint is not None,
+                fresnel_power=fresnel_power,
+            ),
+        )
         main_name = f".W3TerrainDetail {mat_name}"
         images = {"control": control, "params": params, "params2": params2,
                   "params3": params3, "param_lut": param_lut,
                   "normal": normal, "tint": tint}
         main_tree = _ensure_group(main_name, full_sig,
                                   _main_builder(
-                                      res,
-                                      map_res,
-                                      tap_tree,
-                                      images,
-                                      has_holes,
-                                      tint_res=tint_res,
-                                      tint_map_res=tint_map_res,
-                                      fresnel_power=fresnel_power,
-                                  ))
+                                       res,
+                                       map_res,
+                                       compute_tree,
+                                       images,
+                                       tint_res=tint_res,
+                                       tint_map_res=tint_map_res,
+                                   ))
 
         mat.use_nodes = True
         nt = mat.node_tree
@@ -1112,7 +1228,8 @@ def apply_tile_detail_material(
         mat["witcher_terrain_material_key"] = mat_name
         mat["witcher_terrain_detail"] = True
         mat["witcher_terrain_detail_sig"] = full_sig
-        _purge_unused_detail_groups()
+        if purge_unused:
+            _purge_unused_detail_groups()
 
     if texture_pack_key:
         mat[TEXTURE_PACK_KEY_PROP] = str(texture_pack_key)
