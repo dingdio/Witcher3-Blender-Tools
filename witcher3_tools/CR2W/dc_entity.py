@@ -2827,14 +2827,14 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
             child_var = chunk.GetVariableByName("child")
             if parent_var and child_var:
                 chunk_append(new_mesh, chunk, CMeshSkinningAttachment(parent_var.Value-1, child_var.Value-1))
-            else:
+            elif not _chunk_prop_bool(chunk, "isBroken", default=False):
                 log.warning(f'CMeshSkinningAttachment missing parent or child at template chunk {chunk.ChunkIndex}')
         elif (chunk.Type == "CAnimatedAttachment"):
             parent_var = chunk.GetVariableByName("parent")
             child_var = chunk.GetVariableByName("child")
             if parent_var and child_var:
                 chunk_append(new_mesh, chunk, CAnimatedAttachment(parent_var.Value-1, child_var.Value-1))
-            else:
+            elif not _chunk_prop_bool(chunk, "isBroken", default=False):
                 log.warning(f'CAnimatedAttachment missing parent or child at template chunk {chunk.ChunkIndex}')
         elif (chunk.Type == "CAnimDangleBufferComponent"):
             name = _chunk_prop_string(chunk, "name")
@@ -4358,7 +4358,7 @@ def create_CEntity(file, _inherit_visited=None):
             child_var = chunk.GetVariableByName("child")
             if parent_var and child_var:
                 chunk_append(new_mesh, chunk, CMeshSkinningAttachment(parent_var.Value-1, child_var.Value-1))
-            else:
+            elif not _chunk_prop_bool(chunk, "isBroken", default=False):
                 log.warning(f'CMeshSkinningAttachment missing parent or child at chunk {chunk.ChunkIndex}')
         elif (chunk.Type == "CSkeletonBoneSlot"):
             bone_index_var = chunk.GetVariableByName("boneIndex")
@@ -4505,7 +4505,7 @@ def create_CEntity(file, _inherit_visited=None):
             child_var = chunk.GetVariableByName("child")
             if parent_var and child_var:
                 chunk_append(new_mesh, chunk, CAnimatedAttachment(parent_var.Value-1, child_var.Value-1))
-            else:
+            elif not _chunk_prop_bool(chunk, "isBroken", default=False):
                 log.warning(f'CAnimatedAttachment missing parent or child at chunk {chunk.ChunkIndex}')
         elif (chunk.Type == "CAnimDangleBufferComponent"):
             name = _chunk_prop_string(chunk, "name")

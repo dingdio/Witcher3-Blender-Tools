@@ -224,6 +224,27 @@ class EntityPathResolverTests(unittest.TestCase):
         self.assertNotEqual(resolved, workspace_copy)
         self.assertEqual(resolved, uncooked_copy)
 
+    def test_active_redkit_depots_follow_resource_links(self):
+        from witcher3_tools.CR2W import common_blender
+
+        alias_path = r"characters\models\animals\horse\draft\model\tail.redapex"
+        target_path = r"characters\models\animals\horse\draft\model\tail.redcloth"
+        with tempfile.TemporaryDirectory() as root:
+            depot = os.path.join(root, "r4data")
+            uncooked = os.path.join(root, "redkit")
+            target = _touch(uncooked, target_path)
+            link = _touch(depot, alias_path + ".link")
+            with open(link, "w", encoding="utf-8") as handle:
+                handle.write(target_path)
+
+            with (
+                mock.patch.object(common_blender, "_get_repo_roots_from_prefs", return_value=("", "", "", False)),
+                common_blender.redkit_repo_context(roots=[depot, uncooked]),
+            ):
+                resolved = common_blender.repo_file(alias_path)
+
+        self.assertEqual(resolved, target)
+
 
 if __name__ == "__main__":
     unittest.main()

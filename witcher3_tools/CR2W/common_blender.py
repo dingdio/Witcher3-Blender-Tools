@@ -1076,6 +1076,64 @@ def _get_redkit_depot_roots():
             roots.append(os.path.normpath(value))
     return roots
 
+
+def _resolve_redkit_repo_file(filepath: str, roots) -> str:
+    relpath = str(filepath or "").replace("/", "\\")
+    if os.path.isabs(relpath):
+        for root in roots:
+            if _is_under_root(relpath, root):
+                if os.path.exists(win_safe_path(relpath)):
+                    return relpath
+                relpath = os.path.relpath(relpath, root)
+                break
+        else:
+            return ""
+    relpath = relpath.lstrip("\\")
+
+    seen = set()
+    for _ in range(11):  # Initial path plus ten redirected targets.
+        key = os.path.normcase(os.path.normpath(relpath))
+        if key in seen:
+            log.warning("REDkit resource link cycle detected at '%s'.", relpath)
+            return ""
+        seen.add(key)
+
+        candidates = []
+        for root in roots:
+            candidate = os.path.normpath(os.path.join(root, relpath))
+            if not _is_under_root(candidate, root):
+                continue
+            if os.path.exists(win_safe_path(candidate)):
+                return candidate
+            candidates.append(candidate)
+
+        target = ""
+        for candidate in candidates:
+            link_path = candidate + ".link"
+            if not os.path.isfile(win_safe_path(link_path)):
+                continue
+            try:
+                with open(win_safe_path(link_path), "r", encoding="utf-8-sig") as handle:
+                    target = handle.read().strip()
+            except OSError as exc:
+                log.warning("Could not read REDkit resource link '%s': %s", link_path, exc)
+                return ""
+            break
+
+        target = target.replace("/", "\\")
+        if not target:
+            return ""
+        drive, _tail = os.path.splitdrive(target)
+        target = os.path.normpath(target)
+        if drive or target.startswith("\\") or target == ".." or target.startswith("..\\"):
+            log.warning("Ignoring invalid REDkit resource link target '%s'.", target)
+            return ""
+        relpath = target
+
+    log.warning("REDkit resource link depth exceeded for '%s'.", filepath)
+    return ""
+
+
 def repo_file(filepath: str, version = 999, is_abs_path = False):
     try:
         version = int(version)
@@ -1090,15 +1148,9 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
     # REDkit depot, so normal bundle/uncook imports are not hijacked by REDkit
     # preference paths.
     if redkit_roots:
-        if os.path.isabs(filepath):
-            for root in redkit_roots:
-                if _is_under_root(filepath, root):
-                    return filepath
-        rk_relpath = filepath.replace("/", "\\").lstrip("\\")
-        for root in redkit_roots:
-            candidate = os.path.join(root, rk_relpath)
-            if os.path.exists(win_safe_path(candidate)):
-                return candidate
+        redkit_file = _resolve_redkit_repo_file(filepath, redkit_roots)
+        if redkit_file:
+            return redkit_file
 
     if _repo_override_roots:
         if os.path.isabs(filepath):

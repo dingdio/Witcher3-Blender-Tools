@@ -353,6 +353,89 @@ class BreastSimulatorTests(unittest.TestCase):
 
 
 class DyngParserTests(unittest.TestCase):
+    @staticmethod
+    def _skeleton_chunk(names, parents, rig_data):
+        return SimpleNamespace(
+            name="CSkeleton",
+            PROPS=[
+                SimpleNamespace(
+                    theName="bones",
+                    More=[SimpleNamespace(elementName=name) for name in names],
+                ),
+                SimpleNamespace(theName="parentIndices", value=list(parents)),
+            ],
+            rigData=SimpleNamespace(rigData=list(rig_data)),
+        )
+
+    def test_non_finite_skeleton_rotation_uses_identity_default(self):
+        rig_data = [SimpleNamespace(
+            position=SimpleNamespace(x=1.0, y=2.0, z=3.0, w=1.0),
+            rotation=SimpleNamespace(x=-math.inf, y=math.inf, z=-0.0, w=math.inf),
+            scale=SimpleNamespace(x=1.0, y=1.0, z=1.0, w=1.0),
+        )]
+
+        with self.assertLogs(dc_skeleton.log.name, level="WARNING"):
+            skeleton = dc_skeleton.read_skelly(
+                self._skeleton_chunk(["tail"], [-1], rig_data)
+            )
+
+        self.assertEqual(
+            (skeleton.positions[0].x, skeleton.positions[0].y, skeleton.positions[0].z),
+            (1.0, 2.0, 3.0),
+        )
+        self.assertEqual(
+            tuple(getattr(skeleton.rotations[0], axis) for axis in "XYZW"),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+        self.assertEqual(
+            (skeleton.scales[0].x, skeleton.scales[0].y, skeleton.scales[0].z),
+            (1.0, 1.0, 1.0),
+        )
+
+    def test_skeleton_rejects_invalid_parent_hierarchy(self):
+        with self.assertRaisesRegex(ValueError, "invalid parent index"):
+            dc_skeleton.read_skelly(
+                self._skeleton_chunk(["root", "child"], [-1, 1], [])
+            )
+
+    def test_named_skeleton_rejects_missing_reference_pose(self):
+        with self.assertRaisesRegex(ValueError, "no reference-pose transforms"):
+            dc_skeleton.read_skelly(
+                self._skeleton_chunk(["root"], [-1], [])
+            )
+
+    def test_witcher2_named_skeleton_keeps_legacy_default_pose(self):
+        chunk = self._skeleton_chunk(["root"], [-1], [])
+        setattr(
+            chunk,
+            "_W_CLASS__CR2WFILE",
+            SimpleNamespace(
+                HEADER=SimpleNamespace(version=115),
+                fileName="<memory>",
+            ),
+        )
+
+        skeleton = dc_skeleton.read_skelly(chunk)
+
+        self.assertEqual(len(skeleton.positions), 1)
+        self.assertEqual(len(skeleton.rotations), 1)
+        self.assertEqual(len(skeleton.scales), 1)
+
+    def test_flattened_skeleton_track_properties_prefer_cname_once(self):
+        skeleton = dc_skeleton.read_skelly(SimpleNamespace(
+            name="CSkeleton",
+            PROPS=[SimpleNamespace(
+                theName="tracks",
+                More=[
+                    SimpleNamespace(theName="name", ToString=lambda: "Track0"),
+                    SimpleNamespace(theName="nameAsCName", ToString=lambda: "Track0"),
+                ],
+            )],
+            rigData=SimpleNamespace(rigData=[]),
+        ))
+
+        self.assertEqual(skeleton.tracks, ["Track0"])
+
     def test_uncooked_dyng_rebuilds_empty_skeleton_rig_data(self):
         root = IDENTITY_MATRIX
         child = transform_from_axes(
@@ -364,10 +447,10 @@ class DyngParserTests(unittest.TestCase):
         dyng_chunk = fake_dyng_chunk()
         transforms = dyng_chunk.GetVariableByName("nodeTransforms")
         transforms.More = [matrix_element(root), matrix_element(child)]
-        skeleton_chunk = SimpleNamespace(
-            name="CSkeleton",
-            PROPS=[],
-            rigData=SimpleNamespace(rigData=[]),
+        skeleton_chunk = self._skeleton_chunk(
+            ["root", "dyng_child"],
+            [-1, 0],
+            [],
         )
         source_file = SimpleNamespace(
             CHUNKS=SimpleNamespace(CHUNKS=[skeleton_chunk, dyng_chunk]),
@@ -385,6 +468,17 @@ class DyngParserTests(unittest.TestCase):
         self.assertAlmostEqual(skeleton.rotations[1].Y, 0.0)
         self.assertAlmostEqual(skeleton.rotations[1].Z, math.sqrt(0.5))
         self.assertAlmostEqual(skeleton.rotations[1].W, math.sqrt(0.5))
+
+    def test_uncooked_dyng_does_not_require_skeleton_chunk(self):
+        source_file = SimpleNamespace(
+            CHUNKS=SimpleNamespace(CHUNKS=[fake_dyng_chunk()]),
+        )
+
+        skeleton = dc_skeleton.create_Skeleton(source_file)
+
+        self.assertEqual(skeleton.names, ["root", "dyng_child"])
+        self.assertEqual(skeleton.parentIdx, [-1, 0])
+        self.assertEqual(len(skeleton.positions), 2)
 
     def test_parse_dyng_chunk_extracts_physics_arrays(self):
         data = parse_dyng_chunk(fake_dyng_chunk(), source_path="sample.w3dyng")

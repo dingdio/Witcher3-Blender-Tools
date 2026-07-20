@@ -41,7 +41,7 @@ class Bone(w3_types.base_w3):
         self.scale_numFrames = 0
         self.scaleFrames =[] #new List<Vector>()
 
-def read_skelly(skelly):
+def read_skelly(skelly, *, allow_missing_rig_data=False):
     this_skeleton = w3_types.w2rig(
                 nbBones=94,
                 names= [],
@@ -62,7 +62,16 @@ def read_skelly(skelly):
         text = str(getattr(entry, "elementName", "") or "").strip()
         if text:
             return text
-        for prop_name in ("name", "m_name"):
+        if getattr(entry, "theName", "") in {
+            "name", "m_name", "nameAsCName", "m_nameAsCName",
+        } and hasattr(entry, "ToString"):
+            try:
+                text = str(entry.ToString() or "").strip()
+            except Exception:
+                text = ""
+            if text:
+                return text
+        for prop_name in ("nameAsCName", "m_nameAsCName", "name", "m_name"):
             prop = entry.GetVariableByName(prop_name) if hasattr(entry, "GetVariableByName") else None
             if prop is None:
                 continue
@@ -84,10 +93,20 @@ def read_skelly(skelly):
     for item in skelly.PROPS:
         if item.theName in ("bones", "m_bones"):
             for idx, bone in enumerate(prop_entries(item)):
-                this_skeleton.names.append(entry_name(bone) or str(idx))
+                bone_name = entry_name(bone)
+                if not bone_name:
+                    raise ValueError(f"CSkeleton bone {idx} has no name")
+                this_skeleton.names.append(bone_name)
             this_skeleton.nbBones = len(this_skeleton.names)
         if item.theName in ("tracks", "m_tracks"):
-            for track in prop_entries(item):
+            track_entries = prop_entries(item)
+            direct_cname_entries = [
+                entry for entry in track_entries
+                if getattr(entry, "theName", "") in {"nameAsCName", "m_nameAsCName"}
+            ]
+            if direct_cname_entries:
+                track_entries = direct_cname_entries
+            for track in track_entries:
                 track_name = entry_name(track)
                 if track_name:
                     this_skeleton.tracks.append(track_name)
@@ -95,30 +114,68 @@ def read_skelly(skelly):
             parent_indices = getattr(item, "value", None)
             if isinstance(parent_indices, list):
                 this_skeleton.parentIdx = parent_indices[:]
-    if hasattr(skelly, "rigData"):
-        rig_data = getattr(getattr(skelly, "rigData", None), "rigData", []) or []
-        for data in rig_data:
-            this_skeleton.positions.append(data.position)
-            this_skeleton.rotations.append(data.rotation)
-            this_skeleton.scales.append(data.scale)
+    source_cr2w = getattr(skelly, "_W_CLASS__CR2WFILE", None)
+    source_file = getattr(source_cr2w, "fileName", "<memory>")
+    source_version = getattr(getattr(source_cr2w, "HEADER", None), "version", 999)
+    rig_data = getattr(getattr(skelly, "rigData", None), "rigData", []) or []
+    for idx, data in enumerate(rig_data):
+        position = data.position
+        rotation = data.rotation
+        scale = data.scale
+        repaired = []
+        if not all(math.isfinite(float(getattr(position, axis))) for axis in "xyzw"):
+            position = w3_types.Vector3D(0.0, 0.0, 0.0)
+            repaired.append("translation")
+        if not all(math.isfinite(float(getattr(rotation, axis))) for axis in "xyzw"):
+            rotation = w3_types.Quaternion(0.0, 0.0, 0.0, 1.0)
+            repaired.append("rotation")
+        if not all(math.isfinite(float(getattr(scale, axis))) for axis in "xyzw"):
+            scale = w3_types.Vector3D(1.0, 1.0, 1.0)
+            repaired.append("scale")
+        if repaired:
+            bone_name = this_skeleton.names[idx] if idx < len(this_skeleton.names) else str(idx)
+            log.warning(
+                "Repaired non-finite CSkeleton %s for bone '%s' in %s",
+                "/".join(repaired),
+                bone_name,
+                source_file,
+            )
+        this_skeleton.positions.append(position)
+        this_skeleton.rotations.append(rotation)
+        this_skeleton.scales.append(scale)
     bone_count = len(this_skeleton.names)
     if bone_count:
-        if len(this_skeleton.parentIdx) < bone_count:
-            this_skeleton.parentIdx.extend([-1] * (bone_count - len(this_skeleton.parentIdx)))
-        if len(this_skeleton.positions) < bone_count:
+        if len(this_skeleton.parentIdx) != bone_count:
+            raise ValueError(
+                f"CSkeleton parent count {len(this_skeleton.parentIdx)} does not match bone count {bone_count}"
+            )
+        seen_names = set()
+        for idx, (bone_name, parent_idx) in enumerate(zip(this_skeleton.names, this_skeleton.parentIdx)):
+            name_key = bone_name.casefold()
+            if name_key in seen_names:
+                raise ValueError(f"CSkeleton has duplicate bone name '{bone_name}'")
+            seen_names.add(name_key)
+            if parent_idx != -1 and not (0 <= parent_idx < idx):
+                raise ValueError(
+                    f"CSkeleton bone '{bone_name}' has invalid parent index {parent_idx}"
+                )
+        if rig_data and len(rig_data) != bone_count:
+            raise ValueError(
+                f"CSkeleton transform count {len(rig_data)} does not match bone count {bone_count}"
+            )
+        if not rig_data and source_version > 115 and not allow_missing_rig_data:
+            raise ValueError(
+                f"CSkeleton has {bone_count} named bones but no reference-pose transforms"
+            )
+        if not rig_data and source_version <= 115:
             this_skeleton.positions.extend(
-                w3_types.Vector3D(0.0, 0.0, 0.0)
-                for _ in range(bone_count - len(this_skeleton.positions))
+                w3_types.Vector3D(0.0, 0.0, 0.0) for _ in range(bone_count)
             )
-        if len(this_skeleton.rotations) < bone_count:
             this_skeleton.rotations.extend(
-                w3_types.Quaternion(0.0, 0.0, 0.0, 1.0)
-                for _ in range(bone_count - len(this_skeleton.rotations))
+                w3_types.Quaternion(0.0, 0.0, 0.0, 1.0) for _ in range(bone_count)
             )
-        if len(this_skeleton.scales) < bone_count:
             this_skeleton.scales.extend(
-                w3_types.Vector3D(1.0, 1.0, 1.0)
-                for _ in range(bone_count - len(this_skeleton.scales))
+                w3_types.Vector3D(1.0, 1.0, 1.0) for _ in range(bone_count)
             )
     return this_skeleton
 
@@ -587,14 +644,21 @@ def _skeleton_from_dyng_resource(resource, tracks=()):
 
 def create_Skeleton(file):
     chunks = file.CHUNKS.CHUNKS
+    dyng_chunk = next((chunk for chunk in chunks if chunk.name == "CDyngResource"), None)
     skeleton_chunk = next((chunk for chunk in chunks if chunk.name == "CSkeleton"), None)
     if skeleton_chunk is None:
+        if dyng_chunk is not None:
+            from ..physics.dyng import parse_dyng_chunk
+
+            return _skeleton_from_dyng_resource(parse_dyng_chunk(dyng_chunk))
         raise ValueError("No CSkeleton chunk found")
 
-    skelly = read_skelly(skeleton_chunk)
+    skelly = read_skelly(
+        skeleton_chunk,
+        allow_missing_rig_data=dyng_chunk is not None,
+    )
     rig_data = getattr(getattr(skeleton_chunk, "rigData", None), "rigData", []) or []
     if not rig_data:
-        dyng_chunk = next((chunk for chunk in chunks if chunk.name == "CDyngResource"), None)
         if dyng_chunk is not None:
             from ..physics.dyng import parse_dyng_chunk
 

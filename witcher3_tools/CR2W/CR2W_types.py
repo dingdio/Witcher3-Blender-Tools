@@ -203,20 +203,16 @@ def detectedProp(f, CR2WFILE, offset ):
 def _seek_class_payload(f, CR2WFILE, idx):
     f.seek(CR2WFILE.CR2WExport[idx].dataOffset + CR2WFILE.start)
     version = getattr(getattr(CR2WFILE, "HEADER", None), "version", 999)
-    if version <= 115 or is_old_version(version):
+    # Version 158+ export payloads begin with a one-byte flag field.
+    if version < 158:
         return
 
-    zero = readSByte(f)
-    if zero == 0:
-        return
-    if zero == 1:
-        _ = readInt32(f)
-        return
-    if zero == -128:
-        _ = ReadBit6(f)
-        return
-
-    f.seek(-1, os.SEEK_CUR)
+    payload_flags = readUByte(f)
+    if payload_flags & 4:
+        raise NotImplementedError(
+            "Unsupported CR2W export payload encoding "
+            f"(export #{idx}, flags 0x{payload_flags:02X})"
+        )
 
 
 def getClass(f, CR2WFILE, self, idx):
@@ -1073,9 +1069,22 @@ class CByteArray2(object):
         super(CByteArray2, self).__init__()
         self.arraysize = None
         self.Bytes = None
-    def Read(self, f, size):
+    def Read(self, f, size=0, class_end=None):
+        block_start = f.tell()
+        limit = FileSize(f) if class_end is None else int(class_end)
+        if block_start + 4 > limit:
+            raise ValueError("Truncated length-prefixed block header")
         self.arraysize = readU32(f)
+        if self.arraysize < 4:
+            raise ValueError(f"Invalid length-prefixed block size {self.arraysize}")
+        block_end = block_start + self.arraysize
+        if block_end > limit:
+            raise ValueError(
+                f"Length-prefixed block ends at 0x{block_end:X}, past 0x{limit:X}"
+            )
         self.Bytes = f.read(self.arraysize - 4)
+        if len(self.Bytes) != self.arraysize - 4:
+            raise EOFError("Truncated length-prefixed block payload")
 
 
 class SFoliageInstanceData:
@@ -1568,19 +1577,12 @@ class PROPERTY:
                 for _ in range(0, count):
                     self.Handles.append(HANDLE(f,CR2WFILE, self))
                 f.seek(startofHandles); # FSeek(startof(Handles));
-        elif (Type.type == "array:String" or Type.type == "array:2,0,String"):
-                if CR2WFILE.HEADER.version <= 115:
-                    elementTypeName = STRINGINDEX(f,CR2WFILE, self)
-                    unk2 = readInt16(f)
-                    if unk2 != -1:
-                        raise ValueError('Unexpected value for unk2')
-                    self.elements = []
-                    for _ in range(0,count):
-                        self.elements.append(CSTRING(f))
-                else:
-                    self.elements = []
-                    for _ in range(0,count):
-                        self.elements.append(CSTRING(f)) #<name="submesh">; #not needed remove later
+        elif arrayDataType == "array" and elementType == "String":
+            if CR2WFILE.HEADER.version <= 115:
+                STRINGINDEX(f, CR2WFILE, self)
+                if readInt16(f) != -1:
+                    raise ValueError('Unexpected String array header')
+            self.elements = [CSTRING(f) for _ in range(count)]
         elif ("array:array" in Type.type):
             pass
         elif ("StringAnsi" in Type.type):
@@ -1913,35 +1915,26 @@ class SEntityBufferType1():
         self.ComponentName = False#new CName(cr2w, this, nameof(ComponentName)) { IsSerialized = true };
         self.Guid = CGUID() #new CGUID(cr2w, this, nameof(Guid)) { IsSerialized = true };
         self.Buffer = CByteArray2() #new CByteArray2(cr2w, this, nameof(Buffer)) { IsSerialized = true };
-    def CanRead(self, CR2WFILE, f):
-        # Guard against uncooked/alternative layouts: ensure index is valid before reading the buffer.
-        if f.tell() + 2 > FileSize(f):
-            return False
-        pos = f.tell()
+    def CanRead(self, CR2WFILE, f, class_end=None):
+        if class_end is None:
+            export = CR2WFILE.CR2WExport[CR2WFILE.currentExport]
+            class_end = export.dataOffset + CR2WFILE.start + export.dataSize
+        if f.tell() + 2 > class_end:
+            raise ValueError("Missing CEntity component-data terminator")
         self.ComponentName = STRINGINDEX(f, CR2WFILE, self) #CR2WFILE.CNAMES[readUShort(f)].name
         idx = getattr(self.ComponentName, "Index", 0)
         if idx == 0:
             return False
         if idx >= len(CR2WFILE.CNAMES):
-            f.seek(pos)
-            self.ComponentName.Index = 0
-            return False
-        # Make sure there's enough room for GUID + buffer size before attempting a read.
-        try:
-            export = CR2WFILE.CR2WExport[CR2WFILE.currentExport]
-            class_end = export.dataOffset + CR2WFILE.start + export.dataSize
-            if f.tell() + 16 + 4 > class_end:
-                f.seek(pos)
-                self.ComponentName.Index = 0
-                return False
-        except Exception:
-            pass
+            raise ValueError(f"Invalid CEntity component CName index {idx}")
+        if f.tell() + 16 + 4 > class_end:
+            raise ValueError("Truncated CEntity component-data entry")
         return True
 
-    def Read(self, f, size = 0):
+    def Read(self, f, size=0, class_end=None):
         if self.ComponentName.Index:
             self.Guid.Read(f)
-            self.Buffer.Read(f, size)
+            self.Buffer.Read(f, size, class_end=class_end)
 
 class SEntityBufferType2():
     def __init__(self, CR2WFILE):
@@ -1949,30 +1942,95 @@ class SEntityBufferType2():
         self.componentName = False #new CName(cr2w, this, nameof(componentName)) {IsSerialized = true};
         self.sizeofdata = False #new CUInt32(cr2w, this, nameof(sizeofdata)) { IsSerialized = true };
         self.variables = CBufferUInt32(CR2WFILE, CVariantSizeTypeName) #new CBufferUInt32<CVariantSizeTypeName>(cr2w, this, nameof(variables)) { IsSerialized = true };
-    def Read(self, f, size):
+    def Read(self, f, size=0, class_end=None):
+        block_start = f.tell()
+        limit = FileSize(f) if class_end is None else int(class_end)
+        if block_start + 4 > limit:
+            raise ValueError("Truncated CEntity override block header")
         self.sizeofdata = readU32(f)
-        self.componentName = self.CR2WFILE.CNAMES[readUShort(f)].name
-        self.variables.Read(f, size)
+        if self.sizeofdata < 10:
+            raise ValueError(
+                f"Invalid CEntity override block size {self.sizeofdata}"
+            )
+        block_end = block_start + self.sizeofdata
+        if block_end > limit:
+            raise ValueError(
+                f"CEntity override block ends at 0x{block_end:X}, past 0x{limit:X}"
+            )
+
+        component_name_index = readUShort(f)
+        if component_name_index >= len(self.CR2WFILE.CNAMES):
+            raise ValueError(
+                f"Invalid CEntity instance component CName index {component_name_index}"
+            )
+        self.componentName = self.CR2WFILE.CNAMES[component_name_index].name
+
+        variable_count = readU32(f)
+        if variable_count > (block_end - f.tell()) // 8:
+            raise ValueError(
+                f"CEntity override count {variable_count} cannot fit in its block"
+            )
+        for _ in range(variable_count):
+            variable = CVariantSizeTypeName(self.CR2WFILE)
+            variable.Read(f, 0, class_end=block_end)
+            self.variables.elements.append(variable)
+        if f.tell() > block_end:
+            raise ValueError("CEntity override block was over-read")
+        f.seek(block_end)
 
 
-def _entity_component_tail_positions(tail_start, class_end, prefer_direct=False):
-    positions = []
-    if prefer_direct:
-        positions.append(tail_start)
-        legacy_pos = tail_start + 10
-        if legacy_pos < class_end:
-            positions.append(legacy_pos)
-    else:
-        legacy_pos = tail_start + 10
-        if legacy_pos < class_end:
-            positions.append(legacy_pos)
-        positions.append(tail_start)
-    seen = set()
-    for pos in positions:
-        if pos in seen or pos >= class_end:
-            continue
-        seen.add(pos)
-        yield pos
+def _object_ref_in_range(CR2WFILE, reference):
+    if reference == 0:
+        return True
+    if reference > 0:
+        return reference <= len(getattr(CR2WFILE, "CR2WExport", ()))
+    return -reference <= len(getattr(CR2WFILE, "CR2WImport", ()))
+
+
+def _entity_has_template(template_property):
+    handles = getattr(template_property, "Handles", None) or []
+    if not handles:
+        return False
+    handle = handles[0]
+    raw_value = getattr(handle, "val", None)
+    if raw_value is not None:
+        return raw_value != 0
+    return (
+        getattr(handle, "Reference", None) is not None
+        or bool(getattr(handle, "DepotPath", None))
+    )
+
+
+def _entity_payload_start(f, CR2WFILE, entity_chunk, tail_start, class_end):
+    f.seek(tail_start)
+    context = (
+        f"{getattr(CR2WFILE, 'fileName', '<memory>')} "
+        f"export #{getattr(entity_chunk, 'ChunkIndex', '?')}"
+    )
+
+    if f.tell() + 2 > class_end or readUShort(f) != 0:
+        raise ValueError(f"Missing CEntity property terminator in {context}")
+
+    for list_name in ("parent attachment", "child attachment"):
+        if f.tell() + 4 > class_end:
+            raise ValueError(f"Truncated CEntity {list_name} count in {context}")
+        count = readU32(f)
+        byte_count = count * 4
+        if byte_count > class_end - f.tell():
+            raise ValueError(f"Invalid CEntity {list_name} count {count} in {context}")
+        for _ in range(count):
+            reference = readInt32(f)
+            if not _object_ref_in_range(CR2WFILE, reference):
+                raise ValueError(
+                    f"Invalid CEntity {list_name} reference {reference} in {context}"
+                )
+
+    version = getattr(getattr(CR2WFILE, "HEADER", None), "version", 999)
+    if version < 162:
+        if f.tell() + 64 > class_end:
+            raise ValueError(f"Truncated legacy CEntity local-to-world matrix in {context}")
+        f.seek(64, os.SEEK_CUR)
+    return f.tell()
 
 
 def _try_read_entity_components_at(f, CR2WFILE, class_end, pos):
@@ -1991,73 +2049,81 @@ def _try_read_entity_components_at(f, CR2WFILE, class_end, pos):
         for _item in range(0, elementcount):
             if f.tell() + 4 > class_end:
                 return None
-            components.append(readInt32(f))
+            component = readInt32(f)
+            if not _object_ref_in_range(CR2WFILE, component):
+                return None
+            if component > 0:
+                components.append(component)
     except Exception:
         return None
     return components
 
 
-def _read_entity_components_safe(f, CR2WFILE, entity_chunk, tail_start, class_end, prefer_direct=False):
-    for pos in _entity_component_tail_positions(tail_start, class_end, prefer_direct=prefer_direct):
+def _read_entity_components_from_payload(f, CR2WFILE, entity_chunk, pos, class_end):
+    if pos < class_end:
         components = _try_read_entity_components_at(f, CR2WFILE, class_end, pos)
         if components is not None:
             return components
-    log.warning(
-        "Skipping malformed CEntity component array in %s export #%s at 0x%X (%d byte tail)",
-        getattr(CR2WFILE, "fileName", "<memory>"),
-        getattr(entity_chunk, "ChunkIndex", "?"),
-        int(tail_start),
-        max(0, int(class_end) - int(tail_start)),
+    raise ValueError(
+        "Malformed CEntity component array in "
+        f"{getattr(CR2WFILE, 'fileName', '<memory>')} "
+        f"export #{getattr(entity_chunk, 'ChunkIndex', '?')} at 0x{pos:X}"
     )
-    f.seek(tail_start)
-    return []
+
+
+def _read_entity_buffer_v1_safe(f, CR2WFILE, entity_chunk, class_end):
+    entries = []
+    while True:
+        entry = SEntityBufferType1(CR2WFILE, entries, str(len(entries)))
+        if not entry.CanRead(CR2WFILE, f, class_end=class_end):
+            return entries
+        entry.Read(f, 0, class_end=class_end)
+        entries.append(entry)
 
 
 def _read_entity_buffer_v2_safe(f, CR2WFILE, entity_chunk, class_end):
     start = f.tell()
-    try:
-        if start + 4 > class_end:
-            return []
-        elementcount = readU32Check(f, start)
-        remaining_after_count = max(0, int(class_end) - int(start) - 4)
-        # A BufferV2 element starts with sizeofdata + component CName, so it
-        # cannot be smaller than six bytes even when it has no variables.
-        max_possible = remaining_after_count // 6
-        if elementcount > max_possible:
-            log.debug(
-                "Skipping malformed CEntity BufferV2 in %s export #%s at 0x%X "
-                "(count %d cannot fit in %d byte tail)",
-                getattr(CR2WFILE, "fileName", "<memory>"),
-                getattr(entity_chunk, "ChunkIndex", "?"),
-                int(start),
-                int(elementcount),
-                int(class_end) - int(start),
-            )
-            f.seek(class_end)
-            return []
-        buffer_v2 = CBufferUInt32(CR2WFILE, SEntityBufferType2)
-        buffer_v2.Read(f, 0)
-        return buffer_v2.elements
-    except Exception as exc:
-        log.debug(
-            "Skipping malformed CEntity BufferV2 in %s export #%s at 0x%X: %s",
-            getattr(CR2WFILE, "fileName", "<memory>"),
-            getattr(entity_chunk, "ChunkIndex", "?"),
-            int(start),
-            exc,
+    context = (
+        f"{getattr(CR2WFILE, 'fileName', '<memory>')} "
+        f"export #{getattr(entity_chunk, 'ChunkIndex', '?')}"
+    )
+    if start + 4 > class_end:
+        raise ValueError(f"Missing CEntity BufferV2 count in {context}")
+    elementcount = readU32(f)
+    if elementcount > (class_end - f.tell()) // 10:
+        raise ValueError(
+            f"CEntity BufferV2 count {elementcount} cannot fit in {context}"
         )
-        f.seek(class_end)
-        return []
+    elements = []
+    for _ in range(elementcount):
+        element = SEntityBufferType2(CR2WFILE)
+        element.Read(f, 0, class_end=class_end)
+        elements.append(element)
+    return elements
 
 
 class CVariantSizeTypeName():
     def __init__(self, CR2WFILE):
         self.CR2WFILE = CR2WFILE
         self.PROP = False
-    def Read(self, f, size):
-        varsize = readU32(f)#file.ReadUInt32();
-        self.classEnd = varsize
-        buffer = f.read(varsize - 4)#file.ReadBytes((int)varsize - 4);
+    def Read(self, f, size=0, class_end=None):
+        block_start = f.tell()
+        limit = FileSize(f) if class_end is None else int(class_end)
+        if block_start + 4 > limit:
+            raise ValueError("Truncated CEntity override value header")
+        varsize = readU32(f)
+        if varsize < 8:
+            raise ValueError(f"Invalid CEntity override value size {varsize}")
+        block_end = block_start + varsize
+        if block_end > limit:
+            raise ValueError(
+                f"CEntity override value ends at 0x{block_end:X}, past 0x{limit:X}"
+            )
+        inner_size = varsize - 4
+        self.classEnd = inner_size
+        buffer = f.read(inner_size)
+        if len(buffer) != inner_size:
+            raise EOFError("Truncated CEntity override value")
         br = bReadStream(buffer)
         typeId = readUShort(br)
         nameId = readUShort(br)
@@ -2065,13 +2131,20 @@ class CVariantSizeTypeName():
         if (nameId == 0):
             return
 
+        if typeId >= len(self.CR2WFILE.CNAMES) or nameId >= len(self.CR2WFILE.CNAMES):
+            raise ValueError(
+                f"Invalid CEntity override CName indices {typeId}/{nameId}"
+            )
+
         typename = self.CR2WFILE.CNAMES[typeId].name.value
         varname = self.CR2WFILE.CNAMES[nameId].name.value
         propstart = PROPSTART_BLANK()
-        propstart.size = varsize
+        propstart.size = inner_size
         propstart.name = varname
         propstart.type = typename
         self.PROP = PROPERTY(br, self.CR2WFILE, self, False, propstart)
+        if br.tell() > inner_size:
+            raise ValueError("CEntity override value was over-read")
 
 class CBufferUInt32():
     def __init__(self, CR2WFILE, buffer_type):
@@ -2309,12 +2382,12 @@ class W_CLASS:
             # for idx in range(0, CR2WFILE.maxExport):
             #     if parent.exports[idx] == f.tell():
             #         break
-        startofthis = f.tell() - 1 # -1 for zero read before start
-        if is_old_version(CR2WFILE.HEADER.version):
-            startofthis = f.tell()
+        export_index = idx
+        export = CR2WFILE.CR2WExport[export_index]
+        startofthis = CR2WFILE.start + export.dataOffset
         currentClass = CR2WFILE.CR2WExport[idx].name
         CR2WFILE.currentExport = idx
-        self.classEnd = startofthis + CR2WFILE.CR2WExport[idx].dataSize;#local uint64
+        self.classEnd = startofthis + export.dataSize
         self.PROPS = []
         self.propCount  = 0; # local uint
         self.name = CR2WFILE.CR2WExport[idx].name; #local string
@@ -2570,65 +2643,38 @@ class W_CLASS:
                         self.isCreatedFromTemplate = False
                         self.Template = self.GetVariableByName('template')
                         #self.Transform = self.GetVariableByName('transform').EngineTransform
-                        if self.Template and self.Template.Handles and self.Template.Handles[0].DepotPath:
-                            self.isCreatedFromTemplate = True
+                        self.isCreatedFromTemplate = _entity_has_template(self.Template)
                         self.Components = []
                         entity_tail_start = f.tell()
-                        if self.isCreatedFromTemplate:
-                            f.seek(min(entity_tail_start + 10, self.classEnd))
-                        size = self.classEnd - startofthis
-                        endPos = f.tell()
-                        bytesleft = size - (endPos - startofthis)
+                        entity_payload_pos = _entity_payload_start(
+                            f,
+                            CR2WFILE,
+                            self,
+                            entity_tail_start,
+                            self.classEnd,
+                        )
                         log.debug(self.name)
-                        if (not self.isCreatedFromTemplate):
-                            if bytesleft > 0:
-                                prefer_direct_components = self.GetVariableByName('streamingDataBuffer') is not None
-                                self.Components = _read_entity_components_safe(
-                                    f,
-                                    CR2WFILE,
-                                    self,
-                                    entity_tail_start,
-                                    self.classEnd,
-                                    prefer_direct=prefer_direct_components,
-                                )
-
-
-                        endPos = f.tell()
-                        bytesleft = size - (endPos - startofthis)
-                        self.BufferV1 = []
-
-                        if (bytesleft > 0):
-                            idx = 0
-                            canRead = True
-
-                            while canRead:
-                                t_buffer = SEntityBufferType1(CR2WFILE, self.BufferV1, str(idx))
-                                canRead = t_buffer.CanRead(CR2WFILE, f)
-                                if canRead:
-                                    t_buffer.Read(f, 0)
-                                    self.BufferV1.append(t_buffer)
-                                    idx+=1
-                        else:
-                            _log_optional_centity_buffer_skip(
+                        if not self.isCreatedFromTemplate:
+                            self.Components = _read_entity_components_from_payload(
+                                f,
                                 CR2WFILE,
-                                parent=self,
-                                buffer_name="BufferV1",
-                                offset=f.tell(),
+                                self,
+                                entity_payload_pos,
+                                self.classEnd,
                             )
 
-                        endPos = f.tell()
-                        bytesleft = size - (endPos - startofthis)
+                        version = getattr(CR2WFILE.HEADER, "version", 999)
+                        self.BufferV1 = []
+                        if version >= 131:
+                            self.BufferV1 = _read_entity_buffer_v1_safe(
+                                f, CR2WFILE, self, self.classEnd
+                            )
+
                         self.BufferV2 = False
-                        if (self.isCreatedFromTemplate):
-                            if (bytesleft > 0):
-                                self.BufferV2 = _read_entity_buffer_v2_safe(f, CR2WFILE, self, self.classEnd)
-                            else:
-                                _log_optional_centity_buffer_skip(
-                                    CR2WFILE,
-                                    parent=self,
-                                    buffer_name="BufferV2",
-                                    offset=f.tell(),
-                                )
+                        if self.isCreatedFromTemplate and version >= 149:
+                            self.BufferV2 = _read_entity_buffer_v2_safe(
+                                f, CR2WFILE, self, self.classEnd
+                            )
                     if self.name == "CSkeletalAnimation":
                         # For uncooked animations, the animation data is embedded directly
                         # after the properties, before classEnd
@@ -2652,26 +2698,29 @@ class W_CLASS:
                                     bonecount = 0
                                 break
                         bytesleft = max(0, self.classEnd - f.tell())
+                        has_dyng_fallback = any(
+                            getattr(export, "name", "") == "CDyngResource"
+                            for export in getattr(CR2WFILE, "CR2WExport", ())
+                        )
                         if bonecount > 0 and bytesleft >= bonecount * 48:
                             self.rigData = CCompressedBuffer(f, CR2WFILE, self, Name = "rigData")
                             try:
                                 self.rigData.Read(f, bonecount * 48, bonecount)
                             except Exception as exc:
-                                log.warning(
-                                    "Failed to read CSkeleton rigData for %s; using parsed skeleton properties only: %s",
-                                    getattr(CR2WFILE, "fileName", ""),
-                                    exc,
-                                )
+                                if not has_dyng_fallback:
+                                    raise ValueError(
+                                        "Failed to read CSkeleton reference pose for "
+                                        f"{getattr(CR2WFILE, 'fileName', '<memory>')}"
+                                    ) from exc
                                 self.rigData = None
                                 f.seek(self.classEnd)
                         else:
                             self.rigData = None
-                            if bonecount > 0:
-                                log.debug(
-                                    "CSkeleton has no cooked rigData payload for %s (bones=%s, bytesleft=%s).",
-                                    getattr(CR2WFILE, "fileName", ""),
-                                    bonecount,
-                                    bytesleft,
+                            if bonecount > 0 and not has_dyng_fallback:
+                                raise ValueError(
+                                    "CSkeleton reference pose is truncated in "
+                                    f"{getattr(CR2WFILE, 'fileName', '<memory>')}: "
+                                    f"expected {bonecount * 48} bytes, found {bytesleft}"
                                 )
                             f.seek(self.classEnd)
                         #f.seek(self.classEnd)
@@ -2702,18 +2751,18 @@ class W_CLASS:
 
                         # #BLOCKDATA
                         self.BlockData = []
-                        idx = 0
+                        object_index = 0
                         for curobj in self.Objects:
                             curoffset = curobj.offset
                             leng = 0 #ulong
-                            if (idx < len(self.Objects) - 1):
-                                nextobj = self.Objects[idx + 1]
+                            if (object_index < len(self.Objects) - 1):
+                                nextobj = self.Objects[object_index + 1]
                                 nextoffset = nextobj.offset; #ulong
                                 leng = nextoffset - curoffset
                             else:
                                 leng = self.blocksize - curoffset
                             self.BlockData.append(SBlockData(f, leng, curobj.type))
-                            idx += 1
+                            object_index += 1
                         # for _ in range(0, count):
                         #     self.BlockData.append(SBlockData(f))
 
@@ -2752,17 +2801,6 @@ class W_CLASS:
                         except Exception as e:
                             log.debug(f'CEntityTemplate: failed to parse byte-array flatCompiledData: {e}')
                             self.flatCompiledData = None
-                        if self.flatCompiledData is None:
-                            current_pos = f.tell()
-                            bytes_remaining = self.classEnd - current_pos
-                            if bytes_remaining > 4:
-                                try:
-                                    embedded_bytes = f.read(bytes_remaining)
-                                    embedded_stream = bReadStream(embedded_bytes, name="<embedded>")
-                                    self.flatCompiledData = getCR2W(embedded_stream)
-                                    log.debug(f'CEntityTemplate: parsed flatCompiledData ({bytes_remaining} bytes, {len(self.flatCompiledData.CHUNKS.CHUNKS)} chunks)')
-                                except Exception as e:
-                                    log.debug(f'CEntityTemplate: failed to parse flatCompiledData: {e}')
                         f.seek(self.classEnd)
                     else:
                         f.seek(self.classEnd)
@@ -2777,7 +2815,7 @@ class W_CLASS:
             dummy = readUByte(f)
         currentClass = tempClass
         #self.refChunk = self
-        self.ChunkIndex = idx
+        self.ChunkIndex = export_index
 
 class CR2WProperty:
     def __init__(self, f = None, **kwargs):
