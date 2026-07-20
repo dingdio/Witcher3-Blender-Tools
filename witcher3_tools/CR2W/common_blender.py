@@ -1085,17 +1085,6 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
     fbx_uncook_path, uncook_path, texture_path, use_separate_texture_path = _get_repo_roots_from_prefs(version)
     redkit_roots = _active_redkit_repo_roots()
 
-    # Check override roots first (read-only depots/workspaces)
-    if _repo_override_roots:
-        if os.path.isabs(filepath):
-            for root in _repo_override_roots:
-                if _is_under_root(filepath, root):
-                    return filepath
-        for root in _repo_override_roots:
-            candidate = os.path.join(root, filepath)
-            if os.path.exists(win_safe_path(candidate)):
-                return candidate
-
     # REDkit dual-depot resolution is intentionally context-bound. It is active
     # only while resolving dependencies of a source file already loaded from a
     # REDkit depot, so normal bundle/uncook imports are not hijacked by REDkit
@@ -1108,6 +1097,16 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
         rk_relpath = filepath.replace("/", "\\").lstrip("\\")
         for root in redkit_roots:
             candidate = os.path.join(root, rk_relpath)
+            if os.path.exists(win_safe_path(candidate)):
+                return candidate
+
+    if _repo_override_roots:
+        if os.path.isabs(filepath):
+            for root in _repo_override_roots:
+                if _is_under_root(filepath, root):
+                    return filepath
+        for root in _repo_override_roots:
+            candidate = os.path.join(root, filepath)
             if os.path.exists(win_safe_path(candidate)):
                 return candidate
 

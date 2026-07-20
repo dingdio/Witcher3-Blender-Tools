@@ -1,4 +1,5 @@
 import json
+import math
 import struct
 
 from .bin_helpers import getString, readString
@@ -534,11 +535,70 @@ def create_Skeleton_w2_uncooked(file_data, rigFile):
     return this_skeleton
 
 
+def _quaternion_from_dyng_transform(transform):
+    rotation = [[float(transform[row][column]) for column in range(3)] for row in range(3)]
+    trace = rotation[0][0] + rotation[1][1] + rotation[2][2]
+    if trace > 0.0:
+        root = math.sqrt(trace + 1.0)
+        scale = 0.5 / root
+        x = (rotation[2][1] - rotation[1][2]) * scale
+        y = (rotation[0][2] - rotation[2][0]) * scale
+        z = (rotation[1][0] - rotation[0][1]) * scale
+        w = 0.5 * root
+    else:
+        next_axis = (1, 2, 0)
+        axis = max(range(3), key=lambda idx: rotation[idx][idx])
+        second = next_axis[axis]
+        third = next_axis[second]
+        root = math.sqrt(max(
+            0.0,
+            rotation[axis][axis] - rotation[second][second] - rotation[third][third] + 1.0,
+        ))
+        if root <= 1e-12:
+            return w3_types.Quaternion(0.0, 0.0, 0.0, 1.0)
+        scale = 0.5 / root
+        values = [0.0, 0.0, 0.0, 0.0]
+        values[axis] = 0.5 * root
+        values[3] = (rotation[third][second] - rotation[second][third]) * scale
+        values[second] = (rotation[second][axis] + rotation[axis][second]) * scale
+        values[third] = (rotation[third][axis] + rotation[axis][third]) * scale
+        x, y, z, w = values
+
+    # Match REDengine's post-conversion sign convention.
+    return w3_types.Quaternion(-x, -y, -z, w)
+
+
+def _skeleton_from_dyng_resource(resource, tracks=()):
+    nodes = list(resource.nodes)
+    names = [node.name for node in nodes]
+    indices = {}
+    for idx, name in enumerate(names):
+        indices.setdefault(name, idx)
+    return w3_types.w2rig(
+        nbBones=len(nodes),
+        names=names,
+        tracks=list(tracks or ()),
+        parentIdx=[indices.get(node.parent, -1) for node in nodes],
+        positions=[w3_types.Vector3D(*node.transform[3][:3]) for node in nodes],
+        rotations=[_quaternion_from_dyng_transform(node.transform) for node in nodes],
+        scales=[w3_types.Vector3D(1.0, 1.0, 1.0) for _node in nodes],
+    )
+
+
 def create_Skeleton(file):
-    for chunk in file.CHUNKS.CHUNKS:
-        if chunk.name == "CSkeleton":
-            skelly = read_skelly(chunk)
-            break
+    chunks = file.CHUNKS.CHUNKS
+    skeleton_chunk = next((chunk for chunk in chunks if chunk.name == "CSkeleton"), None)
+    if skeleton_chunk is None:
+        raise ValueError("No CSkeleton chunk found")
+
+    skelly = read_skelly(skeleton_chunk)
+    rig_data = getattr(getattr(skeleton_chunk, "rigData", None), "rigData", []) or []
+    if not rig_data:
+        dyng_chunk = next((chunk for chunk in chunks if chunk.name == "CDyngResource"), None)
+        if dyng_chunk is not None:
+            from ..physics.dyng import parse_dyng_chunk
+
+            return _skeleton_from_dyng_resource(parse_dyng_chunk(dyng_chunk), skelly.tracks)
     return skelly
 
 def load_bin_face(fileName) -> w3_types.CMimicFace:

@@ -161,6 +161,7 @@ assert _scene_data_signature() == before_addon_import, (
 )
 
 from witcher3_tools.cloth import geometry_nodes, import_state, importer
+from witcher3_tools.importers import import_entity
 
 assert _scene_data_signature() == before_addon_import, (
     "Importing cloth Geometry Nodes/state/importer modules mutated existing Blender scene data"
@@ -193,7 +194,7 @@ def test_collision_proxy_evaluated_geometry():
         [(2.0, 0.0, 0.0), (3.0, 0.0, 0.0), (2.0, 1.0, 0.0)],
         [(0, 1, 2)],
     )
-    parent = bpy.data.objects.new("W3TB_APXProxyParent", None)
+    parent = bpy.data.objects.new("W3TB:Collision Connections", None)
     bpy.context.scene.collection.objects.link(parent)
 
     proxy = geometry_nodes.create_collision_proxy_object(
@@ -230,6 +231,16 @@ def test_collision_proxy_evaluated_geometry():
         for node in object_info_nodes
     } == {source_a, source_b}
 
+    importer._parent_and_namespace_collision_objects("W3TB", parent, [source_a, source_b])
+    assert all(bool(source.get("witcher_apx_collision_proxy", False)) for source in (source_a, source_b))
+    import_entity._set_redcloth_collision_helper_visibility(parent, True)
+    assert parent.hide_get()
+    assert parent.hide_render
+    assert proxy.hide_get()
+    assert all(source.hide_get() for source in (source_a, source_b))
+    assert all(source.hide_render for source in (source_a, source_b))
+    assert all(source.display_type == 'SOLID' for source in (source_a, source_b))
+
     bpy.context.view_layer.update()
     depsgraph = bpy.context.evaluated_depsgraph_get()
     evaluated_proxy = proxy.evaluated_get(depsgraph)
@@ -240,10 +251,23 @@ def test_collision_proxy_evaluated_geometry():
     finally:
         evaluated_proxy.to_mesh_clear()
 
-    importer._parent_and_namespace_collision_objects("W3TB", parent, [source_a, source_b])
-    assert all(source.hide_render for source in (source_a, source_b))
-    assert all(source.display_type == 'SOLID' for source in (source_a, source_b))
     return proxy, source_a, source_b
+
+
+def test_collision_helpers_skip_appearance_visibility_drivers(proxy):
+    calls = []
+    original_ensure_driver = import_entity._ensure_app_visibility_driver
+    import_entity._ensure_app_visibility_driver = (
+        lambda _armature, _obj, prop_name, _expression: calls.append(prop_name)
+    )
+    try:
+        import_entity.create_app_drivers(None, proxy, [0])
+    finally:
+        import_entity._ensure_app_visibility_driver = original_ensure_driver
+
+    assert calls == []
+    assert proxy.hide_render
+    assert proxy.hide_get()
 
 
 def test_nested_collider_rewire_is_idempotent(proxy_objects):
@@ -589,6 +613,7 @@ def test_import_cloth_backend_failure_rolls_back_exactly():
 
 
 proxy, source_a, source_b = test_collision_proxy_evaluated_geometry()
+test_collision_helpers_skip_appearance_visibility_drivers(proxy)
 test_nested_collider_rewire_is_idempotent({
     "spheres": proxy,
     "connections": source_a,

@@ -4433,6 +4433,7 @@ _IMPORT_ORIGIN_PROPS = {
     "equip_template": "witcher_equip_template",
     "item_appearance": "witcher_item_appearance",
     "owner_entity_path": "witcher_owner_entity_path",
+    "mesh_file": "witcher_resolved_mesh_path",
 }
 
 _IMPORT_ORIGIN_LABELS = {
@@ -4444,6 +4445,7 @@ _IMPORT_ORIGIN_LABELS = {
     "equip_template": "Equip Template",
     "item_appearance": "Item Appearance",
     "owner_entity_path": "Owner Entity",
+    "mesh_file": "Mesh File",
 }
 
 _ORIGIN_DISPLAY_NAMES = {
@@ -4483,6 +4485,12 @@ def _draw_import_source_section(layout, context, obj):
         label = _IMPORT_ORIGIN_LABELS.get(key, key)
         if key == "origin":
             value = _ORIGIN_DISPLAY_NAMES.get(value, value)
+        if key == "mesh_file":
+            for source in (obj, getattr(obj, "parent", None)):
+                if source is not None and _IMPORT_ORIGIN_PROPS[key] in source:
+                    col.prop(source, f'["{_IMPORT_ORIGIN_PROPS[key]}"]', text=label)
+                    break
+            continue
         col.label(text=f"{label}: {value}")
 
 

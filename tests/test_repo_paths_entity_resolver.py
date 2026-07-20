@@ -4,6 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -199,6 +200,29 @@ class EntityPathResolverTests(unittest.TestCase):
         self.assertEqual(with_parents[0], repo_root)
         self.assertIn(asset_dir, with_parents)
         self.assertEqual(len(with_parents), len({os.path.normcase(path) for path in with_parents}))
+
+    def test_active_redkit_depots_win_over_workspace_override(self):
+        from witcher3_tools.CR2W import common_blender
+
+        repo_path = r"characters\models\main_npc\ciri\model\body_01_wa__ciri.w2mesh"
+        with tempfile.TemporaryDirectory() as root:
+            workspace = os.path.join(root, "workspace")
+            depot = os.path.join(root, "r4data")
+            uncooked = os.path.join(root, "redkit")
+            workspace_copy = _touch(workspace, repo_path)
+            uncooked_copy = _touch(uncooked, repo_path)
+            common_blender.set_repo_override_roots([workspace], read_only=True)
+            try:
+                with (
+                    mock.patch.object(common_blender, "_get_repo_roots_from_prefs", return_value=("", "", "", False)),
+                    common_blender.redkit_repo_context(roots=[depot, uncooked]),
+                ):
+                    resolved = common_blender.repo_file(repo_path)
+            finally:
+                common_blender.clear_repo_override_roots()
+
+        self.assertNotEqual(resolved, workspace_copy)
+        self.assertEqual(resolved, uncooked_copy)
 
 
 if __name__ == "__main__":

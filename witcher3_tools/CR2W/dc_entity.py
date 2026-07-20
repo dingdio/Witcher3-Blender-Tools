@@ -62,6 +62,16 @@ def clear_template_cache():
     _template_file_cache.clear()
 
 
+def _flat_compiled_file(cr2w_file):
+    for chunk in getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or []:
+        if getattr(chunk, "Type", None) != "CEntityTemplate":
+            continue
+        flat = getattr(chunk, "flatCompiledData", None)
+        if getattr(getattr(flat, "CHUNKS", None), "CHUNKS", None):
+            return flat
+    return None
+
+
 def _repo_path_key(path: str) -> str:
     return str(path or "").replace("/", "\\").strip().lower()
 
@@ -1441,8 +1451,10 @@ def read_entity_template_appearance_metadata(template_filename: str):
     try:
         all_names = []
         used_names = []
+        root_used_names = []
         all_seen = set()
         used_seen = set()
+        root_used_seen = set()
         has_armature_root = False
         has_inventory_entries = False
 
@@ -1454,6 +1466,28 @@ def read_entity_template_appearance_metadata(template_filename: str):
                 files_to_scan.extend(related_file for _depot_path, _full_path, related_file in related_files)
             except Exception:
                 log.debug("Failed to scan related Witcher 2 metadata for %s", resolved_path, exc_info=True)
+        else:
+            seen_paths = {os.path.normcase(os.path.normpath(resolved_path))}
+            with redkit_repo_context(resolved_path):
+                for source_file in files_to_scan:
+                    for chunk in getattr(getattr(source_file, "CHUNKS", None), "CHUNKS", None) or []:
+                        if getattr(chunk, "Type", None) != "CEntityTemplate":
+                            continue
+                        for depot_path in _resolve_repo_paths_from_array(chunk, "includes", ".w2ent"):
+                            try:
+                                include_path = materialize_entity_repo_path(
+                                    depot_path,
+                                    version=getattr(getattr(source_file, "HEADER", None), "version", 999),
+                                )
+                                if not include_path or not os.path.exists(include_path):
+                                    continue
+                                norm_include_path = os.path.normcase(os.path.normpath(include_path))
+                                if norm_include_path in seen_paths:
+                                    continue
+                                seen_paths.add(norm_include_path)
+                                files_to_scan.append(read_CR2W(include_path))
+                            except Exception:
+                                log.debug("Failed to scan included entity metadata for %s", depot_path, exc_info=True)
 
         for source_file in files_to_scan:
             for chunk in getattr(getattr(source_file, "CHUNKS", None), "CHUNKS", None) or []:
@@ -1467,6 +1501,8 @@ def read_entity_template_appearance_metadata(template_filename: str):
                     if used_prop:
                         for name in _extract_cname_array_values(used_prop):
                             _append_name(used_names, used_seen, name)
+                            if source_file is cr2w_file:
+                                _append_name(root_used_names, root_used_seen, name)
 
                     appearances_prop = chunk.GetVariableByName("appearances")
                     for appearance in _iter_struct_items(appearances_prop):
@@ -1484,6 +1520,8 @@ def read_entity_template_appearance_metadata(template_filename: str):
                     name = _prop_to_string(_find_prop_by_name(appearance, "name"))
                     _append_name(all_names, all_seen, name)
 
+        if root_used_names:
+            used_names = root_used_names
         all_keys = {name.lower() for name in all_names}
         used_names = [name for name in used_names if name.lower() in all_keys]
         return {
@@ -1606,6 +1644,29 @@ def _fx_spawner_name(track_item, chunks_by_index) -> str:
     return values[0] if values else ""
 
 
+def _effect_from_definition(definition, particle_items, chunks_by_index, effect_name="") -> dict:
+    parsed_name = _chunk_prop_string(definition, "name", default="") if definition else ""
+    result = {
+        "name": str(effect_name or parsed_name or "").strip(),
+        "length": float(_chunk_prop_scalar(definition, "length", default=0.0) or 0.0) if definition else 0.0,
+        "loop_start": float(_chunk_prop_scalar(definition, "loopStart", default=0.0) or 0.0) if definition else 0.0,
+        "loop_end": float(_chunk_prop_scalar(definition, "loopEnd", default=0.0) or 0.0) if definition else 0.0,
+        "is_looped": bool(_chunk_prop_bool(definition, "isLooped", default=False)) if definition else False,
+        "particle_systems": [],
+    }
+    for item in particle_items:
+        particle_path = _soft_handle_path(_find_prop_by_name(item, "particleSystem"))
+        if not particle_path:
+            continue
+        result["particle_systems"].append({
+            "path": particle_path,
+            "slot": _fx_spawner_name(item, chunks_by_index),
+            "time_begin": float(_chunk_prop_scalar(item, "timeBegin", default=0.0) or 0.0),
+            "duration": float(_chunk_prop_scalar(item, "timeDuration", default=0.0) or 0.0),
+        })
+    return result
+
+
 def _parse_cooked_effect_buffer(buffer_prop, effect_name="") -> dict:
     buffer_data = getattr(buffer_prop, "Bufferdata", None)
     buffer_bytes = getattr(buffer_data, "Bytes", None)
@@ -1616,31 +1677,34 @@ def _parse_cooked_effect_buffer(buffer_prop, effect_name="") -> dict:
     chunks = list(getattr(getattr(effect_file, "CHUNKS", None), "CHUNKS", None) or [])
     chunks_by_index = {getattr(chunk, "ChunkIndex", -1): chunk for chunk in chunks}
     definition = next((chunk for chunk in chunks if getattr(chunk, "Type", "") == "CFXDefinition"), None)
+    particle_items = [chunk for chunk in chunks if getattr(chunk, "Type", "") == "CFXTrackItemParticles"]
+    return _effect_from_definition(definition, particle_items, chunks_by_index, effect_name)
 
-    parsed_name = _chunk_prop_string(definition, "name", default="") if definition else ""
-    result = {
-        "name": str(effect_name or parsed_name or "").strip(),
-        "length": float(_chunk_prop_scalar(definition, "length", default=0.0) or 0.0) if definition else 0.0,
-        "loop_start": float(_chunk_prop_scalar(definition, "loopStart", default=0.0) or 0.0) if definition else 0.0,
-        "loop_end": float(_chunk_prop_scalar(definition, "loopEnd", default=0.0) or 0.0) if definition else 0.0,
-        "is_looped": bool(_chunk_prop_bool(definition, "isLooped", default=False)) if definition else False,
-        "particle_systems": [],
-    }
 
-    for chunk in chunks:
-        if getattr(chunk, "Type", "") != "CFXTrackItemParticles":
+def _extract_uncooked_entity_effects(template_chunk, chunks) -> list[dict]:
+    chunks_by_index = {getattr(chunk, "ChunkIndex", -1): chunk for chunk in chunks}
+
+    def _referenced(container, prop_name):
+        return [
+            chunk
+            for ptr in _prop_handle_list(_find_prop_by_name(container, prop_name))
+            if (chunk := chunks_by_index.get(ptr - 1)) is not None
+        ]
+
+    results = []
+    for definition in _referenced(template_chunk, "effects"):
+        if getattr(definition, "Type", "") != "CFXDefinition":
             continue
-        particle_prop = _find_prop_by_name(chunk, "particleSystem")
-        particle_path = _soft_handle_path(particle_prop)
-        if not particle_path:
-            continue
-        result["particle_systems"].append({
-            "path": particle_path,
-            "slot": _fx_spawner_name(chunk, chunks_by_index),
-            "time_begin": float(_chunk_prop_scalar(chunk, "timeBegin", default=0.0) or 0.0),
-            "duration": float(_chunk_prop_scalar(chunk, "timeDuration", default=0.0) or 0.0),
-        })
-    return result
+        particle_items = []
+        for group in _referenced(definition, "trackGroups"):
+            for track in _referenced(group, "tracks"):
+                particle_items.extend(
+                    item
+                    for item in _referenced(track, "trackItems")
+                    if getattr(item, "Type", "") == "CFXTrackItemParticles"
+                )
+        results.append(_effect_from_definition(definition, particle_items, chunks_by_index))
+    return results
 
 
 def _extract_cooked_entity_effects(template_chunk) -> list[dict]:
@@ -2820,14 +2884,9 @@ def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:
     cr2w_file = read_CR2W(fileNameFull)
     is_w2_entity = getattr(getattr(cr2w_file, "HEADER", None), "version", 999) <= 115
     parsed_entity = None
-    has_mesh = False
     if not is_w2_entity:
         with redkit_repo_context(fileNameFull):
             parsed_mesh, parsed_entity = ReadTemplate(cr2w_file, new_mesh)
-        has_mesh = any(getattr(c, "mesh", None) for c in getattr(parsed_mesh, "chunks", []))
-        if has_mesh:
-            _template_file_cache[cache_key] = (parsed_mesh, parsed_entity)
-            return copy.deepcopy(_template_file_cache[cache_key])
     else:
         parsed_mesh = new_mesh
 
@@ -2836,7 +2895,7 @@ def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:
     full_mesh = getattr(full_entity, "staticMeshes", None)
     if full_mesh and getattr(full_mesh, "chunks", None):
         has_full_mesh = any(getattr(c, "mesh", None) for c in full_mesh.chunks)
-        if has_full_mesh or getattr(full_entity, "appearances", None):
+        if not is_w2_entity or has_full_mesh or getattr(full_entity, "appearances", None):
             full_mesh.templateFilename = templateFilename
             full_mesh.ns = Path(templateFilename).stem
             _template_file_cache[cache_key] = (full_mesh, full_entity)
@@ -2846,7 +2905,7 @@ def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:
         parsed_mesh.ns = Path(templateFilename).stem
         _template_file_cache[cache_key] = (parsed_mesh, full_entity)
         return copy.deepcopy(_template_file_cache[cache_key])
-    if has_mesh:
+    if not is_w2_entity and any(getattr(c, "mesh", None) for c in getattr(parsed_mesh, "chunks", [])):
         _template_file_cache[cache_key] = (parsed_mesh, parsed_entity or full_entity)
         return copy.deepcopy(_template_file_cache[cache_key])
     _template_file_cache[cache_key] = (parsed_mesh, full_entity if is_w2_entity else parsed_entity)
@@ -2855,6 +2914,26 @@ def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:
 def create_CEntity(file, _inherit_visited=None):
     hasCMovingPhysicalAgentComponent = False
     CHUNKS = file.CHUNKS.CHUNKS
+    flat_compiled_file = _flat_compiled_file(file) if file.HEADER.version > 115 else None
+    if flat_compiled_file is not None:
+        has_external_proxies = any(
+            getattr(chunk, "Type", None) in {"CExternalProxyComponent", "CExternalProxyAttachment"}
+            for chunk in CHUNKS
+        )
+        has_resolved_components = any(
+            getattr(chunk, "Type", None) in {
+                "CAnimatedComponent",
+                "CMeshComponent",
+                "CStaticMeshComponent",
+                "CRigidMeshComponent",
+                "CClothComponent",
+                "CAnimDangleComponent",
+                "CMovingPhysicalAgentComponent",
+            }
+            for chunk in CHUNKS
+        )
+        if not has_external_proxies and has_resolved_components:
+            flat_compiled_file = None
     this_Entity = w3_types.Entity()
     this_Entity.name = Path(file.fileName).stem
     this_Entity.version = getattr(getattr(file, "HEADER", None), "version", 999)
@@ -3480,6 +3559,45 @@ def create_CEntity(file, _inherit_visited=None):
                 this_Entity.coloringEntries.append(inherited_entry)
                 existing_keys.add(key)
 
+    def _merge_inherited_slots_inventory_and_effects():
+        if file.HEADER.version <= 115 or not top_level_template_includes:
+            return
+
+        slot_names = {
+            str(getattr(slot, "name", "") or "").lower()
+            for slot in this_Entity.slots
+            if getattr(slot, "name", None)
+        }
+        effect_names = {
+            str(effect.get("name", "") or "").lower()
+            for effect in this_Entity.cookedEffects
+            if effect.get("name")
+        }
+        for _depot_path, include_entity in _iter_top_level_included_entities():
+            for inherited_slot in getattr(include_entity, "slots", None) or []:
+                slot_name = str(getattr(inherited_slot, "name", "") or "").lower()
+                if slot_name and slot_name in slot_names:
+                    continue
+                this_Entity.slots.append(copy.deepcopy(inherited_slot))
+                if slot_name:
+                    slot_names.add(slot_name)
+
+            inherited_defs = getattr(include_entity, "inventoryDefinitions", None) or []
+            if inherited_defs:
+                current_defs = getattr(this_Entity, "inventoryDefinitions", None) or []
+                this_Entity.inventoryDefinitions = _merge_related_inventory_definitions(
+                    current_defs,
+                    inherited_defs,
+                )
+
+            for inherited_effect in getattr(include_entity, "cookedEffects", None) or []:
+                effect_name = str(inherited_effect.get("name", "") or "").lower()
+                if effect_name and effect_name in effect_names:
+                    continue
+                this_Entity.cookedEffects.append(copy.deepcopy(inherited_effect))
+                if effect_name:
+                    effect_names.add(effect_name)
+
     def _anim_param_signature(param):
         if isinstance(param, dict):
             name = str(param.get("name", "") or "")
@@ -3878,7 +3996,10 @@ def create_CEntity(file, _inherit_visited=None):
             this_Entity.isLightOn = _chunk_prop_bool(chunk, "isLightOn", default=None)
         if chunk.Type != "CEntityTemplate":
             continue
-        for effect in _extract_cooked_entity_effects(chunk):
+        for effect in (
+            _extract_cooked_entity_effects(chunk)
+            + _extract_uncooked_entity_effects(chunk, CHUNKS)
+        ):
             particle_paths = tuple(
                 str(item.get("path", "") or "").lower()
                 for item in effect.get("particle_systems", [])
@@ -4421,148 +4542,19 @@ def create_CEntity(file, _inherit_visited=None):
             for head_chunk in _build_w2_head_chunks(CHUNKS, head_name):
                 _append_unique_generated_chunk(head_chunk)
 
-    # Process flatCompiledData sub-CR2W chunks (cooked entity files).
-    # Cooked .w2ent files store mesh components in an embedded sub-CR2W
-    # (flatCompiledData on CEntityTemplate), parsed by CR2W_types.
-    for chunk in CHUNKS:
-        if chunk.Type == "CEntityTemplate" and hasattr(chunk, "flatCompiledData") and chunk.flatCompiledData is not None:
-            sub_chunks = chunk.flatCompiledData.CHUNKS.CHUNKS
-            for sub_chunk in sub_chunks:
-                try:
-                    if sub_chunk.Type == "CStaticMeshComponent":
-                        # Uncooked redkit *_dialogue.w2ent items (e.g. weapon
-                        # preview entities) wrap a CStaticMeshComponent inside
-                        # flatCompiledData with no top-level Components and no
-                        # appearances.  Without this branch the mesh chunk is
-                        # silently dropped and import_ent_template returns None.
-                        mesh_component = CStaticMeshComponent(sub_chunk).convert_for_io()
-                        mesh_component.mesh = _resolve_mesh_path(sub_chunk, mesh_component.mesh)
-                        if not mesh_component.mesh:
-                            mesh_component.mesh = _next_mesh_import_path()
-                        if mesh_component.mesh and mesh_component.mesh not in seen_streamed_mesh_paths:
-                            _append_unique_chunk(sub_chunk, mesh_component)
-                        elif not mesh_component.mesh:
-                            log.warning(
-                                f"Skipping flatCompiledData CStaticMeshComponent with invalid mesh ref: {sub_chunk.ChunkIndex}; "
-                                f"props={_chunk_props_summary(sub_chunk)}"
-                            )
-                    elif sub_chunk.Type in ("CMeshComponent", "CDressMeshComponent"):
-                        mesh_component = _coerce_w2_mesh_component_for_io(sub_chunk, CMeshComponent(sub_chunk).convert_for_io())
-                        mesh_component.mesh = _resolve_mesh_path(sub_chunk, mesh_component.mesh)
-                        if not mesh_component.mesh:
-                            mesh_component.mesh = _next_mesh_import_path()
-                        if mesh_component.mesh and mesh_component.mesh not in seen_streamed_mesh_paths:
-                            _append_unique_chunk(sub_chunk, mesh_component)
-                        elif not mesh_component.mesh:
-                            log.warning(
-                                f"Skipping flatCompiledData CMeshComponent with invalid mesh ref: {sub_chunk.ChunkIndex}; "
-                                f"props={_chunk_props_summary(sub_chunk)}"
-                            )
-                    elif sub_chunk.Type == "CRigidMeshComponent" or sub_chunk.Type == "CRagdollMeshComponent":
-                        mesh_component = CMeshComponent(sub_chunk).convert_for_io()
-                        mesh_component.mesh = _resolve_mesh_path(sub_chunk, mesh_component.mesh)
-                        if not mesh_component.mesh:
-                            mesh_component.mesh = _next_mesh_import_path()
-                        if mesh_component.mesh:
-                            _append_unique_chunk(sub_chunk, mesh_component)
-                        else:
-                            log.warning(
-                                f"Skipping flatCompiledData {sub_chunk.Type} with invalid mesh ref: {sub_chunk.ChunkIndex}; "
-                                f"props={_chunk_props_summary(sub_chunk)}"
-                            )
-                    elif sub_chunk.Type == "CFurComponent" and sub_chunk.GetVariableByName("mesh"):
-                        fur_component = CMeshComponent(sub_chunk).convert_for_io()
-                        fur_component.mesh = _resolve_mesh_path(sub_chunk, fur_component.mesh)
-                        if not fur_component.mesh:
-                            fur_component.mesh = _next_mesh_import_path()
-                        if fur_component.mesh:
-                            _append_unique_chunk(sub_chunk, fur_component)
-                        else:
-                            log.warning(
-                                f"Skipping flatCompiledData CFurComponent with invalid mesh ref: {sub_chunk.ChunkIndex}; "
-                                f"props={_chunk_props_summary(sub_chunk)}"
-                            )
-                    elif sub_chunk.Type == "CClothComponent" and sub_chunk.GetVariableByName("resource"):
-                        cloth = sub_chunk.GetVariableByName("resource").ToString()
-                        _cname_prop = sub_chunk.GetVariableByName("name")
-                        _cname = str(_prop_to_string(_cname_prop) or "").strip()
-                        chunk_append(new_mesh, sub_chunk, CClothComponent(cloth, name=_cname))
-                    elif sub_chunk.Type == "CAnimDangleBufferComponent" and sub_chunk.GetVariableByName("skeleton"):
-                        name = sub_chunk.GetVariableByName("name").ToString()
-                        skeleton = _resolve_repo_path(sub_chunk, "skeleton", ".w2rig")
-                        chunk_append(new_mesh, sub_chunk, CAnimDangleBufferComponent(name, skeleton))
-                    elif sub_chunk.Type == "CAnimatedComponent":
-                        animated_component = CAnimatedComponent(sub_chunk).convert_for_io()
-                        name = sub_chunk.GetVariableByName("name").ToString()
-                        skeleton = _resolve_repo_path(sub_chunk, "skeleton", ".w2rig")
-                        animation_sets = _resolve_repo_paths_from_array(sub_chunk, "animationSets", ".w2anims")
-                        if not skeleton:
-                            rig_paths = _collect_rig_import_paths(file)
-                            if rig_paths:
-                                skeleton = rig_paths[0]
-                                log.debug(
-                                    f"CAnimatedComponent #{sub_chunk.ChunkIndex} has no skeleton "
-                                    f"property; using import-table fallback: {skeleton}"
-                                )
-                        animated_component.name = name or animated_component.name
-                        animated_component.skeleton = skeleton
-                        animated_component.animationSets = animation_sets
-                        _append_unique_animated_chunk(sub_chunk, animated_component)
-                    elif sub_chunk.Type == "CPointLightComponent":
-                        _append_unique_light_chunk(sub_chunk, CPointLightComponent(sub_chunk).convert_for_io())
-                    elif sub_chunk.Type == "CSpotLightComponent":
-                        _append_unique_light_chunk(sub_chunk, CSpotLightComponent(sub_chunk).convert_for_io())
-                    elif sub_chunk.Type in _STREAMED_ITEM_CHUNK_TYPES or sub_chunk.Type == "CEntity":
-                        # Item entities (Crossbow, CWitcherSword, ...) and uncooked-redkit
-                        # *_dialogue.w2ent preview entities (a generic CEntity wrapper) both
-                        # park their visual components inside a SharedDataBuffer
-                        # (streamingDataBuffer) rather than as direct sub-chunks.  Parse the
-                        # buffer and pull out every recognized mesh component type.
-                        sdb_var = sub_chunk.GetVariableByName("streamingDataBuffer")
-                        if not sdb_var:
-                            log.debug(
-                                "flatCompiledData %s #%s: GetVariableByName('streamingDataBuffer') "
-                                "returned None (PROPS=%s); mesh sourced from main CR2W entity chunk.",
-                                sub_chunk.Type, sub_chunk.ChunkIndex,
-                                _chunk_props_summary(sub_chunk),
-                            )
-                        if sdb_var and hasattr(sdb_var, "Bufferdata") and hasattr(sdb_var.Bufferdata, "Bytes"):
-                            try:
-                                buf_stream = bReadStream(sdb_var.Bufferdata.Bytes, name="streamingDataBuffer")
-                                buf_cr2w = getCR2W(buf_stream)
-                                for buf_chunk in buf_cr2w.CHUNKS.CHUNKS:
-                                    if buf_chunk.Type == "CStaticMeshComponent":
-                                        component = CStaticMeshComponent(buf_chunk).convert_for_io()
-                                    elif buf_chunk.Type == "CMeshComponent":
-                                        component = CMeshComponent(buf_chunk).convert_for_io()
-                                    elif buf_chunk.Type in ("CRigidMeshComponent", "CRagdollMeshComponent"):
-                                        component = CMeshComponent(buf_chunk).convert_for_io()
-                                    else:
-                                        continue
-                                    component.mesh = _resolve_mesh_path(buf_chunk, component.mesh)
-                                    if not component.mesh:
-                                        component.mesh = _next_mesh_import_path()
-                                    if _register_streamed_slot_mesh(component, buf_chunk.Type):
-                                        continue
-                                    if component.mesh and component.mesh not in seen_streamed_mesh_paths:
-                                        chunk_append(new_mesh, buf_chunk, component)
-                                        seen_streamed_mesh_paths.add(component.mesh)
-                                        log.debug(
-                                            f"Extracted {buf_chunk.Type} from streamingDataBuffer "
-                                            f"of {sub_chunk.Type} #{sub_chunk.ChunkIndex}: {component.mesh}"
-                                        )
-                                    elif not component.mesh:
-                                        log.warning(
-                                            f"Skipping streamingDataBuffer {buf_chunk.Type} with "
-                                            f"invalid mesh ref inside {sub_chunk.Type} #{sub_chunk.ChunkIndex}"
-                                        )
-                            except Exception as e:
-                                log.warning(
-                                    f"Failed to parse streamingDataBuffer for {sub_chunk.Type} "
-                                    f"#{sub_chunk.ChunkIndex}: {e}"
-                                )
-                except Exception as e:
-                    log.warning(f"Failed to process flatCompiledData chunk {sub_chunk.Type}: {e}")
+    if flat_compiled_file is not None:
+        try:
+            resolved_entity = create_CEntity(flat_compiled_file, _inherit_visited=inherit_visited)
+            resolved_mesh = getattr(resolved_entity, "staticMeshes", None)
+            if resolved_mesh and getattr(resolved_mesh, "chunks", None):
+                new_mesh = resolved_mesh
+                pending_streamed_hard.clear()
+            resolved_moving = getattr(resolved_entity, "MovingPhysicalAgentComponent", None)
+            if resolved_moving is not None:
+                this_Entity.MovingPhysicalAgentComponent = resolved_moving
+                hasCMovingPhysicalAgentComponent = True
+        except Exception as e:
+            log.warning("Failed to resolve flatCompiledData for %s: %s", file.fileName, e)
 
     # Wire streamed slot items to the animated component now that every chunk is known.
     if pending_streamed_hard:
@@ -4640,6 +4632,7 @@ def create_CEntity(file, _inherit_visited=None):
                 new_mesh.chunks = copy.deepcopy(related_chunks)
 
     _merge_inherited_template_components()
+    _merge_inherited_slots_inventory_and_effects()
     _merge_inherited_coloring_entries()
     _merge_inherited_anim_params()
     _synthesize_missing_transform_parents_from_hard_attachments()

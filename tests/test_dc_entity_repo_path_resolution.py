@@ -1,6 +1,9 @@
 import sys
+import struct
 import types
 import unittest
+from contextlib import nullcontext
+from io import BytesIO
 from unittest import mock
 from pathlib import Path
 
@@ -21,7 +24,8 @@ def _install_namespace_stub(qualified_name: str, package_path: Path) -> None:
 _install_namespace_stub("witcher3_tools", REPO_ROOT / "witcher3_tools")
 _install_namespace_stub("witcher3_tools.CR2W", REPO_ROOT / "witcher3_tools" / "CR2W")
 
-from witcher3_tools.CR2W import dc_entity  # noqa: E402
+from witcher3_tools.CR2W import CR2W_types, dc_entity  # noqa: E402
+from witcher3_tools.CR2W.Types.VariousTypes import CCompressedBuffer  # noqa: E402
 
 
 class _PathLikeIndex:
@@ -84,6 +88,138 @@ class _EffectChunk:
 
 
 class RepoPathResolutionTests(unittest.TestCase):
+    def test_skeleton_buffer_header_uses_payload_size_not_resource_version(self):
+        values = tuple(float(value) for value in range(1, 13))
+        for header in (b"", b"\0", b"\0\0", b"\0\0\0"):
+            stream = BytesIO(header + struct.pack("<12f", *values))
+            parent = types.SimpleNamespace(classEnd=len(stream.getvalue()))
+            cr2w_file = types.SimpleNamespace(HEADER=types.SimpleNamespace(version=153))
+            buffer = CCompressedBuffer(stream, cr2w_file, parent)
+
+            buffer.Read(stream, 48, 1)
+
+            parsed = buffer.rigData[0]
+            self.assertEqual(tuple(getattr(parsed.position, key) for key in "xyzw"), values[:4])
+            self.assertEqual(tuple(getattr(parsed.rotation, key) for key in "xyzw"), values[4:8])
+            self.assertEqual(tuple(getattr(parsed.scale, key) for key in "xyzw"), values[8:])
+
+    def test_byte_array_flat_compiled_data_is_parsed_as_cr2w(self):
+        parsed = types.SimpleNamespace(fileName=None)
+        captured = {}
+
+        def _parse(stream):
+            captured["bytes"] = stream.read()
+            captured["name"] = stream.name
+            return parsed
+
+        prop = types.SimpleNamespace(More=list(b"CR2Wpayload"))
+        with mock.patch.object(CR2W_types, "getCR2W", side_effect=_parse):
+            result = CR2W_types._parse_flat_compiled_data_property(prop, r"C:\source.w2ent")
+
+        self.assertIs(result, parsed)
+        self.assertEqual(captured["bytes"], b"CR2Wpayload")
+        self.assertEqual(captured["name"], r"C:\source.w2ent:flatCompiledData")
+        self.assertEqual(parsed.fileName, r"C:\source.w2ent")
+
+    def test_uncooked_effect_graph_matches_cooked_effect_schema(self):
+        def _ptr(name, *values):
+            return types.SimpleNamespace(theName=name, value=list(values))
+
+        template = _EffectChunk("CEntityTemplate", 0)
+        template.PROPS.append(_ptr("effects", 2))
+        definition = _EffectChunk(
+            "CFXDefinition",
+            1,
+            name="fire",
+            length=7.5,
+            loopStart=0.25,
+            loopEnd=7.0,
+            isLooped=True,
+        )
+        definition.PROPS.append(_ptr("trackGroups", 3))
+        group = _EffectChunk("CFXTrackGroup", 2)
+        group.PROPS.append(_ptr("tracks", 4))
+        track = _EffectChunk("CFXTrack", 3)
+        track.PROPS.append(_ptr("trackItems", 5))
+        particle = _EffectChunk(
+            "CFXTrackItemParticles",
+            4,
+            particleSystem=(None, r"fx\fire.w2p"),
+            spawner=6,
+            timeBegin=0.5,
+            timeDuration=6.5,
+        )
+        spawner = _EffectChunk("CFXSpawnerComponent", 5, componentName="torso")
+
+        self.assertEqual(
+            dc_entity._extract_uncooked_entity_effects(
+                template,
+                [template, definition, group, track, particle, spawner],
+            ),
+            [{
+                "name": "fire",
+                "length": 7.5,
+                "loop_start": 0.25,
+                "loop_end": 7.0,
+                "is_looped": True,
+                "particle_systems": [{
+                    "path": r"fx\fire.w2p",
+                    "slot": "torso",
+                    "time_begin": 0.5,
+                    "duration": 6.5,
+                }],
+            }],
+        )
+
+    def test_appearance_metadata_inherits_w3_included_templates(self):
+        def _template_chunk(*, includes=(), appearances=(), used=()):
+            props = {
+                "includes": types.SimpleNamespace(
+                    Handles=[types.SimpleNamespace(DepotPath=path) for path in includes],
+                ),
+                "appearances": types.SimpleNamespace(
+                    More=[types.SimpleNamespace(PROPS=[_EffectProp("name", name)]) for name in appearances],
+                ),
+                "usedAppearances": types.SimpleNamespace(
+                    Index=[types.SimpleNamespace(String=name) for name in used],
+                ),
+            }
+            return types.SimpleNamespace(
+                Type="CEntityTemplate",
+                flatCompiledData=None,
+                GetVariableByName=props.get,
+            )
+
+        def _file(*chunks):
+            return types.SimpleNamespace(
+                HEADER=types.SimpleNamespace(version=162),
+                CHUNKS=types.SimpleNamespace(CHUNKS=list(chunks)),
+            )
+
+        source_file = _file(_template_chunk(includes=[r"characters\included.w2ent"], used=["base", "naked"]))
+        included_file = _file(
+            _template_chunk(appearances=["base", "naked", "winter"], used=["base", "naked", "winter"]),
+            types.SimpleNamespace(
+                Type="CAnimatedComponent",
+                GetVariableByName={"skeleton": _EffectProp("skeleton", "rig.w2rig")}.get,
+            ),
+            types.SimpleNamespace(Type="CInventoryDefinition"),
+        )
+
+        with (
+            mock.patch.object(dc_entity.os.path, "exists", return_value=True),
+            mock.patch.object(dc_entity, "read_CR2W", side_effect=[source_file, included_file]),
+            mock.patch.object(dc_entity, "materialize_entity_repo_path", return_value=r"C:\included.w2ent"),
+            mock.patch.object(dc_entity, "redkit_repo_context", return_value=nullcontext()),
+        ):
+            metadata = dc_entity.read_entity_template_appearance_metadata(r"C:\source.w2ent")
+
+        self.assertEqual(metadata["all_names"], ["base", "naked", "winter"])
+        self.assertEqual(metadata["used_names"], ["base", "naked"])
+        self.assertEqual(metadata["default_name"], "base")
+        self.assertTrue(metadata["has_armature_root"])
+        self.assertTrue(metadata["has_inventory_entries"])
+
     def test_path_like_property_index_wins_over_import_table_number(self):
         roof_path = (
             r"environment\architecture\human\redania\nomans_land"

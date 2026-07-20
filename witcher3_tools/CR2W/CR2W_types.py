@@ -2259,6 +2259,16 @@ class CLayerGroup(object):
 
 
 
+def _parse_flat_compiled_data_property(prop, source_name=""):
+    raw = bytes(getattr(prop, "More", None) or ())
+    if not raw.startswith(b"CR2W"):
+        return None
+    embedded = getCR2W(bReadStream(raw, name=f"{source_name or '<embedded>'}:flatCompiledData"))
+    if source_name:
+        embedded.fileName = source_name
+    return embedded
+
+
 class W_CLASS:
     def get_CR2W_version(self):
         return self.__CR2WFILE.HEADER.version
@@ -2642,7 +2652,7 @@ class W_CLASS:
                                     bonecount = 0
                                 break
                         bytesleft = max(0, self.classEnd - f.tell())
-                        if bonecount > 0 and bytesleft >= (2 + bonecount * 48):
+                        if bonecount > 0 and bytesleft >= bonecount * 48:
                             self.rigData = CCompressedBuffer(f, CR2WFILE, self, Name = "rigData")
                             try:
                                 self.rigData.Read(f, bonecount * 48, bonecount)
@@ -2734,22 +2744,25 @@ class W_CLASS:
                         self.ParentGroup = HANDLE(f, CR2WFILE, self)
                         f.seek(self.classEnd)
                     elif self.name == "CEntityTemplate":
-                        # Parse embedded flatCompiledData sub-CR2W.
-                        # PROPERTY.Read() returned early (SharedDataBuffer detection) after PROPSTART + 4-byte skip,
-                        # leaving the file pointer at the start of the embedded CR2W binary.
-                        current_pos = f.tell()
-                        bytes_remaining = self.classEnd - current_pos
-                        if bytes_remaining > 4:
-                            try:
-                                embedded_bytes = f.read(bytes_remaining)
-                                embedded_stream = bReadStream(embedded_bytes, name="<embedded>")
-                                self.flatCompiledData = getCR2W(embedded_stream)
-                                log.debug(f'CEntityTemplate: parsed flatCompiledData ({bytes_remaining} bytes, {len(self.flatCompiledData.CHUNKS.CHUNKS)} chunks)')
-                            except Exception as e:
-                                log.debug(f'CEntityTemplate: failed to parse flatCompiledData: {e}')
-                                self.flatCompiledData = None
-                        else:
+                        try:
+                            self.flatCompiledData = _parse_flat_compiled_data_property(
+                                self.GetVariableByName("flatCompiledData"),
+                                getattr(CR2WFILE, "fileName", ""),
+                            )
+                        except Exception as e:
+                            log.debug(f'CEntityTemplate: failed to parse byte-array flatCompiledData: {e}')
                             self.flatCompiledData = None
+                        if self.flatCompiledData is None:
+                            current_pos = f.tell()
+                            bytes_remaining = self.classEnd - current_pos
+                            if bytes_remaining > 4:
+                                try:
+                                    embedded_bytes = f.read(bytes_remaining)
+                                    embedded_stream = bReadStream(embedded_bytes, name="<embedded>")
+                                    self.flatCompiledData = getCR2W(embedded_stream)
+                                    log.debug(f'CEntityTemplate: parsed flatCompiledData ({bytes_remaining} bytes, {len(self.flatCompiledData.CHUNKS.CHUNKS)} chunks)')
+                                except Exception as e:
+                                    log.debug(f'CEntityTemplate: failed to parse flatCompiledData: {e}')
                         f.seek(self.classEnd)
                     else:
                         f.seek(self.classEnd)

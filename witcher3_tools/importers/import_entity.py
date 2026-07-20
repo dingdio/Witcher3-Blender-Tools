@@ -434,6 +434,40 @@ def _iter_object_descendants(root_obj):
         stack.extend(list(getattr(obj, "children", [])))
 
 
+def _is_redcloth_collision_helper(obj) -> bool:
+    try:
+        if obj.get("witcher_apx_collision_proxy", False):
+            return True
+        object_name = str(getattr(obj, "name", "") or "").lower()
+        parent_name = str(getattr(getattr(obj, "parent", None), "name", "") or "").lower()
+        return any(
+            label in object_name or label in parent_name
+            for label in (
+                "collision spheres",
+                "collision connections",
+                "collision capsules",
+                "collision proxies",
+            )
+        )
+    except Exception:
+        return False
+
+
+def _set_redcloth_collision_helper_visibility(root_obj, hidden: bool):
+    if root_obj is None:
+        return
+    for obj in (root_obj, *_iter_object_descendants(root_obj)):
+        if not _is_redcloth_collision_helper(obj):
+            continue
+        try:
+            # The Outliner eye controls the viewport; helpers never render.
+            obj.hide_viewport = False
+            obj.hide_set(bool(hidden))
+            obj.hide_render = True
+        except Exception:
+            continue
+
+
 def _find_reusable_redcloth_armature(owner_armature, reuse_key: str, *, key_prop: str = "witcher_redcloth_reuse_key"):
     if owner_armature is None or not reuse_key:
         return None
@@ -743,7 +777,7 @@ def import_or_reuse_redcloth(
     import_name: str,
     entity_name: str,
     target_collection=None,
-    hide_collision_proxies=False,
+    hide_collision_proxies=True,
 ):
     total_started = time.perf_counter()
     resolve_seconds = 0.0
@@ -912,15 +946,7 @@ def import_or_reuse_redcloth(
             redcloth_resource,
             redcloth_mat_path,
         )
-    if visible_root is not None:
-        for obj in (visible_root, *_iter_object_descendants(visible_root)):
-            try:
-                if not bool(obj.get("witcher_apx_collision_proxy", False)):
-                    continue
-                obj.hide_viewport = bool(hide_collision_proxies)
-                obj.hide_render = bool(hide_collision_proxies)
-            except Exception:
-                continue
+    _set_redcloth_collision_helper_visibility(visible_root, hide_collision_proxies)
     collect_started = time.perf_counter()
     cloth_meshes = _collect_redcloth_meshes(cloth_arma)
     collect_seconds = time.perf_counter() - collect_started
@@ -2628,6 +2654,14 @@ def create_app_drivers(armobj: bpy.types.Armature, obj_to_hide:bpy.types.Object,
         appearance_indices: Optional list of appearance indices where object should be visible.
                            If None, uses current app_list_index only.
     """
+    if _is_redcloth_collision_helper(obj_to_hide):
+        _remove_hide_drivers(obj_to_hide)
+        obj_to_hide.hide_viewport = False
+        obj_to_hide.hide_render = True
+        for obj in obj_to_hide.children:
+            create_app_drivers(armobj, obj, appearance_indices)
+        return
+
     # Keep shadowmesh objects hidden regardless of active appearance.
     if _is_shadowmesh_name(getattr(obj_to_hide, "name", "")):
         _force_shadowmesh_hidden(obj_to_hide)

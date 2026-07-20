@@ -292,16 +292,8 @@ class CCompressedBuffer:
         self.CR2WFILE = CR2WFILE
         self.rigData = []
     def Read(self, f, size, count, buffer_type = SSkeletonRigData):
-        m_count = count
-        #tell = f.tell()
-        try:
-            from ..old_version_reader import is_old_version
-            header_version = getattr(getattr(self.CR2WFILE, "HEADER", None), "version", 999)
-            header_skip = 3 if is_old_version(header_version) else 2
-        except Exception:
-            header_skip = 2
-        f.seek(header_skip,1)
-        for _ in range(0, m_count):
+        f.seek(self.parent.classEnd - size)
+        for _ in range(count):
             self.rigData.append(buffer_type(f))
 
 

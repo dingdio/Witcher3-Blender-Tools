@@ -311,7 +311,7 @@ def _mesh_object_source_paths(mesh_obj) -> list[str]:
     ):
         if value and value not in paths:
             paths.append(value)
-    for key in ("witcher_path", "repo_path"):
+    for key in ("witcher_resolved_mesh_path", "witcher_path", "repo_path"):
         try:
             value = str(mesh_obj.get(key, "") or "").strip()
         except Exception:
@@ -1313,6 +1313,9 @@ def import_mesh(filename:str,
                     hide_zero_weight_faces,
                     build_material_nodes,
                     target_armature)
+                resolved_source_path = os.path.normpath(os.path.abspath(filename))
+                for imported_obj in [*final_bl_meshes, *armatures]:
+                    imported_obj["witcher_resolved_mesh_path"] = resolved_source_path
                 prepare_seconds = time.perf_counter() - prepare_started
                 
                 if rotate_180:
