@@ -146,6 +146,8 @@ def _parent_and_namespace_collision_objects(prefix: str, parent_obj: Object, obj
         if obj is None or obj.name not in bpy.data.objects:
             continue
         obj.name = _namespaced_name(prefix, obj.name)
+        obj.hide_render = True
+        obj.display_type = 'SOLID'
         obj.select_set(True)
         selected_count += 1
     if selected_count:

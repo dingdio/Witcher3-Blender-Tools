@@ -23,6 +23,7 @@ wheels = [
 
 [permissions]
 files = "Read game data and write caches/exports"
+network = "Read the local REDkit debug service"
 
 [build]
 paths_exclude_pattern = [

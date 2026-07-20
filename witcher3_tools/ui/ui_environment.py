@@ -1,7 +1,5 @@
 """World environment loading and preview controls for the Witcher N-panel."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 import math
 import os
@@ -45,15 +43,7 @@ _RUNTIME: dict[int, dict[str, Any]] = {}
 _ENVIRONMENT_SELECTOR_CACHE_KEY: tuple[str, ...] | None = None
 _ENVIRONMENT_SELECTOR_CATALOG: tuple[EnvironmentDefinitionItem, ...] = ()
 _ENVIRONMENT_SELECTOR_LOOKUP: dict[str, EnvironmentDefinitionItem] = {}
-_ENVIRONMENT_SELECTOR_ENUM_ITEMS = (
-    (
-        ENVIRONMENT_OFF_IDENTIFIER,
-        "ENV - OFF",
-        "Disable the Entity Editor preview environment",
-        "WORLD_DATA",
-        0,
-    ),
-)
+_ENVIRONMENT_SELECTOR_ITEMS = ((ENVIRONMENT_OFF_IDENTIFIER, "ENV - OFF"),)
 
 
 @dataclass(frozen=True)
@@ -1591,61 +1581,26 @@ def _environment_selector_roots(context) -> tuple[str, ...]:
     return tuple(roots)
 
 
-def _environment_enum_number(identifier: str, used: set[int]) -> int:
-    try:
-        number = int(identifier.removeprefix("ENV_")[:8], 16) & 0x7FFFFFFF
-    except (TypeError, ValueError):
-        number = 1
-    number = number or 1
-    while number in used:
-        number = 1 if number == 0x7FFFFFFF else number + 1
-    used.add(number)
-    return number
-
-
 def _rebuild_environment_selector_cache(context, *, force: bool = False):
     global _ENVIRONMENT_SELECTOR_CACHE_KEY
     global _ENVIRONMENT_SELECTOR_CATALOG
     global _ENVIRONMENT_SELECTOR_LOOKUP
-    global _ENVIRONMENT_SELECTOR_ENUM_ITEMS
+    global _ENVIRONMENT_SELECTOR_ITEMS
 
     roots = _environment_selector_roots(context)
     cache_key = tuple(os.path.normcase(os.path.normpath(root)) for root in roots)
     if not force and cache_key == _ENVIRONMENT_SELECTOR_CACHE_KEY:
-        return _ENVIRONMENT_SELECTOR_ENUM_ITEMS
+        return _ENVIRONMENT_SELECTOR_ITEMS
 
     catalog = scan_environment_definitions(roots)
-    used_numbers = {0}
-    enum_items = [
-        (
-            ENVIRONMENT_OFF_IDENTIFIER,
-            "ENV - OFF",
-            "Disable the Entity Editor preview environment",
-            "WORLD_DATA",
-            0,
-        )
-    ]
-    for item in catalog:
-        enum_items.append(
-            (
-                item.identifier,
-                item.label,
-                f"Load {item.depot_path}",
-                "WORLD_DATA",
-                _environment_enum_number(item.identifier, used_numbers),
-            )
-        )
-
-    # Blender's dynamic EnumProperty keeps references to the strings returned by its callback.
     _ENVIRONMENT_SELECTOR_CACHE_KEY = cache_key
     _ENVIRONMENT_SELECTOR_CATALOG = catalog
     _ENVIRONMENT_SELECTOR_LOOKUP = {item.identifier: item for item in catalog}
-    _ENVIRONMENT_SELECTOR_ENUM_ITEMS = tuple(enum_items)
-    return _ENVIRONMENT_SELECTOR_ENUM_ITEMS
-
-
-def _enum_preview_environment_items(_owner, context):
-    return _rebuild_environment_selector_cache(context)
+    _ENVIRONMENT_SELECTOR_ITEMS = (
+        (ENVIRONMENT_OFF_IDENTIFIER, "ENV - OFF"),
+        *((item.identifier, item.label) for item in catalog),
+    )
+    return _ENVIRONMENT_SELECTOR_ITEMS
 
 
 def _disable_preview_environment_selector(settings, context) -> None:
@@ -1847,7 +1802,7 @@ class WITCH_PG_EnvironmentSettings(bpy.types.PropertyGroup):
     full_effects: BoolProperty(
         name="Full Effects",
         description="Enable the realtime balance LUT and volumetric fog; slower in large rendered viewports",
-        default=False,
+        default=True,
         update=_on_preview_setting_changed,
     )
     import_materials: BoolProperty(
@@ -1946,29 +1901,88 @@ class WITCH_PG_EnvironmentSettings(bpy.types.PropertyGroup):
     )
 
 
+class WITCH_PG_EnvironmentSelectorItem(bpy.types.PropertyGroup):
+    identifier: StringProperty(default="")
+    path: StringProperty(name="Path", default="")
+
+
+class WITCH_UL_EnvironmentSelectorItems(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        layout.prop(item, "path", text="", icon="WORLD_DATA", emboss=False)
+
+
 class WITCH_OT_EnvironmentSelectorSelect(bpy.types.Operator):
     bl_idname = "witcher.environment_selector_select"
     bl_label = "Select Preview Environment"
-    bl_description = "Search for and load a native Entity Editor preview environment"
-    bl_property = "environment"
+    bl_description = "Browse and load a native Entity Editor preview environment"
+    bl_options = {"REGISTER", "INTERNAL"}
 
-    environment: EnumProperty(
-        name="Environment",
-        description="Environment definition to load",
-        items=_enum_preview_environment_items,
-    )
+    environment: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+    filter_text: StringProperty(name="Search", default="")
+    environment_items: CollectionProperty(type=WITCH_PG_EnvironmentSelectorItem)
+    environment_items_index: IntProperty(default=0)
+
+    def _rebuild_items(self, context):
+        _rebuild_environment_selector_cache(context)
+        query = self.filter_text.strip().casefold()
+        rows = [(ENVIRONMENT_OFF_IDENTIFIER, "ENV - OFF")]
+        rows.extend((item.identifier, item.depot_path) for item in _ENVIRONMENT_SELECTOR_CATALOG)
+        if query:
+            rows = [row for row in rows if query in row[1].casefold()]
+
+        self.environment_items.clear()
+        for identifier, path in rows:
+            item = self.environment_items.add()
+            item.identifier = identifier
+            item.path = path
+        self.environment_items_index = (
+            min(max(self.environment_items_index, 0), len(self.environment_items) - 1)
+            if self.environment_items else -1
+        )
 
     def invoke(self, context, event):
         settings = _settings(context.scene)
+        if settings is None:
+            return {"CANCELLED"}
         current = str(getattr(settings, "preview_environment", "") or ENVIRONMENT_OFF_IDENTIFIER)
-        identifiers = {item[0] for item in _rebuild_environment_selector_cache(context)}
-        self.environment = current if current in identifiers else ENVIRONMENT_OFF_IDENTIFIER
-        context.window_manager.invoke_search_popup(self)
-        return {"RUNNING_MODAL"}
+        self.environment = ""
+        self.filter_text = ""
+        self._rebuild_items(context)
+        for index, item in enumerate(self.environment_items):
+            if item.identifier == current:
+                self.environment_items_index = index
+                break
+        return context.window_manager.invoke_props_dialog(self, width=980)
+
+    def check(self, context):
+        self._rebuild_items(context)
+        return True
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "filter_text", text="", icon="VIEWZOOM")
+        if not self.environment_items:
+            layout.label(text="No matching environments found.", icon="INFO")
+            return
+        box = layout.box()
+        box.template_list(
+            WITCH_UL_EnvironmentSelectorItems.__name__,
+            "",
+            self,
+            "environment_items",
+            self,
+            "environment_items_index",
+            rows=18,
+        )
+        layout.label(text=f"{len(self.environment_items)} environment(s)", icon="INFO")
 
     def execute(self, context):
+        identifier = str(self.environment or "")
+        if not identifier:
+            if not (0 <= self.environment_items_index < len(self.environment_items)):
+                return {"CANCELLED"}
+            identifier = self.environment_items[self.environment_items_index].identifier
         settings = _settings(context.scene)
-        identifier = str(self.environment or ENVIRONMENT_OFF_IDENTIFIER)
         result = _apply_preview_environment_identifier(settings, context, identifier)
         if not result.ok:
             self.report({"ERROR"}, result.message)
@@ -2392,6 +2406,8 @@ classes = (
     WITCH_PG_EnvironmentFieldItem,
     WITCH_PG_EnvironmentWeatherPreset,
     WITCH_PG_EnvironmentSettings,
+    WITCH_PG_EnvironmentSelectorItem,
+    WITCH_UL_EnvironmentSelectorItems,
     WITCH_OT_EnvironmentSelectorSelect,
     WITCH_OT_EnvironmentSelectorRefresh,
     WITCH_OT_EnvironmentLoad,
@@ -2420,7 +2436,7 @@ def unregister():
     global _ENVIRONMENT_SELECTOR_CACHE_KEY
     global _ENVIRONMENT_SELECTOR_CATALOG
     global _ENVIRONMENT_SELECTOR_LOOKUP
-    global _ENVIRONMENT_SELECTOR_ENUM_ITEMS
+    global _ENVIRONMENT_SELECTOR_ITEMS
 
     try:
         preview = _preview_module()
@@ -2433,15 +2449,7 @@ def unregister():
     _ENVIRONMENT_SELECTOR_CACHE_KEY = None
     _ENVIRONMENT_SELECTOR_CATALOG = ()
     _ENVIRONMENT_SELECTOR_LOOKUP = {}
-    _ENVIRONMENT_SELECTOR_ENUM_ITEMS = (
-        (
-            ENVIRONMENT_OFF_IDENTIFIER,
-            "ENV - OFF",
-            "Disable the Entity Editor preview environment",
-            "WORLD_DATA",
-            0,
-        ),
-    )
+    _ENVIRONMENT_SELECTOR_ITEMS = ((ENVIRONMENT_OFF_IDENTIFIER, "ENV - OFF"),)
     if hasattr(bpy.types.Scene, _SCENE_PROP):
         delattr(bpy.types.Scene, _SCENE_PROP)
     for cls in reversed(classes):

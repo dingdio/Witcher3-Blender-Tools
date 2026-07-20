@@ -1941,21 +1941,46 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
     # Materials #
     #===========#
     if do_import_mats and final_bl_meshes:
-        ### MATERIALS
-        force_mat_update = True
-        
-        
+        apply_mesh_materials(
+            meshFile,
+            the_materials,
+            the_material_names,
+            final_bl_meshes,
+            meshName,
+            build_material_nodes=build_material_nodes,
+        )
+
+    armatures = []
+    if (_mesh_has_skinned_chunks(CData) and create_mesh_armature):
+        armature_obj.select_set(True)
+        bpy.context.view_layer.objects.active = armature_obj
+        armatures.append(armature_obj)
+    elif bind_armature_obj is not None:
+        bpy.context.view_layer.objects.active = bind_armature_obj
+    else:
+        if final_bl_meshes:
+            bpy.context.view_layer.objects.active = final_bl_meshes[0]
+    for mesh in final_bl_meshes:
+        mesh.select_set(True)
+    try:
+        from ..unreal_export.mesh_signature import mesh_geometry_signature
+        for mesh_obj in final_bl_meshes:
+            mesh_obj.witcherui_MeshSettings['source_signature'] = mesh_geometry_signature(mesh_obj)
+    except Exception:
+        pass
+    return (final_bl_meshes, armatures)
+
+
+def apply_mesh_materials(meshFile, the_materials, the_material_names, final_bl_meshes, meshName, build_material_nodes=True):
+    if final_bl_meshes:
         if meshFile.HEADER.version <= 115:
             uncook_path = w2_source_repo_root_if_configured(getattr(meshFile, "fileName", "") or "")
             if not uncook_path:
                 roots = configured_w2_repo_roots(bpy.context)
                 uncook_path = roots[0] if roots else ""
-            uncook_path = (uncook_path.rstrip("\\/") + "\\") if uncook_path else "" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
-            #uncook_path_modkit = get_witcher2_game_path(bpy.context)
+            uncook_path = (uncook_path.rstrip("\\/") + "\\") if uncook_path else ""
         else:
-            uncook_path = get_texture_path(bpy.context)+"\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
-            #uncook_path_modkit = get_uncook_path(bpy.context)
-        xml_path = "w2mesh"
+            uncook_path = get_texture_path(bpy.context)+"\\"
         
         materials = []
         handles = getattr(the_materials, "Handles", None) if the_materials else None
@@ -2006,8 +2031,6 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                     else:
                         log.warning(f"Could not resolve material handle: {o.DepotPath} - inserting placeholder to preserve slot alignment")
                         materials.append(None)
-        #material_names = [o.String.split('::')[1] for o in chunk.GetVariableByName('apexMaterialNames').elements]
-
         load_materials = True if materials else False
         if load_materials:
             mat_filename = "witcher_mat"
@@ -2026,29 +2049,20 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
                 build_material_nodes=build_material_nodes,
             )
 
-    #===========#
-    #  Finish   #
-    #===========#
-    #select everything just imported
-    armatures = []
-    if (_mesh_has_skinned_chunks(CData) and create_mesh_armature):
-        armature_obj.select_set(True)
-        bpy.context.view_layer.objects.active = armature_obj
-        armatures.append(armature_obj)
-    elif bind_armature_obj is not None:
-        bpy.context.view_layer.objects.active = bind_armature_obj
-    else:
-        if final_bl_meshes:
-            bpy.context.view_layer.objects.active = final_bl_meshes[0]
-    for mesh in final_bl_meshes:
-        mesh.select_set(True)
-    try:
-        from ..unreal_export.mesh_signature import mesh_geometry_signature
-        for mesh_obj in final_bl_meshes:
-            mesh_obj.witcherui_MeshSettings['source_signature'] = mesh_geometry_signature(mesh_obj)
-    except Exception:
-        pass
-    return (final_bl_meshes, armatures)
+
+def import_mesh_materials(filename, mesh_objects, embedded_cmesh_chunk_index=None):
+    mesh_objects = [o for o in mesh_objects or [] if getattr(o, "type", "") == 'MESH']
+    if not mesh_objects:
+        return 0
+    (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile) = dc_mesh.load_bin_mesh(
+        filename,
+        False,
+        False,
+        embedded_cmesh_chunk_index=embedded_cmesh_chunk_index,
+    )
+    apply_mesh_materials(meshFile, the_materials, the_material_names, mesh_objects, meshName)
+    return len(mesh_objects)
+
 
 #returns mesh object
 def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_normals:bool):

@@ -427,6 +427,7 @@ from . import file_helpers
 #ui
 from .ui import ui_custom_icons
 from .ui import ui_map
+from .ui import ui_redkit_link
 from .ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_w2w,
                                      WITCH_OT_import_world_tile,
@@ -436,6 +437,7 @@ from .ui.ui_map import (WITCH_OT_w2L,
                                      WITCH_OT_load_layer_group,
                                      WITCH_OT_cancel_layer_stream_job,
                                      WITCH_OT_load_layers_around_camera,
+                                     WITCH_OT_stream_missing_materials,
                                      WITCH_OT_rebuild_layer_scan_cache,
                                      WITCH_OT_scan_layers_nearby,
                                      WITCH_OT_radish_w2L,
@@ -4009,6 +4011,10 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
             header.label(text=label, icon=icon)
             return body
 
+        body = section("witcher_terrain_redkit_link", "REDkit Link", 'LINKED')
+        if body:
+            ui_redkit_link.draw_redkit_link(body, context)
+
         if scene_settings and hasattr(scene_settings, "terrain_import_mode"):
             body = section("witcher_terrain_import_mode", "Import Mode", 'SETTINGS')
             if body:
@@ -4238,6 +4244,11 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 row = controls.row(align=True)
                 row.operator("witcher.load_layers_around_camera", text="Load Layers Around Camera", icon='VIEW_CAMERA')
                 row.operator("witcher.rebuild_layer_scan_cache", text="", icon='FILE_REFRESH')
+                pending_mats = ui_map.import_blender_fun.deferred_material_queue_size()
+                if pending_mats:
+                    controls.label(text=f"Streaming materials: {pending_mats} meshes left", icon='MATERIAL')
+                else:
+                    controls.operator("witcher.stream_missing_materials", text="Stream Missing Materials", icon='MATERIAL')
                 controls.operator(
                     "witcher.send_unreal_layers_around_camera",
                     text="Send Nearby Layers to Unreal", icon='URL',
@@ -4268,6 +4279,7 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 mesh_box = import_options_box.box()
                 mesh_box.label(text="W2Mesh")
                 mesh_box.prop(scene_settings, "terrain_layer_instanced_sector", text="Instance Repeated Meshes")
+                mesh_box.prop(scene_settings, "terrain_layer_defer_materials", text="Defer Materials")
                 mesh_row = mesh_box.row(align=True)
                 mesh_row.prop(scene_settings, "terrain_layer_keep_lod_meshes", text="Keep LODs")
                 mesh_row.prop(scene_settings, "terrain_layer_keep_empty_lods", text="Keep Empty LODs")
@@ -4297,7 +4309,7 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                     row = visibility_box.row(align=True)
                     hide_enabled = bool(getattr(scene_settings, hide_prop, False))
                     solo_enabled = bool(getattr(scene_settings, solo_prop, False))
-                    row.prop(scene_settings, hide_prop, text=label, icon='HIDE_ON' if hide_enabled else 'HIDE_OFF', toggle=True)
+                    row.prop(scene_settings, hide_prop, text=label, icon='HIDE_ON' if hide_enabled else 'HIDE_OFF', toggle=True, invert_checkbox=True)
                     row.prop(scene_settings, solo_prop, text="", icon='HIDE_OFF' if solo_enabled else 'HIDE_ON', toggle=True)
 
                 visibility_row("Default-Hidden Groups", "terrain_layer_hide_default_hidden", "terrain_layer_solo_default_hidden")
@@ -5038,6 +5050,7 @@ _classes = [
     WITCH_OT_load_layer_group,
     WITCH_OT_cancel_layer_stream_job,
     WITCH_OT_load_layers_around_camera,
+    WITCH_OT_stream_missing_materials,
     WITCH_OT_rebuild_layer_scan_cache,
     WITCH_OT_scan_layers_nearby,
     WITCH_OT_cancel_foliage_job,
@@ -5143,6 +5156,7 @@ def register():
     bpy.types.Scene.witcher_terrain_texture_pack_metadata = StringProperty(
         name="Texture Pack Source Data", options={'HIDDEN'})
     ui_custom_icons.register()
+    ui_redkit_link.register()
     ui_file_browser.register()
     ui_entity.register()
     ui_equipment.register()
@@ -5256,6 +5270,7 @@ def unregister():
     ui_equipment.unregister()
     ui_entity.unregister()
     ui_file_browser.unregister()
+    ui_redkit_link.unregister()
     livelink_face.unregister()
     ui_morphs.unregister()
     lipsync.unregister()

@@ -2850,6 +2850,36 @@ def _open_location(context, world_path: str, layer_dir: str, name: str, report,
             return {'CANCELLED'}
         _finish_stage("world_metadata", stage_started)
 
+        # Load the parent world's ocean and environment for the selected tile.
+        stage_started = _time.perf_counter()
+        try:
+            import_w2w._ensure_world_water_plane(
+                spec.hub_name,
+                spec.terrain_size,
+                lowest_elevation=spec.lowest_elevation,
+                highest_elevation=spec.highest_elevation,
+                world_key=spec.world_key,
+            )
+        except Exception:
+            log.warning("Could not load location world water for %s", world_depot, exc_info=True)
+        try:
+            from .ui import ui_environment
+            environment_result = ui_environment.sync_world_import(
+                context, world_file, world_abs)
+            if not environment_result.ok:
+                log.warning(
+                    "Could not sync location world environment for %s: %s",
+                    world_depot,
+                    environment_result.message,
+                )
+        except Exception:
+            log.warning(
+                "Could not sync location world environment for %s",
+                world_depot,
+                exc_info=True,
+            )
+        _finish_stage("world_environment", stage_started)
+
         location_root = (
             _location_scope_for_full_load(world_root, layer_dir_n)
             if load_full_layers

@@ -817,6 +817,11 @@ class MySettings(PropertyGroup):
         description="Group identical CSectorData mesh placements into a single instancer object instead of one object per placement. Greatly reduces object count for dense static layers (rocks, cliffs, debris). Individual selection is not possible for instanced meshes.",
         default=True,
     )
+    terrain_layer_defer_materials: BoolProperty(
+        name="Defer Materials",
+        description="Import nearby-layer meshes with empty placeholder materials, then stream the real materials in the background after the load finishes. Greatly reduces time to first view",
+        default=True,
+    )
     terrain_layer_keep_lod_meshes: BoolProperty(
         name="Keep LODs",
         description="Keep lower-detail mesh LODs when importing nearby layers",

@@ -3041,9 +3041,10 @@ def create_texarray(group_name = "WitcherTexArray", ARRAY_SIZE = 2):
     me = obj.data
     highest_green = 0
     if obj.type == "MESH":
+        active_color = me.color_attributes.active_color
         for vert in me.vertices:
-            if me.color_attributes.active:
-                elem = me.color_attributes.active.data[vert.index]
+            if active_color:
+                elem = active_color.data[vert.index]
                 color = elem.color if hasattr(elem, 'color') else elem.vector
                 vertex_color_data.append(list(color))
                 highest_green = max(highest_green, color[1])

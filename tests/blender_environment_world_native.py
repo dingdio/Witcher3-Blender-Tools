@@ -104,15 +104,15 @@ def main() -> None:
             settings = bpy.context.scene.witcher_environment
             assert settings.environment_path
             assert len(settings.weather_presets) > 0
-            assert not settings.full_effects
-            fast_values = ui_environment._preview_values(bpy.context.scene)
-            assert fast_values["balance_map_path"] == ""
-            assert fast_values["fog_density"] == 0.0
-            settings.full_effects = True
+            assert settings.full_effects
             full_values = ui_environment._preview_values(bpy.context.scene)
             assert full_values["balance_map_path"]
             assert full_values["fog_density"] > 0.0
             settings.full_effects = False
+            fast_values = ui_environment._preview_values(bpy.context.scene)
+            assert fast_values["balance_map_path"] == ""
+            assert fast_values["fog_density"] == 0.0
+            settings.full_effects = True
 
             settings.preview_enabled = True
             preview = ui_environment._refresh_preview(bpy.context, ensure=True)

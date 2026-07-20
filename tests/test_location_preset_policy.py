@@ -281,6 +281,40 @@ class LocationPresetPolicyTests(unittest.TestCase):
         )
         self.assertLess(busy_guard.lineno, first_world_mutation.lineno)
 
+    def test_location_loads_parent_world_water_and_environment(self):
+        source = BROWSER_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(BROWSER_PATH))
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_open_location"
+        )
+        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+
+        load_world = next(
+            node for node in calls
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "load_w2w"
+        )
+        ensure_water = next(
+            node for node in calls
+            if isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_ensure_world_water_plane"
+        )
+        sync_environment = next(
+            node for node in calls
+            if isinstance(node.func, ast.Attribute)
+            and node.func.attr == "sync_world_import"
+        )
+        import_tile = next(
+            node for node in calls
+            if isinstance(node.func, ast.Attribute)
+            and node.func.attr == "import_world_terrain_tile"
+        )
+
+        self.assertLess(load_world.lineno, ensure_water.lineno)
+        self.assertLess(ensure_water.lineno, sync_environment.lineno)
+        self.assertLess(sync_environment.lineno, import_tile.lineno)
+        self.assertIn("world_key", {keyword.arg for keyword in ensure_water.keywords})
+
     def test_stream_start_race_does_not_request_sync_fallback(self):
         source = BROWSER_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(BROWSER_PATH))

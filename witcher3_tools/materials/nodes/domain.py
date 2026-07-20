@@ -809,11 +809,34 @@ def suspend_witcher_include_updates():
         _WITCHER_INCLUDE_UPDATE_SUSPENDED = previous
 
 
+_WITCHER_INCLUDE_LAYOUT_SUSPENDED = False
+
+
+@contextmanager
+def suspend_witcher_include_layout():
+    """Defer cosmetic node layout until the material's next refresh."""
+    global _WITCHER_INCLUDE_LAYOUT_SUSPENDED
+    previous = _WITCHER_INCLUDE_LAYOUT_SUSPENDED
+    _WITCHER_INCLUDE_LAYOUT_SUSPENDED = True
+    try:
+        yield
+    finally:
+        _WITCHER_INCLUDE_LAYOUT_SUSPENDED = previous
+
+
 def refresh_witcher_include_state(material):
     """Run the witcher_include sync/layout pass for a known material."""
     if material is None:
         return
     _sync_local_override_nodes(material)
+    if _WITCHER_INCLUDE_LAYOUT_SUSPENDED:
+        material["witcher_layout_pending"] = True
+        return
+    if material.get("witcher_layout_pending") is not None:
+        try:
+            del material["witcher_layout_pending"]
+        except Exception:
+            pass
     _apply_chain_item_colors_to_nodes(material)
     if bool(getattr(getattr(material, "witcher_props", None), "base_read_chain_frames_enabled", True)):
         _layout_chain_nodes_by_source(material)

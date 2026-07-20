@@ -694,6 +694,47 @@ def clear_redcloth_failure_cache():
     _REDCLOTH_FAILED_IMPORTS.clear()
 
 
+_ERROR_PLACEHOLDER_MESH = "W3_ERR_placeholder"
+_ERROR_PLACEHOLDER_MAT = "W3_ERR_placeholder_mat"
+
+
+def _get_error_placeholder_mesh():
+    mesh = bpy.data.meshes.get(_ERROR_PLACEHOLDER_MESH)
+    if mesh is not None:
+        return mesh
+    mesh = bpy.data.meshes.new(_ERROR_PLACEHOLDER_MESH)
+    s = 0.25
+    verts = [(-s, -s, 0), (s, -s, 0), (s, s, 0), (-s, s, 0),
+             (-s, -s, 2 * s), (s, -s, 2 * s), (s, s, 2 * s), (-s, s, 2 * s)]
+    faces = [(0, 1, 2, 3), (7, 6, 5, 4), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)]
+    mesh.from_pydata(verts, [], faces)
+    mat = bpy.data.materials.get(_ERROR_PLACEHOLDER_MAT)
+    if mat is None:
+        mat = bpy.data.materials.new(_ERROR_PLACEHOLDER_MAT)
+        mat.diffuse_color = (1.0, 0.0, 1.0, 1.0)
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf is not None:
+            bsdf.inputs["Base Color"].default_value = (1.0, 0.0, 1.0, 1.0)
+    mesh.materials.append(mat)
+    return mesh
+
+
+def make_import_error_placeholder(resource, target_collection=None):
+    label = Path(str(resource or "").replace("/", "\\")).name or "import"
+    obj = bpy.data.objects.new(f"ERR_{label}", _get_error_placeholder_mesh())
+    obj["witcher_import_error"] = str(resource or "")
+    obj.color = (1.0, 0.0, 1.0, 1.0)
+    coll = target_collection
+    if coll is None:
+        coll = getattr(bpy.context, "collection", None) or bpy.context.scene.collection
+    try:
+        coll.objects.link(obj)
+    except Exception:
+        pass
+    return obj
+
+
 def import_or_reuse_redcloth(
     owner_armature,
     redcloth_resource: str,
@@ -721,7 +762,7 @@ def import_or_reuse_redcloth(
     redcloth_reuse_key = _make_redcloth_reuse_key(redcloth_resource, redcloth_mat_path)
     if redcloth_reuse_key in _REDCLOTH_FAILED_IMPORTS:
         log.debug("Skipping redcloth %s: import failed earlier this session", redcloth_resource)
-        return None, None, []
+        return make_import_error_placeholder(redcloth_resource, target_collection), None, []
     scene = getattr(bpy.context, "scene", None)
     cloth_arma = _find_reusable_redcloth_armature(owner_armature, redcloth_reuse_key)
     if cloth_arma is not None:
@@ -842,7 +883,7 @@ def import_or_reuse_redcloth(
                 "yes" if reused else "no",
                 "yes" if imported else "no",
             )
-        return None, None, []
+        return make_import_error_placeholder(redcloth_resource, target_collection), None, []
 
     clear_external_import_dependency_alert("redcloth")
     cloth_grp = None
@@ -4939,6 +4980,11 @@ def process_constraints(constrains, objdict, group_parent=None):
                     parent_obj,
                     dangle_drivers_by_parent.get(id(parent_obj), {}),
                 )
+                continue
+            if child_obj.get("witcher_import_error"):
+                _set_parent_keep_world(child_obj, parent_obj)
+                if group_parent and parent_obj_name == group_parent:
+                    return_objs.append(child_obj)
                 continue
             parent_is_merged = _is_merged_character_armature(parent_obj)
             child_is_merged = _is_merged_character_armature(child_obj)

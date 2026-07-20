@@ -88,10 +88,14 @@ def main() -> None:
 
         selector_items = ui_environment._rebuild_environment_selector_cache(bpy.context, force=True)
         assert settings.preview_environment == ENVIRONMENT_OFF_IDENTIFIER
+        assert settings.full_effects
         assert selector_items[0][0] == ENVIRONMENT_OFF_IDENTIFIER
         assert selector_items[0][1] == "ENV - OFF"
+        selector_properties = bpy.ops.witcher.environment_selector_select.get_rna_type().properties
+        assert selector_properties.get("filter_text") is not None
+        assert selector_properties.get("environment_items") is not None
         invoke_result = bpy.ops.witcher.environment_selector_select("INVOKE_DEFAULT")
-        assert invoke_result in ({"RUNNING_MODAL"}, {"FINISHED"})
+        assert invoke_result in ({"RUNNING_MODAL"}, {"FINISHED"}, {"CANCELLED"})
         if len(selector_items) > 1:
             base_path = settings.environment_path
             result = bpy.ops.witcher.environment_selector_select(environment=selector_items[1][0])

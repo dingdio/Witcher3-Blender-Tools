@@ -1444,7 +1444,7 @@ class _PhysicsTargetListBase(bpy.types.UIList):
             toggle_op = toggle_slot.operator(
                 WITCH_OT_ClothToggleSimulationObject.bl_idname,
                 text="",
-                icon="HIDE_ON" if enabled else "HIDE_OFF",
+                icon="HIDE_OFF" if enabled else "HIDE_ON",
             )
             toggle_op.object_name = item.name
             toggle_op.show = not enabled

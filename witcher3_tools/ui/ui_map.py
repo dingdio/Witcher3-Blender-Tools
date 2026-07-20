@@ -137,6 +137,7 @@ def _layer_import_kwargs_from_scene(scene_settings):
         "do_enable_name_filter": bool(getattr(scene_settings, "terrain_layer_enable_name_filter", False)),
         "do_name_filter_regex": str(getattr(scene_settings, "terrain_layer_name_filter_regex", "") or ""),
         "instanced_sector": bool(getattr(scene_settings, "terrain_layer_instanced_sector", False)),
+        "defer_mesh_materials": bool(getattr(scene_settings, "terrain_layer_defer_materials", True)),
         "hide_engine_hidden_meshes": bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True)),
         "solo_engine_hidden_meshes": bool(getattr(scene_settings, "terrain_layer_solo_engine_hidden_meshes", False)),
         "hide_proxy_meshes": bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False)),
@@ -3645,6 +3646,7 @@ def _start_layer_stream_job(context, mode, root_collection):
         import_entity.clear_redcloth_failure_cache()
     except Exception:
         pass
+    import_blender_fun.set_deferred_materials_paused(True)
     job = _LAYER_STREAM_JOB
     job["running"] = True
     job["mode"] = str(mode or "").strip()
@@ -4719,6 +4721,8 @@ def _finish_layer_stream_job(operator, context, cancelled=False, failed=False):
 
     load = job.get("load", {}) or {}
     _close_layer_load_batch_isolation(job)
+    import_blender_fun.set_deferred_materials_paused(False)
+    import_blender_fun.ensure_deferred_material_timer()
     previous_active_layer_collection = load.get("previous_active_layer_collection")
     view_layer = getattr(context, "view_layer", None)
     if view_layer is not None and previous_active_layer_collection is not None:
@@ -5841,7 +5845,13 @@ def _import_level_from_collection(
             and getattr(isolation_batch_session, "isolated", False)
         )
 
-        with import_isolation.global_undo_disabled(), redkit_repo_context(resolved):
+        from ..materials.nodes.domain import suspend_witcher_include_layout
+
+        with (
+            import_isolation.global_undo_disabled(),
+            suspend_witcher_include_layout(),
+            redkit_repo_context(resolved),
+        ):
             if use_fast_path:
                 if use_isolation_scope:
                     with import_isolation.isolated_batch_import_target(
@@ -6074,6 +6084,22 @@ class WITCH_OT_cancel_layer_stream_job(bpy.types.Operator):
             return {'CANCELLED'}
         _LAYER_STREAM_JOB["cancel_requested"] = True
         _tag_layer_stream_redraw(context, wm=getattr(context, "window_manager", None))
+        return {'FINISHED'}
+
+
+class WITCH_OT_stream_missing_materials(bpy.types.Operator):
+    bl_idname = "witcher.stream_missing_materials"
+    bl_label = "Stream Missing Materials"
+    bl_description = "Find imported meshes whose Witcher materials were never filled (e.g. after an interrupted load) and stream them in the background"
+
+    def execute(self, context):
+        queued = import_blender_fun.queue_missing_scene_materials()
+        if queued <= 0:
+            self.report({'INFO'}, "No missing Witcher materials found")
+            return {'FINISHED'}
+        import_blender_fun.set_deferred_materials_paused(False)
+        import_blender_fun.ensure_deferred_material_timer()
+        self.report({'INFO'}, f"Streaming materials for {queued} meshes in the background")
         return {'FINISHED'}
 
 

@@ -249,14 +249,15 @@ def convert_xbm_to_dds(fdir, force=False, out_path=None):
         packed_width = struct.pack('i', width)
         packed_height = struct.pack('i', height)
 
-        if dxt in ['TCM_DXTNoAlpha', 'TCM_Normals']:
-            packed_dxt = b'\x44\x58\x54\x31'
-        elif dxt == 'TCM_None':
-            packed_dxt = b'\x00\x00\x00\x00'
-        elif dxt in ['TCM_DXTAlpha', 'TCM_NormalsHigh', 'TCM_NormalsGloss', 'TCM_QualityColor']:
-            packed_dxt = b'\x44\x58\x54\x35'
-        else:
-            raise ValueError(f"Unknown DXT compression: {dxt}")
+        if metadata is None:
+            if dxt in ['TCM_DXTNoAlpha', 'TCM_Normals']:
+                packed_dxt = b'\x44\x58\x54\x31'
+            elif dxt == 'TCM_None':
+                packed_dxt = b'\x00\x00\x00\x00'
+            elif dxt in ['TCM_DXTAlpha', 'TCM_NormalsHigh', 'TCM_NormalsGloss', 'TCM_QualityColor']:
+                packed_dxt = b'\x44\x58\x54\x35'
+            else:
+                raise ValueError(f"Unknown DXT compression: {dxt}")
 
         if os.path.exists(dds_path) and not force:
             return dds_path

@@ -204,6 +204,8 @@ def test_collision_proxy_evaluated_geometry():
     )
     assert proxy is not None
     assert proxy.parent is parent
+    assert proxy.hide_render
+    assert proxy.display_type != 'WIRE'
     assert bool(proxy.get("witcher_apx_collision_proxy", False))
 
     modifier = proxy.modifiers.get("WitcherAPXCollisionProxy")
@@ -238,6 +240,9 @@ def test_collision_proxy_evaluated_geometry():
     finally:
         evaluated_proxy.to_mesh_clear()
 
+    importer._parent_and_namespace_collision_objects("W3TB", parent, [source_a, source_b])
+    assert all(source.hide_render for source in (source_a, source_b))
+    assert all(source.display_type == 'SOLID' for source in (source_a, source_b))
     return proxy, source_a, source_b
 
 

@@ -261,10 +261,6 @@ def create_collision_proxy_object(name: str, parent: Object, owner_collection, s
     proxy.hide_render = True
     proxy.hide_select = True
     try:
-        proxy.display_type = 'WIRE'
-    except Exception:
-        pass
-    try:
         proxy["witcher_apx_collision_proxy"] = True
     except Exception:
         pass
