@@ -2153,7 +2153,39 @@ def _coerce_slot_inline_ui_state(slot):
     return repaired
 
 
+def _get_loaded_slot_mount_strategy(slot):
+    guid = str(getattr(slot, "equip_guid", "") or "")
+    if not getattr(slot, "is_loaded", False) or not guid:
+        return ""
+    objects = [
+        obj for obj in find_objects_by_guid(guid, "witcher_equip_guid")
+        if not obj.get("witcher_bound_parent_guid")
+    ]
+    for obj in objects:
+        strategy = str(obj.get("witcher_mount_strategy", "") or "")
+        if strategy:
+            return strategy
+
+    object_set = set(objects)
+    for obj in objects:
+        if getattr(obj, "type", "") != 'ARMATURE':
+            continue
+        if any(
+            constraint.type in {'COPY_TRANSFORMS', 'CHILD_OF'}
+            and getattr(constraint, "target", None) not in object_set
+            and getattr(getattr(constraint, "target", None), "type", "") == 'ARMATURE'
+            for bone in obj.pose.bones
+            for constraint in bone.constraints
+        ):
+            return "owner_graph_bound"
+    return ""
+
+
 def _get_slot_hold_toggle_state(slot, slot_policy):
+    if slot.is_loaded and _get_loaded_slot_mount_strategy(slot) == "owner_graph_bound":
+        if slot.is_in_hold_slot:
+            return True, "Mount", 'FILE_3D'
+        return False, "", 'ARMATURE_DATA'
     if slot.is_loaded and slot_policy["hold_valid"]:
         is_in_hold = bool(slot.is_in_hold_slot)
         toggle_icon = 'ARMATURE_DATA' if is_in_hold else 'FILE_3D'
@@ -2571,12 +2603,19 @@ def _mount_animated_roots_with_anchor(roots, guid, kind, parent_hint, *, slot_em
     return anchor
 
 
+def _objects_in_current_view_layer(objects):
+    view_layer = getattr(bpy.context, "view_layer", None)
+    if view_layer is None:
+        return []
+    return [
+        obj for obj in objects
+        if getattr(obj, "name", "") in view_layer.objects
+        and not import_entity._is_redcloth_collision_helper(obj)
+    ]
+
+
 def hide_objects_by_guid(guid, prop_name, hidden=True):
-    """Toggle viewport visibility for all objects with the given GUID.
-    
-    Uses hide_set() for temporary UI visibility toggle (doesn't conflict with drivers).
-    """
-    objects = find_objects_by_guid(guid, prop_name)
+    objects = _objects_in_current_view_layer(find_objects_by_guid(guid, prop_name))
     for obj in objects:
         if obj.get("witcher_mount_anchor"):
             obj.hide_set(True)
@@ -2885,7 +2924,13 @@ def _can_load_slot_for_mount_mode(slot_policy, mount_mode):
     mount_mode = str(mount_mode or "").strip().lower()
     if mount_mode == "hold":
         return bool(slot_policy.get("hold_valid"))
-    return slot_policy.get("policy") == "equipable_on_rig"
+    if slot_policy.get("policy") == "equipable_on_rig":
+        return True
+    equip_target = slot_policy.get("equip_target") or {}
+    return bool(
+        slot_policy.get("item_is_visual")
+        and not str(equip_target.get("name", "") or "").strip()
+    )
 
 
 def _slot_has_explicit_mount_target(slot):
@@ -4212,6 +4257,13 @@ def _resolve_visual_policy_from_slot_names(equip_slot_name, hold_slot_name, arma
         policy = "equipable_on_rig"
     elif equip_target["is_valid"]:
         policy = "equipable_on_rig"
+    # Slotless skinned items mount to the owner; hold_slot remains an alternate.
+    elif (
+        attachment_profile is not None
+        and getattr(attachment_profile, "has_skinned_mesh_payload", False)
+        and not equip_slot_name
+    ):
+        policy = "equipable_on_rig"
     elif hold_target["is_valid"]:
         policy = "hold_only_on_rig"
     elif allow_unmounted_visual:
@@ -4702,7 +4754,7 @@ def _set_child_of_inverse_for_armature(bound_armature):
 def _is_guid_hidden(guid, prop_name="witcher_equip_guid"):
     if not guid:
         return False
-    objs = find_objects_by_guid(guid, prop_name)
+    objs = _objects_in_current_view_layer(find_objects_by_guid(guid, prop_name))
     if not objs:
         return False
     try:
@@ -4716,7 +4768,7 @@ def _iter_bound_item_objects(parent_guid, bound_name):
             yield obj
 
 def _is_bound_item_hidden(parent_guid, bound_name):
-    objs = list(_iter_bound_item_objects(parent_guid, bound_name))
+    objs = _objects_in_current_view_layer(_iter_bound_item_objects(parent_guid, bound_name))
     if not objs:
         return False
     try:
@@ -6227,9 +6279,21 @@ class EQUIPMENT_OT_ToggleItem(bpy.types.Operator):
             return {'CANCELLED'}
 
         is_in_hold = bool(slot.is_in_hold_slot)
+        mount_strategy = _get_loaded_slot_mount_strategy(slot)
         target_info = slot_policy["equip_target"] if is_in_hold else slot_policy["hold_target"]
 
-        if is_in_hold and not slot_policy["equip_valid"]:
+        if mount_strategy == "owner_graph_bound" and not is_in_hold:
+            self.report({'INFO'}, f"'{slot.item_name}' is skinned to its owner and has no hold state")
+            return {'CANCELLED'}
+
+        if is_in_hold and (mount_strategy == "owner_graph_bound" or not slot_policy["equip_valid"]):
+            if load_equipment_item(context, ob, self.slot_index, rig_settings, mount_mode="equip"):
+                self.report({'INFO'}, f"'{slot.item_name}' moved to mount")
+                return {'FINISHED'}
+            if mount_strategy == "owner_graph_bound":
+                reason = _get_last_equipment_load_failure(ob, self.slot_index) or "Unknown failure"
+                self.report({'WARNING'}, reason)
+                return {'CANCELLED'}
             unload_equipment_item(slot)
             self.report({'INFO'}, f"'{slot.item_name}' put away")
             return {'FINISHED'}
@@ -6340,7 +6404,7 @@ class EQUIPMENT_OT_HideBoundItem(bpy.types.Operator):
         if self.slot_index < 0 or self.slot_index >= len(rig_settings.equipment_slots):
             return {'CANCELLED'}
         slot = rig_settings.equipment_slots[self.slot_index]
-        for obj in _iter_bound_item_objects(slot.equip_guid, self.bound_name):
+        for obj in _objects_in_current_view_layer(_iter_bound_item_objects(slot.equip_guid, self.bound_name)):
             obj.hide_set(True)
         return {'FINISHED'}
 
@@ -6360,7 +6424,7 @@ class EQUIPMENT_OT_ShowBoundItem(bpy.types.Operator):
         if self.slot_index < 0 or self.slot_index >= len(rig_settings.equipment_slots):
             return {'CANCELLED'}
         slot = rig_settings.equipment_slots[self.slot_index]
-        for obj in _iter_bound_item_objects(slot.equip_guid, self.bound_name):
+        for obj in _objects_in_current_view_layer(_iter_bound_item_objects(slot.equip_guid, self.bound_name)):
             obj.hide_set(False)
         return {'FINISHED'}
 
@@ -6988,10 +7052,10 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
 
                     vis_sub = controls.row(align=True)
                     vis_sub.enabled = slot.is_loaded
-                    is_hidden = bool(slot.is_loaded and _is_guid_hidden(slot.equip_guid, "witcher_equip_guid"))
-                    vis_icon = 'HIDE_OFF' if is_hidden else 'HIDE_ON'
-                    vis_op_name = "witcher.equipment_show_equipment" if is_hidden else "witcher.equipment_hide_equipment"
-                    op = vis_sub.operator(vis_op_name, text="", icon=vis_icon)
+                    is_visible = bool(slot.is_loaded and not _is_guid_hidden(slot.equip_guid, "witcher_equip_guid"))
+                    vis_icon = 'HIDE_OFF' if is_visible else 'HIDE_ON'
+                    vis_op_name = "witcher.equipment_hide_equipment" if is_visible else "witcher.equipment_show_equipment"
+                    op = vis_sub.operator(vis_op_name, text="", icon=vis_icon, depress=is_visible)
                     op.slot_index = i if slot.is_loaded else -1
 
                     if slot.is_loaded:
@@ -7003,7 +7067,7 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                         if can_load:
                             op = btn.operator("witcher.equipment_load_equipment", text="", icon='IMPORT')
                             op.slot_index = i
-                            op.mount_mode = requested_mount_mode
+                            op.mount_mode = "auto"
                         else:
                             op = btn.operator("witcher.equipment_load_disabled", text="", icon='IMPORT')
                             op.reason = slot_policy.get("reason", "Incompatible item/rig.")
@@ -7025,11 +7089,10 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                             bound_row = box.row(align=True)
                             bound_row.label(text=f"  Bound: {bound_name}", icon='LINKED')
                             if slot.is_loaded:
-                                hidden = _is_bound_item_hidden(slot.equip_guid, bound_name)
-                                if hidden:
-                                    op = bound_row.operator("witcher.equipment_show_bound_item", text="", icon='HIDE_OFF')
-                                else:
-                                    op = bound_row.operator("witcher.equipment_hide_bound_item", text="", icon='HIDE_ON')
+                                is_visible = not _is_bound_item_hidden(slot.equip_guid, bound_name)
+                                op_name = "witcher.equipment_hide_bound_item" if is_visible else "witcher.equipment_show_bound_item"
+                                icon = 'HIDE_OFF' if is_visible else 'HIDE_ON'
+                                op = bound_row.operator(op_name, text="", icon=icon, depress=is_visible)
                                 op.slot_index = i
                                 op.bound_name = bound_name
                 if not visible_slots:
@@ -8676,9 +8739,6 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
             pass
 
     requested_mount_mode = str(mount_mode or "").strip().lower()
-    if requested_mount_mode not in {"equip", "hold"}:
-        requested_mount_mode = "hold" if (slot.is_loaded and slot.is_in_hold_slot) else "equip"
-    allow_unmounted_visual_load = False
 
     effective_template = get_effective_equip_template(slot)
     if not effective_template or effective_template == "None":
@@ -8689,9 +8749,6 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         return False
 
     prepared = _prepare_equipment_load_context(armature, rig_settings, prepared_context)
-    target_key = "hold_target" if requested_mount_mode == "hold" else "equip_target"
-    target_label = "hold" if requested_mount_mode == "hold" else "equip"
-
     source_roots = prepared.get("source_roots", [])
     _core_started = time.perf_counter()
     _resolve_started = time.perf_counter()
@@ -8741,14 +8798,6 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
     _coerce_slot_inline_ui_state(slot)
 
     attachment_profile = import_entity.classify_equipment_attachment_profile(item_entity_for_apps)
-    allow_unmounted_visual_load = (
-        requested_mount_mode == "equip"
-        and _allow_unmounted_slotless_visual(
-            slot,
-            attachment_profile=attachment_profile,
-            item_entity=item_entity_for_apps,
-        )
-    )
     _maybe_log_legacy_attachment_type_conflict(
         getattr(slot, "item_name", "") or effective_template,
         getattr(slot, "attachment_type", ""),
@@ -8760,6 +8809,18 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         rig_settings,
         item_entity=item_entity_for_apps,
         attachment_profile=attachment_profile,
+    )
+    if requested_mount_mode not in {"equip", "hold"}:
+        requested_mount_mode = _get_slot_requested_mount_mode(slot, slot_policy)
+    target_key = "hold_target" if requested_mount_mode == "hold" else "equip_target"
+    target_label = "hold" if requested_mount_mode == "hold" else "equip"
+    allow_unmounted_visual_load = (
+        requested_mount_mode == "equip"
+        and _allow_unmounted_slotless_visual(
+            slot,
+            attachment_profile=attachment_profile,
+            item_entity=item_entity_for_apps,
+        )
     )
     target_info = slot_policy[target_key]
     target_armature = target_info.get("armature") or armature
@@ -8907,6 +8968,8 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         return False
     slot.equip_guid = guid
     slot.is_loaded = True
+    for obj in new_objects:
+        obj["witcher_mount_strategy"] = mount_strategy
 
     try:
         selected_item_appearance = str(import_info.get("selected_appearance_name", "") or "").strip()
@@ -9158,7 +9221,7 @@ def load_equipment_items_batch(context, armature, slot_indices, rig_settings=Non
                 prepared_context=prepared,
                 refresh_variants_before_load=False,
                 post_refresh_variants=False,
-                mount_mode=mount_mode_resolved,
+                mount_mode=mount_mode,
             ):
                 loaded += 1
 
@@ -9405,7 +9468,7 @@ class EQUIPMENT_OT_LoadEquipment(bpy.types.Operator):
                             mount_mode_resolved = _get_slot_requested_mount_mode(slots[i], slot_policy)
                         if not _can_load_slot_for_mount_mode(slot_policy, mount_mode_resolved):
                             continue
-                        if load_equipment_item(context, armature, i, rig_settings, mount_mode=mount_mode_resolved):
+                        if load_equipment_item(context, armature, i, rig_settings, mount_mode=self.mount_mode):
                             loaded += 1
                         else:
                             if slots[i].equip_template and slots[i].equip_template != "None":
@@ -9418,11 +9481,7 @@ class EQUIPMENT_OT_LoadEquipment(bpy.types.Operator):
                 else:
                     if self.slot_index < len(slots):
                         slot = slots[self.slot_index]
-                        slot_policy = _resolve_slot_visual_policy(slot, armature, rig_settings)
-                        mount_mode_resolved = str(self.mount_mode or "").strip().lower()
-                        if mount_mode_resolved not in {"equip", "hold"}:
-                            mount_mode_resolved = _get_slot_requested_mount_mode(slot, slot_policy)
-                        if load_equipment_item(context, armature, self.slot_index, rig_settings, mount_mode=mount_mode_resolved):
+                        if load_equipment_item(context, armature, self.slot_index, rig_settings, mount_mode=self.mount_mode):
                             loaded += 1
                         else:
                             failed += 1

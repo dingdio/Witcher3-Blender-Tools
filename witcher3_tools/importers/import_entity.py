@@ -4404,9 +4404,6 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
             }
             existing_loaded = True
             for slot in existing_inventory_slots:
-                slot_policy = _resolve_slot_visual_policy(slot, armature, rig_settings)
-                if slot_policy["policy"] != "equipable_on_rig":
-                    continue
                 if not (getattr(slot, "is_loaded", False) and getattr(slot, "equip_guid", "")):
                     existing_loaded = False
                     break
