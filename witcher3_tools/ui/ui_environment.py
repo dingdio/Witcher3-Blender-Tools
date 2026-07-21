@@ -498,6 +498,15 @@ def _preview_values(scene) -> dict[str, Any]:
         (255.0, 255.0, 255.0, 1.0),
         zero_color_is_unset=True,
     )
+    eye_blick_color_value = _blend_curve_value(
+        base_environment,
+        overlay_environment,
+        weather_blend,
+        seconds,
+        ("globallight.characterseyeblickscolor",),
+        (255.0, 255.0, 255.0, 1.0),
+        zero_color_is_unset=True,
+    )
     sun_color_value = _blend_curve_value(
         base_environment,
         overlay_environment,
@@ -1043,15 +1052,10 @@ def _preview_values(scene) -> dict[str, Any]:
                 * float(getattr(settings, "ambient_light_energy", 1.0))
                 * _BLENDER_REFLECTION_FILL_ENERGY_SCALE
             )
-    # Direct environment previews omit camera-following lights.
-    camera_lights = (
-        _camera_light_values(
-            base_environment,
-            seconds,
-            float(settings.key_light_energy),
-        )
-        if not direct_environment
-        else ()
+    camera_lights = _camera_light_values(
+        base_environment,
+        seconds,
+        float(settings.key_light_energy),
     )
 
     weather_effects = ()
@@ -1094,6 +1098,10 @@ def _preview_values(scene) -> dict[str, Any]:
         "moon_color": _curve_color(moon_color_value, (0.55, 0.65, 1.0, 1.0)),
         "key_color": key_color,
         "key_energy": key_energy,
+        "eye_blick_color": _curve_color(
+            eye_blick_color_value,
+            (255.0, 255.0, 255.0, 1.0),
+        ),
         "ambient_color": ambient_color,
         "ambient_energy": ambient_energy,
         "camera_lights": camera_lights,
@@ -1173,11 +1181,14 @@ def _refresh_preview(context, *, ensure: bool = False, quiet: bool = False):
     if settings is None or not settings.preview_enabled:
         return None
     values = _preview_values(scene)
+    eye_blick_color = values.pop("eye_blick_color", (1.0, 1.0, 1.0))
     preview = _preview_module()
     if ensure:
         result = preview.ensure_preview(context, **values)
     else:
         result = preview.update_preview(context, **values)
+    from ..materials.material import set_eye_blick_environment_color
+    set_eye_blick_environment_color(eye_blick_color, scene=scene)
     if not quiet:
         warnings = tuple(getattr(result, "warnings", ()) or ())
         if warnings:
@@ -1204,6 +1215,14 @@ def _refresh_preview(context, *, ensure: bool = False, quiet: bool = False):
                     details.append(f"{label}: {resolved}")
             _set_status(settings, "Preview updated", details="\n".join(details), level="OK")
     return result
+
+
+def _show_environment_in_viewports(context) -> None:
+    for window in getattr(context.window_manager, "windows", ()):
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                area.spaces.active.shading.use_scene_world = True
+                area.spaces.active.shading.use_scene_lights = True
 
 
 def _on_daycycle_changed(settings, context) -> None:
@@ -1241,8 +1260,11 @@ def _on_preview_enabled(settings, context) -> None:
         if settings.preview_enabled:
             _ensure_loaded(context)
             _refresh_preview(context, ensure=True, quiet=True)
+            _show_environment_in_viewports(context)
         else:
             _preview_module().clear_preview(context)
+            from ..materials.material import set_eye_blick_environment_color
+            set_eye_blick_environment_color((1.0, 1.0, 1.0), scene=context.scene)
     except Exception as exc:
         _set_status(settings, "Preview unavailable", details=str(exc), level="WARNING")
 
@@ -1292,7 +1314,8 @@ def _environment_details(resolved: str) -> str:
     return (
         f"Environment: {resolved}\n\n"
         "Preview: sky and horizon color, sky brightness, stars, visible sun and moon, "
-        "and the global key light. Other environment fields remain loaded but are not previewed."
+        "global key light, character camera lights, and eye-highlight color. "
+        "Other environment fields remain loaded but are not previewed."
     )
 
 
@@ -1412,6 +1435,7 @@ def load_environment_path(context, path: str) -> EnvironmentUIResult:
         )
         if settings.preview_enabled:
             _refresh_preview(context, ensure=True, quiet=True)
+            _show_environment_in_viewports(context)
         return EnvironmentUIResult(True, settings.status_text, environment, resolved)
     except Exception as exc:
         _set_status(settings, "Environment load failed", details=str(exc), level="ERROR")
@@ -1612,6 +1636,8 @@ def _disable_preview_environment_selector(settings, context) -> None:
         settings.preview_enabled = False
     else:
         _preview_module().clear_preview(context)
+    from ..materials.material import set_eye_blick_environment_color
+    set_eye_blick_environment_color((1.0, 1.0, 1.0), scene=context.scene)
     _set_status(
         settings,
         "Preview environment off",
@@ -1659,6 +1685,7 @@ def _apply_preview_environment_identifier(settings, context, identifier: str) ->
     )
     if settings.preview_enabled:
         _refresh_preview(context, ensure=True, quiet=True)
+        _show_environment_in_viewports(context)
     else:
         settings.preview_enabled = True
     return EnvironmentUIResult(True, settings.status_text, environment, resolved)
@@ -2107,6 +2134,8 @@ class WITCH_OT_EnvironmentPreview(bpy.types.Operator):
             if self.action == "CLEAR":
                 removed = _preview_module().clear_preview(context)
                 settings.preview_enabled = False
+                from ..materials.material import set_eye_blick_environment_color
+                set_eye_blick_environment_color((1.0, 1.0, 1.0), scene=context.scene)
                 _set_status(settings, "Preview cleared", details=f"Removed objects: {removed}", level="OK")
             else:
                 _ensure_loaded(context)

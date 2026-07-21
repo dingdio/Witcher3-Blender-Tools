@@ -1296,6 +1296,8 @@ class MyMimicListItem_Debug(bpy.types.Operator):
             return "Load currently selected mimic animation"
         if properties.action == "clear_search":
             return "Clear quick mimic search"
+        if properties.action == "search":
+            return "Search quick mimic list"
         if properties.action == "clear":
             return "Clear quick mimic list"
         return ""
@@ -1331,6 +1333,8 @@ class MyMimicListItem_Debug(bpy.types.Operator):
                 setattr(scene, MIMIC_SEARCH_PROP, "")
             else:
                 RefreshMimicList(context=context)
+        elif "search" == action:
+            RefreshMimicList(context=context)
         elif "clear" == action:
             log.debug("=== Debug Clear ====")
             getattr(scene, MIMIC_LIST_PROP).clear()
@@ -1518,7 +1522,8 @@ class SCENE_PT_witcher_mimic_list(WITCH_PT_Base, bpy.types.Panel):
         layout = self.layout
 
         search_row = layout.row(align=True)
-        search_row.prop(scn, MIMIC_SEARCH_PROP, text="", icon='VIEWZOOM')
+        search_row.prop(scn, MIMIC_SEARCH_PROP, text="")
+        search_row.operator("witcher.quick_mimic_debug", text="", icon='VIEWZOOM').action = "search"
         clear_btn = search_row.row(align=True)
         clear_btn.enabled = bool(getattr(scn, MIMIC_SEARCH_PROP, ""))
         clear_btn.operator("witcher.quick_mimic_debug", text="", icon='X').action = "clear_search"

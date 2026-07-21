@@ -6618,7 +6618,8 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
 
                 search_row = mimic_col.row(align=True)
                 if hasattr(scene, _ui_mimics_dialog.MIMIC_SEARCH_PROP):
-                    search_row.prop(scene, _ui_mimics_dialog.MIMIC_SEARCH_PROP, text="", icon='VIEWZOOM')
+                    search_row.prop(scene, _ui_mimics_dialog.MIMIC_SEARCH_PROP, text="")
+                    search_row.operator("witcher.quick_mimic_debug", text="", icon='VIEWZOOM').action = "search"
                     clear_btn = search_row.row(align=True)
                     clear_btn.enabled = bool(getattr(scene, _ui_mimics_dialog.MIMIC_SEARCH_PROP, ""))
                     clear_btn.operator("witcher.quick_mimic_debug", text="", icon='X').action = "clear_search"

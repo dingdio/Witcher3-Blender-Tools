@@ -24,6 +24,7 @@ from bpy.types import PropertyGroup
 from bpy.props import IntProperty, StringProperty, CollectionProperty, BoolProperty, EnumProperty
 
 _DYNAMIC_ENUM_CACHE = {}
+_EYE_MATERIAL_MORPHS = frozenset({'iris_wide', 'iris_narrow'})
 
 
 def _cache_dynamic_enum_items(cache_key, items):
@@ -1147,6 +1148,17 @@ def _ensure_morph_shape_key(mesh_bl_o, this_POSE_name):
         except TypeError:
             new_morph = mesh_bl_o.shape_key_add(name=this_POSE_name)
     return new_morph
+
+
+def _ensure_neutral_morph_shape_key(mesh_bl_o, pose_name):
+    shape_key = _ensure_morph_shape_key(mesh_bl_o, pose_name)
+    shape_keys = mesh_bl_o.data.shape_keys
+    basis = shape_keys.reference_key or shape_keys.key_blocks[0]
+    coords = [0.0] * (len(basis.data) * 3)
+    basis.data.foreach_get("co", coords)
+    shape_key.data.foreach_set("co", coords)
+    shape_key.value = 0.0
+    return shape_key
 
 
 def _write_morph_shape_key_coords(obj, mesh_bl_o, this_POSE_name, coords, control_bone_name='w3_face_poses', ensure_driver=True):
@@ -2427,12 +2439,18 @@ def try_copy_face_morphs_from_donor(context, main_obj):
             donor_mesh = donor_map[target_keys[mesh_obj.name]]
             copy_names = donor_names[target_keys[mesh_obj.name]]
             if donor_mesh is mesh_obj or donor_mesh.data is mesh_obj.data:
+                for key_name in _EYE_MATERIAL_MORPHS.intersection(copy_names):
+                    _ensure_neutral_morph_shape_key(mesh_obj, key_name)
                 copied_keys += len(copy_names)
                 continue
             _remove_face_reload_shape_keys([mesh_obj], set(copy_names))
             donor_blocks = donor_mesh.data.shape_keys.key_blocks
             coords = [0.0] * (len(donor_mesh.data.vertices) * 3)
             for key_name in copy_names:
+                if key_name in _EYE_MATERIAL_MORPHS:
+                    _ensure_neutral_morph_shape_key(mesh_obj, key_name)
+                    copied_keys += 1
+                    continue
                 donor_block = donor_blocks.get(key_name)
                 if donor_block is None:
                     continue
@@ -2465,6 +2483,18 @@ def try_copy_face_morphs_from_donor(context, main_obj):
                 log.warning("Phoneme refresh after face morph reuse returned %s", op_result)
         except Exception as exc:
             log.warning("Phoneme refresh after face morph reuse failed: %s", exc)
+
+        try:
+            from ..materials import material as material_module
+            iris_driver_count = material_module.setup_eye_iris_morph_drivers(
+                target_meshes,
+                main_obj,
+                W3_FACE_POSES_BONE,
+            )
+            if iris_driver_count:
+                log.info("Linked iris face controls to %d eye material(s).", iris_driver_count)
+        except Exception as exc:
+            log.warning("Could not link iris face controls to eye materials: %s", exc)
 
         log.info(
             "Reused %d baked face morph shape key(s) for %s from an identical head already in the scene.",
@@ -2704,6 +2734,12 @@ class WITCH_OT_morphs(bpy.types.Operator):
                                 f"Baking face morph {pose_index + 1}/{total_poses}: {pose.name}"
                             )
 
+                        # Iris poses drive the eye material, not skinned geometry.
+                        if not use_w2_mimic and pose.name in _EYE_MATERIAL_MORPHS:
+                            for target_mesh, _source_mesh in bake_mesh_pairs:
+                                _ensure_neutral_morph_shape_key(target_mesh, pose.name)
+                            continue
+
                         step_started = time.perf_counter()
                         _clear_armature_pose_state(bake_evaluation_armatures if using_duplicate_bake else [bake_face_rig])
                         _accum_bake_step("clear", step_started)
@@ -2879,6 +2915,18 @@ class WITCH_OT_morphs(bpy.types.Operator):
                         log.warning("Auto phoneme refresh returned %s", op_result)
                 except Exception as exc:
                     log.warning("Auto phoneme refresh failed: %s", exc)
+
+                try:
+                    from ..materials import material as material_module
+                    iris_driver_count = material_module.setup_eye_iris_morph_drivers(
+                        face_mesh_objs,
+                        main_obj,
+                        control_bone_name,
+                    )
+                    if iris_driver_count:
+                        log.info("Linked iris face controls to %d eye material(s).", iris_driver_count)
+                except Exception as exc:
+                    log.warning("Could not link iris face controls to eye materials: %s", exc)
 
             #bpy.context.view_layer.objects.active = main_obj
             return {'FINISHED'}

@@ -133,6 +133,7 @@ _BLENDER_CLOUD_MAX_REACH = 2048.0
 # Eevee's default 1 mm SUN shadow texel exhausts the virtual shadow pool on a
 # whole imported world. Two centimetres retains useful authored shadows.
 _BLENDER_KEY_SHADOW_RESOLUTION = 0.02
+_BLENDER_CHARACTER_KEY_SHADOW_RESOLUTION = 0.001
 # These upper-sky colors are not a full environment probe; keep proxies overhead.
 _AMBIENT_FILL_DIRECTIONS = (
     (1.0, 1.0, 1.0),
@@ -1953,9 +1954,13 @@ def _ensure_key_light(collection, anchor):
         light_obj.data.type = "SUN"
     light_obj.data.use_shadow = True
     if hasattr(light_obj.data, "shadow_maximum_resolution"):
-        light_obj.data.shadow_maximum_resolution = max(
-            float(light_obj.data.shadow_maximum_resolution),
-            _BLENDER_KEY_SHADOW_RESOLUTION,
+        source_name = _normalise_depot_path(
+            collection.get(_SOURCE_PATH_PROP, "")
+        ).rsplit("\\", 1)[-1].casefold()
+        light_obj.data.shadow_maximum_resolution = (
+            _BLENDER_CHARACTER_KEY_SHADOW_RESOLUTION
+            if source_name == "gui_character_environment.env"
+            else _BLENDER_KEY_SHADOW_RESOLUTION
         )
     # SUN translation is irrelevant. Keeping it under the moving sky anchor
     # needlessly reevaluates the light and every lit object on camera movement.

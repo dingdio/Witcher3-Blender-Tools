@@ -5,7 +5,6 @@ import logging
 log = logging.getLogger(__name__)
 
 from pathlib import Path
-from math import radians
 import hashlib
 import struct
 import time
@@ -212,13 +211,16 @@ def ensure_node_group(ng_name, resource_path=RES_PATH):
         raise KeyError(f"Node group {ng_name} not found in {resource_path}")
     ng.use_fake_user = False
 
-    if _node_group_family_name(ng.name).lower() == 'witcher3_skin':
+    family_name = _node_group_family_name(ng.name).lower()
+    if family_name == 'witcher3_skin':
         _ensure_witcher3_skin_subsurface(ng)
+    elif family_name == 'witcher3_eye':
+        _ensure_witcher3_eye_shader(ng)
 
     return ng
 
 
-MATERIAL_SETUP_VERSION = 5
+MATERIAL_SETUP_VERSION = 7
 _BASE_PATH_NODE_GROUP_CACHE: Dict[Tuple[object, ...], Dict[str, str]] = {}
 _RESOURCE_NODE_GROUP_CACHE: Dict[str, Tuple[Optional[float], Set[str]]] = {}
 
@@ -1781,6 +1783,54 @@ def _ensure_witcher3_skin_subsurface(node_tree) -> None:
         scale.default_value = 0.01
 
 
+def _ensure_witcher3_eye_shader(node_tree) -> None:
+    group_input = next((node for node in node_tree.nodes if node.type == 'GROUP_INPUT'), None)
+    group_output = next((node for node in node_tree.nodes if node.type == 'GROUP_OUTPUT'), None)
+    principled = next((node for node in node_tree.nodes if node.type == 'BSDF_PRINCIPLED'), None)
+    if group_input is None or group_output is None or principled is None:
+        return
+
+    emission = node_tree.nodes.get('W3 Eye Blick Emission') or next(
+        (node for node in node_tree.nodes if node.type == 'EMISSION'),
+        None,
+    )
+    if emission is None:
+        emission = node_tree.nodes.new('ShaderNodeEmission')
+    emission.name = 'W3 Eye Blick Emission'
+    emission.label = 'REDengine Blick'
+    emission.inputs['Strength'].default_value = 1.0
+
+    add_shader = node_tree.nodes.get('W3 Eye Additive Blick')
+    if add_shader is None or add_shader.type != 'ADD_SHADER':
+        if add_shader is not None:
+            node_tree.nodes.remove(add_shader)
+        add_shader = node_tree.nodes.new('ShaderNodeAddShader')
+        add_shader.name = 'W3 Eye Additive Blick'
+    add_shader.label = 'Base + Blick'
+
+    def replace_input(source, target) -> None:
+        while target.is_linked:
+            node_tree.links.remove(target.links[0])
+        node_tree.links.new(source, target)
+
+    blick = _find_socket_by_name(group_input.outputs, 'BlickCube')
+    specular = _find_socket_by_name(group_input.outputs, 'Specular')
+    specular_input = _find_socket_by_name(principled.inputs, 'Specular IOR Level')
+    if specular_input is None:
+        specular_input = _find_socket_by_name(principled.inputs, 'Specular')
+    if blick is not None:
+        replace_input(blick, emission.inputs['Color'])
+    if specular is not None and specular_input is not None:
+        replace_input(specular, specular_input)
+
+    replace_input(principled.outputs[0], add_shader.inputs[0])
+    replace_input(emission.outputs[0], add_shader.inputs[1])
+    for output_name in ('Cycles', 'Eevee'):
+        output = _find_socket_by_name(group_output.inputs, output_name)
+        if output is not None:
+            replace_input(add_shader.outputs[0], output)
+
+
 def get_active_witcher_group_node(material: Optional[Material]) -> Optional[Node]:
     if material is None or getattr(material, "node_tree", None) is None:
         return None
@@ -2648,7 +2698,7 @@ def create_node_cubemap(
     if w2cube_path and os.path.exists(win_safe_path(w2cube_path)):
         try:
             if par_name == 'BlickCube':
-                loaded_img, dds_path = load_w2cube_blick_equirect_image(w2cube_path, colorspace='sRGB')
+                loaded_img, dds_path = load_w2cube_blick_equirect_image(w2cube_path, colorspace='Non-Color')
             else:
                 loaded_img, dds_path = load_w2cube_image(w2cube_path, colorspace='sRGB')
         except Exception as e:
@@ -2672,7 +2722,7 @@ def create_node_cubemap(
         try:
             img = bpy_image_load_safe(dds_path, check_existing=True)
             if img:
-                img.colorspace_settings.name = 'sRGB'
+                img.colorspace_settings.name = 'Non-Color' if par_name == 'BlickCube' else 'sRGB'
                 node.image = img
                 if par_name == 'BlickCube':
                     log.warning("BlickCube equirect build failed, falling back to DDS cubemap image: %s", dds_path)
@@ -2692,103 +2742,583 @@ def create_node_cubemap(
     return node
 
 
+_EYE_BLICK_ENV_NODE = 'W3 Eye Environment Blick'
+_EYE_BLICK_SCENE_PROP = 'witcher_eye_blick_color'
+_EYE_IRIS_MORPH_CONTROL_NODE = 'W3 Eye Iris Morph Control'
+_EYE_IRIS_MORPH_STRENGTH_NODE = 'W3 Eye Iris Morph Strength'
+_EYE_IRIS_SIZE_BASE_PROP = 'witcher_eye_iris_size_base'
+_EYE_IRIS_CONTROLLER_PROP = 'witcher_eye_iris_controller'
+
+
+def set_eye_blick_environment_color(color, *, scene=None) -> tuple[float, float, float]:
+    rgb = tuple(max(0.0, float(value)) for value in tuple(color)[:3])
+    if len(rgb) != 3:
+        rgb = (1.0, 1.0, 1.0)
+    scene = scene or getattr(bpy.context, 'scene', None)
+    if scene is not None:
+        scene[_EYE_BLICK_SCENE_PROP] = rgb
+    for mat in bpy.data.materials:
+        tree = getattr(mat, 'node_tree', None)
+        if tree is None:
+            continue
+        node = tree.nodes.get(_EYE_BLICK_ENV_NODE)
+        if node is not None and node.type == 'VECT_MATH':
+            node.inputs[1].default_value = rgb
+    return rgb
+
+
 def setup_eye_reflection_nodes(material: Material, nodegroup_node: Node, nodes, links):
-    """Configure the pbr_eye Blick cubemap sampler without extra emission/fresnel nodes."""
-    del material  # Kept for call-site compatibility.
-
     def find_blick_env_node():
-        blick_input = nodegroup_node.inputs.get('BlickCube')
-        if blick_input and blick_input.is_linked:
-            for link in blick_input.links:
-                if link.from_node and link.from_node.type == 'TEX_ENVIRONMENT':
-                    return link.from_node
-
         node = nodes.get('BlickCube')
-        if node and node.type == 'TEX_ENVIRONMENT':
+        if node is not None and node.type == 'TEX_ENVIRONMENT':
             return node
-
-        for node in nodes:
-            if node.type != 'TEX_ENVIRONMENT':
-                continue
-            if node.name == 'BlickCube' or node.label == 'BlickCube':
-                return node
-        return None
+        return next(
+            (
+                node for node in nodes
+                if node.type == 'TEX_ENVIRONMENT'
+                and (node.name == 'BlickCube' or node.label == 'BlickCube')
+            ),
+            None,
+        )
 
     env_node = find_blick_env_node()
-    if not env_node:
+    if env_node is not None:
+        _ensure_witcher3_eye_shader(nodegroup_node.node_tree)
+
+    def ensure(name: str, node_type: str):
+        node = nodes.get(name)
+        if node is not None and node.bl_idname != node_type:
+            nodes.remove(node)
+            node = None
+        if node is None:
+            node = nodes.new(node_type)
+            node.name = name
+        return node
+
+    def replace_input(source, target) -> None:
+        while target.is_linked:
+            links.remove(target.links[0])
+        links.new(source, target)
+
+    def parameter(name: str, target, default: float) -> None:
+        socket = nodegroup_node.inputs.get(name)
+        while target.is_linked:
+            links.remove(target.links[0])
+        if socket is not None and socket.is_linked:
+            links.new(socket.links[0].from_socket, target)
+        else:
+            target.default_value = float(getattr(socket, 'default_value', default))
+
+    for stale_name in ('eye_blick_fetch_vector', 'eye_blick_orientation'):
+        stale = nodes.get(stale_name)
+        if stale is not None:
+            nodes.remove(stale)
+
+    geo = ensure('W3 Eye Geometry', 'ShaderNodeNewGeometry')
+    camera = ensure('W3 Eye Camera Data', 'ShaderNodeCameraData')
+    texcoord = ensure('W3 Eye UV', 'ShaderNodeTexCoord')
+    center_offset = ensure('W3 Eye Center Offset', 'ShaderNodeVectorMath')
+    center_offset.operation = 'SCALE'
+    center = ensure('W3 Eye Center', 'ShaderNodeVectorMath')
+    center.operation = 'SUBTRACT'
+    camera_offset = ensure('W3 Eye Camera Offset', 'ShaderNodeVectorMath')
+    camera_offset.operation = 'SCALE'
+    camera_position = ensure('W3 Eye Camera Position', 'ShaderNodeVectorMath')
+    camera_position.operation = 'ADD'
+    camera_from_center = ensure('W3 Eye Camera From Center', 'ShaderNodeVectorMath')
+    camera_from_center.operation = 'SUBTRACT'
+    flatten = ensure('W3 Eye Horizontal Camera', 'ShaderNodeVectorMath')
+    flatten.operation = 'MULTIPLY'
+    flatten.inputs[1].default_value = (1.0, 1.0, 0.0)
+    side = ensure('W3 Eye Side', 'ShaderNodeVectorMath')
+    side.operation = 'NORMALIZE'
+    forward = ensure('W3 Eye Forward', 'ShaderNodeVectorMath')
+    forward.operation = 'CROSS_PRODUCT'
+    forward.inputs[1].default_value = (0.0, 0.0, 1.0)
+    incident = ensure('W3 Eye Incident', 'ShaderNodeVectorMath')
+    incident.operation = 'SCALE'
+    incident.inputs[3].default_value = -1.0
+    reflection = ensure('W3 Eye Reflection', 'ShaderNodeVectorMath')
+    reflection.operation = 'REFLECT'
+    lookup_x = ensure('W3 Eye Lookup X', 'ShaderNodeVectorMath')
+    lookup_x.operation = 'DOT_PRODUCT'
+    lookup_y = ensure('W3 Eye Lookup Y', 'ShaderNodeVectorMath')
+    lookup_y.operation = 'DOT_PRODUCT'
+    negate_x = ensure('W3 Eye Lookup -X', 'ShaderNodeMath')
+    negate_x.operation = 'MULTIPLY'
+    negate_x.inputs[1].default_value = -1.0
+    reflection_xyz = ensure('W3 Eye Reflection XYZ', 'ShaderNodeSeparateXYZ')
+    lookup = ensure('W3 Eye Blick Lookup', 'ShaderNodeCombineXYZ')
+
+    replace_input(geo.outputs['Normal'], center_offset.inputs[0])
+    parameter('EyeRadius', center_offset.inputs[3], 0.015)
+    replace_input(geo.outputs['Position'], center.inputs[0])
+    replace_input(center_offset.outputs['Vector'], center.inputs[1])
+    replace_input(geo.outputs['Incoming'], camera_offset.inputs[0])
+    replace_input(camera.outputs['View Distance'], camera_offset.inputs[3])
+    replace_input(geo.outputs['Position'], camera_position.inputs[0])
+    replace_input(camera_offset.outputs['Vector'], camera_position.inputs[1])
+    replace_input(camera_position.outputs['Vector'], camera_from_center.inputs[0])
+    replace_input(center.outputs['Vector'], camera_from_center.inputs[1])
+    replace_input(camera_from_center.outputs['Vector'], flatten.inputs[0])
+    replace_input(flatten.outputs['Vector'], side.inputs[0])
+    replace_input(side.outputs['Vector'], forward.inputs[0])
+    replace_input(geo.outputs['Incoming'], incident.inputs[0])
+    replace_input(incident.outputs['Vector'], reflection.inputs[0])
+    replace_input(geo.outputs['Normal'], reflection.inputs[1])
+    replace_input(forward.outputs['Vector'], lookup_x.inputs[0])
+    replace_input(reflection.outputs['Vector'], lookup_x.inputs[1])
+    replace_input(side.outputs['Vector'], lookup_y.inputs[0])
+    replace_input(reflection.outputs['Vector'], lookup_y.inputs[1])
+    replace_input(lookup_x.outputs['Value'], negate_x.inputs[0])
+    replace_input(reflection.outputs['Vector'], reflection_xyz.inputs[0])
+    # w2cube conversion axes: RED (forward, side, up) -> Blender (side, -forward, up).
+    replace_input(lookup_y.outputs['Value'], lookup.inputs['X'])
+    replace_input(negate_x.outputs[0], lookup.inputs['Y'])
+    replace_input(reflection_xyz.outputs['Z'], lookup.inputs['Z'])
+    if env_node is not None:
+        replace_input(lookup.outputs['Vector'], env_node.inputs['Vector'])
+
+    uv_xyz = ensure('W3 Eye UV XYZ', 'ShaderNodeSeparateXYZ')
+    uv_positive = ensure('W3 Eye UV Positive', 'ShaderNodeMath')
+    uv_positive.operation = 'GREATER_THAN'
+    uv_twice = ensure('W3 Eye UV Tile Offset', 'ShaderNodeMath')
+    uv_twice.operation = 'MULTIPLY'
+    uv_twice.inputs[1].default_value = 2.0
+    uv_plus_one = ensure('W3 Eye UV Plus One', 'ShaderNodeMath')
+    uv_plus_one.operation = 'ADD'
+    uv_plus_one.inputs[1].default_value = 1.0
+    uv_wrapped = ensure('W3 Eye UV Wrapped', 'ShaderNodeMath')
+    uv_wrapped.operation = 'SUBTRACT'
+    corner_mask = ensure('W3 Eye Corner Meat Mask', 'ShaderNodeMath')
+    corner_mask.operation = 'LESS_THAN'
+    replace_input(texcoord.outputs['UV'], uv_xyz.inputs[0])
+    replace_input(uv_xyz.outputs['X'], uv_positive.inputs[0])
+    replace_input(uv_positive.outputs[0], uv_twice.inputs[0])
+    replace_input(uv_xyz.outputs['X'], uv_plus_one.inputs[0])
+    replace_input(uv_plus_one.outputs[0], uv_wrapped.inputs[0])
+    replace_input(uv_twice.outputs[0], uv_wrapped.inputs[1])
+    replace_input(uv_wrapped.outputs[0], corner_mask.inputs[0])
+
+    # pbr_eye reflects the Blick cubemap around its procedural corneal normal,
+    # not the mesh normal used above to recover the eye centre.
+    bubble_uv = ensure('W3 Eye Bubble UV', 'ShaderNodeCombineXYZ')
+    replace_input(uv_wrapped.outputs[0], bubble_uv.inputs['X'])
+    replace_input(uv_xyz.outputs['Y'], bubble_uv.inputs['Y'])
+    bubble_uv_tiled = ensure('W3 Eye Bubble UV Tiled', 'ShaderNodeVectorMath')
+    bubble_uv_tiled.operation = 'SCALE'
+    replace_input(bubble_uv.outputs['Vector'], bubble_uv_tiled.inputs[0])
+    parameter('BubbleNormalTile', bubble_uv_tiled.inputs[3], 10.0)
+
+    bubble_texture = nodegroup_node.inputs.get('NormalBubble')
+    bubble_color = bubble_texture.links[0].from_socket if bubble_texture and bubble_texture.is_linked else None
+    if bubble_color is not None:
+        vector_input = bubble_color.node.inputs.get('Vector')
+        if vector_input is not None:
+            replace_input(bubble_uv_tiled.outputs['Vector'], vector_input)
+
+    bubble_unpack_scale = ensure('W3 Eye Bubble Detail x2', 'ShaderNodeVectorMath')
+    bubble_unpack_scale.operation = 'SCALE'
+    bubble_unpack_scale.inputs[3].default_value = 2.0
+    bubble_unpack = ensure('W3 Eye Bubble Detail Unpack', 'ShaderNodeVectorMath')
+    bubble_unpack.operation = 'ADD'
+    bubble_unpack.inputs[1].default_value = (-1.0, -1.0, -1.0)
+    if bubble_color is not None:
+        replace_input(bubble_color, bubble_unpack_scale.inputs[0])
+    else:
+        bubble_unpack_scale.inputs[0].default_value = (0.5, 0.5, 1.0)
+    replace_input(bubble_unpack_scale.outputs['Vector'], bubble_unpack.inputs[0])
+
+    bubble_offset = ensure('W3 Eye Bubble Offset', 'ShaderNodeVectorMath')
+    bubble_offset.operation = 'SUBTRACT'
+    bubble_offset.inputs[1].default_value = (0.5, 0.5, 0.0)
+    replace_input(bubble_uv.outputs['Vector'], bubble_offset.inputs[0])
+    bubble_offset_length = ensure('W3 Eye Bubble Offset Length', 'ShaderNodeVectorMath')
+    bubble_offset_length.operation = 'LENGTH'
+    replace_input(bubble_offset.outputs['Vector'], bubble_offset_length.inputs[0])
+
+    iris_low = ensure('W3 Eye Iris Low', 'ShaderNodeMath')
+    iris_low.operation = 'SUBTRACT'
+    parameter('IrisCoordFactor', iris_low.inputs[0], 0.1)
+    parameter('IrisCoordMargin', iris_low.inputs[1], 0.02)
+    iris_width = ensure('W3 Eye Iris Width', 'ShaderNodeMath')
+    iris_width.operation = 'MULTIPLY'
+    iris_width.inputs[1].default_value = 2.0
+    parameter('IrisCoordMargin', iris_width.inputs[0], 0.02)
+    iris_distance = ensure('W3 Eye Iris Distance', 'ShaderNodeMath')
+    iris_distance.operation = 'SUBTRACT'
+    replace_input(bubble_offset_length.outputs['Value'], iris_distance.inputs[0])
+    replace_input(iris_low.outputs[0], iris_distance.inputs[1])
+    iris_ramp = ensure('W3 Eye Iris Ramp', 'ShaderNodeMath')
+    iris_ramp.operation = 'DIVIDE'
+    replace_input(iris_distance.outputs[0], iris_ramp.inputs[0])
+    replace_input(iris_width.outputs[0], iris_ramp.inputs[1])
+    iris_invert = ensure('W3 Eye Iris Invert', 'ShaderNodeMath')
+    iris_invert.operation = 'SUBTRACT'
+    iris_invert.inputs[0].default_value = 1.0
+    replace_input(iris_ramp.outputs[0], iris_invert.inputs[1])
+    iris_factor = ensure('W3 Eye Iris Factor', 'ShaderNodeClamp')
+    iris_factor.inputs['Min'].default_value = 0.0
+    iris_factor.inputs['Max'].default_value = 1.0
+    replace_input(iris_invert.outputs[0], iris_factor.inputs['Value'])
+
+    # EyeRaytrace applies IrisSize to both Diffuse and NormalBase UVs.
+    iris_size_base = float(material.get(_EYE_IRIS_SIZE_BASE_PROP, 0.0) or 0.0)
+    if iris_size_base <= 0.0:
+        iris_size_socket = nodegroup_node.inputs.get('IrisSize')
+        iris_size_base = 0.65
+        if iris_size_socket is not None:
+            if iris_size_socket.is_linked:
+                source_socket = iris_size_socket.links[0].from_socket
+                iris_size_base = float(getattr(source_socket, 'default_value', iris_size_base))
+            else:
+                iris_size_base = float(getattr(iris_size_socket, 'default_value', iris_size_base))
+        iris_size_base = max(0.0001, iris_size_base)
+        material[_EYE_IRIS_SIZE_BASE_PROP] = iris_size_base
+
+    iris_size_relative = ensure('W3 Eye Iris Size Relative', 'ShaderNodeMath')
+    iris_size_relative.operation = 'DIVIDE'
+    parameter('IrisSize', iris_size_relative.inputs[0], iris_size_base)
+    iris_size_relative.inputs[1].default_value = iris_size_base
+
+    iris_morph_control = ensure(_EYE_IRIS_MORPH_CONTROL_NODE, 'ShaderNodeValue')
+    iris_morph_control.outputs[0].default_value = 0.0
+    existing_strength = nodes.get(_EYE_IRIS_MORPH_STRENGTH_NODE)
+    iris_morph_strength = ensure(_EYE_IRIS_MORPH_STRENGTH_NODE, 'ShaderNodeValue')
+    if existing_strength is None or existing_strength is not iris_morph_strength:
+        # No native bone-to-material calibration exists; keep this editable.
+        iris_morph_strength.outputs[0].default_value = 0.2
+    iris_morph_amount = ensure('W3 Eye Iris Morph Amount', 'ShaderNodeMath')
+    iris_morph_amount.operation = 'MULTIPLY'
+    replace_input(iris_morph_control.outputs[0], iris_morph_amount.inputs[0])
+    replace_input(iris_morph_strength.outputs[0], iris_morph_amount.inputs[1])
+    iris_morph_scale = ensure('W3 Eye Iris Morph Scale', 'ShaderNodeMath')
+    iris_morph_scale.operation = 'ADD'
+    iris_morph_scale.inputs[0].default_value = 1.0
+    replace_input(iris_morph_amount.outputs[0], iris_morph_scale.inputs[1])
+    iris_scale = ensure('W3 Eye Iris Scale', 'ShaderNodeMath')
+    iris_scale.operation = 'MULTIPLY'
+    replace_input(iris_size_relative.outputs[0], iris_scale.inputs[0])
+    replace_input(iris_morph_scale.outputs[0], iris_scale.inputs[1])
+
+    iris_centered = ensure('W3 Eye Iris UV Centered', 'ShaderNodeVectorMath')
+    iris_centered.operation = 'SUBTRACT'
+    iris_centered.inputs[1].default_value = (0.5, 0.5, 0.0)
+    replace_input(bubble_uv.outputs['Vector'], iris_centered.inputs[0])
+    iris_scaled = ensure('W3 Eye Iris UV Scaled', 'ShaderNodeVectorMath')
+    iris_scaled.operation = 'SCALE'
+    replace_input(iris_centered.outputs['Vector'], iris_scaled.inputs[0])
+    replace_input(iris_scale.outputs[0], iris_scaled.inputs[3])
+    iris_recentered = ensure('W3 Eye Iris UV Recentered', 'ShaderNodeVectorMath')
+    iris_recentered.operation = 'ADD'
+    iris_recentered.inputs[1].default_value = (0.5, 0.5, 0.0)
+    replace_input(iris_scaled.outputs['Vector'], iris_recentered.inputs[0])
+    iris_uv_delta = ensure('W3 Eye Iris UV Delta', 'ShaderNodeVectorMath')
+    iris_uv_delta.operation = 'SUBTRACT'
+    replace_input(iris_recentered.outputs['Vector'], iris_uv_delta.inputs[0])
+    replace_input(bubble_uv.outputs['Vector'], iris_uv_delta.inputs[1])
+    iris_uv_masked = ensure('W3 Eye Iris UV Masked', 'ShaderNodeVectorMath')
+    iris_uv_masked.operation = 'SCALE'
+    replace_input(iris_uv_delta.outputs['Vector'], iris_uv_masked.inputs[0])
+    replace_input(iris_factor.outputs['Result'], iris_uv_masked.inputs[3])
+    iris_uv = ensure('W3 Eye Iris UV', 'ShaderNodeVectorMath')
+    iris_uv.operation = 'ADD'
+    replace_input(bubble_uv.outputs['Vector'], iris_uv.inputs[0])
+    replace_input(iris_uv_masked.outputs['Vector'], iris_uv.inputs[1])
+
+    for texture_name in ('Diffuse', 'NormalBase'):
+        texture_socket = nodegroup_node.inputs.get(texture_name)
+        if texture_socket is None or not texture_socket.is_linked:
+            continue
+        texture_node = texture_socket.links[0].from_node
+        vector_input = texture_node.inputs.get('Vector')
+        if texture_node.type == 'TEX_IMAGE' and vector_input is not None:
+            replace_input(iris_uv.outputs['Vector'], vector_input)
+
+    bubble_detail_factor = ensure('W3 Eye Bubble Detail Factor', 'ShaderNodeMath')
+    bubble_detail_factor.operation = 'SUBTRACT'
+    bubble_detail_factor.inputs[0].default_value = 1.0
+    replace_input(iris_factor.outputs['Result'], bubble_detail_factor.inputs[1])
+
+    bubble_radius_below = ensure('W3 Eye Bubble Radius Below', 'ShaderNodeMath')
+    bubble_radius_below.operation = 'MULTIPLY'
+    parameter('EggFullRadius', bubble_radius_below.inputs[0], 0.5)
+    parameter('EggSubFactor', bubble_radius_below.inputs[1], 0.22)
+    bubble_offset_xyz = ensure('W3 Eye Bubble Offset XYZ', 'ShaderNodeSeparateXYZ')
+    replace_input(bubble_offset.outputs['Vector'], bubble_offset_xyz.inputs[0])
+    bubble_v0 = ensure('W3 Eye Bubble V0', 'ShaderNodeCombineXYZ')
+    replace_input(bubble_offset_xyz.outputs['X'], bubble_v0.inputs['X'])
+    replace_input(bubble_offset_xyz.outputs['Y'], bubble_v0.inputs['Y'])
+    replace_input(bubble_radius_below.outputs[0], bubble_v0.inputs['Z'])
+    bubble_v0_normalized = ensure('W3 Eye Bubble V0 Normalized', 'ShaderNodeVectorMath')
+    bubble_v0_normalized.operation = 'NORMALIZE'
+    replace_input(bubble_v0.outputs['Vector'], bubble_v0_normalized.inputs[0])
+    bubble_v1 = ensure('W3 Eye Bubble V1', 'ShaderNodeVectorMath')
+    bubble_v1.operation = 'SCALE'
+    replace_input(bubble_v0_normalized.outputs['Vector'], bubble_v1.inputs[0])
+    parameter('EggFullRadius', bubble_v1.inputs[3], 0.5)
+    bubble_delta = ensure('W3 Eye Bubble Delta', 'ShaderNodeVectorMath')
+    bubble_delta.operation = 'SUBTRACT'
+    replace_input(bubble_v1.outputs['Vector'], bubble_delta.inputs[0])
+    replace_input(bubble_v0.outputs['Vector'], bubble_delta.inputs[1])
+    bubble_delta_normalized = ensure('W3 Eye Bubble Delta Normalized', 'ShaderNodeVectorMath')
+    bubble_delta_normalized.operation = 'NORMALIZE'
+    replace_input(bubble_delta.outputs['Vector'], bubble_delta_normalized.inputs[0])
+    bubble_v1_xyz = ensure('W3 Eye Bubble V1 XYZ', 'ShaderNodeSeparateXYZ')
+    replace_input(bubble_v1.outputs['Vector'], bubble_v1_xyz.inputs[0])
+    bubble_v0_xyz = ensure('W3 Eye Bubble V0 XYZ', 'ShaderNodeSeparateXYZ')
+    replace_input(bubble_v0.outputs['Vector'], bubble_v0_xyz.inputs[0])
+    bubble_above = ensure('W3 Eye Bubble Above', 'ShaderNodeMath')
+    bubble_above.operation = 'GREATER_THAN'
+    replace_input(bubble_v1_xyz.outputs['Z'], bubble_above.inputs[0])
+    replace_input(bubble_v0_xyz.outputs['Z'], bubble_above.inputs[1])
+    bubble_delta_selected = ensure('W3 Eye Bubble Delta Selected', 'ShaderNodeVectorMath')
+    bubble_delta_selected.operation = 'SCALE'
+    replace_input(bubble_delta_normalized.outputs['Vector'], bubble_delta_selected.inputs[0])
+    replace_input(bubble_above.outputs[0], bubble_delta_selected.inputs[3])
+    bubble_not_above = ensure('W3 Eye Bubble Not Above', 'ShaderNodeMath')
+    bubble_not_above.operation = 'SUBTRACT'
+    bubble_not_above.inputs[0].default_value = 1.0
+    replace_input(bubble_above.outputs[0], bubble_not_above.inputs[1])
+    bubble_up = ensure('W3 Eye Bubble Up', 'ShaderNodeCombineXYZ')
+    replace_input(bubble_not_above.outputs[0], bubble_up.inputs['Z'])
+    bubble_base_normal = ensure('W3 Eye Bubble Base Normal', 'ShaderNodeVectorMath')
+    bubble_base_normal.operation = 'ADD'
+    replace_input(bubble_delta_selected.outputs['Vector'], bubble_base_normal.inputs[0])
+    replace_input(bubble_up.outputs['Vector'], bubble_base_normal.inputs[1])
+
+    bubble_radius_squared = ensure('W3 Eye Bubble Radius Squared', 'ShaderNodeMath')
+    bubble_radius_squared.operation = 'MULTIPLY'
+    parameter('EggFullRadius', bubble_radius_squared.inputs[0], 0.5)
+    parameter('EggFullRadius', bubble_radius_squared.inputs[1], 0.5)
+    bubble_below_squared = ensure('W3 Eye Bubble Below Squared', 'ShaderNodeMath')
+    bubble_below_squared.operation = 'MULTIPLY'
+    replace_input(bubble_radius_below.outputs[0], bubble_below_squared.inputs[0])
+    replace_input(bubble_radius_below.outputs[0], bubble_below_squared.inputs[1])
+    bubble_max_offset_squared = ensure('W3 Eye Bubble Max Offset Squared', 'ShaderNodeMath')
+    bubble_max_offset_squared.operation = 'SUBTRACT'
+    replace_input(bubble_radius_squared.outputs[0], bubble_max_offset_squared.inputs[0])
+    replace_input(bubble_below_squared.outputs[0], bubble_max_offset_squared.inputs[1])
+    bubble_max_offset = ensure('W3 Eye Bubble Max Offset', 'ShaderNodeMath')
+    bubble_max_offset.operation = 'SQRT'
+    replace_input(bubble_max_offset_squared.outputs[0], bubble_max_offset.inputs[0])
+    bubble_edge_ratio = ensure('W3 Eye Bubble Edge Ratio', 'ShaderNodeMath')
+    bubble_edge_ratio.operation = 'DIVIDE'
+    replace_input(bubble_offset_length.outputs['Value'], bubble_edge_ratio.inputs[0])
+    replace_input(bubble_max_offset.outputs[0], bubble_edge_ratio.inputs[1])
+    bubble_edge_scaled = ensure('W3 Eye Bubble Edge Scaled', 'ShaderNodeMath')
+    bubble_edge_scaled.operation = 'MULTIPLY'
+    replace_input(bubble_edge_ratio.outputs[0], bubble_edge_scaled.inputs[0])
+    parameter('EggMarginFactor', bubble_edge_scaled.inputs[1], 1.0)
+    bubble_edge_invert = ensure('W3 Eye Bubble Edge Invert', 'ShaderNodeMath')
+    bubble_edge_invert.operation = 'SUBTRACT'
+    bubble_edge_invert.inputs[0].default_value = 1.0
+    replace_input(bubble_edge_scaled.outputs[0], bubble_edge_invert.inputs[1])
+    bubble_edge_clamp = ensure('W3 Eye Bubble Edge Clamp', 'ShaderNodeClamp')
+    bubble_edge_clamp.inputs['Min'].default_value = 0.0
+    bubble_edge_clamp.inputs['Max'].default_value = 1.0
+    replace_input(bubble_edge_invert.outputs[0], bubble_edge_clamp.inputs['Value'])
+    bubble_edge = ensure('W3 Eye Bubble Edge', 'ShaderNodeMath')
+    bubble_edge.operation = 'POWER'
+    replace_input(bubble_edge_clamp.outputs['Result'], bubble_edge.inputs[0])
+    parameter('EggMarginExponent', bubble_edge.inputs[1], 1.6)
+    bubble_edge_xy = ensure('W3 Eye Bubble Edge XY', 'ShaderNodeCombineXYZ')
+    replace_input(bubble_edge.outputs[0], bubble_edge_xy.inputs['X'])
+    replace_input(bubble_edge.outputs[0], bubble_edge_xy.inputs['Y'])
+    bubble_edge_xy.inputs['Z'].default_value = 1.0
+    bubble_rounded = ensure('W3 Eye Bubble Rounded', 'ShaderNodeVectorMath')
+    bubble_rounded.operation = 'MULTIPLY'
+    replace_input(bubble_base_normal.outputs['Vector'], bubble_rounded.inputs[0])
+    replace_input(bubble_edge_xy.outputs['Vector'], bubble_rounded.inputs[1])
+    bubble_rounded_normalized = ensure('W3 Eye Bubble Rounded Normalized', 'ShaderNodeVectorMath')
+    bubble_rounded_normalized.operation = 'NORMALIZE'
+    replace_input(bubble_rounded.outputs['Vector'], bubble_rounded_normalized.inputs[0])
+
+    bubble_detail_xy = ensure('W3 Eye Bubble Detail XY', 'ShaderNodeVectorMath')
+    bubble_detail_xy.operation = 'MULTIPLY'
+    # Blender's V flip requires inverting sampled normal-detail Y.
+    bubble_detail_xy.inputs[1].default_value = (1.0, -1.0, 0.0)
+    replace_input(bubble_unpack.outputs['Vector'], bubble_detail_xy.inputs[0])
+    bubble_detail_scaled = ensure('W3 Eye Bubble Detail Scaled', 'ShaderNodeVectorMath')
+    bubble_detail_scaled.operation = 'SCALE'
+    replace_input(bubble_detail_xy.outputs['Vector'], bubble_detail_scaled.inputs[0])
+    replace_input(bubble_detail_factor.outputs[0], bubble_detail_scaled.inputs[3])
+    bubble_tangent = ensure('W3 Eye Bubble Tangent Normal', 'ShaderNodeVectorMath')
+    bubble_tangent.operation = 'ADD'
+    replace_input(bubble_rounded_normalized.outputs['Vector'], bubble_tangent.inputs[0])
+    replace_input(bubble_detail_scaled.outputs['Vector'], bubble_tangent.inputs[1])
+    bubble_tangent_normalized = ensure('W3 Eye Bubble Tangent Normalized', 'ShaderNodeVectorMath')
+    bubble_tangent_normalized.operation = 'NORMALIZE'
+    replace_input(bubble_tangent.outputs['Vector'], bubble_tangent_normalized.inputs[0])
+    bubble_encoded_scale = ensure('W3 Eye Bubble Encode Scale', 'ShaderNodeVectorMath')
+    bubble_encoded_scale.operation = 'SCALE'
+    bubble_encoded_scale.inputs[3].default_value = 0.5
+    replace_input(bubble_tangent_normalized.outputs['Vector'], bubble_encoded_scale.inputs[0])
+    bubble_encoded = ensure('W3 Eye Bubble Encoded', 'ShaderNodeVectorMath')
+    bubble_encoded.operation = 'ADD'
+    bubble_encoded.inputs[1].default_value = (0.5, 0.5, 0.5)
+    replace_input(bubble_encoded_scale.outputs['Vector'], bubble_encoded.inputs[0])
+    bubble_world = ensure('W3 Eye Bubble World Normal', 'ShaderNodeNormalMap')
+    bubble_world.space = 'TANGENT'
+    replace_input(bubble_encoded.outputs['Vector'], bubble_world.inputs['Color'])
+    replace_input(bubble_world.outputs['Normal'], reflection.inputs[1])
+
+    if env_node is None:
         return
 
-    # Ensure the cubemap sampler feeds the eye group's BlickCube input.
-    blick_input = nodegroup_node.inputs.get('BlickCube')
-    if blick_input:
-        if blick_input.is_linked:
-            current_link = blick_input.links[0]
-            if current_link.from_node != env_node:
-                links.remove(current_link)
-                links.new(env_node.outputs[0], blick_input)
-        else:
-            links.new(env_node.outputs[0], blick_input)
+    def masked_parameter(prefix: str, iris_name: str, meat_name: str, default: float):
+        delta = ensure(f'W3 Eye {prefix} Delta', 'ShaderNodeMath')
+        delta.operation = 'SUBTRACT'
+        masked = ensure(f'W3 Eye {prefix} Masked', 'ShaderNodeMath')
+        masked.operation = 'MULTIPLY'
+        value = ensure(f'W3 Eye {prefix}', 'ShaderNodeMath')
+        value.operation = 'ADD'
+        parameter(meat_name, delta.inputs[0], default)
+        parameter(iris_name, delta.inputs[1], default)
+        replace_input(delta.outputs[0], masked.inputs[0])
+        replace_input(corner_mask.outputs[0], masked.inputs[1])
+        parameter(iris_name, value.inputs[0], default)
+        replace_input(masked.outputs[0], value.inputs[1])
+        return value.outputs[0]
 
-    # Reuse nodes if import is rerun on the same material.
-    geo_node = nodes.get('eye_blick_geometry')
-    if not geo_node or geo_node.type != 'NEW_GEOMETRY':
-        geo_node = nodes.new(type='ShaderNodeNewGeometry')
-        geo_node.name = 'eye_blick_geometry'
-    geo_node.label = 'Surface Normal'
+    blick_scale = masked_parameter('Blick Scale', 'BlickScale', 'BlikScaleMeat', 1.0)
+    specularity = masked_parameter('Specularity', 'Specularity', 'SpecularityMeat', 0.18)
+    scaled_blick = ensure('W3 Eye Scaled Blick', 'ShaderNodeVectorMath')
+    scaled_blick.operation = 'SCALE'
+    replace_input(env_node.outputs['Color'], scaled_blick.inputs[0])
+    replace_input(blick_scale, scaled_blick.inputs[3])
 
-    vt_node = nodes.get('eye_blick_fetch_vector')
-    if not vt_node or vt_node.type != 'VECT_TRANSFORM':
-        vt_node = nodes.new(type='ShaderNodeVectorTransform')
-        vt_node.name = 'eye_blick_fetch_vector'
-    vt_node.label = 'BlickFetchVector (World->Camera)'
-    vt_node.vector_type = 'NORMAL'
-    vt_node.convert_from = 'WORLD'
-    vt_node.convert_to = 'CAMERA'
+    environment_blick = ensure(_EYE_BLICK_ENV_NODE, 'ShaderNodeVectorMath')
+    environment_blick.operation = 'MULTIPLY'
+    replace_input(scaled_blick.outputs['Vector'], environment_blick.inputs[0])
+    scene = getattr(bpy.context, 'scene', None)
+    environment_color = tuple(scene.get(_EYE_BLICK_SCENE_PROP, (1.0, 1.0, 1.0))) if scene else (1.0,) * 3
+    environment_blick.inputs[1].default_value = environment_color[:3]
+    replace_input(environment_blick.outputs['Vector'], nodegroup_node.inputs['BlickCube'])
 
-    map_node = nodes.get('eye_blick_orientation')
-    if not map_node or map_node.type != 'MAPPING':
-        map_node = nodes.new(type='ShaderNodeMapping')
-        map_node.name = 'eye_blick_orientation'
-    map_node.label = 'Cubemap Orientation'
-    map_node.vector_type = 'POINT'
-    map_node.inputs['Location'].default_value = (0.0, 0.0, 0.0)
-    map_node.inputs['Rotation'].default_value = (radians(105.0), radians(0.0), radians(-65.0))
-    map_node.inputs['Scale'].default_value = (-1.1, 1.1, 0.5)
+    specular_linear = ensure('W3 Eye Specularity Linear', 'ShaderNodeMath')
+    specular_linear.operation = 'POWER'
+    specular_linear.inputs[1].default_value = 2.2
+    specular_level = ensure('W3 Eye Specular IOR Level', 'ShaderNodeMath')
+    specular_level.operation = 'MULTIPLY'
+    specular_level.inputs[1].default_value = 1.0 / (2.0 * ((1.38 - 1.0) / (1.38 + 1.0)) ** 2)
+    replace_input(specularity, specular_linear.inputs[0])
+    replace_input(specular_linear.outputs[0], specular_level.inputs[0])
+    replace_input(specular_level.outputs[0], nodegroup_node.inputs['Specular'])
 
-    env_node.label = 'Cube Sampler (BlickCube)'
-    try:
-        env_node.interpolation = 'Linear'
-    except Exception:
-        pass
-    is_blick_equirect = False
-    if getattr(env_node, 'image', None):
+    env_node.label = 'REDengine BlickCube'
+    env_node.interpolation = 'Linear'
+    if getattr(env_node, 'image', None) is not None:
         try:
-            is_blick_equirect = bool(env_node.image.get("witcher_blick_equirect_dds"))
-        except Exception:
-            is_blick_equirect = False
-        if not is_blick_equirect:
-            is_blick_equirect = "BlickCubemap_Equirect" in getattr(env_node.image, "name", "")
-    if is_blick_equirect:
-        try:
-            env_node.projection = 'EQUIRECTANGULAR'
+            if env_node.image.get('witcher_blick_equirect_dds'):
+                env_node.projection = 'EQUIRECTANGULAR'
+                env_node.image.colorspace_settings.name = 'Non-Color'
         except Exception:
             pass
 
-    y = env_node.location.y
-    geo_node.location = (env_node.location.x - 840, y)
-    vt_node.location = (env_node.location.x - 560, y)
-    map_node.location = (env_node.location.x - 280, y)
 
-    env_vector_input = env_node.inputs.get('Vector')
-    if not env_vector_input:
-        return
+def _find_eye_shader_group_node(material):
+    tree = getattr(material, 'node_tree', None)
+    if tree is None:
+        return None
+    for node in tree.nodes:
+        if node.type != 'GROUP' or node.node_tree is None:
+            continue
+        if _node_group_family_name(node.node_tree.name).lower() == 'witcher3_eye':
+            return node
+    return None
 
-    while env_vector_input.is_linked:
-        links.remove(env_vector_input.links[0])
 
-    links.new(geo_node.outputs['Normal'], vt_node.inputs['Vector'])
-    links.new(vt_node.outputs['Vector'], map_node.inputs['Vector'])
-    links.new(map_node.outputs['Vector'], env_vector_input)
+def setup_eye_iris_morph_drivers(mesh_objects, control_armature=None, control_bone_name='w3_face_poses') -> int:
+    mesh_objects = [
+        mesh_obj
+        for mesh_obj in (mesh_objects or [])
+        if mesh_obj is not None and getattr(mesh_obj, 'type', None) == 'MESH'
+    ]
+    mesh_pointers = {mesh_obj.as_pointer() for mesh_obj in mesh_objects}
+    material_sources = {}
+    for mesh_obj in mesh_objects:
+        for slot in getattr(mesh_obj, 'material_slots', []):
+            material = getattr(slot, 'material', None)
+            if material is not None:
+                material_sources.setdefault(material.as_pointer(), (material, mesh_obj))
+
+    driver_count = 0
+    for material, mesh_obj in material_sources.values():
+        nodegroup_node = _find_eye_shader_group_node(material)
+        if nodegroup_node is None:
+            continue
+
+        shape_keys = getattr(getattr(mesh_obj, 'data', None), 'shape_keys', None)
+        key_blocks = getattr(shape_keys, 'key_blocks', None)
+        pose = getattr(control_armature, 'pose', None)
+        pose_bone = pose.bones.get(control_bone_name) if pose is not None else None
+        use_armature = bool(
+            pose_bone is not None
+            and 'iris_wide' in pose_bone
+            and 'iris_narrow' in pose_bone
+        )
+        use_shape_keys = not use_armature and bool(
+            key_blocks
+            and key_blocks.get('iris_wide') is not None
+            and key_blocks.get('iris_narrow') is not None
+        )
+        if not use_armature and not use_shape_keys:
+            continue
+
+        controller_name = (
+            getattr(control_armature, 'name_full', getattr(control_armature, 'name', ''))
+            if use_armature
+            else shape_keys.name
+        )
+        previous_controller = str(material.get(_EYE_IRIS_CONTROLLER_PROP, '') or '')
+        has_external_owner = any(
+            obj.as_pointer() not in mesh_pointers
+            and getattr(obj, 'type', None) == 'MESH'
+            and any(slot.material is material for slot in obj.material_slots)
+            for obj in bpy.data.objects
+        )
+        if (previous_controller and previous_controller != controller_name) or (
+            not previous_controller and has_external_owner
+        ):
+            original_material = material
+            material = original_material.copy()
+            for current_mesh in mesh_objects:
+                for slot in current_mesh.material_slots:
+                    if slot.material is original_material:
+                        slot.material = material
+            nodegroup_node = _find_eye_shader_group_node(material)
+        material[_EYE_IRIS_CONTROLLER_PROP] = controller_name
+
+        tree = material.node_tree
+        setup_eye_reflection_nodes(material, nodegroup_node, tree.nodes, tree.links)
+        control_node = tree.nodes.get(_EYE_IRIS_MORPH_CONTROL_NODE)
+        if control_node is None or control_node.type != 'VALUE':
+            continue
+
+        driver_curve = control_node.outputs[0].driver_add('default_value')
+        driver = driver_curve.driver
+        driver.type = 'SCRIPTED'
+        while driver.variables:
+            driver.variables.remove(driver.variables[0])
+        for variable_name, channel_name in (('wide', 'iris_wide'), ('narrow', 'iris_narrow')):
+            variable = driver.variables.new()
+            variable.name = variable_name
+            variable.type = 'SINGLE_PROP'
+            target = variable.targets[0]
+            if use_armature:
+                target.id_type = 'OBJECT'
+                target.id = control_armature
+                target.data_path = f'pose.bones["{control_bone_name}"]["{channel_name}"]'
+            else:
+                target.id_type = 'KEY'
+                target.id = shape_keys
+                target.data_path = f'key_blocks["{channel_name}"].value'
+        driver.expression = 'narrow - wide'
+        tree.update_tag()
+        driver_count += 1
+
+    return driver_count
 
 
 def load_texture(

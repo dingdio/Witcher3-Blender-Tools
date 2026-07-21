@@ -189,6 +189,9 @@ def main() -> None:
             },
             curves={
                 "m_globalLight.sunColor": ColorCurve((255.0, 255.0, 255.0, 60.0)),
+                "m_globalLight.charactersEyeBlicksColor": ColorCurve(
+                    (251.0, 251.0, 251.0, 1.9810169)
+                ),
                 "m_globalLight.envProbeAmbientScaleLight": ScalarCurve(0.25),
                 "m_globalLight.envProbeBaseLightingReflection.colorSkyAdd": ColorCurve(
                     (255.0, 255.0, 255.0, 0.48898953199386597)
@@ -243,7 +246,15 @@ def main() -> None:
         assert abs(
             authored_values["tone_exposure_ev"] - math.log2(2.0 / shaped_key)
         ) < 1e-6
-        assert authored_values["camera_lights"] == ()
+        assert len(authored_values["camera_lights"]) == 2
+        expected_eye_blick = ui_environment._curve_color(
+            (251.0, 251.0, 251.0, 1.9810169),
+            (255.0, 255.0, 255.0, 1.0),
+        )
+        assert all(
+            abs(actual - expected) < 1e-6
+            for actual, expected in zip(authored_values["eye_blick_color"], expected_eye_blick)
+        )
         assert abs(authored_values["key_energy"] - 60.0) < 1e-6
         assert authored_values["balance_map_path"].endswith("test_balance.xbm")
         assert abs(authored_values["balance_map_amount"] - 0.4) < 1e-6
@@ -295,7 +306,7 @@ def main() -> None:
         runtime["environment"] = runtime.pop("selector_environment")
         runtime["direct_environment"] = True
         manual_values = ui_environment._preview_values(scene)
-        assert manual_values["camera_lights"] == ()
+        assert len(manual_values["camera_lights"]) == 2
         assert abs(manual_values["ambient_energy"] - expected_reflection_fill) < 1e-6
         ui_environment.clear_environment_runtime(scene)
         raw_water = ui_environment._linear_color(
@@ -312,6 +323,7 @@ def main() -> None:
 
         result = import_environment.ensure_preview(
             bpy.context,
+            source_path="C:\\environment\\gui_character_environment.env",
             sun_direction=(1.0, 0.0, 0.25),
             moon_direction=(-1.0, 0.0, -0.25),
             key_direction=(0.0, 1.0, 1.0),
@@ -562,10 +574,11 @@ def main() -> None:
         key_light = bpy.data.objects[result.key_light_name]
         assert key_light.data.use_shadow
         if hasattr(key_light.data, "shadow_maximum_resolution"):
-            assert (
+            assert abs(
                 key_light.data.shadow_maximum_resolution
-                >= import_environment._BLENDER_KEY_SHADOW_RESOLUTION - 1.0e-6
-            )
+                - import_environment._BLENDER_CHARACTER_KEY_SHADOW_RESOLUTION
+            ) < 1.0e-6
+            key_light.data.shadow_maximum_resolution = 0.02
         key_light.data.specular_factor = 0.125
         for ambient_light in ambient_lights:
             ambient_light.data.specular_factor = 0.5
@@ -613,6 +626,11 @@ def main() -> None:
         assert first_rotation != second_rotation
         assert abs(scene.view_settings.exposure - (original_view_exposure + 0.75)) < 1e-6
         assert abs(key_light.data.specular_factor - 0.25) < 1e-6
+        if hasattr(key_light.data, "shadow_maximum_resolution"):
+            assert abs(
+                key_light.data.shadow_maximum_resolution
+                - import_environment._BLENDER_CHARACTER_KEY_SHADOW_RESOLUTION
+            ) < 1.0e-6
         assert all(abs(light.data.energy - 0.25) < 1e-6 for light in ambient_lights)
         assert all(not light.data.use_shadow for light in ambient_lights)
         assert all(abs(light.data.specular_factor) < 1e-6 for light in ambient_lights)
