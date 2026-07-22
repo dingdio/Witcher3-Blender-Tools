@@ -2945,7 +2945,6 @@ def create_CEntity(file, _inherit_visited=None):
     this_Entity.isLightOn = None
     new_mesh = ModelEnt("staticMeshes", "staticMeshes")
     added_chunks = set()  # Track chunk indices already added to avoid duplicates
-    seen_streamed_mesh_paths = set()  # Track mesh paths already added via streamingDataBuffer to avoid duplicates
     streamed_attachment_slots = _read_streamed_attachment_slots(CHUNKS)
     streamed_synth_counter = [0]
     streamed_hard_attached = set()  # component names already bone-slot attached
@@ -4310,10 +4309,7 @@ def create_CEntity(file, _inherit_visited=None):
                             mc.mesh = _next_mesh_import_path()
                         if _register_streamed_slot_mesh(mc, buf_chunk.Type):
                             continue
-                        if mc.mesh and mc.mesh not in seen_streamed_mesh_paths:
-                            chunk_append(new_mesh, entity_chunk, mc, added_chunks)
-                            new_mesh.chunks[-1].type = buf_chunk.Type
-                            seen_streamed_mesh_paths.add(mc.mesh)
+                        if mc.mesh and _append_unique_chunk(buf_chunk, mc):
                             log.debug(
                                 'Extracted %s from streamingDataBuffer of %s #%s: %s',
                                 buf_chunk.Type, entity_chunk.Type, entity_chunk.ChunkIndex, mc.mesh,
@@ -4324,7 +4320,7 @@ def create_CEntity(file, _inherit_visited=None):
                                     and buf_chunk.Type in ('CMeshComponent', 'CRigidMeshComponent', 'CRagdollMeshComponent')):
                                 skinning = CMeshSkinningAttachment(
                                     entity_animated_component_chunk_index,
-                                    entity_chunk.ChunkIndex,
+                                    buf_chunk.ChunkIndex,
                                 )
                                 skinning.type = 'CMeshSkinningAttachment'
                                 skinning.chunkIndex = -1  # synthetic, no real CR2W chunk

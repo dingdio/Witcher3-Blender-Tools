@@ -620,6 +620,59 @@ class RepoPathResolutionTests(unittest.TestCase):
         self.assertTrue(metadata["has_armature_root"])
         self.assertTrue(metadata["has_inventory_entries"])
 
+    def test_streaming_buffer_keeps_distinct_components_with_the_same_mesh(self):
+        mesh_path = r"fx\water\water_fountain\fountain_splash.w2mesh"
+        owner = _EffectChunk("CEntity", 0)
+        owner.Components = []
+        owner.PROPS.append(types.SimpleNamespace(
+            theName="streamingDataBuffer",
+            Bufferdata=types.SimpleNamespace(Bytes=b"stream"),
+        ))
+
+        upper = _EffectChunk("CMeshComponent", 1)
+        upper.component_name = "CMeshComponent0"
+        upper.mesh = mesh_path
+        lower = _EffectChunk("CMeshComponent", 2)
+        lower.component_name = "CMeshComponent1"
+        lower.mesh = mesh_path
+
+        source_file = types.SimpleNamespace(
+            HEADER=types.SimpleNamespace(version=159),
+            CHUNKS=types.SimpleNamespace(CHUNKS=[owner]),
+            CR2WImport=[],
+            fileName="<memory>",
+        )
+        buffer_file = types.SimpleNamespace(
+            CHUNKS=types.SimpleNamespace(CHUNKS=[upper, lower]),
+        )
+
+        class _Converter:
+            def __init__(self, chunk):
+                self.chunk = chunk
+
+            def convert_for_io(self):
+                return types.SimpleNamespace(
+                    name=self.chunk.component_name,
+                    mesh=self.chunk.mesh,
+                    transform=None,
+                    transformParent=None,
+                )
+
+        with (
+            mock.patch.object(dc_entity, "_flat_compiled_file", return_value=None),
+            mock.patch.object(dc_entity, "getCR2W", return_value=buffer_file),
+            mock.patch.object(dc_entity, "CMeshComponent", _Converter),
+            mock.patch.object(dc_entity, "_resolve_mesh_path", side_effect=lambda _chunk, value: value),
+        ):
+            entity = dc_entity.create_CEntity(source_file)
+
+        meshes = [
+            chunk for chunk in entity.staticMeshes.chunks
+            if chunk.type == "CMeshComponent"
+        ]
+        self.assertEqual([chunk.name for chunk in meshes], ["CMeshComponent0", "CMeshComponent1"])
+        self.assertEqual([chunk.chunkIndex for chunk in meshes], [1, 2])
+
     def test_path_like_property_index_wins_over_import_table_number(self):
         roof_path = (
             r"environment\architecture\human\redania\nomans_land"
