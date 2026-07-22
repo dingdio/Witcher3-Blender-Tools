@@ -5,7 +5,6 @@
       "name": "White Orchard Village",
       "map": "White Orchard",
       "world_path": "levels\\prolog_village\\prolog_village.w2w",
-      "layer_dir": "levels\\prolog_village\\village",
       "position": [-11.36, -36.04, 10.0],
       "description": ""
     },
@@ -13,7 +12,6 @@
       "name": "Nilfgaardian Garrison",
       "map": "White Orchard",
       "world_path": "levels\\prolog_village\\prolog_village.w2w",
-      "layer_dir": "levels\\prolog_village\\griffon_castle",
       "position": [-327.92, 359.94, 10.0],
       "description": ""
     },
@@ -21,7 +19,6 @@
       "name": "Crow's Perch",
       "map": "Velen",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\baron_lair\\baron_castle",
       "position": [197.61, 130.25, 10.0],
       "description": ""
     },
@@ -29,11 +26,6 @@
       "name": "Keira Metz's Hut",
       "map": "Velen",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\nml_villages\\keira_metz_house",
-      "layer_deny": [
-        "secret_room\\*",
-        "volume.w2l"
-      ],
       "position": [
         -260.0,
         -110.0,
@@ -46,7 +38,6 @@
       "name": "Hanged Man's Tree",
       "map": "Velen",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\nml_surface\\hangman_mountain",
       "position": [981.90, 705.30, 10.0],
       "description": ""
     },
@@ -54,7 +45,6 @@
       "name": "Fyke Isle",
       "map": "Velen",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\popiel_tower",
       "position": [245.54, -738.23, 10.0],
       "description": ""
     },
@@ -62,7 +52,6 @@
       "name": "Crossroads Inn",
       "map": "Velen",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\inn_crossroads",
       "position": [530.02, 535.01, 10.0],
       "description": ""
     },
@@ -70,7 +59,6 @@
       "name": "Crookback Bog",
       "map": "Velen",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\crookback_bog",
       "position": [1659.07, -905.22, 10.0],
       "description": ""
     },
@@ -78,7 +66,6 @@
       "name": "Bald Mountain",
       "map": "Velen",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\bald_mountain",
       "position": [1456.70, -1209.90, 10.0],
       "description": ""
     },
@@ -86,18 +73,13 @@
       "name": "Passiflora",
       "map": "Novigrad",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\novigrad\\passiflora",
       "position": [668.40, 2100.69, 10.0],
-      "layer_extra": [
-        "levels\\novigrad\\doors.w2l"
-      ],
       "description": ""
     },
     {
       "name": "Hierarch Square",
       "map": "Novigrad",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\novigrad\\main_square",
       "position": [649.24, 1885.46, 10.0],
       "description": ""
     },
@@ -105,7 +87,6 @@
       "name": "Temple Isle",
       "map": "Novigrad",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\novigrad\\temple_island",
       "position": [498.54, 2206.43, 10.0],
       "description": ""
     },
@@ -113,7 +94,6 @@
       "name": "Novigrad Harbour",
       "map": "Novigrad",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\novigrad\\_harbour_district",
       "position": [535.55, 1950.46, 10.0],
       "description": ""
     },
@@ -121,7 +101,6 @@
       "name": "The Chameleon",
       "map": "Novigrad",
       "world_path": "levels\\novigrad\\novigrad.w2w",
-      "layer_dir": "levels\\novigrad\\novigrad\\dandelion_brothel",
       "position": [714.18, 1739.06, 10.0],
       "description": ""
     },
@@ -129,7 +108,6 @@
       "name": "Kaer Trolde",
       "map": "Skellige",
       "world_path": "levels\\skellige\\skellige.w2w",
-      "layer_dir": "levels\\skellige\\ard_skellig\\kaer_trolde",
       "position": [-158.22, 695.38, 10.0],
       "description": ""
     },
@@ -137,7 +115,6 @@
       "name": "Larvik",
       "map": "Skellige",
       "world_path": "levels\\skellige\\skellige.w2w",
-      "layer_dir": "levels\\skellige\\hindarsfjall\\larvik",
       "position": [2774.56, 60.67, 10.0],
       "description": ""
     },
@@ -145,7 +122,6 @@
       "name": "Druids' Camp",
       "map": "Skellige",
       "world_path": "levels\\skellige\\skellige.w2w",
-      "layer_dir": "levels\\skellige\\ard_skellig\\druids",
       "position": [1042.09, 233.68, 10.0],
       "description": ""
     },
@@ -153,7 +129,6 @@
       "name": "Undvik",
       "map": "Skellige",
       "world_path": "levels\\skellige\\skellige.w2w",
-      "layer_dir": "levels\\skellige\\undvik",
       "position": [-1485.23, -117.15, 10.0],
       "description": ""
     },
@@ -161,7 +136,6 @@
       "name": "Kaer Morhen",
       "map": "Kaer Morhen",
       "world_path": "levels\\kaer_morhen\\kaer_morhen.w2w",
-      "layer_dir": "levels\\kaer_morhen\\kaer_morhen_valley",
       "position": [-9.87, -6.29, 10.0],
       "description": ""
     },
@@ -169,7 +143,6 @@
       "name": "Beauclair",
       "map": "Toussaint",
       "world_path": "dlc\\bob\\data\\levels\\bob\\bob.w2w",
-      "layer_dir": "dlc\\bob\\data\\levels\\bob\\community\\beauclair",
       "position": [-516.46, -1398.98, 10.0],
       "description": ""
     },
@@ -177,15 +150,14 @@
       "name": "Beauclair Palace",
       "map": "Toussaint",
       "world_path": "dlc\\bob\\data\\levels\\bob\\bob.w2w",
-      "layer_dir": "dlc\\bob\\data\\levels\\bob\\community\\beauclair\\palace",
-      "position": [-684.12, -1193.06, 10.0],
+      "position": [-696.63, -1207.23, 167.106],
+      "radius": 100,
       "description": ""
     },
     {
       "name": "Corvo Bianco",
       "map": "Toussaint",
       "world_path": "dlc\\bob\\data\\levels\\bob\\bob.w2w",
-      "layer_dir": "dlc\\bob\\data\\levels\\bob\\community\\vineyards\\corvo_bianco",
       "position": [-350.33, -808.93, 10.0],
       "description": ""
     },
@@ -193,7 +165,6 @@
       "name": "Dun Tynne",
       "map": "Toussaint",
       "world_path": "dlc\\bob\\data\\levels\\bob\\bob.w2w",
-      "layer_dir": "dlc\\bob\\data\\levels\\bob\\community\\dun_tynne",
       "position": [75.0, -540.0, 10.0],
       "description": ""
     },
@@ -201,7 +172,6 @@
       "name": "Tournament Grounds",
       "map": "Toussaint",
       "world_path": "dlc\\bob\\data\\levels\\bob\\bob.w2w",
-      "layer_dir": "dlc\\bob\\data\\levels\\bob\\community\\tournament",
       "position": [-524.76, -977.05, 10.0],
       "description": ""
     },
@@ -209,7 +179,6 @@
       "name": "Vizima Castle",
       "map": "Vizima",
       "world_path": "levels\\wyzima_castle\\wyzima_castle.w2w",
-      "layer_dir": "levels\\wyzima_castle\\wyzima_castle",
       "position": [-4.0, 16.79, 10.0],
       "description": ""
     }

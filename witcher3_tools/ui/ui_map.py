@@ -64,6 +64,8 @@ _FAST_SCAN_ENTITY_TYPES = frozenset(getattr(CR2W.CR2W_types, "Entity_Type_List",
 _FAST_SCAN_TOP_LEVEL_TYPES = frozenset({"CLayer", "CEntityTemplate", "CFoliageResource"})
 _LAYER_COMPLETE_STATES = frozenset({"complete", "proxy_complete"})
 _LAYER_COVERED_STATES = frozenset({"complete", "proxy_complete", "partial", "proxy_partial"})
+# Filter candidate anchors by height, then import the qualifying layer intact.
+_LAYER_CANDIDATE_VERTICAL_RADIUS = 20.0
 _LAYER_QUERY_FILTER_KINDS = frozenset({
     "mesh",
     "component_mesh",
@@ -77,8 +79,6 @@ _LAYER_QUERY_FILTER_KINDS = frozenset({
     "component_point_light",
     "component_spot_light",
     "cloth",
-    "entity",
-    "entity_empty",
     "entity_template",
 })
 W2LAYER_PATH_PROP = "w2layer_path"
@@ -1176,6 +1176,7 @@ class WITCH_OT_update_terrain_view_lod(bpy.types.Operator):
 
 
 _VIEW_LOD_AUTO_STATE = {"pos": None, "pending": 0}
+_FOLIAGE_VIEWPORT_AUTO_STATE = {"pos": None}
 
 
 def _viewport_view_signature():
@@ -1209,10 +1210,11 @@ def _terrain_view_lod_auto_tick():
     try:
         scene = getattr(bpy.context, "scene", None)
         settings = getattr(scene, "witcher_file_browser", None)
+        foliage_interval = _update_foliage_viewport_from_view(scene, settings)
         if settings is None or not getattr(settings, "terrain_lod_auto_update", False):
             _VIEW_LOD_AUTO_STATE["pos"] = None
             _VIEW_LOD_AUTO_STATE["pending"] = 0
-            return 2.0
+            return foliage_interval
         candidates = _find_view_lod_world_collections()
         if len(candidates) != 1:
             _VIEW_LOD_AUTO_STATE["pos"] = None
@@ -1275,6 +1277,22 @@ def _terrain_view_lod_auto_tick():
     except Exception:
         log.exception("Terrain View LOD auto update failed")
         return 5.0
+
+
+def _update_foliage_viewport_from_view(scene, settings) -> float:
+    if settings is None or not getattr(settings, "foliage_viewport_distance_culling", True):
+        _FOLIAGE_VIEWPORT_AUTO_STATE["pos"] = None
+        return 2.0
+    position = _get_camera_position()
+    if position is None:
+        return 1.0
+    previous = _FOLIAGE_VIEWPORT_AUTO_STATE.get("pos")
+    if previous is None or sum((a - b) ** 2 for a, b in zip(previous, position)) >= 4.0:
+        from ..importers import import_foliage
+
+        import_foliage.update_foliage_viewport_position(position, scene, min_distance=2.0)
+        _FOLIAGE_VIEWPORT_AUTO_STATE["pos"] = position
+    return 0.5
 
 
 def register_view_lod_timer():
@@ -1574,39 +1592,6 @@ def _find_world_root_collection(context):
     return _find_world_root_collection_for_collection(getattr(context, "collection", None))
 
 
-def _is_location_viewer_root(root_collection):
-    """Return whether a root was opened by a location preset."""
-    if root_collection is None:
-        return False
-    for obj in list(getattr(root_collection, "objects", []) or []):
-        try:
-            if bool(obj.get("witcher_location_world_anchor", False)):
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _location_viewer_import_policy(import_settings):
-    """Return the visible-scene fast path used by compact location presets."""
-    settings = dict(import_settings or {})
-    settings["do_import_ProxyMesh"] = False
-    settings["keep_proxy_meshes"] = False
-    settings["hide_proxy_meshes"] = True
-    # Hide technical collisions and instance repeated scenery.
-    settings["do_import_Collision"] = False
-    settings["instanced_sector"] = True
-    settings["hide_engine_hidden_meshes"] = True
-    return settings
-
-
-def location_viewer_visibility_active(context, root_collection=None):
-    """Public UI helper for the automatic location visibility policy."""
-    if root_collection is None:
-        root_collection = _find_world_root_collection(context)
-    return _is_location_viewer_root(root_collection)
-
-
 def _collection_has_imported_layer_objects(collection):
     if collection is None:
         return False
@@ -1652,6 +1637,14 @@ def _resolve_layer_visibility_root_collection(context):
     context_collection = getattr(context, "collection", None)
     if _collection_has_imported_layer_objects(context_collection):
         return context_collection
+    scene = getattr(context, "scene", None)
+    world_roots = [
+        collection
+        for collection in getattr(getattr(scene, "collection", None), "children", ())
+        if str(collection.get("world_path", "")).strip()
+    ]
+    if len(world_roots) == 1:
+        return world_roots[0]
     return None
 
 
@@ -1675,12 +1668,9 @@ def _world_layer_cache_dir():
 def _world_layer_cache_key(context, root_collection):
     world_path = str(root_collection.get("world_path", "")).strip()
     world_id = world_path or f"collection:{root_collection.name}"
-    location_scope_id = str(root_collection.get("witcher_location_scope_id", "") or "").strip()
     primary_roots, secondary_roots, prefer_repo_extract = _level_search_roots(context, root_collection)
     roots_id = "\n".join(primary_roots + ["--"] + secondary_roots)
     payload = f"{_WORLD_LAYER_SCAN_CACHE_VERSION}\n{world_id}\n{int(prefer_repo_extract)}\n{roots_id}"
-    if location_scope_id:
-        payload += f"\nlocation_scope:{location_scope_id}"
     return hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest()
 
 
@@ -1882,12 +1872,13 @@ def _entry_manifest_complete(entry):
 def _load_world_layer_cache_entry(conn, level_key, *, include_items=False):
     if conn is None or not level_key:
         return None
+    items_column = ", items_json" if include_items else ""
     row = conn.execute(
-        """
+        f"""
         SELECT level_path, resolved_path, file_mtime, file_size,
                has_bounds, min_x, min_y, max_x, max_y,
                object_count, has_manifest, manifest_complete, import_item_count,
-               scan_backend, unresolved_json, plan_hash, items_json
+               scan_backend, unresolved_json, plan_hash{items_column}
         FROM layers
         WHERE level_key = ?
         """,
@@ -2410,6 +2401,7 @@ def _count_nearby_manifest_items_for_entry(
     item_kind_filter=None,
     import_filter_kwargs=None,
     context=None,
+    vertical_radius=None,
 ):
     if camera_position is None:
         return 0, None
@@ -2435,6 +2427,9 @@ def _count_nearby_manifest_items_for_entry(
         distance_sq = (dx * dx) + (dy * dy)
         if distance_sq > radius_sq:
             continue
+        if vertical_radius is not None and len(camera_position) > 2:
+            if abs(position[2] - float(camera_position[2])) > float(vertical_radius):
+                continue
         count += 1
         if nearest_sq is None or distance_sq < nearest_sq:
             nearest_sq = distance_sq
@@ -4118,6 +4113,8 @@ def _query_world_layer_cache_nearby_candidates(
     item_kind_filter=None,
     import_filter_kwargs=None,
     context=None,
+    exclude_level_keys=None,
+    vertical_radius=None,
 ):
     cache_path = str(index.get("cache_path", "") or "").strip()
     if not cache_path or camera_position is None:
@@ -4131,6 +4128,11 @@ def _query_world_layer_cache_nearby_candidates(
     entry_map_started = time.perf_counter()
     entry_by_level_key = _world_layer_entry_map(index)
     entry_map_seconds = time.perf_counter() - entry_map_started
+    exclude_level_keys = {
+        str(level_key or "").strip().lower()
+        for level_key in (exclude_level_keys or ())
+        if str(level_key or "").strip()
+    }
 
     skip_started = time.perf_counter()
     skip_level_keys = _world_layer_cache_skip_level_keys(
@@ -4192,7 +4194,7 @@ def _query_world_layer_cache_nearby_candidates(
     seen_level_keys = set()
     for row in rows:
         level_key = str(row["level_key"] or "").strip()
-        if not level_key:
+        if not level_key or level_key.lower() in exclude_level_keys:
             continue
         entry = entry_by_level_key.get(level_key)
         if entry is None:
@@ -4208,6 +4210,7 @@ def _query_world_layer_cache_nearby_candidates(
                 item_kind_filter=item_kind_filter,
                 import_filter_kwargs=import_filter_kwargs,
                 context=context,
+                vertical_radius=vertical_radius,
             )
             if nearby_item_count <= 0:
                 continue
@@ -4227,7 +4230,12 @@ def _query_world_layer_cache_nearby_candidates(
     fallback_started = time.perf_counter()
     for entry in index.get("entries", []):
         level_key = str(entry.get("level_key", "") or "").strip()
-        if not level_key or level_key in seen_level_keys or level_key in skip_level_keys:
+        if (
+            not level_key
+            or level_key in seen_level_keys
+            or level_key in skip_level_keys
+            or level_key.lower() in exclude_level_keys
+        ):
             continue
         if _entry_manifest_complete(entry):
             continue
@@ -4387,7 +4395,16 @@ def _prepare_layer_load_phase(job, context):
     query_seconds = 0.0
     mode_signature = job.get("mode_signature")
     import_filter_kwargs = job.get("import_filter_kwargs") if bool(job.get("import_filter_active")) else None
-    item_kind_filter = _LAYER_QUERY_FILTER_KINDS if import_filter_kwargs is not None else None
+    item_kind_filter = _LAYER_QUERY_FILTER_KINDS
+    vertical_radius = max(
+        0.0,
+        float(job.get("candidate_vertical_radius", _LAYER_CANDIDATE_VERTICAL_RADIUS)),
+    )
+    exclude_level_keys = (
+        _default_hidden_level_paths(root_collection)
+        if bool(job.get("exclude_default_hidden"))
+        else set()
+    )
     if str(index.get("cache_backend", "") or "").strip().lower() == "sqlite":
         query_started = time.perf_counter()
         candidates, skipped_complete = _query_world_layer_cache_nearby_candidates(
@@ -4399,6 +4416,8 @@ def _prepare_layer_load_phase(job, context):
             item_kind_filter=item_kind_filter,
             import_filter_kwargs=import_filter_kwargs,
             context=context,
+            exclude_level_keys=exclude_level_keys,
+            vertical_radius=vertical_radius,
         )
         query_seconds = time.perf_counter() - query_started
     else:
@@ -4407,6 +4426,9 @@ def _prepare_layer_load_phase(job, context):
 
         query_started = time.perf_counter()
         for entry in index.get("entries", []):
+            level_key = str(entry.get("level_key", "") or "").strip().lower()
+            if level_key in exclude_level_keys:
+                continue
             collection = bpy.data.collections.get(entry["collection_name"])
             if collection is None:
                 continue
@@ -4426,6 +4448,7 @@ def _prepare_layer_load_phase(job, context):
                 item_kind_filter=item_kind_filter,
                 import_filter_kwargs=import_filter_kwargs,
                 context=context,
+                vertical_radius=vertical_radius,
             )
             if entry.get("items"):
                 if nearby_item_count <= 0:
@@ -4478,8 +4501,9 @@ def _prepare_layer_load_phase(job, context):
             int(skipped_complete or 0),
         )
         job["summary"] = (
-            f"No nearby importable objects within {radius:.0f} world units "
-            f"(indexed {index.get('stats', {}).get('indexed', 0)}, skipped complete {skipped_complete})"
+            f"No nearby renderable objects within {radius:.0f} world units "
+            f"(Z +/-{vertical_radius:.0f}, indexed {index.get('stats', {}).get('indexed', 0)}, "
+            f"skipped complete {skipped_complete})"
         )
         return False
     isolation_started = time.perf_counter()
@@ -4688,8 +4712,9 @@ def _process_layer_load_batch(job, context):
         )
         job["summary"] = (
             f"Loaded {int(load.get('imported', 0))}/{total} nearby layers "
-            f"covering {int(load.get('selected_item_count', 0)):,} cached nearby objects "
-            f"(radius {radius:.0f} world units, indexed {int(index.get('stats', {}).get('indexed', 0))})"
+            f"covering {int(load.get('selected_item_count', 0)):,} cached nearby renderables "
+            f"(radius {radius:.0f} XY / +/-{float(job.get('candidate_vertical_radius', _LAYER_CANDIDATE_VERTICAL_RADIUS)):.0f} Z, "
+            f"indexed {int(index.get('stats', {}).get('indexed', 0))})"
         )
         if int(job.get("load_limit", 0) or 0) > 0 and int(load.get("candidate_count", 0) or 0) > total:
             job["summary"] += f", limited from {int(load.get('candidate_count', 0))}"
@@ -5096,13 +5121,13 @@ def _layer_visibility_reasons(obj, descendant_engine_states=None):
         return set()
 
     reasons = set()
+    if _layer_visibility_is_proxy_mesh_object(obj):
+        reasons.add("proxy")
     if getattr(obj, "type", "") == 'MESH':
         if _layer_visibility_is_volume_mesh(obj):
             reasons.add("volume")
         if _layer_visibility_is_shadow_mesh(obj):
             reasons.add("shadow")
-        if _layer_visibility_is_proxy_mesh_object(obj):
-            reasons.add("proxy")
     if _layer_visibility_is_collision_object(obj):
         reasons.add("collision")
     if _layer_visibility_is_redapex_object(obj):
@@ -5299,22 +5324,6 @@ def _apply_layer_object_visibility_rules(
 def _apply_layer_post_import_visibility(job, context):
     root_collection = bpy.data.collections.get(str((job or {}).get("root_collection_name", "") or ""))
     invalidate_layer_visibility_cache(root_collection)
-    if bool((job or {}).get("location_visibility_preapplied")):
-        requires_classification = any(bool((job or {}).get(key)) for key in (
-            "hide_volume_meshes",
-            "hide_shadow_meshes",
-            "hide_collision",
-            "hide_redapex",
-            "solo_volume_meshes",
-            "solo_shadow_meshes",
-            "solo_collision",
-            "solo_engine_hidden_meshes",
-            "solo_proxy_meshes",
-            "solo_redapex",
-        ))
-        if not requires_classification:
-            # Location imports already apply this visibility policy.
-            return 0
     return _apply_layer_object_visibility_rules(
         context,
         hide_volume=bool((job or {}).get("hide_volume_meshes")),
@@ -5341,20 +5350,13 @@ def apply_layer_visibility_settings(context, scene_settings=None, root_collectio
         return 0
     if root_collection is None:
         root_collection = _resolve_layer_visibility_root_collection(context)
-    location_viewer = _is_location_viewer_root(root_collection)
     return _apply_layer_object_visibility_rules(
         context,
         hide_volume=bool(getattr(scene_settings, "terrain_layer_hide_volume_meshes", False)),
         hide_shadow=bool(getattr(scene_settings, "terrain_layer_hide_shadow_meshes", False)),
         hide_collision=bool(getattr(scene_settings, "terrain_layer_hide_collision", False)),
-        hide_engine_hidden=(
-            location_viewer
-            or bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True))
-        ),
-        hide_proxy=(
-            location_viewer
-            or bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False))
-        ),
+        hide_engine_hidden=bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True)),
+        hide_proxy=bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False)),
         hide_redapex=bool(getattr(scene_settings, "terrain_layer_hide_redapex", False)),
         solo_volume=bool(getattr(scene_settings, "terrain_layer_solo_volume_meshes", False)),
         solo_shadow=bool(getattr(scene_settings, "terrain_layer_solo_shadow_meshes", False)),
@@ -5558,6 +5560,25 @@ def _get_camera_position(context=None):
         return None
 
 
+def _layer_candidate_vertical_radius(context, camera_position):
+    vertical_radius = float(_LAYER_CANDIDATE_VERTICAL_RADIUS)
+    if camera_position is None or len(camera_position) < 3:
+        return vertical_radius
+    area = _get_current_view3d_area(context)
+    if area is None:
+        return vertical_radius
+    try:
+        target_z = float(area.spaces.active.region_3d.view_location.z)
+        # Allow a metre for terrain/float drift beyond the target.
+        vertical_radius = max(
+            vertical_radius,
+            abs(float(camera_position[2]) - target_z) + 1.0,
+        )
+    except Exception:
+        pass
+    return vertical_radius
+
+
 def get_camera_position_label(context):
     position = _get_camera_position(context)
     if position is None:
@@ -5752,8 +5773,41 @@ def _compute_nearby_cache_summary_label(context, camera_position, root_collectio
     scene_settings = getattr(getattr(context, "scene", None), "witcher_file_browser", None)
     radius = max(1.0, float(getattr(scene_settings, "terrain_layer_load_radius", 100.0) or 100.0))
     skip_loaded = bool(getattr(scene_settings, "terrain_layer_skip_loaded", True))
-    nearby_items, nearby_layers = _query_world_layer_runtime_nearby(index, camera_position, radius, skip_loaded)
-    return f"Scan Cache Nearby: {nearby_items:,} importable objects in {nearby_layers:,} layers"
+    if str(index.get("cache_backend", "") or "").strip().lower() == "sqlite":
+        import_kwargs = _layer_import_kwargs_from_scene(scene_settings)
+        import_filter_kwargs = (
+            import_kwargs if _layer_import_query_filter_active(scene_settings) else None
+        )
+        exclude_default_hidden = (
+            bool(getattr(scene_settings, "terrain_layer_hide_default_hidden", True))
+            and not bool(getattr(scene_settings, "terrain_layer_solo_default_hidden", False))
+        )
+        candidates, _skipped = _query_world_layer_cache_nearby_candidates(
+            index,
+            camera_position,
+            radius,
+            skip_loaded,
+            mode_signature=_layer_load_mode_signature_for_scene(scene_settings),
+            item_kind_filter=_LAYER_QUERY_FILTER_KINDS,
+            import_filter_kwargs=import_filter_kwargs,
+            context=context,
+            exclude_level_keys=(
+                _default_hidden_level_paths(root_collection)
+                if exclude_default_hidden
+                else set()
+            ),
+            vertical_radius=_layer_candidate_vertical_radius(context, camera_position),
+        )
+        nearby_items = sum(int(item[3] or 0) for item in candidates)
+        nearby_layers = len(candidates)
+    else:
+        nearby_items, nearby_layers = _query_world_layer_runtime_nearby(
+            index,
+            camera_position,
+            radius,
+            skip_loaded,
+        )
+    return f"Scan Cache Nearby: {nearby_items:,} renderables in {nearby_layers:,} layers"
 
 
 def get_nearby_cache_summary_label(context):
@@ -6159,8 +6213,7 @@ class WITCH_OT_rebuild_layer_scan_cache(bpy.types.Operator):
 class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
     bl_idname = "witcher.load_layers_around_camera"
     bl_label = "Load Layers Around Camera"
-    bl_description = "Load nearby world layers based on cached .w2l bounds and the current viewport camera"
-
+    bl_description = "Load visible world layers with renderable content near the current viewport camera"
     def execute(self, context):
         execute_started = time.perf_counter()
         hydrate_seconds = 0.0
@@ -6189,11 +6242,6 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
         write_profile_log = bool(getattr(scene_settings, "terrain_layer_write_profile_log", False))
         import_kwargs = _layer_import_kwargs_from_scene(scene_settings)
         import_filter_active = _layer_import_query_filter_active(scene_settings)
-        location_viewer = _is_location_viewer_root(root_collection)
-        if location_viewer:
-            # Apply the curated location viewer policy.
-            import_kwargs = _location_viewer_import_policy(import_kwargs)
-            import_filter_active = True
 
         _unhide_default_hidden_layer_groups(context)
         job = _start_layer_stream_job(context, "load_nearby", root_collection)
@@ -6201,28 +6249,28 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
         job["load_limit"] = load_limit
         job["skip_complete"] = skip_loaded
         job["camera_position"] = camera_position
+        job["candidate_vertical_radius"] = _layer_candidate_vertical_radius(
+            context,
+            camera_position,
+        )
         job["mode_signature"] = _layer_load_mode_signature_for_scene(scene_settings)
-        if location_viewer:
-            job["mode_signature"] += (
-                ";location_viewer=1;location_proxy_mesh=0;location_proxy_lods=0"
-                ";location_collision=0;location_instanced=1"
-            )
         job["import_kwargs"] = import_kwargs
         job["import_filter_kwargs"] = import_kwargs
         job["import_filter_active"] = import_filter_active
+        job["exclude_default_hidden"] = (
+            bool(getattr(scene_settings, "terrain_layer_hide_default_hidden", True))
+            and not bool(getattr(scene_settings, "terrain_layer_solo_default_hidden", False))
+        )
         job["hide_volume_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_volume_meshes", False))
         job["hide_shadow_meshes"] = bool(getattr(scene_settings, "terrain_layer_hide_shadow_meshes", False))
         job["hide_collision"] = bool(getattr(scene_settings, "terrain_layer_hide_collision", False))
-        job["hide_engine_hidden_meshes"] = (
-            location_viewer
-            or bool(getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True))
+        job["hide_engine_hidden_meshes"] = bool(
+            getattr(scene_settings, "terrain_layer_hide_engine_hidden_meshes", True)
         )
-        job["hide_proxy_meshes"] = (
-            location_viewer
-            or bool(getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False))
+        job["hide_proxy_meshes"] = bool(
+            getattr(scene_settings, "terrain_layer_hide_proxy_meshes", False)
         )
         job["hide_redapex"] = bool(getattr(scene_settings, "terrain_layer_hide_redapex", False))
-        job["location_visibility_preapplied"] = bool(location_viewer)
         job["solo_volume_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_volume_meshes", False))
         job["solo_shadow_meshes"] = bool(getattr(scene_settings, "terrain_layer_solo_shadow_meshes", False))
         job["solo_collision"] = bool(getattr(scene_settings, "terrain_layer_solo_collision", False))

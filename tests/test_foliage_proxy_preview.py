@@ -85,6 +85,17 @@ class TestFoliageProxyClassification(unittest.TestCase):
         self.assertNotIn("grass_8.srt", selected)
         self.assertNotIn(r"trees\oak_6.srt", selected)
 
+    def test_viewport_density_applies_only_to_ground_cover(self):
+        self.assertTrue(foliage._is_ground_cover("grass.srt"))
+        self.assertTrue(foliage._is_ground_cover("flowers\\poppy.srt"))
+        self.assertFalse(foliage._is_ground_cover("trees\\oak.srt"))
+        self.assertFalse(foliage._is_ground_cover("trees\\pine.srt"))
+
+    def test_viewport_density_threshold_is_explicit_percentage(self):
+        self.assertEqual(foliage._viewport_density_threshold(0.01), 0.5)
+        self.assertEqual(foliage._viewport_density_threshold(0.25), 24.5)
+        self.assertEqual(foliage._viewport_density_threshold(1.0), 99.5)
+
 
 class TestFoliageProxyVisibility(unittest.TestCase):
     def test_technical_source_is_disabled_in_viewport_and_render(self):

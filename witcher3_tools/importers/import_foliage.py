@@ -40,6 +40,18 @@ _PROXY_SOURCE_MARKER = "_foliage_shared_proxy_source"
 _PROXY_KIND_PROP = "_foliage_proxy_kind"
 _FALLBACK_HIDDEN_PROP = "_foliage_fallback_hidden"
 _SOURCE_NODE_NAME = "Foliage Source"
+_VIEWPORT_POSITION_NODE_NAME = "W3 Viewport Position"
+_VIEWPORT_DISTANCE_NODE_NAME = "W3 Viewport Distance"
+_VIEWPORT_CULL_ENABLED_NODE_NAME = "W3 Viewport Cull Enabled"
+_VIEWPORT_DENSITY_NODE_NAME = "W3 Ground Cover Density"
+_VIEWPORT_DENSITY_ENABLED_NODE_NAME = "W3 Ground Cover Density Enabled"
+_VIEWPORT_SOURCE_NODE_NAME = "W3 Fast Viewport Source"
+_VIEWPORT_FAST_MATERIAL_ENABLED_NODE_NAME = "W3 Fast Viewport Material Enabled"
+_VIEWPORT_MATERIAL_PROP = "_w3_foliage_viewport_material"
+_VIEWPORT_MATERIAL_SOURCE_PROP = "_w3_foliage_viewport_material_source"
+_VIEWPORT_SOURCE_PROP = "_w3_foliage_viewport_source"
+_LEGACY_VIEWPORT_DRIVER_PROP = "_w3_foliage_viewport_driver"
+_FOLIAGE_GN_VERSION = 8
 
 _PROXY_KIND_GRASS = "grass"
 _PROXY_KIND_FLOWER = "flower"
@@ -51,6 +63,9 @@ _PROXY_KIND_TREE = "tree"
 # Viewer mode hydrates only dominant source types.
 FOLIAGE_VIEWER_GROUND_SOURCE_LIMIT = 8
 FOLIAGE_VIEWER_TREE_SOURCE_LIMIT = 6
+
+_DEFAULT_VIEWPORT_DISTANCE = 75.0
+_DEFAULT_VIEWPORT_GROUND_DENSITY = 0.25
 
 
 def _normalise_source_mode(source_mode: str) -> str:
@@ -529,6 +544,109 @@ def _foliage_proxy_kind(depot_path: str) -> str:
     return _PROXY_KIND_SHRUB
 
 
+def _is_ground_cover(depot_path: str) -> bool:
+    return _foliage_proxy_kind(depot_path) not in {_PROXY_KIND_TREE, _PROXY_KIND_CONIFER}
+
+
+def _foliage_viewport_settings(scene=None):
+    scene = scene or getattr(bpy.context, "scene", None)
+    settings = getattr(scene, "witcher_file_browser", None)
+    return {
+        "cull_enabled": bool(getattr(settings, "foliage_viewport_distance_culling", True)),
+        "distance": max(
+            1.0,
+            float(getattr(settings, "foliage_viewport_distance", _DEFAULT_VIEWPORT_DISTANCE)),
+        ),
+        "ground_density": min(
+            1.0,
+            max(
+                0.01,
+                float(
+                    getattr(
+                        settings,
+                        "foliage_viewport_ground_density",
+                        _DEFAULT_VIEWPORT_GROUND_DENSITY,
+                    )
+                ),
+            ),
+        ),
+        "fast_materials": bool(getattr(settings, "foliage_viewport_fast_materials", True)),
+    }
+
+
+def _viewport_density_threshold(density: float) -> float:
+    density = min(1.0, max(0.01, float(density)))
+    return density * 100.0 - 0.5
+
+
+def _diffuse_image_from_material(material):
+    node_tree = getattr(material, "node_tree", None)
+    nodes = list(getattr(node_tree, "nodes", ()) or ())
+    image_nodes = [node for node in nodes if getattr(node, "type", "") == 'TEX_IMAGE' and node.image]
+    if not image_nodes:
+        return None
+    for node in image_nodes:
+        label = f"{getattr(node, 'name', '')} {getattr(node, 'label', '')}".lower()
+        if any(word in label for word in ("diffuse", "base color", "basecolor", "albedo")):
+            return node.image
+    return image_nodes[0].image
+
+
+def _get_or_create_fast_viewport_material(source_material):
+    source_key = str(getattr(source_material, "name_full", None) or source_material.name)
+    for material in bpy.data.materials:
+        if (
+            material.get(_VIEWPORT_MATERIAL_PROP)
+            and str(material.get(_VIEWPORT_MATERIAL_SOURCE_PROP, "")) == source_key
+        ):
+            return material
+
+    material = bpy.data.materials.new(name=f"{source_material.name} [W3 Viewport]")
+    material.use_nodes = True
+    material[_VIEWPORT_MATERIAL_PROP] = True
+    material[_VIEWPORT_MATERIAL_SOURCE_PROP] = source_key
+    try:
+        material.diffuse_color = source_material.diffuse_color
+    except Exception:
+        pass
+
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    nodes.clear()
+    output = nodes.new('ShaderNodeOutputMaterial')
+    output.location = (320, 0)
+    shader = nodes.new('ShaderNodeBsdfPrincipled')
+    shader.location = (40, 0)
+    shader.inputs['Roughness'].default_value = 0.8
+    links.new(shader.outputs['BSDF'], output.inputs['Surface'])
+
+    image = _diffuse_image_from_material(source_material)
+    if image is not None:
+        texture = nodes.new('ShaderNodeTexImage')
+        texture.location = (-260, 0)
+        texture.image = image
+        links.new(texture.outputs['Color'], shader.inputs['Base Color'])
+        links.new(texture.outputs['Alpha'], shader.inputs['Alpha'])
+    else:
+        try:
+            shader.inputs['Base Color'].default_value = source_material.diffuse_color
+        except Exception:
+            pass
+
+    try:
+        material.surface_render_method = 'DITHERED'
+    except Exception:
+        try:
+            material.blend_method = 'HASHED'
+        except Exception:
+            pass
+    try:
+        material.use_transparency_overlap = False
+    except Exception:
+        pass
+    return material
+
+
 def _hide_foliage_source(source) -> None:
     """Keep source datablocks usable by GN but out of the viewport and render."""
 
@@ -542,6 +660,39 @@ def _hide_foliage_source(source) -> None:
         source.hide_set(True)
     except Exception:
         pass
+
+
+def _get_or_create_fast_viewport_source(source_obj, foliage_root):
+    data = getattr(source_obj, "data", None)
+    if data is None:
+        return None
+    source_materials = [slot.material for slot in getattr(source_obj, "material_slots", ())]
+    if not source_materials or not any(source_materials):
+        return None
+
+    source_key = str(getattr(source_obj, "name_full", None) or source_obj.name)
+    fast_source = next(
+        (
+            obj for obj in foliage_root.objects
+            if str(obj.get(_VIEWPORT_SOURCE_PROP, "")) == source_key
+            and getattr(obj, "data", None) is data
+        ),
+        None,
+    )
+    if fast_source is None:
+        fast_source = bpy.data.objects.new(f"{source_obj.name} [W3 Viewport]", data)
+        fast_source[_VIEWPORT_SOURCE_PROP] = source_key
+        foliage_root.objects.link(fast_source)
+
+    for slot, source_material in zip(fast_source.material_slots, source_materials):
+        slot.link = 'OBJECT'
+        slot.material = (
+            _get_or_create_fast_viewport_material(source_material)
+            if source_material is not None
+            else None
+        )
+    _hide_foliage_source(fast_source)
+    return fast_source
 
 
 def _get_or_create_proxy_source(foliage_root, depot_path: str = ""):
@@ -728,7 +879,18 @@ def _transforms_for_depot(root_transforms: dict, depot_path: str, owner_indices_
     return combined, owner_indices
 
 
-def _build_foliage_gn_tree(ng, source_obj):
+def _build_foliage_gn_tree(
+    ng,
+    source_obj,
+    *,
+    viewport_position=(0.0, 0.0, 0.0),
+    viewport_distance: float = _DEFAULT_VIEWPORT_DISTANCE,
+    viewport_cull_enabled: bool = True,
+    viewport_ground_density: float = _DEFAULT_VIEWPORT_GROUND_DENSITY,
+    is_ground_cover: bool = True,
+    fast_viewport_source=None,
+    fast_viewport_material_enabled: bool = True,
+):
     """
     Named Attribute "rot" (FLOAT_VECTOR, XYZ euler)
       → Euler to Rotation
@@ -813,8 +975,106 @@ def _build_foliage_gn_tree(ng, source_obj):
     iop = nodes.new('GeometryNodeInstanceOnPoints')
     iop.location = (150, 0)
 
-    links.new(gin.outputs['Geometry'], iop.inputs['Points'])
-    links.new(oi.outputs['Geometry'], iop.inputs['Instance'])
+    # Cull only in the viewport; renders keep every authored point.
+    is_viewport = nodes.new('GeometryNodeIsViewport')
+    is_viewport.location = (-500, 500)
+    position = nodes.new('GeometryNodeInputPosition')
+    position.location = (-900, 300)
+    view_position = nodes.new('ShaderNodeCombineXYZ')
+    view_position.name = _VIEWPORT_POSITION_NODE_NAME
+    view_position.label = _VIEWPORT_POSITION_NODE_NAME
+    view_position.location = (-900, 450)
+    for socket, value in zip(view_position.inputs, viewport_position):
+        socket.default_value = float(value)
+    distance = nodes.new('ShaderNodeVectorMath')
+    distance.operation = 'DISTANCE'
+    distance.location = (-700, 350)
+    outside = nodes.new('ShaderNodeMath')
+    outside.name = _VIEWPORT_DISTANCE_NODE_NAME
+    outside.label = _VIEWPORT_DISTANCE_NODE_NAME
+    outside.operation = 'GREATER_THAN'
+    outside.inputs[1].default_value = float(viewport_distance)
+    outside.location = (-500, 300)
+    viewport_cull = nodes.new('FunctionNodeBooleanMath')
+    viewport_cull.operation = 'AND'
+    viewport_cull.location = (-300, 350)
+    cull_enabled = nodes.new('FunctionNodeBooleanMath')
+    cull_enabled.name = _VIEWPORT_CULL_ENABLED_NODE_NAME
+    cull_enabled.label = _VIEWPORT_CULL_ENABLED_NODE_NAME
+    cull_enabled.operation = 'AND'
+    cull_enabled.inputs[1].default_value = bool(viewport_cull_enabled)
+    cull_enabled.location = (-150, 300)
+    index = nodes.new('GeometryNodeInputIndex')
+    index.location = (-700, 700)
+    modulo = nodes.new('ShaderNodeMath')
+    modulo.operation = 'MODULO'
+    modulo.inputs[1].default_value = 100.0
+    modulo.location = (-500, 700)
+    density = nodes.new('ShaderNodeMath')
+    density.name = _VIEWPORT_DENSITY_NODE_NAME
+    density.label = _VIEWPORT_DENSITY_NODE_NAME
+    density.operation = 'GREATER_THAN'
+    density.inputs[1].default_value = _viewport_density_threshold(viewport_ground_density)
+    density.location = (-300, 700)
+    viewport_density = nodes.new('FunctionNodeBooleanMath')
+    viewport_density.operation = 'AND'
+    viewport_density.location = (-100, 650)
+    density_enabled = nodes.new('FunctionNodeBooleanMath')
+    density_enabled.name = _VIEWPORT_DENSITY_ENABLED_NODE_NAME
+    density_enabled.label = _VIEWPORT_DENSITY_ENABLED_NODE_NAME
+    density_enabled.operation = 'AND'
+    density_enabled.inputs[1].default_value = bool(is_ground_cover)
+    density_enabled.location = (50, 550)
+    viewport_remove = nodes.new('FunctionNodeBooleanMath')
+    viewport_remove.operation = 'OR'
+    viewport_remove.location = (100, 300)
+    delete = nodes.new('GeometryNodeDeleteGeometry')
+    delete.domain = 'POINT'
+    delete.location = (250, 100)
+
+    links.new(position.outputs['Position'], distance.inputs[0])
+    links.new(view_position.outputs['Vector'], distance.inputs[1])
+    links.new(distance.outputs['Value'], outside.inputs[0])
+    links.new(outside.outputs[0], viewport_cull.inputs[0])
+    links.new(is_viewport.outputs[0], viewport_cull.inputs[1])
+    links.new(viewport_cull.outputs[0], cull_enabled.inputs[0])
+    links.new(index.outputs['Index'], modulo.inputs[0])
+    links.new(modulo.outputs[0], density.inputs[0])
+    links.new(density.outputs[0], viewport_density.inputs[0])
+    links.new(is_viewport.outputs[0], viewport_density.inputs[1])
+    links.new(viewport_density.outputs[0], density_enabled.inputs[0])
+    links.new(cull_enabled.outputs[0], viewport_remove.inputs[0])
+    links.new(density_enabled.outputs[0], viewport_remove.inputs[1])
+    links.new(gin.outputs['Geometry'], delete.inputs['Geometry'])
+    links.new(viewport_remove.outputs[0], delete.inputs['Selection'])
+    links.new(delete.outputs['Geometry'], iop.inputs['Points'])
+
+    # Swap to cheap object-linked materials only in the viewport.
+    fast_oi = nodes.new('GeometryNodeObjectInfo')
+    fast_oi.name = _VIEWPORT_SOURCE_NODE_NAME
+    fast_oi.label = _VIEWPORT_SOURCE_NODE_NAME
+    fast_oi.location = (-100, -450)
+    fast_oi.inputs['Object'].default_value = fast_viewport_source
+    try:
+        fast_oi.transform_space = 'ORIGINAL'
+    except Exception:
+        pass
+    material_switch = nodes.new('GeometryNodeSwitch')
+    material_switch.input_type = 'GEOMETRY'
+    material_switch.location = (100, -300)
+    fast_enabled = nodes.new('FunctionNodeBooleanMath')
+    fast_enabled.name = _VIEWPORT_FAST_MATERIAL_ENABLED_NODE_NAME
+    fast_enabled.label = _VIEWPORT_FAST_MATERIAL_ENABLED_NODE_NAME
+    fast_enabled.operation = 'AND'
+    fast_enabled.inputs[1].default_value = bool(
+        fast_viewport_material_enabled and fast_viewport_source is not None
+    )
+    fast_enabled.location = (-100, -550)
+    links.new(is_viewport.outputs[0], fast_enabled.inputs[0])
+    links.new(fast_enabled.outputs[0], material_switch.inputs['Switch'])
+    links.new(oi.outputs['Geometry'], material_switch.inputs['False'])
+    links.new(fast_oi.outputs['Geometry'], material_switch.inputs['True'])
+    links.new(material_switch.outputs['Output'], iop.inputs['Instance'])
     if e2r is not None:
         links.new(na.outputs[0], e2r.inputs[0])
         try:
@@ -831,6 +1091,55 @@ def _build_foliage_gn_tree(ng, source_obj):
     except Exception:
         pass
     links.new(iop.outputs['Instances'], gout.inputs['Geometry'])
+
+
+def _set_instancer_viewport_source(
+    instancer_obj,
+    source_obj,
+    foliage_root,
+    enabled: bool,
+) -> None:
+    fast_source = _get_or_create_fast_viewport_source(source_obj, foliage_root)
+    for modifier in instancer_obj.modifiers:
+        if modifier.type != 'NODES' or modifier.node_group is None:
+            continue
+        nodes = modifier.node_group.nodes
+        source_node = nodes.get(_VIEWPORT_SOURCE_NODE_NAME)
+        fast_enabled = nodes.get(_VIEWPORT_FAST_MATERIAL_ENABLED_NODE_NAME)
+        if source_node is not None:
+            source_node.inputs['Object'].default_value = fast_source
+        if fast_enabled is not None:
+            fast_enabled.inputs[1].default_value = bool(enabled and fast_source is not None)
+        modifier.node_group.update_tag()
+
+
+def _set_instancer_viewport_settings(
+    instancer_obj,
+    settings=None,
+    depot_path: str = "",
+) -> None:
+    settings = settings or _foliage_viewport_settings()
+    depot_path = depot_path or _instancer_depot_path(instancer_obj)
+
+    for modifier in instancer_obj.modifiers:
+        if modifier.type != 'NODES' or modifier.node_group is None:
+            continue
+        nodes = modifier.node_group.nodes
+        distance = nodes.get(_VIEWPORT_DISTANCE_NODE_NAME)
+        cull_enabled = nodes.get(_VIEWPORT_CULL_ENABLED_NODE_NAME)
+        density = nodes.get(_VIEWPORT_DENSITY_NODE_NAME)
+        density_enabled = nodes.get(_VIEWPORT_DENSITY_ENABLED_NODE_NAME)
+        if distance is not None:
+            distance.inputs[1].default_value = float(settings["distance"])
+        if cull_enabled is not None:
+            cull_enabled.inputs[1].default_value = bool(settings["cull_enabled"])
+        if density is not None:
+            density.inputs[1].default_value = _viewport_density_threshold(
+                settings["ground_density"]
+            )
+        if density_enabled is not None:
+            density_enabled.inputs[1].default_value = _is_ground_cover(depot_path)
+        modifier.node_group.update_tag()
 
 
 def _instancer_source_nodes(instancer_obj) -> list:
@@ -952,21 +1261,46 @@ def _get_or_create_instancer(
     source_context_path: str = "",
 ):
     """Return (or create) the GN instancer object for this depot path."""
+    viewport_settings = _foliage_viewport_settings()
+    fast_source = _get_or_create_fast_viewport_source(source_obj, foliage_root)
     marker = "_inst_" + depot_path
     for obj in foliage_root.objects:
         if obj.get("_depot_path") == marker:
-            if int(obj.get("_foliage_gn_version", 0) or 0) < 2:
+            if int(obj.get("_foliage_gn_version", 0) or 0) < _FOLIAGE_GN_VERSION:
                 modifier = next((mod for mod in obj.modifiers if mod.type == 'NODES'), None)
                 old_group = modifier.node_group if modifier is not None else None
-                node_group = bpy.data.node_groups.new(obj.name + "_GN_v2", 'GeometryNodeTree')
+                node_group = bpy.data.node_groups.new(
+                    obj.name + f"_GN_v{_FOLIAGE_GN_VERSION}",
+                    'GeometryNodeTree',
+                )
                 if modifier is None:
                     modifier = obj.modifiers.new("FoliageInstancer", 'NODES')
                 modifier.node_group = node_group
-                _build_foliage_gn_tree(node_group, source_obj)
+                _build_foliage_gn_tree(
+                    node_group,
+                    source_obj,
+                    viewport_distance=viewport_settings["distance"],
+                    viewport_cull_enabled=viewport_settings["cull_enabled"],
+                    viewport_ground_density=viewport_settings["ground_density"],
+                    is_ground_cover=_is_ground_cover(depot_path),
+                    fast_viewport_source=fast_source,
+                    fast_viewport_material_enabled=viewport_settings["fast_materials"],
+                )
                 if old_group is not None and old_group.users == 0:
                     bpy.data.node_groups.remove(old_group)
-                obj["_foliage_gn_version"] = 2
+                obj["_foliage_gn_version"] = _FOLIAGE_GN_VERSION
             _set_instancer_source(obj, source_obj)
+            _set_instancer_viewport_source(
+                obj,
+                source_obj,
+                foliage_root,
+                viewport_settings["fast_materials"],
+            )
+            _set_instancer_viewport_settings(
+                obj,
+                settings=viewport_settings,
+                depot_path=depot_path,
+            )
             if source_context_path:
                 obj[_SOURCE_CONTEXT_PROP] = str(source_context_path)
             return obj
@@ -976,18 +1310,103 @@ def _get_or_create_instancer(
     obj  = bpy.data.objects.new(safe, mesh)
     obj["_depot_path"] = marker
     obj["_is_foliage_instancer"] = True
-    obj["_foliage_gn_version"] = 2
+    obj["_foliage_gn_version"] = _FOLIAGE_GN_VERSION
     foliage_root.objects.link(obj)
 
     ng  = bpy.data.node_groups.new(safe + "_GN", 'GeometryNodeTree')
     mod = obj.modifiers.new("FoliageInstancer", 'NODES')
     mod.node_group = ng
-    _build_foliage_gn_tree(ng, source_obj)
+    _build_foliage_gn_tree(
+        ng,
+        source_obj,
+        viewport_distance=viewport_settings["distance"],
+        viewport_cull_enabled=viewport_settings["cull_enabled"],
+        viewport_ground_density=viewport_settings["ground_density"],
+        is_ground_cover=_is_ground_cover(depot_path),
+        fast_viewport_source=fast_source,
+        fast_viewport_material_enabled=viewport_settings["fast_materials"],
+    )
     _set_instancer_source(obj, source_obj)
     if source_context_path:
         obj[_SOURCE_CONTEXT_PROP] = str(source_context_path)
 
     return obj
+
+
+def apply_foliage_viewport_settings(scene=None, position=None) -> int:
+    settings = _foliage_viewport_settings(scene)
+    updated = 0
+    for foliage_root in bpy.data.collections:
+        if not foliage_root.get("_is_foliage_root"):
+            continue
+        for obj in list(foliage_root.objects):
+            if obj.get(_LEGACY_VIEWPORT_DRIVER_PROP):
+                bpy.data.objects.remove(obj, do_unlink=True)
+        for instancer in list(foliage_root.objects):
+            if not instancer.get("_is_foliage_instancer"):
+                continue
+            depot_path = _instancer_depot_path(instancer)
+            source = _get_instancer_source(instancer)
+            if not depot_path or source is None:
+                continue
+            instancer = _get_or_create_instancer(
+                depot_path,
+                source,
+                foliage_root,
+                str(instancer.get(_SOURCE_CONTEXT_PROP, "") or ""),
+            )
+            _set_instancer_viewport_source(
+                instancer,
+                source,
+                foliage_root,
+                settings["fast_materials"],
+            )
+            _set_instancer_viewport_settings(
+                instancer,
+                settings,
+                depot_path,
+            )
+            updated += 1
+    if position is not None:
+        update_foliage_viewport_position(position, scene, min_distance=0.0)
+    return updated
+
+
+def update_foliage_viewport_position(position, scene=None, *, min_distance: float = 1.0) -> int:
+    if position is None:
+        return 0
+    settings = _foliage_viewport_settings(scene)
+    if not settings["cull_enabled"]:
+        return 0
+    updated = 0
+    min_distance_sq = float(min_distance) ** 2
+    for foliage_root in bpy.data.collections:
+        if not foliage_root.get("_is_foliage_root"):
+            continue
+        for instancer in foliage_root.objects:
+            if not instancer.get("_is_foliage_instancer"):
+                continue
+            if instancer.hide_viewport or instancer.get(_FALLBACK_HIDDEN_PROP, False):
+                continue
+            origin = getattr(
+                getattr(instancer, "matrix_world", None),
+                "translation",
+                (0.0, 0.0, 0.0),
+            )
+            target = tuple(float(position[index]) - float(origin[index]) for index in range(3))
+            for modifier in instancer.modifiers:
+                if modifier.type != 'NODES' or modifier.node_group is None:
+                    continue
+                node = modifier.node_group.nodes.get(_VIEWPORT_POSITION_NODE_NAME)
+                if node is None:
+                    continue
+                previous = tuple(float(socket.default_value) for socket in node.inputs[:3])
+                if sum((a - b) ** 2 for a, b in zip(previous, target)) < min_distance_sq:
+                    continue
+                for socket, value in zip(node.inputs, target):
+                    socket.default_value = value
+                updated += 1
+    return updated
 
 
 def _find_instancer(depot_path: str, foliage_root):

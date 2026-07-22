@@ -2628,7 +2628,7 @@ CACHE_ITEMS = (
         "name": "journal_browser_locations.pkl",
         "relative_path": os.path.join("JournalBrowser", "journal_browser_locations.pkl"),
         "label": "journal_browser_locations.pkl",
-        "description": "Curated locations browser entry cache.",
+        "description": "Saved locations browser entry cache.",
     },
     {
         "name": "journal_icons_bestiary",
@@ -4247,8 +4247,6 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 pending_mats = ui_map.import_blender_fun.deferred_material_queue_size()
                 if pending_mats:
                     controls.label(text=f"Streaming materials: {pending_mats} meshes left", icon='MATERIAL')
-                else:
-                    controls.operator("witcher.stream_missing_materials", text="Stream Missing Materials", icon='MATERIAL')
                 controls.operator(
                     "witcher.send_unreal_layers_around_camera",
                     text="Send Nearby Layers to Unreal", icon='URL',
@@ -4302,9 +4300,7 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 regex_row.prop(scene_settings, "terrain_layer_name_filter_regex", text="Regex")
 
                 visibility_box = controls.box()
-                visibility_box.label(text="Visibility After Load")
-                if ui_map.location_viewer_visibility_active(context):
-                    visibility_box.label(text="Location View: Proxies Hidden", icon='HIDE_ON')
+                visibility_box.label(text="Visibility / Nearby Selection")
                 def visibility_row(label, hide_prop, solo_prop):
                     row = visibility_box.row(align=True)
                     hide_enabled = bool(getattr(scene_settings, hide_prop, False))
@@ -4335,6 +4331,32 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 controls.prop(scene_settings, "foliage_load_radius", text="Radius (World Units)")
             controls.operator("witcher.load_foliage_around_camera", text="Load Foliage Around Camera", icon='PARTICLE_DATA')
             controls.operator("witcher.hydrate_foliage_sources", text="Load Full Sources", icon='IMPORT')
+            if scene_settings and hasattr(scene_settings, "foliage_viewport_distance_culling"):
+                viewport_box = controls.box()
+                viewport_box.label(text="Viewport Quality")
+                viewport_box.prop(
+                    scene_settings,
+                    "foliage_viewport_distance_culling",
+                    text="Cull Far Foliage",
+                )
+                distance_row = viewport_box.row(align=True)
+                distance_row.enabled = bool(scene_settings.foliage_viewport_distance_culling)
+                distance_row.prop(
+                    scene_settings,
+                    "foliage_viewport_distance",
+                    text="Foliage Distance",
+                )
+                viewport_box.prop(
+                    scene_settings,
+                    "foliage_viewport_ground_density",
+                    text="Ground Cover Density",
+                    slider=True,
+                )
+                viewport_box.prop(
+                    scene_settings,
+                    "foliage_viewport_fast_materials",
+                    text="Fast Foliage Materials",
+                )
             row = controls.row(align=True)
             row.operator("witcher.check_foliage_world", text="World Info", icon='INFO')
             row.operator("witcher.open_foliage_browser", text="Browse Folder", icon='FILE_FOLDER')
@@ -5198,6 +5220,7 @@ def register():
     w3_asset_browser.register()
     unreal_export.register()
     ui_map.register_view_lod_timer()
+    ui_map.import_blender_fun.register_deferred_material_load_handler()
 
     # Register dev features only when the dev folder exists and dev_mode_enabled is true.
     try:
@@ -5208,6 +5231,7 @@ def register():
 
 
 def unregister():
+    ui_map.import_blender_fun.unregister_deferred_material_load_handler()
     ui_map.unregister_view_lod_timer()
     # Safe no-op when dev features were never registered.
     try:

@@ -14,6 +14,7 @@ from ..CR2W.common_blender import repo_file, get_collision_for_mesh, get_collisi
 from ..importers.import_rig import rotate_and_connect_bones
 
 from ..materials.cr2w import setup_w3_material_CR2W
+from ..materials.material import MATERIAL_SETUP_VERSION, _ensure_raw_vertex_color
 from ..materials import reader as material_reader
 from .. import (
     get_all_addon_prefs,
@@ -1775,6 +1776,7 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
         # original file.  Assign faces to the correct material index.
         for mat in ordered_materials:
             mesh_bl.data.materials.append(mat)
+        mesh_bl["witcher_expected_material_count"] = len(ordered_materials)
         if ordered_materials and (mat_id < 0 or mat_id >= len(ordered_materials)):
             log.warning(
                 "Object '%s' submesh materialID=%s is out of range for %d prepared slots on mesh '%s'",
@@ -2043,7 +2045,7 @@ def apply_mesh_materials(meshFile, the_materials, the_material_names, final_bl_m
                 len(materials),
                 len(final_bl_meshes),
             )
-            load_w3_materials_CR2W_Mesh(
+            return load_w3_materials_CR2W_Mesh(
                 final_bl_meshes,
                 uncook_path,
                 materials,
@@ -2051,6 +2053,7 @@ def apply_mesh_materials(meshFile, the_materials, the_material_names, final_bl_m
                 mat_filename=mat_filename,
                 build_material_nodes=build_material_nodes,
             )
+    return True
 
 
 def import_mesh_materials(filename, mesh_objects, embedded_cmesh_chunk_index=None):
@@ -2063,8 +2066,87 @@ def import_mesh_materials(filename, mesh_objects, embedded_cmesh_chunk_index=Non
         False,
         embedded_cmesh_chunk_index=embedded_cmesh_chunk_index,
     )
-    apply_mesh_materials(meshFile, the_materials, the_material_names, mesh_objects, meshName)
-    return len(mesh_objects)
+    _ensure_imported_material_slots(mesh_objects, the_material_names, filename)
+    return apply_mesh_materials(meshFile, the_materials, the_material_names, mesh_objects, meshName)
+
+
+def _ensure_imported_material_slots(mesh_objects, material_names, filename):
+    names = [str(name) for name in material_names or []]
+    expected = len(names)
+    try:
+        source_path = get_repo_from_abs_path(filename)
+    except Exception:
+        source_path = str(filename or "")
+    source_key = str(source_path or "").replace("/", "\\").casefold()
+    placeholders = {}
+
+    def placeholder(index):
+        cached = placeholders.get(index)
+        if cached is not None:
+            return cached
+        source_name = names[index]
+        cached = next((
+            mat for mat in bpy.data.materials
+            if mat.get("w3_source_material_name") == source_name
+            and str(mat.get("w3_source_mesh_path", "") or "").replace("/", "\\").casefold() == source_key
+        ), None)
+        if cached is None:
+            cached = bpy.data.materials.new(source_name[-63:] or f"Material{index}")
+            cached["w3_source_material_name"] = source_name
+            cached["w3_source_mesh_path"] = source_path
+        placeholders[index] = cached
+        return cached
+
+    for obj in mesh_objects:
+        obj["witcher_expected_material_count"] = expected
+        while len(obj.data.materials) < expected:
+            obj.data.materials.append(placeholder(len(obj.data.materials)))
+        for index in range(expected):
+            if obj.data.materials[index] is None:
+                obj.data.materials[index] = placeholder(index)
+
+
+def witcher_mesh_materials_ready(obj, repair_vertex_color=False):
+    if obj is None or getattr(obj, "type", "") != 'MESH' or getattr(obj, "data", None) is None:
+        return True
+    slots = list(obj.data.materials)
+    expected = obj.get("witcher_expected_material_count")
+    if expected is not None:
+        expected = int(expected)
+        if len(slots) < expected or any(mat is None for mat in slots[:expected]):
+            return False
+        materials = slots[:expected]
+    else:
+        materials = [
+            mat for mat in slots
+            if mat is not None and mat.get("w3_source_material_name") is not None
+        ]
+    if not materials:
+        return True
+    if repair_vertex_color:
+        _ensure_raw_vertex_color(obj)
+    attributes = getattr(obj.data, "color_attributes", None)
+    source = attributes.get('Color') if attributes is not None else None
+    raw = attributes.get('W3RawColor') if attributes is not None else None
+    if source is not None and (
+        raw is None
+        or raw.domain != source.domain
+        or raw.data_type != 'FLOAT_COLOR'
+        or len(raw.data) != len(source.data)
+    ):
+        return False
+    require_current = bool(obj.get("witcher_materials_pending", False))
+    for mat in materials:
+        setup_version = int(mat.get('witcher3_material_setup_version', 0) or 0)
+        if (
+            not mat.use_nodes
+            or mat.node_tree is None
+            or len(mat.node_tree.nodes) <= 2
+            or setup_version <= 0
+            or (require_current and setup_version != MATERIAL_SETUP_VERSION)
+        ):
+            return False
+    return True
 
 
 #returns mesh object
@@ -2145,6 +2227,8 @@ def do_blender_mesh_import(meshDataBl: MeshData, CData: CommonData, do_merge_nor
             color_attr = mesh.color_attributes.new(name = 'Color', domain = 'POINT', type = 'BYTE_COLOR')
             flat_colors = np.array(color_data, dtype=np.float32).ravel()
             color_attr.data.foreach_set("color", flat_colors)
+            # BYTE_COLOR stores linear values; its sRGB view recovers REDengine bytes.
+            _ensure_raw_vertex_color(mesh_ob)
 
         #=========#
         # Normals #
@@ -2328,6 +2412,9 @@ def load_w3_materials_CR2W_Mesh(
     ):
     materials_started = time.perf_counter()
     objs = objs or []
+    if build_material_nodes:
+        for obj in objs:
+            _ensure_raw_vertex_color(obj)
     materials_bin = materials_bin or []
     material_names = material_names or []
     obj_names = [obj.name for obj in objs]
@@ -2339,7 +2426,12 @@ def load_w3_materials_CR2W_Mesh(
         mat_filename,
     )
     log.debug("Material targets: %s", obj_names)
-    if (materials_bin or []) and (material_names or []) and len(materials_bin) != len(material_names):
+    success = not (
+        (materials_bin or [])
+        and (material_names or [])
+        and len(materials_bin) != len(material_names)
+    )
+    if not success:
         log.warning(
             "Material handle/name count mismatch during mesh material import: handles=%d names=%d",
             len(materials_bin),
@@ -2350,6 +2442,7 @@ def load_w3_materials_CR2W_Mesh(
         slot_started = time.perf_counter()
         if mat is None:
             log.warning(f"Skipping unresolved material at slot {idx} ({material_names[idx] if idx < len(material_names) else '?'})")
+            success = False
             continue
         xml_mat_name = material_names[idx] if idx < len(material_names) else f"Material{idx}"
         if idx >= len(material_names):
@@ -2412,6 +2505,7 @@ def load_w3_materials_CR2W_Mesh(
                     build_nodes=build_material_nodes,
                 )
             except Exception:
+                success = False
                 log.exception(
                     "Material slot %d '%s' failed during setup (target='%s', chunk_type=%s, local=%s, depot='%s')",
                     idx,
@@ -2421,6 +2515,10 @@ def load_w3_materials_CR2W_Mesh(
                     getattr(mat, "local", None),
                     getattr(mat, "DepotPath", None),
                 )
+                continue
+            if finished_mat is None:
+                success = False
+                log.error("Material slot %d '%s' produced no Blender material", idx, xml_mat_name)
                 continue
             if target_slots:
                 for slot in target_slots:
@@ -2437,6 +2535,12 @@ def load_w3_materials_CR2W_Mesh(
                 len(target_slots),
             )
         else:
+            if any(
+                int(poly.material_index) == idx
+                for obj in objs
+                for poly in obj.data.polygons
+            ):
+                success = False
             log.info(
                 "Material slot %d '%s': no target Blender slot/material found (likely skipped submesh/LOD-only slot)",
                 idx,
@@ -2463,6 +2567,7 @@ def load_w3_materials_CR2W_Mesh(
             mat_filename,
         )
         #finished_mat.name = finished_mat.name +"_"+ target_mat.name
+    return success and all(witcher_mesh_materials_ready(obj, repair_vertex_color=True) for obj in objs)
 
 def assignVertexGroup(vert, CData, mesh_ob):
     boneIdx = vert.boneId

@@ -220,7 +220,7 @@ def ensure_node_group(ng_name, resource_path=RES_PATH):
     return ng
 
 
-MATERIAL_SETUP_VERSION = 7
+MATERIAL_SETUP_VERSION = 11
 _BASE_PATH_NODE_GROUP_CACHE: Dict[Tuple[object, ...], Dict[str, str]] = {}
 _RESOURCE_NODE_GROUP_CACHE: Dict[str, Tuple[Optional[float], Set[str]]] = {}
 
@@ -1340,7 +1340,7 @@ def setup_w3_material(
     material['witcher3_mat_base'] = mat_base
     material['witcher3_mat_params'] = params
     material['witcher3_mat_source_path'] = material_source_path
-    material['witcher3_material_setup_version'] = MATERIAL_SETUP_VERSION
+    material.pop('witcher3_material_setup_version', None)
 
     #TODO Create the material instance NodeGroup
     #TODO instances contained within w2mesh files will be imported as materials.
@@ -1452,6 +1452,7 @@ def setup_w3_material(
             #! Missing params will be created by this function
             mat_load_params_into_nodes(material, ordered_params, nodegroup_node, uncook_path)
             apply_shader_default_overrides(material, nodegroup_node, inherited_params, uncook_path, inherited_param_sources)
+            reconcile_w3_pattern_uv_links(material, nodegroup_node)
             if shader_type == 'pbr_eye':
                 setup_eye_reflection_nodes(material, nodegroup_node, nodes, links)
             hide_unused_sockets(nodegroup_node)
@@ -1480,6 +1481,8 @@ def setup_w3_material(
             node_seconds,
             finalize_seconds,
         )
+    # Publish success only after the complete node graph exists.
+    material['witcher3_material_setup_version'] = MATERIAL_SETUP_VERSION
     return material
 
 def find_material(
@@ -2217,11 +2220,140 @@ def reconcile_uv_mapping_vector_links(mat: Material) -> None:
         _apply_uv_mapping_vector_links(mat, param_name, node)
 
 
-_SRGB_TEXTURE_PIN_NAMES = {'Diffuse', 'SpecularTexture', 'SnowDiffuse'}
+def reconcile_w3_pattern_uv_links(mat: Material, node_ng: Node) -> None:
+    if (
+        mat is None
+        or mat.node_tree is None
+        or node_ng is None
+        or node_ng.node_tree is None
+    ):
+        return
+
+    family = _node_group_family_name(node_ng.node_tree.name).casefold()
+    if family not in {'pbr_pattern_normal_spec', 'pbr_vert_blend_colorize'}:
+        return
+
+    inputs = {socket.name.casefold(): socket for socket in node_ng.inputs}
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+
+    def replace_link(source, target):
+        while target.is_linked:
+            links.remove(target.links[0])
+        links.new(source, target)
+
+    if family == 'pbr_vert_blend_colorize':
+        pattern_socket = inputs.get('patterntexture')
+        if not pattern_socket or not pattern_socket.is_linked or pattern_socket.links[0].from_node.type != 'TEX_IMAGE':
+            return
+
+        pattern_texture = pattern_socket.links[0].from_node
+        uv = nodes.get('__W3_VertPatternUV')
+        if uv is None or uv.type != 'UVMAP':
+            if uv is not None:
+                nodes.remove(uv)
+            uv = nodes.new('ShaderNodeUVMap')
+            uv.name = '__W3_VertPatternUV'
+        uv.uv_map = 'SecondUV'
+        uv.hide = True
+
+        scale = nodes.get('__W3_VertPatternScale')
+        if scale is None or scale.type != 'VECT_MATH':
+            if scale is not None:
+                nodes.remove(scale)
+            scale = nodes.new('ShaderNodeVectorMath')
+            scale.name = '__W3_VertPatternScale'
+        scale.operation = 'SCALE'
+        scale.hide = True
+        replace_link(uv.outputs['UV'], scale.inputs[0])
+
+        scale_socket = inputs.get('patternuvscale')
+        if scale_socket and scale_socket.is_linked:
+            replace_link(scale_socket.links[0].from_socket, scale.inputs['Scale'])
+        elif not scale.inputs['Scale'].is_linked:
+            scale.inputs['Scale'].default_value = 1.0
+
+        offset = nodes.get('__W3_VertPatternOffset')
+        if offset is None or offset.type != 'VECT_MATH':
+            if offset is not None:
+                nodes.remove(offset)
+            offset = nodes.new('ShaderNodeVectorMath')
+            offset.name = '__W3_VertPatternOffset'
+        offset.operation = 'ADD'
+        offset.hide = True
+        replace_link(scale.outputs['Vector'], offset.inputs[0])
+
+        offset_socket = inputs.get('patternuvoffset')
+        if offset_socket and offset_socket.is_linked:
+            replace_link(offset_socket.links[0].from_socket, offset.inputs[1])
+        elif not offset.inputs[1].is_linked:
+            offset.inputs[1].default_value = (0.0, 0.0, 0.0)
+        replace_link(offset.outputs['Vector'], pattern_texture.inputs['Vector'])
+
+        mask_socket = inputs.get('patternmask')
+        if mask_socket and mask_socket.is_linked and mask_socket.links[0].from_node.type == 'TEX_IMAGE':
+            mask_uv = nodes.get('__W3_VertPatternMaskUV')
+            if mask_uv is None or mask_uv.type != 'UVMAP':
+                if mask_uv is not None:
+                    nodes.remove(mask_uv)
+                mask_uv = nodes.new('ShaderNodeUVMap')
+                mask_uv.name = '__W3_VertPatternMaskUV'
+            mask_uv.uv_map = 'DiffuseUV'
+            mask_uv.hide = True
+            replace_link(mask_uv.outputs['UV'], mask_socket.links[0].from_node.inputs['Vector'])
+        return
+
+    texture_nodes = []
+    for name in ('p_diffuse', 'p_normal', 'specular'):
+        socket = inputs.get(name)
+        if socket and socket.is_linked and socket.links[0].from_node.type == 'TEX_IMAGE':
+            texture_nodes.append(socket.links[0].from_node)
+    if not texture_nodes:
+        return
+
+    uv = nodes.get('__W3_PatternUV')
+    if uv is None or uv.type != 'UVMAP':
+        if uv is not None:
+            nodes.remove(uv)
+        uv = nodes.new('ShaderNodeUVMap')
+        uv.name = '__W3_PatternUV'
+    uv.uv_map = 'DiffuseUV'
+    uv.hide = True
+
+    transform = nodes.get('__W3_PatternUVTransform')
+    if transform is None or transform.type != 'GROUP':
+        if transform is not None:
+            nodes.remove(transform)
+        transform = nodes.new('ShaderNodeGroup')
+        transform.name = '__W3_PatternUVTransform'
+    transform.node_tree = ensure_node_group('W3 Pattern UV Transform')
+    transform.hide = True
+    replace_link(uv.outputs['UV'], transform.inputs['UV'])
+
+    for name, fallback in (('p_tile', (1.0, 1.0, 1.0)), ('p_rotation', 0.0)):
+        source = inputs.get(name)
+        target = transform.inputs['Tile' if name == 'p_tile' else 'Rotation']
+        if source and source.is_linked:
+            replace_link(source.links[0].from_socket, target)
+        elif not target.is_linked:
+            target.default_value = fallback
+    for texture_node in texture_nodes:
+        replace_link(transform.outputs['Vector'], texture_node.inputs['Vector'])
+
+
+_SRGB_TEXTURE_PIN_NAMES = {
+    'basediffuse',
+    'diffuse',
+    'p_diffuse',
+    'patternarray',
+    'patterntexture',
+    'snowdiffuse',
+    'specular',
+    'speculartexture',
+}
 
 
 def _is_srgb_texture_param(pin_name: str, par_name: str, is_w2_material: bool = False) -> bool:
-    if pin_name in _SRGB_TEXTURE_PIN_NAMES or 'DiffuseArray' in (par_name or ""):
+    if str(pin_name or '').casefold() in _SRGB_TEXTURE_PIN_NAMES or 'diffusearray' in str(par_name or '').casefold():
         return True
     # W2 graphs use their own parameter names (diffusemap, specular, ...).
     return is_w2_material and is_w2_srgb_texture_param(pin_name)
@@ -3439,11 +3571,15 @@ def create_node_color(mat, param, node_ng):
 
     values = [float(f) for f in par_value.split("; ")]
     node = nodes.new(type='ShaderNodeRGB')
+    def srgb_to_linear(value):
+        value /= 255.0
+        return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
     node.outputs[0].default_value = (
-        values[0] / 255
-        ,values[1] / 255
-        ,values[2] / 255
-        ,values[3] / 255
+        srgb_to_linear(values[0]),
+        srgb_to_linear(values[1]),
+        srgb_to_linear(values[2]),
+        values[3] / 255.0,
     )
 
     return node
@@ -3533,11 +3669,28 @@ def mat_set_name_by_diffuse(mat, node_ng, nodes):
         # mat.name = "!3 No Texture"
         pass
 
+
+def _ensure_neutral_hair_vertex_color(mat: Material) -> None:
+    """REDengine defaults a missing vertex-color stream to white."""
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH' or not any(candidate == mat for candidate in obj.data.materials):
+            continue
+        attributes = getattr(obj.data, 'color_attributes', None)
+        if attributes is None or attributes.get('Color') is not None:
+            continue
+        color = attributes.new(name='Color', domain='POINT', type='BYTE_COLOR')
+        for item in color.data:
+            item.color = (1.0, 1.0, 1.0, 1.0)
+
+
 def mat_apply_settings(mat, shader_type: str):
     """Setting material viewport settings."""
     mat.metallic = 0
     mat.roughness = 0.5
     mat.diffuse_color = (0.3, 0.3, 0.3, 1)
+    shader_key = str(shader_type or '').casefold()
+    if 'hair' in shader_key:
+        _ensure_neutral_hair_vertex_color(mat)
     # blend_method, show_transparent_back, use_screen_refraction, use_sss_translucency
     # were removed in Blender 4.2 (EEVEE Next). Only set them on older versions.
     _has_blend = hasattr(mat, 'blend_method')
@@ -3558,6 +3711,16 @@ def mat_apply_settings(mat, shader_type: str):
             mat.use_screen_refraction = True
             mat.use_sss_translucency = True
         set_shadow_method(mat)
+    elif 'hair' in shader_key:
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'DITHERED'
+        elif _has_blend:
+            mat.blend_method = 'HASHED'
+        if hasattr(mat, 'show_transparent_back'):
+            mat.show_transparent_back = False
+        if hasattr(mat, 'use_transparency_overlap'):
+            mat.use_transparency_overlap = False
+        set_shadow_method(mat)
     else:
         if _has_blend:
             mat.blend_method = 'CLIP'
@@ -3565,117 +3728,83 @@ def mat_apply_settings(mat, shader_type: str):
 
 
 
-def create_texarray(group_name = "WitcherTexArray", ARRAY_SIZE = 2):
-    vertex_color_data = []
-    obj = bpy.context.active_object
-    me = obj.data
-    highest_green = 0
-    if obj.type == "MESH":
-        active_color = me.color_attributes.active_color
-        for vert in me.vertices:
-            if active_color:
-                elem = active_color.data[vert.index]
-                color = elem.color if hasattr(elem, 'color') else elem.vector
-                vertex_color_data.append(list(color))
-                highest_green = max(highest_green, color[1])
+def _ensure_raw_vertex_color(obj: Object) -> str:
+    """Keep REDengine's packed data channels out of Blender's sRGB conversion."""
+    if obj is None or obj.type != 'MESH':
+        return 'Color'
+    attributes = getattr(obj.data, 'color_attributes', None)
+    source = attributes.get('Color') if attributes is not None else None
+    if source is None:
+        return 'Color'
 
-    # # Check if group already exists
-    # if group_name in bpy.data.node_groups:
-    #     group = bpy.data.node_groups[group_name]
-    #     group.nodes.clear()
-    #     group.inputs.clear()
-    # else:
-    #     # Create a new node group
+    raw = attributes.get('W3RawColor')
+    if raw is None or raw.domain != source.domain or raw.data_type != 'FLOAT_COLOR':
+        if raw is not None:
+            attributes.remove(raw)
+        raw = attributes.new(name='W3RawColor', domain=source.domain, type='FLOAT_COLOR')
+
+    source_property = 'color_srgb' if source.data_type == 'BYTE_COLOR' else 'color'
+    raw.data.foreach_set(
+        'color',
+        [component for item in source.data for component in getattr(item, source_property)],
+    )
+    return raw.name
+
+
+def create_texarray(group_name = "WitcherTexArray", ARRAY_SIZE = 2):
     group = bpy.data.node_groups.new(group_name, 'ShaderNodeTree')
-    
+    array_size = max(1, int(ARRAY_SIZE))
+
     output = group.nodes.new('NodeGroupOutput')
     output.location = (700, 0)
-    
-    
+
     if bpy.app.version >= (4, 0, 0):
         group.interface.new_socket(name="Output", in_out='OUTPUT', socket_type='NodeSocketColor')
     else:
         group.outputs.new('NodeSocketColor','Output')
-    # Create a single input with two sockets
+
     input = group.nodes.new('NodeGroupInput')
     input.name = 'Array'
     input.location = (-400, 0)
-    
-    try:
-        array_step = highest_green/ARRAY_SIZE
-    except Exception as e:
-        log.critical('ERROR CREATING TEXTURE ARRAY')
-        return group
 
-
-    for index in range(0,ARRAY_SIZE):
-        this_index = index
-
+    for index in range(array_size):
         if bpy.app.version >= (4, 0, 0):
-            group.interface.new_socket(name=f"Array_{str(this_index)}", in_out='INPUT', socket_type='NodeSocketColor')
+            group.interface.new_socket(name=f"Array_{index}", in_out='INPUT', socket_type='NodeSocketColor')
         else:
-            group.inputs.new('NodeSocketColor', f"Array_{str(this_index)}")
+            group.inputs.new('NodeSocketColor', f"Array_{index}")
 
-
-    #create the first mix
-    mix = _new_mix_color_node(group)
-    _mix_fac_input(mix).default_value = 0.5
-    mix.location = (0, -100)
-
-    privious_mix = mix
-
-    if ARRAY_SIZE > 1:
-        mix_a, mix_b = _mix_color_inputs(mix)
-        group.links.new(input.outputs[0], mix_a)
-        group.links.new(input.outputs[1], mix_b)
-    # for i in range(ARRAY_SIZE):
-    #     group.links.new(input.outputs[i], mix.inputs[i+1])
-
-    group.links.new(_mix_color_output(mix), output.inputs[0])
-
-    if bpy.app.version >= (4, 0, 0):
-        color_attr = group.nodes.new('ShaderNodeAttribute')
-        color_attr.attribute_type = 'GEOMETRY'
-        color_attr.attribute_name = "Color"
-    else:
-        color_attr = group.nodes.new('ShaderNodeVertexColor')
-        color_attr.layer_name = "Color"
+    color_attr = group.nodes.new('ShaderNodeVertexColor')
+    color_attr.layer_name = 'W3RawColor'
+    color_attr.name = 'W3 Texture Array Vertex Color'
     color_attr.location = (-300, 400)
-    
-    color_ramp = group.nodes.new('ShaderNodeValToRGB')
-    #color_ramp.color_ramp.elements[1].position = array_step/1.2
-    color_ramp.color_ramp.elements[1].position = array_step
-    color_ramp.location = (200, 400)
-
     separate_color = group.nodes.new('ShaderNodeSeparateColor')
     separate_color.location = (0, 400)
-
-
     group.links.new(color_attr.outputs[0], separate_color.inputs[0])
-    group.links.new(separate_color.outputs[1], color_ramp.inputs[0])
-    group.links.new(color_ramp.outputs[0], _mix_fac_input(mix))
 
-    for i in range(ARRAY_SIZE-2):
-        i+=1
-        color_ramp = group.nodes.new('ShaderNodeValToRGB')
-        #color_ramp.color_ramp.elements[1].position = (array_step*(i+1))/1.2
-        color_ramp.color_ramp.elements[1].position = array_step*(i+1)
-        color_ramp.location = (-200, -400 * i)
+    layer = group.nodes.new('ShaderNodeMath')
+    layer.name = 'W3 Texture Array Layer'
+    layer.operation = 'MULTIPLY'
+    layer.inputs[1].default_value = 16.0
+    layer.location = (200, 400)
+    group.links.new(separate_color.outputs['Green'], layer.inputs[0])
 
+    previous = input.outputs[0]
+    for index in range(1, array_size):
+        factor = group.nodes.new('ShaderNodeMath')
+        factor.operation = 'SUBTRACT'
+        factor.use_clamp = True
+        factor.inputs[1].default_value = float(index - 1)
+        factor.location = (0, -250 * index)
         mix = _new_mix_color_node(group)
-        _mix_fac_input(mix).default_value = 0.5
-        mix.location = (200, -400 * i )
+        mix.location = (300, -250 * index)
         mix_a, mix_b = _mix_color_inputs(mix)
-        group.links.new(color_ramp.outputs[0], _mix_fac_input(mix))
-        group.links.new(_mix_color_output(privious_mix), mix_a)
-        group.links.new(input.outputs[i+1], mix_b)
-        group.links.new(separate_color.outputs[1], color_ramp.inputs[0])
-        group.links.new(_mix_color_output(mix), output.inputs[0])
+        group.links.new(layer.outputs[0], factor.inputs[0])
+        group.links.new(factor.outputs[0], _mix_fac_input(mix))
+        group.links.new(previous, mix_a)
+        group.links.new(input.outputs[index], mix_b)
+        previous = _mix_color_output(mix)
 
-        privious_mix = mix
-
-    
-    
+    group.links.new(previous, output.inputs[0])
     return group
 
 def set_shadow_method(mat):

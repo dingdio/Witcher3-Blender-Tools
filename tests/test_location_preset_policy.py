@@ -1,9 +1,11 @@
 import ast
-import fnmatch
 import hashlib
 import importlib.util
 import json
+import os
+import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,28 +13,30 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 BROWSER_PATH = ROOT / "witcher3_tools" / "w3_asset_browser.py"
+UI_MAP_PATH = ROOT / "witcher3_tools" / "ui" / "ui_map.py"
 LOCATIONS_PATH = ROOT / "witcher3_tools" / "CR2W" / "data" / "locations.json"
 
 
-def _load_policy_functions():
+def _load_location_helpers():
     source = BROWSER_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(BROWSER_PATH))
     wanted = {
-        "_normalize_depot_path",
-        "_location_layer_patterns",
-        "_location_layer_relative_path",
-        "_location_layer_path_allowed",
-        "_location_scope_id",
-        "_location_scope_for_full_load",
-        "_terrain_tile_from_world_position",
-        "_location_anchor_positions_from_items",
-        "_location_dense_position",
+        "_collection_pointer",
+        "_iter_descendant_collections",
+        "_world_root_has_complete_layer_tree",
+        "_terrain_tiles_within_radius",
+        "_user_locations_data_path",
+        "_read_locations_file",
+        "_location_identity",
+        "_merge_locations",
+        "_save_user_location",
+        "_user_location_image_path",
+        "_location_preview_relative_path",
     }
     nodes = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted
     ]
-    module = ast.Module(body=nodes, type_ignores=[])
     terrain_spec = importlib.util.spec_from_file_location(
         "terrain_core_for_location_tests",
         ROOT / "witcher3_tools" / "terrain_core.py",
@@ -41,371 +45,275 @@ def _load_policy_functions():
     sys.modules[terrain_spec.name] = terrain_core
     terrain_spec.loader.exec_module(terrain_core)
     namespace = {
-        "fnmatch": fnmatch,
         "hashlib": hashlib,
         "json": json,
+        "os": os,
+        "re": re,
+        "log": SimpleNamespace(warning=lambda *_args, **_kwargs: None),
+        "_LOCATION_PREVIEW_DIR": "location_previews",
+        "_USER_LOCATIONS_DATA_FILE": "user_locations.json",
+        "_safe_text": lambda value: str(value or "").strip(),
+        "get_extension_user_dir": lambda create=True: tempfile.gettempdir(),
+        "win_path_exists": os.path.exists,
+        "_grid_tile_bounds": terrain_core.terrain_tile_bounds,
         "_grid_tile_from_world_position": terrain_core.terrain_tile_from_world_position,
     }
+    module = ast.Module(body=nodes, type_ignores=[])
     exec(compile(module, str(BROWSER_PATH), "exec"), namespace)
     return namespace
 
 
-POLICY = _load_policy_functions()
-is_allowed = POLICY["_location_layer_path_allowed"]
-scope_id = POLICY["_location_scope_id"]
-scope_for_full_load = POLICY["_location_scope_for_full_load"]
-terrain_tile_from_position = POLICY["_terrain_tile_from_world_position"]
-location_anchor_positions = POLICY["_location_anchor_positions_from_items"]
-location_dense_position = POLICY["_location_dense_position"]
+HELPERS = _load_location_helpers()
 
 
-class LocationPresetPolicyTests(unittest.TestCase):
-    @staticmethod
-    def _terrain_spec():
-        return SimpleNamespace(
-            terrain_size=2048.0,
-            x_tiles=32,
-            y_tiles=32,
+class LocationSystemTests(unittest.TestCase):
+    def test_only_a_real_global_layer_group_counts_as_a_loaded_world_tree(self):
+        class Collection(dict):
+            def __init__(self, *args, children=(), **kwargs):
+                super().__init__(*args, **kwargs)
+                self.children = list(children)
+
+            def as_pointer(self):
+                return id(self)
+
+        layer = Collection(group_type="LayerInfo")
+        global_group = Collection(
+            group_type="LayerGroup",
+            witcher_visible_on_start=True,
+            children=(layer,),
+        )
+        wrapper = Collection(children=(global_group,))
+        unmarked_partial_group = Collection(group_type="LayerGroup", children=(layer,))
+
+        self.assertTrue(HELPERS["_world_root_has_complete_layer_tree"](wrapper))
+        self.assertFalse(
+            HELPERS["_world_root_has_complete_layer_tree"](
+                Collection(children=(unmarked_partial_group,))
+            )
         )
 
-    def test_location_density_selects_tile_with_most_entity_anchors(self):
-        spec = self._terrain_spec()
-        dense = [
-            (101.0, 202.0, 4.0),
-            (103.0, 204.0, 6.0),
-            (105.0, 206.0, 8.0),
-            (107.0, 208.0, 10.0),
-        ]
-        outliers = [(-900.0, -900.0, 0.0), (900.0, 900.0, 0.0)]
-
-        position = location_dense_position(dense + outliers, spec)
-
-        self.assertEqual(
-            terrain_tile_from_position(spec, position),
-            terrain_tile_from_position(spec, dense[0]),
-        )
-        self.assertEqual(position, (104.0, 205.0, 7.0))
-
-    def test_every_curated_location_has_a_provisional_position(self):
-        data = json.loads(LOCATIONS_PATH.read_text(encoding="utf-8"))
-        locations = data["locations"]
-        missing = [item["name"] for item in locations if len(item.get("position") or ()) < 3]
-        self.assertEqual(missing, [])
-        for item in locations:
-            with self.subTest(location=item["name"]):
+    def test_bundled_locations_use_world_position_radius_schema(self):
+        locations = json.loads(LOCATIONS_PATH.read_text(encoding="utf-8"))["locations"]
+        policy_keys = {"layer_dir", "layer_allow", "layer_deny", "layer_extra"}
+        for location in locations:
+            with self.subTest(location=location.get("name")):
+                self.assertFalse(policy_keys.intersection(location))
+                self.assertTrue(location.get("world_path"))
+                self.assertEqual(len(location.get("position") or ()), 3)
                 self.assertTrue(all(
                     isinstance(value, (int, float))
-                    for value in item["position"][:3]
+                    for value in location["position"]
                 ))
 
-    def test_location_density_ignores_entity_component_multiplication(self):
-        items = [
-            {
-                "id": "entity_1",
-                "kind": "entity",
-                "parent_id": "",
-                "world_position": [100.0, 200.0, 5.0],
-            },
-            {
-                "id": "mesh_1",
-                "kind": "mesh",
-                "parent_id": "entity_1",
-                "world_position": [100.0, 200.0, 5.0],
-            },
-            {
-                "id": "mesh_2",
-                "kind": "mesh",
-                "parent_id": "entity_1",
-                "world_position": [100.0, 200.0, 5.0],
-            },
-            {
-                "id": "nested_entity",
-                "kind": "entity",
-                "parent_id": "entity_1",
-                "world_position": [100.0, 200.0, 5.0],
-            },
-            {
-                "id": "sector_1",
-                "kind": "mesh",
-                "parent_id": "",
-                "world_position": [110.0, 210.0, 5.0],
-            },
-        ]
+        palace = next(item for item in locations if item["name"] == "Beauclair Palace")
+        self.assertEqual(palace["position"], [-696.63, -1207.23, 167.106])
+        self.assertEqual(palace["radius"], 100)
 
+    def test_location_radius_selects_every_intersected_terrain_tile(self):
+        spec = SimpleNamespace(terrain_size=40.0, x_tiles=4, y_tiles=4)
+        tiles = HELPERS["_terrain_tiles_within_radius"](spec, (5.0, 5.0, 0.0), 6.0)
+
+        self.assertEqual(tiles[0], (2, 2))
         self.assertEqual(
-            location_anchor_positions(items),
-            [(100.0, 200.0, 5.0), (110.0, 210.0, 5.0)],
+            set(tiles),
+            {(2, 2), (1, 2), (3, 2), (2, 1), (2, 3)},
         )
-
-    def test_full_load_never_reuses_filtered_viewer_scope(self):
-        directory = r"levels\novigrad\location"
-        viewer = {
-            "witcher_location_scope": True,
-            "witcher_location_scope_id": scope_id(directory, (), ["volume.w2l"]),
-            "witcher_location_layer_dir": directory,
-        }
-        full = {
-            "witcher_location_scope": True,
-            "witcher_location_scope_id": scope_id(directory),
-            "witcher_location_layer_dir": directory,
-        }
-
-        class Root:
-            children = [viewer]
-
-        self.assertIsNone(scope_for_full_load(Root(), directory))
-        Root.children = [viewer, full]
-        self.assertIs(scope_for_full_load(Root(), directory), full)
-
-    def test_keira_viewer_policy_denies_only_pocket_interior(self):
-        data = json.loads(LOCATIONS_PATH.read_text(encoding="utf-8"))
-        keira = next(item for item in data["locations"] if item["name"] == "Keira Metz's Hut")
-        self.assertNotIn("layer_allow", keira)
-        self.assertEqual(keira["layer_deny"], ["secret_room\\*", "volume.w2l"])
-        directory = keira["layer_dir"]
-        deny = keira["layer_deny"]
-        for visible in (
-            r"hut.w2l",
-            r"cellar.w2l",
-            r"environment.w2l",
-            r"decoration\deco.w2l",
-            r"decoration\deco_ns.w2l",
-            r"path_to_keira\assets.w2l",
-        ):
-            self.assertTrue(is_allowed(directory + "\\" + visible, directory, layer_deny=deny))
-        for hidden in (r"secret_room\secret_room.w2l", r"secret_room\skydome.w2l", r"volume.w2l"):
-            self.assertFalse(is_allowed(directory + "\\" + hidden, directory, layer_deny=deny))
-
-    def test_allow_patterns_are_relative_to_location_directory(self):
-        directory = r"levels\novigrad\nml_villages\keira_metz_house"
-        allow = [r"hut.w2l", r"path_to_keira\assets.w2l"]
-        self.assertTrue(is_allowed(directory + r"\hut.w2l", directory, layer_allow=allow))
-        self.assertTrue(is_allowed(directory + r"\path_to_keira\assets.w2l", directory, layer_allow=allow))
-        self.assertFalse(is_allowed(directory + r"\secret_room\secret_room.w2l", directory, layer_allow=allow))
-
-    def test_deny_patterns_override_allow_patterns(self):
-        directory = r"levels\novigrad\location"
-        self.assertFalse(
-            is_allowed(
-                directory + r"\secret_room\terrain.w2l",
-                directory,
-                layer_allow=[r"*.w2l"],
-                layer_deny=[r"secret_room\*"],
-            )
+        self.assertEqual(
+            HELPERS["_terrain_tiles_within_radius"](spec, (5.0, 5.0), 0.0),
+            ((2, 2),),
         )
-
-    def test_empty_policy_preserves_full_layer_behavior(self):
-        self.assertTrue(
-            is_allowed(
-                r"levels\novigrad\location\anything.w2l",
-                r"levels\novigrad\location",
-            )
+        self.assertEqual(
+            HELPERS["_terrain_tiles_within_radius"](spec, (100.0, 100.0), 1.0),
+            (),
         )
+        with self.assertRaises(ValueError):
+            HELPERS["_terrain_tiles_within_radius"](spec, (5.0, 5.0), -1.0)
 
-    def test_scope_cache_identity_changes_with_policy(self):
-        directory = r"levels\novigrad\location"
-        viewer = scope_id(directory, ["hut.w2l"], [])
-        full = scope_id(directory, [], [])
-        self.assertNotEqual(viewer, full)
-        self.assertEqual(viewer, scope_id(directory.upper(), ["HUT.W2L"], []))
+    def test_user_overlay_updates_a_builtin_without_repeating_world_data(self):
+        builtin = [{
+            "name": "Palace",
+            "map": "Toussaint",
+            "world_path": r"dlc\bob\bob.w2w",
+            "position": [1, 2, 3],
+            "radius": 100,
+        }]
+        user = [{
+            "name": "palace",
+            "map": "TOUSSAINT",
+            "position": [4, 5, 6],
+            "image_file": "location_previews/palace.png",
+        }]
 
-    def test_scope_cache_identity_includes_shared_layers(self):
-        directory = r"levels\novigrad\novigrad\passiflora"
-        base = scope_id(directory)
-        with_doors = scope_id(
-            directory,
-            layer_extra=[r"levels\novigrad\doors.w2l"],
-        )
-        self.assertNotEqual(base, with_doors)
+        merged = HELPERS["_merge_locations"](builtin, user)
 
-    def test_passiflora_includes_global_interactive_door_layer(self):
-        data = json.loads(LOCATIONS_PATH.read_text(encoding="utf-8"))
-        passiflora = next(item for item in data["locations"] if item["name"] == "Passiflora")
-        self.assertEqual(passiflora["layer_extra"], [r"levels\novigrad\doors.w2l"])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["world_path"], builtin[0]["world_path"])
+        self.assertEqual(merged[0]["radius"], 100)
+        self.assertEqual(merged[0]["position"], [4, 5, 6])
+        self.assertTrue(merged[0]["_user_location"])
 
-    def test_background_import_exits_before_viewport_access(self):
-        source = BROWSER_PATH.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(BROWSER_PATH))
-        function = next(
-            node for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_start_location_stream"
-        )
-        background_guard = next(
-            node for node in function.body
-            if isinstance(node, ast.If)
-            and "bpy.app" in ast.unparse(node.test)
-            and "background" in ast.unparse(node.test)
-        )
-        self.assertTrue(
-            any(
-                isinstance(node, ast.Return)
-                and isinstance(node.value, ast.Constant)
-                and node.value.value is False
-                for node in background_guard.body
-            )
-        )
-        viewport_access = next(
-            node for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_find_view3d_area"
-        )
-        self.assertLess(background_guard.lineno, viewport_access.lineno)
+    def test_user_preview_path_cannot_escape_extension_storage(self):
+        original = HELPERS["get_extension_user_dir"]
+        with tempfile.TemporaryDirectory() as root:
+            HELPERS["get_extension_user_dir"] = lambda create=True: root
+            try:
+                preview = Path(root, "location_previews", "valid.png")
+                preview.parent.mkdir()
+                preview.write_bytes(b"png")
+                self.assertEqual(
+                    HELPERS["_user_location_image_path"]("location_previews/valid.png"),
+                    str(preview),
+                )
+                self.assertEqual(HELPERS["_user_location_image_path"]("../escape.png"), "")
+                self.assertEqual(HELPERS["_user_location_image_path"](str(preview)), "")
+            finally:
+                HELPERS["get_extension_user_dir"] = original
 
-    def test_busy_job_cancels_before_location_world_mutation(self):
+    def test_malformed_user_file_is_not_overwritten(self):
+        original = HELPERS["get_extension_user_dir"]
+        with tempfile.TemporaryDirectory() as root:
+            HELPERS["get_extension_user_dir"] = lambda create=True: root
+            path = Path(root, "user_locations.json")
+            path.write_text("{broken", encoding="utf-8")
+            try:
+                with self.assertRaises(ValueError):
+                    HELPERS["_save_user_location"]({
+                        "name": "View",
+                        "map": "Toussaint",
+                        "world_path": r"dlc\bob\bob.w2w",
+                        "position": [1, 2, 3],
+                    })
+                self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
+            finally:
+                HELPERS["get_extension_user_dir"] = original
+
+    def test_user_location_store_upserts_by_map_and_name(self):
+        original = HELPERS["get_extension_user_dir"]
+        with tempfile.TemporaryDirectory() as root:
+            HELPERS["get_extension_user_dir"] = lambda create=True: root
+            try:
+                first = {
+                    "name": "View",
+                    "map": "Toussaint",
+                    "world_path": r"dlc\bob\bob.w2w",
+                    "position": [1, 2, 3],
+                }
+                HELPERS["_save_user_location"](first)
+                HELPERS["_save_user_location"]({**first, "position": [4, 5, 6]})
+
+                path = Path(root, "user_locations.json")
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(len(data["locations"]), 1)
+                self.assertEqual(data["locations"][0]["position"], [4, 5, 6])
+                self.assertFalse(Path(str(path) + ".tmp").exists())
+            finally:
+                HELPERS["get_extension_user_dir"] = original
+
+    def test_open_location_has_exactly_one_global_layer_path(self):
         source = BROWSER_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(BROWSER_PATH))
         function = next(
             node for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name == "_open_location"
         )
-        busy_guard = next(
-            node for node in function.body
+        function_source = ast.unparse(function)
+
+        self.assertIn("AddCLayerGroup", function_source)
+        self.assertIn("_terrain_tiles_within_radius", function_source)
+        self.assertIn("_start_location_stream", function_source)
+        for forbidden in (
+            "layer_dir",
+            "layer_allow",
+            "layer_deny",
+            "layer_extra",
+            "location_scope",
+            "location_viewer",
+            "_import_location_layers_sync",
+        ):
+            self.assertNotIn(forbidden, function_source)
+
+    def test_viewport_and_busy_checks_happen_before_world_mutation(self):
+        source = BROWSER_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(BROWSER_PATH))
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_open_location"
+        )
+        busy_check = next(
+            node for node in ast.walk(function)
             if isinstance(node, ast.If)
             and "layer_stream_job_running" in ast.unparse(node.test)
-            and "foliage_busy" in ast.unparse(node.test)
         )
-        self.assertTrue(
-            any(
-                isinstance(node, ast.Return)
-                and "CANCELLED" in ast.unparse(node)
-                for node in busy_guard.body
-            )
+        viewport_check = next(
+            node for node in ast.walk(function)
+            if isinstance(node, ast.If)
+            and "_find_view3d_area" in ast.unparse(node.test)
         )
-        first_world_mutation = next(
+        mutation = next(
             node for node in ast.walk(function)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "ensure_world_terrain_collection"
         )
-        self.assertLess(busy_guard.lineno, first_world_mutation.lineno)
+        self.assertLess(busy_check.lineno, mutation.lineno)
+        self.assertLess(viewport_check.lineno, mutation.lineno)
 
-    def test_location_loads_parent_world_water_and_environment(self):
+    def test_each_intersected_tile_gets_terrain_and_foliage(self):
         source = BROWSER_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(BROWSER_PATH))
         function = next(
             node for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name == "_open_location"
         )
-        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+        terrain_loop = next(
+            node for node in ast.walk(function)
+            if isinstance(node, ast.For)
+            and "terrain_tiles" in ast.unparse(node.iter)
+            and "import_world_terrain_tile" in ast.unparse(node)
+        )
+        foliage_loop = next(
+            node for node in ast.walk(function)
+            if isinstance(node, ast.For)
+            and "terrain_results" in ast.unparse(node.iter)
+            and "_schedule_location_tile_foliage" in ast.unparse(node)
+        )
+        self.assertLess(terrain_loop.lineno, foliage_loop.lineno)
 
-        load_world = next(
-            node for node in calls
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "load_w2w"
-        )
-        ensure_water = next(
-            node for node in calls
-            if isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_ensure_world_water_plane"
-        )
-        sync_environment = next(
-            node for node in calls
-            if isinstance(node.func, ast.Attribute)
-            and node.func.attr == "sync_world_import"
-        )
-        import_tile = next(
-            node for node in calls
-            if isinstance(node.func, ast.Attribute)
-            and node.func.attr == "import_world_terrain_tile"
-        )
-
-        self.assertLess(load_world.lineno, ensure_water.lineno)
-        self.assertLess(ensure_water.lineno, sync_environment.lineno)
-        self.assertLess(sync_environment.lineno, import_tile.lineno)
-        self.assertIn("world_key", {keyword.arg for keyword in ensure_water.keywords})
-
-    def test_stream_start_race_does_not_request_sync_fallback(self):
+    def test_stream_invokes_the_normal_load_around_camera_operator(self):
         source = BROWSER_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(BROWSER_PATH))
         function = next(
             node for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_start_location_stream"
+            if isinstance(node, ast.FunctionDef) and node.name == "_start_location_stream"
         )
-        busy_guard = next(
-            node for node in function.body
-            if isinstance(node, ast.If)
-            and "layer_stream_job_running" in ast.unparse(node.test)
-            and "foliage_busy" in ast.unparse(node.test)
-        )
-        self.assertTrue(
-            any(
-                isinstance(node, ast.Return)
-                and (
-                    node.value is None
-                    or (
-                        isinstance(node.value, ast.Constant)
-                        and node.value.value is None
-                    )
-                )
-                for node in busy_guard.body
-            )
-        )
-
-    def test_location_refresh_invalidates_discovered_layer_paths(self):
-        source = BROWSER_PATH.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(BROWSER_PATH))
-        function = next(
-            node for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_load_location_entries_cached"
-        )
-        refresh_guard = next(
-            node for node in function.body
-            if isinstance(node, ast.If)
-            and "force_refresh" in ast.unparse(node.test)
-        )
-        self.assertTrue(
-            any(
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "_LOCATION_LAYER_PATH_CACHE"
-                and node.func.attr == "clear"
-                for node in ast.walk(refresh_guard)
-            )
-        )
-
-    def test_full_load_checks_for_an_existing_full_scope(self):
-        source = BROWSER_PATH.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(BROWSER_PATH))
-        function = next(
-            node for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_open_location"
-        )
-        calls = [
+        call = next(
             node for node in ast.walk(function)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_location_scope_for_full_load"
-        ]
-        self.assertEqual(len(calls), 1)
-        self.assertIn("load_full_layers", ast.unparse(function))
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "load_layers_around_camera"
+        )
+        self.assertEqual(call.keywords, [])
+        self.assertNotIn("location_viewer", UI_MAP_PATH.read_text(encoding="utf-8"))
 
-    def test_synchronous_fallback_receives_shared_layers(self):
+    def test_location_save_captures_preview_then_writes_user_json(self):
         source = BROWSER_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(BROWSER_PATH))
-        sync_function = next(
+        operator = next(
             node for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_import_location_layers_sync"
+            if isinstance(node, ast.ClassDef) and node.name == "MyLocationSaveOperator"
         )
-        self.assertIn("layer_extra", [arg.arg for arg in sync_function.args.kwonlyargs])
-        self.assertIn("extra_paths", ast.unparse(sync_function))
-
-        open_function = next(
-            node for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_open_location"
+        execute = next(
+            node for node in operator.body
+            if isinstance(node, ast.FunctionDef) and node.name == "execute"
         )
-        fallback_calls = [
-            node for node in ast.walk(open_function)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_import_location_layers_sync"
-        ]
-        self.assertEqual(len(fallback_calls), 1)
-        self.assertIn("layer_extra", {keyword.arg for keyword in fallback_calls[0].keywords})
+        calls = {
+            node.func.id: node.lineno
+            for node in ast.walk(execute)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in {"_capture_location_preview", "_save_user_location"}
+        }
+        self.assertLess(calls["_capture_location_preview"], calls["_save_user_location"])
+        self.assertNotIn("layer_dir", ast.unparse(operator))
 
 
 if __name__ == "__main__":

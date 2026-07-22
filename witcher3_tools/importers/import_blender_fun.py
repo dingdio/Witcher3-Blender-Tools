@@ -4,6 +4,7 @@ import re
 from ..CR2W.CR2W_helpers import Enums
 from ..CR2W.CR2W_types import Entity_Type_List
 import bpy
+from bpy.app.handlers import persistent
 import os
 from ..importers.import_helpers import MatrixToArray, MeshReferenceMissing, checkLevel, meshPath, set_blender_object_transform, _transform_real
 from mathutils import Matrix, Euler
@@ -2898,9 +2899,9 @@ def _merge_sector_source_meshes(mesh_objects, name, parent_root=None):
                     if material is None:
                         continue
                     try:
-                        material_key = int(material.as_pointer())
+                        material_key = (slot_index, int(material.as_pointer()))
                     except Exception:
-                        material_key = id(material)
+                        material_key = (slot_index, id(material))
                     combined_index = material_indices.get(material_key)
                     if combined_index is None:
                         combined_index = len(materials)
@@ -2923,7 +2924,9 @@ def _merge_sector_source_meshes(mesh_objects, name, parent_root=None):
 
     for material in materials:
         combined_mesh.materials.append(material)
+    combined_obj["witcher_expected_material_count"] = len(materials)
     combined_mesh.update()
+    import_mesh._ensure_raw_vertex_color(combined_obj)
     combined_obj.show_in_front = False
     return combined_obj
 
@@ -2983,6 +2986,13 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
 
     cached_source = _get_cached_sector_source(marker)
     if cached_source is not None:
+        import_mesh._ensure_raw_vertex_color(cached_source)
+        if not import_mesh.witcher_mesh_materials_ready(cached_source):
+            resolved = _resolve_deferred_mesh_path(repo_path, repo_path)
+            if kwargs.get("defer_mesh_materials"):
+                queue_deferred_mesh_materials(resolved or repo_path, None, [cached_source], repo_path=repo_path)
+            elif resolved:
+                import_mesh.import_mesh_materials(resolved, [cached_source])
         return cached_source
 
     src_mesh_data = _new_mesh_path(
@@ -3017,6 +3027,11 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
     # Imported LODs are children of the returned wrapper.
     new_objects = list(_iter_object_tree(wrapper) or [])
     imported_names = [o.name for o in new_objects if getattr(o, "type", "") == 'MESH']
+    resolved_source_path = next((
+        str(o.get("witcher_resolved_mesh_path", "") or "")
+        for o in new_objects
+        if getattr(o, "type", "") == 'MESH' and o.get("witcher_resolved_mesh_path")
+    ), repo_path)
 
     # Preserve deferred materials when the imported objects are merged away.
     source = _pick_best_sector_source_mesh(new_objects, wrapper)
@@ -3026,6 +3041,9 @@ def _get_or_import_sector_source_mesh(repo_path, target_collection, kwargs, erro
     stem = Path(repo_path.replace("\\", "/")).stem or "Source"
     source.name = f"si_{stem}_src"
     replace_deferred_queue_objects(imported_names, source.name)
+    import_mesh._ensure_raw_vertex_color(source)
+    if mesh_kwargs.get("defer_mesh_materials"):
+        queue_deferred_mesh_materials(resolved_source_path, None, [source], repo_path=repo_path)
     source[_SECTOR_SOURCE_MARKER_PROP] = marker
     source["_is_sector_source"] = True
     source["repo_path"] = repo_path
@@ -5407,13 +5425,18 @@ def loadLevelFromCachedPlan(level_file, plan_items, context=None, **kwargs):
 from bpy.types import Object, Mesh
 
 _DEFERRED_MATERIAL_QUEUE = []
-_DEFERRED_MATERIAL_SEEN = set()
 _DEFERRED_MATERIALS_PAUSED = False
+_DEFERRED_MATERIAL_MAX_ATTEMPTS = 10
+_DEFERRED_MATERIAL_ERROR_PROP = "witcher_materials_deferred_error"
+_DEFERRED_MATERIAL_EXHAUSTED_PROP = "witcher_materials_retry_exhausted"
 
 
 def set_deferred_materials_paused(paused):
     global _DEFERRED_MATERIALS_PAUSED
     _DEFERRED_MATERIALS_PAUSED = bool(paused)
+    if not _DEFERRED_MATERIALS_PAUSED:
+        queue_missing_scene_materials()
+        ensure_deferred_material_timer()
 
 
 def _strip_win_prefix(path):
@@ -5421,15 +5444,38 @@ def _strip_win_prefix(path):
     return p[4:] if p.startswith("\\\\?\\") else p
 
 
+def _deferred_material_key(path, embedded_chunk_index):
+    path = os.path.normcase(os.path.normpath(_strip_win_prefix(path)))
+    return path, embedded_chunk_index
+
+
 def queue_deferred_mesh_materials(resolved_path, embedded_chunk_index, objs, repo_path=""):
-    key = (str(resolved_path or ""), embedded_chunk_index)
-    if not key[0] or key in _DEFERRED_MATERIAL_SEEN:
+    resolved_path = str(resolved_path or "")
+    clean_repo_path = _strip_win_prefix(repo_path)
+    identity_path = resolved_path or clean_repo_path
+    if not identity_path:
         return
-    names = [o.name for o in objs or [] if getattr(o, "type", "") == 'MESH']
+    key = _deferred_material_key(identity_path, embedded_chunk_index)
+    mesh_objects = [o for o in objs or [] if getattr(o, "type", "") == 'MESH']
+    names = list(dict.fromkeys(o.name for o in mesh_objects))
     if not names:
         return
-    _DEFERRED_MATERIAL_SEEN.add(key)
-    _DEFERRED_MATERIAL_QUEUE.append([key[0], embedded_chunk_index, names, _strip_win_prefix(repo_path)])
+    for obj in mesh_objects:
+        obj.pop(_DEFERRED_MATERIAL_ERROR_PROP, None)
+        obj.pop(_DEFERRED_MATERIAL_EXHAUSTED_PROP, None)
+        obj["witcher_materials_pending"] = True
+    for entry in _DEFERRED_MATERIAL_QUEUE:
+        if _deferred_material_key(entry[0], entry[1]) != key:
+            continue
+        entry[2][:] = list(dict.fromkeys([*entry[2], *names]))
+        if not entry[3] and clean_repo_path:
+            entry[3] = clean_repo_path
+        if not _DEFERRED_MATERIALS_PAUSED:
+            ensure_deferred_material_timer()
+        return
+    _DEFERRED_MATERIAL_QUEUE.append([identity_path, embedded_chunk_index, names, clean_repo_path, 0])
+    if not _DEFERRED_MATERIALS_PAUSED:
+        ensure_deferred_material_timer()
 
 
 def _resolve_deferred_mesh_path(path, repo_path):
@@ -5448,7 +5494,7 @@ def _resolve_deferred_mesh_path(path, repo_path):
 
 
 def deferred_material_queue_size():
-    return len(_DEFERRED_MATERIAL_QUEUE)
+    return sum(len(entry[2]) for entry in _DEFERRED_MATERIAL_QUEUE)
 
 
 def replace_deferred_queue_objects(old_names, new_name):
@@ -5458,7 +5504,7 @@ def replace_deferred_queue_objects(old_names, new_name):
         return
     for entry in _DEFERRED_MATERIAL_QUEUE:
         if old.intersection(entry[2]):
-            entry[2][:] = [new_name]
+            entry[2][:] = list(dict.fromkeys(new_name if name in old else name for name in entry[2]))
 
 
 _DEFERRED_MATERIAL_DONE = 0
@@ -5481,42 +5527,146 @@ def _set_deferred_status(text):
         pass
 
 
+def _normalized_deferred_source_path(path):
+    return os.path.normcase(os.path.normpath(_strip_win_prefix(path))).replace("/", "\\")
+
+
+def _deferred_object_source_paths(obj):
+    values = [
+        obj.get("witcher_resolved_mesh_path", ""),
+        obj.get("repo_path", ""),
+        obj.parent.get("repo_path", "") if obj.parent is not None else "",
+    ]
+    # Shared materials are a fallback; object paths identify the source mesh.
+    if not any(values):
+        values = [
+            mat.get("w3_source_mesh_path", "")
+            for mat in obj.data.materials
+            if mat is not None
+        ]
+    return {_normalized_deferred_source_path(value) for value in values if value}
+
+
+def _find_deferred_material_targets(path, repo_path, chunk_idx):
+    source_keys = {
+        _normalized_deferred_source_path(value)
+        for value in (path, repo_path)
+        if value
+    }
+    if not source_keys:
+        return []
+    targets = []
+    for obj in bpy.data.objects:
+        if getattr(obj, "type", "") != 'MESH' or getattr(obj, "data", None) is None:
+            continue
+        if not obj.get("witcher_materials_pending", False):
+            continue
+        obj_chunk = obj.get("witcher_embedded_cmesh_chunk_index")
+        if obj_chunk is None and obj.parent is not None:
+            obj_chunk = obj.parent.get("witcher_embedded_cmesh_chunk_index")
+        if chunk_idx is not None and obj_chunk != chunk_idx:
+            continue
+        if source_keys.intersection(_deferred_object_source_paths(obj)):
+            targets.append(obj)
+    return targets
+
+
+def _exhaust_deferred_material_entry(entry, objs, message):
+    if entry[4] < _DEFERRED_MATERIAL_MAX_ATTEMPTS:
+        return False
+    _DEFERRED_MATERIAL_QUEUE.pop(0)
+    for obj in objs:
+        obj[_DEFERRED_MATERIAL_ERROR_PROP] = str(message)
+        obj[_DEFERRED_MATERIAL_EXHAUSTED_PROP] = True
+    log.error(
+        "Deferred materials stopped after %d attempts for %s. Reloading the file retries automatically.",
+        entry[4],
+        message,
+    )
+    return True
+
+
 def _deferred_material_tick():
     global _DEFERRED_MATERIAL_DONE
     if _DEFERRED_MATERIALS_PAUSED:
         return 0.5
     from ..materials.nodes.domain import suspend_witcher_include_layout
     started = time.perf_counter()
+    retry_delay = False
     with suspend_witcher_include_layout():
         while _DEFERRED_MATERIAL_QUEUE and time.perf_counter() - started < 0.3:
-            entry = _DEFERRED_MATERIAL_QUEUE.pop(0)
+            entry = _DEFERRED_MATERIAL_QUEUE[0]
             path, chunk_idx, names = entry[0], entry[1], entry[2]
             repo_path = entry[3] if len(entry) > 3 else ""
-            objs = [o for o in (bpy.data.objects.get(n) for n in names) if o is not None]
-            _DEFERRED_MATERIAL_DONE += 1
+            objs = [
+                o for o in (bpy.data.objects.get(n) for n in names)
+                if o is not None and getattr(o, "type", "") == 'MESH'
+            ]
             if not objs:
+                objs = _find_deferred_material_targets(path, repo_path, chunk_idx)
+            if not objs:
+                _DEFERRED_MATERIAL_QUEUE.pop(0)
                 continue
             resolved = _resolve_deferred_mesh_path(path, repo_path)
             if not resolved:
-                log.warning("Deferred materials: mesh not found for %s (repo %s)", path, repo_path or "<none>")
-                continue
+                entry[4] += 1
+                if entry[4] == 1 or entry[4] % 10 == 0:
+                    log.error("Deferred materials: mesh not found for %s (repo %s); retry %d", path, repo_path or "<none>", entry[4])
+                if _exhaust_deferred_material_entry(entry, objs, repo_path or path):
+                    continue
+                _DEFERRED_MATERIAL_QUEUE.append(_DEFERRED_MATERIAL_QUEUE.pop(0))
+                retry_delay = True
+                break
             try:
-                import_mesh.import_mesh_materials(resolved, objs, embedded_cmesh_chunk_index=chunk_idx)
+                loaded = import_mesh.import_mesh_materials(resolved, objs, embedded_cmesh_chunk_index=chunk_idx)
             except Exception:
-                log.exception("Deferred material load failed for %s", resolved)
+                loaded = False
+                log.exception("Deferred material load failed for %s; keeping it queued", resolved)
+            ready = loaded is not False and all(
+                import_mesh.witcher_mesh_materials_ready(obj, repair_vertex_color=True)
+                for obj in objs
+            )
+            if not ready:
+                entry[4] += 1
+                if entry[4] == 1 or entry[4] % 10 == 0:
+                    log.error("Deferred materials failed validation for %s; retry %d", repo_path or resolved, entry[4])
+                if _exhaust_deferred_material_entry(entry, objs, repo_path or resolved):
+                    continue
+                _DEFERRED_MATERIAL_QUEUE.append(_DEFERRED_MATERIAL_QUEUE.pop(0))
+                retry_delay = True
+                break
+            _DEFERRED_MATERIAL_QUEUE.pop(0)
+            for obj in objs:
+                obj.pop("witcher_materials_pending", None)
+                obj.pop(_DEFERRED_MATERIAL_ERROR_PROP, None)
+                obj.pop(_DEFERRED_MATERIAL_EXHAUSTED_PROP, None)
+            _DEFERRED_MATERIAL_DONE += 1
     remaining = len(_DEFERRED_MATERIAL_QUEUE)
     _tag_view3d_redraw()
     if not remaining:
+        recovered = queue_missing_scene_materials()
+        if recovered:
+            log.warning("Deferred material validation automatically recovered %d missed batches", recovered)
+            remaining = len(_DEFERRED_MATERIAL_QUEUE)
+    if not remaining:
         total = _DEFERRED_MATERIAL_DONE
         _DEFERRED_MATERIAL_DONE = 0
-        _DEFERRED_MATERIAL_SEEN.clear()
-        _set_deferred_status(None)
-        log.info("Deferred material streaming complete (%d meshes)", total)
+        failed = sum(
+            1 for obj in bpy.data.objects
+            if getattr(obj, "type", "") == 'MESH' and obj.get(_DEFERRED_MATERIAL_EXHAUSTED_PROP, False)
+        )
+        if failed:
+            _set_deferred_status(f"Witcher: material streaming failed for {failed} meshes")
+            log.error("Deferred material streaming ended with %d failed meshes; see object error properties", failed)
+        else:
+            _set_deferred_status(None)
+            log.info("Deferred material streaming complete (%d meshes)", total)
         return None
-    _set_deferred_status(f"Witcher: streaming materials — {remaining} meshes remaining")
+    target_count = deferred_material_queue_size()
+    _set_deferred_status(f"Witcher: streaming materials — {target_count} meshes remaining")
     if _DEFERRED_MATERIAL_DONE % 100 == 0:
-        log.info("Deferred material streaming: %d done, %d remaining", _DEFERRED_MATERIAL_DONE, remaining)
-    return 0.05
+        log.info("Deferred material streaming: %d done, %d targets remaining", _DEFERRED_MATERIAL_DONE, target_count)
+    return 0.5 if retry_delay else 0.05
 
 
 def queue_missing_scene_materials():
@@ -5524,21 +5674,32 @@ def queue_missing_scene_materials():
     for obj in bpy.data.objects:
         if getattr(obj, "type", "") != 'MESH':
             continue
-        for mat in obj.data.materials:
-            if mat is None or mat.get("w3_source_material_name") is None:
-                continue
-            # Default or aborted node trees have at most two nodes.
-            if mat.use_nodes and len(mat.node_tree.nodes) > 2:
-                continue
-            src = str(mat.get("w3_source_mesh_path", "") or "")
-            if not src:
-                continue
-            chunk = obj.get("witcher_embedded_cmesh_chunk_index")
-            if chunk is None and obj.parent is not None:
-                chunk = obj.parent.get("witcher_embedded_cmesh_chunk_index")
-            key = (src, int(chunk) if chunk is not None else None)
-            groups.setdefault(key, []).append(obj)
-            break
+        ready = import_mesh.witcher_mesh_materials_ready(obj, repair_vertex_color=True)
+        if not obj.get("witcher_materials_pending", False):
+            continue
+        if obj.get(_DEFERRED_MATERIAL_EXHAUSTED_PROP, False):
+            continue
+        if ready:
+            obj.pop("witcher_materials_pending", None)
+            continue
+        mat = next((
+            candidate for candidate in obj.data.materials
+            if candidate is not None and candidate.get("w3_source_material_name") is not None
+        ), None)
+        src = str(
+            obj.get("witcher_resolved_mesh_path", "")
+            or obj.get("repo_path", "")
+            or (obj.parent.get("repo_path", "") if obj.parent is not None else "")
+            or (mat.get("w3_source_mesh_path", "") if mat is not None else "")
+            or ""
+        )
+        if not src:
+            continue
+        chunk = obj.get("witcher_embedded_cmesh_chunk_index")
+        if chunk is None and obj.parent is not None:
+            chunk = obj.parent.get("witcher_embedded_cmesh_chunk_index")
+        key = (src, int(chunk) if chunk is not None else None)
+        groups.setdefault(key, []).append(obj)
     queued = 0
     for (src, chunk), objs in groups.items():
         src_clean = _strip_win_prefix(src)
@@ -5546,7 +5707,6 @@ def queue_missing_scene_materials():
             resolved = repo_file(src_clean)
         except Exception:
             resolved = src_clean
-        _DEFERRED_MATERIAL_SEEN.discard((str(resolved), chunk))
         before = len(_DEFERRED_MATERIAL_QUEUE)
         queue_deferred_mesh_materials(resolved, chunk, objs, repo_path=src_clean)
         queued += len(_DEFERRED_MATERIAL_QUEUE) - before
@@ -5561,6 +5721,51 @@ def ensure_deferred_material_timer():
             bpy.app.timers.register(_deferred_material_tick, first_interval=0.5)
     except Exception:
         log.exception("Could not start deferred material timer")
+
+
+def _scan_loaded_deferred_materials():
+    try:
+        queue_missing_scene_materials()
+        ensure_deferred_material_timer()
+    except Exception:
+        log.exception("Could not recover deferred materials after loading the scene")
+    return None
+
+
+@persistent
+def _resume_deferred_materials_on_load(_filepath):
+    global _DEFERRED_MATERIAL_DONE, _DEFERRED_MATERIALS_PAUSED
+    _DEFERRED_MATERIAL_QUEUE.clear()
+    _DEFERRED_MATERIAL_DONE = 0
+    _DEFERRED_MATERIALS_PAUSED = False
+    for obj in getattr(bpy.data, "objects", ()):
+        if getattr(obj, "type", "") == 'MESH' and obj.get("witcher_materials_pending", False):
+            obj.pop(_DEFERRED_MATERIAL_ERROR_PROP, None)
+            obj.pop(_DEFERRED_MATERIAL_EXHAUSTED_PROP, None)
+    try:
+        if not bpy.app.timers.is_registered(_scan_loaded_deferred_materials):
+            bpy.app.timers.register(_scan_loaded_deferred_materials, first_interval=0.25)
+    except Exception:
+        _scan_loaded_deferred_materials()
+
+
+def register_deferred_material_load_handler():
+    if _resume_deferred_materials_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_resume_deferred_materials_on_load)
+    _resume_deferred_materials_on_load(None)
+
+
+def unregister_deferred_material_load_handler():
+    if _resume_deferred_materials_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_resume_deferred_materials_on_load)
+    for callback in (_scan_loaded_deferred_materials, _deferred_material_tick):
+        try:
+            if bpy.app.timers.is_registered(callback):
+                bpy.app.timers.unregister(callback)
+        except Exception:
+            pass
+    _DEFERRED_MATERIAL_QUEUE.clear()
+    _set_deferred_status(None)
 
 
 def repo_in_scene(dct, path):
@@ -5945,7 +6150,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
                 elif not use_fbx:
                     backend = "cr2w"
                     defer_mats = bool(kwargs.get("defer_mesh_materials"))
-                    import_mesh.import_mesh(
+                    imported_meshes, _imported_armatures = import_mesh.import_mesh(
                         resolved_cr2w_path,
                         do_import_mats=not defer_mats,
                         keep_lod_meshes=keep_lod_meshes,
@@ -5953,6 +6158,14 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
                         keep_proxy_meshes=kwargs.get('keep_proxy_meshes', False),
                         embedded_cmesh_chunk_index=embedded_cmesh_chunk_index,
                     )
+                    if defer_mats:
+                        # Queue before wrapper/finalization can replace the geometry.
+                        queue_deferred_mesh_materials(
+                            resolved_cr2w_path,
+                            embedded_cmesh_chunk_index,
+                            imported_meshes,
+                            repo_path=mesh_name,
+                        )
                 else:
                     backend = "fallback_cube"
                     log.warning("Can't find FBX file %s", mesh.fbxPath())

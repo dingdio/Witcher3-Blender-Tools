@@ -52,6 +52,7 @@ from ..material import (
     get_active_witcher_group_node,
     get_recommended_node_group_for_base_path,
     init_material_nodes,
+    reconcile_w3_pattern_uv_links,
 )
 from ..reader import normalize_depot_path
 from ..vector_param import (
@@ -829,6 +830,7 @@ def refresh_witcher_include_state(material):
     if material is None:
         return
     _sync_local_override_nodes(material)
+    reconcile_w3_pattern_uv_links(material, get_active_witcher_group_node(material))
     if _WITCHER_INCLUDE_LAYOUT_SUSPENDED:
         material["witcher_layout_pending"] = True
         return

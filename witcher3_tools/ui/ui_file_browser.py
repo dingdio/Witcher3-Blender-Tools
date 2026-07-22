@@ -91,6 +91,21 @@ def _update_layer_visibility_settings(self, context):
         pass
 
 
+def _update_foliage_viewport_settings(self, context):
+    if context is None:
+        return
+    try:
+        from ..importers import import_foliage
+        from . import ui_map
+
+        import_foliage.apply_foliage_viewport_settings(
+            context.scene,
+            ui_map._get_camera_position(context),
+        )
+    except Exception:
+        log.debug("Could not update loaded foliage viewport controls", exc_info=True)
+
+
 def _update_terrain_material_controls(self, context):
     if context is None:
         return
@@ -740,6 +755,35 @@ class MySettings(PropertyGroup):
         min=1.0,
         soft_max=2000.0,
     )
+    foliage_viewport_distance_culling: BoolProperty(
+        name="Cull Far Foliage",
+        description="Hide foliage outside the viewport distance; final renders remain complete",
+        default=True,
+        update=_update_foliage_viewport_settings,
+    )
+    foliage_viewport_distance: FloatProperty(
+        name="Foliage Distance",
+        description="Viewport foliage distance; final renders ignore this limit",
+        default=75.0,
+        min=1.0,
+        soft_max=500.0,
+        update=_update_foliage_viewport_settings,
+    )
+    foliage_viewport_ground_density: FloatProperty(
+        name="Ground Cover Density",
+        description="Percentage of nearby grass, flowers, reeds and shrubs shown in the viewport; final renders always use 100 percent",
+        default=0.25,
+        min=0.01,
+        max=1.0,
+        subtype='FACTOR',
+        update=_update_foliage_viewport_settings,
+    )
+    foliage_viewport_fast_materials: BoolProperty(
+        name="Fast Foliage Materials",
+        description="Use a simple diffuse and alpha material for compatible foliage in the viewport only; final renders keep the original materials",
+        default=True,
+        update=_update_foliage_viewport_settings,
+    )
     terrain_layer_max_load_count: IntProperty(
         name="Layer Load Limit",
         description="Safety limit for nearby layer imports in one pass; set to 0 to load every matching layer",
@@ -926,7 +970,7 @@ class MySettings(PropertyGroup):
     )
     terrain_layer_hide_default_hidden: BoolProperty(
         name="Hide Default-Hidden Layer Groups",
-        description="Hide layer group collections whose isVisibleOnStart flag is off in the game data. Layers are always temporarily shown during any import operation, then this state is restored",
+        description="Exclude default-hidden layer groups from nearby loads and hide them after other layer imports",
         default=True,
         update=lambda self, context: _update_hide_default_hidden(self, context),
     )
