@@ -5611,7 +5611,17 @@ class EQUIPMENT_PT_MainPanel(WITCH_PT_Base, bpy.types.Panel):
                 op.entry_index = index
 
                 if entry.hold_slot:
-                    box.operator("witcher.equipment_toggle_item", text="Toggle Item Manipulation")
+                    # The operator defaults to slot_index -1, which it rejects as an
+                    # invalid index, so resolve the live slot this entry drives.
+                    entry_slot_index = next(
+                        (i for i, s in enumerate(rig_settings.equipment_slots)
+                         if s.category == entry.category),
+                        -1,
+                    )
+                    toggle_row = box.row()
+                    toggle_row.enabled = entry_slot_index >= 0
+                    op = toggle_row.operator("witcher.equipment_toggle_item", text="Toggle Item Manipulation")
+                    op.slot_index = entry_slot_index
                     box.prop(entry, "toggle_value", text="Manipulation Active")
 
             # Bottom actions
