@@ -13,6 +13,7 @@ from ..CR2W.witcher_cache.TextureCache import LoadTextureManager
 from ..CR2W.CR2W_types import getCR2W
 from ..CR2W.CR2W_helpers import Enums
 from ..CR2W import bStream
+from ..CR2W.common_blender import depot_path_to_os
 from .. import get_texture_path, get_uncook_path
 
 COOKED_W2CUBE_RGBA8_HV_FLIP_ENABLED = False  # Debug compare vs uncooked raw payload
@@ -195,7 +196,7 @@ def convert_xbm_to_dds(fdir, force=False, out_path=None):
                     if texture_item:
                         import os
                         import bpy
-                        extractPath = out_path or os.path.join(get_texture_path(bpy.context), texture_item.Name)
+                        extractPath = out_path or os.path.join(get_texture_path(bpy.context), depot_path_to_os(texture_item.Name))
                         texture_item.extract_to_file(extractPath)
                         dds_path = os.path.splitext(extractPath)[0] + '.dds'
                     else:
