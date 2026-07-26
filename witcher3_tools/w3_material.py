@@ -39,7 +39,7 @@ from .ui.blender_fun import (
     load_w2cube_image,
     load_w2cube_blick_equirect_image,
 )
-from .CR2W.common_blender import repo_file, win_safe_path, bpy_image_load_safe, win_path_key, win_unprefix_path, overwrite_existing_enabled
+from .CR2W.common_blender import repo_file, win_safe_path, bpy_image_load_safe, win_path_key, win_unprefix_path, overwrite_existing_enabled, depot_path_to_os
 
 possible_folders = [
     'files\\Raw\\Mod',
@@ -1321,7 +1321,7 @@ def create_node_for_param(
         texture_array = []
         tex_index = 0
         
-        texarray_path = os.path.abspath( uncook_path + os.sep + f"{par_value}.texture_{str(tex_index)}{get_tex_ext(bpy.context)}" )
+        texarray_path = os.path.abspath( os.path.join(uncook_path, depot_path_to_os(f"{par_value}.texture_{str(tex_index)}{get_tex_ext(bpy.context)}")) )
         create_one = True
         
         while create_one or Path(texarray_path).exists():
@@ -1335,7 +1335,7 @@ def create_node_for_param(
             sub_node.location = (-800, y_loc)
             texture_array.append(sub_node)
             tex_index+=1
-            texarray_path = os.path.abspath( uncook_path + os.sep + f"{par_value}.texture_{str(tex_index)}{get_tex_ext(bpy.context)}" )
+            texarray_path = os.path.abspath( os.path.join(uncook_path, depot_path_to_os(f"{par_value}.texture_{str(tex_index)}{get_tex_ext(bpy.context)}")) )
 
         #full_path = os.path.join(get_uncook_path(bpy.context), par_value)
         #texarray_ = CR2W_reader.load_material(full_path)
@@ -1491,7 +1491,7 @@ def create_node_texture(
     try:
         final_texture = repo_file_mat(final_tex_path) # TODO fix loading texarray
         if not os.path.exists(win_safe_path(final_texture)):
-            final_texture = uncook_path + os.sep + final_tex_path
+            final_texture = os.path.join(uncook_path, depot_path_to_os(final_tex_path))
     except Exception as e:
         #raise e
         log.critical(f"TEXTURE ERROR {e}")
@@ -1576,7 +1576,7 @@ def create_node_cubemap(
     # Resolve the .w2cube file path
     w2cube_path = repo_file(par_value) if par_value and not os.path.isabs(par_value) else par_value
     if not w2cube_path or not os.path.exists(win_safe_path(w2cube_path)):
-        w2cube_path = os.path.join(uncook_path, par_value) if par_value else None
+        w2cube_path = os.path.join(uncook_path, depot_path_to_os(par_value)) if par_value else None
 
     dds_path = None
     loaded_img = None
