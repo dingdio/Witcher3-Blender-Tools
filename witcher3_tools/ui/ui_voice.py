@@ -569,7 +569,7 @@ class VoiceLineResourceManager:
         
         RES_DIR = Path(__file__)
         RES_DIR = str(Path(RES_DIR).parents[1])
-        filename = os.path.join(RES_DIR, "CR2W\\data\\actor_voicelines.csv")
+        filename = os.path.join(RES_DIR, "CR2W", "data", "actor_voicelines.csv")
         self.pathashespath = filename
         #self.HashdumpDict = {}
         reader = csv.DictReader(open(self.pathashespath), delimiter=";")

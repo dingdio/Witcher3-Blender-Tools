@@ -226,7 +226,7 @@ class CModStoryBoardAnimationListsManager(object):
         self._extraAnimCount = self._animMeta.addExtraAnimations(SBUI_getExtraAnimations())
         RES_DIR = Path(__file__)
         RES_DIR = str(Path(RES_DIR).parents[1])
-        self._animMeta.loadCsv(os.path.join(RES_DIR, "CR2W\\data\\actor_animations.csv"))
+        self._animMeta.loadCsv(os.path.join(RES_DIR, "CR2W", "data", "actor_animations.csv"))
         CModStoryBoardAnimationListsManager._shared_anim_meta = self._animMeta
         CModStoryBoardAnimationListsManager._shared_extra_anim_count = self._extraAnimCount
         self._dataLoaded = True
@@ -298,7 +298,7 @@ class CModStoryBoardMimicsListsManager(CModStoryBoardAnimationListsManager):
         
         RES_DIR = Path(__file__)
         RES_DIR = str(Path(RES_DIR).parents[1])
-        animMeta.loadCsv(os.path.join(RES_DIR, "CR2W\\data\\actor_mimics.csv"))
+        animMeta.loadCsv(os.path.join(RES_DIR, "CR2W", "data", "actor_mimics.csv"))
         dataLoaded = True
     # ------------------------------------------------------------------------
 # ----------------------------------------------------------------------------

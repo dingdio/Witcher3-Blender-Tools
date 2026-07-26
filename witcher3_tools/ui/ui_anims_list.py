@@ -532,7 +532,7 @@ class AnimsResourceManager:
 
         RES_DIR = Path(__file__)
         RES_DIR = str(Path(RES_DIR).parents[1])
-        filename = os.path.join(RES_DIR, "CR2W\\data\\actor_animations.csv")
+        filename = os.path.join(RES_DIR, "CR2W", "data", "actor_animations.csv")
         self.pathashespath = filename
         #self.HashdumpDict = {}
         reader = csv.DictReader(open(self.pathashespath), delimiter=";")
