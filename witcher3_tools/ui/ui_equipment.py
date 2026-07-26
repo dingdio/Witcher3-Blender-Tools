@@ -14,6 +14,8 @@ log = logging.getLogger(__name__)
 from ..CR2W.witcher_cache.CacheController import CacheController
 from ..CR2W.witcher_cache.Bundles import LoadBundleManager
 from ..CR2W.witcher_cache.Bundles.BundleItem import BundleItem
+from ..CR2W.witcher_cache.Bundles.BundleManager import BundleManager
+from ..CR2W.witcher_cache import cache_meta
 from ..CR2W.common_blender import repo_file, mod_loading_context, depot_path_to_os
 from ..importers import import_entity
 from ..importers import import_isolation
@@ -4471,15 +4473,56 @@ def _get_equipment_xml_bundle_cache_root():
     return str(cache_root)
 
 
+def _equipment_xml_meta_path(out_root):
+    return cache_meta.get_meta_path(os.path.join(out_root, "_extraction"))
+
+
+def _equipment_xml_cache_is_complete(out_root):
+    """Whether the extracted cache can be trusted without re-reading the bundles.
+
+    A cache is only trusted when the previous run recorded that it finished with
+    no failed extractions, and the bundle sources still match. Presence of files
+    is deliberately not sufficient: an extraction that failed part-way (for
+    example when an optional decompressor was unavailable, which silently skips
+    every entry using it) leaves a populated but incomplete directory that is
+    otherwise indistinguishable from a good one.
+
+    Nothing here is compared against a fixed expected count -- the counts are
+    whatever the previous successful run observed, so this keeps working as the
+    game, its DLC or mods change.
+    """
+    meta = cache_meta.load_meta(_equipment_xml_meta_path(out_root))
+    if not meta:
+        return False, "no extraction metadata (cache predates completeness tracking)"
+    if meta.get("failed_count"):
+        return False, f"previous extraction skipped {meta.get('failed_count')} file(s)"
+    extracted = meta.get("extracted_count")
+    if not extracted:
+        return False, "previous extraction recorded no files"
+    on_disk = sum(1 for _dp, _dns, fns in os.walk(out_root) for f in fns if f.lower().endswith(".xml"))
+    if on_disk < extracted:
+        return False, f"{extracted - on_disk} extracted file(s) have gone missing"
+    try:
+        signature, _source = BundleManager.BuildSourceSignature(False)
+    except Exception:
+        # Can't verify the sources; trust the completeness flags rather than
+        # forcing an expensive re-extract on every refresh.
+        return True, "sources unverified"
+    if not cache_meta.signatures_match(meta.get("signature", {}), signature):
+        return False, "bundle sources changed"
+    return True, "up to date"
+
+
 def _extract_equipment_xmls_from_bundles():
     out_root = _get_equipment_xml_bundle_cache_root()
 
-    # Early exit: if XML files are already extracted to the cache directory,
-    # skip loading BundleManager entirely (expensive on every refresh).
+    # Skip loading BundleManager (expensive on every refresh) only when the
+    # cache is known-complete. See _equipment_xml_cache_is_complete().
     if os.path.isdir(out_root):
-        for _dp, _dns, fnames in os.walk(out_root):
-            if any(f.lower().endswith(".xml") for f in fnames):
-                return out_root
+        complete, reason = _equipment_xml_cache_is_complete(out_root)
+        if complete:
+            return out_root
+        log.info("Re-extracting equipment XMLs: %s", reason)
 
     try:
         bundle_manager = LoadBundleManager()
@@ -4491,6 +4534,8 @@ def _extract_equipment_xmls_from_bundles():
     if not items:
         return ""
     found = 0
+    extracted = 0
+    failed = []
 
     for key, value in items.items():
         rel_key = str(key or "").replace("/", "\\").lstrip("\\")
@@ -4513,10 +4558,32 @@ def _extract_equipment_xmls_from_bundles():
             try:
                 final_item.extract_to_file(export_path)
             except Exception as e:
+                failed.append(rel_key)
                 log.warning("Failed to extract equipment XML '%s': %s", rel_key, e)
+                continue
+        extracted += 1
 
     if found == 0:
         return ""
+
+    # Record what this run actually achieved so a partial extraction is retried
+    # next time instead of being mistaken for a complete cache.
+    try:
+        signature, source = BundleManager.BuildSourceSignature(False)
+    except Exception:
+        signature, source = {}, {}
+    meta = cache_meta.make_meta("equipment_items_xml_bundle", out_root, signature, source)
+    meta["found_count"] = found
+    meta["extracted_count"] = extracted
+    meta["failed_count"] = len(failed)
+    meta["failed"] = sorted(failed)[:50]
+    cache_meta.save_meta(_equipment_xml_meta_path(out_root), meta)
+
+    if failed:
+        log.warning(
+            "Extracted %d/%d equipment XMLs; %d failed and will be retried on the next refresh.",
+            extracted, found, len(failed),
+        )
     return out_root
 
 
