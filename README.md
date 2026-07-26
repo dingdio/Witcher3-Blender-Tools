@@ -140,14 +140,20 @@ Every journal character and bestiary creature with their in-game portrait. One c
 |---|---|
 | Windows | Fully supported |
 | Linux | Supported — see limitations below |
-| macOS | Untested — no native Doboz build is shipped (see `CR2W/witcher_cache/Bundles/native/README.md`) |
+| macOS | Untested, but nothing is known to be Windows-specific beyond the limitations below |
 
 Depot paths inside the game data are stored backslash-separated. They are kept
 that way internally (they are used as cache keys and for prefix matching) and
 translated to the host separator only where they touch the real filesystem.
 
-The Doboz bundle decompressor is a native library loaded through `ctypes`, so
-it is shipped per platform — `Doboz.dll` for Windows, `Doboz.so` for Linux.
+The Doboz bundle decompressor is a native library used through `ctypes`. Only
+the Windows build is vendored; on other platforms it is compiled from bundled
+sources the first time a Doboz-compressed entry is read and then cached per
+user, so no binaries are committed for those platforms. This needs a C++
+compiler (`g++`, `clang++` or `c++`) on `PATH` — it takes well under a second,
+happens once, and if no compiler is present only Doboz entries are affected
+(~2.6% of bundle entries), with everything else loading normally. See
+[`CR2W/witcher_cache/Bundles/native/README.md`](witcher3_tools/CR2W/witcher_cache/Bundles/native/README.md).
 
 ### Known limitations on Linux
 

@@ -1,0 +1,144 @@
+name: Verify
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  doboz:
+    name: Doboz builds and round-trips (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the vendored Doboz decompressor
+        shell: bash
+        working-directory: witcher3_tools/CR2W/witcher_cache/Bundles/native
+        run: |
+          case "${{ runner.os }}" in
+            macOS) LIB=Doboz.dylib ;;
+            *)     LIB=Doboz.so ;;
+          esac
+          echo "Building $LIB with $(c++ --version | head -1)"
+          c++ -O2 -fPIC -shared -DNDEBUG -include cstddef -I src \
+              -o "$LIB" src/doboz_capi.cpp src/Decompressor.cpp
+          ls -l "$LIB"
+          echo "DOBOZ_LIB=$PWD/$LIB" >> "$GITHUB_ENV"
+
+      # The addon only ever decompresses, so the reference compressor is built
+      # here purely to generate valid test input.
+      - name: Round-trip through the built library
+        shell: bash
+        working-directory: witcher3_tools/CR2W/witcher_cache/Bundles/native
+        run: |
+          git clone --depth 1 https://github.com/nemequ/doboz.git /tmp/doboz
+          cat > /tmp/roundtrip.cpp <<'CPP'
+          #include <cstdio>
+          #include <cstring>
+          #include <cstdlib>
+          #include <vector>
+          #include <dlfcn.h>
+          #include "Compressor.h"
+          typedef int (*DecompressFn)(const void*, size_t, void*, size_t);
+          static int check(DecompressFn dec, const std::vector<char>& in, const char* label) {
+              size_t bound = doboz::Compressor::getMaxCompressedSize(in.size());
+              std::vector<char> comp(bound);
+              size_t compSize = 0;
+              doboz::Compressor c;
+              if (c.compress(in.data(), in.size(), comp.data(), bound, compSize) != doboz::RESULT_OK) {
+                  printf("FAIL %s: compress\n", label); return 1;
+              }
+              std::vector<char> out(in.size());
+              int r = dec(comp.data(), compSize, out.data(), out.size());
+              if (r != 0) { printf("FAIL %s: decompress rc=%d\n", label, r); return 1; }
+              if (memcmp(in.data(), out.data(), in.size()) != 0) {
+                  printf("FAIL %s: payload mismatch\n", label); return 1;
+              }
+              printf("ok   %s (%zu -> %zu bytes)\n", label, in.size(), compSize);
+              return 0;
+          }
+          int main(int argc, char** argv) {
+              void* h = dlopen(argv[1], RTLD_NOW);
+              if (!h) { printf("FAIL dlopen: %s\n", dlerror()); return 1; }
+              DecompressFn dec = (DecompressFn)dlsym(h, "Decompress");
+              if (!dec) { printf("FAIL dlsym Decompress\n"); return 1; }
+              int bad = 0;
+              { std::vector<char> v(1 << 20, 'A'); bad |= check(dec, v, "repetitive 1MB"); }
+              { std::vector<char> v(1 << 20); srand(1);
+                for (auto& ch : v) ch = (char)rand(); bad |= check(dec, v, "random 1MB"); }
+              { std::vector<char> v(8 << 20); srand(2);
+                for (size_t i = 0; i < v.size(); ++i) v[i] = (char)((i % 251) ^ (rand() & 3));
+                bad |= check(dec, v, "mixed 8MB"); }
+              { std::vector<char> v(1, 'x'); bad |= check(dec, v, "single byte"); }
+              { const char* s = "the quick brown fox jumps over the lazy dog. ";
+                std::vector<char> v; while (v.size() < 100000) v.insert(v.end(), s, s + strlen(s));
+                bad |= check(dec, v, "text"); }
+              printf(bad ? "\nROUND-TRIP FAILED\n" : "\nall round-trips identical\n");
+              return bad;
+          }
+          CPP
+          c++ -O2 -DNDEBUG -include cstddef -I /tmp/doboz/Source/Doboz -o /tmp/roundtrip \
+              /tmp/roundtrip.cpp /tmp/doboz/Source/Doboz/Compressor.cpp /tmp/doboz/Source/Doboz/Dictionary.cpp
+          /tmp/roundtrip "$DOBOZ_LIB"
+
+      - name: No binaries are committed for this platform
+        shell: bash
+        run: |
+          bad=0
+          for f in Doboz.so Doboz.dylib; do
+            p="witcher3_tools/CR2W/witcher_cache/Bundles/native/$f"
+            if git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
+              echo "::error::$p is committed; it is built on demand instead."
+              bad=1
+            fi
+          done
+          if [ "$bad" -ne 0 ]; then
+            exit 1
+          fi
+          echo "ok - no committed .so/.dylib"
+
+  extension:
+    name: Extension validates and enables
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Blender 4.5 LTS
+        run: |
+          curl -fsSL -o /tmp/blender.tar.xz \
+            https://download.blender.org/release/Blender4.5/blender-4.5.0-linux-x64.tar.xz
+          mkdir -p /tmp/blender && tar -xJf /tmp/blender.tar.xz -C /tmp/blender --strip-components=1
+          /tmp/blender/blender --version
+
+      - name: Validate the manifest
+        run: /tmp/blender/blender --command extension validate witcher3_tools
+
+      - name: Build the extension package
+        run: |
+          mkdir -p dist
+          /tmp/blender/blender --command extension build \
+            --source-dir witcher3_tools --output-dir dist
+          ls -l dist
+
+      # Catches import-time errors and syntax breakage across the whole addon,
+      # which a plain zip step cannot.
+      - name: Install and enable it
+        run: |
+          /tmp/blender/blender --background --factory-startup --python-expr "
+          import bpy, sys, glob
+          pkg = glob.glob('dist/*.zip')[0]
+          bpy.ops.extensions.package_install_files(filepath=pkg, repo='user_default', enable_on_install=True)
+          mod = 'bl_ext.user_default.witcher3_tools'
+          if mod not in sys.modules:
+              print('FAILED: extension did not load'); sys.exit(1)
+          print('OK: extension enabled')
+          "
+
+      - name: Compile every Python file
+        run: python3 -m compileall -q witcher3_tools
