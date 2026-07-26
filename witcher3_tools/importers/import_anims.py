@@ -1377,7 +1377,7 @@ def load_idle_animation_for_armature(context, armature_obj):
         if not anim_paths:
             return False
 
-        from ..CR2W.common_blender import repo_file as _repo_file
+        from ..CR2W.common_blender import repo_file as _repo_file, depot_path_to_os
         from ..CR2W.dc_anims import load_bin_anims_single
         import os
         from .. import get_uncook_path
@@ -1390,7 +1390,7 @@ def load_idle_animation_for_armature(context, armature_obj):
             animation = None
             try:
                 _repo_file(anim_path)
-                fdir = os.path.join(get_uncook_path(context), anim_path)
+                fdir = os.path.join(get_uncook_path(context), depot_path_to_os(anim_path))
                 if os.path.exists(fdir + ".json"):
                     fdir += ".json"
                 if not os.path.exists(fdir):

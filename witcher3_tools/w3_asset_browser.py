@@ -355,7 +355,7 @@ def _ensure_bundle_item_exported(bundle_item: BundleItem) -> str:
     abs_path = repo_file(depot_path)
     if win_path_exists(abs_path):
         return abs_path
-    export_path = os.path.join(get_uncook_path(bpy.context), depot_path)
+    export_path = os.path.join(get_uncook_path(bpy.context), depot_path_to_os(depot_path))
     bundle_item.extract_to_file(export_path)
     return export_path
 
@@ -942,7 +942,7 @@ def _iter_top_level_reddlc_files(game_path: str) -> Iterable[str]:
 
         local_path = repo_file(item_name)
         if not win_path_exists(local_path):
-            export_path = os.path.join(get_uncook_path(bpy.context), item_name)
+            export_path = os.path.join(get_uncook_path(bpy.context), depot_path_to_os(item_name))
             try:
                 final_item.extract_to_file(export_path)
                 local_path = export_path

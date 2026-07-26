@@ -1408,7 +1408,7 @@ class WITCH_OT_RevealAnimInExplorer(Operator):
     def execute(self, context):
         if not self.path:
             return {'CANCELLED'}
-        full_path = os.path.join(get_uncook_path(context), self.path)
+        full_path = os.path.join(get_uncook_path(context), depot_path_to_os(self.path))
         try:
             with mod_loading_context(context):
                 resolved = repo_file(self.path)
@@ -1545,7 +1545,7 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
                 if anim_path and ":" not in anim_path:
                     from ..CR2W.common_blender import repo_file as _repo_file
                     _repo_file(anim_path)  # Extract from bundle to uncook dir if not already present
-                    fdir = os.path.join(get_uncook_path(context), anim_path)
+                    fdir = os.path.join(get_uncook_path(context), depot_path_to_os(anim_path))
                     log.debug("Loading anims from: %s", fdir)
                     if os.path.exists(fdir + '.json'):
                         fdir = fdir + '.json'

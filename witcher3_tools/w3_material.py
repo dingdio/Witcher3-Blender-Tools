@@ -82,12 +82,12 @@ def _apply_image_texture_metadata(image: Optional[Image], source_path: str) -> N
 
 def repo_file_mat(filepath: str):
     if filepath.endswith(get_tex_ext(bpy.context)):
-        modded_texture = os.path.join(get_modded_texture_path(bpy.context), filepath)
+        modded_texture = os.path.join(get_modded_texture_path(bpy.context), depot_path_to_os(filepath))
         if os.path.exists(modded_texture):
             return modded_texture
         else:
             for folder in possible_folders:
-                modded_texture = os.path.join(get_mod_directory(bpy.context)+'\\'+folder, filepath)
+                modded_texture = os.path.join(get_mod_directory(bpy.context), depot_path_to_os(folder), depot_path_to_os(filepath))
                 if os.path.exists(modded_texture):
                    return modded_texture
     # if filepath.endswith('.tga'):
