@@ -125,12 +125,43 @@ Every journal character and bestiary creature with their in-game portrait. One c
 
    | Preference | Set to |
    |---|---|
-   | **Witcher 3 Path** | Root Game install folder (eg. C:\GOG Games\The Witcher 3 Wild Hunt GOTY)  |
+   | **Witcher 3 Path** | Root Game install folder (eg. `C:\GOG Games\The Witcher 3 Wild Hunt GOTY`, or `~/.steam/steam/steamapps/common/The Witcher 3` on Linux) |
    | **Uncook Path** | Extracted files depot addon will use |
 
-    **Witcher 3 Path** will be automatically found and set if it exists in a standard install location. **Uncook Path** will automatically use blender's Roaming data folder. Change it to a new empty folder if you prefer.
+    **Witcher 3 Path** will be automatically found and set if it exists in a standard install location — note that auto-detection only probes Windows install locations, so on Linux and macOS this has to be set by hand. **Uncook Path** will automatically use Blender's user extension data folder. Change it to a new empty folder if you prefer.
 
 4. Find `Witcher 3` in the n-panel of the 3D viewport. Click on `Geralt` to load Geralt player entity. This will warm up the bundle and texture caches for the first time.
+
+---
+
+## Platform support
+
+| Platform | Status |
+|---|---|
+| Windows | Fully supported |
+| Linux | Supported — see limitations below |
+| macOS | Untested — no native Doboz build is shipped (see `CR2W/witcher_cache/Bundles/native/README.md`) |
+
+Depot paths inside the game data are stored backslash-separated. They are kept
+that way internally (they are used as cache keys and for prefix matching) and
+translated to the host separator only where they touch the real filesystem.
+
+The Doboz bundle decompressor is a native library loaded through `ctypes`, so
+it is shipped per platform — `Doboz.dll` for Windows, `Doboz.so` for Linux.
+
+### Known limitations on Linux
+
+| Area | Status | Cause |
+|---|---|---|
+| LZ4 / Snappy bundle entries | Unavailable | the `cramjam` wheels pinned in `blender_manifest.toml` are `win_amd64` only |
+| Voicelines & audio conversion | Unavailable | `CR2W/third_party_libs/vgmstream-win64/` ships a Windows `.exe` plus DLLs, with no Linux build |
+| Game path auto-detection | Manual setup | candidate locations are Windows-only (`C:\Program Files`, `%SystemDrive%\GOG Games`, Windows Steam roots) |
+| Witcher 3 version shown in preferences | Not shown | reads the PE version resource via `ctypes.windll` |
+
+LZ4 and Snappy together account for roughly 1.6% of bundle entries (5,598 of
+341,892 in a GOTY install). The remainder are uncompressed, Zlib, or Doboz and
+load normally. Assets that do need LZ4 or Snappy raise
+`MissingCompressionException` naming the format, rather than failing silently.
 
 ---
 
