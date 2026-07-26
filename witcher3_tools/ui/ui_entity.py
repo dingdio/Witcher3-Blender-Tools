@@ -38,6 +38,7 @@ from ..read_game_bin import (
 from ..CR2W.common_blender import (
     repo_file,
     mod_loading_context,
+    depot_path_to_os,
 )
 from ..duplication import duplicate_character_hierarchy as _duplicate_character_hierarchy
 
@@ -1269,7 +1270,7 @@ class WITCH_OT_ENTITY_import_geralt(bpy.types.Operator):
 
         with mod_loading_context(context):
             rel_path = "gameplay\\templates\\characters\\player\\player.w2ent"
-            uncook_path = os.path.join(get_uncook_path(context), rel_path)
+            uncook_path = os.path.join(get_uncook_path(context), depot_path_to_os(rel_path))
             use_uncook_file = os.path.exists(uncook_path)
 
             if not use_uncook_file:
@@ -1317,7 +1318,7 @@ class WITCH_OT_ENTITY_import_ciri(bpy.types.Operator):
 
         with mod_loading_context(context):
             rel_path = "gameplay\\templates\\characters\\player\\ciri_player.w2ent"
-            uncook_path = os.path.join(get_uncook_path(context), rel_path)
+            uncook_path = os.path.join(get_uncook_path(context), depot_path_to_os(rel_path))
             use_uncook_file = os.path.exists(uncook_path)
 
             if not use_uncook_file:

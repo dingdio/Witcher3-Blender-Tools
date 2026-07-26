@@ -5,6 +5,7 @@ import json
 import numpy as np
 from pathlib import Path
 from .. import get_uncook_path
+from ..CR2W.common_blender import depot_path_to_os
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.CR2W_types import EngineTransform
@@ -234,7 +235,7 @@ class SceneImporter():
 
             actor_obj = check_if_actor_already_in_scene(actor.entityTemplate)
             if not actor_obj:
-                actor_obj = import_entity.import_ent_template(get_uncook_path(bpy.context)+'\\'+actor.entityTemplate, load_face_poses=actor.useMimic)
+                actor_obj = import_entity.import_ent_template(os.path.join(get_uncook_path(bpy.context), depot_path_to_os(actor.entityTemplate)), load_face_poses=actor.useMimic)
             actors_dict[actor.id] = (actor_obj, actor)
 
         for di in _CStoryScene.dialogsetInstances.value: #<array:2,0,ptr:CStorySceneActor>

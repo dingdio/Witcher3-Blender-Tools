@@ -1939,7 +1939,7 @@ def importCloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename="
         log.warning("Skipping redcloth import, APX/APB file not found: %s", filepath)
         return None
 
-    uncook_path = get_texture_path(context)+"\\" # PATH WITH TEXTURES
+    uncook_path = get_texture_path(context) + os.sep # PATH WITH TEXTURES
 
     filepath = _sanitize_apx_for_import(filepath)
 

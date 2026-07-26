@@ -125,7 +125,7 @@ class WITCH_OT_apx(bpy.types.Operator, ImportHelper):
 
     def invoke(self, context, event):
         """Invoke."""
-        UNCOOK_PATH = get_uncook_path(context) + "\\"
+        UNCOOK_PATH = get_uncook_path(context) + os.sep
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
@@ -230,7 +230,7 @@ class WITCH_OT_w2mesh(bpy.types.Operator, ImportHelper):
     def invoke(self, context, event):
         """Invoke."""
         MeshImportSettings.from_addon_prefs(get_all_addon_prefs(context)).apply_to(self)
-        UNCOOK_PATH = get_uncook_path(context) + "\\"
+        UNCOOK_PATH = get_uncook_path(context) + os.sep
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         #wm = context.window_manager.fileselect_add(self)
@@ -2888,7 +2888,7 @@ class WITCH_OT_nxs(bpy.types.Operator, ImportHelper):
     )
     def invoke(self, context, event):
         """Invoke."""
-        UNCOOK_PATH = get_uncook_path(context) + "\\"
+        UNCOOK_PATH = get_uncook_path(context) + os.sep
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         #wm = context.window_manager.fileselect_add(self)

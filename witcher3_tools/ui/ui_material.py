@@ -1273,7 +1273,7 @@ class WITCH_OT_w2mg(bpy.types.Operator, ImportHelper):
         return {'FINISHED'}
     
     def invoke(self, context, event):
-        UNCOOK_PATH = get_uncook_path(context) + '\\'
+        UNCOOK_PATH = get_uncook_path(context) + os.sep
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
@@ -1326,7 +1326,7 @@ class WITCH_OT_w2mi(bpy.types.Operator, ImportHelper):
         return {'FINISHED'}
     
     def invoke(self, context, event):
-        UNCOOK_PATH = get_uncook_path(context) + '\\'
+        UNCOOK_PATH = get_uncook_path(context) + os.sep
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
@@ -1360,7 +1360,7 @@ class WITCH_OT_xbm(bpy.types.Operator, ImportHelper):
         return {'FINISHED'}
     
     def invoke(self, context, event):
-        UNCOOK_PATH = get_uncook_path(context) + '\\'
+        UNCOOK_PATH = get_uncook_path(context) + os.sep
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
@@ -1532,7 +1532,7 @@ class WITCH_OT_w2cube(bpy.types.Operator, ImportHelper):
         return {'FINISHED'}
 
     def invoke(self, context, event):
-        UNCOOK_PATH = get_uncook_path(context) + '\\'
+        UNCOOK_PATH = get_uncook_path(context) + os.sep
         if os.path.exists(UNCOOK_PATH):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)

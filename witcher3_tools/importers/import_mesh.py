@@ -917,10 +917,10 @@ def prepare_mesh_import(CData, bufferInfos, the_material_names, the_materials, m
         
         
         if meshFile.HEADER.version <= 115:
-            uncook_path = get_witcher2_game_path(bpy.context)+"\\data\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
+            uncook_path = os.path.join(get_witcher2_game_path(bpy.context), "data") + os.sep #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
             #uncook_path_modkit = get_witcher2_game_path(bpy.context)
         else:
-            uncook_path = get_texture_path(bpy.context)+"\\" #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
+            uncook_path = get_texture_path(bpy.context) + os.sep #! THE PATH WITH THE TEXTURES NOT THE FBX FILES
             #uncook_path_modkit = get_uncook_path(bpy.context)
         xml_path = "w2mesh"
         
