@@ -19,14 +19,35 @@ except Exception as e:
 import zlib
 
 import ctypes
+import sys
 def get_dll_path(dll_name):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     dll_path = os.path.join(script_dir, dll_name)
     return dll_path
-doboz_dll_path = get_dll_path(r'native\Doboz.dll')
-doboz_lib = ctypes.CDLL(doboz_dll_path)
-doboz_lib.Decompress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
-doboz_lib.Decompress.restype = ctypes.c_int
+
+if sys.platform.startswith("linux"):
+    _doboz_lib_name = "Doboz.so"
+elif sys.platform == "darwin":
+    _doboz_lib_name = "Doboz.dylib"
+else:
+    _doboz_lib_name = "Doboz.dll"
+
+_doboz_lib = None
+def get_doboz_lib():
+    global _doboz_lib
+    if _doboz_lib is None:
+        doboz_dll_path = get_dll_path(os.path.join('native', _doboz_lib_name))
+        try:
+            lib = ctypes.CDLL(doboz_dll_path)
+        except OSError as e:
+            raise MissingCompressionException(
+                "Doboz",
+                f"Doboz decompressor could not be loaded from {doboz_dll_path}: {e}"
+            ) from e
+        lib.Decompress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+        lib.Decompress.restype = ctypes.c_int
+        _doboz_lib = lib
+    return _doboz_lib
 
 class MissingCompressionException(Exception):
     def __init__(self, compression, message="Unhandled compression algorithm."):
@@ -92,7 +113,7 @@ class BundleItem:
             output.write(bytes(uncompressed_data))
         elif self.compression_type == "Doboz":
             destination_buffer = ctypes.create_string_buffer(self.size)
-            result = doboz_lib.Decompress(ctypes.byref(ctypes.create_string_buffer(viewstream)), self.zsize,
+            result = get_doboz_lib().Decompress(ctypes.byref(ctypes.create_string_buffer(viewstream)), self.zsize,
                                           ctypes.byref(destination_buffer),self.size)
             if result == 0:
                 decompressed_data = bytearray(destination_buffer[:self.size])

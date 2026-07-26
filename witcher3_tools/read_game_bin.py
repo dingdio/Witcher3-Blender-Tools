@@ -439,13 +439,17 @@ def update_witcher_game_path(self, context):
 
     exe_path = get_witcher3_exe_path(game_path)
     if os.path.isfile(exe_path):
-        version_info = get_all_version_info(exe_path)
+        try:
+            version_info = get_all_version_info(exe_path)
+        except Exception as e:
+            self.version_info = f"Path OK. Version info unavailable on this platform: {e}"
+            return
         if "Error" in version_info:
             self.version_info = version_info["Error"]
         else:
             # Format version info for display
-            lines = [f"{k}: {v[0] if k == 'P4CL' else v}" + 
-                     (f" (Offset: {hex(v[1])})" if k == "P4CL" else "") 
+            lines = [f"{k}: {v[0] if k == 'P4CL' else v}" +
+                     (f" (Offset: {hex(v[1])})" if k == "P4CL" else "")
                      for k, v in version_info.items()]
             self.version_info = "\n".join(lines)
     else:

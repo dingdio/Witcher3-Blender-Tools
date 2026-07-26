@@ -60,6 +60,16 @@ def win_safe_path(path: str) -> str:
     return path
 
 
+def _depot_path_to_os(rel_path: str) -> str:
+    """Convert a depot-style (backslash-separated) relative path to the local
+    OS's native separator, for use only where it's about to touch the real
+    filesystem (os.path.join with a real root, os.path.exists, open, etc.).
+    Depot paths are conventionally kept backslash-separated everywhere else in
+    this module (dict keys, prefix/suffix checks) — do not normalize those.
+    No-op on Windows, where os.sep is already '\\'."""
+    return rel_path.replace('\\', os.sep) if os.sep != '\\' else rel_path
+
+
 def win_bpy_image_path(path: str) -> str:
     """Blender image loading on Windows is more reliable with an explicit extended-length path."""
     if sys.platform != 'win32' or not path:
@@ -578,7 +588,7 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                 if _is_under_root(filepath, root):
                     return filepath
         for root in _repo_override_roots:
-            candidate = os.path.join(root, filepath)
+            candidate = os.path.join(root, _depot_path_to_os(filepath))
             if os.path.exists(win_safe_path(candidate)):
                 return candidate
 
@@ -602,8 +612,8 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
     is_texture_repo = version > 115 and use_separate_texture_path and _is_texture_repo_path(filepath)
     extract_root = uncook_path
     if is_texture_repo:
-        texture_abs = os.path.join(texture_path, filepath)
-        uncook_abs = os.path.join(uncook_path, filepath)
+        texture_abs = os.path.join(texture_path, _depot_path_to_os(filepath))
+        uncook_abs = os.path.join(uncook_path, _depot_path_to_os(filepath))
         if not _overwrite_existing:
             if os.path.exists(win_safe_path(texture_abs)):
                 return texture_abs
@@ -615,22 +625,22 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
     if filepath.endswith('.fbx'):
         if not fbx_uncook_path:
             return filepath
-        return os.path.join(fbx_uncook_path, filepath)
+        return os.path.join(fbx_uncook_path, _depot_path_to_os(filepath))
     else:
         if not extract_root:
             if is_texture_repo and texture_path:
-                return os.path.join(texture_path, filepath)
+                return os.path.join(texture_path, _depot_path_to_os(filepath))
             return filepath
-        abs_filename = os.path.join(extract_root, filepath)
+        abs_filename = os.path.join(extract_root, _depot_path_to_os(filepath))
         if version <= 115 and not os.path.exists(win_safe_path(abs_filename)):
             templates_fallback = None
             lower_filepath = filepath.lower()
             if not lower_filepath.startswith("templates\\"):
-                templates_fallback = os.path.join(extract_root, "templates", filepath)
+                templates_fallback = os.path.join(extract_root, "templates", _depot_path_to_os(filepath))
             elif lower_filepath.startswith("templates\\"):
                 stripped = filepath[len("templates\\"):]
                 if stripped:
-                    fallback_candidate = os.path.join(extract_root, stripped)
+                    fallback_candidate = os.path.join(extract_root, _depot_path_to_os(stripped))
                     if os.path.exists(win_safe_path(fallback_candidate)):
                         return fallback_candidate
             if templates_fallback and os.path.exists(win_safe_path(templates_fallback)):
@@ -659,7 +669,7 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                 extracted_any = False
                 base_extracted = False
                 if base_item:
-                    out_path = os.path.join(extract_root, base_item[0])
+                    out_path = os.path.join(extract_root, _depot_path_to_os(base_item[0]))
                     if prepare_extraction_target(out_path, extract_root):
                         final_item:BundleItem = base_item[1][-1]
                         final_item.extract_to_file(out_path)
@@ -668,7 +678,7 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
 
                 if base_extracted or base_from_same_mod:
                     for _, inner, item_list in buffer_items:
-                        out_path = os.path.join(extract_root, inner)
+                        out_path = os.path.join(extract_root, _depot_path_to_os(inner))
                         if not prepare_extraction_target(out_path, extract_root):
                             continue
                         final_item:BundleItem = item_list[-1]
@@ -697,7 +707,7 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                 extracted_any = False
                 for rel_path, item in items:
                     final_item:BundleItem = item[-1]
-                    out_path = os.path.join(extract_root, rel_path)
+                    out_path = os.path.join(extract_root, _depot_path_to_os(rel_path))
                     if not prepare_extraction_target(out_path, extract_root):
                         continue
                     final_item.extract_to_file(out_path)
@@ -712,13 +722,13 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                         log.info("Repairing missing Witcher 3 mesh path: %s -> %s", filepath, repaired_filepath)
                         filepath = repaired_filepath
                         filepath_key = filepath.lower()
-                        abs_filename = os.path.join(extract_root, filepath)
+                        abs_filename = os.path.join(extract_root, _depot_path_to_os(filepath))
                         items = _collect_bundle_extract_items(bundle_manager, filepath)
                 if items:
                     extracted_any = False
                     for rel_path, item in items:
                         final_item:BundleItem = item[-1]
-                        out_path = os.path.join(extract_root, rel_path)
+                        out_path = os.path.join(extract_root, _depot_path_to_os(rel_path))
                         if not prepare_extraction_target(out_path, extract_root):
                             continue
                         final_item.extract_to_file(out_path)
@@ -744,7 +754,7 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
                             extracted_any = False
                             base_extracted = False
                             if base_item:
-                                out_path = os.path.join(extract_root, base_item[0])
+                                out_path = os.path.join(extract_root, _depot_path_to_os(base_item[0]))
                                 if prepare_extraction_target(out_path, extract_root):
                                     final_item:BundleItem = base_item[1][-1]
                                     final_item.extract_to_file(out_path)
@@ -753,7 +763,7 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
 
                             if base_extracted:
                                 for _, inner, item_list in buffer_items:
-                                    out_path = os.path.join(extract_root, inner)
+                                    out_path = os.path.join(extract_root, _depot_path_to_os(inner))
                                     if not prepare_extraction_target(out_path, extract_root):
                                         continue
                                     final_item:BundleItem = item_list[-1]
