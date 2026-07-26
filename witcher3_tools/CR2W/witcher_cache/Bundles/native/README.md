@@ -72,6 +72,40 @@ int Decompress(const void* source, size_t sourceSize,
 
 It returns `0` (`doboz::RESULT_OK`) on success.
 
+## Why build from source instead of shipping a wheel?
+
+The addon already ships a native dependency as a wheel — `cramjam`, for LZ4 and
+Snappy — so the obvious question is why Doboz is not handled the same way.
+
+On packaging mechanics alone, a wheel would be the better answer. It is the
+*only* fully platform-aware mechanism in Blender's extension system: the client
+installer selects wheels by platform tag automatically, and
+`--split-platforms` filters the `wheels` list and nothing else, so raw
+`.so`/`.dll` files are copied into every platform archive unchanged.
+
+What rules it out is the verification rule. extensions.blender.org checks every
+bundled wheel's SHA-256 against `https://pypi.org/pypi/{name}/{version}/json`
+and flags any mismatch — the server-side enforcement of "wheels must be bundled
+unmodified from Python's package index." `cramjam` passes that trivially
+because it is a real published PyPI package. Doboz is not on PyPI at all, so
+shipping it as a wheel would mean publishing and maintaining a PyPI package
+purely to deliver a 15 KB shared library. A wheel is also still a binary
+artifact in the diff, which is what vendoring source avoids.
+
+So the two dependencies differ in kind rather than being treated
+inconsistently:
+
+| | Doboz | cramjam |
+|---|---|---|
+| Language | ~350 lines of dependency-free C++ | Rust, with a toolchain you cannot assume |
+| On PyPI | No | Yes |
+| Approach | vendor source, build on demand | vendor the published wheel |
+
+The remaining asymmetry is real and worth stating: Doboz needs a C++ compiler
+at runtime, which the cramjam wheel does not. That is the accepted tradeoff —
+it is a one-off sub-second build, it is lazy so it never blocks addon
+registration, and if no compiler exists only Doboz entries are affected.
+
 ## Verifying a build
 
 Round-trip a buffer: compress it with the upstream `Compressor` and check that

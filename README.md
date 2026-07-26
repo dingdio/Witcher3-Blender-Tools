@@ -159,15 +159,17 @@ happens once, and if no compiler is present only Doboz entries are affected
 
 | Area | Status | Cause |
 |---|---|---|
-| LZ4 / Snappy bundle entries | Unavailable | the `cramjam` wheels pinned in `blender_manifest.toml` are `win_amd64` only |
 | Voicelines & audio conversion | Unavailable | `CR2W/third_party_libs/vgmstream-win64/` ships a Windows `.exe` plus DLLs, with no Linux build |
+| Texture export (`.xbm` write) | Unavailable | `CR2W/third_party_libs/texconv.dll` is a Windows DLL, with no Linux build |
 | Game path auto-detection | Manual setup | candidate locations are Windows-only (`C:\Program Files`, `%SystemDrive%\GOG Games`, Windows Steam roots) |
 | Witcher 3 version shown in preferences | Not shown | reads the PE version resource via `ctypes.windll` |
 
-LZ4 and Snappy together account for roughly 1.6% of bundle entries (5,598 of
-341,892 in a GOTY install). The remainder are uncompressed, Zlib, or Doboz and
-load normally. Assets that do need LZ4 or Snappy raise
-`MissingCompressionException` naming the format, rather than failing silently.
+All four bundle compression formats work: uncompressed, Zlib, Doboz (built on
+first use, above) and LZ4/Snappy (via the `cramjam` wheels). macOS has no
+`cramjam` wheel listed, so LZ4 and Snappy are unavailable there — that is
+~1.6% of bundle entries overall, but it is concentrated in animations, where
+LZ4 alone is 20.7% of `.w2anims` entries. Affected assets raise
+`MissingCompressionException` naming the format rather than failing silently.
 
 ---
 
