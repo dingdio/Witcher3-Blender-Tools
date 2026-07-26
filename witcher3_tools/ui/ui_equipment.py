@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 from ..CR2W.witcher_cache.CacheController import CacheController
 from ..CR2W.witcher_cache.Bundles import LoadBundleManager
 from ..CR2W.witcher_cache.Bundles.BundleItem import BundleItem
-from ..CR2W.common_blender import repo_file, mod_loading_context
+from ..CR2W.common_blender import repo_file, mod_loading_context, depot_path_to_os
 from ..importers import import_entity
 from ..importers import import_isolation
 from ..importers.import_anims import load_idle_animation_for_armature as _load_idle_anim
@@ -4505,7 +4505,7 @@ def _extract_equipment_xmls_from_bundles():
             continue
 
         found += 1
-        export_path = os.path.join(out_root, rel_key)
+        export_path = os.path.join(out_root, depot_path_to_os(rel_key))
         export_dir = os.path.dirname(export_path)
         if export_dir:
             os.makedirs(export_dir, exist_ok=True)

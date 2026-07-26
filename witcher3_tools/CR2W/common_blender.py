@@ -885,7 +885,7 @@ def repo_collision_file(mesh_filepath: str) -> str:
         return None
 
     # Determine output path
-    output_path = os.path.join(uncook_path, item.Name)
+    output_path = os.path.join(uncook_path, depot_path_to_os(item.Name))
     if not output_path.endswith('.nxs'):
         output_path = output_path + '.nxs'
 

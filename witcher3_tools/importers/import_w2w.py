@@ -8,7 +8,7 @@ import numpy as np
 from ..importers.import_texarray import insert_color, get_texture_node, insert_heightmap_to_disp
 from ..importers import terrain_w2ter
 from ..CR2W.CR2W_file import WORLD
-from ..CR2W.common_blender import repo_file, bpy_image_load_safe
+from ..CR2W.common_blender import repo_file, bpy_image_load_safe, depot_path_to_os
 from .. import CR2W
 from ..importers import import_w2l
 from ..CR2W.third_party_libs import yaml
@@ -256,7 +256,7 @@ class MyListTreeItem_Debug(bpy.types.Operator):
             log.debug("Level name: %s", treeList[myListTree_index].name)
             uncook_path = get_uncook_path(context)
             fbx_uncook_path = get_fbx_uncook_path(context)
-            full_path = os.path.join(uncook_path, treeList[myListTree_index].name)
+            full_path = os.path.join(uncook_path, depot_path_to_os(treeList[myListTree_index].name))
             level_file = CR2W.CR2W_reader.load_w2l(full_path)
             import_w2l.btn_import_W2L(level_file, fbx_uncook_path)
             # for node in myNodes:

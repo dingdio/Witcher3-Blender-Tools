@@ -28,6 +28,7 @@ from .CR2W.common_blender import (
     win_path_isfile,
     win_path_getmtime,
     win_path_getsize,
+    depot_path_to_os,
 )
 from .CR2W.witcher_cache.TextureCache import LoadTextureManager
 from .CR2W.witcher_cache.TextureCache.TextureCacheItem import TextureCacheItem
@@ -1185,7 +1186,7 @@ def _resolve_image_path_from_roots(image_roots: list[str], image_file: str):
 
     for image_root in image_roots:
         image_directory = repo_file(image_root)
-        filepath = os.path.join(image_directory, image_file)
+        filepath = os.path.join(image_directory, depot_path_to_os(normalized_image))
         if win_path_exists(filepath):
             return filepath, _normalize_depot_path(os.path.join(image_root, image_file))
     return None, ""
@@ -1199,7 +1200,7 @@ def _ensure_texture_roots_exported(image_dirs: list[str]):
         if not tex_items:
             continue
         final_item: TextureCacheItem = tex_items[-1]
-        export_path = os.path.join(get_uncook_path(bpy.context), final_item.name)
+        export_path = os.path.join(get_uncook_path(bpy.context), depot_path_to_os(final_item.name))
         if not win_path_exists(export_path) and not win_path_exists(export_path.rsplit('.', 1)[0] + '.dds'):
             final_item.extract_to_file(export_path)
 

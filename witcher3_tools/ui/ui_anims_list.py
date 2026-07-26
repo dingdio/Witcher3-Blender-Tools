@@ -3,7 +3,7 @@ from pathlib import Path
 from .. import import_anims
 #from io_import_w2l.filter_list import memory
 log = logging.getLogger(__name__)
-from ..CR2W.common_blender import repo_file
+from ..CR2W.common_blender import repo_file, depot_path_to_os
 from ..CR2W.dc_anims import load_bin_anims_single
 
 import csv
@@ -622,7 +622,7 @@ def GetAnimationInfoByName(anim_name):
         log.critical('Did not find animation!')
         return (None, None)
     #(, ) = item.animLineId.split(';')
-    fdir = os.path.join(uncook_path, fdir)
+    fdir = os.path.join(uncook_path, depot_path_to_os(fdir))
     return (anim_name, fdir)
 
 def SetupActor(main_arm_obj, context=None, show_all=False):

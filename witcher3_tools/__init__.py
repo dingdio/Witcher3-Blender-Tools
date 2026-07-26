@@ -271,8 +271,7 @@ def get_vgmstream_path(context) -> str:
     #addon_prefs = context.preferences.addons[ADDON_NAME].preferences
     #vgmstream_path = addon_prefs.vgmstream_path
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    exe_name = r"CR2W\third_party_libs\vgmstream-win64\vgmstream-cli.exe"
-    exe_path = os.path.join(script_dir, exe_name)
+    exe_path = os.path.join(script_dir, "CR2W", "third_party_libs", "vgmstream-win64", "vgmstream-cli.exe")
     vgmstream_path = exe_path
     return vgmstream_path
 

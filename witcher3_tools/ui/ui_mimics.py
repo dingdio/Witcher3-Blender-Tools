@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 from ..CR2W.dc_anims import load_bin_anims_single
-from ..CR2W.common_blender import repo_file
+from ..CR2W.common_blender import repo_file, depot_path_to_os
 from ..importers import import_anims
 from ..ui.armature_context import get_main_armature
 
@@ -439,7 +439,7 @@ def _load_selected_mimic(context):
 
     uncook_path = get_uncook_path(context)
     fileName, anim_name = item.mimicLineId.split(';', 1)
-    fileName = os.path.join(uncook_path, fileName)
+    fileName = os.path.join(uncook_path, depot_path_to_os(fileName))
     result = load_bin_anims_single(fileName, anim_name, rigPath=rig_path)
     if not result or not result.animations:
         return False

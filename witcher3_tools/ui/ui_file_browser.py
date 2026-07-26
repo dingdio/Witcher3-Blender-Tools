@@ -22,6 +22,7 @@ from ..CR2W.common_blender import (
     set_source_for_path,
     prepare_extraction_target,
     clear_mod_index_cache,
+    depot_path_to_os,
 )
 
 from .. import (
@@ -1452,7 +1453,7 @@ def _ensure_redcloth_apx_for_asset_import(context, redcloth_abs_path: str, redcl
                 rel_name = get_vanilla_path(item_name, loadmods)
                 rel_apb = os.path.splitext(rel_name)[0] + output_ext
                 uncook_path = get_uncook_path(context) or ""
-                local_apb = os.path.join(uncook_path, rel_apb)
+                local_apb = os.path.join(uncook_path, depot_path_to_os(rel_apb))
                 if uncook_path and prepare_extraction_target(local_apb, uncook_path):
                     written = final_item.extract_to_file(local_apb)
                     if written:
@@ -1993,7 +1994,7 @@ def get_uncook_file_info(context, item_path, loadmods=False):
         uncook_path = addon_prefs.uncook_path
         # Strip mod prefix when browsing mods
         check_path = get_vanilla_path(item_path, loadmods)
-        abs_path = os.path.join(uncook_path, check_path)
+        abs_path = os.path.join(uncook_path, depot_path_to_os(check_path))
         if win_path_exists(abs_path):
             return (True, win_path_getsize(abs_path))
         return (False, 0)
@@ -2018,7 +2019,7 @@ def get_collision_file_info(context, item_path, loadmods=False):
         addon_prefs = get_all_addon_prefs(context)
         uncook_path = addon_prefs.uncook_path
         check_path = get_collision_output_rel_path(item_path, loadmods=loadmods)
-        abs_path = os.path.join(uncook_path, check_path)
+        abs_path = os.path.join(uncook_path, depot_path_to_os(check_path))
         if win_path_exists(abs_path):
             return (True, win_path_getsize(abs_path))
         return (False, 0)
@@ -2030,7 +2031,7 @@ def get_texture_file_info(context, item_path, loadmods=False):
     try:
         texture_root = get_texture_path(context) or ""
         check_path = get_vanilla_path(item_path, loadmods)
-        abs_xbm = os.path.join(texture_root, check_path)
+        abs_xbm = os.path.join(texture_root, depot_path_to_os(check_path))
         abs_dds = os.path.splitext(abs_xbm)[0] + ".dds"
         if win_path_exists(abs_dds):
             return (True, win_path_getsize(abs_dds))
@@ -2080,7 +2081,7 @@ def get_uncook_abs_path(context, item_path, loadmods=False) -> str:
         addon_prefs = get_all_addon_prefs(context)
         uncook_path = addon_prefs.uncook_path
         rel_path = get_vanilla_path(item_path, loadmods)
-        return os.path.join(uncook_path, rel_path)
+        return os.path.join(uncook_path, depot_path_to_os(rel_path))
     except Exception:
         return ""
 
@@ -2098,7 +2099,7 @@ def get_browser_item_output_path(context, cache_type, item_path, loadmods=False)
         check_path = get_collision_output_rel_path(item_path, loadmods=loadmods)
         if not addon_prefs or not check_path:
             return ""
-        return os.path.join(addon_prefs.uncook_path, check_path)
+        return os.path.join(addon_prefs.uncook_path, depot_path_to_os(check_path))
 
     rel_path = get_vanilla_path(item_path, loadmods)
     if not rel_path:
@@ -5643,7 +5644,7 @@ class SimpleFileBrowser(Operator):
         def export_item(item):
             final_item:TextureCacheItem = item[-1]
             export_root = get_texture_path(bpy.context)
-            exportPath = os.path.join(export_root, final_item.name)
+            exportPath = os.path.join(export_root, depot_path_to_os(final_item.name))
             final_item.extract_to_file(exportPath)
             return exportPath
 
@@ -6625,14 +6626,14 @@ class FileActionOperatorImportToScene(Operator):
                         buffer_items.append((inner_name, final_item))
 
                 if base_item:
-                    abs_file_path = os.path.join(export_root, base_item[0])
+                    abs_file_path = os.path.join(export_root, depot_path_to_os(base_item[0]))
                     if prepare_extraction_target(abs_file_path, export_root):
                         base_item[1].extract_to_file(abs_file_path)
                 else:
-                    abs_file_path = os.path.join(export_root, full_path_norm)
+                    abs_file_path = os.path.join(export_root, depot_path_to_os(full_path_norm))
 
                 for inner_name, final_item in buffer_items:
-                    out_path = os.path.join(export_root, inner_name)
+                    out_path = os.path.join(export_root, depot_path_to_os(inner_name))
                     if prepare_extraction_target(out_path, export_root):
                         final_item.extract_to_file(out_path)
 
@@ -6644,7 +6645,7 @@ class FileActionOperatorImportToScene(Operator):
                     uncook_path = addon_prefs.uncook_path
                     full_path_norm = full_path.replace("/", "\\")
                     base_name = get_vanilla_path(full_path_norm, True)
-                    abs_file_path = os.path.join(uncook_path, base_name)
+                    abs_file_path = os.path.join(uncook_path, depot_path_to_os(base_name))
                     mod_name = full_path_norm.split("\\", 1)[0] if "\\" in full_path_norm else ""
                     if not mod_name:
                         mod_name = get_mod_override_label(base_name, loadmods=True) or ""
@@ -6707,7 +6708,7 @@ class FileActionOperatorImportToScene(Operator):
                             extracted_any = False
                             base_extracted = False
                             if base_item:
-                                out_path = os.path.join(uncook_path, base_item[0])
+                                out_path = os.path.join(uncook_path, depot_path_to_os(base_item[0]))
                                 if prepare_extraction_target(out_path, uncook_path):
                                     base_item[1].extract_to_file(out_path)
                                     extracted_any = True
@@ -6715,7 +6716,7 @@ class FileActionOperatorImportToScene(Operator):
 
                             if base_extracted or base_from_same_mod:
                                 for inner_name, final_item in buffer_items:
-                                    out_path = os.path.join(uncook_path, inner_name)
+                                    out_path = os.path.join(uncook_path, depot_path_to_os(inner_name))
                                     if prepare_extraction_target(out_path, uncook_path):
                                         final_item.extract_to_file(out_path)
                                         extracted_any = True
@@ -6777,7 +6778,7 @@ class FileActionOperatorImportToScene(Operator):
                     # Get the uncook path for extraction
                     addon_prefs = get_all_addon_prefs(context)
                     uncook_path = addon_prefs.uncook_path
-                    abs_file_path = os.path.join(uncook_path, output_name)
+                    abs_file_path = os.path.join(uncook_path, depot_path_to_os(output_name))
 
                     # Extract directly from collision cache
                     if prepare_extraction_target(abs_file_path, uncook_path):
