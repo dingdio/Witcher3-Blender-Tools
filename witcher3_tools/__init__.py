@@ -99,11 +99,9 @@ from .read_game_bin import (
     update_witcher_game_path,
     auto_detect_witcher3_game_path,
     auto_detect_witcher2_game_path,
-    get_witcher3_exe_path,
     get_witcher2_exe_path,
     is_valid_witcher3_game_path,
     is_valid_witcher2_game_path,
-    WITCHER3_EXE_REL,
     WITCHER2_EXE_REL,
 )
 log = logging.getLogger(__name__)
@@ -648,12 +646,11 @@ def get_witcher3_game_path_issue(context) -> str:
 
     raw_game_path = (getattr(addon_prefs, "witcher_game_path", "") or "").strip()
     if not raw_game_path:
-        return f"Set Witcher 3 install folder ({WITCHER3_EXE_REL}) in addon preferences."
+        return "Set the Witcher 3 install folder or witcher3.exe in addon preferences."
     game_path = bpy.path.abspath(raw_game_path)
     if is_valid_witcher3_game_path(game_path):
         return ""
-    exe_path = get_witcher3_exe_path(game_path)
-    return f"Invalid Witcher 3 path. Missing: {exe_path}"
+    return "Invalid Witcher 3 path. Could not find witcher3.exe."
 
 
 def get_witcher2_game_path_issue(context) -> str:
@@ -1518,9 +1515,9 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
 
     witcher_game_path: StringProperty(
         name="Witcher 3 Path",
-        subtype='DIR_PATH',
+        subtype='FILE_PATH',
         default="",
-        description="Path where The Witcher 3 is installed.",
+        description="Witcher 3 install folder or path to witcher3.exe",
         update=update_witcher_game_path
     )
     version_info: StringProperty(
@@ -2699,6 +2696,8 @@ def _get_cache_item(cache_name: str) -> dict:
 
 
 def _get_cache_label(cache_name: str) -> str:
+    if cache_name in {"string_cache.pkl", "speech_cache.pkl"}:
+        return os.path.basename(_get_cache_abs_path(cache_name))
     item = _get_cache_item(cache_name)
     return item.get("label", cache_name)
 
@@ -2727,11 +2726,22 @@ def _get_cache_group_label(cache_name: str) -> str:
     return CACHE_GROUP_LABELS.get(_get_cache_group(cache_name), CACHE_GROUP_LABELS["other"])
 
 def _get_cache_abs_path(cache_name: str) -> str:
+    if cache_name == "string_cache.pkl":
+        return W3StringManager.GetCachePath(create=False)
+    if cache_name == "speech_cache.pkl":
+        return SpeechManager.GetCachePath(create=False)
     item = _get_cache_item(cache_name)
     root_kind = item.get("root", "cache")
     cache_root = get_temp_root(create=True) if root_kind == "temp" else get_cache_root(create=True)
     relative_path = CACHE_PATHS.get(cache_name, cache_name)
     return os.path.join(cache_root, relative_path)
+
+
+def _build_pathhashes_cache_signature():
+    from .CR2W.witcher_cache import bundle
+
+    return bundle.build_pathhashes_source_signature()
+
 
 def _get_cache_signature_builder(cache_name: str):
     if cache_name == "string_cache.pkl":
@@ -2754,6 +2764,13 @@ def _get_cache_signature_builder(cache_name: str):
         return lambda: BundleManager.BuildSourceSignature(False)
     if cache_name == "bundle_cache_mods.pkl":
         return lambda: BundleManager.BuildSourceSignature(True)
+    if cache_name == "equipment_items_xml_bundle":
+        return lambda: BundleManager.BuildSourceSignature(False)
+    if cache_name == "equipment_categories.json":
+        from .ui import equipment_catalog
+        return equipment_catalog.build_w3_category_cache_source_signature
+    if cache_name == "pathhashes.csv":
+        return _build_pathhashes_cache_signature
     if cache_name == "w2_dzip_cache.pkl":
         return lambda: DzipManager.BuildSourceSignature(get_witcher2_game_path(bpy.context))
     if cache_name == "dlc_definition_cache.pkl":
@@ -2772,10 +2789,9 @@ def _check_cache_status(cache_name: str):
         return "missing", "Cache file not found"
 
     item = _get_cache_item(cache_name)
-    if bool(item.get("is_dir")):
-        return "ok", "Directory present"
-
     builder = _get_cache_signature_builder(cache_name)
+    if bool(item.get("is_dir")) and builder is None:
+        return "ok", "Directory present"
     if builder is None:
         return "ok", "Present (no signature check)"
 
@@ -2787,9 +2803,12 @@ def _check_cache_status(cache_name: str):
     meta_path = cache_meta.get_meta_path(cache_path)
     meta = cache_meta.load_meta(meta_path)
     meta_signature = meta.get("signature", {}) if isinstance(meta, dict) else {}
+    meta_source = meta.get("source", {}) if isinstance(meta, dict) else {}
 
     if not meta_signature:
         return "unknown", "No cache metadata"
+    if isinstance(meta_source, dict) and meta_source.get("pending_removals"):
+        return "stale", "Cleanup pending"
     if cache_meta.signatures_match(meta_signature, signature):
         return "ok", "Up to date"
     return "stale", "Sources changed"
@@ -2821,6 +2840,11 @@ def _refresh_pathhashes_cache() -> bool:
         path = _get_cache_abs_path("pathhashes.csv")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         bundle.create_pathhashes(outputPath=path)
+        from .CR2W.CR2W_types import Cr2wResourceManager
+        Cr2wResourceManager.Reset()
+        Cr2wResourceManager.Get()
+        from .CR2W.scene_csv_utils import reset_scene_csv_caches
+        reset_scene_csv_caches()
         return os.path.exists(path)
     except Exception:
         log.warning("Failed to rebuild pathhashes.csv", exc_info=True)
@@ -2829,11 +2853,12 @@ def _refresh_pathhashes_cache() -> bool:
 
 def _refresh_equipment_categories_cache() -> bool:
     try:
-        op = getattr(getattr(bpy.ops, "witcher", None), "equipment_refresh_categories", None)
-        if op is None:
-            return False
-        result = op()
-        return isinstance(result, set) and ("FINISHED" in result)
+        from .ui import equipment_catalog
+        refreshed = bool(equipment_catalog.refresh_w3_catalog_from_xml(
+            bpy.context,
+            force_bundle_refresh=True,
+        ))
+        return refreshed and not equipment_catalog._w3_loaded_category_cache_is_stale()
     except Exception:
         log.warning("Failed to refresh equipment categories cache", exc_info=True)
         return False
@@ -2841,13 +2866,27 @@ def _refresh_equipment_categories_cache() -> bool:
 
 def _refresh_equipment_xml_bundle_cache() -> bool:
     try:
-        from .ui import ui_equipment
+        from .ui import equipment_catalog
 
-        root = ui_equipment._extract_equipment_xmls_from_bundles()
-        return bool(root and os.path.isdir(root))
+        root = equipment_catalog.extract_equipment_xmls_from_bundles(force_refresh=True)
+        return bool(
+            root
+            and os.path.isdir(root)
+            and _check_cache_status("equipment_items_xml_bundle")[0] == "ok"
+        )
     except Exception:
         log.warning("Failed to refresh equipment XML bundle cache", exc_info=True)
         return False
+
+
+def _refresh_bundle_cache(loadmods: bool):
+    manager = BundleManager.Get(loadmods=loadmods, reset_cache=True)
+    from .CR2W.CR2W_types import Cr2wResourceManager
+    Cr2wResourceManager.Reset()
+    Cr2wResourceManager.Get()
+    from .CR2W.scene_csv_utils import reset_scene_csv_caches
+    reset_scene_csv_caches()
+    return manager
 
 
 def _build_dlc_definition_cache_signature():
@@ -2896,8 +2935,8 @@ def _refresh_cache_by_name(cache_name: str) -> bool:
         "sound_cache.pkl": lambda: SoundManager.Get(do_reload=True),
         "sound_cache_mods.pkl": lambda: SoundManager.Get(do_reload=True, loadmods=True),
         "speech_cache.pkl": lambda: SpeechManager.Get(do_reload=True),
-        "bundle_cache.pkl": lambda: BundleManager.Get(loadmods=False, reset_cache=True),
-        "bundle_cache_mods.pkl": lambda: BundleManager.Get(loadmods=True, reset_cache=True),
+        "bundle_cache.pkl": lambda: _refresh_bundle_cache(False),
+        "bundle_cache_mods.pkl": lambda: _refresh_bundle_cache(True),
         "w2_dzip_cache.pkl": lambda: DzipManager.Get(reset_cache=True),
         "w2_string_cache": lambda: W2StringManager.Get(do_reload=True),
         "w2_speech_cache": lambda: W2SpeechManager.Get(do_reload=True),
@@ -2911,7 +2950,15 @@ def _refresh_cache_by_name(cache_name: str) -> bool:
         "equipment_categories.json": _refresh_equipment_categories_cache,
         "equipment_items_xml_bundle": _refresh_equipment_xml_bundle_cache,
     }
-    return _run_cache_refresh_action(refresh_actions.get(cache_name))
+    refreshed = _run_cache_refresh_action(refresh_actions.get(cache_name))
+    if refreshed and cache_name in {
+        "string_cache.pkl",
+        "speech_cache.pkl",
+        "bundle_cache.pkl",
+        "bundle_cache_mods.pkl",
+    }:
+        ui_voice.invalidate_voice_cache_sources()
+    return refreshed
 
 
 def _delete_cache_by_name(cache_name: str) -> bool:
@@ -2933,6 +2980,10 @@ def _delete_cache_by_name(cache_name: str) -> bool:
 
         if bool(item.get("is_dir")) or os.path.isdir(file_path):
             shutil.rmtree(file_path, ignore_errors=False)
+            meta_path = cache_meta.get_meta_path(file_path)
+            if os.path.exists(meta_path):
+                os.remove(meta_path)
+            _reset_deleted_cache_runtime_state(cache_name)
             return True
 
         os.remove(file_path)
@@ -2942,12 +2993,49 @@ def _delete_cache_by_name(cache_name: str) -> bool:
                 os.remove(meta_path)
             except Exception:
                 pass
+        _reset_deleted_cache_runtime_state(cache_name)
         if cache_name == "dlc_definition_cache.pkl":
             _clear_dlc_definition_cache_state()
         return True
     except Exception:
         log.warning("Failed to delete cache/reference item %s", cache_name, exc_info=True)
         return False
+
+
+def _reset_deleted_cache_runtime_state(cache_name: str) -> None:
+    if cache_name == "pathhashes.csv":
+        from .CR2W.CR2W_types import Cr2wResourceManager
+        Cr2wResourceManager.Reset()
+    elif cache_name == "string_cache.pkl":
+        W3StringManager.InstanceManager = None
+        ui_voice.invalidate_voice_cache_sources()
+    elif cache_name == "speech_cache.pkl":
+        SpeechManager.InstanceManager = None
+        SpeechManager.InstanceManagers.clear()
+        ui_voice.invalidate_voice_cache_sources()
+    elif cache_name == "bundle_cache.pkl":
+        BundleManager.InstanceManager = None
+    elif cache_name == "bundle_cache_mods.pkl":
+        BundleManager.InstanceManagerMods = None
+    elif cache_name == "texture_cache.pkl":
+        TextureManager.InstanceManager = None
+    elif cache_name == "texture_cache_mods.pkl":
+        TextureManager.InstanceManagerMods = None
+    elif cache_name in {"collision_cache.pkl", "collision_cache_mods.pkl"}:
+        CollisionManager.ResetInstance()
+    elif cache_name in {"sound_cache.pkl", "sound_cache_mods.pkl"}:
+        SoundManager.ResetInstance()
+    elif cache_name == "w2_dzip_cache.pkl":
+        DzipManager.InstanceManager = None
+    elif cache_name == "w2_string_cache":
+        W2StringManager.InstanceManager = None
+        W2StringManager.InstanceManagers.clear()
+    elif cache_name == "w2_speech_cache":
+        W2SpeechManager.InstanceManager = None
+        W2SpeechManager.InstanceManagers.clear()
+    elif cache_name == "equipment_categories.json":
+        from .ui import equipment_catalog
+        equipment_catalog.reset_w3_category_cache_runtime()
 
 
 def _draw_cache_management_table(body):
@@ -4696,7 +4784,7 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
             warn_row = warn_col.row(align=True)
             warn_row.label(text="SET WITCHER 3 PATH", icon='ERROR')
             warn_row.operator("witcher.open_addon_preferences", text="Open Preferences", icon='PREFERENCES')
-            warn_col.label(text=f"Need folder containing {WITCHER3_EXE_REL}")
+            warn_col.label(text="Need install folder or witcher3.exe")
             warn_col.label(text=game_path_issue)
             warn_col.operator("witcher.autofind_w3_path", text="Auto Find Witcher 3 Path", icon='VIEWZOOM')
             layout.separator()

@@ -1,106 +1,13 @@
 import struct
-import io
 import csv
 import os
 
 from ..common_blender import get_game_path
+from . import cache_meta
 import logging
 log = logging.getLogger(__name__)
 
-blobs = [
-r"content\content0\bundles\blob.bundle",
-r"content\content0\bundles\buffers.bundle",
-r"content\content0\bundles\movies.bundle",
-r"content\content0\bundles\r4gui.bundle",
-r"content\content0\bundles\r4items.bundle",
-r"content\content0\bundles\startup.bundle",
-r"content\content0\bundles\world_world_runtime.bundle",
-r"content\content0\bundles\world_world_startup.bundle",
-r"content\content0\bundles\xml.bundle",
-r"content\content1\bundles\blob.bundle",
-r"content\content1\bundles\buffers.bundle",
-r"content\content1\bundles\world_kaer_morhen_runtime.bundle",
-r"content\content1\bundles\world_kaer_morhen_startup.bundle",
-r"content\content10\bundles\blob.bundle",
-r"content\content10\bundles\buffers.bundle",
-r"content\content10\bundles\world_the_spiral_runtime.bundle",
-r"content\content10\bundles\world_the_spiral_startup.bundle",
-r"content\content11\bundles\blob.bundle",
-r"content\content11\bundles\buffers.bundle",
-r"content\content12\bundles\blob.bundle",
-r"content\content12\bundles\buffers.bundle",
-r"content\content12\bundles\world_prolog_village_winter_runtime.bundle",
-r"content\content12\bundles\world_prolog_village_winter_startup.bundle",
-r"content\content2\bundles\blob.bundle",
-r"content\content2\bundles\buffers.bundle",
-r"content\content2\bundles\world_prolog_village_runtime.bundle",
-r"content\content2\bundles\world_prolog_village_startup.bundle",
-r"content\content3\bundles\blob.bundle",
-r"content\content3\bundles\buffers.bundle",
-r"content\content3\bundles\world_wyzima_castle_runtime.bundle",
-r"content\content3\bundles\world_wyzima_castle_startup.bundle",
-r"content\content4\bundles\blob.bundle",
-r"content\content4\bundles\buffers0.bundle",
-r"content\content4\bundles\buffers1.bundle",
-r"content\content4\bundles\movies0.bundle",
-r"content\content4\bundles\movies1.bundle",
-r"content\content4\bundles\world_novigrad_runtime.bundle",
-r"content\content4\bundles\world_novigrad_startup.bundle",
-r"content\content5\bundles\blob.bundle",
-r"content\content5\bundles\buffers.bundle",
-r"content\content5\bundles\world_skellige_runtime.bundle",
-r"content\content5\bundles\world_skellige_startup.bundle",
-r"content\content6\bundles\blob.bundle",
-r"content\content6\bundles\buffers.bundle",
-r"content\content7\bundles\blob.bundle",
-r"content\content7\bundles\buffers.bundle",
-r"content\content7\bundles\world_island_of_mist_runtime.bundle",
-r"content\content7\bundles\world_island_of_mist_startup.bundle",
-r"content\content8\bundles\blob.bundle",
-r"content\content8\bundles\buffers.bundle",
-r"content\content9\bundles\blob.bundle",
-r"content\content9\bundles\buffers.bundle",
-r"dlc\bob\content\bundles\blob.bundle",
-r"dlc\bob\content\bundles\buffers.bundle",
-r"dlc\bob\content\bundles\world_bob_runtime.bundle",
-r"dlc\bob\content\bundles\world_bob_startup.bundle",
-r"dlc\dlc1\content\bundles\blob.bundle",
-r"dlc\dlc1\content\bundles\buffers.bundle",
-r"dlc\dlc10\content\bundles\blob.bundle",
-r"dlc\dlc10\content\bundles\buffers.bundle",
-r"dlc\dlc11\content\bundles\blob.bundle",
-r"dlc\dlc11\content\bundles\buffers.bundle",
-r"dlc\dlc12\content\bundles\blob.bundle",
-r"dlc\dlc12\content\bundles\buffers.bundle",
-r"dlc\dlc13\content\bundles\blob.bundle",
-r"dlc\dlc13\content\bundles\buffers.bundle",
-r"dlc\dlc14\content\bundles\blob.bundle",
-r"dlc\dlc14\content\bundles\buffers.bundle",
-r"dlc\dlc15\content\bundles\blob.bundle",
-r"dlc\dlc15\content\bundles\buffers.bundle",
-r"dlc\dlc16\content\bundles\blob.bundle",
-r"dlc\dlc16\content\bundles\buffers.bundle",
-r"dlc\dlc17\content\bundles\blob.bundle",
-r"dlc\dlc17\content\bundles\buffers.bundle",
-r"dlc\dlc18\content\bundles\blob.bundle",
-r"dlc\dlc2\content\bundles\blob.bundle",
-r"dlc\dlc2\content\bundles\buffers.bundle",
-r"dlc\dlc20\content\bundles\blob.bundle",
-r"dlc\dlc20\content\bundles\buffers.bundle",
-r"dlc\dlc3\content\bundles\blob.bundle",
-r"dlc\dlc4\content\bundles\blob.bundle",
-r"dlc\dlc4\content\bundles\buffers.bundle",
-r"dlc\dlc5\content\bundles\blob.bundle",
-r"dlc\dlc5\content\bundles\buffers.bundle",
-r"dlc\dlc6\content\bundles\blob.bundle",
-r"dlc\dlc6\content\bundles\buffers.bundle",
-r"dlc\dlc7\content\bundles\blob.bundle",
-r"dlc\dlc7\content\bundles\buffers.bundle",
-r"dlc\dlc8\content\bundles\blob.bundle",
-r"dlc\dlc9\content\bundles\blob.bundle",
-r"dlc\ep1\content\bundles\blob.bundle",
-r"dlc\ep1\content\bundles\buffers.bundle",
-]
+PATHHASH_CACHE_VERSION = 1
 
 def fnv1a64(x):
     FnvHashPrime = 0x00000100000001B3
@@ -115,24 +22,59 @@ def fnv1a64(x):
 def hash_bundle_paths(filename):
     filenames = {}
     with open(filename, 'rb') as f:
-        magic = f.read(8)
-        if magic != b'POTATO70':
+        preamble = f.read(32)
+        if preamble[:8] != b'POTATO70':
             raise Exception(filename+" is not potato!")
-        f.seek(16)
-        files_offset = struct.unpack('<I', f.read(4))[0]
-        num_files = files_offset/320
+        files_offset = struct.unpack_from('<I', preamble, 16)[0]
+        header_version = struct.unpack_from('<H', preamble, 20)[0]
+        entry_size = {3: 320, 5: 304}.get(header_version)
+        if not entry_size or files_offset % entry_size:
+            raise ValueError(f"Unsupported or malformed bundle header version {header_version}: {filename}")
         f.seek(0x20)
-        for _ in range(int(num_files)):
+        for _ in range(files_offset // entry_size):
             str_data = f.read(256)
-            zero_idx = str_data.index(b"\x00")
-            str_data = str_data[:zero_idx]
+            str_data = str_data.split(b"\x00", 1)[0]
             path = str_data.decode('ascii')
             hashint = fnv1a64(path)
             filenames.update({path: hashint})
-            f.seek(64, 1)
+            f.seek(entry_size - 256, 1)
     return filenames
 
+
+def _iter_bundle_files(gamedir):
+    roots = (os.path.join(gamedir, name) for name in ("content", "dlc")) if gamedir else ()
+    return cache_meta.iter_files(roots, lambda path: path.lower().endswith(".bundle"))
+
+
+def build_pathhashes_source_signature(gamedir=None):
+    gamedir = gamedir or get_game_path() or ""
+    gamedir = os.path.normpath(gamedir) if gamedir else ""
+    signature = cache_meta.compute_signature(_iter_bundle_files(gamedir))
+    signature["hash"] = f"{PATHHASH_CACHE_VERSION}:{signature.get('hash', '')}"
+    return signature, {
+        "type": "pathhashes",
+        "base_path": gamedir,
+        "serialization_version": PATHHASH_CACHE_VERSION,
+    }
+
+
+def ensure_pathhashes(gamedir=None, outputPath=None):
+    if not outputPath:
+        raise ValueError("outputPath is required")
+    signature, _source = build_pathhashes_source_signature(gamedir)
+    if os.path.exists(outputPath):
+        meta = cache_meta.load_meta(cache_meta.get_meta_path(outputPath))
+        if cache_meta.signatures_match(meta.get("signature", {}), signature):
+            return False
+        # Keep the last good cache while the game path is unavailable.
+        if not signature.get("count"):
+            return False
+    create_pathhashes(gamedir=gamedir, outputPath=outputPath)
+    return True
+
 def create_pathhashes(gamedir=None, outputPath=None):
+    if not outputPath:
+        raise ValueError("outputPath is required")
     if gamedir is None:
         gamedir = get_game_path()
     # Replace the CSV atomically for concurrent readers.
@@ -143,16 +85,14 @@ def create_pathhashes(gamedir=None, outputPath=None):
 
         writer.writeheader()
 
-        for blob in blobs:
-            blobpath = os.path.join(gamedir, blob)
-            if os.path.exists(blobpath):
-                files = hash_bundle_paths(blobpath)
-                for path, hashint in files.items():
-                    writer.writerow({'Path': path, 'HashInt': int(hashint)})
-            else:
-                continue
+        for bundle_path in _iter_bundle_files(gamedir):
+            for path, hashint in hash_bundle_paths(bundle_path).items():
+                writer.writerow({'Path': path, 'HashInt': int(hashint)})
 
     os.replace(tmp_path, outputPath)
+    signature, source = build_pathhashes_source_signature(gamedir)
+    meta = cache_meta.make_meta(os.path.basename(outputPath), outputPath, signature, source)
+    cache_meta.save_meta(cache_meta.get_meta_path(outputPath), meta)
     log.info("created pathhashes.csv!")
         
 #create_pathhashes(gamedir)

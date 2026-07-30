@@ -386,7 +386,10 @@ def has_installed_voice_language(language):
 
 def supported_dialog_languages():
     """Compatibility helper: return supported text/subtitle language handles."""
-    return list(_TEXT_LANGUAGE_ORDER)
+    return list(_ordered_languages(
+        tuple(_TEXT_LANGUAGE_ORDER) + tuple(installed_text_languages()),
+        _TEXT_LANGUAGE_ORDER,
+    ))
 
 
 def supported_voice_languages():

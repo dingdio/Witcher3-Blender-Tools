@@ -10,7 +10,11 @@ except Exception:
     def get_dev_override(_key, default=None):
         return default
 
-WITCHER3_EXE_REL = os.path.join("bin", "x64", "witcher3.exe")
+WITCHER3_EXE_REL = os.path.join("bin", "x64_dx12", "witcher3.exe")
+WITCHER3_DESKTOP_EXE_REL = os.path.join("bin", "Gaming.Desktop.x64", "witcher3.exe")
+WITCHER3_LEGACY_EXE_REL = os.path.join("bin", "x64", "witcher3.exe")
+WITCHER3_EXE_RELS = (WITCHER3_EXE_REL, WITCHER3_DESKTOP_EXE_REL, WITCHER3_LEGACY_EXE_REL)
+WITCHER3_BIN_DIRS = {os.path.basename(os.path.dirname(path)).lower() for path in WITCHER3_EXE_RELS}
 WITCHER2_EXE_REL = os.path.join("bin", "witcher2.exe")
 
 
@@ -23,11 +27,28 @@ def _normalize_dir(path):
         return os.path.normpath(path)
 
 
-def get_witcher3_exe_path(game_path):
-    game_root = _normalize_dir(game_path)
-    if not game_root:
+def get_witcher3_game_root(game_path):
+    path = _normalize_dir(game_path)
+    if not path:
         return ""
-    return os.path.join(game_root, WITCHER3_EXE_REL)
+    if os.path.basename(path).lower() == "witcher3.exe":
+        path = os.path.dirname(path)
+    if os.path.basename(path).lower() in WITCHER3_BIN_DIRS and os.path.basename(os.path.dirname(path)).lower() == "bin":
+        return _normalize_dir(os.path.join(path, os.pardir, os.pardir))
+    return path
+
+
+def get_witcher3_exe_path(game_path):
+    path = _normalize_dir(game_path)
+    if not path:
+        return ""
+    if os.path.basename(path).lower() == "witcher3.exe":
+        return path
+    if os.path.basename(path).lower() in WITCHER3_BIN_DIRS:
+        return os.path.join(path, "witcher3.exe")
+
+    candidates = [os.path.join(path, rel_path) for rel_path in WITCHER3_EXE_RELS]
+    return next((candidate for candidate in candidates if os.path.isfile(candidate)), candidates[0])
 
 
 def is_valid_witcher3_game_path(game_path):
@@ -318,11 +339,7 @@ def auto_detect_witcher3_game_path():
         if not candidate_norm:
             continue
 
-        # Registry DisplayIcon may point directly to the executable.
-        if candidate_norm.lower().endswith("witcher3.exe"):
-            maybe_root = _normalize_dir(os.path.dirname(os.path.dirname(os.path.dirname(candidate_norm))))
-        else:
-            maybe_root = candidate_norm
+        maybe_root = get_witcher3_game_root(candidate_norm)
 
         key = maybe_root.lower()
         if key in seen:
@@ -370,6 +387,21 @@ def _refresh_archive_configuration(game_path):
     Configuration.ExecutablePath = game_root
     Configuration.GameModDir = os.path.join(game_root, "mods") if game_root else ""
     Configuration.GameDlcDir = os.path.join(game_root, "dlc") if game_root else ""
+    try:
+        from .CR2W.CR2W_types import Cr2wResourceManager
+        Cr2wResourceManager.Reset()
+    except Exception:
+        pass
+    try:
+        from .CR2W.scene_csv_utils import reset_scene_csv_caches
+        reset_scene_csv_caches()
+    except Exception:
+        pass
+    try:
+        from .ui import ui_voice
+        ui_voice.invalidate_voice_cache_sources()
+    except Exception:
+        pass
 
 def get_translation(buf):
     # Query the Translation table to get (lang, codepage)
@@ -429,7 +461,7 @@ def get_all_version_info(path):
 
 def update_witcher_game_path(self, context):
     """Update callback for witcher_game_path."""
-    game_path = _normalize_dir(getattr(self, "witcher_game_path", ""))
+    game_path = get_witcher3_game_root(getattr(self, "witcher_game_path", ""))
     if getattr(self, "witcher_game_path", "") != game_path:
         # Normalize persisted path for cleaner comparisons/UX.
         self.witcher_game_path = game_path
@@ -450,9 +482,9 @@ def update_witcher_game_path(self, context):
             self.version_info = "\n".join(lines)
     else:
         if game_path:
-            self.version_info = "Error: invalid Witcher 3 path (missing bin\\x64\\witcher3.exe)"
+            self.version_info = "Error: invalid Witcher 3 path (missing a supported witcher3.exe under bin)"
         else:
-            self.version_info = "Error: Witcher 3 path not set (choose folder containing bin\\x64\\witcher3.exe)"
+            self.version_info = "Error: Witcher 3 path not set (choose the install folder or witcher3.exe)"
 
 if __name__ == "__main__":
     path = get_dev_override("read_game_exe_file", "")

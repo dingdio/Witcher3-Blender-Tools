@@ -74,6 +74,7 @@ class SoundManager(WitcherArchiveManager):
     InstanceManagerMods = None
     CACHE_FILENAME = "sound_cache.pkl"
     CACHE_FILENAME_MODS = "sound_cache_mods.pkl"
+    CACHE_FORMAT_VERSION = 2
 
     def __init__(self):
         self.base_path: Optional[str] = None
@@ -329,7 +330,10 @@ class SoundManager(WitcherArchiveManager):
 
         signature = cache_meta.compute_signature(cache_meta.iter_files(roots, _predicate))
         metadata_token = _soundbanks_metadata_token()
-        mix = f"{signature.get('hash', '')}|soundbanks:{metadata_token}"
+        mix = (
+            f"{signature.get('hash', '')}|soundbanks:{metadata_token}"
+            f"|parser:{SoundManager.CACHE_FORMAT_VERSION}"
+        )
         signature["hash"] = hashlib.sha1(mix.encode("utf-8", "ignore")).hexdigest()
         metadata_path = _soundbanks_metadata_path()
         source = {
@@ -339,6 +343,7 @@ class SoundManager(WitcherArchiveManager):
             "soundbanks_metadata": metadata_path,
             "soundbanks_xml": _soundbanks_xml_path(),
             "soundbanks_token": metadata_token,
+            "cache_format_version": SoundManager.CACHE_FORMAT_VERSION,
         }
         return signature, source
 

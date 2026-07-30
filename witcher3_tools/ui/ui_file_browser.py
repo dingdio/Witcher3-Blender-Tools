@@ -47,11 +47,9 @@ from .. import (
     get_witcher2_game_path,
 )
 from ..read_game_bin import (
-    get_witcher3_exe_path,
     get_witcher2_exe_path,
     is_valid_witcher3_game_path,
     is_valid_witcher2_game_path,
-    WITCHER3_EXE_REL,
     WITCHER2_EXE_REL,
 )
 from ..extension_paths import get_extension_user_dir
@@ -1884,11 +1882,11 @@ def _get_witcher3_game_path_issue(context) -> str:
 
     raw_game_path = (getattr(addon_prefs, "witcher_game_path", "") or "").strip()
     if not raw_game_path:
-        return f"Set Witcher 3 install folder ({WITCHER3_EXE_REL}) in add-on preferences."
+        return "Set the Witcher 3 install folder or witcher3.exe in add-on preferences."
     game_path = _normalize_dir(raw_game_path)
     if is_valid_witcher3_game_path(game_path):
         return ""
-    return f"Invalid Witcher 3 path. Missing: {get_witcher3_exe_path(game_path)}"
+    return "Invalid Witcher 3 path. Could not find witcher3.exe."
 
 
 def _get_witcher2_game_path_issue(context) -> str:

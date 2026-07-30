@@ -149,25 +149,32 @@ class W3Speech(object):
         return EBundleType.SPEECH
     
     def read(self, filepath):
-        file:bStream = bStream(path=filepath)
+        file:bStream = bStream(path=filepath, reader=open(filepath, "rb"))
         file_str = file.read(4).decode('utf-8')
         version = file.readUInt32()
         key1 = file.readUInt16()
         item_count_value, item_count_len = ReadBit6(file.fhandle, True)
 
         raw_item_infos = []
-        for _ in range(item_count_value):
+        for item_index in range(item_count_value):
             lang_specific_ID = file.readUInt32()
             id_high = file.readUInt32()
-            wave_offs = file.readUInt32() + 4
+            raw_wave_offs = file.readUInt32()
             file.readUInt32()  # Skip 4 bytes
-            wave_size = file.readUInt32() - 12
+            raw_wave_size = file.readUInt32()
             file.readUInt32()  # Skip 4 bytes
             cr2w_offs = file.readUInt32()
             file.readUInt32()  # Skip 4 bytes
             cr2w_size = file.readUInt32()
             file.readUInt32()  # Skip 4 bytes
 
+            # Skip placeholder rows without WEM payloads.
+            if raw_wave_offs == 0 or raw_wave_size < 12:
+                log.debug("Skipping empty speech entry %d in %s", item_index, filepath)
+                continue
+
+            wave_offs = raw_wave_offs + 4
+            wave_size = raw_wave_size - 12
             raw_item_infos.append((lang_specific_ID, id_high, wave_offs, wave_size, cr2w_offs, cr2w_size))
         key2 = file.readUInt16()
         key = (key1 << 16) | key2
@@ -175,18 +182,19 @@ class W3Speech(object):
         log.debug("key: 0x%08X", key)
         magic, lang = get_key(key)
         log.debug("-> magic: 0x%08X (%s)", magic, lang)
-        
+
         position = 4 + 4 + 2 + item_count_len + item_count_value * 10 * 4 + 2
 
         item_infos = []
         for item in sorted(raw_item_infos, key=lambda x: x[2]):
             lang_id = item[0] ^ magic # convert id
             duration_offset = item[2] - position + item[3]
-            file.seek(duration_offset, os.SEEK_CUR) 
+            file.seek(duration_offset, os.SEEK_CUR)
             position += duration_offset
             duration = file.readFloat()  # Assuming readFloat is implemented in bStream
             position += 4
             item_infos.append(SpeechEntry(self, lang_id, item[1], item[2], item[3], item[4], item[5], duration))
+        file.close()
 
         self.ArchiveAbsolutePath = filepath
         self.file_str = str #public String id { get; set; }

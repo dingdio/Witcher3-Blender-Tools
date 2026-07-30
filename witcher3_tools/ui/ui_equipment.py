@@ -6125,31 +6125,6 @@ def _select_final_bundle_item(items):
     return equipment_catalog.select_final_bundle_item(items)
 
 
-def _get_equipment_xml_bundle_cache_root():
-    return equipment_catalog.get_equipment_xml_bundle_cache_root()
-
-
-def _extract_equipment_xmls_from_bundles():
-    return equipment_catalog.extract_equipment_xmls_from_bundles()
-
-
-def _get_equipment_xml_sources(context, addon_prefs):
-    return equipment_catalog.get_equipment_xml_sources(context, addon_prefs)
-
-
-def _refresh_w3_catalog_from_xml(context):
-    return equipment_catalog.refresh_w3_catalog_from_xml(context)
-
-
-def _merge_equipment_xml_data(target_categories, target_attributes, source_categories, source_attributes):
-    return equipment_catalog.merge_equipment_xml_data(
-        target_categories,
-        target_attributes,
-        source_categories,
-        source_attributes,
-    )
-
-
 def _strip_duplicate_xml_attributes(xml_text):
     return equipment_catalog.strip_duplicate_xml_attributes(xml_text)
 
@@ -6182,60 +6157,13 @@ class EQUIPMENT_OT_RefreshCategories(bpy.types.Operator):
             self.report({'WARNING'}, "No Witcher 2 item XMLs found for the active source roots")
             return {'CANCELLED'}
 
-        addon_prefs = get_all_addon_prefs(context)
-        sources = _get_equipment_xml_sources(context, addon_prefs)
-        valid_sources = [(label, path) for (label, path, is_valid) in sources if is_valid]
-        if not valid_sources:
-            searched = ", ".join(
-                f"{label}={'<unset>' if not path else path}"
-                for (label, path, _is_valid) in sources
-            )
+        if not equipment_catalog.refresh_w3_catalog_from_xml(context, force_bundle_refresh=True):
             self.report({'WARNING'}, "No valid gameplay/items XML source found")
-            if searched:
-                self.report({'INFO'}, f"Searched: {searched}")
             return {'CANCELLED'}
-
-        merged_category_items = {}
-        merged_item_attributes = {}
-        source_summaries = []
-        for label, folder_path in valid_sources:
-            _, category_items_from_xml, item_attributes_from_xml = extract_categories_from_xml(folder_path)
-            _merge_equipment_xml_data(
-                merged_category_items,
-                merged_item_attributes,
-                category_items_from_xml,
-                item_attributes_from_xml,
-            )
-            source_summaries.append(
-                f"{label} ({len(category_items_from_xml)} cats, {len(item_attributes_from_xml)} items)"
-            )
-
-        # Update the class-level category_items and item_attributes
-        for category, items in merged_category_items.items():
-            if category not in EquipmentDefinitionEntry.category_items:
-                # If the category doesn't exist, add it with items from XML
-                EquipmentDefinitionEntry.category_items[category] = items
-            else:
-                # If category exists, update the items
-                existing_items_set = set(tuple(item) for item in EquipmentDefinitionEntry.category_items[category])
-                for item in items:
-                    if tuple(item) not in existing_items_set:
-                        EquipmentDefinitionEntry.category_items[category].append(item)
-                        existing_items_set.add(tuple(item))
-
-        # Update item_attributes (source priority already resolved in merged_item_attributes)
-        EquipmentDefinitionEntry.item_attributes.update(merged_item_attributes)
-        _clear_item_attribute_identifier_lookup("w3")
-
-        # Save to cache for persistence across reloads
-        _save_category_cache()
-        # Clear template path cache so any newly uncoooked files are picked up.
-        _TEMPLATE_PATH_RESOLVE_CACHE.clear()
 
         if context.area:
             context.area.tag_redraw()  # Refresh the UI to reflect changes if necessary
-        if source_summaries:
-            self.report({'INFO'}, "Equipment XML sources: " + " | ".join(source_summaries[:3]))
+        self.report({'INFO'}, "Equipment categories refreshed")
         return {'FINISHED'}
 
 # Operator to toggle item manipulation (switch between mount slot and hold slot)

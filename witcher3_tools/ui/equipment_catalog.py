@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -13,7 +14,8 @@ from .. import (
     get_all_addon_prefs,
     get_uncook_path,
 )
-from ..CR2W.witcher_cache.Bundles import LoadBundleManager
+from ..CR2W.witcher_cache import cache_meta
+from ..CR2W.witcher_cache.Bundles import BundleManager, LoadBundleManager
 from ..extension_paths import get_cache_root, get_dev_override
 from ..repo_paths import (
     configured_w2_repo_roots,
@@ -44,9 +46,18 @@ w2_item_attributes = {}
 
 _CATEGORY_CACHE_FILE = Path(get_cache_root(create=True)) / "equipment_categories.json"
 _CATEGORY_CACHE_SCHEMA_VERSION = 2
+_CATEGORY_SOURCE_VALIDATION_INTERVAL_SECONDS = 5.0
+_CATEGORY_REFRESH_RETRY_INTERVAL_SECONDS = 30.0
 _CATALOG_CACHE_FLAGS = {
     "w3": {"schema_version": 0, "icon_path": False, "hold_template": False},
     "w2": {"schema_version": 0, "icon_path": False, "hold_template": False},
+}
+_W3_CATEGORY_BUNDLE_STATE = {
+    "loaded": False,
+    "stale": False,
+    "signature": {},
+    "source_checked_at": 0.0,
+    "refresh_after": 0.0,
 }
 _ITEM_ATTRIBUTE_IDENTIFIER_LOOKUP = {
     "w3": None,
@@ -244,6 +255,96 @@ def get_category_cache_file(source_game="w3"):
     return _CATEGORY_CACHE_FILE
 
 
+def build_w3_category_cache_source_signature():
+    try:
+        signature, source = BundleManager.BuildSourceSignature(False)
+    except Exception:
+        log.debug("Failed to build equipment category source signature", exc_info=True)
+        return {}, {}
+    if not signature.get("count"):
+        return {}, dict(source or {})
+    signature = dict(signature)
+    source = dict(source or {})
+    source["type"] = "equipment_categories"
+    source["category_schema_version"] = _CATEGORY_CACHE_SCHEMA_VERSION
+    return signature, source
+
+
+def _bundle_xml_cache_has_xml():
+    root = Path(get_cache_root(create=True)) / "equipment_items_xml_bundle"
+    if not root.is_dir():
+        return False
+    return any(
+        name.lower().endswith(".xml")
+        for _dirpath, _dirnames, names in os.walk(root)
+        for name in names
+    )
+
+
+def _w3_bundle_xml_source_snapshot():
+    has_xml = _bundle_xml_cache_has_xml()
+    if not has_xml:
+        return {}, {}, False
+    root = Path(get_cache_root(create=True)) / "equipment_items_xml_bundle"
+    meta = cache_meta.load_meta(cache_meta.get_meta_path(str(root)))
+    if not isinstance(meta, dict):
+        return {}, {}, True
+    source = dict(meta.get("source") or {})
+    if source.get("pending_removals"):
+        return {}, source, True
+    return dict(meta.get("signature") or {}), source, True
+
+
+def _w3_category_cache_is_current(cache_file, cache_data):
+    has_snapshot = "bundle_xml_source_signature" in cache_data
+    stored_signature = cache_data.get("bundle_xml_source_signature") or {}
+    current_signature, _source = build_w3_category_cache_source_signature()
+
+    # Empty stored signatures are manual caches; empty current ones preserve last-good data.
+    if has_snapshot:
+        if not stored_signature or not current_signature:
+            return True
+        return cache_meta.signatures_match(stored_signature, current_signature)
+
+    # Preserve legacy manual caches and last-good data while sources are unavailable.
+    if not _bundle_xml_cache_has_xml() or not current_signature:
+        return True
+
+    # Trust legacy caches only when newer than matching bundle metadata.
+    bundle_root = Path(get_cache_root(create=True)) / "equipment_items_xml_bundle"
+    bundle_meta = cache_meta.load_meta(cache_meta.get_meta_path(str(bundle_root)))
+    bundle_signature = bundle_meta.get("signature", {}) if isinstance(bundle_meta, dict) else {}
+    try:
+        cache_mtime = int(cache_file.stat().st_mtime)
+        bundle_created_at = int(bundle_meta.get("created_at", 0) or 0)
+    except OSError:
+        return False
+    return bool(
+        bundle_created_at
+        and cache_mtime >= bundle_created_at
+        and cache_meta.signatures_match(bundle_signature, current_signature)
+    )
+
+
+def _w3_loaded_category_cache_is_stale():
+    if _W3_CATEGORY_BUNDLE_STATE["stale"]:
+        return True
+    stored_signature = _W3_CATEGORY_BUNDLE_STATE.get("signature") or {}
+    if not _W3_CATEGORY_BUNDLE_STATE["loaded"] or not stored_signature:
+        return False
+    now = time.monotonic()
+    if (
+        now - float(_W3_CATEGORY_BUNDLE_STATE.get("source_checked_at", 0.0))
+        < _CATEGORY_SOURCE_VALIDATION_INTERVAL_SECONDS
+    ):
+        return False
+    _W3_CATEGORY_BUNDLE_STATE["source_checked_at"] = now
+    current_signature, _source = build_w3_category_cache_source_signature()
+    if current_signature and not cache_meta.signatures_match(stored_signature, current_signature):
+        _W3_CATEGORY_BUNDLE_STATE["stale"] = True
+    return _W3_CATEGORY_BUNDLE_STATE["stale"]
+
+
 def catalog_key_for_source_game(source_game="w3"):
     source_game = _normalize_source_game(source_game)
     if source_game == "w2":
@@ -317,9 +418,27 @@ def get_equipment_catalog_for_search_roots(search_roots=None):
     return get_equipment_catalog(get_equipment_source_game_for_search_roots(search_roots))
 
 
+def reset_w3_category_cache_runtime():
+    category_items.clear()
+    category_items.update({category: list(items) for category, items in default_categories.items()})
+    item_attributes.clear()
+    set_catalog_cache_flags("w3")
+    clear_item_attribute_identifier_lookup("w3")
+    _W3_CATEGORY_BUNDLE_STATE.update({
+        "loaded": False,
+        "stale": False,
+        "signature": {},
+        "source_checked_at": 0.0,
+        "refresh_after": 0.0,
+    })
+    _notify_icon_cache_clear()
+    _notify_template_cache_clear()
+
+
 def save_category_cache(source_game="w3"):
     """Save loaded categories to the appropriate cache file."""
     try:
+        source_game = _normalize_source_game(source_game)
         categories, attrs_by_item = get_equipment_catalog(source_game)
         cache_file = get_category_cache_file(source_game)
         has_icon_path, has_hold_template = infer_catalog_cache_flags(attrs_by_item)
@@ -332,9 +451,33 @@ def save_category_cache(source_game="w3"):
             "category_items": categories,
             "item_attributes": attrs_by_item,
         }
+        bundle_signature = {}
+        bundle_source = {}
+        bundle_xml_present = False
+        if source_game == "w3":
+            bundle_signature, bundle_source, bundle_xml_present = _w3_bundle_xml_source_snapshot()
+            # Empty snapshots mark manual caches; omit unknown bundle snapshots so they retry.
+            if bundle_signature or not bundle_xml_present:
+                cache_data["bundle_xml_source_signature"] = bundle_signature
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, indent=2)
+        if source_game == "w3":
+            meta_path = cache_meta.get_meta_path(str(cache_file))
+            if bundle_signature:
+                meta = cache_meta.make_meta(cache_file.name, str(cache_file), bundle_signature, bundle_source)
+                cache_meta.save_meta(meta_path, meta)
+            elif os.path.exists(meta_path):
+                try:
+                    os.remove(meta_path)
+                except OSError:
+                    log.debug("Failed to remove stale equipment category metadata", exc_info=True)
+            _W3_CATEGORY_BUNDLE_STATE.update({
+                "loaded": True,
+                "stale": bool(bundle_xml_present and not bundle_signature),
+                "signature": dict(bundle_signature),
+                "source_checked_at": 0.0,
+            })
         set_catalog_cache_flags(
             source_game,
             schema_version=_CATEGORY_CACHE_SCHEMA_VERSION,
@@ -342,8 +485,10 @@ def save_category_cache(source_game="w3"):
             hold_template=has_hold_template,
         )
         log.debug("Saved %s category cache to %s", _normalize_source_game(source_game), cache_file)
+        return True
     except Exception as e:
         log.warning("Failed to save category cache: %s", e)
+        return False
 
 
 def load_category_cache(source_game="w3"):
@@ -355,6 +500,16 @@ def load_category_cache(source_game="w3"):
     try:
         with open(cache_file, "r", encoding="utf-8") as f:
             cache_data = json.load(f)
+
+        if source_game == "w3" and not _w3_category_cache_is_current(cache_file, cache_data):
+            _W3_CATEGORY_BUNDLE_STATE.update({
+                "loaded": False,
+                "stale": True,
+                "signature": dict(cache_data.get("bundle_xml_source_signature") or {}),
+                "source_checked_at": time.monotonic(),
+            })
+            log.info("Equipment category cache is stale; rebuilding from XML sources")
+            return False
 
         loaded_categories = cache_data.get("category_items", {})
         loaded_attributes = cache_data.get("item_attributes", {})
@@ -398,6 +553,16 @@ def load_category_cache(source_game="w3"):
             hold_template=feature_flags.get("hold_template", inferred_hold_template),
         )
         clear_item_attribute_identifier_lookup(source_game)
+        if source_game == "w3":
+            bundle_signature = dict(cache_data.get("bundle_xml_source_signature") or {})
+            if not bundle_signature and "bundle_xml_source_signature" not in cache_data and _bundle_xml_cache_has_xml():
+                bundle_signature, _source = build_w3_category_cache_source_signature()
+            _W3_CATEGORY_BUNDLE_STATE.update({
+                "loaded": True,
+                "stale": False,
+                "signature": bundle_signature,
+                "source_checked_at": time.monotonic(),
+            })
         log.debug("Loaded %d %s categories from cache", len(loaded_categories), source_game)
         return True
     except Exception as e:
@@ -560,15 +725,22 @@ def ensure_equipment_catalog_ready(source_game="w3", search_roots=None, context=
         ensure_equipment_catalog_for_search_roots(search_roots)
         _category_items, attrs_by_item = get_equipment_catalog(source_game)
         return bool(attrs_by_item)
-    if not attrs_by_item:
+    retry_wait_active = time.monotonic() < float(_W3_CATEGORY_BUNDLE_STATE.get("refresh_after", 0.0))
+    if not attrs_by_item and not retry_wait_active:
         load_category_cache(source_game)
         _category_items, attrs_by_item = get_equipment_catalog(source_game)
-    if source_game == "w3" and context is not None:
-        needs_w3_refresh = not attrs_by_item
+    if context is not None:
+        needs_w3_refresh = not attrs_by_item or _w3_loaded_category_cache_is_stale()
         if require_browser_icon_fields and not catalog_has_browser_icon_fields(source_game):
             needs_w3_refresh = True
-        if needs_w3_refresh and refresh_w3_catalog_from_xml(context):
-            _category_items, attrs_by_item = get_equipment_catalog(source_game)
+        if needs_w3_refresh:
+            now = time.monotonic()
+            if now >= float(_W3_CATEGORY_BUNDLE_STATE.get("refresh_after", 0.0)):
+                _W3_CATEGORY_BUNDLE_STATE["refresh_after"] = (
+                    now + _CATEGORY_REFRESH_RETRY_INTERVAL_SECONDS
+                )
+                if refresh_w3_catalog_from_xml(context):
+                    _category_items, attrs_by_item = get_equipment_catalog(source_game)
     return bool(attrs_by_item)
 
 
@@ -767,26 +939,46 @@ def get_equipment_xml_bundle_cache_root():
     return str(cache_root)
 
 
-def extract_equipment_xmls_from_bundles():
+def extract_equipment_xmls_from_bundles(force_refresh=False):
     out_root = get_equipment_xml_bundle_cache_root()
+    meta_path = cache_meta.get_meta_path(out_root)
+    old_meta = cache_meta.load_meta(meta_path)
+    if not isinstance(old_meta, dict):
+        old_meta = {}
+    old_source = old_meta.get("source") or {}
+    pending_removals = set(old_source.get("pending_removals") or [])
+    has_cached_xml = _bundle_xml_cache_has_xml()
 
-    # Early exit: if XML files are already extracted to the cache directory,
-    # skip loading BundleManager entirely (expensive on every refresh).
-    if os.path.isdir(out_root):
-        for _dp, _dns, fnames in os.walk(out_root):
-            if any(f.lower().endswith(".xml") for f in fnames):
-                return out_root
+    signature = {}
+    source = {}
+    try:
+        signature, source = BundleManager.BuildSourceSignature(False)
+    except Exception:
+        log.debug("Failed to build equipment bundle XML source signature", exc_info=True)
+
+    cache_is_current = bool(
+        has_cached_xml
+        and signature
+        and not pending_removals
+        and cache_meta.signatures_match(old_meta.get("signature", {}), signature)
+    )
+    if cache_is_current and not force_refresh:
+        return out_root
+    if has_cached_xml and not signature and not force_refresh:
+        return out_root
 
     try:
-        bundle_manager = LoadBundleManager()
+        bundle_manager = LoadBundleManager(reset_cache=True)
     except Exception as e:
         log.warning("Failed to load bundle manager for equipment XMLs: %s", e)
-        return ""
+        return out_root if has_cached_xml else ""
 
     items = getattr(bundle_manager, "Items", None) or {}
     if not items:
-        return ""
+        return out_root if has_cached_xml else ""
     found = 0
+    failed = False
+    extracted_files = set()
 
     for key, value in items.items():
         rel_key = str(key or "").replace("/", "\\").lstrip("\\")
@@ -800,23 +992,50 @@ def extract_equipment_xmls_from_bundles():
         if not final_item or not hasattr(final_item, "extract_to_file"):
             continue
 
+        export_path = os.path.join(out_root, *rel_key.split("\\"))
+        if not is_under_root(export_path, out_root):
+            log.warning("Skipping unsafe equipment XML bundle path '%s'", rel_key)
+            continue
+
         found += 1
-        export_path = os.path.join(out_root, rel_key)
         export_dir = os.path.dirname(export_path)
         if export_dir:
             os.makedirs(export_dir, exist_ok=True)
-        if not os.path.exists(export_path):
-            try:
-                final_item.extract_to_file(export_path)
-            except Exception as e:
-                log.warning("Failed to extract equipment XML '%s': %s", rel_key, e)
+        try:
+            final_item.extract_to_file(export_path)
+            extracted_files.add(rel_key.replace("\\", "/"))
+        except Exception as e:
+            failed = True
+            log.warning("Failed to extract equipment XML '%s': %s", rel_key, e)
 
     if found == 0:
-        return ""
+        return out_root if has_cached_xml else ""
+
+    if not failed and signature:
+        previous_files = set(old_source.get("extracted_files") or [])
+        retry_removals = set()
+        for relative_path in previous_files - extracted_files:
+            stale_path = os.path.join(out_root, relative_path.replace("/", os.sep).replace("\\", os.sep))
+            if (
+                stale_path.lower().endswith(".xml")
+                and is_under_root(stale_path, out_root)
+                and os.path.isfile(stale_path)
+            ):
+                try:
+                    os.remove(stale_path)
+                except OSError:
+                    retry_removals.add(relative_path)
+                    log.debug("Failed to remove stale equipment XML %s", stale_path, exc_info=True)
+
+        source = dict(source or {})
+        source["extracted_files"] = sorted(extracted_files | retry_removals)
+        source["pending_removals"] = sorted(retry_removals)
+        meta = cache_meta.make_meta("equipment_items_xml_bundle", out_root, signature, source)
+        cache_meta.save_meta(meta_path, meta)
     return out_root
 
 
-def get_equipment_xml_sources(context, addon_prefs):
+def get_equipment_xml_sources(context, addon_prefs, force_bundle_refresh=False):
     prefer_redkit = bool(getattr(addon_prefs, "prefer_redkit_equipment_xml", False))
 
     try:
@@ -825,7 +1044,7 @@ def get_equipment_xml_sources(context, addon_prefs):
         uncook_root = ""
     uncook_items = os.path.join(uncook_root, "gameplay", "items") if uncook_root else ""
 
-    bundle_items_root = extract_equipment_xmls_from_bundles()
+    bundle_items_root = extract_equipment_xmls_from_bundles(force_refresh=force_bundle_refresh)
 
     redkit_depot = getattr(addon_prefs, "redkit_depot_path", "") or ""
     redkit_items = os.path.join(redkit_depot, "gameplay", "items") if redkit_depot else ""
@@ -866,10 +1085,14 @@ def get_equipment_xml_sources(context, addon_prefs):
     return result
 
 
-def refresh_w3_catalog_from_xml(context):
+def refresh_w3_catalog_from_xml(context, force_bundle_refresh=False):
     try:
         addon_prefs = get_all_addon_prefs(context)
-        sources = get_equipment_xml_sources(context, addon_prefs)
+        sources = get_equipment_xml_sources(
+            context,
+            addon_prefs,
+            force_bundle_refresh=force_bundle_refresh,
+        )
     except Exception:
         log.debug("Failed to resolve equipment XML sources for catalog refresh", exc_info=True)
         return False
@@ -902,7 +1125,8 @@ def refresh_w3_catalog_from_xml(context):
         merged_attributes,
     )
     clear_item_attribute_identifier_lookup("w3")
-    save_category_cache("w3")
+    if not save_category_cache("w3"):
+        return False
     _notify_template_cache_clear()
     return True
 

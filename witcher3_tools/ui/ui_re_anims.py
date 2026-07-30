@@ -10,6 +10,7 @@ Export: Samples w3_face_poses per frame -> temporary mesh + armature -> RE expor
 import os
 import site
 import sys
+import addon_utils
 import bpy
 import logging
 from ..animation.action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
@@ -33,10 +34,9 @@ def _ensure_user_site_on_path():
 
 
 def _is_re_plugin_available():
-    _ensure_user_site_on_path()
     try:
-        from blender_re_animations_plugin import hdf_manager  # noqa: F401
-        return True
+        _exists, enabled = addon_utils.check("blender_re_animations_plugin")
+        return bool(enabled)
     except Exception:
         return False
 
@@ -789,6 +789,7 @@ class WITCH_OT_ExportREMimic(bpy.types.Operator, ExportHelper):
                 al = (fe - fs + 1) / (scene.render.fps or 30)
 
             # Call RE plugin's export with mimic context override
+            _patch_re_plugin_selected_ids()
             orig_read = _patch_re_phoneme_headers(morph_names)
             override = {'is_exporting_mimic': ''}
             if not _has_view_3d_context(context):
@@ -875,7 +876,6 @@ _classes = [
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
-    _patch_re_plugin_selected_ids()
     bpy.types.VIEW3D_MT_object_context_menu.append(_draw_viewport_menu)
     bpy.types.OUTLINER_MT_object.append(_draw_outliner_menu)
 

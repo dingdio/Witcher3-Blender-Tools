@@ -701,9 +701,8 @@ class Cr2wResourceManager:
 
         cache_root = get_cache_root(create=True)
         filename = os.path.join(cache_root, "pathhashes.csv")
-        if not os.path.exists(filename):
-            bundle.create_pathhashes(outputPath=filename)
-            log.info('Creating pathhashes.csv')
+        if bundle.ensure_pathhashes(outputPath=filename):
+            log.info('Created pathhashes.csv')
         self.pathashespath = filename
         with open(self.pathashespath, newline='') as csvfile:
             self.HashdumpDict = {}
@@ -717,6 +716,11 @@ class Cr2wResourceManager:
                 if Cr2wResourceManager.resourceManager is None:
                     Cr2wResourceManager.resourceManager = Cr2wResourceManager()
         return Cr2wResourceManager.resourceManager
+
+    @staticmethod
+    def Reset():
+        with Cr2wResourceManager._lock:
+            Cr2wResourceManager.resourceManager = None
 
 class CSectorDataResource:
     def __init__(self, f, CR2WFILE, parent):

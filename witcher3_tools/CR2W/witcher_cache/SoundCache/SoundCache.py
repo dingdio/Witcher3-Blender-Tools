@@ -43,7 +43,7 @@ class SoundCache:
         return "SoundCache"
 
     def _read(self, filepath: str) -> None:
-        with bStream(path=filepath) as stream:
+        with open(filepath, "rb") as handle, bStream(path=filepath, reader=handle) as stream:
             magic = stream.read(4)
             if magic != self.MAGIC:
                 raise InvalidSoundCacheException(
@@ -58,7 +58,8 @@ class SoundCache:
 
             if is_64bit:
                 self.InfoOffset = stream.readUInt64()
-                self.NumberOfFiles = stream.readUInt64()
+                self.NumberOfFiles = stream.readUInt32()
+                stream.readUInt32()  # Native alignment padding.
                 self.NameTableOffset = stream.readUInt64()
             else:
                 self.InfoOffset = stream.readUInt32()
@@ -68,8 +69,10 @@ class SoundCache:
             self.NamesSize = stream.readUInt32()
             if is_64bit:
                 self.Unk3 = stream.readUInt32()
-
-            self.BufferSize = stream.readUInt64()
+                self.BufferSize = stream.readUInt64()
+            else:
+                self.BufferSize = stream.readUInt32()
+                self.Unk3 = stream.readUInt32()  # Native alignment padding.
             self.CheckSum = stream.readUInt64()
 
             stream.seek(self.InfoOffset)
@@ -79,7 +82,8 @@ class SoundCache:
             for _ in range(self.NumberOfFiles):
                 item = SoundCacheItem(parent=self)
                 if is_64bit:
-                    item.NameOffset = stream.readUInt64()
+                    item.NameOffset = stream.readUInt32()
+                    stream.readUInt32()  # Native alignment padding.
                     item.PageOffset = stream.readUInt64()
                     item.Size = int(stream.readUInt64())
                 else:

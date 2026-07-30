@@ -1,4 +1,5 @@
 import logging
+import sys
 
 import bpy
 
@@ -7,6 +8,15 @@ from .. import dialog_language
 log = logging.getLogger(__name__)
 
 _LANGUAGE_REFRESHING = False
+
+
+def _clear_language_cache_status(*cache_names):
+    root_package = (__package__ or "witcher3_tools.ui").rsplit(".", 1)[0]
+    root_module = sys.modules.get(root_package)
+    status = getattr(root_module, "CACHE_STATUS", None)
+    if isinstance(status, dict):
+        for cache_name in cache_names:
+            status.pop(cache_name, None)
 
 
 def _tag_dialog_language_redraw(context):
@@ -84,6 +94,7 @@ def _on_text_language_update(self, context):
             voice_language=voice_language,
             reset_string_manager=True,
         )
+        _clear_language_cache_status("string_cache.pkl")
         refresh_dialog_language_consumers(context, refresh_audio=False)
     finally:
         _LANGUAGE_REFRESHING = False
@@ -100,6 +111,7 @@ def _on_voice_language_update(self, context):
             voice_language=dialog_language.get_active_voice_language(context),
             reset_string_manager=False,
         )
+        _clear_language_cache_status("speech_cache.pkl")
         refresh_dialog_language_consumers(context, refresh_audio=True)
     finally:
         _LANGUAGE_REFRESHING = False

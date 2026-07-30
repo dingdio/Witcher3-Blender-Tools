@@ -49,6 +49,7 @@ def _has_speech_source_root(base_path, language):
 class SpeechManager(WitcherArchiveManager):
     InstanceManager = None
     InstanceManagers = {}
+    CACHE_FORMAT_VERSION = 2
     def __init__(self):
         self.base_path = None
         self.language = "en"
@@ -190,10 +191,7 @@ class SpeechManager(WitcherArchiveManager):
             do_reload = True
 
         if (instance is None or do_reload):
-            cache_root = get_cache_root(create=True)
-            cache_dir = os.path.join(cache_root, "Speech")
-            os.makedirs(cache_dir, exist_ok=True)
-            filename = os.path.join(cache_dir, f"speech_cache_{current_language}.pkl")
+            filename = SpeechManager.GetCachePath(current_language, create=True)
             meta_path = cache_meta.get_meta_path(filename)
             
             start_time = time.time()
@@ -209,11 +207,7 @@ class SpeechManager(WitcherArchiveManager):
                 with open(filename, 'wb') as f:
                     pickle.dump(sm, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-                signature, source = cache_meta.signature_w3speech(
-                    current_base_path,
-                    WitcherArchiveManager.VANILLA_DLC_LIST,
-                    language=current_language,
-                )
+                signature, source = SpeechManager.BuildSourceSignature(current_language)
                 meta = cache_meta.make_meta(f"speech_cache_{current_language}.pkl", filename, signature, source)
                 cache_meta.save_meta(meta_path, meta)
                 return sm
@@ -249,10 +243,23 @@ class SpeechManager(WitcherArchiveManager):
         return SpeechManager.InstanceManagers.get(manager_key, SpeechManager.InstanceManager)
 
     @staticmethod
+    def GetCachePath(language=None, create=True):
+        cache_language = dialog_language.normalize_dialog_language(
+            language or dialog_language.get_active_voice_language()
+        )
+        cache_dir = os.path.join(get_cache_root(create=create), "Speech")
+        if create:
+            os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, f"speech_cache_{cache_language}.pkl")
+
+    @staticmethod
     def BuildSourceSignature(language=None):
         base_path = refresh_game_configuration_path()
-        return cache_meta.signature_w3speech(
+        signature, source = cache_meta.signature_w3speech(
             base_path,
             WitcherArchiveManager.VANILLA_DLC_LIST,
             language=language or dialog_language.get_active_voice_language(),
         )
+        signature["hash"] = f"{SpeechManager.CACHE_FORMAT_VERSION}:{signature.get('hash', '')}"
+        source["cache_format_version"] = SpeechManager.CACHE_FORMAT_VERSION
+        return signature, source

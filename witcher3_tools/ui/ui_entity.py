@@ -31,10 +31,8 @@ from .. import (
 )
 from ..read_game_bin import (
     auto_detect_witcher3_game_path,
-    get_witcher3_exe_path,
     is_valid_witcher3_game_path,
     update_witcher_game_path,
-    WITCHER3_EXE_REL,
 )
 from ..CR2W.common_blender import (
     mod_loading_context,
@@ -286,11 +284,11 @@ def _get_witcher3_game_path_issue(context) -> str:
     addon_prefs = get_all_addon_prefs(context)
     raw_game_path = (getattr(addon_prefs, "witcher_game_path", "") or "").strip()
     if not raw_game_path:
-        return f"Set Witcher 3 install folder ({WITCHER3_EXE_REL}) in addon preferences."
+        return "Set the Witcher 3 install folder or witcher3.exe in addon preferences."
     game_path = bpy.path.abspath(raw_game_path)
     if is_valid_witcher3_game_path(game_path):
         return ""
-    return f"Invalid Witcher 3 path. Missing: {get_witcher3_exe_path(game_path)}"
+    return "Invalid Witcher 3 path. Could not find witcher3.exe."
 
 
 def _ensure_witcher3_game_path_initialized(context) -> bool:

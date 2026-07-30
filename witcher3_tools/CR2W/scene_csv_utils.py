@@ -10,6 +10,12 @@ DEFAULT_BODY_EMOTIONAL_STATE = "Determined"
 DEFAULT_BODY_POSE_NAME = "Standing"
 
 
+def reset_scene_csv_caches():
+    global _body_anim_csv_cache, _mimics_csv_cache
+    _body_anim_csv_cache = None
+    _mimics_csv_cache = None
+
+
 def _parse_body_anim_csv():
     """Parse scene_body_animations.csv via repo_file (searches all configured uncook paths).
     Returns {(status_lower, emotional_lower, pose_lower): {"idles": [...], "pose_display": str,
@@ -45,6 +51,8 @@ def _parse_body_anim_csv():
                                                 "emotional_display": cur_emotional})
                 if anim_type == "Idle":
                     entry["idles"].append(anim_name)
+    except FileNotFoundError:
+        log.debug("scene_body_animations.csv is not available yet (path: %s)", csv_path)
     except Exception:
         log.warning("Failed to parse scene_body_animations.csv (path: %s)", csv_path, exc_info=True)
         result = {}
@@ -135,6 +143,8 @@ def _parse_mimics_csv():
                     "pose": row[2].strip(),
                     "animation": row[3].strip(),
                 }
+    except FileNotFoundError:
+        log.debug("scene_mimics_emotional_states.csv is not available yet (path: %s)", csv_path)
     except Exception:
         log.warning("Failed to parse scene_mimics_emotional_states.csv (path: %s)", csv_path, exc_info=True)
     _mimics_csv_cache = result

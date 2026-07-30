@@ -5,9 +5,10 @@ log = logging.getLogger(__name__)
 from .. import get_uncook_path, get_w2_unbundle_path, get_W3_VOICE_PATH, get_W3_OGG_PATH, get_vgmstream_path, get_all_addon_prefs
 from ..extension_paths import get_cache_root, get_dev_override, get_dev_override_list
 from ..animation.action_compat import bind_strip_action_slot, new_action_fcurve, resolve_action_slot
-from ..CR2W.witcher_cache.Speech import LoadSpeechManager
+from ..CR2W.witcher_cache.Speech import LoadSpeechManager, SpeechManager
 from ..CR2W.witcher_cache.Speech.W3Speech import SpeechEntry
 from ..CR2W.witcher_cache.W3Strings import LoadStringsManager
+from ..CR2W.witcher_cache import cache_meta
 from .. import dialogue_browser_core as browser_core
 from . import phoneme_helper
 from .ui_morphs import get_face_meshs
@@ -42,6 +43,8 @@ _voice_filtered_indices = []
 _VOICE_LIST_DEFERRED = False
 _VOICE_BROWSER_INDEX_LANGUAGE = "en"
 _voice_cache_identity_loaded = None
+_voice_cache_source_revision = 0
+_voice_cache_source_revision_loaded = None
 
 
 def _voice_browser_index_language():
@@ -83,11 +86,71 @@ def _voice_cache_path(context=None):
     game, index_language, text_language = _voice_cache_identity(context)
     return str(cache_dir / f"voice_cache_v{VOICE_CACHE_VERSION}_{game.lower()}_index_{index_language}_{text_language}.json")
 
+
+def _voice_node_input_signature():
+    data_dir = Path(__file__).resolve().parents[1] / "CR2W" / "data"
+    dialogue_dir = data_dir / "dialogue" / "w3"
+    cache_root = Path(get_cache_root(create=False))
+    paths = [
+        data_dir / "voice_names.json",
+        data_dir / "actor_voicelines.csv",
+        data_dir / "speaker_codes.json",
+        dialogue_dir / "scene_voice_tags.json",
+        dialogue_dir / "voice_tag_entities.json",
+        dialogue_dir / "scene_dialog_index_v2.sqlite3",
+        dialogue_dir / "scene_voice_tags_user.json",
+        dialogue_dir / "scene_voice_tags_user.csv",
+        cache_root / "SceneDialog" / "w3" / "user_scene_dialog_index_v2.sqlite3",
+        cache_root / "SceneDialog" / "W3" / "w3_scene_dialog_metadata.json",
+        cache_root / "SceneDialog" / "VoiceTags" / "scene_voice_tags_user.json",
+        cache_root / "SceneDialog" / "VoiceTags" / "scene_voice_tags_user.csv",
+    ]
+    voice_names_override = get_dev_override("voice_names_json", "")
+    if voice_names_override:
+        paths.append(Path(voice_names_override))
+    paths.extend(
+        Path(path)
+        for path in get_dev_override_list("scene_voice_tags_paths", [])
+        if isinstance(path, str) and path
+    )
+    return cache_meta.compute_signature(str(path) for path in paths)
+
+
+def _voice_source_signature(context=None):
+    game, index_language, text_language = _voice_cache_identity(context)
+    if game != VOICE_GAME_W3:
+        return {}
+    try:
+        speech_signature, speech_source = SpeechManager.BuildSourceSignature(index_language)
+        strings_signature, _ = cache_meta.signature_w3strings(
+            speech_source.get("base_path", ""), text_language
+        )
+        node_input_signature = _voice_node_input_signature()
+    except Exception:
+        log.debug("Could not build voice-browser source signature.", exc_info=True)
+        return {}
+    if not speech_signature.get("count") and not strings_signature.get("count"):
+        return {}
+    return {
+        "speech": speech_signature.get("hash", ""),
+        "strings": strings_signature.get("hash", ""),
+        "node_inputs": node_input_signature.get("hash", ""),
+    }
+
+
+def invalidate_voice_cache_sources():
+    """Invalidate inputs without scanning during UI draws."""
+    global _voice_cache_source_revision
+    _voice_cache_source_revision += 1
+
+
 def _save_voice_cache(context=None):
     """Write _voice_node_cache to disk as JSON."""
-    global _voice_node_cache
+    global _voice_node_cache, _voice_cache_source_revision_loaded
     game, index_language, text_language = _voice_cache_identity(context)
     path = _voice_cache_path(context)
+    source_signature = _voice_source_signature(context)
+    _voice_cache_source_revision_loaded = _voice_cache_source_revision
     try:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({
@@ -95,6 +158,7 @@ def _save_voice_cache(context=None):
                 'game': game,
                 'text_language': text_language,
                 'index_language': index_language,
+                'source_signature': source_signature,
                 'count': len(_voice_node_cache),
                 'nodes': _voice_node_cache,
             }, f, ensure_ascii=False, separators=(',', ':'))
@@ -104,7 +168,8 @@ def _save_voice_cache(context=None):
 
 def _load_voice_cache(context=None):
     """Load _voice_node_cache from the JSON file on disk. Returns True if loaded."""
-    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices, _voice_cache_identity_loaded
+    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices
+    global _voice_cache_identity_loaded, _voice_cache_source_revision_loaded
     identity = _voice_cache_identity(context)
     path = _voice_cache_path(context)
     if not os.path.isfile(path):
@@ -117,14 +182,19 @@ def _load_voice_cache(context=None):
                 return False
             if str(data.get('game') or VOICE_GAME_W3).upper() != identity[0]:
                 return False
+            current_source_signature = _voice_source_signature(context)
+            if current_source_signature and data.get('source_signature') != current_source_signature:
+                return False
             _voice_node_cache = data['nodes']
             if not _voice_node_cache:
                 _voice_cache_loaded = False
                 _voice_filtered_indices = []
                 _voice_cache_identity_loaded = None
+                _voice_cache_source_revision_loaded = None
                 return False
             _voice_cache_loaded = True
             _voice_cache_identity_loaded = identity
+            _voice_cache_source_revision_loaded = _voice_cache_source_revision
             _voice_filtered_indices = list(range(len(_voice_node_cache)))
             _refresh_speaker_stats(_voice_node_cache)
             log.info("Voice cache loaded: %d items from %s", len(_voice_node_cache), path)
@@ -158,15 +228,23 @@ def get_voice_node_count():
 
 def ensure_voice_cache(context=None):
     """Load the voice cache from disk, rebuilding when the cached language list is empty."""
-    global _voice_cache_loaded, _voice_node_cache, _voice_filtered_indices, _voice_cache_identity_loaded
+    global _voice_cache_loaded, _voice_node_cache, _voice_filtered_indices
+    global _voice_cache_identity_loaded, _voice_cache_source_revision_loaded
     identity = _voice_cache_identity(context)
     if _voice_cache_loaded and _voice_node_cache and _voice_cache_identity_loaded == identity:
-        return
+        if identity[0] != VOICE_GAME_W3 or _voice_cache_source_revision_loaded == _voice_cache_source_revision:
+            return
+        _voice_node_cache = []
+        _voice_filtered_indices = []
+        _voice_cache_loaded = False
+        _voice_cache_identity_loaded = None
+        _voice_cache_source_revision_loaded = None
     if _voice_cache_identity_loaded != identity:
         _voice_node_cache = []
         _voice_filtered_indices = []
         _voice_cache_loaded = False
         _voice_cache_identity_loaded = None
+        _voice_cache_source_revision_loaded = None
     if not _load_voice_cache(context) and not _voice_node_cache:
         SetupNodeData(do_reload_strings=False)
 
@@ -1790,12 +1868,14 @@ def _on_voice_page_number_update(self, context):
 
 
 def _on_voice_game_update(self, context):
-    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices, _voice_cache_identity_loaded
+    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices
+    global _voice_cache_identity_loaded, _voice_cache_source_revision_loaded
     scene = getattr(context, "scene", None) if context is not None else None
     _voice_node_cache = []
     _voice_filtered_indices = []
     _voice_cache_loaded = False
     _voice_cache_identity_loaded = None
+    _voice_cache_source_revision_loaded = None
     if scene is not None:
         if hasattr(scene, "witcher_voice_list"):
             scene.witcher_voice_list.clear()
@@ -2016,7 +2096,8 @@ def _w2_source_path_for_entry(entry):
 
 
 def _setup_w2_node_data(do_reload_strings=False, reload_scene_metadata=False):
-    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices, _voice_cache_identity_loaded
+    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices
+    global _voice_cache_identity_loaded, _voice_cache_source_revision_loaded
 
     text_language = dialog_language.get_active_text_language(bpy.context)
     voice_language = dialog_language.get_active_voice_language(bpy.context)
@@ -2029,6 +2110,7 @@ def _setup_w2_node_data(do_reload_strings=False, reload_scene_metadata=False):
         _voice_filtered_indices = []
         _voice_cache_loaded = False
         _voice_cache_identity_loaded = None
+        _voice_cache_source_revision_loaded = None
         return
 
     speech_manager = LoadWitcher2SpeechManager(do_reload=do_reload_strings, language=voice_language)
@@ -2056,6 +2138,7 @@ def _setup_w2_node_data(do_reload_strings=False, reload_scene_metadata=False):
 
     _voice_node_cache = []
     _voice_filtered_indices = []
+    _voice_cache_source_revision_loaded = None
 
     items = getattr(speech_manager, "Items", None) or {}
     id_to_key = getattr(strings_manager, "IdToKey", {}) or {}
@@ -2166,7 +2249,8 @@ def _setup_w2_node_data(do_reload_strings=False, reload_scene_metadata=False):
 
 
 def SetupNodeData(do_reload_strings=False, reload_scene_metadata=False):
-    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices, _voice_cache_identity_loaded
+    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices
+    global _voice_cache_identity_loaded, _voice_cache_source_revision_loaded
     if get_active_voice_game(bpy.context) == VOICE_GAME_W2:
         _setup_w2_node_data(
             do_reload_strings=do_reload_strings,
@@ -2212,6 +2296,7 @@ def SetupNodeData(do_reload_strings=False, reload_scene_metadata=False):
     
     _voice_node_cache = []
     _voice_filtered_indices = []
+    _voice_cache_source_revision_loaded = None
     
     char_dict = {
         'ciri' : 'Ciri',
@@ -2360,11 +2445,13 @@ def SetupListFromNodeData():
 
 
 def _clear_voice_browser_runtime_state(scene=None):
-    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices, _voice_cache_identity_loaded
+    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices
+    global _voice_cache_identity_loaded, _voice_cache_source_revision_loaded
     _voice_node_cache = []
     _voice_filtered_indices = []
     _voice_cache_loaded = False
     _voice_cache_identity_loaded = None
+    _voice_cache_source_revision_loaded = None
     if scene is None:
         return
     if hasattr(scene, "witcher_voice_list"):
@@ -2457,7 +2544,8 @@ def clear_user_scene_dialog_index(context):
 
 
 def refresh_voice_dialog_language(context, refresh_audio=False):
-    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices, _voice_cache_identity_loaded
+    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices
+    global _voice_cache_identity_loaded, _voice_cache_source_revision_loaded
 
     scene = getattr(context, "scene", None) if context is not None else None
     selected_id = _get_selected_voice_id(scene) if scene is not None else ""
@@ -2476,6 +2564,7 @@ def refresh_voice_dialog_language(context, refresh_audio=False):
     _voice_filtered_indices = []
     _voice_cache_loaded = False
     _voice_cache_identity_loaded = None
+    _voice_cache_source_revision_loaded = None
     loaded_cache = _load_voice_cache(context)
     if not loaded_cache:
         SetupNodeData(do_reload_strings=True)

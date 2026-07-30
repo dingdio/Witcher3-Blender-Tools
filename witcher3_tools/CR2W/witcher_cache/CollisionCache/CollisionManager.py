@@ -41,6 +41,7 @@ class CollisionManager(WitcherArchiveManager):
     InstanceManagerMods = None
     CACHE_FILENAME = "collision_cache.pkl"
     CACHE_FILENAME_MODS = "collision_cache_mods.pkl"
+    CACHE_FORMAT_VERSION = 2
 
     def __init__(self):
         self.base_path: Optional[str] = None
@@ -381,10 +382,12 @@ class CollisionManager(WitcherArchiveManager):
             return Cache.GetCacheTypeOfFile(path) == Cache.Cachetype.Collision
 
         signature = cache_meta.compute_signature(cache_meta.iter_files(roots, _predicate))
+        signature["hash"] = f"{CollisionManager.CACHE_FORMAT_VERSION}:{signature.get('hash', '')}"
         source = {
             "type": "collision_cache_mods" if loadmods else "collision_cache",
             "base_path": base_path,
             "roots": roots,
+            "cache_format_version": CollisionManager.CACHE_FORMAT_VERSION,
         }
         return signature, source
 

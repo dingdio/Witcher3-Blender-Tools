@@ -44,7 +44,7 @@ class BundleManager(WitcherArchiveManager):
 
     @staticmethod
     def SerializationVersion():
-        return "1.0"
+        return "1.1"
 
     def find_item_by_hash(self, hash_value):
         return self.Items.get(hash_value, None)
@@ -325,8 +325,12 @@ class BundleManager(WitcherArchiveManager):
     def BuildSourceSignature(loadmods: bool):
         base_path = refresh_game_configuration_path()
         if loadmods:
-            return cache_meta.signature_bundles_mods(base_path, WitcherArchiveManager.VANILLA_DLC_LIST)
-        return cache_meta.signature_bundles_base(base_path, WitcherArchiveManager.VANILLA_DLC_LIST)
+            signature, source = cache_meta.signature_bundles_mods(base_path, WitcherArchiveManager.VANILLA_DLC_LIST)
+        else:
+            signature, source = cache_meta.signature_bundles_base(base_path, WitcherArchiveManager.VANILLA_DLC_LIST)
+        signature["hash"] = f"{BundleManager.SerializationVersion()}:{signature.get('hash', '')}"
+        source["serialization_version"] = BundleManager.SerializationVersion()
+        return signature, source
 
 def RebuildRootNode(self):
     # Placeholder for implementation

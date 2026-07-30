@@ -1,8 +1,5 @@
 from collections import OrderedDict
-import os
 import struct
-from io import BytesIO
-from ...bStream import bStream
 from .BundleItem import BundleItem
 import logging
 log = logging.getLogger(__name__)
@@ -10,12 +7,20 @@ log = logging.getLogger(__name__)
 class InvalidBundleException(Exception):
     pass
 
+
+def toc_entry_size(header_version):
+    try:
+        return {3: 320, 5: 304}[header_version]
+    except KeyError as exc:
+        raise InvalidBundleException(f"Unsupported bundle header version: {header_version}") from exc
+
+
 class Bundle:
     IDString = b'POTATO70'
     HEADER_SIZE = 32
     ALIGNMENT_TARGET = 4096
     FOOTER_DATA = b"AlignmentUnused"  # Bytes, not string
-    TOCEntrySize = 0x100 + 16 + 4 + 4 + 4 + 4 + 8 + 16 + 4 + 4
+    TOCEntrySize = 320  # Legacy version 3 debug header.
 
     def __init__(self, filename=None):
         self.ArchiveAbsolutePath = filename
@@ -28,61 +33,66 @@ class Bundle:
     def TypeName(self):
         return "Bundle"
 
-    # def Read(self):
-    #     with open(self.ArchiveAbsolutePath, 'rb') as reader:
-    #         idstring = reader.read(len(self.IDString))
-    #         if idstring != self.IDString:
-    #             raise Exception("Bundle header mismatch.")
-
-    #         self.bundlesize, self.dummysize, self.dataoffset = struct.unpack('III', reader.read(12))
-    #         reader.seek(0x20)
-
-    #         while reader.tell() < self.dataoffset + 0x20:
-    #             # Read and process TOC entry
-    #             # ... (similar to C# implementation, adjusted for Python)
-    #             pass
     def Read(self):
         self.Items = OrderedDict()
 
-        with bStream(path=self.ArchiveAbsolutePath) as file:
-            idstring = file.read(len(self.IDString))
-
-            if idstring != self.IDString:
+        with open(self.ArchiveAbsolutePath, "rb") as file:
+            preamble = file.read(self.HEADER_SIZE)
+            if len(preamble) != self.HEADER_SIZE or preamble[:len(self.IDString)] != self.IDString:
                 raise InvalidBundleException("Bundle header mismatch.")
 
-            self.bundlesize = file.readUInt32()
-            self.dummysize = file.readUInt32()
-            self.dataoffset = file.readUInt32()
+            self.header_version = struct.unpack_from("<H", preamble, 20)[0]
+            entry_size = toc_entry_size(self.header_version)
+            if self.header_version == 5:
+                self.bundlesize = struct.unpack_from("<Q", preamble, 8)[0]
+                self.dummysize = 0
+                self.dataoffset = struct.unpack_from("<I", preamble, 16)[0]
+            else:
+                self.bundlesize, self.dummysize, self.dataoffset = struct.unpack_from("<III", preamble, 8)
+            if self.dataoffset % entry_size:
+                raise InvalidBundleException(
+                    f"Bundle header size {self.dataoffset} is not divisible by version "
+                    f"{self.header_version} entry size {entry_size}."
+                )
 
             file.seek(0x20)
 
-            while file.tell() < self.dataoffset + 0x20:
+            for _ in range(self.dataoffset // entry_size):
+                row = file.read(entry_size)
+                if len(row) != entry_size:
+                    raise InvalidBundleException("Bundle header ended before its declared size.")
+
                 item = BundleItem()
                 item.bundle = self
+                item.name = row[:0x100].split(b'\0', 1)[0].decode('iso-8859-1')
+                item.hash = row[0x100:0x110]
 
-                strname = file.read(0x100).decode('iso-8859-1')
-                item.name = strname.split('\0', 1)[0]
-                item.hash = file.read(16)
-                item.empty = file.readUInt32()
-                item.size = file.readUInt32()
-                item.zsize = file.readUInt32()
-                item.page_offset = file.readUInt32()
-
-                date = file.readUInt32()
-                y = date >> 20
-                m = (date >> 15) & 0x1F
-                d = (date >> 10) & 0x1F
-
-                time = file.readUInt32()
-                h = time >> 22
-                n = (time >> 16) & 0x3F
-                s = (time >> 10) & 0x3F
-
-                item.date_string = f"{d}/{m}/{y} {h}:{n}:{s}"
-
-                item.zero = file.read(16)  # always zero
-                item.crc = file.readUInt32()
-                item.compression = file.readUInt32()
+                if self.header_version == 5:
+                    (
+                        item.page_offset,
+                        item.size,
+                        item.zsize,
+                        item.crc,
+                        item.compression,
+                    ) = struct.unpack_from("<QIIIB", row, 0x110)
+                    item.empty = 0
+                    item.zero = row[0x125:0x130]
+                    item.date_string = ""
+                else:
+                    (
+                        item.empty,
+                        item.size,
+                        item.zsize,
+                        item.page_offset,
+                        date,
+                        time,
+                    ) = struct.unpack_from("<6I", row, 0x110)
+                    item.zero = row[0x128:0x138]
+                    item.crc, item.compression = struct.unpack_from("<2I", row, 0x138)
+                    item.date_string = (
+                        f"{(date >> 10) & 0x1F}/{(date >> 15) & 0x1F}/{date >> 20} "
+                        f"{time >> 22}:{(time >> 16) & 0x3F}:{(time >> 10) & 0x3F}"
+                    )
 
                 if item.name not in self.Items:
                     self.Items[item.name] = item

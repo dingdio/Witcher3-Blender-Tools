@@ -28,6 +28,7 @@ _LANGUAGE_DECODER_CACHE_VERSION = {
     "tr": 1,
 }
 _STRING_CACHE_FORMAT_VERSION = 2
+_SOURCE_VALIDATION_INTERVAL_SECONDS = 5.0
 
 
 def _decoder_cache_version(language: str):
@@ -55,6 +56,8 @@ class W3StringManager():
     def __init__(self):
         self.Language  = 'en'
         self.base_path = ""
+        self.source_signature = {}
+        self._source_checked_at = 0.0
         self.Lines:dict = {}
         self.Keys:dict = {}
         self.KeyToId:dict = {}
@@ -160,6 +163,8 @@ class W3StringManager():
         t_class = cls()
         t_class.Language = data['Language']
         t_class.base_path = normalize_game_path(data.get('base_path', ""))
+        t_class.source_signature = data.get('source_signature', {})
+        t_class._source_checked_at = 0.0
         t_class.decoder_cache_version = data.get('decoder_cache_version')
         t_class.string_cache_format_version = data.get('string_cache_format_version', 1)
         for key, val in data['Lines'].items():
@@ -172,20 +177,47 @@ class W3StringManager():
     @staticmethod
     def Get(do_reload = False):
         current_base_path = _refresh_strings_configuration_path()
+        cache_language = str(Configuration.TextLanguage or "en")
+        required_decoder_version = _decoder_cache_version(cache_language)
+        current_signature = None
+        force_rebuild = bool(do_reload)
+        refresh_instance = force_rebuild
 
-        if (
-            W3StringManager.InstanceManager is not None
-            and getattr(W3StringManager.InstanceManager, "base_path", None) != current_base_path
-        ):
-            do_reload = True
+        if W3StringManager.InstanceManager is not None:
+            if (
+                getattr(W3StringManager.InstanceManager, "base_path", None) != current_base_path
+                or getattr(W3StringManager.InstanceManager, "Language", "") != cache_language
+            ):
+                refresh_instance = True
+            elif not _has_string_source_root(current_base_path):
+                # Keep the last good manager while the game path is unavailable.
+                W3StringManager.InstanceManager._source_checked_at = time.monotonic()
+                refresh_instance = False
+            elif force_rebuild:
+                current_signature, _ = W3StringManager.BuildSourceSignature(
+                    cache_language,
+                    current_base_path,
+                )
+                W3StringManager.InstanceManager._source_checked_at = time.monotonic()
+                if not current_signature.get("count"):
+                    refresh_instance = False
+            elif (
+                time.monotonic() - getattr(W3StringManager.InstanceManager, "_source_checked_at", 0.0)
+                >= _SOURCE_VALIDATION_INTERVAL_SECONDS
+            ):
+                current_signature, _ = W3StringManager.BuildSourceSignature(
+                    cache_language,
+                    current_base_path,
+                )
+                W3StringManager.InstanceManager._source_checked_at = time.monotonic()
+                if current_signature.get("count") and not cache_meta.signatures_match(
+                    getattr(W3StringManager.InstanceManager, "source_signature", {}),
+                    current_signature,
+                ):
+                    refresh_instance = True
 
-        if (W3StringManager.InstanceManager == None or do_reload):
-            cache_root = get_cache_root(create=True)
-            cache_dir = os.path.join(cache_root, "W3Strings")
-            os.makedirs(cache_dir, exist_ok=True)
-            cache_language = Configuration.TextLanguage
-            required_decoder_version = _decoder_cache_version(cache_language)
-            filename = os.path.join(cache_dir, f"string_cache_{cache_language}.pkl")
+        if W3StringManager.InstanceManager is None or refresh_instance:
+            filename = W3StringManager.GetCachePath(cache_language, create=True)
             meta_path = cache_meta.get_meta_path(filename)
 
             start_time = time.time()
@@ -193,16 +225,21 @@ class W3StringManager():
 
             def build_from_game():
                 w3StringManager = W3StringManager()
-                w3StringManager.Load(Configuration.TextLanguage, current_base_path)
+                w3StringManager.Load(cache_language, current_base_path)
+                signature, source = W3StringManager.BuildSourceSignature(
+                    cache_language,
+                    current_base_path,
+                )
+                w3StringManager.source_signature = signature
+                w3StringManager._source_checked_at = time.monotonic()
 
                 # Blank-run friendly: do not overwrite cache/meta with an empty build from an invalid path.
-                if not _has_string_source_root(current_base_path):
+                if not _has_string_source_root(current_base_path) or not signature.get("count"):
                     return w3StringManager
 
                 with open(filename, "wb") as file:
                     pickle.dump(w3StringManager, file, protocol=pickle.HIGHEST_PROTOCOL)
 
-                signature, source = cache_meta.signature_w3strings(current_base_path, Configuration.TextLanguage)
                 meta = cache_meta.make_meta(f"string_cache_{cache_language}.pkl", filename, signature, source)
                 cache_meta.save_meta(meta_path, meta)
                 return w3StringManager
@@ -211,42 +248,66 @@ class W3StringManager():
                 w3StringManager = build_from_game()
             elif not os.path.exists(filename):
                 w3StringManager = build_from_game()
-            elif do_reload:
+            elif force_rebuild:
                 load_reason = "rebuilt (forced)"
                 w3StringManager = build_from_game()
             else:
-                try:
-                    with open(filename, "rb") as f:
-                        w3StringManager = pickle.load(f)
-                    if getattr(w3StringManager, "base_path", "") != current_base_path:
-                        load_reason = "rebuilt (game path changed)"
-                        w3StringManager = build_from_game()
-                    elif getattr(w3StringManager, "Language", "") != cache_language:
-                        load_reason = "rebuilt (language changed)"
-                        w3StringManager = build_from_game()
-                    elif (
-                        required_decoder_version is not None
-                        and getattr(w3StringManager, "decoder_cache_version", None) != required_decoder_version
-                    ):
-                        load_reason = "rebuilt (decoder changed)"
-                        w3StringManager = build_from_game()
-                    elif getattr(w3StringManager, "string_cache_format_version", 1) != _STRING_CACHE_FORMAT_VERSION:
-                        load_reason = "rebuilt (format changed)"
-                        w3StringManager = build_from_game()
-                    elif w3StringManager._looks_corrupted():
-                        load_reason = "rebuilt (corrupted cache)"
-                        w3StringManager = build_from_game()
-                    else:
-                        load_reason = "loaded from cache"
-                except Exception:
-                    load_reason = "rebuilt (load error)"
+                meta = cache_meta.load_meta(meta_path)
+                if current_signature is None:
+                    current_signature, _ = W3StringManager.BuildSourceSignature(
+                        cache_language,
+                        current_base_path,
+                    )
+                if not cache_meta.signatures_match(meta.get("signature", {}), current_signature):
+                    load_reason = "rebuilt (sources changed)"
                     w3StringManager = build_from_game()
+                else:
+                    try:
+                        with open(filename, "rb") as f:
+                            w3StringManager = pickle.load(f)
+                        if getattr(w3StringManager, "base_path", "") != current_base_path:
+                            load_reason = "rebuilt (game path changed)"
+                            w3StringManager = build_from_game()
+                        elif getattr(w3StringManager, "Language", "") != cache_language:
+                            load_reason = "rebuilt (language changed)"
+                            w3StringManager = build_from_game()
+                        elif (
+                            required_decoder_version is not None
+                            and getattr(w3StringManager, "decoder_cache_version", None) != required_decoder_version
+                        ):
+                            load_reason = "rebuilt (decoder changed)"
+                            w3StringManager = build_from_game()
+                        elif getattr(w3StringManager, "string_cache_format_version", 1) != _STRING_CACHE_FORMAT_VERSION:
+                            load_reason = "rebuilt (format changed)"
+                            w3StringManager = build_from_game()
+                        elif w3StringManager._looks_corrupted():
+                            load_reason = "rebuilt (corrupted cache)"
+                            w3StringManager = build_from_game()
+                        else:
+                            w3StringManager.source_signature = current_signature
+                            w3StringManager._source_checked_at = time.monotonic()
+                            load_reason = "loaded from cache"
+                    except Exception:
+                        load_reason = "rebuilt (load error)"
+                        w3StringManager = build_from_game()
             time_taken = time.time() - start_time
             log.info('Strings: %s in %.2fs', load_reason, time_taken)
             W3StringManager.InstanceManager = w3StringManager
         return W3StringManager.InstanceManager
 
     @staticmethod
-    def BuildSourceSignature():
-        base_path = _refresh_strings_configuration_path()
-        return cache_meta.signature_w3strings(base_path, Configuration.TextLanguage)
+    def GetCachePath(language=None, create=True):
+        cache_language = str(language or Configuration.TextLanguage or "en")
+        cache_dir = os.path.join(get_cache_root(create=create), "W3Strings")
+        if create:
+            os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, f"string_cache_{cache_language}.pkl")
+
+    @staticmethod
+    def BuildSourceSignature(language=None, base_path=None):
+        cache_language = str(language or Configuration.TextLanguage or "en")
+        if base_path is None:
+            base_path = _refresh_strings_configuration_path()
+        else:
+            base_path = normalize_game_path(base_path)
+        return cache_meta.signature_w3strings(base_path, cache_language)
