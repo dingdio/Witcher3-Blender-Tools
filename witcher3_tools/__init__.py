@@ -412,6 +412,7 @@ from .importers import (
                                     import_rig,
                                     import_w2l,
                                     import_mesh,
+                                    entity_light,
                                     import_w2w,
                                     import_texarray
                                     )
@@ -5202,6 +5203,7 @@ _classes = [
 ]
 
 def register():
+    entity_light.register_driver_namespace()
     bpy.utils.register_class(PathItem)
     bpy.utils.register_class(UnrealProjectItem)
     bpy.utils.register_class(DlcMounterSourceItem)
@@ -5319,6 +5321,7 @@ def register():
 
 
 def unregister():
+    entity_light.unregister_driver_namespace()
     ui_map.import_blender_fun.unregister_deferred_material_load_handler()
     ui_map.unregister_view_lod_timer()
     # Safe no-op when dev features were never registered.

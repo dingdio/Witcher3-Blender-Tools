@@ -43,6 +43,7 @@ from ..CR2W.dc_entity import read_entity_template_appearance_metadata as _read_e
 from ..CR2W.dc_entity import is_valid_mesh_path
 from ..CR2W.dc_entity import _resolve_repo_path, _resolve_repo_paths_from_array
 from ..CR2W.CR2W_types import EngineTransform
+from ..CR2W.prop_utils import prop_to_string, read_enum_prop
 from ..animation.camera_tracks import setup_camera_preview_drivers
 from ..rigging.attachment import (
     bone_name_from_slot_index,
@@ -52,6 +53,7 @@ from ..rigging.attachment import (
 from ..importers.import_helpers import set_blender_object_transform
 from ..importers import import_isolation
 from . import entity_effects
+from .entity_light import configure_entity_light, orient_red_spot
 from ..duplication import duplicate_object_hierarchy
 from ..ui.ui_morphs import witcherui_add_redmorph, create_control_bone, create_morph_and_driver
 from ..CR2W.common_blender import repo_file, redkit_repo_context, win_safe_path
@@ -6168,6 +6170,11 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
 
                 for mesh in meshes:
                     add_chunk_metadata(mesh, chunk, mesh_path, component_name=component_name)
+                    _apply_drawable_shadow_flags(
+                        mesh,
+                        chunk.get("drawableFlags"),
+                        chunk.get("type", ""),
+                    )
                     _store_w2_head_metadata(mesh, chunk)
                     if mesh.name[-5:-1] == "_lod":
                         meshdict[chunk_ns + mesh.name[-5:]] = mesh
@@ -6464,6 +6471,42 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
     return constrains, objdict, meshdict, HardAttachments, root_skeleton, morphs_todo
 
 from mathutils import Euler, Matrix
+def _drawable_flags_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple, set)):
+        return "|".join(str(item).strip() for item in value if str(item).strip())
+    return str(read_enum_prop(value) or prop_to_string(value, default="") or "").strip()
+
+
+def _apply_drawable_shadow_flags(obj, value, component_type=""):
+    flags = _drawable_flags_text(value)
+    default = str(component_type or "") in {
+        "CDestructionComponent",
+        "CDestructionSystemComponent",
+    }
+    raw_value = getattr(value, "Value", value)
+    if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        raw_flags = int(raw_value)
+        local_only = bool(raw_flags & 1024)
+        casts_shadows = bool(raw_flags & (2 | 1024))
+    elif value is None:
+        local_only = False
+        casts_shadows = default
+    else:
+        flag_names = {
+            part for part in re.split(r"[\s,|;]+", flags) if part
+        }
+        local_only = "DF_CastShadowsFromLocalLightsOnly" in flag_names
+        casts_shadows = "DF_CastShadows" in flag_names or local_only
+    obj.visible_shadow = casts_shadows
+    obj["witcher_redkit_drawableFlags"] = flags or "Unset"
+    obj["witcher_drawableFlags_has_DF_CastShadows"] = casts_shadows
+    obj["witcher_drawableFlags_local_lights_only"] = local_only
+
+
 def _coerce_real(value, default=0.0):
     if value is None:
         return default
@@ -6478,60 +6521,26 @@ def _coerce_real(value, default=0.0):
         return default
 
 
-def _light_color_channel(color_value, channel_name, default=255.0):
-    if color_value is None:
-        return default
-    if isinstance(color_value, dict):
-        return _coerce_real(color_value.get(channel_name), default)
-    if hasattr(color_value, "get"):
-        try:
-            return _coerce_real(color_value.get(channel_name), default)
-        except Exception:
-            pass
-    return _coerce_real(getattr(color_value, channel_name, None), default)
-
-
 def _import_light_component(chunk):
     chunk_type = str(chunk.get("type", "") or "").strip()
     if chunk_type not in {"CPointLightComponent", "CSpotLightComponent"}:
         return None
 
-    light_kind = 'SPOT' if chunk_type == "CSpotLightComponent" else 'POINT'
-    bpy.ops.object.light_add(type=light_kind, radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
+    bpy.ops.object.light_add(type='POINT', radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
     light_obj = bpy.context.selected_objects[:][0]
     light_name = str(chunk.get("name", "") or "").strip()
     if light_name:
         light_obj.name = light_name
         light_obj.data.name = light_name
 
-    brightness = _coerce_real(chunk.get("brightness"), 0.0)
-    light_obj.data.energy = brightness * (3.0 if light_kind == 'SPOT' else 10.0)
-    light_obj["witcher_base_energy"] = float(light_obj.data.energy)
-
-    flicker = chunk.get("lightFlickering") or {}
-    if isinstance(flicker, dict):
-        light_obj["witcher_flicker_strength"] = _coerce_real(flicker.get("flickerStrength"), 0.0)
-        light_obj["witcher_flicker_position_offset"] = _coerce_real(flicker.get("positionOffset"), 0.0)
-
-    color_value = chunk.get("color")
-    light_obj.data.color[0] = _light_color_channel(color_value, "Red") / 255.0
-    light_obj.data.color[1] = _light_color_channel(color_value, "Green") / 255.0
-    light_obj.data.color[2] = _light_color_channel(color_value, "Blue") / 255.0
-
-    radius = _coerce_real(chunk.get("radius"), 0.0)
-    if radius > 0.0:
-        light_obj.data.shadow_soft_size = radius
+    configure_entity_light(light_obj, chunk, chunk_type, scene=bpy.context.scene)
 
     rt = _coerce_engine_transform(chunk.get("transform"))
     if rt is not None:
         set_blender_object_transform(light_obj, rt, rotate_180=False)
 
-    if light_kind == 'SPOT':
-        light_obj.rotation_euler.x += 1.5708
-        light_obj.data.spot_blend = 0.0
-        outer_angle = _coerce_real(chunk.get("outerAngle"), 0.0)
-        if outer_angle > 0.0:
-            light_obj.data.spot_size = outer_angle
+    if chunk_type == "CSpotLightComponent":
+        orient_red_spot(light_obj)
 
     return light_obj
 

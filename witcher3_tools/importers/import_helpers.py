@@ -214,6 +214,15 @@ def _resolve_static_mesh_chunk_path(meshChunk):
     if embedded_source_path and embedded_cmesh_chunk_index is not None:
         return str(embedded_source_path), int(embedded_cmesh_chunk_index)
 
+    component_type = str(getattr(meshChunk, "name", None) or getattr(meshChunk, "Type", None) or "")
+    if component_type == "CDestructionComponent":
+        destruction_path = _resolve_repo_path(meshChunk, "m_baseResource", ".reddest")
+        if destruction_path:
+            return destruction_path, None
+        raise MeshReferenceMissing(
+            f"{_chunk_debug_label(meshChunk)} has no m_baseResource destruction mesh"
+        )
+
     mesh_path = _resolve_repo_path(meshChunk, "mesh", ".w2mesh")
     if mesh_path:
         return _repair_w2_component_mesh_path(meshChunk, mesh_path), None

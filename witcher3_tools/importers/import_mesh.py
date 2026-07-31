@@ -1275,7 +1275,7 @@ def import_mesh(filename:str,
     collision_seconds = 0.0
     dirpath, file = os.path.split(filename)
     basename, ext = os.path.splitext(file)
-    if ext.lower() in ('.w2mesh', '.w2ent') or embedded_cmesh_chunk_index is not None:
+    if ext.lower() in ('.w2mesh', '.w2ent', '.reddest') or embedded_cmesh_chunk_index is not None:
         with open(win_safe_path(filename), "rb") as _mesh_file:
             try:
                 parse_started = time.perf_counter()

@@ -346,6 +346,25 @@ def _curve_color(value, default) -> tuple[float, float, float]:
     return tuple((max(0.0, component / scale) ** 2.2) * intensity for component in rgba[:3])
 
 
+def _entity_light_color_groups(base_environment, overlay_environment, blend, seconds):
+    from ..importers.entity_light import ENV_COLOR_GROUPS, environment_group_curve_suffix
+
+    return {
+        group: _curve_color(
+            _blend_curve_value(
+                base_environment,
+                overlay_environment,
+                blend,
+                seconds,
+                (environment_group_curve_suffix(group),),
+                (255.0, 255.0, 255.0, 1.0),
+            ),
+            (255.0, 255.0, 255.0, 1.0),
+        )
+        for group in ENV_COLOR_GROUPS
+    }
+
+
 def _linear_color(value, default) -> tuple[float, float, float]:
     """Convert a packed color to linear RGB while preserving intensity."""
 
@@ -1105,6 +1124,12 @@ def _preview_values(scene) -> dict[str, Any]:
         "ambient_color": ambient_color,
         "ambient_energy": ambient_energy,
         "camera_lights": camera_lights,
+        "entity_light_color_groups": _entity_light_color_groups(
+            base_environment,
+            overlay_environment,
+            weather_blend,
+            seconds,
+        ),
         "tone_exposure_ev": tone_exposure_ev,
         "tone_curve_parameters": tone_curve_parameters,
         "tone_post_scale": max(0.0, float(tone_post_scale)),
@@ -1182,13 +1207,17 @@ def _refresh_preview(context, *, ensure: bool = False, quiet: bool = False):
         return None
     values = _preview_values(scene)
     eye_blick_color = values.pop("eye_blick_color", (1.0, 1.0, 1.0))
+    entity_light_color_groups = values.pop("entity_light_color_groups", {})
     preview = _preview_module()
     if ensure:
         result = preview.ensure_preview(context, **values)
     else:
         result = preview.update_preview(context, **values)
     from ..materials.material import set_eye_blick_environment_color
+    from ..importers.entity_light import apply_environment_light_groups
+
     set_eye_blick_environment_color(eye_blick_color, scene=scene)
+    apply_environment_light_groups(scene, entity_light_color_groups)
     if not quiet:
         warnings = tuple(getattr(result, "warnings", ()) or ())
         if warnings:
@@ -1404,6 +1433,9 @@ def sync_world_import(context, world_file, file_path: str) -> EnvironmentUIResul
             warnings = _store_world(scene, world, resolved, load_references=True)
         else:
             world, resolved, warnings = _load_world(scene, file_path, load_references=True)
+        if settings.preview_enabled:
+            _refresh_preview(context, ensure=True, quiet=True)
+            _show_environment_in_viewports(context)
         details = f"World: {resolved}"
         if warnings:
             details += "\n\nReferenced sources:\n" + "\n".join(warnings)

@@ -650,7 +650,7 @@ def _collect_bundle_extract_items(bundle_manager, filepath: str):
     base_item = bundle_manager.find_item_by_hash(filepath)
     if base_item:
         items.append((filepath, base_item))
-    if filepath.endswith('.w2mesh') or filepath.endswith('.w2anims'):
+    if filepath.endswith((".w2mesh", ".w2anims", ".reddest")):
         items.extend(_collect_buffer_sidecar_items(bundle_manager, filepath))
     return items
 
@@ -1339,13 +1339,7 @@ def repo_file(filepath: str, version = 999, is_abs_path = False):
         return abs_filename
 
 def extract_missing_buffers(abs_w2anims_path: str, required_index: int | None = None) -> set[int]:
-    """Extract any missing .N.buffer sidecar files for a .w2anims/.w2mesh.
-
-    Called on-demand by dc_anims when a specific buffer is missing, NOT on
-    every repo_file call. If required_index is provided, only that sidecar is
-    probed and extracted; otherwise all missing sidecars are extracted in one
-    pass so the bundle manager is only loaded once.
-    """
+    """Extract missing .N.buffer sidecars from cooked bundles."""
     extracted = set()
     _, uncook_path, _, _ = _get_repo_roots_from_prefs()
     if not uncook_path:

@@ -42,8 +42,8 @@ _WORLD_LAYER_INDEX_CACHE = {}
 _WORLD_LAYER_RUNTIME_CACHE = {}
 _LAYER_VISIBILITY_CACHE = {}
 _DEFAULT_HIDDEN_GROUP_CACHE = {}
-# 10: invalidate caches built with a partially-read pathhashes.csv (raw hash ints as repo paths)
-_WORLD_LAYER_SCAN_CACHE_VERSION = 10
+# 15: refreshed entities, lights, and native REDdest meshes
+_WORLD_LAYER_SCAN_CACHE_VERSION = 15
 _WORLD_LAYER_SPATIAL_CELL_SIZE = 10.0
 _LAYER_SCAN_BATCH_SIZE = 16
 _LAYER_LOAD_BATCH_SIZE = 8
@@ -177,7 +177,7 @@ def _layer_load_mode_signature_for_scene(scene_settings):
     regex = settings.get("do_name_filter_regex", "") if settings.get("do_enable_name_filter") else ""
     return (
         f"dev_empty={int(dev_empty_only)}"
-        f";transform={int(getattr(import_blender_fun, 'CACHED_LAYER_TRANSFORM_MODE_VERSION', 7))}"
+        f";transform={int(getattr(import_blender_fun, 'CACHED_LAYER_TRANSFORM_MODE_VERSION', 11))}"
         f";mesh={int(settings.get('do_import_Mesh', True))}"
         f";proxy_mesh={int(settings.get('do_import_ProxyMesh', False))}"
         f";collision={int(settings.get('do_import_Collision', True))}"
@@ -2085,6 +2085,11 @@ def _manifest_item_position(item):
         x = float(position[0])
         y = float(position[1])
         z = float(position[2]) if len(position) > 2 else 0.0
+        if not all(math.isfinite(value) for value in (x, y, z)):
+            return None
+        cell_x, cell_y = _spatial_cell_key(x, y, _WORLD_LAYER_SPATIAL_CELL_SIZE)
+        if not all(-(1 << 63) <= cell < (1 << 63) for cell in (cell_x, cell_y)):
+            return None
         return (x, y, z)
     except Exception:
         return None
@@ -2736,6 +2741,7 @@ def _summarize_level_exports_for_fast_scan(export_names):
         or has_sector_data
         or has_foliage
         or has_template_chunk
+        or (top_level_type == "CLayer" and len(names) > 1)
     )
     return {
         "top_level_type": top_level_type,
@@ -4856,6 +4862,11 @@ def _layer_covered_by_previous_load(collection, camera_position, radius, mode_si
         return False
     state = str(collection.get("witcher_layer_import_state", "") or "").strip().lower()
     if state not in _LAYER_COVERED_STATES:
+        return False
+    if (
+        state in {"partial", "proxy_partial"}
+        and int(collection.get("witcher_layer_import_errors", 0) or 0) > 0
+    ):
         return False
     if collection.get("witcher_layer_load_radius") is None:
         return False

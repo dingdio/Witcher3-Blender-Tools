@@ -2,11 +2,13 @@ import logging
 from pathlib import Path
 import re
 from ..CR2W.CR2W_helpers import Enums
-from ..CR2W.CR2W_types import Entity_Type_List
+from ..CR2W.CR2W_types import is_entity_chunk
+from ..CR2W.prop_utils import read_prop_value
 import bpy
 from bpy.app.handlers import persistent
 import os
 from ..importers.import_helpers import MatrixToArray, MeshReferenceMissing, checkLevel, meshPath, set_blender_object_transform, _transform_real
+from ..importers.entity_light import configure_entity_light, orient_red_spot
 from mathutils import Matrix, Euler
 from math import radians
 import time
@@ -17,7 +19,7 @@ _MESH_IMPORT_TIMING_ENABLED = True
 _MESH_IMPORT_WARN_THRESHOLD = 0.25
 _LAYER_IMPORT_PROFILE_ENABLED = True
 _LAYER_IMPORT_PROFILE_WARN_THRESHOLD = 0.25
-CACHED_LAYER_TRANSFORM_MODE_VERSION = 7
+CACHED_LAYER_TRANSFORM_MODE_VERSION = 11
 
 from .. import fbx_util
 from .. import get_uncook_path
@@ -428,6 +430,46 @@ def _drawable_flags_visible_from_value(flags, default=True):
         return bool(default)
 
 
+def _drawable_flags_cast_shadows_from_value(flags, default=False):
+    if flags is None:
+        return bool(default)
+    if hasattr(flags, "strings"):
+        return _drawable_flags_cast_shadows_from_value(getattr(flags, "strings", None), default=default)
+    if hasattr(flags, "Value"):
+        return _drawable_flags_cast_shadows_from_value(getattr(flags, "Value", None), default=default)
+    if isinstance(flags, (list, tuple, set)):
+        values = {str(value or "").strip() for value in flags}
+        return bool({"DF_CastShadows", "DF_CastShadowsFromLocalLightsOnly"} & values)
+    if isinstance(flags, str):
+        values = {part for part in re.split(r"[\s,|;]+", flags.strip()) if part}
+        return bool({"DF_CastShadows", "DF_CastShadowsFromLocalLightsOnly"} & values)
+    try:
+        return bool(int(flags) & (2 | 1024))
+    except Exception:
+        return bool(default)
+
+
+def _drawable_flags_local_only_from_value(flags):
+    if flags is None:
+        return False
+    if hasattr(flags, "strings"):
+        return _drawable_flags_local_only_from_value(getattr(flags, "strings", None))
+    if hasattr(flags, "Value"):
+        return _drawable_flags_local_only_from_value(getattr(flags, "Value", None))
+    if isinstance(flags, (list, tuple, set)):
+        return "DF_CastShadowsFromLocalLightsOnly" in {
+            str(value or "").strip() for value in flags
+        }
+    if isinstance(flags, str):
+        return "DF_CastShadowsFromLocalLightsOnly" in {
+            part for part in re.split(r"[\s,|;]+", flags.strip()) if part
+        }
+    try:
+        return bool(int(flags) & 1024)
+    except Exception:
+        return False
+
+
 def _component_drawable_flags(component):
     prop = None
     try:
@@ -475,6 +517,34 @@ def _component_display_label(component):
 
 def _component_action_name(component):
     return _component_prop_string(component, "actionName")
+
+
+_ENTITY_LIGHT_PROPERTY_NAMES = (
+    "radius",
+    "brightness",
+    "attenuation",
+    "color",
+    "envColorGroup",
+    "shadowCastingMode",
+    "lightFlickering",
+    "lightUsageMask",
+    "isEnabled",
+    "innerAngle",
+    "outerAngle",
+    "softness",
+)
+
+
+def _component_light_properties(component):
+    values = {}
+    for prop_name in _ENTITY_LIGHT_PROPERTY_NAMES:
+        try:
+            prop = component.GetVariableByName(prop_name)
+        except Exception:
+            prop = None
+        if prop is not None:
+            values[prop_name] = read_prop_value(prop, ())
+    return values
 
 
 def _entity_prop_string(entity, prop_name):
@@ -547,6 +617,17 @@ def _set_redkit_component_metadata(
             obj["witcher_redkit_actionName"] = str(action_name)
         drawable_flags_text = _drawable_flags_display_value(drawable_flags)
         obj["witcher_redkit_drawableFlags"] = drawable_flags_text if drawable_flags_text else "Unset"
+        shadow_default = str(component_type or "") in {
+            "CDestructionComponent",
+            "CDestructionSystemComponent",
+        }
+        obj["witcher_drawableFlags_has_DF_CastShadows"] = _drawable_flags_cast_shadows_from_value(
+            drawable_flags,
+            default=shadow_default,
+        )
+        obj["witcher_drawableFlags_local_lights_only"] = _drawable_flags_local_only_from_value(
+            drawable_flags,
+        )
         if engine_visible is not None:
             obj["witcher_layer_engine_visible"] = bool(engine_visible)
             obj["witcher_drawableFlags_has_DF_IsVisible"] = bool(engine_visible)
@@ -886,6 +967,7 @@ def _import_component_mesh_from_mesh(
         kwargs,
         drawable_flags=drawable_flags,
     )
+    _tag_object_tree_drawable_shadows(component_obj, drawable_flags, component_type)
     _set_redkit_component_metadata(
         component_obj,
         component_type,
@@ -1100,15 +1182,54 @@ def _redapex_import_options(kwargs):
     }
 
 
-def _chunk_cloth_resource(chunk):
+def _cloth_import_failure_reason(root_obj):
+    if root_obj is None:
+        return "returned no object"
     try:
-        resource_var = chunk.GetVariableByName('resource') or chunk.GetVariableByName('m_resource')
-        handles = getattr(resource_var, "Handles", None) or []
-        if handles:
-            return str(getattr(handles[0], "DepotPath", "") or "").strip()
+        failed_resource = str(root_obj.get("witcher_import_error", "") or "").strip()
     except Exception:
-        pass
+        failed_resource = ""
+    if failed_resource:
+        return f"returned an error placeholder for {failed_resource}"
     return ""
+
+
+def _apply_cached_destruction_metadata(root_obj, item, kwargs=None):
+    component_type = str(item.get("component_type", "") or "").strip()
+    if component_type not in {"CDestructionComponent", "CDestructionSystemComponent"}:
+        return
+    drawable_flags = item.get("drawable_flags") if "drawable_flags" in item else None
+    engine_visible = item.get("engine_visible") if "engine_visible" in item else True
+    _tag_object_tree_drawable_shadows(root_obj, drawable_flags, component_type)
+    _tag_object_tree_engine_visibility(
+        root_obj,
+        engine_visible,
+        kwargs,
+        drawable_flags=drawable_flags,
+    )
+    _set_redkit_component_metadata(
+        root_obj,
+        component_type,
+        component_name=str(item.get("component_name", "") or ""),
+        drawable_flags=drawable_flags,
+        engine_visible=engine_visible,
+        action_name=str(item.get("action_name", "") or ""),
+    )
+
+
+def _chunk_cloth_resource(chunk):
+    for property_name in ("resource", "m_resource"):
+        try:
+            resource_var = chunk.GetVariableByName(property_name)
+            handles = getattr(resource_var, "Handles", None) or []
+            if handles:
+                resource = str(getattr(handles[0], "DepotPath", "") or "").strip()
+                if resource:
+                    return resource
+        except Exception:
+            continue
+    return ""
+
 
 def _new_mesh_path(
     mesh_name=False,
@@ -1442,6 +1563,7 @@ def _add_level_import_plan_item(
     component_type="",
     component_name="",
     action_name="",
+    light_properties=None,
     cr2w_version=None,
     mesh_uncook_path=None,
 ):
@@ -1484,6 +1606,8 @@ def _add_level_import_plan_item(
         item["component_name"] = str(component_name)
     if action_name:
         item["action_name"] = str(action_name)
+    if light_properties:
+        item.update(light_properties)
     if cr2w_version is not None:
         item["cr2w_version"] = _mesh_cr2w_version(None, cr2w_version)
     if mesh_uncook_path:
@@ -1993,9 +2117,16 @@ def _import_cached_plan_redcloth_items(plan, target_collection, kwargs, context=
             if errors is not None:
                 errors.append(f"Problem with cached {resource_label} import {resource}: {exc}")
             continue
-        if cloth_arma is None:
+        failure_reason = _cloth_import_failure_reason(cloth_arma)
+        if failure_reason:
+            resource_label = "redapex" if _is_redapex_resource(resource) else "redcloth"
+            message = f"Problem with cached {resource_label} import {resource}: {failure_reason}"
+            log.warning("%s", message)
+            if errors is not None:
+                errors.append(message)
             continue
         root_obj = cloth_grp if cloth_grp is not None else cloth_arma
+        _apply_cached_destruction_metadata(root_obj, item, kwargs)
         _apply_requested_proxy_helper_visibility(root_obj, kwargs)
         if parent_obj is not None:
             root_obj.parent = parent_obj
@@ -2139,31 +2270,39 @@ def _import_cached_plan_light_item(
     item_id,
     mode_signature,
 ):
-    light_type = "SPOT" if kind in {"spot_light", "component_spot_light"} else "POINT"
+    component_light = kind in {"component_point_light", "component_spot_light"}
+    light_type = "SPOT" if kind == "spot_light" else "POINT"
     name = str(item.get("name", "") or light_type.title())
     light_data = bpy.data.lights.new(name, type=light_type)
-    brightness = _cached_plan_float(item, "brightness", 1.0)
-    default_multiplier = 3.0 if light_type == "SPOT" else 10.0
-    light_data.energy = _cached_plan_float(item, "energy", brightness * default_multiplier)
-    light_data.color = _cached_plan_light_color(item)
+    if not component_light:
+        brightness = _cached_plan_float(item, "brightness", 1.0)
+        default_multiplier = 3.0 if light_type == "SPOT" else 10.0
+        light_data.energy = _cached_plan_float(item, "energy", brightness * default_multiplier)
+        light_data.color = _cached_plan_light_color(item)
 
-    if item.get("radius") is not None:
-        radius_value = _cached_plan_float(item, "radius", 0.0)
-        if kind in {"point_light", "spot_light"}:
-            radius_value /= 255.0
-        light_data.shadow_soft_size = max(0.0, radius_value)
+        if item.get("radius") is not None:
+            radius_value = _cached_plan_float(item, "radius", 0.0) / 255.0
+            light_data.shadow_soft_size = max(0.0, radius_value)
 
-    if light_type == "SPOT":
-        light_data.spot_blend = _cached_plan_float(item, "spot_blend", 0.0)
-        if item.get("outer_angle") is not None:
-            light_data.spot_size = _cached_plan_float(item, "outer_angle", light_data.spot_size)
+        if light_type == "SPOT":
+            light_data.spot_blend = _cached_plan_float(item, "spot_blend", 0.0)
+            if item.get("outer_angle") is not None:
+                light_data.spot_size = _cached_plan_float(item, "outer_angle", light_data.spot_size)
 
     light_obj = bpy.data.objects.new(name, light_data)
     target_collection.objects.link(light_obj)
     if parent_obj is not None:
         light_obj.parent = parent_obj
     _apply_plan_item_transform_for_parent(light_obj, item, parent_obj)
-    if light_type == "SPOT":
+    if component_light:
+        component_type = str(
+            item.get("component_type", "")
+            or ("CSpotLightComponent" if kind == "component_spot_light" else "CPointLightComponent")
+        )
+        configure_entity_light(light_obj, item, component_type, scene=bpy.context.scene)
+        if component_type == "CSpotLightComponent":
+            orient_red_spot(light_obj)
+    elif light_type == "SPOT":
         light_obj.rotation_euler.x += 1.5708
     _tag_single_object_for_layer(light_obj, owner_tag)
     _tag_object_tree_for_plan_item(light_obj, item_id, mode_signature)
@@ -3455,9 +3594,15 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 log.warning("Problem with cached %s import %s: %s", resource_label, resource, exc)
                 errors.append(f"Problem with cached {resource_label} import {resource}: {exc}")
                 continue
-            if cloth_arma is None:
+            failure_reason = _cloth_import_failure_reason(cloth_arma)
+            if failure_reason:
+                resource_label = "redapex" if _is_redapex_resource(resource) else "redcloth"
+                message = f"Problem with cached {resource_label} import {resource}: {failure_reason}"
+                log.warning("%s", message)
+                errors.append(message)
                 continue
             root_obj = cloth_grp if cloth_grp is not None else cloth_arma
+            _apply_cached_destruction_metadata(root_obj, item, kwargs)
             _apply_requested_proxy_helper_visibility(root_obj, kwargs)
             if parent_obj is not None:
                 root_obj.parent = parent_obj
@@ -3746,7 +3891,11 @@ def _resolve_component_import_plan(
         transform_prop = None
     transform = getattr(transform_prop, "EngineTransform", None) if transform_prop else None
 
-    if component_name in {"CMeshComponent", "CStaticMeshComponent"}:
+    if component_name in {
+        "CMeshComponent",
+        "CStaticMeshComponent",
+        "CDestructionComponent",
+    }:
         component_label = _component_prop_string(component, "name")
         action_name = _component_action_name(component)
         try:
@@ -3806,20 +3955,24 @@ def _resolve_component_import_plan(
         return _add_level_import_plan_item(
             plan,
             "component_point_light",
-            "PointLightComponent",
+            _component_prop_string(component, "name") or "PointLightComponent",
             parent_id=parent_id,
             transform=transform,
             world_position=world_position,
+            component_type=component_name,
+            light_properties=_component_light_properties(component),
         )
 
     if component_name == "CSpotLightComponent":
         return _add_level_import_plan_item(
             plan,
             "component_spot_light",
-            "SpotLightComponent",
+            _component_prop_string(component, "name") or "SpotLightComponent",
             parent_id=parent_id,
             transform=transform,
             world_position=world_position,
+            component_type=component_name,
+            light_properties=_component_light_properties(component),
         )
 
     return None
@@ -3857,6 +4010,7 @@ def _resolve_gameplay_entity_import_plan(
     supported_component_names = {
         "CMeshComponent",
         "CStaticMeshComponent",
+        "CDestructionComponent",
         "CPointLightComponent",
         "CSpotLightComponent",
     }
@@ -4019,24 +4173,20 @@ def _resolve_gameplay_entity_import_plan(
 
     for chunk in cloth_list:
         cloth_name = getattr(ENTITY_OBJECT, "name", "") or "Cloth"
-        cloth_resource = ""
+        cloth_resource = _chunk_cloth_resource(chunk)
         try:
             name_var = chunk.GetVariableByName('name')
             cloth_name = str(getattr(getattr(name_var, "String", None), "String", "") or "").strip() or cloth_name
         except Exception:
             pass
-        try:
-            resource_var = chunk.GetVariableByName('resource')
-            handles = getattr(resource_var, "Handles", None) or []
-            if handles:
-                cloth_resource = str(getattr(handles[0], "DepotPath", "") or "").strip()
-        except Exception:
-            cloth_resource = ""
         transform_prop = None
         try:
             transform_prop = chunk.GetVariableByName('transform')
         except Exception:
             transform_prop = None
+        component_type = str(getattr(chunk, "name", "") or "").strip()
+        component_name = _component_prop_string(chunk, "name")
+        drawable_flags = _component_drawable_flags(chunk)
         _add_level_import_plan_item(
             plan,
             "cloth",
@@ -4045,6 +4195,11 @@ def _resolve_gameplay_entity_import_plan(
             repo_path=cloth_resource,
             transform=getattr(transform_prop, "EngineTransform", None) if transform_prop else None,
             world_position=_chunk_world_position(chunk, anchor_position),
+            drawable_flags=drawable_flags,
+            engine_visible=_drawable_flags_visible_from_value(drawable_flags, default=True),
+            component_type=component_type,
+            component_name=component_name,
+            action_name=_component_action_name(chunk),
         )
 
     for component in eligible_components:
@@ -4084,7 +4239,7 @@ def _resolve_gameplay_entity_import_plan(
                 )
                 for INCLUDE_OBJECT in template.includes:
                     for inc_entity in getattr(INCLUDE_OBJECT, "Entities", []) or []:
-                        if inc_entity.type in Entity_Type_List:
+                        if is_entity_chunk(inc_entity):
                             _resolve_gameplay_entity_import_plan(
                                 plan,
                                 inc_entity,
@@ -4344,7 +4499,7 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
     if do_import_Entity:
         for INCLUDE_OBJECT in levelData.includes:
             for ENTITY_OBJECT in INCLUDE_OBJECT.Entities:
-                if ENTITY_OBJECT.type in Entity_Type_List:
+                if is_entity_chunk(ENTITY_OBJECT):
                     _resolve_gameplay_entity_import_plan(
                         plan,
                         ENTITY_OBJECT,
@@ -4357,7 +4512,7 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
 
         for ENTITY_OBJECT in levelData.Entities:
             if re.search(do_name_filter_regex, ENTITY_OBJECT.name) if do_enable_name_filter else True:
-                if ENTITY_OBJECT.type in Entity_Type_List:
+                if is_entity_chunk(ENTITY_OBJECT):
                     _resolve_gameplay_entity_import_plan(
                         plan,
                         ENTITY_OBJECT,
@@ -4574,6 +4729,28 @@ def _tag_object_tree_engine_visibility(root_obj, visible, kwargs=None, *, drawab
             elif visible and _hide_engine_hidden_meshes_enabled(kwargs):
                 obj.hide_viewport = False
                 obj.hide_render = False
+        except Exception:
+            continue
+
+
+def _tag_object_tree_drawable_shadows(root_obj, drawable_flags, component_type=""):
+    default = str(component_type or "") in {
+        "CDestructionComponent",
+        "CDestructionSystemComponent",
+    }
+    casts_shadows = _drawable_flags_cast_shadows_from_value(
+        drawable_flags,
+        default=default,
+    )
+    local_only = _drawable_flags_local_only_from_value(drawable_flags)
+    flags_text = _drawable_flags_display_value(drawable_flags) or "Unset"
+    for obj in _iter_object_tree(root_obj):
+        try:
+            obj["witcher_redkit_drawableFlags"] = flags_text
+            obj["witcher_drawableFlags_has_DF_CastShadows"] = casts_shadows
+            obj["witcher_drawableFlags_local_lights_only"] = local_only
+            if obj.type == "MESH":
+                obj.visible_shadow = casts_shadows
         except Exception:
             continue
 
@@ -5140,7 +5317,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                         _raise_if_layer_import_cancelled(kwargs)
                         for ENTITY_OBJECT in INCLUDE_OBJECT.Entities:
                             _raise_if_layer_import_cancelled(kwargs)
-                            if ENTITY_OBJECT.type in Entity_Type_List:
+                            if is_entity_chunk(ENTITY_OBJECT):
                                 imported_entity = import_gameplay_entity(
                                     ENTITY_OBJECT,
                                     errors,
@@ -5152,7 +5329,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
 
                     top_level_entity_total = sum(
                         1 for entity in levelData.Entities
-                        if getattr(entity, "type", None) in Entity_Type_List
+                        if is_entity_chunk(entity)
                     )
                     total_loops = len(levelData.Entities)
                     for idx, ENTITY_OBJECT in enumerate(levelData.Entities):
@@ -5163,7 +5340,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                         )
                         if name_matches:
                             progress_msg = f"{idx+1}/{total_loops} - {ENTITY_OBJECT.name}"
-                            if ENTITY_OBJECT.type in Entity_Type_List:
+                            if is_entity_chunk(ENTITY_OBJECT):
                                 imported_entity = import_gameplay_entity(
                                     ENTITY_OBJECT,
                                     errors,
@@ -6098,7 +6275,11 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
         pass
     embedded_cmesh_chunk_index = _embedded_cmesh_chunk_index(mesh)
     scene_repo_key = _mesh_scene_repo_key(mesh_name, embedded_cmesh_chunk_index)
-    use_fbx = get_use_fbx_repo(bpy.context) and embedded_cmesh_chunk_index is None
+    use_fbx = (
+        get_use_fbx_repo(bpy.context)
+        and embedded_cmesh_chunk_index is None
+        and not mesh_name.lower().endswith(".reddest")
+    )
     import_seconds = 0.0
     finalize_seconds = 0.0
     transform_seconds = 0.0
@@ -6366,6 +6547,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
 
 MeshComponent_Type_List = ['CStaticMeshComponent',
                             'CMeshComponent',
+                            'CDestructionComponent',
                             'CRigidMeshComponent',
                             "CBgMeshComponent",
                             "CBgNpcItemComponent",
@@ -6386,7 +6568,7 @@ def getDataBufferMesh(entity, *, mesh_fbx_uncook_path=None, mesh_uncook_path=Non
     cloth_list = []
     if hasattr(entity, "streamingDataBuffer") and entity.streamingDataBuffer:
         for chunk in entity.streamingDataBuffer.CHUNKS.CHUNKS:
-            if chunk.name in Entity_Type_List:
+            if is_entity_chunk(chunk):
                 log.info("Found an entity in data buffer??")
             if chunk.name in MeshComponent_Type_List:
                 try:
@@ -6415,7 +6597,11 @@ def getDataBufferMesh(entity, *, mesh_fbx_uncook_path=None, mesh_uncook_path=Non
 from .. import get_witcher2_game_path
 
 def import_single_component(component, parent_obj, keep_lod_meshes = False, **kwargs):
-    if component.name == "CMeshComponent" or component.name == "CStaticMeshComponent":
+    if component.name in {
+        "CMeshComponent",
+        "CStaticMeshComponent",
+        "CDestructionComponent",
+    }:
         try:
             component_type = component.name
             component_name = _component_prop_string(component, "name")
@@ -6467,69 +6653,32 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False, **kw
         except Exception as e:
             log.exception("import_single_component mesh fail: %s", e) #w2 has embedded here??
             raise
-    elif component.name == "CPointLightComponent":
-        if not bool(kwargs.get("do_import_PointLight", True)):
-            return
+    elif component.name in {"CPointLightComponent", "CSpotLightComponent"}:
+        option_name = (
+            "do_import_SpotLight"
+            if component.name == "CSpotLightComponent"
+            else "do_import_PointLight"
+        )
+        if not bool(kwargs.get(option_name, True)):
+            return None
         bpy.ops.object.light_add(type='POINT', radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
         light_obj = bpy.context.selected_objects[:][0]
         light_obj.parent = parent_obj
-        if component.GetVariableByName('brightness'):
-            light_obj.data.energy = component.GetVariableByName('brightness').Value * 10
-
-        
-        COLOR = component.GetVariableByName('color')
-        if COLOR:
-            for color in COLOR.More:
-                if color.theName == "Red":
-                    light_obj.data.color[0] = color.Value/255
-                elif color.theName == "Green":
-                    light_obj.data.color[1] = color.Value/255
-                elif color.theName == "Blue":
-                    light_obj.data.color[2] = color.Value/255
-                elif color.theName == "Alpha":
-                    pass # do some custom val?
-                    #light_obj.data.color[3] = color.Value/255
-        RADIUS = component.GetVariableByName('radius')
-        if RADIUS:
-            light_obj.data.shadow_soft_size = RADIUS.Value
-        if component.GetVariableByName('transform'):
-            set_blender_object_transform(light_obj, component.GetVariableByName('transform').EngineTransform)
-        return light_obj
-    
-    elif component.name == "CSpotLightComponent":
-        if not bool(kwargs.get("do_import_SpotLight", True)):
-            return
-        bpy.ops.object.light_add(type='SPOT', radius=1, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
-        light_obj = bpy.context.selected_objects[:][0]
-        light_obj.parent = parent_obj
-        light_obj.data.energy = component.GetVariableByName('brightness').Value * 3
-
-        COLOR = component.GetVariableByName('color')
-        if COLOR:
-            for color in COLOR.More:
-                if color.theName == "Red":
-                    light_obj.data.color[0] = color.Value/255
-                elif color.theName == "Green":
-                    light_obj.data.color[1] = color.Value/255
-                elif color.theName == "Blue":
-                    light_obj.data.color[2] = color.Value/255
-                elif color.theName == "Alpha":
-                    pass # do some custom val?
-                    #light_obj.data.color[3] = color.Value/255
-        RADIUS = component.GetVariableByName('radius')
-        if RADIUS:
-            light_obj.data.shadow_soft_size = RADIUS.Value
-        if component.GetVariableByName('transform'):
-            set_blender_object_transform(light_obj, component.GetVariableByName('transform').EngineTransform)
-            #TODO should add 90 to X in every spotlight so it matches engine
-            rotation_euler = light_obj.rotation_euler
-            rotation_euler.x += 1.5708  # 90 degrees in radians
-            light_obj.rotation_euler = rotation_euler
-
-        #light_obj.data.spot_blend = component.GetVariableByName('innerAngle').Value
-        light_obj.data.spot_blend = 0
-        light_obj.data.spot_size = component.GetVariableByName('outerAngle').Value
-        #light_obj.data.spot_size = component.GetVariableByName('softness').Value
+        name = _component_prop_string(component, "name")
+        if name:
+            light_obj.name = name
+            light_obj.data.name = name
+        configure_entity_light(
+            light_obj,
+            _component_light_properties(component),
+            component.name,
+            scene=bpy.context.scene,
+        )
+        transform = component.GetVariableByName('transform')
+        if transform:
+            set_blender_object_transform(light_obj, transform.EngineTransform)
+        if component.name == "CSpotLightComponent":
+            orient_red_spot(light_obj)
         return light_obj
 
 def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_meshes = False, **kwargs):
@@ -6565,6 +6714,7 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
     supported_component_names = {
         "CMeshComponent",
         "CStaticMeshComponent",
+        "CDestructionComponent",
         "CPointLightComponent",
         "CSpotLightComponent",
     }
@@ -6771,6 +6921,7 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
         target_collection = entity_target_collection or _get_active_collection()
         for chunk in cloth_list:
             _raise_if_layer_import_cancelled(kwargs)
+            resource = ""
             try:
                 resource = _chunk_cloth_resource(chunk)
                 if _is_redapex_resource(resource):
@@ -6801,24 +6952,54 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
                         hide_collision_proxies=bool(kwargs.get("hide_proxy_meshes", False)),
                     )
                     root_obj = cloth_grp if cloth_grp is not None else cloth_arma
+                failure_reason = _cloth_import_failure_reason(cloth_arma)
+                if failure_reason:
+                    resource_label = "redapex" if _is_redapex_resource(resource) else "redcloth"
+                    message = f"Problem with {resource_label} import {resource}: {failure_reason}"
+                    log.warning("%s", message)
+                    errors.append(message)
+                    continue
                 if target_collection is not None:
                     _activate_collection(bpy.context, target_collection)
                 if cloth_arma:
                     if root_obj is not None:
                         root_obj.parent = empty_transform
+                        component_type = str(getattr(chunk, "name", "") or "").strip()
                         try:
                             transform_prop = chunk.GetVariableByName('transform')
                         except Exception:
                             transform_prop = None
-                        if transform_prop is not None:
-                            try:
-                                _apply_engine_transform_local(root_obj, getattr(transform_prop, "EngineTransform", None))
-                            except Exception:
-                                pass
+                        try:
+                            _apply_engine_transform_local(
+                                root_obj,
+                                getattr(transform_prop, "EngineTransform", None) if transform_prop else None,
+                            )
+                        except Exception:
+                            pass
+                        if component_type in {"CDestructionComponent", "CDestructionSystemComponent"}:
+                            drawable_flags = _component_drawable_flags(chunk)
+                            engine_visible = _drawable_flags_visible_from_value(drawable_flags, default=True)
+                            _tag_object_tree_drawable_shadows(root_obj, drawable_flags, component_type)
+                            _tag_object_tree_engine_visibility(
+                                root_obj,
+                                engine_visible,
+                                kwargs,
+                                drawable_flags=drawable_flags,
+                            )
+                            _set_redkit_component_metadata(
+                                root_obj,
+                                component_type,
+                                component_name=_component_prop_string(chunk, "name"),
+                                drawable_flags=drawable_flags,
+                                engine_visible=engine_visible,
+                                action_name=_component_action_name(chunk),
+                            )
                     imported_any = True
             except Exception as e:
-                resource_label = "redapex" if _is_redapex_resource(resource if 'resource' in locals() else "") else "cloth"
-                log.warning("Problem with %s import: %s", resource_label, e)
+                resource_label = "redapex" if _is_redapex_resource(resource) else "cloth"
+                message = f"Problem with {resource_label} import {resource}: {e}"
+                log.warning("%s", message)
+                errors.append(message)
     
     for component in eligible_components:
         _raise_if_layer_import_cancelled(kwargs)
@@ -6861,7 +7042,7 @@ def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_m
                     _raise_if_layer_import_cancelled(kwargs)
                     for inc_entity in INCLUDE_OBJECT.Entities:
                         _raise_if_layer_import_cancelled(kwargs)
-                        if inc_entity.type in Entity_Type_List:
+                        if is_entity_chunk(inc_entity):
                             imported_child = import_gameplay_entity(
                                 inc_entity,
                                 errors,

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .common_blender import repo_file, redkit_repo_context
 from .CR2W_file import create_level, read_CR2W
-from .CR2W_types import Entity_Type_List, getCR2W
+from .CR2W_types import Entity_Type_List, getCR2W, is_entity_chunk
 from .bStream import bStream, bReadStream
 from .prop_utils import prop_to_string
 from .read_json_w3 import readCSkeletonData
@@ -2861,7 +2861,7 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
             if (chunk.GetVariableByName("parentSlot")):
                 chunk_append(new_mesh, chunk, CHardAttachment(chunk).convert_for_io())
         else:
-            if chunk.Type in _KNOWN_STRUCTURAL_CHUNKS:
+            if chunk.Type in _KNOWN_STRUCTURAL_CHUNKS or is_entity_chunk(chunk):
                 log.debug("Skipping structural chunk in ReadTemplate: %s", chunk.Type)
             else:
                 _log_unknown_character_chunk(
@@ -3160,7 +3160,7 @@ def create_CEntity(file, _inherit_visited=None):
             selected_root = cooked_root if cooked_root is not None else editor_root
             if selected_root is None:
                 continue
-            if getattr(CHUNKS[selected_root], "Type", None) in Entity_Type_List:
+            if is_entity_chunk(CHUNKS[selected_root]):
                 roots.add(selected_root)
         return roots
 
@@ -4167,8 +4167,10 @@ def create_CEntity(file, _inherit_visited=None):
                         #   'animationSets':list(map(lambda x: x.DepotPath, chunk.GetVariableByName("animationSets").ToArray()))
                         # })
 
-        elif chunk.Type in Entity_Type_List: #entity is
+        elif is_entity_chunk(chunk):
             entity_chunk = chunk  # save before inner loop reassigns chunk variable
+            this_Entity.is_entity = True
+            this_Entity.type = entity_chunk.Type
             entity_animated_component_chunk_index = None  # track for synthetic skinning attachment
             if hasattr(chunk, 'Components'):
             #for staticChunkPtr in chunk.GetVariableByName("components").ToArray():

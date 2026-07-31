@@ -1442,7 +1442,7 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
     #?###################?#
     chunk: W_CLASS
     for chunk in meshFile.CHUNKS.CHUNKS:
-        if chunk.Type == "CMesh":
+        if chunk.Type in {"CMesh", "CPhysicsDestructionResource"}:
             the_materials = chunk.GetVariableByName("materials")
             the_material_names_chunk = chunk.GetVariableByName("materialNames")
             the_material_names = []

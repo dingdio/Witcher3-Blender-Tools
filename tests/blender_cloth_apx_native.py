@@ -10,6 +10,7 @@ import types
 from pathlib import Path
 
 import bpy
+from mathutils import Matrix
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -161,7 +162,7 @@ assert _scene_data_signature() == before_addon_import, (
 )
 
 from witcher3_tools.cloth import geometry_nodes, import_state, importer
-from witcher3_tools.importers import import_entity
+from witcher3_tools.importers import import_blender_fun, import_entity
 
 assert _scene_data_signature() == before_addon_import, (
     "Importing cloth Geometry Nodes/state/importer modules mutated existing Blender scene data"
@@ -612,6 +613,100 @@ def test_import_cloth_backend_failure_rolls_back_exactly():
         Path(apx_path).unlink(missing_ok=True)
 
 
+def test_cached_redapex_none_is_an_import_error():
+    target = bpy.data.collections.new("W3TB_CachedRedapexFailure")
+    bpy.context.scene.collection.children.link(target)
+    resource = r"environment\test\missing.redapex"
+    plan = {
+        "items": [
+            {
+                "id": "entity",
+                "kind": "entity",
+                "name": "Entity",
+                "parent_id": "",
+                "repo_path": "",
+                "transform": None,
+            },
+            {
+                "id": "redapex",
+                "kind": "cloth",
+                "name": "MissingRedapex",
+                "parent_id": "entity",
+                "repo_path": resource,
+                "transform": None,
+            },
+        ]
+    }
+    original_import = import_entity.import_or_reuse_redapex
+    import_entity.import_or_reuse_redapex = lambda *_args, **_kwargs: (None, [])
+    errors = []
+    try:
+        imported = import_blender_fun._import_cached_plan_full_items(
+            plan,
+            target,
+            {
+                "do_import_Redapex": True,
+                "_layer_import_owner": "redapex-failure-test",
+                "_layer_import_mode_signature": "redapex-failure-test",
+            },
+            errors=errors,
+        )
+    finally:
+        import_entity.import_or_reuse_redapex = original_import
+
+    assert imported == 0
+    assert errors == [
+        f"Problem with cached redapex import {resource}: returned no object"
+    ]
+    assert not any(
+        obj.get("witcher_layer_plan_item_id") == "redapex"
+        for obj in target.all_objects
+    )
+
+
+def test_cached_destruction_uses_only_component_transform():
+    parent = bpy.data.objects.new("W3TB_RedapexEntity", None)
+    child = bpy.data.objects.new("W3TB_RedapexRoot", None)
+    bpy.context.scene.collection.objects.link(parent)
+    bpy.context.scene.collection.objects.link(child)
+    child.parent = parent
+    child.matrix_parent_inverse = Matrix.Translation((0.0, -1.1, 0.0))
+
+    import_blender_fun._apply_plan_item_transform_as_child(
+        child,
+        {
+            "component_type": "CDestructionComponent",
+            "transform": {
+                "X": 0.25,
+                "Y": -0.5,
+                "Z": 0.75,
+                "Pitch": 0.0,
+                "Yaw": 0.0,
+                "Roll": 0.0,
+                "Scale_x": 1.0,
+                "Scale_y": 1.0,
+                "Scale_z": 1.0,
+            },
+            # A serialized destruction physics pose is not a visual transform.
+            "parameters.m_pose": (
+                (1.0, 0.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0, 1.1),
+                (0.0, 0.0, 1.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0),
+            ),
+            "translation": None,
+        },
+    )
+
+    expected = Matrix.Translation((0.25, -0.5, 0.75))
+    assert max(
+        abs(float(child.matrix_local[row][column] - expected[row][column]))
+        for row in range(4)
+        for column in range(4)
+    ) < 1.0e-6
+    assert child.matrix_parent_inverse == Matrix.Identity(4)
+
+
 proxy, source_a, source_b = test_collision_proxy_evaluated_geometry()
 test_collision_helpers_skip_appearance_visibility_drivers(proxy)
 test_nested_collider_rewire_is_idempotent({
@@ -623,5 +718,7 @@ test_cloth_import_state_restores_context()
 test_imported_collection_uses_transaction_delta()
 test_failed_import_cleanup_preserves_snapshot_identity()
 test_import_cloth_backend_failure_rolls_back_exactly()
+test_cached_redapex_none_is_an_import_error()
+test_cached_destruction_uses_only_component_transform()
 
 print("W3TB_CLOTH_APX_NATIVE_OK")

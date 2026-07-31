@@ -79,6 +79,35 @@ Entity_Type_List = ["CEntity",
                     #"CDeniedAreaComponent",
                     ]
 
+
+def is_entity_chunk(chunk):
+    if isinstance(chunk, str):
+        return chunk in Entity_Type_List
+    cached = getattr(chunk, "is_entity", None)
+    if cached is not None:
+        return bool(cached)
+    chunk_type = (
+        getattr(chunk, "Type", None)
+        or getattr(chunk, "type", None)
+        or getattr(chunk, "name", "")
+    )
+    if chunk_type in Entity_Type_List:
+        result = True
+    else:
+        try:
+            result = chunk.GetVariableByName("streamingDataBuffer") is not None
+        except (AttributeError, TypeError):
+            result = any(
+                getattr(prop, "theName", None) == "streamingDataBuffer"
+                for prop in (getattr(chunk, "PROPS", None) or [])
+            )
+    # cache the negative too: this runs per chunk in the parse hot loop
+    try:
+        chunk.is_entity = result
+    except Exception:
+        pass
+    return result
+
 def _describe_cr2w_warning_context(cr2w_file=None, *, prop_name="", prop_type="",
                                    parent=None, offset=None):
     parts = []
@@ -803,7 +832,6 @@ class SBlockDataRigidBody:
         self.padd3 = readUByte(f) #CUInt8
 
 class SBlockDataPointLight(object):
-    """docstring for SBlockDataPointLight."""
     def __init__(self):
         self.color = None #CUInt32
         self.radius = None #CFloat
@@ -819,8 +847,11 @@ class SBlockDataPointLight(object):
         self.envColorGroup = None #CUInt8
         self.padding = None #CUInt8
         self.lightUsageMask = None #CUInt32
+        self.trailingData = b""
 
-    def Read(self, f):
+    def Read(self, f, payload_size=52):
+        if payload_size < 52:
+            raise ValueError(f"Point-light payload is too short: {payload_size}")
         self.color = CColor().Read(f) #readU32(f) #CUInt32
         self.radius = readFloat(f) #CFloat
         self.brightness = readFloat(f) #CFloat
@@ -835,6 +866,7 @@ class SBlockDataPointLight(object):
         self.envColorGroup = readUByte(f) #CUInt8
         self.padding = readUByte(f) #CUInt8
         self.lightUsageMask = readU32(f) #CUInt32
+        self.trailingData = f.read(payload_size - 52)
         return self
 
 
@@ -862,8 +894,12 @@ class SBlockDataSpotLight: #make CPointLightComponent
         self.projectionTexureVBias = None # CFloat
         self.projectionTexture = None # CUInt16
         self.padding2 = None # CUInt16
+        self.packedLightData = b""
+        self.trailingData = b""
 
-    def Read(self, f):
+    def Read(self, f, payload_size=80):
+        if payload_size < 64:
+            raise ValueError(f"Spotlight payload is too short: {payload_size}")
         self.color = CColor().Read(f) #CUInt32
         self.radius = readFloat(f) #CFloat
         self.brightness = readFloat(f) #CFloat
@@ -878,14 +914,18 @@ class SBlockDataSpotLight: #make CPointLightComponent
         self.envColorGroup = readUByte(f) # CUInt8
         self.padding = readUByte(f) # CUInt8
         self.lightUsageMask = readU32(f) # CUInt32
+        if payload_size < 80:
+            self.packedLightData = f.read(payload_size - 64)
         self.innerAngle = readFloat(f) # CFloat
         self.outerAngle = readFloat(f) # CFloat
         self.softness = readFloat(f) # CFloat
-        self.projectionTextureAngle = readFloat(f) # CFloat
-        self.projectionTexureUBias = readFloat(f) # CFloat
-        self.projectionTexureVBias = readFloat(f) # CFloat
-        self.projectionTexture = readUShort(f) # CUInt16
-        self.padding2 = readUShort(f) # CUInt16
+        if payload_size >= 80:
+            self.projectionTextureAngle = readFloat(f) # CFloat
+            self.projectionTexureUBias = readFloat(f) # CFloat
+            self.projectionTexureVBias = readFloat(f) # CFloat
+            self.projectionTexture = readUShort(f) # CUInt16
+            self.padding2 = readUShort(f) # CUInt16
+            self.trailingData = f.read(payload_size - 80)
         return self
 
 class SBlockDataParticles():
@@ -929,9 +969,9 @@ class SBlockData:
         elif packedObjectType == Enums.BlockDataObjectType.Dimmer:
             self.packedObject = SBlockDataDimmer(f)
         elif packedObjectType == Enums.BlockDataObjectType.PointLight:
-            self.packedObject = SBlockDataPointLight().Read(f)
+            self.packedObject = SBlockDataPointLight().Read(f, max(0, size - 56))
         elif packedObjectType == Enums.BlockDataObjectType.SpotLight:
-            self.packedObject = SBlockDataSpotLight().Read(f)
+            self.packedObject = SBlockDataSpotLight().Read(f, max(0, size - 56))
         elif packedObjectType == Enums.BlockDataObjectType.RigidBody: # actuall rigid bodies?
             self.packedObject = SBlockDataRigidBody(f)
             self.resourceIndex = self.packedObject.meshIndex
@@ -955,6 +995,7 @@ class SBlockData:
             pass
         elif(read > size):
             log.warning("read too far")
+        f.seek(startp + size)
         # endp = f.tell()
         # read = endp - startp
         # if (read < size):
@@ -2442,7 +2483,8 @@ class W_CLASS:
                     break
                 self.PROPS.append(prop)
                 
-            if self.name in Entity_Type_List:
+            if is_entity_chunk(self):
+                self.is_entity = True
                 CR2WFILE.entity_count +=1
                 self.isCreatedFromTemplate = False
                 self.Template = self.GetVariableByName('template')
@@ -2532,7 +2574,7 @@ class W_CLASS:
             self.Trees.Read(f, 0)
             self.Grasses = CBufferVLQInt32(CR2WFILE, SFoliageResourceData)
             self.Grasses.Read(f, 0)
-        elif currentClass == "CMesh":
+        elif currentClass in {"CMesh", "CPhysicsDestructionResource"}:
             while True:
                 prop = PROPERTY(f, CR2WFILE, self)
                 if prop.Type == None:
@@ -2643,7 +2685,8 @@ class W_CLASS:
                     #     log.critical("CClipMap")
                     self.propCount+=1
                 else:
-                    if self.name in Entity_Type_List:
+                    if is_entity_chunk(self):
+                        self.is_entity = True
                         self.isCreatedFromTemplate = False
                         self.Template = self.GetVariableByName('template')
                         #self.Transform = self.GetVariableByName('transform').EngineTransform

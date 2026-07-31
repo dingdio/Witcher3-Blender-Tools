@@ -22,11 +22,12 @@ from .bin_helpers import (ReadUlong48, readUShort,
                         ReadFloat16)
 
 from .CR2W_helpers import Enums
-from .CR2W_types import ( Entity_Type_List, getCR2W, W_CLASS )
+from .CR2W_types import ( getCR2W, is_entity_chunk, W_CLASS )
 
 from .bStream import *
 
 _ENTITY_DIRECT_COMPONENT_TYPES = {
+    "CDestructionComponent",
     "CPointLightComponent",
     "CSpotLightComponent",
     "CMeshComponent",
@@ -972,7 +973,7 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
     Entities = []
     level.name = CHUNKS[0].name
     level.type = CHUNKS[0].name
-    expected_entities = sum(1 for chunk in CHUNKS if getattr(chunk, "name", "") in Entity_Type_List)
+    expected_entities = sum(1 for chunk in CHUNKS if is_entity_chunk(chunk))
     template_static_mesh_chunks = []
     parent_component_map = _entity_component_parent_map(file, CHUNKS)
 
@@ -1019,14 +1020,11 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
             mesh_path = _first_handle_depot_path(mesh_prop) or str(prop_to_string(mesh_prop) or "").strip()
             if mesh_path:
                 template_static_mesh_chunks.append(chunk)
-        if chunk.name in Entity_Type_List:
-            try:
-                class_ = getattr(CR2W_file, chunk.name)
-            except Exception as e:
-                log.critical(f'Found undefined entity class "{chunk.name}", skipping')
-                #raise e
-                continue
+        if is_entity_chunk(chunk):
+            class_ = getattr(CR2W_file, chunk.name, CEntity)
             Entity = class_()
+            Entity.is_entity = True
+            Entity.type = chunk.name
             Entity.name = chunk.get_name_prop_string()
             if chunk.GetVariableByName('transform'):
                 Entity.transform = chunk.GetVariableByName('transform').EngineTransform

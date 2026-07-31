@@ -1,4 +1,5 @@
 import ast
+import math
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,16 +19,23 @@ def _load_candidate_helpers():
         "_manifest_item_position",
         "_count_nearby_manifest_items_for_entry",
         "_layer_candidate_vertical_radius",
+        "_collection_has_loaded_content",
+        "_layer_covered_by_previous_load",
+        "_layer_should_skip_for_load",
         "_normalize_level_path",
         "_default_hidden_level_paths",
+        "_spatial_cell_key",
     }
     nodes = []
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
             isinstance(target, ast.Name)
             and target.id in {
+                "_WORLD_LAYER_SPATIAL_CELL_SIZE",
                 "_LAYER_QUERY_FILTER_KINDS",
                 "_LAYER_CANDIDATE_VERTICAL_RADIUS",
+                "_LAYER_COMPLETE_STATES",
+                "_LAYER_COVERED_STATES",
                 "W2LAYER_PATH_PROP",
                 "LEGACY_LEVEL_PATH_PROP",
             }
@@ -36,7 +44,7 @@ def _load_candidate_helpers():
             nodes.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in wanted_functions:
             nodes.append(node)
-    namespace = {}
+    namespace = {"math": math}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(UI_MAP_PATH), "exec"), namespace)
     return namespace
 
@@ -45,6 +53,35 @@ HELPERS = _load_candidate_helpers()
 
 
 class LayerCandidatePolicyTests(unittest.TestCase):
+    def test_non_finite_positions_are_not_spatial_candidates(self):
+        for value in (math.nan, math.inf, -math.inf):
+            for axis in range(3):
+                position = [1.0, 2.0, 3.0]
+                position[axis] = value
+                item = {"kind": "mesh", "world_position": position}
+                with self.subTest(value=value, axis=axis):
+                    self.assertIsNone(HELPERS["_manifest_item_position"](item))
+                    self.assertEqual(
+                        HELPERS["_count_nearby_manifest_items_for_entry"](
+                            {"items": [item]},
+                            (0.0, 0.0, 0.0),
+                            100.0,
+                        ),
+                        (0, None),
+                    )
+
+    def test_positions_outside_sqlite_cell_range_are_not_spatial_candidates(self):
+        for axis in range(2):
+            for value in (-1e20, 1e20):
+                position = [1.0, 2.0, 3.0]
+                position[axis] = value
+                with self.subTest(value=value, axis=axis):
+                    self.assertIsNone(
+                        HELPERS["_manifest_item_position"](
+                            {"kind": "mesh", "world_position": position}
+                        )
+                    )
+
     def test_candidate_layer_needs_a_renderable_anchor_in_the_vertical_band(self):
         entry = {
             "items": [
@@ -139,6 +176,32 @@ class LayerCandidatePolicyTests(unittest.TestCase):
         hidden_paths = HELPERS["_default_hidden_level_paths"](root)
 
         self.assertEqual(hidden_paths, {r"levels\hidden.w2l"})
+
+    def test_partial_layer_with_import_errors_is_retried(self):
+        collection = {
+            "witcher_layer_import_state": "partial",
+            "witcher_layer_import_errors": 1,
+            "witcher_layer_load_radius": 90.0,
+            "witcher_layer_load_camera_x": 10.0,
+            "witcher_layer_load_camera_y": 20.0,
+        }
+
+        self.assertFalse(
+            HELPERS["_layer_should_skip_for_load"](
+                collection,
+                (10.0, 20.0, 0.0),
+                90.0,
+            )
+        )
+
+        collection["witcher_layer_import_errors"] = 0
+        self.assertTrue(
+            HELPERS["_layer_should_skip_for_load"](
+                collection,
+                (10.0, 20.0, 0.0),
+                90.0,
+            )
+        )
 
 
 if __name__ == "__main__":

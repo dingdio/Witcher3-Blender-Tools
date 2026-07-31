@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from . import CR2W_types
 from .CR2W_helpers import Enums
+from .prop_utils import read_prop_value
 from .Types.VariousTypes import CBufferVLQInt32
 from .bin_helpers import (
     ReadBit6,
@@ -31,6 +32,7 @@ _DIRECT_COMPONENT_TYPES = frozenset(
     {
         "CMeshComponent",
         "CStaticMeshComponent",
+        "CDestructionComponent",
         "CPointLightComponent",
         "CSpotLightComponent",
     }
@@ -55,16 +57,33 @@ _STREAM_MESH_COMPONENT_TYPES = frozenset(
         "CWindowComponent",
     }
 )
-_STREAM_COMPONENT_TYPES = _STREAM_MESH_COMPONENT_TYPES | {"CClothComponent", "CDestructionSystemComponent"}
+_STREAM_COMPONENT_TYPES = _STREAM_MESH_COMPONENT_TYPES | {
+    "CClothComponent",
+    "CDestructionComponent",
+    "CDestructionSystemComponent",
+}
 _TARGET_PROP_NAMES = frozenset(
     {
         "actionName",
+        "attenuation",
+        "brightness",
+        "color",
         "drawableFlags",
+        "envColorGroup",
         "includes",
+        "innerAngle",
+        "isEnabled",
+        "lightFlickering",
+        "lightUsageMask",
         "mesh",
+        "m_baseResource",
         "m_resource",
         "name",
+        "outerAngle",
+        "radius",
         "resource",
+        "shadowCastingMode",
+        "softness",
         "streamingDataBuffer",
         "streamingDistance",
         "template",
@@ -75,7 +94,15 @@ _PLAN_ITEM_EXTRA_KEYS = frozenset(
     {
         "brightness",
         "radius",
+        "attenuation",
         "color",
+        "envColorGroup",
+        "shadowCastingMode",
+        "lightFlickering",
+        "lightUsageMask",
+        "isEnabled",
+        "innerAngle",
+        "outerAngle",
         "inner_angle",
         "outer_angle",
         "softness",
@@ -292,6 +319,7 @@ def _scan_cr2w_structure(
     component_parent_map = {}
 
     exports = list(getattr(cr2w_file, "CR2WExport", []) or [])
+    root_export_name = str(getattr(exports[0], "name", "") or "").strip() if exports else ""
     for export_index, export in enumerate(exports):
         export_name = str(getattr(export, "name", "") or "").strip()
         if not export_name:
@@ -332,7 +360,21 @@ def _scan_cr2w_structure(
             _merge_scan_result(result, template_scan)
             continue
 
-        if export_name in _ENTITY_TYPES and not stream_only:
+        entity_props = None
+        if (
+            not stream_only
+            and export_name not in _ENTITY_TYPES
+            and root_export_name in {"CLayer", "CEntityTemplate"}
+            and int(getattr(export, "parentID", 0) or 0) == 1
+        ):
+            prop_start = handle.tell()
+            candidate_props = _scan_selected_props(cr2w_file, handle, class_end)
+            if "streamingDataBuffer" in candidate_props:
+                entity_props = candidate_props
+            else:
+                handle.seek(prop_start)
+
+        if (export_name in _ENTITY_TYPES or entity_props is not None) and not stream_only:
             entity_scan = _scan_entity_export(
                 cr2w_file,
                 handle,
@@ -342,6 +384,7 @@ def _scan_cr2w_structure(
                 source_name,
                 dependency_resolver=dependency_resolver,
                 dependency_loader=dependency_loader,
+                props=entity_props,
             )
             if entity_scan is None:
                 return None
@@ -489,7 +532,7 @@ def _parse_selected_prop_value(cr2w_file, handle, prop, data_end):
     if prop_name == "includes":
         return _read_handle_paths(handle, cr2w_file, count)
 
-    if prop_name in {"mesh", "resource", "m_resource"}:
+    if prop_name in {"mesh", "resource", "m_baseResource", "m_resource"}:
         return _read_first_handle_path(handle, cr2w_file, count)
 
     if prop_name == "drawableFlags":
@@ -512,6 +555,21 @@ def _parse_selected_prop_value(cr2w_file, handle, prop, data_end):
                 return float(readUShort(handle))
             return float(readU32(handle))
         return None
+
+    if prop_name in {"brightness", "radius", "attenuation", "innerAngle", "outerAngle", "softness"}:
+        return float(readFloat(handle)) if element_type == "Float" else None
+
+    if prop_name == "isEnabled":
+        return bool(readSByte(handle)) if element_type == "Bool" else None
+
+    if prop_name in {"color", "envColorGroup", "shadowCastingMode", "lightFlickering", "lightUsageMask"}:
+        parsed = CR2W_types.PROPERTY(
+            handle,
+            cr2w_file,
+            SimpleNamespace(classEnd=data_end),
+            custom_propstart=prop,
+        )
+        return read_prop_value(parsed, ())
 
     if prop_name == "streamingDataBuffer":
         if prop_type == "SharedDataBuffer":
@@ -848,8 +906,10 @@ def _scan_entity_export(
     *,
     dependency_resolver=None,
     dependency_loader=None,
+    props=None,
 ):
-    props = _scan_selected_props(cr2w_file, handle, class_end)
+    if props is None:
+        props = _scan_selected_props(cr2w_file, handle, class_end)
     entity_name = str(props.get("name", "") or "").strip()
     if entity_name:
         entity_name = f"{entity_name} ({export_name})"
@@ -886,7 +946,12 @@ def _scan_entity_export(
     stream_items = []
     buffer_bytes = _extract_buffer_bytes(cr2w_file, streaming_buffer)
     if buffer_bytes:
-        stream_items = _scan_stream_buffer_items(buffer_bytes, f"{source_name}:{export_name}:stream")
+        stream_items = _scan_stream_buffer_items(
+            buffer_bytes,
+            f"{source_name}:{export_name}:stream",
+            dependency_resolver=dependency_resolver,
+            dependency_loader=dependency_loader,
+        )
         if stream_items is None:
             return None
 
@@ -924,10 +989,38 @@ def _scan_entity_export(
     }
 
 
-def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stream):
+def _scan_component_export(
+    cr2w_file,
+    handle,
+    export_name,
+    class_end,
+    *,
+    as_stream,
+):
     props = _scan_selected_props(cr2w_file, handle, class_end)
     transform = props.get("transform")
     local_position = _transform_position(transform)
+
+    if export_name == "CDestructionComponent":
+        repo_path = str(props.get("m_baseResource", "") or "").strip()
+        if not repo_path.lower().endswith(".reddest"):
+            return None
+        component_name = str(props.get("name", "") or "").strip()
+        drawable_flags = props.get("drawableFlags")
+        return {
+            "kind": "component_mesh",
+            "name": _component_plan_label(export_name, component_name, repo_path),
+            "repo_path": repo_path,
+            "transform": transform,
+            "matrix": None,
+            "translation": None,
+            "local_position": local_position,
+            "drawable_flags": drawable_flags,
+            "engine_visible": _drawable_flags_visible_from_value(drawable_flags, default=True),
+            "component_type": export_name,
+            "component_name": component_name,
+            "action_name": str(props.get("actionName", "") or "").strip(),
+        }
 
     if as_stream:
         if export_name in _STREAM_MESH_COMPONENT_TYPES:
@@ -970,6 +1063,7 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
             if not repo_path:
                 return None
             redapex_name = str(props.get("name", "") or "").strip() or Path(repo_path).stem or "Redapex"
+            drawable_flags = props.get("drawableFlags")
             return {
                 "kind": "cloth",
                 "name": redapex_name,
@@ -978,6 +1072,11 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
                 "matrix": None,
                 "translation": None,
                 "local_position": local_position,
+                "drawable_flags": drawable_flags,
+                "engine_visible": _drawable_flags_visible_from_value(drawable_flags, default=True),
+                "component_type": export_name,
+                "component_name": str(props.get("name", "") or "").strip(),
+                "action_name": str(props.get("actionName", "") or "").strip(),
             }
         return None
 
@@ -1007,25 +1106,44 @@ def _scan_component_export(cr2w_file, handle, export_name, class_end, *, as_stre
     if export_name == "CPointLightComponent":
         return {
             "kind": "component_point_light",
-            "name": "PointLightComponent",
+            "name": str(props.get("name", "") or "PointLightComponent"),
             "repo_path": "",
             "transform": transform,
             "matrix": None,
             "translation": None,
             "local_position": local_position,
             "streaming_distance": float(props.get("streamingDistance", 0.0) or 0.0),
+            "component_type": export_name,
+            **{
+                key: props[key]
+                for key in (
+                    "radius", "brightness", "attenuation", "color", "envColorGroup",
+                    "shadowCastingMode", "lightFlickering", "lightUsageMask", "isEnabled",
+                )
+                if key in props
+            },
         }
 
     if export_name == "CSpotLightComponent":
         return {
             "kind": "component_spot_light",
-            "name": "SpotLightComponent",
+            "name": str(props.get("name", "") or "SpotLightComponent"),
             "repo_path": "",
             "transform": transform,
             "matrix": None,
             "translation": None,
             "local_position": local_position,
             "streaming_distance": float(props.get("streamingDistance", 0.0) or 0.0),
+            "component_type": export_name,
+            **{
+                key: props[key]
+                for key in (
+                    "radius", "brightness", "attenuation", "color", "envColorGroup",
+                    "shadowCastingMode", "lightFlickering", "lightUsageMask", "isEnabled",
+                    "innerAngle", "outerAngle", "softness",
+                )
+                if key in props
+            },
         }
 
     return None
@@ -1083,7 +1201,13 @@ def _scan_embedded_template_data(
     return scan_result
 
 
-def _scan_stream_buffer_items(buffer_bytes, source_name):
+def _scan_stream_buffer_items(
+    buffer_bytes,
+    source_name,
+    *,
+    dependency_resolver=None,
+    dependency_loader=None,
+):
     if not buffer_bytes:
         return []
     data = bytes(buffer_bytes)
@@ -1098,7 +1222,14 @@ def _scan_stream_buffer_items(buffer_bytes, source_name):
         return None
     if not _supports_fast_scan(cr2w_file):
         return None
-    stream_scan = _scan_cr2w_structure(cr2w_file, stream, source_name, stream_only=True)
+    stream_scan = _scan_cr2w_structure(
+        cr2w_file,
+        stream,
+        source_name,
+        dependency_resolver=dependency_resolver,
+        dependency_loader=dependency_loader,
+        stream_only=True,
+    )
     if stream_scan is None:
         return None
     return list(stream_scan.get("sector_items", []) or [])
