@@ -33,13 +33,13 @@ def main():
         assert ui_map._WORLD_LAYER_SCAN_CACHE_VERSION == 15
         assert import_blender_fun.CACHED_LAYER_TRANSFORM_MODE_VERSION == 11
         entity_light.unregister_driver_namespace()
-        assert "witcher_light_double_cross" not in bpy.app.driver_namespace
+        assert "witcher_light_wander" not in bpy.app.driver_namespace
         assert not entity_light._driver_namespace_handlers()
         entity_light.register_driver_namespace()
         assert len(entity_light._driver_namespace_handlers()) == 1
-        bpy.app.driver_namespace.pop("witcher_light_double_cross", None)
+        bpy.app.driver_namespace.pop("witcher_light_wander", None)
         entity_light._restore_driver_namespace_on_load()
-        assert callable(bpy.app.driver_namespace["witcher_light_double_cross"])
+        assert callable(bpy.app.driver_namespace["witcher_light_wander"])
 
         point = import_entity._import_light_component({
             "type": "CPointLightComponent",
@@ -75,9 +75,15 @@ def main():
         assert min(energy_samples) >= base_energy * 0.6 - 1.0e-4
         assert max(energy_samples) <= base_energy + 1.0e-4
         assert max(energy_samples) - min(energy_samples) > base_energy * 0.1
-        assert max(abs(value[0]) for value in position_samples) > 0.004
-        assert all(abs(value[2] - 0.5 * value[0]) < 1.0e-7 for value in position_samples)
-        _close(position_samples[0][0], position_samples[96][0])
+        assert all(
+            max(value[axis] for value in position_samples)
+            - min(value[axis] for value in position_samples) > span
+            for axis, span in enumerate((0.008, 0.005, 0.003))
+        )
+        assert all(
+            abs(position_samples[0][axis] - position_samples[96][axis]) < 1.0e-7
+            for axis in range(3)
+        )
         bpy.context.scene.render.fps = 30
         bpy.context.scene.frame_set(15)
         _close(point.data.energy, energy_samples[12])

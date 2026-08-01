@@ -195,20 +195,168 @@ def hide_unused_sockets(node, inp=True, out=True):
         for socket in node.outputs:
             socket.hide = True
 
+
+_EXACT_WATER_GROUP_SPECS = {
+    'm_fountain_cascade': {
+        'graph': r'fx\water\water_fountain\m_fountain_cascade.w2mg',
+        'version': 6,
+        'inputs': {
+            'normal_and_splash': 'NodeSocketColor',
+            'normal_and_splash_alpha': 'NodeSocketFloat',
+            'cubemap': 'NodeSocketColor',
+            'texture_speed': 'NodeSocketVector',
+            'texture_coord': 'NodeSocketVector',
+            'normal_multiplier': 'NodeSocketVector',
+            'alpha_ramp_a': 'NodeSocketFloat',
+            'alpha_ramp_b': 'NodeSocketFloat',
+            'alpha_multiplier': 'NodeSocketFloat',
+            'reflection_power_exponent': 'NodeSocketFloat',
+            'reflection_multiplier': 'NodeSocketFloat',
+            'soft_alpha': 'NodeSocketFloat',
+            'refraction_multiplier': 'NodeSocketFloat',
+            'fountain_uv': 'NodeSocketVector',
+        },
+        'helper_property': 'witcher_fountain_shader_version',
+        'helper_version': 2,
+        'helper_nodes': {
+            'W3 Fountain UV': 'ShaderNodeUVMap',
+            'W3 Fountain UV Scale': 'ShaderNodeVectorMath',
+            'W3 Fountain Time': 'ShaderNodeValue',
+            'W3 Fountain Direction': 'ShaderNodeVectorMath',
+            'W3 Fountain Flow': 'ShaderNodeVectorMath',
+            'W3 Fountain Animated UV': 'ShaderNodeVectorMath',
+        },
+    },
+    'transparent_reflective': {
+        'graph': r'engine\materials\graphs\transparent_reflective.w2mg',
+        'version': 3,
+        'inputs': {
+            'Diffuse': 'NodeSocketColor',
+            'Normal': 'NodeSocketColor',
+            'NormalBig': 'NodeSocketColor',
+            'Normal_is_sRGB': 'NodeSocketFloat',
+            'Alpha': 'NodeSocketFloat',
+            'Opacity': 'NodeSocketFloat',
+            'Roughness': 'NodeSocketFloat',
+            'IOR': 'NodeSocketFloat',
+            'SpecularColor': 'NodeSocketColor',
+            'RSpecBase': 'NodeSocketFloat',
+            'RSpecScale': 'NodeSocketFloat',
+            'DeepColor': 'NodeSocketColor',
+            'Transparency': 'NodeSocketFloat',
+            'WindSpeed': 'NodeSocketVector',
+            'SmallWavesTile': 'NodeSocketVector',
+            'BigWavesTile': 'NodeSocketVector',
+            'NormalIntensity': 'NodeSocketFloat',
+        },
+        'helper_property': 'witcher_transparent_reflective_shader_version',
+        'helper_version': 1,
+        'helper_nodes': {
+            'W3 Water UV': 'ShaderNodeUVMap',
+            'W3 Water Time': 'ShaderNodeValue',
+            'W3 Water Small Scale': 'ShaderNodeVectorMath',
+            'W3 Water Big Scale': 'ShaderNodeVectorMath',
+            'W3 Water Flow': 'ShaderNodeVectorMath',
+            'W3 Water Small UV': 'ShaderNodeVectorMath',
+            'W3 Water Big UV': 'ShaderNodeVectorMath',
+            'W3 Water Normal Big': 'ShaderNodeTexImage',
+        },
+    },
+}
+
+
+def _exact_water_group_spec(ng_name: str):
+    return _EXACT_WATER_GROUP_SPECS.get(_node_group_family_name(ng_name).casefold())
+
+
+def _exact_water_group_is_current(node_group, spec=None) -> bool:
+    spec = spec or _exact_water_group_spec(getattr(node_group, 'name', ''))
+    if node_group is None or spec is None:
+        return False
+    try:
+        if int(node_group.get('witcher_material_graph_version', 0) or 0) < spec['version']:
+            return False
+    except (TypeError, ValueError):
+        return False
+    graph = str(node_group.get('witcher_material_graph', '') or '').replace('/', '\\').casefold()
+    if graph != spec['graph'].casefold():
+        return False
+    inputs = {
+        item.name: item.socket_type
+        for item in node_group.interface.items_tree
+        if getattr(item, 'item_type', '') == 'SOCKET' and item.in_out == 'INPUT'
+    }
+    outputs = {
+        item.name: item.socket_type
+        for item in node_group.interface.items_tree
+        if getattr(item, 'item_type', '') == 'SOCKET' and item.in_out == 'OUTPUT'
+    }
+    return all(inputs.get(name) == socket_type for name, socket_type in spec['inputs'].items()) \
+        and outputs.get('Shader') == 'NodeSocketShader'
+
+
+def _exact_water_material_upgrade_required(material, expected_ng_name: str) -> bool:
+    spec = _exact_water_group_spec(expected_ng_name)
+    if material is None or spec is None:
+        return False
+    active_group = get_active_witcher_group_node(material)
+    active_tree = getattr(active_group, 'node_tree', None) if active_group else None
+    if not _exact_water_group_is_current(active_tree, spec):
+        return True
+    try:
+        helper_version = int(material.get(spec['helper_property'], 0) or 0)
+    except (TypeError, ValueError):
+        return True
+    if helper_version < spec['helper_version']:
+        return True
+    nodes = material.node_tree.nodes
+    return any(
+        nodes.get(name) is None or nodes[name].bl_idname != node_type
+        for name, node_type in spec['helper_nodes'].items()
+    )
+
+
+def _refresh_exact_water_group(node_group, spec, resource_path):
+    with bpy.data.libraries.load(resource_path, relative=False) as (data_from, data_to):
+        source_name = next((name for name in data_from.node_groups if name.casefold() == node_group.name.casefold()), '')
+        if not source_name:
+            source_name = next((name for name in data_from.node_groups if name.casefold() in _EXACT_WATER_GROUP_SPECS and _EXACT_WATER_GROUP_SPECS[name.casefold()] is spec), '')
+        if not source_name:
+            raise KeyError(f"Exact node group {node_group.name} not found in {resource_path}")
+        data_to.node_groups.append(source_name)
+    fresh = data_to.node_groups[0]
+    if fresh is None or not _exact_water_group_is_current(fresh, spec):
+        if fresh is not None and fresh != node_group:
+            bpy.data.node_groups.remove(fresh, do_unlink=True)
+        raise RuntimeError(f"Bundled exact node group {source_name} has an invalid version or socket contract")
+    old_name = node_group.name
+    node_group.user_remap(fresh)
+    bpy.data.node_groups.remove(node_group, do_unlink=True)
+    fresh.name = source_name
+    log.info("Refreshed stale exact node group %s from %s", old_name, resource_path)
+    return fresh
+
 def ensure_node_group(ng_name, resource_path=RES_PATH):
     """Check if a nodegroup exists, and if not, append it from the addon's resource file."""
 
     resource_path = resource_path or RES_PATH
     ng_name = _find_available_node_group_name(ng_name, resource_path) or ng_name
-    if ng_name not in bpy.data.node_groups:
+    ng = bpy.data.node_groups.get(ng_name)
+    spec = _exact_water_group_spec(ng_name)
+    bundled_resource = _resource_cache_key(resource_path) == _resource_cache_key(RES_PATH)
+    if ng is not None and spec is not None and bundled_resource and not _exact_water_group_is_current(ng, spec):
+        ng = _refresh_exact_water_group(ng, spec, resource_path)
+    if ng is None:
         with bpy.data.libraries.load(resource_path, relative=False) as (data_from, data_to):
             for ng in data_from.node_groups:
                 if ng == ng_name:
                     data_to.node_groups.append(ng)
 
-    ng = bpy.data.node_groups.get(ng_name)
+        ng = bpy.data.node_groups.get(ng_name)
     if ng is None:
         raise KeyError(f"Node group {ng_name} not found in {resource_path}")
+    if spec is not None and bundled_resource and not _exact_water_group_is_current(ng, spec):
+        raise RuntimeError(f"Bundled exact node group {ng_name} has an invalid version or socket contract")
     ng.use_fake_user = False
 
     family_name = _node_group_family_name(ng.name).lower()
@@ -220,7 +368,7 @@ def ensure_node_group(ng_name, resource_path=RES_PATH):
     return ng
 
 
-MATERIAL_SETUP_VERSION = 11
+MATERIAL_SETUP_VERSION = 12
 _BASE_PATH_NODE_GROUP_CACHE: Dict[Tuple[object, ...], Dict[str, str]] = {}
 _RESOURCE_NODE_GROUP_CACHE: Dict[str, Tuple[Optional[float], Set[str]]] = {}
 
@@ -1319,6 +1467,10 @@ def setup_w3_material(
     if existing_mat:
         if overwrite_existing_enabled():
             repair_broken_dds_images_in_material(existing_mat, allow_dds_repair=True)
+        exact_upgrade_required = _exact_water_material_upgrade_required(existing_mat, expected_ng_name)
+        if exact_upgrade_required:
+            force_update = True
+            log.info("Refreshing stale exact material helpers on %s", existing_mat.name)
         if not force_update:
             duplicate_seconds = time.perf_counter() - duplicate_started
             total_seconds = time.perf_counter() - material_started
@@ -1453,6 +1605,8 @@ def setup_w3_material(
             mat_load_params_into_nodes(material, ordered_params, nodegroup_node, uncook_path)
             apply_shader_default_overrides(material, nodegroup_node, inherited_params, uncook_path, inherited_param_sources)
             reconcile_w3_pattern_uv_links(material, nodegroup_node)
+            setup_fountain_cascade_nodes(material, nodegroup_node)
+            setup_transparent_reflective_nodes(material, nodegroup_node)
             if shader_type == 'pbr_eye':
                 setup_eye_reflection_nodes(material, nodegroup_node, nodes, links)
             hide_unused_sockets(nodegroup_node)
@@ -2338,6 +2492,225 @@ def reconcile_w3_pattern_uv_links(mat: Material, node_ng: Node) -> None:
             target.default_value = fallback
     for texture_node in texture_nodes:
         replace_link(transform.outputs['Vector'], texture_node.inputs['Vector'])
+
+
+def _set_game_time_driver(output) -> None:
+    driver = output.driver_add('default_value').driver
+    driver.type = 'SCRIPTED'
+    while driver.variables:
+        driver.variables.remove(driver.variables[0])
+    for name, data_path in (('fps', 'render.fps'), ('fps_base', 'render.fps_base')):
+        variable = driver.variables.new()
+        variable.name = name
+        variable.type = 'SINGLE_PROP'
+        variable.targets[0].id_type = 'SCENE'
+        variable.targets[0].id = bpy.context.scene
+        variable.targets[0].data_path = data_path
+    driver.expression = 'frame * fps_base / fps'
+
+
+def setup_fountain_cascade_nodes(mat: Material, node_ng: Node) -> None:
+    """Wire REDengine time/UV inputs around the exact fountain shader group."""
+    if (
+        mat is None
+        or mat.node_tree is None
+        or node_ng is None
+        or node_ng.node_tree is None
+        or _node_group_family_name(node_ng.node_tree.name).casefold() != 'm_fountain_cascade'
+    ):
+        return
+
+    inputs = {socket.name.casefold(): socket for socket in node_ng.inputs}
+    texture_socket = inputs.get('normal_and_splash')
+    if not texture_socket or not texture_socket.is_linked:
+        return
+    texture = texture_socket.links[0].from_node
+    if texture.type != 'TEX_IMAGE':
+        return
+
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+
+    def ensure(node_type: str, name: str):
+        node = nodes.get(name)
+        if node is None or node.bl_idname != node_type:
+            if node is not None:
+                nodes.remove(node)
+            node = nodes.new(node_type)
+            node.name = name
+        node.hide = True
+        node['witcher_fountain_helper'] = True
+        return node
+
+    def replace_link(source, target):
+        while target.is_linked:
+            links.remove(target.links[0])
+        links.new(source, target)
+
+    uv = ensure('ShaderNodeUVMap', 'W3 Fountain UV')
+    uv.uv_map = 'DiffuseUV'
+    uv.location = (-1450, 1050)
+
+    uv_scale = ensure('ShaderNodeVectorMath', 'W3 Fountain UV Scale')
+    uv_scale.operation = 'MULTIPLY'
+    uv_scale.location = (-1210, 1050)
+    replace_link(uv.outputs['UV'], uv_scale.inputs[0])
+    texture_coord = inputs.get('texture_coord')
+    if texture_coord and texture_coord.is_linked:
+        replace_link(texture_coord.links[0].from_socket, uv_scale.inputs[1])
+    elif texture_coord:
+        uv_scale.inputs[1].default_value = texture_coord.default_value
+
+    water_time = ensure('ShaderNodeValue', 'W3 Fountain Time')
+    water_time.label = 'Game Time (seconds)'
+    water_time.location = (-1450, 820)
+    _set_game_time_driver(water_time.outputs[0])
+
+    direction = ensure('ShaderNodeVectorMath', 'W3 Fountain Direction')
+    direction.operation = 'MULTIPLY'
+    direction.location = (-1210, 820)
+    direction.inputs[1].default_value = (1.0, -1.0, 1.0)
+    texture_speed = inputs.get('texture_speed')
+    if texture_speed and texture_speed.is_linked:
+        replace_link(texture_speed.links[0].from_socket, direction.inputs[0])
+    elif texture_speed:
+        direction.inputs[0].default_value = texture_speed.default_value
+
+    flow = ensure('ShaderNodeVectorMath', 'W3 Fountain Flow')
+    flow.operation = 'SCALE'
+    flow.location = (-970, 820)
+    replace_link(direction.outputs[0], flow.inputs[0])
+    replace_link(water_time.outputs[0], flow.inputs['Scale'])
+
+    animated_uv = ensure('ShaderNodeVectorMath', 'W3 Fountain Animated UV')
+    animated_uv.operation = 'ADD'
+    animated_uv.location = (-730, 1000)
+    replace_link(uv_scale.outputs[0], animated_uv.inputs[0])
+    replace_link(flow.outputs[0], animated_uv.inputs[1])
+    replace_link(animated_uv.outputs[0], texture.inputs['Vector'])
+
+    raw_uv = inputs.get('fountain_uv')
+    if raw_uv is not None:
+        replace_link(uv.outputs['UV'], raw_uv)
+
+    cubemap_socket = inputs.get('cubemap')
+    if cubemap_socket and cubemap_socket.is_linked:
+        cubemap = cubemap_socket.links[0].from_node
+        if cubemap.type == 'TEX_ENVIRONMENT':
+            geometry = ensure('ShaderNodeNewGeometry', 'W3 Fountain Coordinates')
+            geometry.location = (-1450, 580)
+            normal = ensure('ShaderNodeNormalMap', 'W3 Fountain Normal')
+            normal.uv_map = 'DiffuseUV'
+            normal.location = (-1200, 580)
+            normal.inputs['Strength'].default_value = 1.0
+            replace_link(texture.outputs['Color'], normal.inputs['Color'])
+            reflection = ensure('ShaderNodeVectorMath', 'W3 Fountain Reflection')
+            reflection.operation = 'REFLECT'
+            reflection.location = (-960, 580)
+            replace_link(geometry.outputs['Incoming'], reflection.inputs[0])
+            replace_link(normal.outputs['Normal'], reflection.inputs[1])
+            replace_link(reflection.outputs[0], cubemap.inputs['Vector'])
+
+    mat['witcher_fountain_shader_version'] = _EXACT_WATER_GROUP_SPECS['m_fountain_cascade']['helper_version']
+    mat.node_tree.update_tag()
+
+
+def setup_transparent_reflective_nodes(mat: Material, node_ng: Node) -> None:
+    """Animate the two authored wave scales around the exact shallow-water group."""
+    if (
+        mat is None
+        or mat.node_tree is None
+        or node_ng is None
+        or node_ng.node_tree is None
+        or _node_group_family_name(node_ng.node_tree.name).casefold() != 'transparent_reflective'
+    ):
+        return
+
+    inputs = {socket.name.casefold(): socket for socket in node_ng.inputs}
+    normal_socket = inputs.get('normal')
+    normal_big_socket = inputs.get('normalbig')
+    if not normal_socket or not normal_socket.is_linked or normal_big_socket is None:
+        return
+    normal = normal_socket.links[0].from_node
+    if normal.type != 'TEX_IMAGE':
+        return
+
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+
+    def ensure(node_type: str, name: str):
+        node = nodes.get(name)
+        if node is None or node.bl_idname != node_type:
+            if node is not None:
+                nodes.remove(node)
+            node = nodes.new(node_type)
+            node.name = name
+        node.hide = True
+        node['witcher_water_helper'] = True
+        return node
+
+    def replace_link(source, target):
+        while target.is_linked:
+            links.remove(target.links[0])
+        links.new(source, target)
+
+    def apply_vector_input(socket_name: str, target):
+        socket = inputs.get(socket_name)
+        if socket and socket.is_linked:
+            replace_link(socket.links[0].from_socket, target)
+        elif socket:
+            target.default_value = socket.default_value
+
+    uv = ensure('ShaderNodeUVMap', 'W3 Water UV')
+    uv.uv_map = 'DiffuseUV'
+    uv.location = (-1450, 350)
+
+    small_scale = ensure('ShaderNodeVectorMath', 'W3 Water Small Scale')
+    small_scale.operation = 'MULTIPLY'
+    small_scale.location = (-1210, 450)
+    replace_link(uv.outputs['UV'], small_scale.inputs[0])
+    apply_vector_input('smallwavestile', small_scale.inputs[1])
+
+    big_scale = ensure('ShaderNodeVectorMath', 'W3 Water Big Scale')
+    big_scale.operation = 'MULTIPLY'
+    big_scale.location = (-1210, 200)
+    replace_link(uv.outputs['UV'], big_scale.inputs[0])
+    apply_vector_input('bigwavestile', big_scale.inputs[1])
+
+    water_time = ensure('ShaderNodeValue', 'W3 Water Time')
+    water_time.label = 'Game Time (seconds)'
+    water_time.location = (-1450, 0)
+    _set_game_time_driver(water_time.outputs[0])
+
+    flow = ensure('ShaderNodeVectorMath', 'W3 Water Flow')
+    flow.operation = 'SCALE'
+    flow.location = (-1210, -50)
+    apply_vector_input('windspeed', flow.inputs[0])
+    replace_link(water_time.outputs[0], flow.inputs['Scale'])
+
+    small_uv = ensure('ShaderNodeVectorMath', 'W3 Water Small UV')
+    small_uv.operation = 'ADD'
+    small_uv.location = (-970, 450)
+    replace_link(small_scale.outputs[0], small_uv.inputs[0])
+    replace_link(flow.outputs[0], small_uv.inputs[1])
+    replace_link(small_uv.outputs[0], normal.inputs['Vector'])
+
+    big_uv = ensure('ShaderNodeVectorMath', 'W3 Water Big UV')
+    big_uv.operation = 'SUBTRACT'
+    big_uv.location = (-970, 200)
+    replace_link(big_scale.outputs[0], big_uv.inputs[0])
+    replace_link(flow.outputs[0], big_uv.inputs[1])
+
+    normal_big = ensure('ShaderNodeTexImage', 'W3 Water Normal Big')
+    normal_big.location = (-730, 200)
+    normal_big.image = normal.image
+    normal_big.extension = normal.extension
+    normal_big.interpolation = normal.interpolation
+    normal_big.projection = normal.projection
+    normal_big.projection_blend = normal.projection_blend
+    replace_link(big_uv.outputs[0], normal_big.inputs['Vector'])
+    replace_link(normal_big.outputs['Color'], normal_big_socket)
+
+    mat['witcher_transparent_reflective_shader_version'] = _EXACT_WATER_GROUP_SPECS['transparent_reflective']['helper_version']
+    mat.node_tree.update_tag()
 
 
 _SRGB_TEXTURE_PIN_NAMES = {
@@ -3711,6 +4084,18 @@ def mat_apply_settings(mat, shader_type: str):
             mat.use_screen_refraction = True
             mat.use_sss_translucency = True
         set_shadow_method(mat)
+    elif shader_key in {'m_fountain_cascade', 'transparent_reflective'}:
+        set_shadow_method(mat)
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'BLENDED'
+        elif _has_blend:
+            mat.blend_method = 'BLEND'
+        if hasattr(mat, 'show_transparent_back'):
+            mat.show_transparent_back = False
+        if hasattr(mat, 'use_transparency_overlap'):
+            mat.use_transparency_overlap = False
+        if hasattr(mat, 'use_transparent_shadow'):
+            mat.use_transparent_shadow = False
     elif 'hair' in shader_key:
         if hasattr(mat, 'surface_render_method'):
             mat.surface_render_method = 'DITHERED'

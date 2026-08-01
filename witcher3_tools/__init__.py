@@ -413,6 +413,7 @@ from .importers import (
                                     import_w2l,
                                     import_mesh,
                                     entity_light,
+                                    import_particle,
                                     import_w2w,
                                     import_texarray
                                     )
@@ -5311,6 +5312,7 @@ def register():
     unreal_export.register()
     ui_map.register_view_lod_timer()
     ui_map.import_blender_fun.register_deferred_material_load_handler()
+    import_particle.register_particle_preview_runtime()
 
     # Register dev features only when the dev folder exists and dev_mode_enabled is true.
     try:
@@ -5322,6 +5324,7 @@ def register():
 
 def unregister():
     entity_light.unregister_driver_namespace()
+    import_particle.unregister_particle_preview_runtime()
     ui_map.import_blender_fun.unregister_deferred_material_load_handler()
     ui_map.unregister_view_lod_timer()
     # Safe no-op when dev features were never registered.

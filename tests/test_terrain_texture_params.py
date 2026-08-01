@@ -5,6 +5,7 @@ import struct
 import sys
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -33,6 +34,82 @@ from witcher3_tools.unreal_export import terrain_material
 
 
 class TestCountedTerrainParameterElements(unittest.TestCase):
+
+    def test_missing_redkit_array_falls_back_to_vanilla_cooked_data(self):
+        source = {"vanilla": False}
+
+        @contextmanager
+        def vanilla_only():
+            previous = source["vanilla"]
+            source["vanilla"] = True
+            try:
+                yield
+            finally:
+                source["vanilla"] = previous
+
+        def repo_file(depot_path):
+            if depot_path == "terrain.w2mg":
+                return depot_path
+            root = "vanilla" if source["vanilla"] else "redkit"
+            return f"{root}/{depot_path}"
+
+        def convert_texarray(path, force=False):
+            del force
+            return {
+                "vanilla/diffuse.texarray": ["diffuse.dds"],
+                "redkit/normal.texarray": ["normal.dds"],
+            }.get(path, [])
+
+        def bitmap_paths(path):
+            return {
+                "redkit/diffuse.texarray": ["preferred_diffuse.xbm"],
+                "redkit/normal.texarray": ["preferred_normal.xbm"],
+            }.get(path, [])
+
+        root_package = types.ModuleType("witcher3_tools")
+        root_package.__path__ = [str(REPO_ROOT / "witcher3_tools")]
+        cr2w_package = types.ModuleType("witcher3_tools.CR2W")
+        cr2w_package.__path__ = [str(REPO_ROOT / "witcher3_tools" / "CR2W")]
+        common_blender = types.ModuleType("witcher3_tools.CR2W.common_blender")
+        common_blender.repo_file = mock.Mock(side_effect=repo_file)
+        common_blender.vanilla_only_repo_context = vanilla_only
+        texture_converters = types.ModuleType("witcher3_tools.CR2W.texture_converters")
+        texture_converters.convert_texarray_to_dds = mock.Mock(side_effect=convert_texarray)
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "witcher3_tools": root_package,
+                    "witcher3_tools.CR2W": cr2w_package,
+                    "witcher3_tools.CR2W.common_blender": common_blender,
+                    "witcher3_tools.CR2W.texture_converters": texture_converters,
+                },
+            ),
+            mock.patch.object(terrain_material, "get_terrain_material_path", return_value="terrain.w2mg"),
+            mock.patch.object(
+                terrain_material,
+                "get_terrain_material_properties",
+                return_value=("diffuse.texarray", "normal.texarray", 2.0),
+            ),
+            mock.patch.object(terrain_material, "get_texture_array_bitmap_paths", side_effect=bitmap_paths),
+            mock.patch.object(terrain_material, "_resolved_existing_repo_files", return_value=[]),
+            mock.patch.object(
+                terrain_material,
+                "get_terrain_texture_params",
+                return_value=[{"blend_sharpness": 1.25}],
+            ),
+            mock.patch.object(terrain_material.os.path, "isfile", return_value=True),
+        ):
+            result = terrain_material.extract_terrain_material_set(object())
+
+        self.assertEqual(len(result.layers), 1)
+        self.assertEqual(result.layers[0].diffuse_dds, "diffuse.dds")
+        self.assertEqual(result.layers[0].normal_dds, "normal.dds")
+        self.assertEqual(result.layers[0].diffuse_source, "preferred_diffuse.xbm")
+        self.assertEqual(result.layers[0].normal_source, "preferred_normal.xbm")
+        self.assertEqual(result.layers[0].blend_sharpness, 1.25)
+        self.assertEqual(result.warnings, [])
 
     def test_empty_struct_keeps_its_source_index(self):
         # Element 0 contains one fake property; element 1 is entirely empty.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from math import pi, radians
+from math import pi, radians, sin
 
 import bpy
 from bpy.app.handlers import persistent
@@ -64,24 +64,18 @@ ENV_COLOR_GROUPS = (
 _SCENE_COLOR_GROUPS_PROP = "witcher_environment_light_color_groups"
 
 
-def _driver_double_cross(frame, phase, offset, axis, fps):
-    cycle = (float(frame) * 0.25 / max(0.001, float(fps)) + float(phase)) % 1.0
-    t = 2.0 * cycle
-    if t > 1.0:
-        t -= 1.0
-        sign = 1.0
-        radius = float(offset)
-    else:
-        sign = -1.0
-        radius = 2.0 * float(offset)
-    xz = radius * (-sign * 3.0 * t * t + sign * 3.0 * t)
+def _driver_light_wander(frame, phase, offset, axis, fps):
+    angle = 2.0 * pi * (float(frame) / (4.0 * max(0.001, float(fps))) + float(phase))
+    offset = float(offset)
     if int(axis) == 1:
-        return radius * (6.0 * t * t * t - 9.0 * t * t + 3.0 * t)
-    return 0.5 * xz if int(axis) == 2 else xz
+        return 0.7 * offset * sin(2.0 * angle + 1.1)
+    if int(axis) == 2:
+        return 0.45 * offset * sin(3.0 * angle + 2.3)
+    return offset * sin(angle)
 
 
 def _install_driver_namespace():
-    bpy.app.driver_namespace["witcher_light_double_cross"] = _driver_double_cross
+    bpy.app.driver_namespace["witcher_light_wander"] = _driver_light_wander
 
 
 @persistent
@@ -110,15 +104,15 @@ def register_driver_namespace():
 def unregister_driver_namespace():
     for handler in _driver_namespace_handlers():
         bpy.app.handlers.load_post.remove(handler)
-    function = bpy.app.driver_namespace.get("witcher_light_double_cross")
+    function = bpy.app.driver_namespace.get("witcher_light_wander")
     if (
-        function is _driver_double_cross
+        function is _driver_light_wander
         or (
             getattr(function, "__module__", "") == __name__
-            and getattr(function, "__name__", "") == "_driver_double_cross"
+            and getattr(function, "__name__", "") == "_driver_light_wander"
         )
     ):
-        bpy.app.driver_namespace.pop("witcher_light_double_cross", None)
+        bpy.app.driver_namespace.pop("witcher_light_wander", None)
 
 
 def environment_group_curve_suffix(group_name: str) -> str:
@@ -267,6 +261,8 @@ def configure_entity_light_flicker(
     light_obj,
     *,
     scene=None,
+    owner=None,
+    enabled_prop="",
     phase=0.0,
 ):
     if light_obj is None or getattr(light_obj, "type", "") != "LIGHT":
@@ -276,9 +272,10 @@ def configure_entity_light_flicker(
         return
 
     base_energy = float(light_obj.get("witcher_base_energy", light_data.energy) or 0.0)
+    default_strength = 0.25 if owner is not None else 0.0
     strength = max(
         0.0,
-        min(1.0, float(light_obj.get("witcher_flicker_strength", 0.0) or 0.0)),
+        min(1.0, float(light_obj.get("witcher_flicker_strength", default_strength) or 0.0)),
     )
     period = max(0.001, float(light_obj.get("witcher_flicker_period", 0.2) or 0.2))
     position_offset = max(
@@ -295,13 +292,16 @@ def configure_entity_light_flicker(
         0.001,
         float(getattr(render, "fps_base", 1.0) or 1.0),
     )
-    if strength > 0.0:
+    enabled = owner is not None and bool(enabled_prop)
+    enabled_prefix = "enabled*" if enabled else ""
+
+    if strength > 0.0 or enabled:
         if scene is not None:
             frequency = f"({2.0 * pi:.9g}*b/max(1,p*f))"
         else:
             frequency = f"{2.0 * pi / max(1.0, period * fps):.9g}"
         expression = (
-            f"base*(1-{0.5 * strength:.9g}+{0.5 * strength:.9g}*("
+            f"{enabled_prefix}base*(1-{0.5 * strength:.9g}+{0.5 * strength:.9g}*("
             f"0.5*sin(frame*{frequency}+{phase:.9g})+"
             f"0.3*sin(frame*0.53*{frequency}+{phase + 1.3:.9g})+"
             f"0.2*sin(frame*1.79*{frequency}+{phase + 2.1:.9g})))"
@@ -312,10 +312,11 @@ def configure_entity_light_flicker(
         if scene is not None:
             _add_driver_property(fcurve, "f", scene, "render.fps")
             _add_driver_property(fcurve, "b", scene, "render.fps_base")
+        if enabled:
+            _add_driver_property(fcurve, "enabled", owner, f'["{enabled_prop}"]')
         fcurve.driver.expression = expression
 
     if strength > 0.0 and position_offset > 0.0:
-        # Native RED uses a four-second DoubleCrossBezier path in XYZ.
         _install_driver_namespace()
         light_obj["witcher_flicker_position_phase"] = float(phase) % 1.0
         position_fps = "f/max(b,.001)" if scene is not None else f"{fps:.9g}"
@@ -336,12 +337,16 @@ def configure_entity_light_flicker(
             if scene is not None:
                 _add_driver_property(fcurve, "f", scene, "render.fps")
                 _add_driver_property(fcurve, "b", scene, "render.fps_base")
+            if enabled:
+                _add_driver_property(fcurve, "enabled", owner, f'["{enabled_prop}"]')
             fcurve.driver.expression = (
-                "witcher_light_double_cross("
+                f"{enabled_prefix}witcher_light_wander("
                 f"frame,phase,offset,{axis},{position_fps})"
             )
 
-    light_obj["witcher_light_flicker_driver"] = strength > 0.0
+    light_obj["witcher_light_flicker_driver"] = bool(
+        strength > 0.0 or enabled
+    )
 
 
 def configure_entity_light(light_obj, component, component_type=None, *, scene=None):

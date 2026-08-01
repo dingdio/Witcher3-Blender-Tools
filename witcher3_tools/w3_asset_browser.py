@@ -2429,6 +2429,8 @@ def _open_location(context, world_path: str, name: str, report, position=None, r
                 world_depot,
                 environment_result.message,
             )
+        elif not context.scene.witcher_environment.preview_enabled:
+            context.scene.witcher_environment.preview_enabled = True
     except Exception:
         log.warning(
             "Could not sync location world environment for %s",

@@ -2273,7 +2273,7 @@ def _get_entity_effect_owner(obj):
     current = obj
     while current is not None:
         try:
-            if "witcher_fire_enabled" in current:
+            if "witcher_fire_enabled" in current or "witcher_water_fx_enabled" in current:
                 return current
         except Exception:
             pass
@@ -2299,15 +2299,20 @@ class WITCH_PT_ENTITY_EFFECTS_Panel(WITCH_PT_Base, Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
-        state_box = layout.box()
-        state_box.label(text="Fire Preview", icon='LIGHT_POINT')
-        state_box.prop(owner, '["witcher_fire_enabled"]', text="Enabled")
-
         source_box = layout.box()
         source_box.label(text="Source", icon='INFO')
         source_box.prop(owner, "name", text="Entity")
-        source_box.prop(owner, '["witcher_fire_effect"]', text="Effect")
-        source_box.prop(owner, '["witcher_fire_particle"]', text="Particle")
+        for label, icon, enabled, effect, particles in (
+            ("Fire Preview", 'LIGHT_POINT', "witcher_fire_enabled", "witcher_fire_effect", "witcher_fire_particle"),
+            ("Water Preview", 'MOD_FLUIDSIM', "witcher_water_fx_enabled", "witcher_water_fx_effect", "witcher_water_fx_particles"),
+        ):
+            if enabled not in owner:
+                continue
+            effect_box = layout.box()
+            effect_box.label(text=label, icon=icon)
+            effect_box.prop(owner, f'["{enabled}"]', text="Enabled")
+            effect_box.prop(owner, f'["{effect}"]', text="Effect")
+            effect_box.prop(owner, f'["{particles}"]', text="Particles")
 
 classes = [
     #properties

@@ -251,8 +251,35 @@ def _resolved_existing_repo_files(repo_paths: list[str]) -> list[str]:
 
 def extract_terrain_material_set(world) -> TerrainMaterialSet:
     """Resolve the terrain material set and split both atlases into DDS slices."""
-    from ..CR2W.common_blender import repo_file
+    from ..CR2W.common_blender import repo_file, vanilla_only_repo_context
     from ..CR2W.texture_converters import convert_texarray_to_dds
+
+    def resolve_array(depot_path):
+        if not depot_path:
+            return [], []
+
+        def resolve_path(array_path):
+            sources = get_texture_array_bitmap_paths(array_path)
+            slices = convert_texarray_to_dds(array_path) or []
+            if not slices:
+                slices = _resolved_existing_repo_files(sources)
+            return sources, slices
+
+        array_path = repo_file(depot_path)
+        sources, slices = resolve_path(array_path)
+        if slices:
+            return sources, slices
+        # REDkit arrays can contain only child references; use the cooked copy for pixels.
+        with vanilla_only_repo_context():
+            vanilla_path = repo_file(depot_path)
+            if (
+                not vanilla_path
+                or os.path.normcase(os.path.abspath(vanilla_path))
+                == os.path.normcase(os.path.abspath(array_path or ""))
+            ):
+                return sources, slices
+            vanilla_sources, vanilla_slices = resolve_path(vanilla_path)
+        return (sources or vanilla_sources, vanilla_slices) if vanilla_slices else (sources, slices)
 
     result = TerrainMaterialSet()
     result.material_path = get_terrain_material_path(world)
@@ -274,20 +301,8 @@ def extract_terrain_material_set(world) -> TerrainMaterialSet:
         result.warnings.append("Terrain material graph has no diffuse texture array.")
         return result
 
-    diffuse_abs = repo_file(result.diffuse_texarray)
-    normal_abs = repo_file(result.normal_texarray) if result.normal_texarray else ""
-
-    diffuse_sources = get_texture_array_bitmap_paths(diffuse_abs)
-    normal_sources = get_texture_array_bitmap_paths(normal_abs) if normal_abs else []
-
-    diffuse_slices = convert_texarray_to_dds(diffuse_abs) or []
-    if not diffuse_slices:
-        diffuse_slices = _resolved_existing_repo_files(diffuse_sources)
-    normal_slices = []
-    if result.normal_texarray:
-        normal_slices = convert_texarray_to_dds(normal_abs) or []
-        if not normal_slices:
-            normal_slices = _resolved_existing_repo_files(normal_sources)
+    diffuse_sources, diffuse_slices = resolve_array(result.diffuse_texarray)
+    normal_sources, normal_slices = resolve_array(result.normal_texarray)
 
     texture_params = get_terrain_texture_params(world)
     count = len(diffuse_slices)

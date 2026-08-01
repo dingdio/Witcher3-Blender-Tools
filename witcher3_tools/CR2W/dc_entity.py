@@ -4295,15 +4295,13 @@ def create_CEntity(file, _inherit_visited=None):
                     for buf_chunk in buf_cr2w.CHUNKS.CHUNKS:
                         if buf_chunk.Type == 'CStaticMeshComponent':
                             mc = CStaticMeshComponent(buf_chunk).convert_for_io()
-                        elif buf_chunk.Type == 'CMeshComponent':
+                        elif buf_chunk.Type in ('CMeshComponent', 'CRigidMeshComponent', 'CFurComponent'):
                             mc = CMeshComponent(buf_chunk).convert_for_io()
                         elif buf_chunk.Type == 'CRagdollMeshComponent':
                             if buf_chunk.GetVariableByName("mesh") is None:
                                 continue
                             mc = CRagdollMeshComponent(buf_chunk).convert_for_io()
                             mc.ragdoll_meta = _extract_w2_ragdoll_meta(buf_chunk, buf_cr2w.CHUNKS.CHUNKS)
-                        elif buf_chunk.Type == 'CRigidMeshComponent':
-                            mc = CMeshComponent(buf_chunk).convert_for_io()
                         else:
                             continue
                         mc.mesh = _resolve_mesh_path(buf_chunk, mc.mesh)
@@ -4319,7 +4317,7 @@ def create_CEntity(file, _inherit_visited=None):
                             # Bind the entity's rig (CAnimatedComponent) to skinned meshes
                             # via a synthesized CMeshSkinningAttachment, like cooked levels do.
                             if (entity_animated_component_chunk_index is not None
-                                    and buf_chunk.Type in ('CMeshComponent', 'CRigidMeshComponent', 'CRagdollMeshComponent')):
+                                    and buf_chunk.Type in ('CMeshComponent', 'CRigidMeshComponent', 'CRagdollMeshComponent', 'CFurComponent')):
                                 skinning = CMeshSkinningAttachment(
                                     entity_animated_component_chunk_index,
                                     buf_chunk.ChunkIndex,

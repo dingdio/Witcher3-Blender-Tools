@@ -14,6 +14,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 BROWSER_PATH = ROOT / "witcher3_tools" / "w3_asset_browser.py"
 UI_MAP_PATH = ROOT / "witcher3_tools" / "ui" / "ui_map.py"
+IMPORT_BLENDER_FUN_PATH = ROOT / "witcher3_tools" / "importers" / "import_blender_fun.py"
 LOCATIONS_PATH = ROOT / "witcher3_tools" / "CR2W" / "data" / "locations.json"
 
 
@@ -221,6 +222,7 @@ class LocationSystemTests(unittest.TestCase):
         self.assertIn("AddCLayerGroup", function_source)
         self.assertIn("_terrain_tiles_within_radius", function_source)
         self.assertIn("_start_location_stream", function_source)
+        self.assertIn("preview_enabled = True", function_source)
         for forbidden in (
             "layer_dir",
             "layer_allow",
@@ -231,6 +233,51 @@ class LocationSystemTests(unittest.TestCase):
             "_import_location_layers_sync",
         ):
             self.assertNotIn(forbidden, function_source)
+
+    def test_full_plan_uses_shared_redcloth_and_redapex_resource_resolver(self):
+        tree = ast.parse(
+            IMPORT_BLENDER_FUN_PATH.read_text(encoding="utf-8"),
+            filename=str(IMPORT_BLENDER_FUN_PATH),
+        )
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_resolve_gameplay_entity_import_plan"
+        )
+
+        self.assertIn(
+            "cloth_resource = _chunk_cloth_resource(chunk)",
+            ast.unparse(function),
+        )
+
+    def test_redapex_resource_resolver_falls_back_to_v164_property(self):
+        tree = ast.parse(
+            IMPORT_BLENDER_FUN_PATH.read_text(encoding="utf-8"),
+            filename=str(IMPORT_BLENDER_FUN_PATH),
+        )
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_chunk_cloth_resource"
+        )
+        namespace = {}
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(IMPORT_BLENDER_FUN_PATH), "exec"),
+            namespace,
+        )
+        properties = {
+            "resource": SimpleNamespace(Handles=[]),
+            "m_resource": SimpleNamespace(
+                Handles=[SimpleNamespace(DepotPath=r"environment\decorations\bucket.redapex")]
+            ),
+        }
+
+        self.assertEqual(
+            namespace["_chunk_cloth_resource"](
+                SimpleNamespace(GetVariableByName=properties.get)
+            ),
+            r"environment\decorations\bucket.redapex",
+        )
 
     def test_viewport_and_busy_checks_happen_before_world_mutation(self):
         source = BROWSER_PATH.read_text(encoding="utf-8")

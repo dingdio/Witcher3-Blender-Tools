@@ -620,9 +620,9 @@ class RepoPathResolutionTests(unittest.TestCase):
         self.assertTrue(metadata["has_armature_root"])
         self.assertTrue(metadata["has_inventory_entries"])
 
-    def test_streaming_buffer_keeps_distinct_components_with_the_same_mesh(self):
+    def test_streamed_entity_keeps_distinct_components_with_the_same_mesh(self):
         mesh_path = r"fx\water\water_fountain\fountain_splash.w2mesh"
-        owner = _EffectChunk("CEntity", 0)
+        owner = _EffectChunk("W3FireSource", 0)
         owner.Components = []
         owner.PROPS.append(types.SimpleNamespace(
             theName="streamingDataBuffer",
@@ -635,6 +635,9 @@ class RepoPathResolutionTests(unittest.TestCase):
         lower = _EffectChunk("CMeshComponent", 2)
         lower.component_name = "CMeshComponent1"
         lower.mesh = mesh_path
+        fur = _EffectChunk("CFurComponent", 3)
+        fur.component_name = "CFurComponent0"
+        fur.mesh = mesh_path
 
         source_file = types.SimpleNamespace(
             HEADER=types.SimpleNamespace(version=159),
@@ -643,7 +646,7 @@ class RepoPathResolutionTests(unittest.TestCase):
             fileName="<memory>",
         )
         buffer_file = types.SimpleNamespace(
-            CHUNKS=types.SimpleNamespace(CHUNKS=[upper, lower]),
+            CHUNKS=types.SimpleNamespace(CHUNKS=[upper, lower, fur]),
         )
 
         class _Converter:
@@ -658,20 +661,66 @@ class RepoPathResolutionTests(unittest.TestCase):
                     transformParent=None,
                 )
 
-        with (
-            mock.patch.object(dc_entity, "_flat_compiled_file", return_value=None),
-            mock.patch.object(dc_entity, "getCR2W", return_value=buffer_file),
-            mock.patch.object(dc_entity, "CMeshComponent", _Converter),
-            mock.patch.object(dc_entity, "_resolve_mesh_path", side_effect=lambda _chunk, value: value),
-        ):
-            entity = dc_entity.create_CEntity(source_file)
+        for owner_type in ("W3FireSource", "W3FireSourceLifeRegen", "W3ModdedFireSource"):
+            owner.Type = owner_type
+            with (
+                self.subTest(owner_type=owner_type),
+                mock.patch.object(dc_entity, "_flat_compiled_file", return_value=None),
+                mock.patch.object(dc_entity, "getCR2W", return_value=buffer_file),
+                mock.patch.object(dc_entity, "CMeshComponent", _Converter),
+                mock.patch.object(dc_entity, "_resolve_mesh_path", side_effect=lambda _chunk, value: value),
+            ):
+                entity = dc_entity.create_CEntity(source_file)
 
-        meshes = [
-            chunk for chunk in entity.staticMeshes.chunks
-            if chunk.type == "CMeshComponent"
-        ]
-        self.assertEqual([chunk.name for chunk in meshes], ["CMeshComponent0", "CMeshComponent1"])
-        self.assertEqual([chunk.chunkIndex for chunk in meshes], [1, 2])
+                meshes = [
+                    chunk for chunk in entity.staticMeshes.chunks
+                    if chunk.type in {"CMeshComponent", "CFurComponent"}
+                ]
+                self.assertEqual(
+                    [chunk.name for chunk in meshes],
+                    ["CMeshComponent0", "CMeshComponent1", "CFurComponent0"],
+                )
+                self.assertEqual([chunk.chunkIndex for chunk in meshes], [1, 2, 3])
+
+    def test_level_uses_generic_wrapper_for_streamed_entity_subclasses(self):
+        template = types.SimpleNamespace(
+            name="CEntityTemplate",
+            GetVariableByName=lambda _name: None,
+        )
+
+        def entity_chunk(chunk_type, instance_name, *, streamed=False):
+            streaming_buffer = types.SimpleNamespace() if streamed else None
+            return types.SimpleNamespace(
+                name=chunk_type,
+                Type=chunk_type,
+                Components=[],
+                isCreatedFromTemplate=False,
+                GetVariableByName=lambda name: streaming_buffer if name == "streamingDataBuffer" else None,
+                get_name_prop_string=lambda: instance_name,
+            )
+
+        source_file = types.SimpleNamespace(
+            HEADER=types.SimpleNamespace(version=159),
+            CHUNKS=types.SimpleNamespace(CHUNKS=[
+                template,
+                entity_chunk("W3FireSource", "brazier"),
+                entity_chunk("W3FireSourceLifeRegen", "campfire"),
+                entity_chunk("W3ModdedFireSource", "modded campfire", streamed=True),
+            ]),
+            CR2WExport=[],
+        )
+
+        level = dc_entity.create_level(source_file, "<memory>")
+
+        self.assertEqual([entity.type for entity in level.Entities], [
+            "W3FireSource",
+            "W3FireSourceLifeRegen",
+            "W3ModdedFireSource",
+        ])
+        self.assertEqual(
+            [entity.name for entity in level.Entities],
+            ["brazier", "campfire", "modded campfire"],
+        )
 
     def test_path_like_property_index_wins_over_import_table_number(self):
         roof_path = (
